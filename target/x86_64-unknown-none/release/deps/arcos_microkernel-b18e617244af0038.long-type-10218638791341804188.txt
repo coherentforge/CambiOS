@@ -1,0 +1,1 @@
+SpinlockGuard<'_, Option<alloc::boxed::Box<IpcManager>>>

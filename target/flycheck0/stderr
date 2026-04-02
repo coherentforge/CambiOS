@@ -1,0 +1,55 @@
+   0.012957375s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_core"}: cargo::core::compiler::fingerprint: fingerprint error for arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev)/Check { test: true }/TargetInner { ..: lib_target("arcos_core", ["lib"], "/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev/src/lib.rs", Edition2021) }
+   0.012984041s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_core"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev/target/x86_64-unknown-none/debug/.fingerprint/arcos-66f1f4e52adf98a7/test-lib-arcos_core`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: <std::backtrace::Backtrace>::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.015178583s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_microkernel"}: cargo::core::compiler::fingerprint: dependency on `arcos_core` is newer than we are 1775104576.586467198s > 1775103283.236315623s "/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev"
+   0.015378458s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_microkernel"}: cargo::core::compiler::fingerprint: fingerprint dirty for arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev)/Check { test: false }/TargetInner { name: "arcos_microkernel", doc: true, ..: with_path("/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev/src/microkernel/main.rs", Edition2021) }
+   0.015383166s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_microkernel"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { unit: UnitIndex(0), dep_mtime: FileTime { seconds: 1775104576, nanos: 586467198 }, max_mtime: FileTime { seconds: 1775103283, nanos: 236315623 } })
+   0.015595083s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_microkernel"}: cargo::core::compiler::fingerprint: fingerprint error for arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev)/Check { test: true }/TargetInner { name: "arcos_microkernel", doc: true, ..: with_path("/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev/src/microkernel/main.rs", Edition2021) }
+   0.015599083s  INFO prepare_target{force=false package_id=arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev) target="arcos_microkernel"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev/target/x86_64-unknown-none/debug/.fingerprint/arcos-6f38f6829d52a304/test-bin-arcos_microkernel`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: <std::backtrace::Backtrace>::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+    Checking arcos v0.1.0 (/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev)
+error: could not compile `arcos` (bin "arcos_microkernel" test) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `arcos` (lib test) due to 700 previous errors; 1 warning emitted

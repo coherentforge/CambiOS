@@ -1,0 +1,140 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| tail -30$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| tail -40$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| tail -50$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| head -50$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"\\(error\\|warning\\|Finished\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| head -100$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"\\(error\\|Finished\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"\\(error\\|warning: unused\\|Finished\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -A 3 \"unexpected closing\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"\\(error\\|warning\\.\\*buddy\\|Finished\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"error\\|warning: unused\\|Finished\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -A5 \"no method named\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"error\\|Finished\" \\| head -20$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"error\\|Finished\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -B5 \"unexpected closing\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -A3 \"unclosed delimiter\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep \"send_message_with_capability\" \\| head -5$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo check --target x86_64-unknown-none 2>&1 \\| head -50$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"\\^\\(error\\|warning:\\.\\*\\|   Compiling\\|    Finished\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"error\\|warning\\.\\*arcos\\.\\*generated\\|Finished\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo test --lib --target x86_64-apple-darwin 2>&1 \\| cat$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo test --lib --target x86_64-apple-darwin 2>&1 \\| grep -E 'test \\|running\\|ok\\|FAILED\\|result'$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo test --lib --target x86_64-apple-darwin -- ipc::tests --test-threads=1 --nocapture 2>&1 \\| tail -30$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E '\\^error\\|\\^warning\\.\\*arcos\\|Finished'$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E '\\^error\\|Finished'$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E '\\^ \\*--> ' \\| sort -u$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E '\\^warning:\\|\\^error\\|Finished'$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep \"error\\\\\\[\" \\| grep -oP 'src/\\[\\^ \\]\\+:\\\\d\\+' \\| sort -u$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep -E \"\\^error\" \\| grep -o \"src/\\[\\^:\\]\\*\" \\| sort -u$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| grep \"\\\\-\\\\->\" \\| sort -u$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^touch src/microkernel/main\\.rs && cargo build --target x86_64-unknown-none --release 2>&1 && make iso 2>&1 \\| tail -3$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 && make iso 2>&1 \\| tail -1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none 2>&1 \\| tail -3$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

@@ -1,0 +1,1 @@
+rustc-LLVM ERROR: Global variable '_RNvCsjGNoNAw8A3_17arcos_microkernel11__END_MARKER' has an invalid section specifier '.requests_end_marker': mach-o section specifier requires a segment and section separated by a comma.

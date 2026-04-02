@@ -1,0 +1,1094 @@
+#![no_std]
+#![no_main]
+
+//! ArcOS Microkernel Main
+//!
+//! Microkernel core with:
+//! - Task/process scheduler (round-robin, preemptive)
+//! - IPC message dispatcher
+//! - Capability manager
+//! - Driver and service coordination
+//! - Hardware interrupt-driven preemption (PIT + PIC)
+//!
+//! Booted by Limine bootloader which provides:
+//! - Higher-half direct mapping (HHDM)
+//! - Physical memory map
+//! - Framebuffer (optional)
+
+extern crate arcos_core;
+
+use limine::BaseRevision;
+use limine::request::{
+    FramebufferRequest, HhdmRequest, MemoryMapRequest,
+    RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
+};
+use x86_64::instructions::hlt;
+use arcos_core::println;
+use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, BlockReason, TaskId};
+use arcos_core::ipc::{EndpointId, Message, ProcessId, CapabilityRights};
+use arcos_core::interrupts::{IrqNumber, InterruptContext};
+use arcos_core::process::ProcessTable;
+
+// Use the global statics from the library crate
+use arcos_core::{SCHEDULER, TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, INTERRUPT_ROUTER};
+
+// ============================================================================
+// Limine boot protocol requests
+// ============================================================================
+
+/// Base revision — must be supported by our version of the limine crate.
+#[used]
+#[unsafe(link_section = ".requests")]
+static BASE_REVISION: BaseRevision = BaseRevision::new();
+
+/// Request the higher-half direct map offset (physical memory accessible via HHDM).
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+/// Request the physical memory map from the bootloader.
+#[used]
+#[unsafe(link_section = ".requests")]
+static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+/// Request a framebuffer for early graphical output (optional).
+#[used]
+#[unsafe(link_section = ".requests")]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+/// Request a 64KB kernel stack (default is 64KB in Limine, but be explicit).
+#[used]
+#[unsafe(link_section = ".requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new()
+    .with_size(64 * 1024);
+
+/// Limine requests section markers.
+#[used]
+#[unsafe(link_section = ".requests_start_marker")]
+static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
+#[used]
+#[unsafe(link_section = ".requests_end_marker")]
+static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
+
+/// Microkernel entry point (called by Limine bootloader)
+#[unsafe(no_mangle)]
+unsafe extern "C" fn kmain() -> ! {
+    // Initialize serial output FIRST so panic messages are visible
+    unsafe { arcos_core::io::init(); }
+
+    // Verify Limine protocol is supported (panics with a message if not)
+    assert!(BASE_REVISION.is_supported(), "Limine base revision not supported!");
+
+    println!("=== ArcOS Microkernel ===");
+    println!("Booted via Limine\n");
+
+    // Report HHDM offset
+    if let Some(hhdm_response) = HHDM_REQUEST.get_response() {
+        println!("HHDM offset: {:#x}", hhdm_response.offset());
+    } else {
+        println!("WARNING: No HHDM response from bootloader");
+    }
+
+    // Report memory map
+    if let Some(memmap_response) = MEMORY_MAP_REQUEST.get_response() {
+        let entries = memmap_response.entries();
+        println!("Memory map: {} entries", entries.len());
+        for (i, entry) in entries.iter().enumerate().take(8) {
+            println!(
+                "  [{:2}] {:#016x} - {:#016x} len={:#x}",
+                i,
+                entry.base,
+                entry.base + entry.length,
+                entry.length,
+            );
+        }
+        if entries.len() > 8 {
+            println!("  ... ({} more entries)", entries.len() - 8);
+        }
+    } else {
+        println!("WARNING: No memory map from bootloader");
+    }
+
+    // Report framebuffer
+    if let Some(fb_response) = FRAMEBUFFER_REQUEST.get_response() {
+        if let Some(fb) = fb_response.framebuffers().next() {
+            println!(
+                "Framebuffer: {}x{} @ {:#x}",
+                fb.width(),
+                fb.height(),
+                fb.addr() as usize,
+            );
+        }
+    }
+
+    println!();
+
+    // Initialize kernel heap allocator from Limine memory map
+    init_kernel_heap();
+
+    // Initialize core hardware (IDT, etc.)
+    unsafe {
+        arcos_core::interrupts::init();
+    }
+
+    // Initialize microkernel subsystems
+    scheduler_init();
+    ipc_init();
+    capability_manager_init();
+    process_table_init();
+    register_example_interrupts();
+
+    println!("✓ Task scheduler initialized");
+    println!("✓ IPC subsystem ready");
+    println!("✓ Capability manager ready");
+
+    {
+        let scheduler = SCHEDULER.lock();
+        if let Some(sched) = scheduler.as_ref() {
+            let stats = sched.stats();
+            println!(
+                "\nScheduler: {} tasks, current: {:?}",
+                stats.active_tasks, stats.current_task
+            );
+        }
+    }
+
+    println!("\nStarting scheduler event loop...\n");
+
+    // Demo: Test syscalls before entering main loop
+    demo_syscalls();
+
+    // Initialize hardware interrupts (PIC + PIT + IDT timer entry)
+    // This enables real timer interrupts at 100Hz — the timer ISR handles
+    // tick counting, time slice accounting, and preemptive scheduling.
+    // Must be done AFTER all subsystems are initialized.
+    println!("Initializing hardware interrupts...");
+    unsafe {
+        arcos_core::interrupts::init_hardware_interrupts(100); // 100 Hz = 10ms ticks
+    }
+    println!("✓ Hardware interrupt-driven scheduling active\n");
+
+    // Enter idle loop — all scheduling is now interrupt-driven
+    // The PIT timer fires IRQ 0 → vector 32 → timer_interrupt_handler
+    // which ticks the scheduler and performs preemptive context switches.
+    microkernel_loop();
+}
+
+/// Demonstration of working syscalls
+fn demo_syscalls() {
+    use arcos_core::syscalls::SyscallArgs;
+    
+    println!("=== Syscall Demonstration ===\n");
+    
+    // Demo 1: SYS_GET_PID
+    println!("Test 1: SYS_GET_PID");
+    let result = handle_syscall(
+        8,  // SYS_GET_PID
+        SyscallArgs::new(0, 0, 0, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: PID = {}\n", result);
+    
+    // Demo 2: SYS_GET_TIME
+    println!("Test 2: SYS_GET_TIME");
+    let result = handle_syscall(
+        9,  // SYS_GET_TIME
+        SyscallArgs::new(0, 0, 0, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: Time = {} ticks\n", result);
+    
+    // Demo 3: SYS_ALLOCATE
+    println!("Test 3: SYS_ALLOCATE size=4096");
+    let result = handle_syscall(
+        3,  // SYS_ALLOCATE
+        SyscallArgs::new(4096, 0, 0, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: addr = {:#x}\n", result as u64);
+    
+    // Demo 4: SYS_ALLOCATE (fail - too large)
+    println!("Test 4: SYS_ALLOCATE size=2MB (should fail)");
+    let result = handle_syscall(
+        3,  // SYS_ALLOCATE
+        SyscallArgs::new(2 * 1024 * 1024, 0, 0, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: {} (negative = error)\n", result);
+    
+    // Demo 5: SYS_FREE
+    println!("Test 5: SYS_FREE ptr=0x10000 size=4096");
+    let result = handle_syscall(
+        4,  // SYS_FREE
+        SyscallArgs::new(0x10000, 4096, 0, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: {}\n", result);
+    
+    // Demo 6: SYS_REGISTER_ENDPOINT
+    println!("Test 6: SYS_REGISTER_ENDPOINT ep=10");
+    let result = handle_syscall(
+        6,  // SYS_REGISTER_ENDPOINT
+        SyscallArgs::new(10, 0, 0, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: {}\n", result);
+    
+    // Demo 7: SYS_WRITE to registered endpoint
+    println!("Test 7: SYS_WRITE ep=10 len=100");
+    let result = handle_syscall(
+        1,  // SYS_WRITE
+        SyscallArgs::new(10, 0x1000, 100, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: {} bytes written\n", result);
+    
+    // Demo 8: SYS_READ from registered endpoint
+    println!("Test 8: SYS_READ ep=10 buflen=256");
+    let result = handle_syscall(
+        2,  // SYS_READ
+        SyscallArgs::new(10, 0x2000, 256, 0, 0, 0),
+        ProcessId(1),
+        TaskId(1),
+    );
+    println!("  Result: {} bytes read\n", result);
+    
+    println!("=== Syscalls Demonstration Complete ===\n");
+}
+
+// ============================================================================
+// Kernel heap initialization from Limine memory map
+// ============================================================================
+
+/// Kernel heap size: 4 MB (plenty for kernel-level Box/Vec allocations)
+const KERNEL_HEAP_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Initialize the kernel heap allocator from the Limine physical memory map.
+///
+/// Finds a large USABLE physical region, converts it to a virtual address via
+/// the HHDM offset, and hands it to the global allocator.
+fn init_kernel_heap() {
+    use limine::memory_map::EntryType;
+
+    let hhdm_offset = HHDM_REQUEST
+        .get_response()
+        .expect("HHDM response required for kernel heap")
+        .offset();
+
+    let memmap = MEMORY_MAP_REQUEST
+        .get_response()
+        .expect("Memory map required for kernel heap");
+
+    // Find the largest USABLE region that can hold our heap
+    let mut best: Option<(u64, u64)> = None; // (base, length)
+    for entry in memmap.entries() {
+        if entry.entry_type == EntryType::USABLE && entry.length >= KERNEL_HEAP_SIZE {
+            match best {
+                Some((_, best_len)) if entry.length <= best_len => {}
+                _ => best = Some((entry.base, entry.length)),
+            }
+        }
+    }
+
+    let (phys_base, region_len) = best.expect("No usable memory region large enough for kernel heap");
+
+    // Use only what we need from this region
+    let heap_size = KERNEL_HEAP_SIZE as usize;
+    let virt_base = phys_base as usize + hhdm_offset as usize;
+
+    unsafe {
+        arcos_core::KERNEL_HEAP.init(virt_base, heap_size);
+    }
+
+    let (used, free) = arcos_core::KERNEL_HEAP.stats();
+    println!(
+        "✓ Kernel heap: {} KB at virt {:#x} (phys {:#x}, region {} KB)",
+        heap_size / 1024,
+        virt_base,
+        phys_base,
+        region_len / 1024,
+    );
+    let _ = (used, free); // suppress unused warning in release
+}
+
+/// Initialize the task scheduler with tick-based preemption
+fn scheduler_init() {
+    // Create and initialize scheduler
+    let mut scheduler = Scheduler::new();
+    if let Err(e) = scheduler.init() {
+        println!("✗ Scheduler init failed: {:?}", e);
+        arcos_core::halt();
+    }
+
+    // Create some test tasks
+    let _test_task_1 = scheduler.create_task(0x110000, 0x210000, Priority::NORMAL);
+    let _test_task_2 = scheduler.create_task(0x120000, 0x220000, Priority::NORMAL);
+
+    // Store in spinlock-protected global (heap-allocated)
+    *SCHEDULER.lock() = Some(alloc::boxed::Box::new(scheduler));
+
+    // Initialize timer (100 Hz = 10ms ticks)
+    let mut timer = match Timer::new(TimerConfig::HZ_100) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("✗ Timer creation failed: {}", e);
+            arcos_core::halt();
+        }
+    };
+
+    if let Err(e) = timer.init() {
+        println!("✗ Timer init failed: {}", e);
+        arcos_core::halt();
+    }
+
+    *TIMER.lock() = Some(timer);
+}
+
+/// Initialize IPC subsystem
+fn ipc_init() {
+    *IPC_MANAGER.lock() = Some(alloc::boxed::Box::new(arcos_core::ipc::IpcManager::new()));
+    println!("✓ IPC manager ready");
+}
+
+/// Initialize capability manager
+fn capability_manager_init() {
+    *CAPABILITY_MANAGER.lock() = Some(alloc::boxed::Box::new(arcos_core::ipc::capability::CapabilityManager::new()));
+    
+    let mut guard = CAPABILITY_MANAGER.lock();
+    let cap_mgr = guard.as_mut().unwrap();
+
+    for task_id in 0..3 {
+        let process_id = ProcessId(task_id);
+        if let Err(e) = cap_mgr.register_process(process_id) {
+            println!("  ✗ Failed to register process {}: {}", task_id, e);
+            continue;
+        }
+
+        // Grant each process access to endpoints for communication
+        // For this demo: allow all processes to communicate with each other
+        // Real system: would restrict based on process privileges
+        for endpoint_id in 0..16 {
+            let endpoint = EndpointId(endpoint_id);
+
+            // Task 0 (idle) gets full capabilities everywhere
+            if task_id == 0 {
+                let _ = cap_mgr.grant_capability(
+                    process_id,
+                    endpoint,
+                    CapabilityRights::FULL,
+                );
+            }
+            // Other tasks get send+receive but not delegate
+            else {
+                let _ = cap_mgr.grant_capability(
+                    process_id,
+                    endpoint,
+                    CapabilityRights {
+                        send: true,
+                        receive: true,
+                        delegate: false,
+                    },
+                );
+            }
+        }
+    }
+
+    println!("  ✓ Capability manager initialized with {} processes", cap_mgr.process_count());
+}
+
+/// Initialize process table
+fn process_table_init() {
+    let mut pt = ProcessTable::new();
+    
+    // Create process descriptors for the first 3 processes (matching task count)
+    for i in 0..3 {
+        let process_id = ProcessId(i as u32);
+        if let Err(e) = pt.create_process(process_id) {
+            println!("  ✗ Failed to create process {}: {}", i, e);
+        } else {
+            let heap_base = pt.get_heap_base(process_id);
+            println!("  ✓ Process {} heap at {:#x}", i, heap_base);
+        }
+    }
+    
+    *PROCESS_TABLE.lock() = Some(alloc::boxed::Box::new(pt));
+    println!("✓ Process table initialized");
+}
+
+/// Helper: Send IPC message and wake receiver
+///
+/// This is the pattern drivers use to send to services.
+/// Locks are acquired sequentially (non-nested), so global order does not apply.
+/// IPC_MANAGER released before SCHEDULER acquired.
+#[allow(dead_code)]
+fn ipc_send_and_notify(endpoint: EndpointId, msg: Message) -> bool {
+    // Queue the message (IPC_MANAGER can be held independently)
+    {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        if ipc_mgr.send_message(endpoint, msg).is_err() {
+            return false; // ipc_mgr lock released here
+        }
+    } // ipc_mgr lock released here
+
+    // Try to wake the highest-priority receiver
+    // No lock ordering issue: we don't hold IPC_MANAGER while acquiring SCHEDULER
+    {
+        let mut scheduler = SCHEDULER.lock();
+        if let Some(sched) = scheduler.as_mut() {
+            if let Some(receiver_id) = sched.find_highest_priority_receiver(endpoint.0) {
+                let _ = sched.wake_task(receiver_id);
+            }
+        }
+    } // scheduler lock released here
+    
+    true
+}
+
+/// Helper: Try to receive IPC message or block caller
+///
+/// This is the pattern services use to wait for messages.
+/// Returns message if available, blocks caller if queue is empty.
+#[allow(dead_code)]
+fn ipc_recv_or_block(current_task: TaskId, endpoint: EndpointId) -> Option<Message> {
+    // Try to get message from queue
+    {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        if let Some(msg) = ipc_mgr.recv_message(endpoint) {
+            return Some(msg);
+        }
+    }
+
+    // Queue is empty - block caller if scheduler available
+    {
+        let mut scheduler = SCHEDULER.lock();
+        if let Some(sched) = scheduler.as_mut() {
+            let _ = sched.block_task(current_task, BlockReason::MessageWait(endpoint.0));
+        }
+    }
+    
+    None
+}
+
+
+/// Receive IPC message with capability enforcement
+///
+/// Safe version using spinlock guards (no unsafe raw pointers).
+/// Lock ordering: CAPABILITY_MANAGER → IPC_MANAGER   (nested)
+///
+/// Flow:
+/// 1. Receive (process) requests message from endpoint
+/// 2. Capability manager verifies receiver has RECEIVE right
+/// 3. If denied, returns PermissionDenied error
+/// 4. If allowed, returns message or None if queue empty
+#[allow(dead_code)]
+fn ipc_recv_with_capability(
+    receiver_process: ProcessId,
+    endpoint: EndpointId,
+) -> Result<Option<Message>, &'static str> {
+    // Lock order: IPC_MANAGER (must come after CAPABILITY_MANAGER in global order)
+    // Global order is CAPABILITY_MANAGER → IPC_MANAGER , so check capability FIRST
+    let cap_mgr = CAPABILITY_MANAGER.lock();
+    if cap_mgr.verify_access(receiver_process, endpoint, CapabilityRights::RECV_ONLY).is_err() {
+        return Err("Access denied - insufficient capabilities");
+    }
+    drop(cap_mgr); // Explicitly release capability lock
+    
+    // Now acquire IPC manager to receive message
+    let mut ipc_mgr = IPC_MANAGER.lock();
+    Ok(ipc_mgr.recv_message(endpoint))
+}
+
+// ============================================================================
+// Synchronous IPC helpers
+// ============================================================================
+
+/// Synchronous send: deposit message on endpoint, block sender until receiver picks up
+///
+/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+///
+/// Returns true if send completed (receiver was already waiting),
+/// false if sender was blocked (will be woken when receiver calls sync_recv).
+#[allow(dead_code)]
+fn sync_ipc_send(sender_task: TaskId, endpoint: EndpointId, msg: Message) -> bool {
+    use arcos_core::ipc::SyncSendResult;
+
+    // Step 1: Deposit message in sync channel
+    let result = {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        ipc_mgr.sync_send(endpoint, msg, sender_task.0)
+    };
+
+    match result {
+        Ok(SyncSendResult::ReceiverWoken(receiver_task_id)) => {
+            // Receiver was waiting — wake it
+            let mut scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_mut() {
+                let _ = sched.wake_task(TaskId(receiver_task_id));
+            }
+            true // Sender continues (not blocked)
+        }
+        Ok(SyncSendResult::SenderMustBlock) => {
+            // No receiver — block sender
+            let mut scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_mut() {
+                let _ = sched.block_task(sender_task, BlockReason::SyncSendWait(endpoint.0));
+            }
+            false // Sender blocked
+        }
+        Err(_) => false, // Channel busy or invalid
+    }
+}
+
+/// Synchronous receive: pick up message or block until one arrives
+///
+/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+#[allow(dead_code)]
+fn sync_ipc_recv(receiver_task: TaskId, endpoint: EndpointId) -> Option<Message> {
+    use arcos_core::ipc::SyncRecvResult;
+
+    let result = {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        ipc_mgr.sync_recv(endpoint, receiver_task.0)
+    };
+
+    match result {
+        Ok(SyncRecvResult::Message(msg, wake_sender)) => {
+            // Got message — wake sender if it was blocked on send (not call)
+            if let Some(sender_task_id) = wake_sender {
+                let mut scheduler = SCHEDULER.lock();
+                if let Some(sched) = scheduler.as_mut() {
+                    let _ = sched.wake_task(TaskId(sender_task_id));
+                }
+            }
+            Some(msg)
+        }
+        Ok(SyncRecvResult::ReceiverMustBlock) => {
+            // No message — block receiver
+            let mut scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_mut() {
+                let _ = sched.block_task(receiver_task, BlockReason::SyncRecvWait(endpoint.0));
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Synchronous call: send message + block until reply (RPC pattern)
+///
+/// This is the primary IPC pattern for driver↔service communication:
+/// 1. Caller deposits request
+/// 2. Caller blocks until service replies
+/// 3. Service picks up via sync_recv, processes, calls sync_reply
+/// 4. Caller wakes with reply message
+///
+/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+#[allow(dead_code)]
+fn sync_ipc_call(caller_task: TaskId, endpoint: EndpointId, msg: Message) {
+    use arcos_core::ipc::SyncCallResult;
+
+    let result = {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        ipc_mgr.sync_call(endpoint, msg, caller_task.0)
+    };
+
+    match result {
+        Ok(SyncCallResult::ReceiverWoken(receiver_task_id)) => {
+            // Wake receiver, block caller for reply
+            let mut scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_mut() {
+                let _ = sched.wake_task(TaskId(receiver_task_id));
+                let _ = sched.block_task(caller_task, BlockReason::SyncReplyWait(endpoint.0));
+            }
+        }
+        Ok(SyncCallResult::CallerMustBlock) => {
+            // No receiver yet — block caller
+            let mut scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_mut() {
+                let _ = sched.block_task(caller_task, BlockReason::SyncReplyWait(endpoint.0));
+            }
+        }
+        Err(_) => {} // Channel busy
+    }
+}
+
+/// Synchronous reply: complete an RPC cycle by sending reply to blocked caller
+///
+/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+#[allow(dead_code)]
+fn sync_ipc_reply(endpoint: EndpointId, reply: Message) -> bool {
+    let caller_task = {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        ipc_mgr.sync_reply(endpoint, reply)
+    };
+
+    match caller_task {
+        Ok(caller_task_id) => {
+            let mut scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_mut() {
+                let _ = sched.wake_task(TaskId(caller_task_id));
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Dispatch an interrupt to its registered driver
+///
+/// This is the critical path that bridges hardware events to driver tasks:
+/// 
+/// 1. Hardware generates interrupt (e.g., timer tick, keyboard press)
+/// 2. CPU delivers to IDT handler 
+/// 3. Handler calls this function with IRQ number
+/// 4. Look up which driver (task) is registered to handle this IRQ
+/// 5. Create InterruptContext with event details
+/// 6. Queue IPC message to driver's endpoint
+/// 7. Wake driver task (remove from Blocked state)
+/// 8. Scheduler will run driver on next schedule() call
+///
+/// Lock ordering: sequential (non-nested), so global order does not apply.
+/// INTERRUPT_ROUTER released before IPC_MANAGER acquired.
+/// IPC_MANAGER released before SCHEDULER acquired.
+///
+/// Result: Drivers don't poll or spin; they sleep until their interrupt fires.
+#[allow(dead_code)]
+pub fn dispatch_interrupt(irq: IrqNumber, timestamp_ticks: u64) {
+    // Step 1: Look up handler task (acquire and release INTERRUPT_ROUTER early)
+    let route_info = {
+        let router = INTERRUPT_ROUTER.lock();
+        router.lookup(irq)
+    }; // router lock released here
+    
+    let route = match route_info {
+        Some(r) => r,
+        None => return, // No handler registered for this IRQ
+    };
+    
+    // Step 2: Create interrupt context message
+    let context = InterruptContext::new(irq, timestamp_ticks, 0);
+    let message_data = [
+        (context.irq.0 as u32) as u8,
+        (timestamp_ticks & 0xFF) as u8,
+        ((timestamp_ticks >> 8) & 0xFF) as u8,
+        ((timestamp_ticks >> 16) & 0xFF) as u8,
+    ];
+
+    // Step 3: Create IPC message to driver
+    let mut msg = Message::new(
+        EndpointId(0),                      // From kernel (endpoint 0)
+        EndpointId(route.irq.0 as u32),    // To driver's IRQ endpoint
+    );
+    let _ = msg.set_payload(&message_data);
+
+    // Step 4: Queue message (IPC_MANAGER)
+    {
+        let mut ipc_mgr = IPC_MANAGER.lock();
+        if ipc_mgr.send_message(EndpointId(route.irq.0 as u32), msg).is_err() {
+            return; // Failed to queue
+        }
+    } // ipc_mgr lock released here
+    
+    // Step 5: Wake the driver task (SCHEDULER)
+    // Lock order is OK: we released IPC_MANAGER before acquiring SCHEDULER
+    {
+        let mut scheduler = SCHEDULER.lock();
+        if let Some(sched) = scheduler.as_mut() {
+            let _ = sched.wake_task(route.handler_task);
+        }
+    } // scheduler lock released here
+}
+
+/// Example: Register interrupt handlers (called during boot)
+///
+/// This would typically be called by drivers during initialization to claim
+/// their hardware interrupts. In a real system, drivers would be loaded from
+/// modules and would self-register.
+#[allow(dead_code)]
+pub fn register_example_interrupts() {
+    let mut router = INTERRUPT_ROUTER.lock();
+    
+    // Example: Register timer interrupt handler (TaskId 1)
+    let _ = router.register(IrqNumber::TIMER, TaskId(1), 200);
+
+    // Example: Register keyboard interrupt handler (TaskId 2)
+    let _ = router.register(IrqNumber::KEYBOARD, TaskId(2), 180);
+
+    // Example: Register serial port handler (TaskId 3)
+    let _ = router.register(IrqNumber::SERIAL1, TaskId(3), 100);
+
+    println!("  ✓ Interrupt handlers registered: {} routes active", router.entry_count());
+}
+
+/// Main microkernel event loop
+///
+/// Now that scheduling is interrupt-driven (PIT → IRQ 0 → timer_interrupt_handler),
+/// this loop serves as the idle task. It halts the CPU until the next interrupt,
+/// reducing power consumption.
+///
+/// The timer ISR handles all tick counting, time slice accounting, and scheduling.
+/// Periodic invariant verification runs inline between halts.
+fn microkernel_loop() -> ! {
+    let mut idle_count: u64 = 0;
+
+    loop {
+        idle_count += 1;
+
+        // Periodic status reporting (every ~1000 interrupts worth of idle cycles)
+        if idle_count % 1000 == 0 {
+            let ticks = Timer::get_ticks();
+            if ticks > 0 {
+                let scheduler = SCHEDULER.lock();
+                if let Some(sched) = scheduler.as_ref() {
+                    let stats = sched.stats();
+                    println!(
+                        "  [Tick {}] Tasks: {}, Current: {:?}, State: {:?}",
+                        ticks,
+                        stats.active_tasks,
+                        stats.current_task,
+                        stats.state
+                    );
+                }
+            }
+        }
+
+        // Periodic invariant verification (every ~10000 idle cycles)
+        if idle_count % 10000 == 0 {
+            let scheduler = SCHEDULER.lock();
+            if let Some(sched) = scheduler.as_ref() {
+                if let Err(e) = sched.verify_invariants() {
+                    println!("✗ Scheduler invariant violated: {}", e);
+                    arcos_core::halt();
+                }
+            }
+        }
+
+        // Halt CPU until next interrupt (timer, keyboard, etc.)
+        // The `hlt` instruction stops the CPU until an interrupt fires.
+        // On interrupt: CPU wakes → runs ISR → returns here → loops back to hlt.
+        hlt();
+    }
+}
+
+/// Copy data from user buffer to kernel (user → kernel) with single lock acquisition
+/// 
+/// Validates and copies atomically to avoid double-locking PROCESS_TABLE.
+/// Returns the data if successful, None if validation failed or buffer was invalid.
+#[allow(dead_code)]
+fn copy_from_user(process_id: ProcessId, user_ptr: usize, len: usize) -> Option<[u8; 256]> {
+    if len > 256 {
+        return None;
+    }
+    
+    // Validate and copy in one lock acquisition (following global order: PROCESS_TABLE)
+    let pt = PROCESS_TABLE.lock();
+    if let Some(table) = pt.as_ref() {
+        let heap_base = table.get_heap_base(process_id) as usize;
+        let heap_size = table.get_heap_size(process_id) as usize;
+        let heap_end = heap_base + heap_size;
+        
+        // Validate: ptr >= heap_base && ptr + len <= heap_end && ptr + len > ptr (overflow check)
+        if !(user_ptr >= heap_base && user_ptr + len <= heap_end && user_ptr + len > user_ptr) {
+            return None;
+        }
+        
+        // Validation passed - copy the data
+        let src = user_ptr as *const u8;
+        let mut buffer = [0u8; 256];
+        
+        unsafe {
+            // Note: In a production system, this would use a faulting copy mechanism
+            // to handle page faults gracefully. For now, we assume valid mapping.
+            core::ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), len);
+        }
+        
+        Some(buffer)
+    } else {
+        None
+    }
+}
+
+/// Copy data from kernel to user buffer (kernel → user) with single lock acquisition
+/// 
+/// Validates and copies atomically to avoid double-locking PROCESS_TABLE.
+/// Returns true if successful.
+#[allow(dead_code)]
+fn copy_to_user(process_id: ProcessId, user_ptr: usize, data: &[u8]) -> bool {
+    if data.len() > 256 {
+        return false;
+    }
+    
+    // Validate and copy in one lock acquisition (following global order: PROCESS_TABLE)
+    let pt = PROCESS_TABLE.lock();
+    if let Some(table) = pt.as_ref() {
+        let heap_base = table.get_heap_base(process_id) as usize;
+        let heap_size = table.get_heap_size(process_id) as usize;
+        let heap_end = heap_base + heap_size;
+        
+        // Validate: ptr >= heap_base && ptr + len <= heap_end && ptr + len > ptr (overflow check)
+        if !(user_ptr >= heap_base && user_ptr + data.len() <= heap_end && user_ptr + data.len() > user_ptr) {
+            return false;
+        }
+        
+        // Validation passed - copy the data
+        let dst = user_ptr as *mut u8;
+        
+        unsafe {
+            // Note: In a production system, this would use a faulting copy mechanism
+            // to handle page faults gracefully.
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        }
+        
+        true
+    } else {
+        false
+    }
+}
+
+/// Handle a syscall from userspace
+///
+/// This is the main entry point for userspace processes to invoke kernel services.
+/// Called when a process needs kernel assistance (I/O, memory, IPC, etc.).
+///
+/// # Arguments
+/// - `syscall_num`: Syscall number (identifies which operation)
+/// - `args`: Syscall arguments packed in processor registers
+/// - `process_id`: Which process is making the syscall
+/// - `task_id`: Which task (within the process) is calling
+///
+/// # Returns
+/// Result value is placed in RAX by caller (via inline asm wrapper)
+#[allow(dead_code)]
+pub fn handle_syscall(
+    syscall_num: u64,
+    args: arcos_core::syscalls::SyscallArgs,
+    process_id: ProcessId,
+    task_id: TaskId,
+) -> i64 {
+    use arcos_core::syscalls::{SyscallNumber, SyscallError};
+    
+    let num = match SyscallNumber::from_u64(syscall_num) {
+        Some(n) => n,
+        None => return SyscallError::Enosys.as_i64(),
+    };
+
+    match num {
+        // These syscalls don't need kernel state
+        SyscallNumber::GetPid => process_id.0 as i64,
+        SyscallNumber::GetTime => arcos_core::scheduler::Timer::get_ticks() as i64,
+        
+        // Syscalls that need kernel state
+        SyscallNumber::Exit => {
+            let exit_code = args.arg1_u32();
+            println!("[Syscall] EXIT pid={:?} task={:?} code={}", process_id, task_id, exit_code);
+            0
+        }
+        
+        SyscallNumber::Yield => {
+            println!("[Syscall] YIELD pid={:?} task={:?}", process_id, task_id);
+            // TODO: Mark current task for preemption
+            0
+        }
+        
+        SyscallNumber::Allocate => {
+            let size = args.arg_usize(1);
+            let _flags = args.arg1_u32();
+            
+            if size == 0 || size > 1024 * 1024 {
+                return SyscallError::InvalidArg.as_i64();
+            }
+            
+            let mut pt = PROCESS_TABLE.lock();
+            if let Some(table) = pt.as_mut() {
+                if let Some(allocator) = table.get_allocator_mut(process_id) {
+                    let addr = allocator.allocate(size);
+                    if addr == 0 {
+                        println!("[Syscall] ALLOCATE pid={:?} size={} FAILED (heap full)", process_id, size);
+                        return SyscallError::OutOfMemory.as_i64();
+                    }
+                    println!("[Syscall] ALLOCATE pid={:?} size={} -> {:#x}", process_id, size, addr);
+                    addr as i64
+                } else {
+                    println!("[Syscall] ALLOCATE pid={:?} size={} FAILED (no process)", process_id, size);
+                    SyscallError::InvalidArg.as_i64()
+                }
+            } else {
+                SyscallError::InvalidArg.as_i64()
+            }
+        }
+        
+        SyscallNumber::Free => {
+            let ptr = args.arg1 as usize;
+            let _size = args.arg_usize(2);
+            
+            if ptr == 0 {
+                return SyscallError::InvalidArg.as_i64();
+            }
+            
+            let mut pt = PROCESS_TABLE.lock();
+            if let Some(table) = pt.as_mut() {
+                if let Some(allocator) = table.get_allocator_mut(process_id) {
+                    match allocator.free(ptr) {
+                        true => {
+                            println!("[Syscall] FREE pid={:?} ptr={:#x} OK", process_id, ptr);
+                            0
+                        }
+                        false => {
+                            println!("[Syscall] FREE pid={:?} ptr={:#x} INVALID", process_id, ptr);
+                            SyscallError::InvalidArg.as_i64()
+                        }
+                    }
+                } else {
+                    println!("[Syscall] FREE pid={:?} ptr={:#x} FAILED (no process)", process_id, ptr);
+                    SyscallError::InvalidArg.as_i64()
+                }
+            } else {
+                SyscallError::InvalidArg.as_i64()
+            }
+        }
+        
+        SyscallNumber::Write => {
+            let endpoint_id = args.arg1_u32();
+            let buffer_ptr = args.arg2_ptr::<u8>() as usize;
+            let len = args.arg_usize(3);
+            
+            let endpoint = EndpointId(endpoint_id);
+            
+            // Check capability (lock order: CAPABILITY_MANAGER before IPC_MANAGER)
+            {
+                let cap_mgr = CAPABILITY_MANAGER.lock();
+                match cap_mgr.verify_access(process_id, endpoint, CapabilityRights::SEND_ONLY) {
+                    Err(_) => {
+                        println!("[Syscall] WRITE pid={:?} ep={} DENIED", process_id, endpoint_id);
+                        return SyscallError::PermissionDenied.as_i64();
+                    }
+                    Ok(_) => { /* continue */ }
+                }
+            } // capability lock released
+            
+            // Copy payload from user buffer (lock order: PROCESS_TABLE)
+            let payload_buf = match copy_from_user(process_id, buffer_ptr, len) {
+                Some(buf) => buf,
+                None => {
+                    println!("[Syscall] WRITE pid={:?} ep={} COPY FAILED", process_id, endpoint_id);
+                    return SyscallError::InvalidArg.as_i64();
+                }
+            }; // PROCESS_TABLE lock released
+            
+            // Create and send message (lock order: IPC_MANAGER)
+            let mut msg = Message::new(EndpointId(process_id.0), endpoint);
+            if msg.set_payload(&payload_buf[..len]).is_err() {
+                println!("[Syscall] WRITE pid={:?} ep={} PAYLOAD TOO LARGE", process_id, endpoint_id);
+                return SyscallError::InvalidArg.as_i64();
+            }
+            
+            let mut ipc_mgr = IPC_MANAGER.lock();
+            if ipc_mgr.send_message(endpoint, msg).is_ok() {
+                println!("[Syscall] WRITE pid={:?} ep={} len={} OK", process_id, endpoint_id, len);
+                len as i64
+            } else {
+                println!("[Syscall] WRITE pid={:?} ep={} QUEUE FULL", process_id, endpoint_id);
+                SyscallError::InvalidArg.as_i64()
+            }
+        }
+        
+        SyscallNumber::Read => {
+            let endpoint_id = args.arg1_u32();
+            let buffer_ptr = args.arg2_mut_ptr::<u8>() as usize;
+            let max_len = args.arg_usize(3);
+            
+            let endpoint = EndpointId(endpoint_id);
+            
+            // Check capability (lock order: CAPABILITY_MANAGER before IPC_MANAGER)
+            {
+                let cap_mgr = CAPABILITY_MANAGER.lock();
+                match cap_mgr.verify_access(process_id, endpoint, CapabilityRights::RECV_ONLY) {
+                    Err(_) => {
+                        println!("[Syscall] READ pid={:?} ep={} DENIED", process_id, endpoint_id);
+                        return SyscallError::PermissionDenied.as_i64();
+                    }
+                    Ok(_) => { /* continue */ }
+                }
+            } // capability lock released
+            
+            // Try to receive message and copy to stack buffer (no_std compatible)
+            // Lock order: IPC_MANAGER
+            let mut payload_buf = [0u8; 256];
+            let copy_len = {
+                let mut ipc_mgr = IPC_MANAGER.lock();
+                match ipc_mgr.recv_message(endpoint) {
+                    Some(msg) => {
+                        let payload = msg.payload();
+                        let len = core::cmp::min(payload.len(), max_len);
+                        // Copy to stack buffer while holding IPC_MANAGER lock
+                        if len > 0 {
+                            payload_buf[..len].copy_from_slice(&payload[..len]);
+                        }
+                        Some(len)
+                    }
+                    None => {
+                        // No message available
+                        println!("[Syscall] READ pid={:?} ep={} NO MESSAGE", process_id, endpoint_id);
+                        return 0; // Return 0 bytes read
+                    }
+                }
+            }; // ipc_mgr lock released
+            
+            // Now copy to user buffer (lock order: PROCESS_TABLE)
+            if let Some(len) = copy_len {
+                if copy_to_user(process_id, buffer_ptr, &payload_buf[..len]) {
+                    println!("[Syscall] READ pid={:?} ep={} len={} OK", process_id, endpoint_id, len);
+                    len as i64
+                } else {
+                    println!("[Syscall] READ pid={:?} ep={} COPY FAILED", process_id, endpoint_id);
+                    SyscallError::InvalidArg.as_i64()
+                }
+            } else {
+                SyscallError::InvalidArg.as_i64()
+            }
+        }
+        
+        SyscallNumber::RegisterEndpoint => {
+            let endpoint_id = args.arg1_u32();
+            let _flags = args.arg2_u32();
+            
+            let mut cap_mgr = CAPABILITY_MANAGER.lock();
+            match cap_mgr.grant_capability(
+                process_id,
+                EndpointId(endpoint_id),
+                CapabilityRights::FULL,
+            ) {
+                Ok(_) => {
+                    println!("[Syscall] REGISTER_ENDPOINT pid={:?} ep={} OK", process_id, endpoint_id);
+                    0
+                }
+                Err(_) => {
+                    println!("[Syscall] REGISTER_ENDPOINT pid={:?} ep={} FAILED", process_id, endpoint_id);
+                    SyscallError::InvalidArg.as_i64()
+                }
+            }
+        }
+        
+        SyscallNumber::WaitIrq => {
+            let irq_num = args.arg1_u32();
+            println!("[Syscall] WAIT_IRQ pid={:?} task={:?} irq={}", process_id, task_id, irq_num);
+            // TODO: Register task as handler, block until interrupt
+            0
+        }
+    }
+}
+
+/// Panic handler for microkernel
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("\nMICROKERNEL PANIC: {:?}", info);
+    arcos_core::halt();
+}
