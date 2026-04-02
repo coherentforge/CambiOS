@@ -1,1 +1,0 @@
-SpinlockGuard<'_, Option<alloc::boxed::Box<CapabilityManager>>>
