@@ -108,6 +108,23 @@ pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
     &PER_CPU_TIMER[cpu_id]
 }
 
+/// Get the current CPU's scheduler lock (AArch64).
+///
+/// # Safety
+/// TPIDR_EL1 must have been initialized via `init_bsp()` or `init_ap()`.
+#[cfg(target_arch = "aarch64")]
+pub fn local_scheduler() -> &'static IrqSpinlock<Option<Box<Scheduler>>> {
+    let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_SCHEDULER[cpu_id]
+}
+
+/// Get the current CPU's timer lock (AArch64).
+#[cfg(target_arch = "aarch64")]
+pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
+    let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_TIMER[cpu_id]
+}
+
 // ============================================================================
 // Global task → CPU mapping (lock-free via atomics)
 // ============================================================================

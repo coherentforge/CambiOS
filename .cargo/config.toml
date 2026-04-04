@@ -8,3 +8,10 @@ rustflags = [
     "-C", "code-model=kernel",
     "-C", "relocation-model=static",
 ]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=--script=linker-aarch64.ld",
+    "-C", "link-arg=-z", "-C", "link-arg=noexecstack",
+    "-C", "relocation-model=static",
+]

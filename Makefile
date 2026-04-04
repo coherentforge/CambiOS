@@ -65,6 +65,10 @@ run-uefi: iso
 test:
 	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
+# AArch64 targets (scaffold — library only, no binary yet)
+kernel-aarch64:
+	cargo build --target aarch64-unknown-none --lib --release
+
 clean:
 	cargo clean
 	rm -f $(ISO)

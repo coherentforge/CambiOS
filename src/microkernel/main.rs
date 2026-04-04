@@ -46,6 +46,7 @@ use limine::request::{
     FramebufferRequest, HhdmRequest, MemoryMapRequest, MpRequest, RsdpRequest,
     RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
 };
+#[cfg(target_arch = "x86_64")]
 use x86_64::instructions::hlt;
 use arcos_core::println;
 use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, BlockReason, TaskId};

@@ -1,8 +1,9 @@
 //! Platform abstraction layer
 //!
-//! Provides hardware-specific capabilities for x86-64 systems.
-//! Abstract enough for verification while concrete enough for implementation.
+//! Provides hardware-specific capabilities. Abstract enough for verification
+//! while concrete enough for implementation.
 
+#[cfg(target_arch = "x86_64")]
 use x86_64::registers::control::{Cr4, Cr4Flags};
 
 /// Platform information and capabilities
@@ -50,13 +51,16 @@ impl PlatformInfo {
 
 /// CPU feature flags with verification contracts
 pub fn enable_features() -> Result<(), &'static str> {
-    // Enable Physical Address Extension (PAE)
-    // SAFETY: CR4 read and write are valid at ring 0. We only insert the PAE flag
-    // (which is required for long mode and already enabled). This is idempotent.
-    unsafe {
-        let mut cr4 = Cr4::read();
-        cr4.insert(Cr4Flags::PHYSICAL_ADDRESS_EXTENSION);
-        Cr4::write(cr4);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Enable Physical Address Extension (PAE)
+        // SAFETY: CR4 read and write are valid at ring 0. We only insert the PAE flag
+        // (which is required for long mode and already enabled). This is idempotent.
+        unsafe {
+            let mut cr4 = Cr4::read();
+            cr4.insert(Cr4Flags::PHYSICAL_ADDRESS_EXTENSION);
+            Cr4::write(cr4);
+        }
     }
     Ok(())
 }
@@ -190,17 +194,19 @@ impl PowerManager {
                 // Not idle
             }
             PowerState::C1 => {
-                // Standard halt - safe on all x86-64
-                unsafe {
-                    x86_64::instructions::hlt();
-                }
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: HLT is safe at ring 0; wakes on next interrupt.
+                unsafe { x86_64::instructions::hlt(); }
+                #[cfg(not(target_arch = "x86_64"))]
+                core::hint::spin_loop();
             }
             PowerState::C2 | PowerState::C3 => {
-                // Would use MWAIT instruction in real implementation
-                // For now, fall back to C1
-                unsafe {
-                    x86_64::instructions::hlt();
-                }
+                // Would use MWAIT (x86) or WFI (ARM) in real implementation
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: HLT is safe at ring 0; wakes on next interrupt.
+                unsafe { x86_64::instructions::hlt(); }
+                #[cfg(not(target_arch = "x86_64"))]
+                core::hint::spin_loop();
             }
         }
     }
