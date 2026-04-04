@@ -1326,6 +1326,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
     // Step 8: Signal BSP that this AP is ready
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Step 9: Enable interrupts and enter idle loop
     // SAFETY: All AP-local hardware is initialized.
@@ -1521,6 +1522,9 @@ fn microkernel_loop() -> ! {
                 }
             }
         }
+
+        // Load balancing: migrate tasks from overloaded to underloaded CPUs
+        arcos_core::try_load_balance();
 
         // Halt CPU until next interrupt (timer, keyboard, etc.)
         // The `hlt` instruction stops the CPU until an interrupt fires.

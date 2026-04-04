@@ -14,7 +14,7 @@ extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::hlt;
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 pub mod io;
 pub mod memory;
@@ -175,6 +175,108 @@ pub fn block_local_task(
         sched.block_task(task_id, reason).is_ok()
     } else {
         false
+    }
+}
+
+// ============================================================================
+// Load balancing
+// ============================================================================
+
+/// Number of online CPUs (BSP = 1, incremented by each AP that completes init).
+pub static ONLINE_CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Minimum tick interval between balance attempts (1 second at 100Hz).
+const BALANCE_INTERVAL_TICKS: u64 = 100;
+
+/// Tick count at which the last balance attempt ran.
+static LAST_BALANCE_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Attempt to rebalance tasks across CPUs.
+///
+/// Called from the BSP idle loop. Samples each CPU's runnable task count
+/// using `try_lock()` (non-blocking), then migrates one task from the most
+/// loaded to the least loaded CPU if the imbalance is >= 2.
+///
+/// Throttled to run at most once per `BALANCE_INTERVAL_TICKS`.
+#[cfg(not(test))]
+pub fn try_load_balance() {
+    // Throttle: only run every BALANCE_INTERVAL_TICKS
+    let current_tick = scheduler::Timer::get_ticks();
+    let last = LAST_BALANCE_TICK.load(Ordering::Relaxed);
+    if current_tick < last + BALANCE_INTERVAL_TICKS {
+        return;
+    }
+    LAST_BALANCE_TICK.store(current_tick, Ordering::Relaxed);
+
+    let cpu_count = ONLINE_CPU_COUNT.load(Ordering::Acquire) as usize;
+    if cpu_count < 2 {
+        return;
+    }
+
+    // Sample load per CPU using try_lock (non-blocking — safe in idle context)
+    // Load = active runnable tasks (Ready + Running, excluding idle task).
+    let mut loads: [u16; 256] = [0; 256];
+    let mut sampled: [bool; 256] = [false; 256];
+    let mut sampled_count: usize = 0;
+
+    for cpu in 0..cpu_count {
+        if let Some(guard) = PER_CPU_SCHEDULER[cpu].try_lock() {
+            if let Some(sched) = guard.as_ref() {
+                loads[cpu] = sched.active_runnable_count() as u16;
+                sampled[cpu] = true;
+                sampled_count += 1;
+            }
+        }
+    }
+
+    if sampled_count < 2 {
+        return;
+    }
+
+    // Find most-loaded and least-loaded among sampled CPUs
+    let mut max_cpu: usize = 0;
+    let mut min_cpu: usize = 0;
+    let mut found_first = false;
+
+    for cpu in 0..cpu_count {
+        if !sampled[cpu] {
+            continue;
+        }
+        if !found_first {
+            max_cpu = cpu;
+            min_cpu = cpu;
+            found_first = true;
+            continue;
+        }
+        if loads[cpu] > loads[max_cpu] {
+            max_cpu = cpu;
+        }
+        if loads[cpu] < loads[min_cpu] {
+            min_cpu = cpu;
+        }
+    }
+
+    // Only migrate if imbalance >= 2 (avoids pointless 1-task thrashing)
+    if max_cpu == min_cpu || loads[max_cpu] < loads[min_cpu] + 2 {
+        return;
+    }
+
+    // Pick a migratable Ready task from the overloaded CPU
+    let task_to_migrate = {
+        if let Some(guard) = PER_CPU_SCHEDULER[max_cpu].try_lock() {
+            if let Some(sched) = guard.as_ref() {
+                sched.pick_migratable_task()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(tid) = task_to_migrate {
+        // migrate_task handles its own locking with ascending CPU-index order
+        let _ = scheduler::migrate_task(tid, max_cpu, min_cpu);
     }
 }
 

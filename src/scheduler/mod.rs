@@ -643,6 +643,33 @@ impl Scheduler {
     pub fn task_count(&self) -> usize {
         self.task_count
     }
+
+    /// Count non-idle runnable tasks (Ready + Running, excluding idle task 0).
+    ///
+    /// This is the load metric used by the load balancer: how many tasks are
+    /// competing for CPU time on this scheduler.
+    pub fn active_runnable_count(&self) -> usize {
+        self.tasks[1..].iter().filter(|t| {
+            t.as_ref().map(|task| {
+                task.state == TaskState::Ready || task.state == TaskState::Running
+            }).unwrap_or(false)
+        }).count()
+    }
+
+    /// Pick a Ready non-idle task suitable for migration.
+    ///
+    /// Returns the first Ready task found (excluding idle task 0 and the
+    /// currently running task). Returns None if no migratable task exists.
+    pub fn pick_migratable_task(&self) -> Option<TaskId> {
+        for slot in 1..MAX_TASKS {
+            if let Some(task) = &self.tasks[slot] {
+                if task.state == TaskState::Ready {
+                    return Some(task.id);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Migrate a task between two schedulers (pure logic, no locking).
@@ -993,5 +1020,73 @@ mod tests {
         dst.init().unwrap();
 
         assert!(migrate_task_between(&mut src, &mut dst, TaskId(0), 1).is_err());
+    }
+
+    #[test]
+    fn test_active_runnable_count_empty() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        // Only idle task (slot 0) is Running — excluded from count
+        assert_eq!(sched.active_runnable_count(), 0);
+    }
+
+    #[test]
+    fn test_active_runnable_count_with_ready_tasks() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let _t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let _t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Idle=Running (excluded), t1=Ready, t2=Ready → 2
+        assert_eq!(sched.active_runnable_count(), 2);
+    }
+
+    #[test]
+    fn test_active_runnable_count_excludes_blocked() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let _t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(t1, BlockReason::IoWait(0)).unwrap();
+        // t1=Blocked (excluded), t2=Ready → 1
+        assert_eq!(sched.active_runnable_count(), 1);
+    }
+
+    #[test]
+    fn test_pick_migratable_task_returns_ready() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let _t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Should pick the first Ready non-idle task
+        let picked = sched.pick_migratable_task();
+        assert!(picked == Some(t1));
+    }
+
+    #[test]
+    fn test_pick_migratable_task_skips_blocked() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(t1, BlockReason::IoWait(0)).unwrap();
+        // t1 blocked, should pick t2
+        assert_eq!(sched.pick_migratable_task(), Some(t2));
+    }
+
+    #[test]
+    fn test_pick_migratable_task_none_when_only_idle() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        // Only idle task — nothing migratable
+        assert_eq!(sched.pick_migratable_task(), None);
+    }
+
+    #[test]
+    fn test_pick_migratable_task_none_when_all_blocked() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(t1, BlockReason::IoWait(0)).unwrap();
+        assert_eq!(sched.pick_migratable_task(), None);
     }
 }
