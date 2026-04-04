@@ -5,6 +5,7 @@
 //! formal property proof.
 
 pub mod capability;
+pub mod interceptor;
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -239,6 +240,8 @@ pub struct IpcManager {
     queues: [EndpointQueue; MAX_ENDPOINTS],
     /// Sync rendezvous channels (request/reply)
     sync_channels: [SyncChannel; MAX_ENDPOINTS],
+    /// Zero-trust interceptor (set after boot init)
+    interceptor: Option<Box<dyn interceptor::IpcInterceptor>>,
 }
 
 /// Synchronous IPC channel for a single endpoint
@@ -426,6 +429,7 @@ impl IpcManager {
         IpcManager {
             queues: [EMPTY_QUEUE; MAX_ENDPOINTS],
             sync_channels: [EMPTY_CHANNEL; MAX_ENDPOINTS],
+            interceptor: None,
         }
     }
 
@@ -434,16 +438,28 @@ impl IpcManager {
     pub fn new_boxed() -> Box<Self> {
         use alloc::alloc::{alloc_zeroed, Layout};
         let layout = Layout::new::<Self>();
+        // SAFETY: layout is non-zero-sized (IpcManager contains arrays).
         let ptr = unsafe { alloc_zeroed(layout) as *mut Self };
         if ptr.is_null() {
             panic!("Failed to allocate IpcManager");
         }
-        // Safety: All fields zero-init to valid state:
+        // SAFETY: All array fields are valid when zero-initialized:
         // - Option<Message>::None = discriminant 0 = zeroed
         // - usize head/tail/count = 0 = zeroed
         // - SyncChannelState::Empty = first variant = discriminant 0
         // - Option<u32>::None = zeroed
-        unsafe { Box::from_raw(ptr) }
+        // Write the interceptor field explicitly (fat pointer — don't rely on zeroed).
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).interceptor).write(None);
+            Box::from_raw(ptr)
+        }
+    }
+
+    /// Install a zero-trust interceptor for IPC policy enforcement.
+    ///
+    /// Called once during boot after IpcManager is allocated.
+    pub fn set_interceptor(&mut self, interceptor: Box<dyn interceptor::IpcInterceptor>) {
+        self.interceptor = Some(interceptor);
     }
 
     /// Send a message to an endpoint
@@ -488,9 +504,9 @@ impl IpcManager {
         Some(&self.queues[endpoint.0 as usize])
     }
 
-    /// Send a message with capability enforcement
+    /// Send a message with capability enforcement and interceptor check.
     ///
-    /// Verifies that sender has SEND right on target endpoint.
+    /// Pipeline: capability check → interceptor check → enqueue.
     pub fn send_message_with_capability(
         &mut self,
         from_process: ProcessId,
@@ -498,32 +514,47 @@ impl IpcManager {
         msg: Message,
         cap_mgr: &capability::CapabilityManager,
     ) -> Result<(), IpcError> {
-        // Check process has send capability
+        // Layer 1: Capability check
         cap_mgr
             .verify_access(from_process, endpoint, CapabilityRights::SEND_ONLY)
             .map_err(|_| IpcError::PermissionDenied)?;
+
+        // Layer 2: Interceptor check (defense-in-depth)
+        if let Some(ref interceptor) = self.interceptor {
+            if let interceptor::InterceptDecision::Deny(_reason) =
+                interceptor.on_send(from_process, endpoint, &msg)
+            {
+                return Err(IpcError::PermissionDenied);
+            }
+        }
 
         // Perform the send
         self.send_message(endpoint, msg)
     }
 
-    /// Receive a message with capability enforcement
+    /// Receive a message with capability enforcement and interceptor check.
     ///
-    /// Verifies that receiver has RECEIVE right on target endpoint.
-    /// Returns Some(msg) if available, None if queue empty.
+    /// Pipeline: capability check → interceptor check → dequeue.
     pub fn recv_message_with_capability(
         &mut self,
         recv_process: ProcessId,
         endpoint: EndpointId,
         cap_mgr: &capability::CapabilityManager,
     ) -> Result<Option<Message>, IpcError> {
-        // Check process has receive capability
+        // Layer 1: Capability check
         cap_mgr
             .verify_access(recv_process, endpoint, CapabilityRights::RECV_ONLY)
             .map_err(|_| IpcError::PermissionDenied)?;
 
-        // Validation passed; perform the receive
-        // Returns None if queue empty or endpoint out of range.
+        // Layer 2: Interceptor check (defense-in-depth)
+        if let Some(ref interceptor) = self.interceptor {
+            if let interceptor::InterceptDecision::Deny(_reason) =
+                interceptor.on_recv(recv_process, endpoint)
+            {
+                return Err(IpcError::PermissionDenied);
+            }
+        }
+
         Ok(self.recv_message(endpoint))
     }
 
@@ -637,6 +668,11 @@ impl IpcManager {
         }
         Some(self.sync_channels[endpoint.0 as usize].state())
     }
+
+    /// Get a reference to the installed interceptor (if any).
+    pub fn interceptor(&self) -> Option<&dyn interceptor::IpcInterceptor> {
+        self.interceptor.as_deref()
+    }
 }
 
 /// Result of a synchronous send operation
@@ -687,6 +723,7 @@ mod tests {
         assert_eq!(received.from, EndpointId(0));
         assert_eq!(received.to, EndpointId(1));
         assert!(queue.is_empty());
+
     }
 
     #[test]

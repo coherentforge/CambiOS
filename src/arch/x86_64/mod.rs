@@ -1,0 +1,401 @@
+//! Architecture-specific code (x86-64)
+//!
+//! Implements CPU-specific primitives like context switching,
+//! register manipulation, and interrupt control.
+//!
+//! ## Context Switch Architecture
+//!
+//! Two context switch paths exist:
+//!
+//! 1. **Explicit switch** (`context_switch`): Used for voluntary yields and blocking.
+//!    Saves all registers, jumps to target task. Never returns.
+//!
+//! 2. **Interrupt-driven switch** (`timer_isr_stub`): Used for preemption.
+//!    Assembly ISR stub saves full register state to the current task's `SavedContext`,
+//!    calls a Rust handler that may swap the context pointer, then restores from
+//!    the (potentially different) context and does `iretq`.
+
+pub mod apic;
+pub mod gdt;
+pub mod ioapic;
+pub mod percpu;
+pub mod syscall;
+pub mod tlb;
+
+use crate::scheduler::CpuContext;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+// ============================================================================
+// Explicit context switch primitives (global_asm — no compiler interference)
+// ============================================================================
+//
+// These are pure assembly, called via the SysV x86-64 C ABI:
+//   rdi = first arg, rsi = second arg, return via ret
+//
+// CpuContext field offsets (#[repr(C)] — guaranteed sequential layout):
+//   rax=0, rbx=8, rcx=16, rdx=24, rsi=32, rdi=40, rbp=48,
+//   r8=56, r9=64, r10=72, r11=80, r12=88, r13=96, r14=104, r15=112,
+//   rip=120, rsp=128, rflags=136
+
+extern "C" {
+    /// Save current context to a CpuContext structure. Returns normally.
+    ///
+    /// Captures callee-saved registers (rbx, rbp, r12-r15), RIP (return
+    /// address), RSP (caller's stack pointer), and RFLAGS. Caller-saved
+    /// registers (rax, rcx, rdx, rsi, rdi, r8-r11) are zeroed in the
+    /// struct since they're not preserved across function calls.
+    ///
+    /// When this saved context is later restored via `context_restore`,
+    /// execution resumes at the instruction after the `context_save` call.
+    pub fn context_save(ctx: *mut CpuContext);
+
+    /// Restore all registers from a CpuContext and jump to saved RIP.
+    ///
+    /// Does NOT return. Switches RSP to the saved stack, restores all 15
+    /// GPRs and RFLAGS, then `ret`s to the saved RIP.
+    pub fn context_restore(ctx: *const CpuContext) -> !;
+
+    /// Save current context, then restore and jump to next context.
+    ///
+    /// Equivalent to `context_save(current)` + `context_restore(next)` but
+    /// as a single assembly sequence with no compiler-managed code between.
+    /// Does not return from the current invocation. When the saved task is
+    /// later restored (by another `context_switch` or `context_restore`),
+    /// this function appears to return normally to its caller.
+    pub fn context_switch(current_ctx: *mut CpuContext, next_ctx: *const CpuContext) -> !;
+}
+
+core::arch::global_asm!(
+    // =================================================================
+    // context_save(ctx: *mut CpuContext)
+    // SysV ABI: rdi = ctx
+    // =================================================================
+    ".global context_save",
+    "context_save:",
+    // Callee-saved GPRs — the only ones meaningful in a function body
+    "mov [rdi + 8], rbx",
+    "mov [rdi + 48], rbp",
+    "mov [rdi + 88], r12",
+    "mov [rdi + 96], r13",
+    "mov [rdi + 104], r14",
+    "mov [rdi + 112], r15",
+    // RIP = return address sitting on the stack (pushed by `call`)
+    "mov rax, [rsp]",
+    "mov [rdi + 120], rax",
+    // RSP = caller's stack pointer (after `ret` pops the return address)
+    "lea rax, [rsp + 8]",
+    "mov [rdi + 128], rax",
+    // RFLAGS (pushfq/pop is balanced — net stack effect zero)
+    "pushfq",
+    "pop rax",
+    "mov [rdi + 136], rax",
+    // Zero caller-saved slots (not preserved by the calling convention)
+    "xor eax, eax",
+    "mov [rdi], rax",
+    "mov [rdi + 16], rax",
+    "mov [rdi + 24], rax",
+    "mov [rdi + 32], rax",
+    "mov [rdi + 40], rax",
+    "mov [rdi + 56], rax",
+    "mov [rdi + 64], rax",
+    "mov [rdi + 72], rax",
+    "mov [rdi + 80], rax",
+    "ret",
+
+    // =================================================================
+    // context_restore(ctx: *const CpuContext)
+    // SysV ABI: rdi = ctx.  Does not return.
+    //
+    // Strategy: switch RSP first, stage rip+rflags on the new stack,
+    // restore all GPRs (rdi last since it's our base pointer), popfq, ret.
+    // =================================================================
+    ".global context_restore",
+    "context_restore:",
+    "mov rsp, [rdi + 128]",       // Switch to target stack
+    "mov rax, [rdi + 120]",       // rip
+    "push rax",                    // [rsp] = target rip (for ret)
+    "mov rax, [rdi + 136]",       // rflags
+    "push rax",                    // [rsp] = rflags, [rsp+8] = rip
+    // Restore all 15 GPRs.  rdi is restored last because it holds ctx.
+    "mov rax, [rdi]",
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    // rdi restored below
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 56]",
+    "mov r9,  [rdi + 64]",
+    "mov r10, [rdi + 72]",
+    "mov r11, [rdi + 80]",
+    "mov r12, [rdi + 88]",
+    "mov r13, [rdi + 96]",
+    "mov r14, [rdi + 104]",
+    "mov r15, [rdi + 112]",
+    "mov rdi, [rdi + 40]",        // Destroys base pointer — must be last
+    "popfq",                       // Restore RFLAGS
+    "ret",                         // Pop rip, jump to target
+
+    // =================================================================
+    // context_switch(current: *mut CpuContext, next: *const CpuContext)
+    // SysV ABI: rdi = current, rsi = next.  Does not return.
+    // =================================================================
+    ".global context_switch",
+    "context_switch:",
+    // --- Save current task (rdi) ---
+    "mov [rdi + 8], rbx",
+    "mov [rdi + 48], rbp",
+    "mov [rdi + 88], r12",
+    "mov [rdi + 96], r13",
+    "mov [rdi + 104], r14",
+    "mov [rdi + 112], r15",
+    "mov rax, [rsp]",
+    "mov [rdi + 120], rax",
+    "lea rax, [rsp + 8]",
+    "mov [rdi + 128], rax",
+    "pushfq",
+    "pop rax",
+    "mov [rdi + 136], rax",
+    // --- Restore next task (rsi) ---
+    "mov rsp, [rsi + 128]",
+    "mov rax, [rsi + 120]",
+    "push rax",
+    "mov rax, [rsi + 136]",
+    "push rax",
+    "mov rax, [rsi]",
+    "mov rbx, [rsi + 8]",
+    "mov rcx, [rsi + 16]",
+    "mov rdx, [rsi + 24]",
+    "mov rdi, [rsi + 40]",
+    "mov rbp, [rsi + 48]",
+    "mov r8,  [rsi + 56]",
+    "mov r9,  [rsi + 64]",
+    "mov r10, [rsi + 72]",
+    "mov r11, [rsi + 80]",
+    "mov r12, [rsi + 88]",
+    "mov r13, [rsi + 96]",
+    "mov r14, [rsi + 104]",
+    "mov r15, [rsi + 112]",
+    "mov rsi, [rsi + 32]",        // Destroys base pointer — must be last
+    "popfq",
+    "ret",
+);
+
+// ============================================================================
+// Interrupt-driven context switching
+// ============================================================================
+
+/// Saved register state for interrupt context switches.
+///
+/// When the timer ISR fires, the CPU pushes SS, RSP, RFLAGS, CS, RIP.
+/// The ISR stub then pushes rax, rbx, ... r15 (each `push` decrements RSP).
+///
+/// Fields are ordered by ascending memory address.  The last register pushed
+/// (r15) ends up at the lowest address, so it's the first field.  The CPU-
+/// pushed frame (rip, cs, rflags, rsp, ss) is at the highest addresses.
+#[repr(C)]
+pub struct SavedContext {
+    // GP registers — last pushed is at the lowest address
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    // Pushed by CPU on interrupt entry
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+/// Pointer to the current task's SavedContext on its kernel stack.
+/// The timer ISR handler sets this to point to a different task's context
+/// when a context switch is needed.
+///
+/// Accessed from assembly — must be a fixed address.
+/// 0 = no context switch pending (restore from same stack).
+static SWITCH_CONTEXT_PTR: AtomicU64 = AtomicU64::new(0);
+
+/// Set the context pointer for the next iretq
+///
+/// Called by the Rust timer handler when a context switch is needed.
+/// The assembly ISR stub reads this to decide where to restore from.
+pub fn set_switch_context(ctx: *const SavedContext) {
+    SWITCH_CONTEXT_PTR.store(ctx as u64, Ordering::Release);
+}
+
+/// Clear the context switch pointer (no switch pending)
+pub fn clear_switch_context() {
+    SWITCH_CONTEXT_PTR.store(0, Ordering::Release);
+}
+
+/// Get the pending context switch pointer (0 = no switch)
+pub fn get_switch_context() -> u64 {
+    SWITCH_CONTEXT_PTR.load(Ordering::Acquire)
+}
+
+/// Copy a SavedContext into a CpuContext (for scheduler task tracking)
+pub fn saved_to_cpu_context(saved: &SavedContext, cpu: &mut CpuContext) {
+    cpu.rax = saved.rax;
+    cpu.rbx = saved.rbx;
+    cpu.rcx = saved.rcx;
+    cpu.rdx = saved.rdx;
+    cpu.rsi = saved.rsi;
+    cpu.rdi = saved.rdi;
+    cpu.rbp = saved.rbp;
+    cpu.r8 = saved.r8;
+    cpu.r9 = saved.r9;
+    cpu.r10 = saved.r10;
+    cpu.r11 = saved.r11;
+    cpu.r12 = saved.r12;
+    cpu.r13 = saved.r13;
+    cpu.r14 = saved.r14;
+    cpu.r15 = saved.r15;
+    cpu.rip = saved.rip;
+    cpu.rsp = saved.rsp;
+    cpu.rflags = saved.rflags;
+}
+
+/// Copy a CpuContext into a SavedContext (for restoring on iretq)
+pub fn cpu_to_saved_context(cpu: &CpuContext, saved: &mut SavedContext) {
+    saved.rax = cpu.rax;
+    saved.rbx = cpu.rbx;
+    saved.rcx = cpu.rcx;
+    saved.rdx = cpu.rdx;
+    saved.rsi = cpu.rsi;
+    saved.rdi = cpu.rdi;
+    saved.rbp = cpu.rbp;
+    saved.r8 = cpu.r8;
+    saved.r9 = cpu.r9;
+    saved.r10 = cpu.r10;
+    saved.r11 = cpu.r11;
+    saved.r12 = cpu.r12;
+    saved.r13 = cpu.r13;
+    saved.r14 = cpu.r14;
+    saved.r15 = cpu.r15;
+    saved.rip = cpu.rip;
+    saved.rsp = cpu.rsp;
+    saved.rflags = cpu.rflags;
+    saved.cs = gdt::KERNEL_CS as u64;
+    saved.ss = gdt::KERNEL_SS as u64;
+}
+
+// ============================================================================
+// Timer ISR stub — naked assembly for preemptive context switching
+// ============================================================================
+//
+// When the PIT timer fires (vector 32), the CPU pushes SS, RSP, RFLAGS, CS, RIP.
+// This stub pushes all 15 GPRs to create a full SavedContext on the current stack,
+// calls the Rust handler which may decide to switch tasks, then restores registers
+// from the (potentially different) SavedContext and returns via iretq.
+
+core::arch::global_asm!(
+    ".global timer_isr_stub",
+    "timer_isr_stub:",
+    // Save all GPRs to form SavedContext (struct fields: r15..rax at offsets 0..112)
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    // RSP now points to SavedContext. Pass as first arg to Rust handler.
+    "mov rdi, rsp",
+    "cld",                      // Clear DF per ABI before calling C function
+    "call timer_isr_inner",
+    // RAX = new RSP (same task or different task's SavedContext)
+    "mov rsp, rax",
+    // Restore GPRs from (potentially new) SavedContext
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    // Return to (potentially new) task — pops RIP, CS, RFLAGS, RSP, SS
+    "iretq",
+);
+
+/// Rust handler called from the timer ISR stub.
+///
+/// Receives the current task's saved RSP (pointing to SavedContext on its stack).
+/// Returns the RSP to restore from — same value if no switch, or a different
+/// task's SavedContext RSP if a context switch is needed.
+///
+/// Delegates portable tick/schedule logic to `scheduler::on_timer_isr()`,
+/// then performs x86-specific post-switch work (TSS, CR3, PIC EOI).
+#[unsafe(no_mangle)]
+extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
+    let (new_rsp, hint) = crate::scheduler::on_timer_isr(current_rsp);
+
+    // x86-specific post-switch: update TSS and CR3
+    if let Some(hint) = hint {
+        if hint.kernel_stack_top != 0 {
+            // SAFETY: Called from the timer ISR with interrupts disabled.
+            // hint.kernel_stack_top is the top of the next task's kernel stack,
+            // written during task creation (alloc_task_stack / create_user_task).
+            unsafe { crate::arch::gdt::set_kernel_stack(hint.kernel_stack_top); }
+        }
+        if hint.page_table_root != 0 {
+            unsafe {
+                // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
+                let current_cr3: u64;
+                core::arch::asm!(
+                    "mov {}, cr3",
+                    out(reg) current_cr3,
+                    options(nostack, nomem),
+                );
+                if current_cr3 != hint.page_table_root {
+                    // SAFETY: hint.page_table_root is the physical address of a valid
+                    // PML4 set up by create_process_page_table(). Writing CR3 flushes
+                    // the TLB and switches address spaces. Kernel mappings (upper half)
+                    // are shared across all page tables.
+                    core::arch::asm!(
+                        "mov cr3, {}",
+                        in(reg) hint.page_table_root,
+                        options(nostack, preserves_flags),
+                    );
+                }
+            }
+        }
+    }
+
+    // Send End-of-Interrupt to PIC (MUST happen before iretq)
+    // SAFETY: We are in a hardware interrupt handler (vector 32 = timer).
+    // SAFETY: APIC is initialized before interrupts are enabled.
+    // Writing to the EOI register signals completion of this interrupt.
+    unsafe {
+        apic::write_eoi();
+    }
+
+    new_rsp
+}

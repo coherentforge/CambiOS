@@ -43,6 +43,11 @@ pub const TIMER_VECTOR: u8 = PIC1_OFFSET; // Vector 32
 /// # Safety
 /// Must be called exactly once during boot, before enabling interrupts.
 pub unsafe fn init() {
+    // SAFETY for all Port I/O in this function:
+    // Called once during single-threaded boot with interrupts disabled.
+    // Ports 0x20/0x21 (master PIC) and 0xA0/0xA1 (slave PIC) are standard
+    // x86 I/O addresses. The ICW sequence (ICW1-ICW4) follows the Intel 8259
+    // specification with io_wait() delays between writes.
     let mut pic1_cmd = Port::<u8>::new(PIC1_COMMAND);
     let mut pic1_data = Port::<u8>::new(PIC1_DATA);
     let mut pic2_cmd = Port::<u8>::new(PIC2_COMMAND);
@@ -91,7 +96,12 @@ pub unsafe fn init() {
 ///
 /// Must be called at the end of every hardware interrupt handler.
 /// For IRQs 8-15 (slave PIC), EOI must be sent to both PICs.
+///
+/// # Safety
+/// Must be called from an interrupt handler context for a valid IRQ.
 pub unsafe fn send_eoi(irq: u8) {
+    // SAFETY: Writing PIC_EOI (0x20) to the PIC command port is the standard
+    // EOI sequence. Called from ISR context after handling the interrupt.
     let mut pic1_cmd = Port::<u8>::new(PIC1_COMMAND);
 
     if irq >= 8 {
@@ -104,7 +114,8 @@ pub unsafe fn send_eoi(irq: u8) {
 /// Small I/O delay (needed between PIC commands)
 #[inline(always)]
 unsafe fn io_wait() {
-    // Write to unused port 0x80 for a small delay
+    // SAFETY: Port 0x80 is the POST diagnostic port, commonly used as a ~1µs
+    // I/O delay. Writing 0 has no effect on modern hardware.
     let mut port = Port::<u8>::new(0x80);
     port.write(0);
 }

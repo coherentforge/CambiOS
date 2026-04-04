@@ -51,6 +51,10 @@ pub enum SyscallNumber {
     /// get_time() -> u64
     /// Get current system time (ticks)
     GetTime = 9,
+
+    /// print(buffer: *const u8, len: usize) -> isize
+    /// Print a string to the kernel serial console (for debugging)
+    Print = 10,
 }
 
 impl SyscallNumber {
@@ -67,6 +71,7 @@ impl SyscallNumber {
             7 => Some(Self::Yield),
             8 => Some(Self::GetPid),
             9 => Some(Self::GetTime),
+            10 => Some(Self::Print),
             _ => None,
         }
     }

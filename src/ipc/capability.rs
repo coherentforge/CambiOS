@@ -207,12 +207,15 @@ impl CapabilityManager {
     pub fn new_boxed() -> Box<Self> {
         use alloc::alloc::{alloc, Layout};
         let layout = Layout::new::<Self>();
+        // SAFETY: layout is non-zero-sized (CapabilityManager contains arrays).
         let ptr = unsafe { alloc(layout) as *mut Self };
         if ptr.is_null() {
             panic!("Failed to allocate CapabilityManager");
         }
-        // Cannot use alloc_zeroed: Option<ProcessCapabilities> uses niche
-        // optimization (via bool fields), so all-zeros != None.
+        // SAFETY: Cannot use alloc_zeroed because Option<ProcessCapabilities> may
+        // use niche optimization (bool fields), so all-zeros might not be None.
+        // Instead we write each field explicitly. ptr is valid and aligned per
+        // alloc's contract. We write all fields before constructing the Box.
         unsafe {
             core::ptr::addr_of_mut!((*ptr).process_caps)
                 .write([None; MAX_PROCESSES]);
@@ -331,7 +334,9 @@ impl CapabilityManager {
         self.process_count
     }
 
-    /// Delegate a capability to another process
+    /// Delegate a capability to another process.
+    ///
+    /// Pipeline: interceptor check → capability validation → grant.
     ///
     /// The source process must have the delegate right for the endpoint,
     /// and can only delegate rights it owns. The target process must be registered.
@@ -347,6 +352,18 @@ impl CapabilityManager {
         endpoint: EndpointId,
         rights: CapabilityRights,
     ) -> Result<(), CapabilityError> {
+        self.delegate_capability_with_interceptor(source_pid, target_pid, endpoint, rights, None)
+    }
+
+    /// Delegate with optional interceptor check (defense-in-depth).
+    pub fn delegate_capability_with_interceptor(
+        &mut self,
+        source_pid: ProcessId,
+        target_pid: ProcessId,
+        endpoint: EndpointId,
+        rights: CapabilityRights,
+        interceptor: Option<&dyn crate::ipc::interceptor::IpcInterceptor>,
+    ) -> Result<(), CapabilityError> {
         if source_pid.0 >= MAX_PROCESSES as u32 || target_pid.0 >= MAX_PROCESSES as u32 {
             return Err(CapabilityError::InvalidOperation);
         }
@@ -355,7 +372,17 @@ impl CapabilityManager {
             return Err(CapabilityError::InvalidOperation); // Can't delegate to self
         }
 
-        // First, validate the delegation is allowed (scoped to drop reference)
+        // Layer 1: Interceptor check (before any capability validation)
+        if let Some(interceptor) = interceptor {
+            use crate::ipc::interceptor::InterceptDecision;
+            if let InterceptDecision::Deny(_) =
+                interceptor.on_delegate(source_pid, target_pid, endpoint, rights)
+            {
+                return Err(CapabilityError::AccessDenied);
+            }
+        }
+
+        // Layer 2: Validate the delegation is allowed (scoped to drop reference)
         {
             let source_caps = self.process_caps[source_pid.0 as usize]
                 .as_ref()

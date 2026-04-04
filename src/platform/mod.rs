@@ -51,6 +51,8 @@ impl PlatformInfo {
 /// CPU feature flags with verification contracts
 pub fn enable_features() -> Result<(), &'static str> {
     // Enable Physical Address Extension (PAE)
+    // SAFETY: CR4 read and write are valid at ring 0. We only insert the PAE flag
+    // (which is required for long mode and already enabled). This is idempotent.
     unsafe {
         let mut cr4 = Cr4::read();
         cr4.insert(Cr4Flags::PHYSICAL_ADDRESS_EXTENSION);

@@ -3,6 +3,7 @@
 //! Defines task state, context, and lifecycle for verification-ready scheduling.
 
 use core::fmt;
+use crate::ipc::ProcessId;
 
 /// Task/Process ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +76,7 @@ impl TaskState {
 /// Stores saved registers for context switching.
 /// On x86-64, includes GPRs, RIP, RSP, and flags.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct CpuContext {
     /// General purpose registers
     pub rax: u64,
@@ -219,6 +221,17 @@ pub struct Task {
     pub schedule_count: u64,
     /// Reason why task is blocked (if state = Blocked)
     pub block_reason: Option<BlockReason>,
+    /// Saved RSP pointing to SavedContext on kernel stack (for ISR-driven switching).
+    /// 0 = task is currently running (no saved state yet).
+    pub saved_rsp: u64,
+    /// Top of allocated kernel stack (0 = boot stack / not heap-allocated)
+    pub kernel_stack_top: u64,
+    /// Owning process (for CR3 lookup on context switch). None = kernel task.
+    pub process_id: Option<ProcessId>,
+    /// Physical address of PML4 (cached from ProcessDescriptor). 0 = kernel page table.
+    pub cr3: u64,
+    /// Logical CPU index that currently owns this task (0 = BSP).
+    pub home_cpu: u16,
 }
 
 impl Task {
@@ -233,6 +246,36 @@ impl Task {
             time_remaining: 10,
             schedule_count: 0,
             block_reason: None,
+            saved_rsp: 0,
+            kernel_stack_top: 0,
+            process_id: None,
+            cr3: 0,
+            home_cpu: 0,
+        }
+    }
+
+    /// Create a task with a pre-initialized kernel stack for ISR-driven context switching
+    pub fn new_with_stack(
+        id: TaskId,
+        entry_point: u64,
+        saved_rsp: u64,
+        kernel_stack_top: u64,
+        priority: Priority,
+    ) -> Self {
+        Task {
+            id,
+            state: TaskState::Ready,
+            context: CpuContext::new(entry_point, kernel_stack_top),
+            priority,
+            time_slice: 10,
+            time_remaining: 10,
+            schedule_count: 0,
+            block_reason: None,
+            saved_rsp,
+            kernel_stack_top,
+            process_id: None,
+            cr3: 0,
+            home_cpu: 0,
         }
     }
 

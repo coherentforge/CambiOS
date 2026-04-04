@@ -1,250 +1,848 @@
-//! Userspace process loader
+//! Userspace process loader with verify-before-execute security gate
 //!
-//! Loads ELF binaries into isolated memory regions and creates tasks.
-//! Designed with verification and capability-based security in mind.
+//! Loads ELF binaries into isolated per-process address spaces. Every binary
+//! passes through a `BinaryVerifier` before any memory is allocated or mapped.
+//!
+//! Pipeline: parse ELF → collect segments → **verify** → allocate + map → create task
 
 pub mod elf;
 
-use crate::scheduler::{Scheduler, TaskId, Priority};
 use crate::ipc::ProcessId;
-use elf::ElfError;
+use crate::memory::frame_allocator::{FrameAllocator, PAGE_SIZE};
+use crate::memory::paging;
+use crate::process::ProcessTable;
+use crate::scheduler::{Priority, Scheduler, TaskId};
+use elf::{ElfBinary, ElfError, SegmentLoad};
+
+extern crate alloc;
+use alloc::alloc::{alloc, Layout};
+use core::mem::size_of;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Per-task kernel stack size (8 KB) — matches main.rs
+const KERNEL_STACK_SIZE: usize = 8192;
+
+/// Default user stack: 4 pages (16 KB)
+const DEFAULT_STACK_PAGES: usize = 4;
+
+/// Default user stack top virtual address
+const DEFAULT_STACK_TOP: u64 = 0x80_0000;
+
+/// Maximum allowed total memory for a single process (256 MB)
+const MAX_PROCESS_MEMORY: u64 = 256 * 1024 * 1024;
+
+/// Canonical user-space boundary (x86-64 lower half)
+const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+
+// ============================================================================
+// Errors
+// ============================================================================
 
 /// Errors that can occur during process loading
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderError {
-    ElfError(ElfError),
-    InvalidMemoryLayout,
-    MemoryAllocationFailed,
+    /// ELF parsing or validation failed
+    Elf(ElfError),
+    /// Binary was rejected by the verifier
+    Denied(DenyReason),
+    /// Frame allocator out of memory
+    FrameAllocationFailed,
+    /// Page table operation failed
+    PagingFailed,
+    /// Failed to create process in process table
+    ProcessCreationFailed,
+    /// Scheduler has no free task slots
     SchedulerFull,
+    /// Failed to allocate kernel stack
+    KernelStackAllocationFailed,
 }
 
 impl core::fmt::Display for LoaderError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            Self::ElfError(e) => write!(f, "ELF error: {}", e),
-            Self::InvalidMemoryLayout => write!(f, "Invalid memory layout"),
-            Self::MemoryAllocationFailed => write!(f, "Memory allocation failed"),
-            Self::SchedulerFull => write!(f, "Scheduler is full"),
+            Self::Elf(e) => write!(f, "ELF error: {}", e),
+            Self::Denied(r) => write!(f, "Verification denied: {:?}", r),
+            Self::FrameAllocationFailed => write!(f, "Frame allocation failed"),
+            Self::PagingFailed => write!(f, "Page table operation failed"),
+            Self::ProcessCreationFailed => write!(f, "Process creation failed"),
+            Self::SchedulerFull => write!(f, "Scheduler full"),
+            Self::KernelStackAllocationFailed => write!(f, "Kernel stack allocation failed"),
         }
     }
 }
 
-/// Process memory layout
+// ============================================================================
+// Verify-before-execute security gate
+// ============================================================================
+
+/// Reason a binary was denied execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyReason {
+    /// Entry point is not within any loadable segment
+    EntryPointOutOfRange,
+    /// A segment maps into kernel address space
+    SegmentInKernelSpace,
+    /// A segment is both writable and executable (W^X violation)
+    WritableAndExecutable,
+    /// Two LOAD segments overlap in virtual memory
+    OverlappingSegments,
+    /// Total memory footprint exceeds allowed limit
+    ExcessiveMemory,
+    /// Custom policy rejection (for extended verifiers)
+    PolicyViolation,
+}
+
+/// Result of binary verification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyResult {
+    /// Binary is allowed to execute
+    Allow,
+    /// Binary is denied execution
+    Deny(DenyReason),
+}
+
+/// Pre-execution binary verification trait.
 ///
-/// Each userspace process has:
-/// - Code segment (read/execute)
-/// - Data segment (read/write)
-/// - BSS segment (read/write, zero-initialized)
-/// - Heap (read/write, growable)
-/// - Stack (read/write, grows downward)
-#[derive(Debug, Clone, Copy)]
-pub struct ProcessMemoryLayout {
-    /// Process ID
-    pub process_id: ProcessId,
-    /// Base address for code/data (aligned)
-    pub code_base: u64,
-    /// Base address for stack (grows downward)
-    pub stack_base: u64,
-    /// Stack size (grows downward from stack_base)
-    pub stack_size: u64,
-    /// Total virtual address space allocated
-    pub total_size: u64,
+/// Implementations inspect parsed ELF metadata **before** any memory is
+/// allocated or mapped. This is the zero-trust "verify before execute" gate.
+///
+/// The verifier receives:
+/// - `binary`: raw ELF bytes (for hash/signature checks)
+/// - `metadata`: parsed ELF overview (entry point, load range)
+/// - `segments`: all PT_LOAD segments with permissions
+pub trait BinaryVerifier {
+    fn verify(
+        &self,
+        binary: &[u8],
+        metadata: &ElfBinary,
+        segments: &[SegmentLoad],
+    ) -> VerifyResult;
 }
 
-/// Load address allocation strategy
-/// 
-/// Keeps track of next available address for process loading.
-/// In a full system, this would integrate with paging/MMU.
-pub struct ProcessAllocator {
-    /// Next available load address
-    next_load_addr: u64,
-    /// Stack allocation pointer (grows downward)
-    next_stack_addr: u64,
-    /// Maximum address
-    max_addr: u64,
+/// Default verifier enforcing zero-trust security policies.
+///
+/// Checks:
+/// 1. Entry point falls within a LOAD segment
+/// 2. All segments are in user space (below canonical hole)
+/// 3. W^X: no segment is both writable and executable
+/// 4. No overlapping segments
+/// 5. Total memory footprint within limit
+pub struct DefaultVerifier {
+    /// Maximum allowed total memory (bytes)
+    pub max_memory: u64,
 }
 
-impl ProcessAllocator {
-    /// Create a new process allocator
-    /// 
-    /// Userspace: 0x400000 to 0x7FFFFFFF (conservative allocation)
+impl DefaultVerifier {
     pub fn new() -> Self {
-        ProcessAllocator {
-            // Userspace code starts at 0x400000
-            next_load_addr: 0x400000,
-            // Stacks grow downward from 0x7F000000
-            next_stack_addr: 0x7F000000,
-            // Stop before kernel space (0x80000000)
-            max_addr: 0x80000000,
+        Self {
+            max_memory: MAX_PROCESS_MEMORY,
         }
-    }
-
-    /// Allocate contiguous memory for a process's code/data
-    pub fn allocate_code_region(&mut self, size: u64) -> Result<u64, LoaderError> {
-        if size == 0 {
-            return Err(LoaderError::InvalidMemoryLayout);
-        }
-
-        let addr = self.next_load_addr;
-        let aligned_size = (size + 0xFFF) & !0xFFF; // Align to 4K
-
-        if addr + aligned_size >= self.next_stack_addr {
-            return Err(LoaderError::MemoryAllocationFailed);
-        }
-
-        self.next_load_addr = addr + aligned_size;
-        Ok(addr)
-    }
-
-    /// Allocate a stack region for a process (grows downward)
-    pub fn allocate_stack(&mut self, size: u64) -> Result<u64, LoaderError> {
-        if size == 0 {
-            return Err(LoaderError::InvalidMemoryLayout);
-        }
-
-        let aligned_size = (size + 0xFFF) & !0xFFF; // Align to 4K
-
-        if self.next_stack_addr < aligned_size + self.next_load_addr {
-            return Err(LoaderError::MemoryAllocationFailed);
-        }
-
-        // Stack grows downward, so return the top of the stack
-        let stack_top = self.next_stack_addr - aligned_size;
-        self.next_stack_addr = stack_top;
-
-        Ok(stack_top)
     }
 }
 
-/// Load an ELF binary into memory and create a task
-///
-/// This function:
-/// 1. Validates the ELF binary
-/// 2. Allocates memory regions for code/data/stack
-/// 3. Loads program segments into memory
-/// 4. Creates a task in the scheduler
-pub fn load_process(
-    binary: &[u8],
-    scheduler: &mut Scheduler,
-    priority: Priority,
-    allocator: &mut ProcessAllocator,
-) -> Result<(ProcessId, TaskId), LoaderError> {
-    // Parse and analyze ELF
-    let elf_binary = elf::analyze_binary(binary).map_err(LoaderError::ElfError)?;
+impl BinaryVerifier for DefaultVerifier {
+    fn verify(
+        &self,
+        _binary: &[u8],
+        metadata: &ElfBinary,
+        segments: &[SegmentLoad],
+    ) -> VerifyResult {
+        // 1. Entry point must be within a LOAD segment
+        let entry = metadata.entry_point;
+        let entry_in_segment = segments.iter().any(|seg| {
+            entry >= seg.vaddr && entry < seg.vaddr + seg.memsz
+        });
+        if !entry_in_segment {
+            return VerifyResult::Deny(DenyReason::EntryPointOutOfRange);
+        }
 
-    // Allocate memory for code/data
-    let code_base = allocator.allocate_code_region(elf_binary.load_size)?;
+        let mut total_memory: u64 = 0;
 
-    // Allocate stack (8KB default)
-    let stack_size = 0x2000;
-    let stack_base = allocator.allocate_stack(stack_size)?;
+        for seg in segments {
+            // 2. All segments must be in user space
+            let seg_end = seg.vaddr.saturating_add(seg.memsz);
+            if seg.vaddr >= USER_SPACE_END || seg_end > USER_SPACE_END {
+                return VerifyResult::Deny(DenyReason::SegmentInKernelSpace);
+            }
 
-    // Load all LOAD segments into memory
-    load_segments(binary, code_base, elf_binary.load_base)?;
+            // 3. W^X enforcement: no segment may be both writable and executable
+            if seg.writable && seg.executable {
+                return VerifyResult::Deny(DenyReason::WritableAndExecutable);
+            }
 
-    // Calculate entry point (adjusted for new load base)
-    let entry_offset = elf_binary.entry_point - elf_binary.load_base;
-    let adjusted_entry = code_base + entry_offset;
+            total_memory = total_memory.saturating_add(seg.memsz);
+        }
 
-    // Stack pointer points to top of stack (grows downward)
-    let stack_ptr = stack_base + stack_size;
-
-    // Create task in scheduler
-    let task_id = scheduler
-        .create_task(adjusted_entry, stack_ptr, priority)
-        .map_err(|_| LoaderError::SchedulerFull)?;
-
-    // Assign process ID (use task ID as process ID for now)
-    let process_id = ProcessId(task_id.0);
-
-    Ok((process_id, task_id))
-}
-
-/// Load all LOAD segments from ELF binary into memory
-fn load_segments(
-    binary: &[u8],
-    load_base: u64,
-    elf_load_base: u64,
-) -> Result<(), LoaderError> {
-    let header = elf::parse_header(binary).map_err(LoaderError::ElfError)?;
-
-    for i in 0..header.e_phnum as usize {
-        let phdr = elf::get_program_header(binary, &header, i)
-            .map_err(LoaderError::ElfError)?;
-
-        if phdr.p_type == elf::phdr_type::PT_LOAD {
-            // Calculate where this segment should go
-            let offset_in_segment = phdr.p_vaddr - elf_load_base;
-            let dest_addr = load_base + offset_in_segment;
-
-            // Copy from file into memory
-            let src = unsafe {
-                core::slice::from_raw_parts(
-                    binary.as_ptr().add(phdr.p_offset as usize),
-                    phdr.p_filesz as usize,
-                )
-            };
-
-            let dest = unsafe {
-                core::slice::from_raw_parts_mut(
-                    dest_addr as *mut u8,
-                    phdr.p_filesz as usize,
-                )
-            };
-
-            // Copy file data
-            dest.copy_from_slice(src);
-
-            // Zero-fill any BSS (memory beyond file size)
-            if phdr.p_memsz > phdr.p_filesz {
-                let bss_start = dest_addr + phdr.p_filesz;
-                let bss_size = (phdr.p_memsz - phdr.p_filesz) as usize;
-
-                let bss = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        bss_start as *mut u8,
-                        bss_size,
-                    )
-                };
-
-                bss.fill(0);
+        // 4. No overlapping segments
+        for i in 0..segments.len() {
+            for j in (i + 1)..segments.len() {
+                let a = &segments[i];
+                let b = &segments[j];
+                let a_end = a.vaddr + a.memsz;
+                let b_end = b.vaddr + b.memsz;
+                if a.vaddr < b_end && b.vaddr < a_end {
+                    return VerifyResult::Deny(DenyReason::OverlappingSegments);
+                }
             }
         }
+
+        // 5. Total memory within limit
+        if total_memory > self.max_memory {
+            return VerifyResult::Deny(DenyReason::ExcessiveMemory);
+        }
+
+        VerifyResult::Allow
+    }
+}
+
+// ============================================================================
+// Process loading result
+// ============================================================================
+
+/// Successful process load result
+#[derive(Debug, Clone, Copy)]
+pub struct LoadedProcess {
+    pub process_id: ProcessId,
+    pub task_id: TaskId,
+    pub cr3: u64,
+    pub entry_point: u64,
+}
+
+// ============================================================================
+// Production ELF loader
+// ============================================================================
+
+/// Load an ELF binary into an isolated process address space.
+///
+/// Full pipeline:
+/// 1. Parse and validate ELF structure
+/// 2. Collect LOAD segment metadata
+/// 3. **Verify** — security gate rejects before any allocation
+/// 4. Create process with per-process PML4
+/// 5. For each LOAD segment: allocate frames, map pages, copy data, zero BSS
+/// 6. Allocate and map user stack
+/// 7. Allocate kernel stack, set up SavedContext for iretq → ring 3
+/// 8. Register task in scheduler
+///
+/// The caller is responsible for lock ordering if calling from a context
+/// where the global spinlocks are in play. During boot init (single-threaded),
+/// pass the raw references directly.
+#[cfg(target_arch = "x86_64")]
+pub fn load_elf_process(
+    binary: &[u8],
+    process_id: ProcessId,
+    priority: Priority,
+    verifier: &dyn BinaryVerifier,
+    process_table: &mut ProcessTable,
+    frame_alloc: &mut FrameAllocator,
+    scheduler: &mut Scheduler,
+) -> Result<LoadedProcess, LoaderError> {
+    // --- Step 1: Parse ELF ---
+    let metadata = elf::analyze_binary(binary).map_err(LoaderError::Elf)?;
+
+    // --- Step 2: Collect LOAD segments ---
+    let (segments, seg_count) =
+        elf::collect_load_segments(binary).map_err(LoaderError::Elf)?;
+    let segments = &segments[..seg_count];
+
+    // --- Step 3: Verify before execute ---
+    match verifier.verify(binary, &metadata, segments) {
+        VerifyResult::Allow => {}
+        VerifyResult::Deny(reason) => return Err(LoaderError::Denied(reason)),
     }
 
-    Ok(())
+    // --- Step 4: Create process with per-process page table ---
+    process_table
+        .create_process(process_id, Some(frame_alloc))
+        .map_err(|_| LoaderError::ProcessCreationFailed)?;
+
+    let cr3 = process_table.get_cr3(process_id);
+    if cr3 == 0 {
+        return Err(LoaderError::ProcessCreationFailed);
+    }
+
+    // --- Step 5: Map LOAD segments ---
+    let hhdm = crate::hhdm_offset();
+
+    for seg in segments {
+        let page_aligned_vaddr = seg.vaddr & !(PAGE_SIZE - 1);
+        let offset_in_first_page = seg.vaddr - page_aligned_vaddr;
+        let total_bytes = offset_in_first_page + seg.memsz;
+        let num_pages = ((total_bytes + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+
+        let flags = if seg.writable {
+            paging::flags::user_rw()
+        } else {
+            paging::flags::user_ro()
+        };
+
+        for page_idx in 0..num_pages {
+            let page_vaddr = page_aligned_vaddr + (page_idx as u64 * PAGE_SIZE);
+
+            let frame = frame_alloc
+                .allocate()
+                .map_err(|_| LoaderError::FrameAllocationFailed)?;
+
+            // Zero the frame via HHDM before copying data
+            // SAFETY: frame.addr is a freshly allocated physical frame. HHDM maps
+            // it to a valid kernel-accessible virtual address. We zero the full page.
+            unsafe {
+                core::ptr::write_bytes((frame.addr + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
+            }
+
+            // SAFETY: cr3 is a valid PML4 from create_process_page_table(). The
+            // frame is freshly allocated and zeroed.
+            unsafe {
+                let mut pt = paging::page_table_from_cr3(cr3);
+                paging::map_page(&mut pt, page_vaddr, frame.addr, flags, frame_alloc)
+                    .map_err(|_| LoaderError::PagingFailed)?;
+            }
+
+            // Copy file data into this page (if any falls within this page)
+            let page_start_in_segment = if page_idx == 0 {
+                0u64
+            } else {
+                page_idx as u64 * PAGE_SIZE - offset_in_first_page
+            };
+
+            if page_start_in_segment < seg.filesz {
+                let copy_offset_in_page = if page_idx == 0 {
+                    offset_in_first_page
+                } else {
+                    0
+                };
+                let bytes_available = seg.filesz - page_start_in_segment;
+                let bytes_in_page = PAGE_SIZE - copy_offset_in_page;
+                let copy_len = core::cmp::min(bytes_available, bytes_in_page) as usize;
+
+                let src_offset = seg.file_offset + page_start_in_segment;
+
+                // SAFETY: collect_load_segments validated that
+                // file_offset + filesz <= binary.len(). The frame is HHDM-mapped
+                // and writable. src and dst don't overlap.
+                unsafe {
+                    let src = binary.as_ptr().add(src_offset as usize);
+                    let dst = (frame.addr + hhdm + copy_offset_in_page) as *mut u8;
+                    core::ptr::copy_nonoverlapping(src, dst, copy_len);
+                }
+            }
+            // BSS (memsz > filesz) is already zeroed from the write_bytes above
+        }
+    }
+
+    // --- Step 6: Allocate and map user stack ---
+    let stack_base = DEFAULT_STACK_TOP - (DEFAULT_STACK_PAGES as u64 * PAGE_SIZE);
+    for i in 0..DEFAULT_STACK_PAGES {
+        let frame = frame_alloc
+            .allocate()
+            .map_err(|_| LoaderError::FrameAllocationFailed)?;
+
+        // Zero the stack frame
+        // SAFETY: Freshly allocated frame, HHDM-mapped.
+        unsafe {
+            core::ptr::write_bytes((frame.addr + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
+        }
+
+        // SAFETY: cr3 is valid, frame is freshly allocated. user_rw grants
+        // read/write/user-accessible permission for the stack.
+        unsafe {
+            let mut pt = paging::page_table_from_cr3(cr3);
+            paging::map_page(
+                &mut pt,
+                stack_base + (i as u64 * PAGE_SIZE),
+                frame.addr,
+                paging::flags::user_rw(),
+                frame_alloc,
+            )
+            .map_err(|_| LoaderError::PagingFailed)?;
+        }
+    }
+
+    // --- Step 7: Allocate kernel stack + SavedContext ---
+    let kstack_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 16)
+        .map_err(|_| LoaderError::KernelStackAllocationFailed)?;
+
+    // SAFETY: Layout is valid (KERNEL_STACK_SIZE=8192, align=16).
+    let kstack_base = unsafe { alloc(kstack_layout) };
+    if kstack_base.is_null() {
+        return Err(LoaderError::KernelStackAllocationFailed);
+    }
+    let kstack_top = kstack_base as u64 + KERNEL_STACK_SIZE as u64;
+
+    // Set up SavedContext at the top of the kernel stack for iretq → ring 3
+    let saved_ctx_addr = kstack_top - size_of::<crate::arch::SavedContext>() as u64;
+    let saved_ctx = saved_ctx_addr as *mut crate::arch::SavedContext;
+
+    // SAFETY: saved_ctx points within the freshly allocated kernel stack.
+    // The SavedContext is fully initialized with USER_CS/USER_SS (ring 3
+    // selectors) and the ELF entry point / user stack top. iretq will pop
+    // this to transition to ring 3.
+    unsafe {
+        core::ptr::write(
+            saved_ctx,
+            crate::arch::SavedContext {
+                r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0,
+                r9: 0, r8: 0, rbp: 0, rdi: 0, rsi: 0, rdx: 0,
+                rcx: 0, rbx: 0, rax: 0,
+                rip: metadata.entry_point,
+                cs: crate::arch::gdt::USER_CS as u64,
+                rflags: 0x202, // IF set (interrupts enabled)
+                rsp: DEFAULT_STACK_TOP,
+                ss: crate::arch::gdt::USER_SS as u64,
+            },
+        );
+    }
+
+    // --- Step 8: Register task in scheduler ---
+    let task_id = scheduler
+        .create_isr_task(
+            metadata.entry_point,
+            saved_ctx_addr,
+            kstack_top,
+            priority,
+        )
+        .map_err(|_| LoaderError::SchedulerFull)?;
+
+    // Set process_id and CR3 on the task
+    if let Some(task) = scheduler.get_task_mut_pub(task_id) {
+        task.process_id = Some(process_id);
+        task.cr3 = cr3;
+    }
+
+    Ok(LoadedProcess {
+        process_id,
+        task_id,
+        cr3,
+        entry_point: metadata.entry_point,
+    })
 }
+
+// ============================================================================
+// ELF construction from raw code
+// ============================================================================
+
+/// Construct a minimal valid ELF64 binary from raw machine code bytes.
+///
+/// Creates a single PT_LOAD segment (RX) at the given virtual address.
+/// Used during boot to wrap inline assembly into an ELF for the loader pipeline.
+///
+/// The resulting ELF passes `DefaultVerifier`: entry is within the segment,
+/// segment is in user space, and it's read-execute only (no W^X violation).
+#[cfg(target_arch = "x86_64")]
+pub fn build_boot_elf(code: &[u8], entry_vaddr: u64) -> alloc::vec::Vec<u8> {
+    use elf::{Elf64Header, Elf64ProgramHeader, phdr_type, phdr_flags};
+
+    let ehdr_size = size_of::<Elf64Header>();
+    let phdr_size = size_of::<Elf64ProgramHeader>();
+    let headers_size = ehdr_size + phdr_size;
+
+    let mut binary = alloc::vec![0u8; headers_size];
+
+    // Append the raw code bytes after headers
+    binary.extend_from_slice(code);
+
+    // Build the single LOAD program header
+    let phdr = Elf64ProgramHeader {
+        p_type: phdr_type::PT_LOAD,
+        p_flags: phdr_flags::PF_R | phdr_flags::PF_X,
+        p_offset: headers_size as u64,
+        p_vaddr: entry_vaddr,
+        p_paddr: entry_vaddr,
+        p_filesz: code.len() as u64,
+        p_memsz: code.len() as u64,
+        p_align: 0x1000,
+    };
+
+    // Build ELF header
+    let header = Elf64Header {
+        magic: *b"\x7fELF",
+        class: 2,  // 64-bit
+        data: 1,   // little-endian
+        version: 1,
+        os_abi: 0,
+        abi_version: 0,
+        _padding: [0; 7],
+        e_type: 2,  // ET_EXEC
+        e_machine: 0x3E, // x86-64
+        e_version: 1,
+        e_entry: entry_vaddr,
+        e_phoff: ehdr_size as u64,
+        e_shoff: 0,
+        e_flags: 0,
+        e_ehsize: ehdr_size as u16,
+        e_phentsize: phdr_size as u16,
+        e_phnum: 1,
+        e_shentsize: 0,
+        e_shnum: 0,
+        e_shstrndx: 0,
+    };
+
+    // SAFETY: Elf64Header is repr(C), POD. We copy its bytes into the buffer.
+    unsafe {
+        let header_bytes = core::slice::from_raw_parts(
+            &header as *const Elf64Header as *const u8,
+            ehdr_size,
+        );
+        binary[..ehdr_size].copy_from_slice(header_bytes);
+
+        let phdr_bytes = core::slice::from_raw_parts(
+            &phdr as *const Elf64ProgramHeader as *const u8,
+            phdr_size,
+        );
+        binary[ehdr_size..ehdr_size + phdr_size].copy_from_slice(phdr_bytes);
+    }
+
+    binary
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::elf::*;
+
+    // --- Test ELF builder ---
+
+    /// Build a minimal valid x86-64 ELF binary with the given LOAD segments.
+    fn build_test_elf(entry: u64, segments: &[(u64, u64, u64, u32)]) -> alloc::vec::Vec<u8> {
+        use core::mem::size_of;
+
+        let ehdr_size = size_of::<Elf64Header>();
+        let phdr_size = size_of::<Elf64ProgramHeader>();
+        let headers_size = ehdr_size + segments.len() * phdr_size;
+
+        // Each segment's file data follows the headers
+        let mut data_offset = headers_size;
+        let mut binary = alloc::vec![0u8; headers_size];
+
+        // Build program headers and append segment data
+        let mut phdrs = alloc::vec::Vec::new();
+        for &(vaddr, filesz, memsz, flags) in segments {
+            let phdr = Elf64ProgramHeader {
+                p_type: phdr_type::PT_LOAD,
+                p_flags: flags,
+                p_offset: data_offset as u64,
+                p_vaddr: vaddr,
+                p_paddr: vaddr,
+                p_filesz: filesz,
+                p_memsz: memsz,
+                p_align: 0x1000,
+            };
+            phdrs.push(phdr);
+            // Append file data (filled with 0xCC as a marker)
+            binary.extend(core::iter::repeat(0xCC).take(filesz as usize));
+            data_offset += filesz as usize;
+        }
+
+        // Build ELF header
+        let header = Elf64Header {
+            magic: *b"\x7fELF",
+            class: 2,  // 64-bit
+            data: 1,   // little-endian
+            version: 1,
+            os_abi: 0,
+            abi_version: 0,
+            _padding: [0; 7],
+            e_type: 2,  // ET_EXEC
+            e_machine: 0x3E, // x86-64
+            e_version: 1,
+            e_entry: entry,
+            e_phoff: ehdr_size as u64,
+            e_shoff: 0,
+            e_flags: 0,
+            e_ehsize: ehdr_size as u16,
+            e_phentsize: phdr_size as u16,
+            e_phnum: segments.len() as u16,
+            e_shentsize: 0,
+            e_shnum: 0,
+            e_shstrndx: 0,
+        };
+
+        // Write header
+        let header_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                &header as *const Elf64Header as *const u8,
+                ehdr_size,
+            )
+        };
+        binary[..ehdr_size].copy_from_slice(header_bytes);
+
+        // Write program headers
+        for (i, phdr) in phdrs.iter().enumerate() {
+            let offset = ehdr_size + i * phdr_size;
+            let phdr_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    phdr as *const Elf64ProgramHeader as *const u8,
+                    phdr_size,
+                )
+            };
+            binary[offset..offset + phdr_size].copy_from_slice(phdr_bytes);
+        }
+
+        binary
+    }
+
+    // --- Verifier tests ---
 
     #[test]
-    fn test_allocator() {
-        let mut alloc = ProcessAllocator::new();
+    fn test_default_verifier_allows_valid_binary() {
+        let verifier = DefaultVerifier::new();
+        // Single code segment: RX at 0x400000
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
 
-        let code1 = alloc.allocate_code_region(0x1000).unwrap();
-        let code2 = alloc.allocate_code_region(0x1000).unwrap();
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
 
-        assert!(code2 > code1);
-
-        let stack1 = alloc.allocate_stack(0x1000).unwrap();
-        let stack2 = alloc.allocate_stack(0x1000).unwrap();
-
-        assert!(stack2 < stack1);
-        assert!(code2 < stack2); // No overlap
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Allow,
+        );
     }
 
     #[test]
-    fn test_allocator_exhaustion() {
-        let mut alloc = ProcessAllocator::new();
+    fn test_verifier_denies_entry_outside_segment() {
+        let verifier = DefaultVerifier::new();
+        // Entry at 0x500000 but segment at 0x400000
+        let binary = build_test_elf(0x500000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
 
-        // Allocate code up to stack region
-        while alloc.allocate_code_region(0x1000).is_ok() {
-            // Keep allocating until we fail
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::EntryPointOutOfRange),
+        );
+    }
+
+    #[test]
+    fn test_verifier_denies_kernel_space_segment() {
+        let verifier = DefaultVerifier::new();
+        // Segment in kernel space
+        let binary = build_test_elf(
+            0xFFFF_8000_0000_0000,
+            &[(0xFFFF_8000_0000_0000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X)],
+        );
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::SegmentInKernelSpace),
+        );
+    }
+
+    #[test]
+    fn test_verifier_denies_writable_executable() {
+        let verifier = DefaultVerifier::new();
+        // W+X segment
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_W | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::WritableAndExecutable),
+        );
+    }
+
+    #[test]
+    fn test_verifier_denies_overlapping_segments() {
+        let verifier = DefaultVerifier::new();
+        // Two segments that overlap: 0x400000..0x402000 and 0x401000..0x403000
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x2000, phdr_flags::PF_R | phdr_flags::PF_X),
+            (0x401000, 0x1000, 0x2000, phdr_flags::PF_R | phdr_flags::PF_W),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::OverlappingSegments),
+        );
+    }
+
+    #[test]
+    fn test_verifier_denies_excessive_memory() {
+        let mut verifier = DefaultVerifier::new();
+        verifier.max_memory = 0x1000; // Limit to 4KB
+
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x2000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::ExcessiveMemory),
+        );
+    }
+
+    #[test]
+    fn test_verifier_allows_code_plus_data_segments() {
+        let verifier = DefaultVerifier::new();
+        // Typical layout: RX code + RW data, non-overlapping
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x2000, 0x2000, phdr_flags::PF_R | phdr_flags::PF_X), // .text
+            (0x600000, 0x1000, 0x2000, phdr_flags::PF_R | phdr_flags::PF_W), // .data+.bss
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Allow,
+        );
+    }
+
+    #[test]
+    fn test_verifier_entry_at_segment_boundary() {
+        let verifier = DefaultVerifier::new();
+        // Entry point at the very start of the segment (edge case)
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x100, 0x100, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Allow,
+        );
+    }
+
+    #[test]
+    fn test_verifier_entry_at_last_byte() {
+        let verifier = DefaultVerifier::new();
+        // Entry point at the last valid byte of the segment
+        let binary = build_test_elf(0x400FFF, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Allow,
+        );
+    }
+
+    #[test]
+    fn test_verifier_entry_one_past_end() {
+        let verifier = DefaultVerifier::new();
+        // Entry point one byte past the segment — should be denied
+        let binary = build_test_elf(0x401000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::EntryPointOutOfRange),
+        );
+    }
+
+    #[test]
+    fn test_verifier_adjacent_segments_allowed() {
+        let verifier = DefaultVerifier::new();
+        // Two adjacent (non-overlapping) segments
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+            (0x401000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_W),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Allow,
+        );
+    }
+
+    // --- ELF parser integration tests ---
+
+    #[test]
+    fn test_collect_segments_valid() {
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+            (0x600000, 0x500, 0x1000, phdr_flags::PF_R | phdr_flags::PF_W),
+        ]);
+
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(segs[0].vaddr, 0x400000);
+        assert!(segs[0].executable);
+        assert!(!segs[0].writable);
+        assert_eq!(segs[1].vaddr, 0x600000);
+        assert!(segs[1].writable);
+        assert!(!segs[1].executable);
+        assert_eq!(segs[1].filesz, 0x500);
+        assert_eq!(segs[1].memsz, 0x1000);
+    }
+
+    #[test]
+    fn test_elf_roundtrip_parse() {
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x2000, 0x2000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        assert_eq!(metadata.entry_point, 0x400000);
+        assert_eq!(metadata.load_base, 0x400000);
+        assert_eq!(metadata.load_size, 0x2000);
+    }
+
+    // --- Allocator tests (kept from original) ---
+
+    #[test]
+    fn test_custom_verifier() {
+        /// A verifier that denies everything
+        struct DenyAll;
+        impl BinaryVerifier for DenyAll {
+            fn verify(
+                &self,
+                _binary: &[u8],
+                _metadata: &ElfBinary,
+                _segments: &[SegmentLoad],
+            ) -> VerifyResult {
+                VerifyResult::Deny(DenyReason::PolicyViolation)
+            }
         }
 
-        // Should fail now
-        assert!(alloc.allocate_code_region(0x1000).is_err());
+        let verifier = DenyAll;
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::PolicyViolation),
+        );
     }
 }

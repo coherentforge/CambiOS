@@ -32,6 +32,11 @@ const PIT_CMD_CHANNEL0_RATE: u8 = 0x34; // 0b00_11_010_0
 /// # Safety
 /// Must be called after PIC init and before enabling interrupts.
 pub unsafe fn init(frequency_hz: u32) -> u16 {
+    // SAFETY for all Port I/O in this function:
+    // Called once during boot with interrupts disabled. Ports 0x40 (Channel 0 data)
+    // and 0x43 (command) are the standard 8254 PIT I/O addresses.
+    // The command byte 0x34 selects Channel 0, lobyte/hibyte access, rate generator mode.
+
     // Calculate divisor (clamped to u16 range)
     let divisor = if frequency_hz == 0 {
         65535u16 // Minimum frequency (~18.2 Hz)

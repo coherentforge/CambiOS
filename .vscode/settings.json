@@ -135,6 +135,48 @@
         "/^cargo build --target x86_64-unknown-none 2>&1 \\| tail -3$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none 2>&1 \\| tail -20$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none 2>&1 \\| tail -25$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 \\| tail -10$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^qemu-system-x86_64 -cdrom arcos\\.iso -serial mon:stdio -m 128M -no-reboot -smp 2 -display none 2>&1 \\| head -80$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^qemu-system-x86_64 -cdrom arcos\\.iso -serial mon:stdio -m 128M -no-reboot -smp 1 -display none 2>&1 \\| head -80$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^timeout 10 qemu-system-x86_64 -cdrom arcos\\.iso -serial mon:stdio -m 128M -no-reboot -display none -smp 2 2>&1 \\|\\| true$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^gtimeout 10 qemu-system-x86_64 -cdrom arcos\\.iso -serial mon:stdio -m 128M -no-reboot -display none -smp 2 2>&1 \\|\\| true$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 && make iso 2>&1 \\| tail -5$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo build --target x86_64-unknown-none --release 2>&1 && make iso 2>&1 \\| tail -3$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
-    }
+    },
+    "rust-analyzer.cargo.target": "x86_64-unknown-none",
+    "rust-analyzer.check.allTargets": false
 }

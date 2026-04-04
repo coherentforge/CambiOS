@@ -44,7 +44,9 @@ pub struct LockedHeapAllocator {
     inner: core::cell::UnsafeCell<KernelHeapAllocator>,
 }
 
-// SAFETY: Access is protected by the atomic spinlock
+// SAFETY: All access to the inner KernelHeapAllocator is gated by the atomic
+// spinlock (acquire/release). No caller can obtain a reference without holding
+// the lock, so there are no data races.
 unsafe impl Send for LockedHeapAllocator {}
 unsafe impl Sync for LockedHeapAllocator {}
 
@@ -79,13 +81,16 @@ impl LockedHeapAllocator {
     /// that is not used by anything else. Must be called exactly once.
     pub unsafe fn init(&self, heap_start: usize, heap_size: usize) {
         self.acquire();
+        // SAFETY: We hold the spinlock; inner.get() gives exclusive access.
         let inner = &mut *self.inner.get();
 
         assert!(!inner.initialized, "Kernel heap already initialized");
         assert!(heap_size >= MIN_BLOCK_SIZE, "Heap too small");
         assert!(heap_start % HEAP_ALIGN == 0, "Heap base not aligned");
 
-        // Create a single free block spanning the entire heap
+        // SAFETY: heap_start is a valid, writable, heap_size-byte region per caller contract.
+        // We write a FreeBlock header at the base. heap_size >= MIN_BLOCK_SIZE ensures
+        // the region can hold at least one FreeBlock (16 bytes).
         let block = heap_start as *mut FreeBlock;
         (*block).size = heap_size;
         (*block).next = ptr::null_mut();
@@ -101,6 +106,7 @@ impl LockedHeapAllocator {
     /// Returns true if the allocator has been initialized
     pub fn is_initialized(&self) -> bool {
         self.acquire();
+        // SAFETY: Lock is held; inner.get() gives shared access for a Copy field read.
         let val = unsafe { (*self.inner.get()).initialized };
         self.release();
         val
@@ -109,10 +115,14 @@ impl LockedHeapAllocator {
     /// Returns (used, free) byte counts for diagnostics
     pub fn stats(&self) -> (usize, usize) {
         self.acquire();
+        // SAFETY: Lock is held; inner.get() gives shared access.
         let inner = unsafe { &*self.inner.get() };
         let mut free = 0usize;
         let mut current = inner.free_list;
         while !current.is_null() {
+            // SAFETY: Each node in the free list was written by init() or dealloc().
+            // The list is sorted by address and nodes don't overlap, so each
+            // FreeBlock pointer is valid while we hold the lock.
             free += unsafe { (*current).size };
             current = unsafe { (*current).next };
         }
@@ -130,6 +140,7 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
         let header_size: usize = 16; // 2 × usize
 
         self.acquire();
+        // SAFETY: Lock is held; inner.get() gives exclusive access.
         let inner = &mut *self.inner.get();
 
         if !inner.initialized {
@@ -201,12 +212,16 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
             return;
         }
 
+        // SAFETY: ptr was returned by our alloc(), which writes a [block_base, block_size]
+        // header at (aligned_start - 16). Reading it back here recovers the original
+        // allocation metadata. If ptr was NOT returned by this allocator, this is UB.
         let header_size: usize = 16;
         let hdr = (ptr as usize - header_size) as *mut [usize; 2];
         let block_addr = (*hdr)[0];
         let block_size = (*hdr)[1];
 
         self.acquire();
+        // SAFETY: Lock is held; inner.get() gives exclusive access.
         let inner = &mut *self.inner.get();
 
         // Insert freed block into sorted free list and coalesce

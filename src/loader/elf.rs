@@ -133,8 +133,12 @@ pub fn parse_header(binary: &[u8]) -> Result<Elf64Header, ElfError> {
         return Err(ElfError::InvalidMagic);
     }
 
+    // SAFETY: We verified binary.len() >= size_of::<Elf64Header>(). Using
+    // read_unaligned because binary.as_ptr() may not be 8-byte aligned (the
+    // slice could start at any byte offset). Elf64Header has u64 fields that
+    // would require 8-byte alignment for a direct dereference.
     let header = unsafe {
-        *(binary.as_ptr() as *const Elf64Header)
+        core::ptr::read_unaligned(binary.as_ptr() as *const Elf64Header)
     };
 
     // Validate ELF magic
@@ -196,8 +200,11 @@ pub fn get_program_header(
         return Err(ElfError::InvalidProgramHeaderOffset);
     }
 
+    // SAFETY: phdr_offset..phdr_end is within binary bounds (checked above).
+    // Using read_unaligned because the program header may not be naturally
+    // aligned within the binary slice.
     let phdr = unsafe {
-        *(binary.as_ptr().add(phdr_offset) as *const Elf64ProgramHeader)
+        core::ptr::read_unaligned(binary.as_ptr().add(phdr_offset) as *const Elf64ProgramHeader)
     };
 
     Ok(phdr)
@@ -245,6 +252,58 @@ pub fn analyze_binary(binary: &[u8]) -> Result<ElfBinary, ElfError> {
         load_size: load_end - load_base,
         num_segments: header.e_phnum,
     })
+}
+
+/// Maximum number of LOAD segments supported
+pub const MAX_LOAD_SEGMENTS: usize = 16;
+
+/// Collect all PT_LOAD segments from an ELF binary.
+///
+/// Returns the segments and the count. Validates each segment's file range.
+pub fn collect_load_segments(
+    binary: &[u8],
+) -> Result<([SegmentLoad; MAX_LOAD_SEGMENTS], usize), ElfError> {
+    let header = parse_header(binary)?;
+    let mut segments = [SegmentLoad {
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+        file_offset: 0,
+        writable: false,
+        executable: false,
+    }; MAX_LOAD_SEGMENTS];
+    let mut count = 0;
+
+    for i in 0..header.e_phnum as usize {
+        let phdr = get_program_header(binary, &header, i)?;
+
+        if phdr.p_type == phdr_type::PT_LOAD {
+            if count >= MAX_LOAD_SEGMENTS {
+                return Err(ElfError::InvalidPhdrCount);
+            }
+
+            // Validate segment file range
+            if phdr.p_offset + phdr.p_filesz > binary.len() as u64 {
+                return Err(ElfError::SegmentOutOfBounds);
+            }
+
+            segments[count] = SegmentLoad {
+                vaddr: phdr.p_vaddr,
+                filesz: phdr.p_filesz,
+                memsz: phdr.p_memsz,
+                file_offset: phdr.p_offset,
+                writable: (phdr.p_flags & phdr_flags::PF_W) != 0,
+                executable: (phdr.p_flags & phdr_flags::PF_X) != 0,
+            };
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return Err(ElfError::NoLoadableSegments);
+    }
+
+    Ok((segments, count))
 }
 
 /// Verify ELF integrity

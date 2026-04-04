@@ -26,3 +26,10 @@ path = "src/microkernel/main.rs"
 [lib]
 name = "arcos_core"
 path = "src/lib.rs"
+
+[build]
+target = "x86_64-unknown-none"
+
+[alias]
+kbuild = "build --target x86_64-unknown-none"
+ktest = "test --lib"

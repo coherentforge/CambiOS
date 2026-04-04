@@ -169,14 +169,15 @@ impl BuddyAllocator {
         }
     }
 
-    /// Store the order for an allocation's start slot (4 bits, packed 2 per byte)
+    /// Store the order for an allocation's start slot.
+    /// Stored as (order - MIN_ORDER) in 4 bits, so orders 4-19 map to nibbles 0-15.
     fn set_order(&mut self, slot: usize, order: usize) {
         let byte_idx = slot / 2;
         if byte_idx < self.orders.len() {
             let shift = (slot % 2) * 4;
-            // Clear the nibble, then set it
+            let encoded = ((order - MIN_ORDER) as u8) & 0xF;
             self.orders[byte_idx] &= !(0xF << shift);
-            self.orders[byte_idx] |= ((order as u8) & 0xF) << shift;
+            self.orders[byte_idx] |= encoded << shift;
         }
     }
 
@@ -185,7 +186,8 @@ impl BuddyAllocator {
         let byte_idx = slot / 2;
         if byte_idx < self.orders.len() {
             let shift = (slot % 2) * 4;
-            ((self.orders[byte_idx] >> shift) & 0xF) as usize
+            let encoded = ((self.orders[byte_idx] >> shift) & 0xF) as usize;
+            encoded + MIN_ORDER
         } else {
             0
         }
