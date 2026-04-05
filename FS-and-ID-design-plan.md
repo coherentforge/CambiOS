@@ -2,15 +2,20 @@
 
 ## Context
 
-ArcOS has a working microkernel (preemptive multitasking, SMP, ring-3 user tasks, IPC + capabilities, zero-trust interceptor, Limine module loading). The next layer is identity and storage — the most consequential architectural decision in the project so far, because it defines what a "file" means and that propagates into every application built on ArcOS.
+ArcOS has a working microkernel (preemptive multitasking, SMP, ring-3 user tasks, IPC + capabilities, zero-trust interceptor, Limine module loading). The next critical decisions are on identity and storage — philosophically and practically the most consequential architectural decision in the project so far. Because it defines what a "file" means, and respects sovereignty at the user and data object level, this decision propagates into every object the system touches.
 
-This plan reflects design decisions made through extended discussion. The authoritative design document is [identity.md](identity.md). This plan is the implementation sequencing that flows from it.
+This plan reflects design decisions made through extended discussion but is a working document and subject to change. The authoritative design document is [identity.md]. This plan is the implementation sequencing that flows from it.
+
+See something "off"? Share, please.
+
 
 ---
 
 ## Foundational Principle
 
-ArcOS is a protocol as much as an OS. The identity and storage layers define a protocol specification, not just an implementation. Any system that implements the ObjectStore trait (content-addressed signed objects with author/owner), uses Ed25519 Principals for identity, and speaks SSB for inter-instance communication is a compatible peer — regardless of what kernel, language, or hardware it runs on. The microkernel is the reference implementation: the most security-hardened, sovereignty-respecting version of the protocol, but not the only valid one. Forks aren't threats — they're extensions of the network. This is a direct consequence of "no attestation, no gatekeeper" (decision 13): by not requiring instance attestation, ArcOS is defined by its protocol, not its binary. Every architectural decision should be evaluated against this: does it keep the protocol open, or does it tie behavior to a specific implementation?
+Is it robust and secure? Does it keep the protocol open, or does it tie behavior to a specific implementation? Every architectural decision should be evaluated against this.
+
+**ArcOS is a protocol as much as an OS.** The ArcOS microkernel enables secure hardware access to a system of open protocols. The identity and storage layers define a protocol specification as the implementation. Any system that implements the ObjectStore trait (content-addressed signed objects with author/owner), uses Ed25519 Principals for identity, and speaks SSB for inter-instance communication is a compatible peer — regardless of what kernel, language, or hardware it runs on. The microkernel is the reference implementation: by design the most security-hardened, sovereignty-respecting version of the protocol, but not the only valid one. Forks are extensions of the network, not threats to it. This is a direct consequence of "no attestation, no gatekeeper" ([identity.md]): by not requiring instance attestation, ArcOS is defined by its protocol, not its binary.
 
 ---
 
