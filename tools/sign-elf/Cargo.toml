@@ -1,0 +1,12 @@
+[package]
+name = "sign-elf"
+version = "0.2.0"
+edition = "2021"
+description = "ArcOS ELF signing tool — Ed25519 via YubiKey or seed"
+
+[dependencies]
+ed25519-compact = "2.2"
+openpgp-card = "0.6"
+card-backend-pcsc = "0.5"
+secrecy = "0.10"
+rpassword = "5"

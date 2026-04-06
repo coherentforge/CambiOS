@@ -4,8 +4,8 @@
 //! content-addressed signed objects with an immutable author, a transferable
 //! owner, and a cryptographic signature tying content to controller.
 //!
-//! Phase 0: No real crypto. Content hashing uses FNV-1a (placeholder for
-//! Blake3 in Phase 1). Signatures are present but not verified.
+//! Phase 1B: Real crypto. Content hashing uses Blake3. Signatures use
+//! Ed25519 and are verified on retrieval.
 //!
 //! The interfaces defined here are permanent. The implementations evolve.
 
@@ -16,40 +16,66 @@ use alloc::vec::Vec;
 use crate::ipc::Principal;
 
 // ============================================================================
-// Content hashing (Phase 0: FNV-1a placeholder, Phase 1: Blake3)
+// Content hashing (Blake3 — cryptographic, 256-bit)
 // ============================================================================
 
-/// FNV-1a hash producing a 32-byte output by running four independent
-/// FNV-1a-64 passes with different initial seeds, then concatenating.
+/// Blake3 content hash producing a 32-byte (256-bit) output.
 ///
-/// This is NOT cryptographic. It is a Phase 0 placeholder for Blake3.
-/// It exists solely to populate content_hash fields so the object model
-/// can be exercised end-to-end before real crypto crates are integrated.
+/// Blake3 is a cryptographic hash function: collision-resistant, preimage-
+/// resistant, and extremely fast. Used as the content address for ArcObjects.
 pub fn content_hash(data: &[u8]) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    // Four FNV-1a-64 passes with different seeds to fill 32 bytes
-    const SEEDS: [u64; 4] = [
-        0xcbf29ce484222325, // standard FNV offset basis
-        0x6c62272e07bb0142,
-        0x340c3e82a0e3b351,
-        0xaf63bd4c8601b7df,
-    ];
-    for (i, &seed) in SEEDS.iter().enumerate() {
-        let mut h = seed;
-        for &byte in data {
-            h ^= byte as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        result[i * 8..(i + 1) * 8].copy_from_slice(&h.to_le_bytes());
-    }
-    result
+    *blake3::hash(data).as_bytes()
 }
 
 // ============================================================================
-// Signature types (Phase 0: stored but not verified)
+// Ed25519 signature operations
 // ============================================================================
 
-/// Signature algorithm tag. Phase 0 only uses Ed25519.
+/// Sign content with an Ed25519 secret key. Returns a 64-byte signature.
+///
+/// `secret_key_bytes` is the 64-byte Ed25519 secret key (seed || public key).
+/// Deterministic signing (no noise) — same input always produces the same signature.
+pub fn sign_content(secret_key_bytes: &[u8; 64], content: &[u8]) -> SignatureBytes {
+    let sk = ed25519_compact::SecretKey::new(*secret_key_bytes);
+    let sig = sk.sign(content, None);
+    let mut data = [0u8; 64];
+    data.copy_from_slice(sig.as_ref());
+    SignatureBytes { data }
+}
+
+/// Verify an Ed25519 signature over content using the signer's public key.
+///
+/// Returns `true` if the signature is valid, `false` otherwise.
+/// A zeroed (empty) signature always fails verification.
+pub fn verify_signature(public_key: &[u8; 32], content: &[u8], signature: &SignatureBytes) -> bool {
+    // Empty signatures always fail
+    if signature.data == [0u8; 64] {
+        return false;
+    }
+    let pk = ed25519_compact::PublicKey::new(*public_key);
+    let sig = ed25519_compact::Signature::new(signature.data);
+    pk.verify(content, &sig).is_ok()
+}
+
+/// Derive an Ed25519 keypair from a 32-byte seed.
+///
+/// Returns (public_key: [u8; 32], secret_key: [u8; 64]).
+/// The secret key is 64 bytes: seed || public_key (Ed25519 convention).
+pub fn keypair_from_seed(seed: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
+    let ed_seed = ed25519_compact::Seed::new(*seed);
+    let kp = ed25519_compact::KeyPair::from_seed(ed_seed);
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(kp.pk.as_ref());
+    let mut sk = [0u8; 64];
+    sk.copy_from_slice(kp.sk.as_ref());
+    (pk, sk)
+}
+
+// ============================================================================
+// Signature types
+// ============================================================================
+
+/// Signature algorithm tag. Phase 1B uses Ed25519.
 /// ML-DSA-65 (post-quantum) is Phase 1.5+.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -58,16 +84,21 @@ pub enum SignatureAlgo {
     MlDsa65 = 1,
 }
 
-/// Signature bytes. Fixed at 64 bytes for Ed25519 in Phase 0.
+/// Signature bytes. Fixed at 64 bytes for Ed25519.
 /// Phase 1.5+ extends to variable-length for ML-DSA (3293 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureBytes {
-    /// Ed25519 signature (64 bytes). Zeroed = unsigned (Phase 0 default).
+    /// Ed25519 signature (64 bytes). Zeroed = unsigned.
     pub data: [u8; 64],
 }
 
 impl SignatureBytes {
     pub const EMPTY: Self = SignatureBytes { data: [0u8; 64] };
+
+    /// Returns true if the signature is empty (all zeros = unsigned).
+    pub fn is_empty_sig(&self) -> bool {
+        self.data == [0u8; 64]
+    }
 }
 
 // ============================================================================
@@ -173,7 +204,7 @@ impl ObjectCapSet {
 /// - `content_hash` is the object's address (content-derived).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArcObject {
-    /// Content hash — the object's unique address (FNV-1a Phase 0, Blake3 Phase 1).
+    /// Content hash — the object's unique address (Blake3).
     pub content_hash: [u8; 32],
     /// Creator's public key — IMMUTABLE after creation. Historical fact.
     pub author: [u8; 32],
@@ -181,7 +212,7 @@ pub struct ArcObject {
     pub owner: [u8; 32],
     /// Signature algorithm used.
     pub sig_algo: SignatureAlgo,
-    /// Owner's signature over content (Phase 0: zeroed / not verified).
+    /// Owner's Ed25519 signature over content. Verified on retrieval.
     pub signature: SignatureBytes,
     /// Access control list.
     pub capabilities: ObjectCapSet,
@@ -279,6 +310,8 @@ pub enum StoreError {
     InvalidObject,
     /// Caller lacks permission for this operation.
     PermissionDenied,
+    /// Signature verification failed (tampered or unsigned object).
+    InvalidSignature,
 }
 
 impl core::fmt::Display for StoreError {
@@ -288,6 +321,7 @@ impl core::fmt::Display for StoreError {
             Self::CapacityExceeded => write!(f, "Store capacity exceeded"),
             Self::InvalidObject => write!(f, "Invalid object"),
             Self::PermissionDenied => write!(f, "Permission denied"),
+            Self::InvalidSignature => write!(f, "Invalid signature"),
         }
     }
 }
@@ -297,7 +331,7 @@ impl core::fmt::Display for StoreError {
 /// Not a traditional block-device filesystem. Every backing store
 /// (RAM, disk, sovereign cloud, P2P) implements this trait.
 ///
-/// Phase 0: RamObjectStore. Phase 1+: disk-backed, networked.
+/// Phase 1B: RamObjectStore with Blake3 hashing + Ed25519 signatures.
 pub trait ObjectStore {
     /// Retrieve an object by content hash.
     fn get(&self, hash: &[u8; 32]) -> Result<&ArcObject, StoreError>;
@@ -374,8 +408,71 @@ mod tests {
     #[test]
     fn test_content_hash_empty() {
         let h = content_hash(b"");
-        // Should not be all zeros (FNV seeds are non-zero)
+        // Blake3 of empty input is a specific non-zero value
         assert_ne!(h, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_content_hash_is_blake3() {
+        // Verify we're using Blake3 by comparing with the known hash
+        let h = content_hash(b"hello world");
+        let expected = *blake3::hash(b"hello world").as_bytes();
+        assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn test_keypair_from_seed_deterministic() {
+        let seed = [42u8; 32];
+        let (pk1, sk1) = keypair_from_seed(&seed);
+        let (pk2, sk2) = keypair_from_seed(&seed);
+        assert_eq!(pk1, pk2);
+        assert_eq!(sk1, sk2);
+    }
+
+    #[test]
+    fn test_sign_and_verify() {
+        let seed = [1u8; 32];
+        let (pk, sk) = keypair_from_seed(&seed);
+        let content = b"ArcOS signed object content";
+
+        let sig = sign_content(&sk, content);
+        assert!(!sig.is_empty_sig());
+        assert!(verify_signature(&pk, content, &sig));
+    }
+
+    #[test]
+    fn test_verify_wrong_content_fails() {
+        let seed = [1u8; 32];
+        let (pk, sk) = keypair_from_seed(&seed);
+
+        let sig = sign_content(&sk, b"original");
+        assert!(!verify_signature(&pk, b"tampered", &sig));
+    }
+
+    #[test]
+    fn test_verify_wrong_key_fails() {
+        let (_, sk) = keypair_from_seed(&[1u8; 32]);
+        let (wrong_pk, _) = keypair_from_seed(&[2u8; 32]);
+
+        let sig = sign_content(&sk, b"data");
+        assert!(!verify_signature(&wrong_pk, b"data", &sig));
+    }
+
+    #[test]
+    fn test_verify_empty_signature_fails() {
+        let (pk, _) = keypair_from_seed(&[1u8; 32]);
+        assert!(!verify_signature(&pk, b"data", &SignatureBytes::EMPTY));
+    }
+
+    #[test]
+    fn test_sign_deterministic() {
+        let seed = [1u8; 32];
+        let (_, sk) = keypair_from_seed(&seed);
+        let content = b"same content";
+
+        let sig1 = sign_content(&sk, content);
+        let sig2 = sign_content(&sk, content);
+        assert_eq!(sig1, sig2);
     }
 
     #[test]

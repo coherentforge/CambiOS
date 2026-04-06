@@ -93,6 +93,10 @@ pub enum DenyReason {
     ExcessiveMemory,
     /// Custom policy rejection (for extended verifiers)
     PolicyViolation,
+    /// Binary is not signed (signature trailer missing)
+    MissingSignature,
+    /// Ed25519 signature verification failed
+    InvalidSignature,
 }
 
 /// Result of binary verification
@@ -195,6 +199,99 @@ impl BinaryVerifier for DefaultVerifier {
         }
 
         VerifyResult::Allow
+    }
+}
+
+// ============================================================================
+// Signed binary verification
+// ============================================================================
+
+/// Signature trailer appended to ELF binaries by the host-side signing tool.
+///
+/// Format: `[original ELF bytes][Ed25519 signature: 64 bytes][magic: 8 bytes]`
+///
+/// Magic: `ARCSIG\x01\x00` (version 1, no padding).
+/// Total trailer size: 72 bytes.
+///
+/// The signature covers all bytes before the trailer (the original ELF).
+pub const SIGNATURE_TRAILER_MAGIC: &[u8; 8] = b"ARCSIG\x01\x00";
+pub const SIGNATURE_TRAILER_SIZE: usize = 64 + 8; // signature + magic
+
+/// Strip the signature trailer from a signed binary.
+///
+/// Returns `Some((elf_bytes, signature_bytes))` if the trailer is present,
+/// `None` if the binary is unsigned.
+pub fn strip_signature_trailer(binary: &[u8]) -> Option<(&[u8], [u8; 64])> {
+    if binary.len() < SIGNATURE_TRAILER_SIZE {
+        return None;
+    }
+    let magic_start = binary.len() - 8;
+    if &binary[magic_start..] != SIGNATURE_TRAILER_MAGIC {
+        return None;
+    }
+    let sig_start = magic_start - 64;
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&binary[sig_start..magic_start]);
+    Some((&binary[..sig_start], sig))
+}
+
+/// Maximum number of trusted signing keys.
+const MAX_TRUSTED_KEYS: usize = 4;
+
+/// Verifier that requires Ed25519 signature verification before executing.
+///
+/// Wraps `DefaultVerifier` — runs all standard security checks AND requires
+/// a valid signature trailer signed by one of the trusted public keys.
+///
+/// The binary must have an `ARCSIG\x01\x00` trailer containing a 64-byte
+/// Ed25519 signature over the original ELF bytes. The signature must verify
+/// against at least one of the configured trusted keys.
+pub struct SignedBinaryVerifier {
+    /// Trusted public keys (Ed25519, 32 bytes each).
+    /// At least one must have signed the binary.
+    trusted_keys: [[u8; 32]; MAX_TRUSTED_KEYS],
+    /// Number of active trusted keys.
+    key_count: usize,
+    /// Inner verifier for structural checks.
+    inner: DefaultVerifier,
+}
+
+impl SignedBinaryVerifier {
+    /// Create a verifier with a single trusted key.
+    pub fn with_key(key: [u8; 32]) -> Self {
+        let mut keys = [[0u8; 32]; MAX_TRUSTED_KEYS];
+        keys[0] = key;
+        Self {
+            trusted_keys: keys,
+            key_count: 1,
+            inner: DefaultVerifier::new(),
+        }
+    }
+}
+
+impl BinaryVerifier for SignedBinaryVerifier {
+    fn verify(
+        &self,
+        binary: &[u8],
+        metadata: &ElfBinary,
+        segments: &[SegmentLoad],
+    ) -> VerifyResult {
+        // 1. Check for signature trailer
+        let (elf_bytes, sig_bytes) = match strip_signature_trailer(binary) {
+            Some(pair) => pair,
+            None => return VerifyResult::Deny(DenyReason::MissingSignature),
+        };
+
+        // 2. Verify signature against at least one trusted key
+        let sig_valid = self.trusted_keys[..self.key_count].iter().any(|pk| {
+            crate::fs::verify_signature(pk, elf_bytes, &crate::fs::SignatureBytes { data: sig_bytes })
+        });
+        if !sig_valid {
+            return VerifyResult::Deny(DenyReason::InvalidSignature);
+        }
+
+        // 3. Run all standard structural checks (on the original ELF, not trailer)
+        self.inner.verify(elf_bytes, metadata, segments)
     }
 }
 
@@ -842,7 +939,7 @@ mod tests {
         assert_eq!(metadata.load_size, 0x2000);
     }
 
-    // --- Allocator tests (kept from original) ---
+    // --- Custom verifier tests ---
 
     #[test]
     fn test_custom_verifier() {
@@ -870,6 +967,149 @@ mod tests {
         assert_eq!(
             verifier.verify(&binary, &metadata, &segs[..count]),
             VerifyResult::Deny(DenyReason::PolicyViolation),
+        );
+    }
+
+    // --- Signature trailer tests ---
+
+    /// Helper: sign a binary and append the ARCSIG trailer.
+    fn sign_binary(binary: &[u8], sk_bytes: &[u8; 64]) -> alloc::vec::Vec<u8> {
+        let sig = crate::fs::sign_content(sk_bytes, binary);
+        let mut signed = binary.to_vec();
+        signed.extend_from_slice(&sig.data);
+        signed.extend_from_slice(SIGNATURE_TRAILER_MAGIC);
+        signed
+    }
+
+    #[test]
+    fn test_strip_signature_trailer_present() {
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        let seed = [1u8; 32];
+        let (_, sk) = crate::fs::keypair_from_seed(&seed);
+        let signed = sign_binary(&elf, &sk);
+
+        let (stripped, sig) = strip_signature_trailer(&signed).expect("trailer should be found");
+        assert_eq!(stripped, &elf[..]);
+        assert_ne!(sig, [0u8; 64]);
+    }
+
+    #[test]
+    fn test_strip_signature_trailer_missing() {
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        assert!(strip_signature_trailer(&elf).is_none());
+    }
+
+    #[test]
+    fn test_strip_signature_trailer_too_short() {
+        let short = [0u8; 10];
+        assert!(strip_signature_trailer(&short).is_none());
+    }
+
+    #[test]
+    fn test_signed_verifier_allows_valid_signature() {
+        let seed = [1u8; 32];
+        let (pk, sk) = crate::fs::keypair_from_seed(&seed);
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        let signed = sign_binary(&elf, &sk);
+
+        let verifier = SignedBinaryVerifier::with_key(pk);
+
+        // Parse from the signed binary (ELF parser ignores trailing data)
+        let metadata = elf::analyze_binary(&signed).unwrap();
+        let (segs, count) = elf::collect_load_segments(&signed).unwrap();
+
+        assert_eq!(
+            verifier.verify(&signed, &metadata, &segs[..count]),
+            VerifyResult::Allow,
+        );
+    }
+
+    #[test]
+    fn test_signed_verifier_denies_unsigned() {
+        let seed = [1u8; 32];
+        let (pk, _) = crate::fs::keypair_from_seed(&seed);
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let verifier = SignedBinaryVerifier::with_key(pk);
+        let metadata = elf::analyze_binary(&elf).unwrap();
+        let (segs, count) = elf::collect_load_segments(&elf).unwrap();
+
+        assert_eq!(
+            verifier.verify(&elf, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::MissingSignature),
+        );
+    }
+
+    #[test]
+    fn test_signed_verifier_denies_wrong_key() {
+        let (_, sk) = crate::fs::keypair_from_seed(&[1u8; 32]);
+        let (wrong_pk, _) = crate::fs::keypair_from_seed(&[2u8; 32]);
+
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        let signed = sign_binary(&elf, &sk);
+
+        let verifier = SignedBinaryVerifier::with_key(wrong_pk);
+        let metadata = elf::analyze_binary(&signed).unwrap();
+        let (segs, count) = elf::collect_load_segments(&signed).unwrap();
+
+        assert_eq!(
+            verifier.verify(&signed, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::InvalidSignature),
+        );
+    }
+
+    #[test]
+    fn test_signed_verifier_denies_tampered_binary() {
+        let seed = [1u8; 32];
+        let (pk, sk) = crate::fs::keypair_from_seed(&seed);
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        let mut signed = sign_binary(&elf, &sk);
+
+        // Tamper with a byte in the segment data (offset 200 is in the code
+        // section, past the ELF header + program header at offset 120)
+        if signed.len() > 200 {
+            signed[200] ^= 0xFF;
+        }
+
+        let verifier = SignedBinaryVerifier::with_key(pk);
+        let metadata = elf::analyze_binary(&signed).unwrap();
+        let (segs, count) = elf::collect_load_segments(&signed).unwrap();
+
+        assert_eq!(
+            verifier.verify(&signed, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::InvalidSignature),
+        );
+    }
+
+    #[test]
+    fn test_signed_verifier_still_checks_wxe() {
+        // Valid signature but W^X violation — should still be denied
+        let seed = [1u8; 32];
+        let (pk, sk) = crate::fs::keypair_from_seed(&seed);
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_W | phdr_flags::PF_X),
+        ]);
+        let signed = sign_binary(&elf, &sk);
+
+        let verifier = SignedBinaryVerifier::with_key(pk);
+        let metadata = elf::analyze_binary(&signed).unwrap();
+        let (segs, count) = elf::collect_load_segments(&signed).unwrap();
+
+        assert_eq!(
+            verifier.verify(&signed, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::WritableAndExecutable),
         );
     }
 }

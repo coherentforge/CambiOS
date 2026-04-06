@@ -4,15 +4,18 @@ A security-first microkernel OS written in Rust (`no_std`) targeting **x86_64** 
 
 ## Current Status
 
-- **143/143 unit tests passing**
-- **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 5 tasks (3 kernel + 2 ring-3 user with per-process page tables and ELF loading), full SMP with IRQ affinity and load balancing
-- **AArch64**: QEMU `virt` boots to stable preemptive scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem
+- **190/190 unit tests passing**
+- **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 7 tasks (3 kernel + 2 ring-3 user + hello module + FS service), full SMP (phases 0–4c) with IRQ affinity and load balancing
+- **AArch64**: QEMU `virt` boots to stable preemptive SMP scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem (kernel heap, frame allocator, process heaps), EL0 user tasks with per-process TTBR0
+- **Identity (Phase 0)**: Bootstrap Principal bound to kernel processes and boot modules, IPC messages carry unforgeable `sender_principal` stamped by kernel, BindPrincipal/GetPrincipal syscalls
+- **ObjectStore (Phase 0)**: Content-addressed ArcObjects with author/owner/signature/ACL, RamObjectStore (256 objects, FNV-1a hashing), ObjPut/ObjGet/ObjDelete/ObjList syscalls
+- **FS Service**: First user-space Rust service (`user/fs-service/`), receives IPC on endpoint 16, enforces ownership via `sender_principal`, delegates to ObjectStore syscalls
 
 ## Design Principles
 
 - **Microkernel isolation** — device drivers, networking, and filesystems run in user-space; minimal kernel attack surface
 - **Zero-trust security** — capability-based IPC, verify-before-execute ELF gate, IPC interceptor at 3 enforcement points
-- **Cryptographic identity** — identity-based access replaces passwords (planned)
+- **Cryptographic identity** — identity-based access with unforgeable Principals (Phase 0 complete, Ed25519 + Blake3 in Phase 1)
 - **Platform agnostic** — x86_64 and AArch64 today, RISC-V planned
 - **Live-patchable** — AI-assisted kernel updates without reboots (planned)
 - **No telemetry** — no analytics, no phone-home behavior, ever
@@ -21,24 +24,28 @@ A security-first microkernel OS written in Rust (`no_std`) targeting **x86_64** 
 
 ### Completed
 
-- **Preemptive SMP scheduler** — per-CPU priority-band scheduling (4 bands, O(1) via VecDeque), task migration, load balancing (every 1s, threshold of 2)
-- **SYSCALL/SYSRET fast path** (x86_64) / **SVC handler** (AArch64) — 11 syscalls implemented (Exit, Write, Read, Allocate, Free, WaitIrq, RegisterEndpoint, Yield, GetPid, GetTime, Print)
+- **Preemptive SMP scheduler** — per-CPU priority-band scheduling (4 bands, O(1) via VecDeque, MAX_TASKS=256), task migration, load balancing (every 1s, threshold of 2)
+- **SYSCALL/SYSRET fast path** (x86_64) / **SVC handler** (AArch64) — 18 syscalls implemented (Exit, Write, Read, Allocate, Free, WaitIrq, RegisterEndpoint, Yield, GetPid, GetTime, Print, BindPrincipal, GetPrincipal, RecvMsg, ObjPut, ObjGet, ObjDelete, ObjList)
 - **ELF process loader** — per-process page tables, frame allocation, segment mapping, kernel stack setup, verify-before-execute gate (W^X, entry validation, overlap detection)
-- **Capability-based IPC** — endpoint message passing with fine-grained access control (send/receive/delegate), priority levels, zero-trust interceptor
-- **SMP** — Limine MP protocol AP startup, per-CPU GDT/TSS, IPI primitives, TLB shootdown (vector 0xFE), cross-CPU task wake via lock-free `TASK_CPU_MAP`
+- **Capability-based IPC** — per-endpoint sharded locking (`ShardedIpcManager`, 32 shards), fine-grained access control (send/receive/delegate), priority levels, zero-trust interceptor, identity-aware `sender_principal` stamping
+- **SMP** — Limine MP protocol AP startup on both x86_64 and AArch64, per-CPU GDT/TSS, IPI primitives, TLB shootdown (vector 0xFE on x86_64, TLBI broadcast on AArch64), cross-CPU task wake via lock-free `TASK_CPU_MAP`
 - **Local APIC timer** (x86_64) / **ARM Generic Timer** (AArch64) — 100Hz preemptive ticks
 - **I/O APIC** (x86_64) / **GICv3** (AArch64) — device IRQ routing
 - **ACPI parsing** — RSDP, XSDT, MADT for I/O APIC and interrupt source overrides
-- **Memory subsystem** — kernel heap (4MB), bitmap frame allocator (covers 0–2 GiB), buddy allocator, per-process page tables (4-level on both architectures)
-- **Ring-3 user tasks** — user code at 0x400000, user stack at 0x800000, per-process heap with Allocate/Free syscalls
+- **Memory subsystem** — kernel heap (4MB), bitmap frame allocator (covers 0–2 GiB, 524288 frames), buddy allocator, per-CPU frame cache (32-frame LIFO, batch refill/drain), per-process page tables (4-level on both architectures)
+- **Ring-3 user tasks** — user code at 0x400000, user stack at 0x800000, per-process heap with Allocate/Free syscalls, EL0 support on AArch64 with per-process TTBR0
+- **Identity (Phase 0)** — `Principal` type (32-byte public key), Bootstrap Principal bound at boot, `BindPrincipal`/`GetPrincipal` syscalls, IPC messages carry unforgeable `sender_principal` stamped by kernel
+- **ObjectStore (Phase 0)** — `ArcObject` (content-addressed, author/owner, signature field, ACL, lineage), `RamObjectStore` (256 objects, FNV-1a hashing), ObjPut/ObjGet/ObjDelete/ObjList syscalls with ownership enforcement
+- **FS Service** — first user-space Rust service (`user/fs-service/`), registers IPC endpoint 16, service loop (RecvMsg → parse → ObjectStore syscalls → respond), ownership enforcement via `sender_principal`
 
 ### Planned
 
-- AArch64 SMP (AP startup via Limine MP protocol)
-- Device IRQ routing via GIC SPIs on AArch64
-- Userspace driver framework
+- AArch64 device IRQ routing via GIC SPIs
+- Crypto integration (Ed25519 + Blake3, replacing FNV-1a, signed ELF binaries)
+- Key store service (user-space capability-gated, private key isolation)
+- Virtio-net driver (user-space MMIO, DMA buffer management)
+- UDP stack + NTP demo
 - AI-powered binary analysis and anomaly detection
-- Cryptographic identity system
 - Live kernel patching
 - RISC-V port
 
@@ -64,11 +71,17 @@ cargo build --target aarch64-unknown-none --release
 # Run unit tests (host macOS)
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
-# Build ISO + run in QEMU (x86_64, 2 CPUs)
+# Build ISO + run in QEMU (x86_64, 2 CPUs) — includes kernel, hello.elf, fs-service
 make iso && make run
+
+# Just run (rebuilds kernel + user modules automatically)
+make run
 
 # Build FAT image + run in QEMU (AArch64)
 make img-aarch64 && make run-aarch64
+
+# Build fs-service only
+make fs-service
 ```
 
 ## Project Structure
@@ -97,6 +110,9 @@ src/
 │       ├── syscall.rs        # SVC entry + VBAR_EL1 exception vector table
 │       ├── timer.rs          # ARM Generic Timer (CNTP)
 │       └── tlb.rs            # TLB shootdown via TLBI broadcast
+├── fs/
+│   ├── mod.rs                # ArcObject, ObjectStore trait (content-addressed signed objects)
+│   └── ram.rs                # RamObjectStore (256 objects, FNV-1a hashing)
 ├── interrupts/
 │   ├── mod.rs                # IDT setup, exception/device ISR handlers
 │   ├── pic.rs                # 8259 PIC driver (disabled at boot)
@@ -105,8 +121,8 @@ src/
 ├── io/
 │   └── mod.rs                # Serial output (uart_16550 / PL011 UART)
 ├── ipc/
-│   ├── mod.rs                # EndpointQueue, SyncChannel, IpcManager
-│   ├── capability.rs         # Capability-based security
+│   ├── mod.rs                # IPC: Principal, EndpointQueue, SyncChannel, IpcManager, ShardedIpcManager
+│   ├── capability.rs         # Capability-based security + Principal binding
 │   └── interceptor.rs        # Zero-trust IPC interceptor
 ├── loader/
 │   ├── mod.rs                # ELF process loader + verify-before-execute
@@ -114,7 +130,7 @@ src/
 ├── memory/
 │   ├── mod.rs                # Memory init + AArch64 paging (L0-L3)
 │   ├── heap.rs               # Kernel heap allocator (GlobalAlloc)
-│   ├── frame_allocator.rs    # Bitmap frame allocator (0–2 GiB)
+│   ├── frame_allocator.rs    # Bitmap frame allocator (0–2 GiB) + per-CPU FrameCache
 │   ├── buddy_allocator.rs    # Pure bookkeeping buddy allocator
 │   └── paging.rs             # x86_64 page table management
 ├── microkernel/
@@ -127,8 +143,15 @@ src/
 │   └── timer.rs              # Timer tick management
 └── syscalls/
     ├── mod.rs                # SyscallNumber enum, SyscallArgs
-    ├── dispatcher.rs         # Syscall dispatch + all 11 handlers
+    ├── dispatcher.rs         # Syscall dispatch + all 18 handlers
     └── userspace.rs          # Stub userspace syscall wrappers
+user/
+├── hello.S                   # Test module (prints 3x, exits)
+├── user.ld                   # User-space linker script (base 0x400000)
+└── fs-service/               # Filesystem service (Rust no_std crate)
+    ├── Cargo.toml
+    ├── link.ld               # Linker script (.data on separate page for GOT)
+    └── src/main.rs           # IPC service loop on endpoint 16, ObjectStore gateway
 ```
 
 ## Boot Sequence
@@ -143,9 +166,10 @@ ArcOS boots via the **Limine v8.7.0** boot protocol on both architectures.
 4. Per-CPU GDT/TSS installed, IDT loaded, SYSCALL MSRs configured
 5. PIC disabled, I/O APIC programmed, APIC timer started at 100Hz
 6. IPC manager, capability manager, and interceptor initialized
-7. Kernel tasks created, ELF user processes loaded with per-process page tables
-8. AP cores started via Limine MP protocol (per-CPU GDT, APIC, scheduler)
-9. Preemptive SMP scheduling begins
+7. Bootstrap Principal created, bound to kernel processes
+8. Kernel tasks created, ELF user processes loaded (hello.elf + fs-service) with per-process page tables
+9. AP cores started via Limine MP protocol (per-CPU GDT, APIC, scheduler)
+10. Preemptive SMP scheduling begins
 
 ### AArch64
 
@@ -156,7 +180,9 @@ ArcOS boots via the **Limine v8.7.0** boot protocol on both architectures.
 5. GIC distributor, redistributor, and CPU interface initialized
 6. ARM Generic Timer started at 100Hz
 7. Exception vector table installed (VBAR_EL1), SVC handler configured
-8. Kernel tasks created, preemptive scheduling begins
+8. Per-CPU data initialized via MPIDR_EL1
+9. Kernel tasks created, AP cores started via Limine MP protocol
+10. Preemptive SMP scheduling begins
 
 ## IPC Model
 
@@ -167,6 +193,7 @@ Capability-based message passing with zero-trust enforcement:
 - **Priority levels**: Critical, High, Normal, Low
 - **Three-layer enforcement**: IPC interceptor hooks at IpcManager send/recv, syscall pre-dispatch, and capability delegation
 - **Page-table-walk** for user buffer validation in Write/Read syscalls
+- **Identity-aware receive** (`RecvMsg`): returns `[sender_principal:32][from_endpoint:4][payload:N]`
 
 ## Memory Layout
 
@@ -185,10 +212,15 @@ All locks follow strict ordering to prevent deadlock:
 
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7)
+PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
 ```
 
 `*` = IrqSpinlock (saves/disables interrupts before acquiring)
+
+Additional lock domains (independent of hierarchy above):
+- `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR
+- `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint
+- `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter
 
 ## Development
 
@@ -203,11 +235,30 @@ PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7)
 ### Running Tests
 
 ```bash
-# All 143 tests (requires extra stack for buddy allocator tests)
+# All 190 tests (requires extra stack for buddy allocator tests)
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 ```
 
 Note: The microkernel binary (`src/microkernel/main.rs`) uses ELF-specific linker sections and cannot compile for test on macOS. Always use `--lib`.
+
+## Design Documents
+
+- [ArcOS.md](ArcOS.md) — Source-of-truth architecture document
+- [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind ArcOS
+- [identity.md](identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
+- [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Implementation sequencing for identity + storage: content-addressed ObjectStore, ArcObject model, bootstrap identity, IPC sender_principal stamping
+- [SECURITY.md](SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
+- [SYSCALLS.md](SYSCALLS.md) — All 18 syscalls: numbers, arguments, behavior, calling conventions
+- [INTERRUPT_ROUTING.md](INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
+- [src/scheduler/SCHEDULER.md](src/scheduler/SCHEDULER.md) — Scheduler internals: tick-based preemptive round-robin
+
+## Architecture Decision Records
+
+- [ADR-000](docs/adr/000-zta-and-cap.md) — Zero-trust architecture and capability-based access control
+- [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) — Per-CPU scheduling and SMP task management
+- [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) — Three-layer enforcement pipeline for IPC and syscalls
+- [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) — Content-addressed storage and cryptographic identity
+- [ADR-004](docs/adr/004-cryptographic-integrity.md) — Cryptographic integrity: Blake3 hashing and Ed25519 signatures
 
 ## References
 

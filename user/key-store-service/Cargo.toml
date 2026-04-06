@@ -1,0 +1,14 @@
+[package]
+name = "arcos-key-store-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ed25519-compact = { version = "2.2", default-features = false }
+
+[profile.release]
+opt-level = "s"        # Size-optimized (small ELF)
+lto = true
+codegen-units = 1
+strip = false          # Keep symbols for kernel loader debug
+panic = "abort"

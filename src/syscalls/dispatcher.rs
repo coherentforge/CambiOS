@@ -205,6 +205,8 @@ impl SyscallDispatcher {
             SyscallNumber::ObjGet => Self::handle_obj_get(args, ctx),
             SyscallNumber::ObjDelete => Self::handle_obj_delete(args, ctx),
             SyscallNumber::ObjList => Self::handle_obj_list(args, ctx),
+            SyscallNumber::ClaimBootstrapKey => Self::handle_claim_bootstrap_key(args, ctx),
+            SyscallNumber::ObjPutSigned => Self::handle_obj_put_signed(args, ctx),
         }
     }
 
@@ -862,6 +864,9 @@ impl SyscallDispatcher {
     /// Args: arg1 = hash_ptr (user vaddr, 32 bytes), arg2 = out_buf, arg3 = out_buf_len
     ///
     /// Returns bytes written on success, or negative error.
+    /// Verifies the object's Ed25519 signature before returning content.
+    /// Objects with empty (unsigned) signatures are returned without verification
+    /// (graceful degradation for legacy/unsigned objects).
     ///
     /// Lock ordering: OBJECT_STORE(8) only.
     fn handle_obj_get(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
@@ -886,6 +891,16 @@ impl SyscallDispatcher {
             crate::fs::StoreError::NotFound => SyscallError::EndpointNotFound,
             _ => SyscallError::InvalidArg,
         })?;
+
+        // Verify signature if the object is signed (non-empty signature).
+        // Unsigned objects (empty signature) are returned as-is for backward
+        // compatibility — the caller can check the signature field if needed.
+        if !obj.signature.is_empty_sig() {
+            if !crate::fs::verify_signature(&obj.owner, &obj.content, &obj.signature) {
+                drop(store_guard);
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
 
         let copy_len = core::cmp::min(obj.content.len(), out_buf_len);
         let content_slice = &obj.content[..copy_len];
@@ -982,5 +997,132 @@ impl SyscallDispatcher {
         }
 
         Ok(count as u64)
+    }
+
+    // ========================================================================
+    // Key Store syscalls
+    // ========================================================================
+
+    /// SYS_CLAIM_BOOTSTRAP_KEY: One-shot delivery of the bootstrap secret key.
+    ///
+    /// Args: arg1 = out_sk_ptr (user vaddr, must hold 64 bytes)
+    ///
+    /// Writes the 64-byte Ed25519 secret key to the caller's buffer, then
+    /// permanently zeroes the kernel's copy. Restricted to the bootstrap
+    /// Principal. Fails if the key has already been claimed.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) only (BOOTSTRAP_SECRET_KEY is
+    /// independent of the lock hierarchy — single atomic claim operation).
+    fn handle_claim_bootstrap_key(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let out_sk_ptr = args.arg1;
+
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Verify caller holds the bootstrap Principal
+        let principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        };
+
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        if principal != bootstrap {
+            return Err(SyscallError::PermissionDenied);
+        }
+
+        // Claim the key (one-shot: returns None if already claimed)
+        let sk = crate::BOOTSTRAP_SECRET_KEY
+            .claim()
+            .ok_or(SyscallError::PermissionDenied)?;
+
+        // Write 64-byte secret key to user buffer
+        write_user_buffer(ctx.cr3, out_sk_ptr, &sk)?;
+
+        crate::println!("  [ClaimBootstrapKey] pid={} — key claimed, kernel copy zeroed", ctx.process_id.0);
+
+        Ok(64)
+    }
+
+    /// SYS_OBJ_PUT_SIGNED: Store a pre-signed ArcObject.
+    ///
+    /// Args: arg1 = content_ptr, arg2 = content_len, arg3 = sig_ptr (64 bytes),
+    ///        arg4 = out_hash_ptr (32 bytes)
+    ///
+    /// Like ObjPut but accepts a pre-computed Ed25519 signature. The kernel
+    /// verifies the signature against the caller's Principal before storing.
+    /// This is the path for signed objects when the key-store service holds
+    /// the private key.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(8) — sequential.
+    fn handle_obj_put_signed(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let content_ptr = args.arg1;
+        let content_len = args.arg_usize(2);
+        let sig_ptr = args.arg3;
+        let out_hash = args.arg4;
+
+        if content_len == 0 || content_len > MAX_USER_BUFFER {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Read content from user buffer
+        let mut kbuf = [0u8; 4096];
+        let copied = read_user_buffer(ctx.cr3, content_ptr, content_len, &mut kbuf)?;
+
+        // Read 64-byte signature from user buffer
+        let mut sig_bytes = [0u8; 64];
+        read_user_buffer(ctx.cr3, sig_ptr, 64, &mut sig_bytes)?;
+        let signature = crate::fs::SignatureBytes { data: sig_bytes };
+
+        // Get caller's Principal
+        let principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        };
+
+        // Verify the signature against the caller's Principal and content
+        if !crate::fs::verify_signature(&principal.public_key, &kbuf[..copied], &signature) {
+            return Err(SyscallError::PermissionDenied);
+        }
+
+        // Get current time for created_at
+        let ticks = crate::scheduler::Timer::get_ticks();
+
+        // Create ArcObject with the verified signature
+        let content_vec = {
+            extern crate alloc;
+            let mut v = alloc::vec::Vec::with_capacity(copied);
+            v.extend_from_slice(&kbuf[..copied]);
+            v
+        };
+        let mut obj = crate::fs::ArcObject::new(principal, content_vec, ticks);
+        obj.signature = signature;
+        let hash = obj.content_hash;
+
+        // Store in OBJECT_STORE (lock position 8)
+        let mut store_guard = crate::OBJECT_STORE.lock();
+        let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+        use crate::fs::ObjectStore;
+        store.put(obj).map_err(|e| match e {
+            crate::fs::StoreError::CapacityExceeded => SyscallError::OutOfMemory,
+            crate::fs::StoreError::InvalidObject => SyscallError::InvalidArg,
+            _ => SyscallError::InvalidArg,
+        })?;
+        drop(store_guard);
+
+        // Write hash to user buffer
+        write_user_buffer(ctx.cr3, out_hash, &hash)?;
+
+        Ok(0)
     }
 }

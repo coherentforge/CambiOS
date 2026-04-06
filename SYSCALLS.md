@@ -1,14 +1,18 @@
 # ArcOS Syscalls
 
-This document describes the syscall interface that userspace processes (drivers, services) use to request kernel services.
+This document describes the syscall interface that userspace processes (drivers, services) use to request kernel services. All 18 syscalls are fully implemented in [`src/syscalls/dispatcher.rs`](src/syscalls/dispatcher.rs).
 
 ## Overview
 
-Syscalls are the interface between userspace and the microkernel. When a driver needs kernel assistance (memory allocation, IPC, interrupts), it invokes a syscall.
+Syscalls are the interface between userspace and the microkernel. When a driver or service needs kernel assistance (memory allocation, IPC, interrupts, identity, object storage), it invokes a syscall. Every syscall passes through a zero-trust interceptor pre-check before dispatch.
 
-## ABI: x86-64 System V Convention
+User-space buffer access is performed via page-table walks through the process's page table root (CR3 on x86_64, TTBR0 on AArch64) using the HHDM. Buffers are capped at 4KB per syscall.
 
-All syscalls follow the x86-64 System V ABI:
+## ABI
+
+### x86_64 — SYSCALL/SYSRET
+
+The `syscall` instruction traps into the kernel. Entry point: [`src/arch/x86_64/syscall.rs`](src/arch/x86_64/syscall.rs).
 
 | Register | Purpose |
 |----------|---------|
@@ -16,238 +20,171 @@ All syscalls follow the x86-64 System V ABI:
 | RDI | First argument |
 | RSI | Second argument |
 | RDX | Third argument |
-| RCX | Fourth argument |
+| RCX | Fourth argument (clobbered by `syscall` — saved/restored by kernel) |
 | R8  | Fifth argument |
 | R9  | Sixth argument |
 
-Return values:
-- **Positive/zero**: Success (often a count, pointer, or resource ID)
-- **Negative**: Error code (see SyscallError enum)
+### AArch64 — SVC
+
+The `svc #0` instruction generates a synchronous exception routed via VBAR_EL1. Entry point: [`src/arch/aarch64/syscall.rs`](src/arch/aarch64/syscall.rs). The exception handler verifies ESR_EL1 EC=0x15 (SVC from AArch64).
+
+| Register | Purpose |
+|----------|---------|
+| x8 | Syscall number |
+| x0-x5 | Arguments |
+| x0 | Return value |
+
+### Return Convention
+
+- **Positive/zero**: Success (count, pointer, resource ID, or 0 for void-like calls)
+- **Negative**: Error code (see [Error Codes](#error-codes))
+
+---
 
 ## Syscall Reference
 
 ### SYS_EXIT (0)
 
-Terminate the calling process.
+Terminate the calling task. Marks the task as `Terminated` in the per-CPU scheduler. The next timer tick will context-switch away.
 
-```c
+```
 void sys_exit(int exit_code);
 ```
 
-**Arguments:**
-- `exit_code` (RDI): Exit code (typically 0 for success)
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| exit_code | RDI / x0 | Exit code (0 = success) |
 
-**Returns:** Never returns; process is terminated
-
-**Errors:** None (always terminates)
-
-**Example:**
-```rust
-if error {
-    sys_exit(1);
-}
-```
+**Returns:** Technically returns the exit code, but the task is terminated and will not execute further.
 
 ---
 
 ### SYS_WRITE (1)
 
-Send data through a message endpoint.
+Send data through an IPC endpoint. The kernel reads the user buffer via page-table walk, builds an IPC `Message` with `sender_principal` stamped by the kernel (unforgeable), and enqueues it after capability + interceptor checks.
 
-```c
+```
 ssize_t sys_write(uint32_t endpoint_id, const void *buffer, size_t len);
 ```
 
-**Arguments:**
-- `endpoint_id` (RDI): Target endpoint ID
-- `buffer` (RSI): Pointer to data to send
-- `len` (RDX): Number of bytes to send
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| endpoint_id | RDI / x0 | Target endpoint ID |
+| buffer | RSI / x1 | Pointer to data to send |
+| len | RDX / x2 | Bytes to send (max 256) |
 
-**Returns:**
-- ≥0: Number of bytes written
-- <0: Error code (EACCES, ENOENT, etc.)
+**Returns:** Bytes written on success.
 
-**Errors:**
-- `PermissionDenied (-2)`: No SEND capability on endpoint
-- `EndpointNotFound (-4)`: Endpoint doesn't exist
-
-**Example:**
-```rust
-let data = b"Hello, driver!";
-let n = sys_write(SERIAL_ENDPOINT, data.as_ptr(), data.len());
-if n < 0 {
-    println!("Write failed: {}", n);
-}
-```
+**Errors:** `PermissionDenied` (no SEND capability), `InvalidArg` (bad buffer/len)
 
 ---
 
 ### SYS_READ (2)
 
-Receive data from a message endpoint.
+Receive data from an IPC endpoint. Dequeues a message after capability + interceptor checks, then writes the payload to the user buffer.
 
-```c
+```
 ssize_t sys_read(uint32_t endpoint_id, void *buffer, size_t max_len);
 ```
 
-**Arguments:**
-- `endpoint_id` (RDI): Source endpoint ID
-- `buffer` (RSI): Pointer to receive buffer
-- `max_len` (RDX): Maximum bytes to read
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| endpoint_id | RDI / x0 | Source endpoint ID |
+| buffer | RSI / x1 | Receive buffer |
+| max_len | RDX / x2 | Max bytes to read (max 256) |
 
-**Returns:**
-- ≥0: Number of bytes read (0 if queue empty, blocks if capability allows)
-- <0: Error code
+**Returns:** Bytes read (0 if queue empty).
 
-**Errors:**
-- `PermissionDenied (-2)`: No RECEIVE capability on endpoint
-- `EndpointNotFound (-4)`: Endpoint doesn't exist
-- `WouldBlock (-5)`: Non-blocking read, no data available
-
-**Example:**
-```rust
-let mut buf = [0u8; 256];
-let n = sys_read(SERIAL_ENDPOINT, &mut buf as *mut _ as *mut u8, buf.len());
-if n > 0 {
-    println!("Read {} bytes", n);
-}
-```
+**Errors:** `PermissionDenied` (no RECEIVE capability), `InvalidArg` (bad buffer/len)
 
 ---
 
 ### SYS_ALLOCATE (3)
 
-Allocate memory for the process.
+Allocate memory for the calling process. Assigns a virtual region via the process VMA tracker, allocates physical frames (per-CPU cache fast path), zeroes them, and maps into the process page table.
 
-```c
+Includes full rollback on OOM: unmaps already-mapped pages, frees frames, removes VMA entry.
+
+```
 void* sys_allocate(size_t size, uint32_t flags);
 ```
 
-**Arguments:**
-- `size` (RDI): Number of bytes to allocate
-- `flags` (RSI): Allocation flags (reserved, pass 0)
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| size | RDI / x0 | Bytes to allocate (max 1MB) |
+| flags | RSI / x1 | Reserved (pass 0) |
 
-**Returns:**
-- Non-zero: Virtual address of allocated memory
-- 0: Allocation failed
+**Returns:** User virtual address of allocation, or 0 on failure.
 
-**Errors:** (implicit in return value)
-- Out of memory
-- Invalid size
-
-**Example:**
-```rust
-let ptr = sys_allocate(4096, 0);
-if ptr != 0 {
-    let buf = unsafe {
-        core::slice::from_raw_parts_mut(ptr as *mut u8, 4096)
-    };
-    buf.fill(0);
-}
-```
+**Errors:** `InvalidArg` (size 0, >1MB, or kernel task), `OutOfMemory`
 
 ---
 
 ### SYS_FREE (4)
 
-Free previously allocated memory.
+Free previously allocated memory. Looks up the allocation in the process VMA tracker, unmaps all pages, returns frames to the per-CPU cache, removes the VMA entry.
 
-```c
+```
 int sys_free(void* ptr, size_t size);
 ```
 
-**Arguments:**
-- `ptr` (RDI): Pointer to free
-- `size` (RSI): Size of allocation (must match original)
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| ptr | RDI / x0 | Virtual address to free |
+| size | RSI / x1 | Ignored (VMA tracks actual size) |
 
-**Returns:**
-- 0: Success
-- <0: Error code
+**Returns:** 0 on success.
 
-**Errors:**
-- `InvalidArg (-1)`: Invalid pointer or size mismatch
-
-**Example:**
-```rust
-sys_free(ptr, 4096)?;
-```
+**Errors:** `InvalidArg` (null pointer, kernel address, unknown VMA)
 
 ---
 
 ### SYS_WAIT_IRQ (5)
 
-Wait for a specific hardware interrupt to fire.
+Block until a specific hardware interrupt fires. Registers the calling task as the handler for the IRQ, pins the task to the current CPU, routes the IRQ to that CPU (I/O APIC on x86_64, GIC SPI enable on AArch64), and blocks the task.
 
-```c
+```
 int sys_wait_irq(uint32_t irq_number);
 ```
 
-**Arguments:**
-- `irq_number` (RDI): IRQ number to wait for (0-15 for PC)
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| irq_number | RDI / x0 | IRQ number (0-223) |
 
-**Returns:**
-- 0: Interrupt fired
-- <0: Error code
+**Returns:** 0 when the interrupt fires.
 
-**Errors:**
-- `PermissionDenied (-2)`: Process not authorized for this IRQ
-- `InvalidArg (-1)`: Invalid IRQ number
-
-**Example:**
-```rust
-// Register keyboard driver for IRQ 1
-sys_wait_irq(1);  // Blocks until keyboard interrupt
-// ... handle interrupt ...
-sys_wait_irq(1);  // Wait for next interrupt
-```
+**Errors:** `InvalidArg` (IRQ >= 224 or block failed)
 
 ---
 
 ### SYS_REGISTER_ENDPOINT (6)
 
-Register a new message endpoint for this process.
+Register a message endpoint and grant the calling process full capabilities (send/recv/delegate) on it.
 
-```c
+```
 int sys_register_endpoint(uint32_t endpoint_id, uint32_t flags);
 ```
 
-**Arguments:**
-- `endpoint_id` (RDI): Endpoint number to register
-- `flags` (RSI): Flags (reserved, pass 0)
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| endpoint_id | RDI / x0 | Endpoint to register |
+| flags | RSI / x1 | Reserved (pass 0) |
 
-**Returns:**
-- 0: Success
-- <0: Error code
+**Returns:** 0 on success.
 
-**Errors:**
-- `InvalidArg (-1)`: Endpoint already registered
-- `PermissionDenied (-2)`: Not allowed to register this endpoint
-
-**Example:**
-```rust
-sys_register_endpoint(10, 0)?;  // Register endpoint 10
-// Now this process can send/receive on endpoint 10
-```
+**Errors:** `EndpointNotFound` (id >= MAX_ENDPOINTS), `PermissionDenied`
 
 ---
 
 ### SYS_YIELD (7)
 
-Voluntarily yield the CPU to the scheduler.
+Voluntarily yield the CPU. Sets the calling task Ready with zero time remaining, causing the scheduler to pick another task on the next timer tick.
 
-```c
+```
 int sys_yield(void);
 ```
 
-**Arguments:** None
-
-**Returns:** 0 (always succeeds)
-
-**Example:**
-```rust
-// Let another task run
-sys_yield();
-```
+**Returns:** 0 (always succeeds).
 
 ---
 
@@ -255,127 +192,274 @@ sys_yield();
 
 Get the current process ID.
 
-```c
+```
 uint32_t sys_get_pid(void);
 ```
 
-**Arguments:** None
-
-**Returns:** Process ID of calling process
-
-**Example:**
-```rust
-let my_pid = sys_get_pid();
-println!("I am process {}", my_pid);
-```
+**Returns:** Process ID of the calling task.
 
 ---
 
 ### SYS_GET_TIME (9)
 
-Get the current system time in scheduler ticks.
+Get the current system time in scheduler ticks (monotonically increasing, 100Hz).
 
-```c
+```
 uint64_t sys_get_time(void);
 ```
 
-**Arguments:** None
+**Returns:** Tick count.
 
-**Returns:** System time in ticks (monotonic increasing)
+---
 
-**Example:**
-```rust
-let t0 = sys_get_time();
-do_work();
-let t1 = sys_get_time();
-println!("Took {} ticks", t1 - t0);
+### SYS_PRINT (10)
+
+Print a user-provided string to the kernel serial console. Reads the buffer via page-table walk. Intended for debugging.
+
 ```
+ssize_t sys_print(const void *buffer, size_t len);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| buffer | RDI / x0 | String buffer (user vaddr) |
+| len | RSI / x1 | Bytes to print (max 256) |
+
+**Returns:** Bytes printed.
+
+**Errors:** `InvalidArg` (len 0 or >256, bad buffer)
+
+---
+
+### SYS_BIND_PRINCIPAL (11)
+
+Bind a cryptographic Principal (32-byte Ed25519 public key) to a process. **Restricted:** only callable by a process whose own Principal matches the bootstrap Principal.
+
+```
+int sys_bind_principal(uint32_t process_id, const void *pubkey, uint32_t pubkey_len);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| process_id | RDI / x0 | Target process to bind |
+| pubkey | RSI / x1 | 32-byte public key (user vaddr) |
+| pubkey_len | RDX / x2 | Must be 32 |
+
+**Returns:** 0 on success.
+
+**Errors:** `InvalidArg` (len != 32), `PermissionDenied` (caller is not bootstrap Principal)
+
+---
+
+### SYS_GET_PRINCIPAL (12)
+
+Read the calling process's bound Principal (32-byte public key).
+
+```
+int sys_get_principal(void *out_buf, uint32_t buf_len);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| out_buf | RDI / x0 | Output buffer (user vaddr) |
+| buf_len | RSI / x1 | Must be >= 32 |
+
+**Returns:** 32 on success (bytes written).
+
+**Errors:** `InvalidArg` (buf_len < 32, no Principal bound)
+
+---
+
+### SYS_RECV_MSG (13)
+
+Receive an IPC message with sender identity metadata. Unlike `SYS_READ`, the response includes the sender's Principal and originating endpoint.
+
+```
+ssize_t sys_recv_msg(uint32_t endpoint_id, void *buf, size_t buf_len);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| endpoint_id | RDI / x0 | Endpoint to receive from |
+| buf | RSI / x1 | Output buffer (user vaddr) |
+| buf_len | RDX / x2 | Buffer size (must be >= 36) |
+
+**Response layout:**
+```
+[sender_principal: 32 bytes][from_endpoint: 4 bytes LE][payload: N bytes]
+```
+
+**Returns:** Total bytes written (>= 36), or 0 if no message.
+
+**Errors:** `InvalidArg` (buf_len < 36), `PermissionDenied` (no RECEIVE capability)
+
+---
+
+### SYS_OBJ_PUT (14)
+
+Store an ArcObject in the kernel object store. The caller's Principal becomes both author and owner. Content is hashed (FNV-1a, Phase 0) and stored.
+
+```
+ssize_t sys_obj_put(const void *content, size_t content_len, void *out_hash);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| content | RDI / x0 | Object content (user vaddr) |
+| content_len | RSI / x1 | Content size (1-4096 bytes) |
+| out_hash | RDX / x2 | 32-byte output for content hash |
+
+**Returns:** 0 on success.
+
+**Errors:** `InvalidArg` (empty/oversized content, kernel task), `PermissionDenied` (no Principal bound), `OutOfMemory` (store at capacity — 256 objects max)
+
+---
+
+### SYS_OBJ_GET (15)
+
+Retrieve object content by its 32-byte content hash.
+
+```
+ssize_t sys_obj_get(const void *hash, void *out_buf, size_t out_buf_len);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| hash | RDI / x0 | 32-byte content hash (user vaddr) |
+| out_buf | RSI / x1 | Output buffer |
+| out_buf_len | RDX / x2 | Buffer size |
+
+**Returns:** Bytes written (may be less than content if buffer is smaller).
+
+**Errors:** `InvalidArg` (bad buffer, kernel task), `EndpointNotFound` (hash not in store — reuses error code)
+
+---
+
+### SYS_OBJ_DELETE (16)
+
+Delete an object from the store. **Ownership enforced:** only the object's owner can delete it.
+
+```
+ssize_t sys_obj_delete(const void *hash);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| hash | RDI / x0 | 32-byte content hash (user vaddr) |
+
+**Returns:** 0 on success.
+
+**Errors:** `InvalidArg` (kernel task), `PermissionDenied` (caller is not owner or has no Principal), `EndpointNotFound` (hash not in store)
+
+---
+
+### SYS_OBJ_LIST (17)
+
+List all object hashes in the store. Writes packed 32-byte hashes to the user buffer.
+
+```
+ssize_t sys_obj_list(void *out_buf, size_t out_buf_len);
+```
+
+| Arg | Register (x86/arm) | Description |
+|-----|---------------------|-------------|
+| out_buf | RDI / x0 | Output buffer for packed hashes |
+| out_buf_len | RSI / x1 | Buffer size (must be >= 32) |
+
+**Returns:** Number of objects listed (not bytes — each is 32 bytes).
+
+**Errors:** `InvalidArg` (kernel task, buffer < 32 bytes)
 
 ---
 
 ## Error Codes
 
-All error-returning syscalls use negative return values:
-
 | Error | Value | Meaning |
 |-------|-------|---------|
 | Success | 0 | Operation succeeded |
-| InvalidArg | -1 | Invalid argument |
-| PermissionDenied | -2 | Insufficient capabilities |
-| OutOfMemory | -3 | No memory available |
-| EndpointNotFound | -4 | Endpoint doesn't exist |
-| WouldBlock | -5 | Operation would block (future) |
-| Interrupted | -6 | Interrupted by signal (future) |
-| Enosys | -38 | Unknown syscall |
+| InvalidArg | -1 | Invalid argument (bad pointer, size, etc.) |
+| PermissionDenied | -2 | Insufficient capabilities or identity check failed |
+| OutOfMemory | -3 | No memory or store capacity available |
+| EndpointNotFound | -4 | Endpoint or object hash doesn't exist |
+| WouldBlock | -5 | Non-blocking operation, no data available |
+| Interrupted | -6 | Interrupted by signal (reserved) |
+| Enosys | -38 | Unknown syscall number |
 
 ## Capability-Based Access Control
 
-All IPC syscalls (`sys_write`, `sys_read`, `sys_register_endpoint`) are subject to capability checks.
+All IPC syscalls are subject to capability checks via [`src/ipc/capability.rs`](src/ipc/capability.rs):
 
-- **SYS_WRITE**: Requires SEND capability on target endpoint
-- **SYS_READ**: Requires RECEIVE capability on source endpoint
-- **SYS_REGISTER_ENDPOINT**: Requires special privilege (only kernel can grant)
+- **SYS_WRITE / SYS_READ / SYS_RECV_MSG**: Require SEND or RECEIVE capability on the endpoint
+- **SYS_REGISTER_ENDPOINT**: Grants FULL capability (send/recv/delegate) to the caller
 
-The kernel's capability manager (see [../src/ipc/capability.rs](../src/ipc/capability.rs)) controls which processes can communicate.
+Additionally, the zero-trust interceptor ([`src/ipc/interceptor.rs`](src/ipc/interceptor.rs)) runs a pre-dispatch policy check on every syscall and enforces send/recv hooks on IPC operations.
+
+## Identity-Aware IPC
+
+IPC messages carry an unforgeable `sender_principal` field, stamped by the kernel in `send_message_with_capability()`. This enables receiver-side identity verification without trusting the sender's self-reported identity. `SYS_RECV_MSG` exposes this metadata to userspace.
+
+The bootstrap Principal (deterministic seed in Phase 0, real entropy planned for Phase 1) is bound to kernel processes at boot and is the only identity authorized to call `SYS_BIND_PRINCIPAL`.
 
 ## Usage Patterns
 
-### Simple Driver: Keyboard Handler
+### FS Service (real example — [`user/fs-service/`](user/fs-service/))
+
+The filesystem service runs on endpoint 16 and demonstrates the full syscall surface:
 
 ```rust
-// Initialize
-sys_register_endpoint(10, 0)?;
+// Register endpoint and enter service loop
+sys_register_endpoint(16, 0);
 
-// Main loop
 loop {
-    // Wait for keyboard interrupt
-    sys_wait_irq(1);
-    
-    // Read keyboard data
-    let mut buf = [0u8; 256];
-    let n = sys_read(10, &mut buf, buf.len())?;
-    
-    // Process keyboard event
-    handle_keyboard(&buf[..n as usize]);
+    // Identity-aware receive
+    let n = sys_recv_msg(16, buf, buf_len);
+    if n == 0 { sys_yield(); continue; }
+
+    // Parse: [principal:32][endpoint:4][command|payload]
+    let sender = &buf[0..32];
+    let cmd = buf[36];
+
+    match cmd {
+        CMD_PUT => {
+            let hash = sys_obj_put(&buf[37..], content_len, &mut hash_buf);
+            sys_write(from_endpoint, &response, resp_len);
+        }
+        CMD_GET => {
+            let n = sys_obj_get(&hash, &mut content_buf, buf_len);
+            sys_write(from_endpoint, &content_buf[..n], n);
+        }
+        CMD_DELETE => {
+            sys_obj_delete(&hash);  // Ownership enforced by kernel
+        }
+        CMD_LIST => {
+            let count = sys_obj_list(&mut list_buf, list_buf_len);
+            sys_write(from_endpoint, &list_buf, count * 32);
+        }
+    }
 }
 ```
 
-### Message-Passing Service
+### Device Driver Pattern
 
 ```rust
-// Register endpoints
-sys_register_endpoint(20, 0)?;  // Incoming requests
-sys_register_endpoint(21, 0)?;  // Outgoing responses
+// Register endpoint for driver communication
+sys_register_endpoint(DRIVER_ENDPOINT, 0);
 
-// Main loop
 loop {
-    // Wait for request
-    let mut req = [0u8; 256];
-    let n = sys_read(20, &mut req, req.len())?;
-    
-    // Process and generate response
-    let response = process_request(&req[..n]);
-    
-    // Send response
-    sys_write(21, response.as_ptr(), response.len())?;
+    // Block until hardware interrupt fires
+    // (pins task to CPU, routes IRQ via I/O APIC or GIC)
+    sys_wait_irq(IRQ_NUMBER);
+
+    // Handle interrupt, send data to consumers
+    let data = read_device_registers();
+    sys_write(DRIVER_ENDPOINT, &data, data.len());
 }
 ```
-
-## Known Limitations
-
-Current implementation is **stub/placeholder**:
-- Syscalls log but don't fully implement behavior
-- Direct IPC through global structures (not via `syscall` instruction)
-- No actual system call traps to privileged mode
-- Memory allocation returns dummy addresses
-
-This will be replaced with full implementation as ArcOS development continues.
 
 ## Future Enhancements
 
-- [ ] Non-blocking I/O syscalls
-- [ ] Signal handling (SYS_SIGNAL, SYS_SIGACTION)
-- [ ] Memory protection (SYS_MPROTECT, SYS_MMAP)
-- [ ] Process creation (SYS_FORK, SYS_EXEC)
-- [ ] Device I/O (SYS_IOCTL)
-- [ ] Timing (SYS_NANOSLEEP, SYS_CLOCK_GETTIME)
+- AArch64 user-space syscall wrappers (fs-service currently x86_64 only)
+- `SYS_MPROTECT` — change page permissions on existing mappings
+- `SYS_SPAWN` — create a new process from an ELF image
+- `SYS_NANOSLEEP` / `SYS_CLOCK_GETTIME` — wall-clock time
+- Blake3 content hashing + Ed25519 signature verification (Phase 1B)

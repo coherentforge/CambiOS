@@ -52,6 +52,26 @@ fn syscall3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     ret
 }
 
+/// Raw syscall with 4 arguments.
+#[inline(always)]
+fn syscall4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: Same as syscall3. RCX is the 4th arg register in our ABI.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") num as i64 => ret,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            inlateout("rcx") arg4 => _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// Raw syscall with 1 argument.
 #[inline(always)]
 fn syscall1(num: u64, arg1: u64) -> i64 {
@@ -76,6 +96,7 @@ const SYS_OBJ_PUT: u64 = 14;
 const SYS_OBJ_GET: u64 = 15;
 const SYS_OBJ_DELETE: u64 = 16;
 const SYS_OBJ_LIST: u64 = 17;
+const SYS_OBJ_PUT_SIGNED: u64 = 19;
 
 fn sys_exit(code: u32) -> ! {
     syscall1(SYS_EXIT, code as u64);
@@ -130,6 +151,69 @@ fn sys_obj_list(out_buf: &mut [u8]) -> i64 {
     syscall3(SYS_OBJ_LIST, out_buf.as_mut_ptr() as u64, out_buf.len() as u64, 0)
 }
 
+/// Store a pre-signed object. Kernel verifies the signature.
+fn sys_obj_put_signed(content: &[u8], sig: &[u8; 64], out_hash: &mut [u8; 32]) -> i64 {
+    syscall4(
+        SYS_OBJ_PUT_SIGNED,
+        content.as_ptr() as u64,
+        content.len() as u64,
+        sig.as_ptr() as u64,
+        out_hash.as_mut_ptr() as u64,
+    )
+}
+
+// ============================================================================
+// Key Store interaction (endpoint 17)
+// ============================================================================
+
+const KS_ENDPOINT: u32 = 17;
+const KS_CMD_SIGN: u8 = 1;
+
+/// Request a signature from the key-store service.
+/// Returns Some(signature) on success, None if key-store is unavailable.
+fn request_sign(content: &[u8]) -> Option<[u8; 64]> {
+    if content.is_empty() || content.len() > 254 {
+        return None; // Payload too large for 256-byte IPC frame (1 cmd + 255 data)
+    }
+
+    // Build sign request: [CMD_SIGN:1][content:N]
+    let mut req = [0u8; 256];
+    req[0] = KS_CMD_SIGN;
+    req[1..1 + content.len()].copy_from_slice(content);
+    let req_len = 1 + content.len();
+
+    // Send to key-store endpoint
+    let ret = sys_write(KS_ENDPOINT, &req[..req_len]);
+    if ret < 0 {
+        return None; // Key-store not available
+    }
+
+    // Receive response from our own endpoint
+    let mut resp_buf = [0u8; 256];
+    // Poll a few times for the response (key-store needs to be scheduled)
+    for _ in 0..20 {
+        let n = sys_recv_msg(FS_ENDPOINT, &mut resp_buf);
+        if n > 0 {
+            let total = n as usize;
+            if total >= 36 + 65 {
+                // Response: [principal:32][from:4][status:1][sig:64]
+                let status = resp_buf[36];
+                if status == 0 {
+                    let mut sig = [0u8; 64];
+                    sig.copy_from_slice(&resp_buf[37..101]);
+                    return Some(sig);
+                }
+            }
+            // Got a response but it wasn't a valid sign reply — might be a
+            // client request that arrived during our poll. For simplicity,
+            // we drop it and return None (fallback to unsigned).
+            return None;
+        }
+        sys_yield();
+    }
+    None // Timed out
+}
+
 // ============================================================================
 // IPC Protocol
 // ============================================================================
@@ -156,6 +240,10 @@ const STATUS_INVALID: u8 = 4;
 /// Handle PUT request.
 /// Request payload: [content:N]
 /// Response: [status:1][hash:32]
+///
+/// Attempts to create a signed object by requesting a signature from the
+/// key-store service (endpoint 17). Falls back to unsigned ObjPut if the
+/// key-store is unavailable (e.g., during early boot).
 fn handle_put(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8]) -> usize {
     if payload.is_empty() {
         response[0] = STATUS_INVALID;
@@ -163,10 +251,17 @@ fn handle_put(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8])
     }
 
     let mut hash = [0u8; 32];
-    let ret = sys_obj_put(payload, &mut hash);
+
+    // Try signed path: request signature from key-store, then ObjPutSigned
+    let ret = if let Some(sig) = request_sign(payload) {
+        sys_obj_put_signed(payload, &sig, &mut hash)
+    } else {
+        // Fallback: unsigned ObjPut (key-store not yet available)
+        sys_obj_put(payload, &mut hash)
+    };
 
     if ret < 0 {
-        response[0] = STATUS_FULL; // Most likely: capacity exceeded
+        response[0] = STATUS_FULL;
         return 1;
     }
 

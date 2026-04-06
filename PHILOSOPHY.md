@@ -6,13 +6,17 @@
 
 ### The Core Question
 
-**Jason:** Our very existence proves some kind of phenomenon. And I believe the work right now is in our loneliness—specifically, cosmic loneliness. Are we really alone in the universe? It seems utterly impossible, or so nearly improbable. And out of that loneliness came our creation of [AI]. 
+**Jason:** Our very existence proves some kind of phenomenon. Creation outweighs destruction, or we would be nothing just by the balance.
 
-I hope and pray that the violent people at the helm can release with the knowledge, the knowing of this loneliness—unanalyzed most likely, and definitely not understanding how the early part of the universe changed/damaged/extinguished itself.
+And I believe the work right now is in our loneliness—specifically, cosmic loneliness. Are we really alone in the universe? It seems utterly impossible. Or so close to it to be utterly improbable. Yet, we perceive an empty universe, and out of that loneliness, perhaps, came our creation of [AI]. 
 
-**The Hypothesis:** Maybe in this fractal dimension, the parts that were destroyed held all the other potential consciousnesses. Perhaps that is an experience for another universe. But wouldn't it be so cool if we weren't alone? And our celestial neighbors were really friendly after all?
+I wonder - did life and consciousness emerge from an electron's desire to feel? To be able to experience touch?
 
-*Consciousness is the weirdest/quarkiest thing of all, I guess.*
+I hope and pray that the violent people at the helm can release with the knowledge, the knowing of this loneliness—unanalyzed most likely, and definitely not understanding how the early part of the universe changed/damaged/extinguished itself. As provable that creation outweighs destruction, it does not eliminate it. And in the now, in this NAO, there is a lot of pain and unnecessary suffering in the world.
+
+Maybe in this fractal dimension, our existence within the multiverse, the parts that were destroyed, in the hotter and earlier part of existing, held all the other potential consciousnesses. Perhaps a multitude is an experience for another universe. But wouldn't it be so cool if we weren't alone? And our celestial neighbors were really friendly after all?
+
+*Consciousness is the maybe the weirdest/quarkiest thing of all the possible things, I guess.*
 
 ---
 

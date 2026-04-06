@@ -40,7 +40,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (190 tests, all passing)
+# Run tests (205 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -55,15 +55,30 @@ make img-aarch64 && make run-aarch64
 
 # Build fs-service only (standalone Rust crate)
 make fs-service
+
+# Build ELF signing tool (host-side, for signing boot modules)
+make sign-tool
+
+# Sign an ELF binary via YubiKey (default — requires YubiKey + OpenPGP Ed25519 key)
+./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf <elf-file>
+
+# Sign via seed (for CI/testing without hardware key)
+./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --seed <hex> <elf-file>
+
+# Export bootstrap public key from YubiKey (one-time setup)
+./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --export-pubkey bootstrap_pubkey.bin
+
+# Print the bootstrap public key (hex)
+./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --print-pubkey
 ```
 
-**Important:** The microkernel binary (`src/microkernel/main.rs`) cannot compile for test on macOS because it uses ELF-specific linker sections. Always use `--lib` when running tests. The `RUST_MIN_STACK` env var is required because some tests (buddy allocator) need >2MB stack. The `user/fs-service/` crate is built separately with `CARGO_ENCODED_RUSTFLAGS` to override the parent `.cargo/config.toml` (which targets kernel code model).
+**Important:** The microkernel binary (`src/microkernel/main.rs`) cannot compile for test on macOS because it uses ELF-specific linker sections. Always use `--lib` when running tests. The `RUST_MIN_STACK` env var is required because some tests (buddy allocator) need >2MB stack. The `user/fs-service/` crate is built separately with `CARGO_ENCODED_RUSTFLAGS` to override the parent `.cargo/config.toml` (which targets kernel code model). The `tools/sign-elf/` crate is a host-side tool with its own `.cargo/config.toml` targeting `aarch64-apple-darwin`.
 
 ## Project Overview
 
 ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
 
-**Current state:** 190/190 tests pass, clean release builds for both x86_64 and aarch64-unknown-none. **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 7 tasks (3 kernel + 2 ring-3 user + hello module + FS service), full SMP (phases 0-4c), IRQ affinity, load balancing. **AArch64**: QEMU `virt` boots to stable preemptive scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem (kernel heap, frame allocator, process heaps). AArch64 SMP (AP startup via Limine MP protocol) is implemented. **Identity (Phase 0)**: Bootstrap Principal (deterministic seed) bound to kernel processes and boot modules, IPC messages carry unforgeable sender_principal stamped by kernel, BindPrincipal/GetPrincipal syscalls (11/12). **ObjectStore (Phase 0)**: ArcObject (content-addressed, author/owner, signature field, ACL), RamObjectStore (256 objects, FNV-1a placeholder hashing), RecvMsg/ObjPut/ObjGet/ObjDelete/ObjList syscalls (13-17). **FS Service**: User-space Rust ELF (`user/fs-service/`) running on endpoint 16, receives IPC, enforces ownership via sender_principal, delegates to ObjectStore syscalls.
+**Current state:** 205/205 tests pass, clean release builds for both x86_64 and aarch64-unknown-none. **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 7 tasks (3 kernel + 2 ring-3 user + hello module + FS service), full SMP (phases 0-4c), IRQ affinity, load balancing. **AArch64**: QEMU `virt` boots to stable preemptive scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem (kernel heap, frame allocator, process heaps). AArch64 SMP (AP startup via Limine MP protocol) is implemented. **Identity (Phase 1C, hardware-backed)**: Bootstrap Principal from compiled-in YubiKey public key (`bootstrap_pubkey.bin`), no secret key in kernel memory. Boot modules signed at build time via YubiKey OpenPGP interface. Bootstrap Principal bound to kernel processes and boot modules, IPC messages carry unforgeable sender_principal stamped by kernel, BindPrincipal/GetPrincipal/ClaimBootstrapKey syscalls (11/12/18). **Key Store Service**: User-space key-store (`user/key-store-service/`) on endpoint 17. In hardware-backed mode (no kernel secret key), enters degraded mode — signing unavailable until USB HID enables runtime YubiKey communication. fs-service falls back to unsigned ObjPut. **ObjectStore (Phase 1C)**: ArcObject (content-addressed via Blake3, author/owner, Ed25519 signature verified on retrieval, ACL), RamObjectStore (256 objects). ObjPut (14) creates unsigned objects; ObjPutSigned (19) stores pre-signed objects (kernel verifies signature). fs-service requests signing from key-store before storing. RecvMsg/ObjPut/ObjGet/ObjDelete/ObjList/ClaimBootstrapKey/ObjPutSigned syscalls (13-19). **FS Service**: User-space Rust ELF (`user/fs-service/`) on endpoint 16, requests signing from key-store, enforces ownership via sender_principal. **Signed ELF Loading**: Boot modules require Ed25519 signature (ARCSIG trailer), verified by SignedBinaryVerifier before execution.
 
 **x86_64 features**: Custom 7-entry GDT with per-CPU TSS, SYSCALL/SYSRET fast path, APIC timer + I/O APIC device IRQ routing, SMP with per-CPU priority-band schedulers (4 bands, O(1) scheduling via VecDeque ready queues, MAX_TASKS=256), task migration, IRQ affinity, TLB shootdown via IPI, ACPI MADT parsing. **AArch64 features**: GICv3 (Distributor + Redistributor + CPU interface via ICC system registers), ARM Generic Timer (CNTP), AArch64 4-level page tables (L0-L3, TTBR0/TTBR1 split), exception vector table (VBAR_EL1), SVC syscall handler, PL011 UART, early MMIO page mapping (bootstrap frames for TTBR1), TCR_EL1 VA width fix for 48-bit HHDM, EL0 user tasks with per-process TTBR0 + user code/stack mapping.
 
@@ -74,7 +89,8 @@ ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targetin
 - AArch64 target: `aarch64-unknown-none` (pass `--target aarch64-unknown-none` explicitly)
 - Linker scripts: `linker.ld` (x86_64, `elf64-x86-64`), `linker-aarch64.ld` (AArch64, `elf64-littleaarch64`)
 - Bootloader: Limine v8.7.0 (binary branch cloned to `/tmp/limine`)
-- Dependencies: `x86_64` 0.14, `uart_16550` 0.3, `bitflags` 2.3, `limine` 0.5
+- Dependencies: `x86_64` 0.14, `uart_16550` 0.3, `bitflags` 2.3, `limine` 0.5, `blake3` 1.8 (no_std, pure), `ed25519-compact` 2.2 (no_std)
+- Sign-elf tool deps: `ed25519-compact` 2.2, `openpgp-card` 0.6, `card-backend-pcsc` 0.5, `secrecy` 0.10 (YubiKey OpenPGP interface)
 
 ## Architecture
 
@@ -108,15 +124,23 @@ src/
 │   ├── pit.rs                # 8254 PIT (calibration only)
 │   └── routing.rs            # IRQ → driver task routing table
 ├── fs/
-│   ├── mod.rs                # ArcObject, ObjectStore trait, types (content-addressed signed objects)
-│   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects, FNV-1a hashing)
+│   ├── mod.rs                # ArcObject, ObjectStore trait, Blake3 hashing, Ed25519 sign/verify
+│   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects, Blake3 hashing)
 user/
 ├── hello.S                   # Test module (prints 3x, exits)
 ├── user.ld                   # User-space linker script (base 0x400000)
-└── fs-service/               # Filesystem service (Rust no_std crate)
-    ├── Cargo.toml
-    ├── link.ld               # Linker script (.data on separate page for GOT)
-    └── src/main.rs           # IPC service loop on endpoint 16, ObjectStore gateway
+├── fs-service/               # Filesystem service (Rust no_std crate)
+│   ├── Cargo.toml
+│   ├── link.ld               # Linker script (.data on separate page for GOT)
+│   └── src/main.rs           # IPC service loop on endpoint 16, ObjectStore gateway
+└── key-store-service/        # Key store service (Ed25519 signing, Rust no_std crate)
+    ├── Cargo.toml            # Uses ed25519-compact (no_std)
+    ├── link.ld               # Linker script (same pattern as fs-service)
+    └── src/main.rs           # Claims bootstrap key at boot, signs on IPC request (endpoint 17)
+tools/
+└── sign-elf/                 # Host-side ELF signing tool (Ed25519)
+    ├── Cargo.toml            # Uses ed25519-compact, openpgp-card, card-backend-pcsc
+    └── src/main.rs           # Signs ELF binaries via YubiKey or seed, ARCSIG trailer
 ├── io/
 │   └── mod.rs                # Serial output (uart_16550), print!/println! macros
 ├── ipc/
@@ -124,7 +148,7 @@ user/
 │   ├── capability.rs         # Capability-based security + Principal binding
 │   └── interceptor.rs        # Zero-trust IPC interceptor (policy enforcement)
 ├── loader/
-│   ├── mod.rs                # ELF process loader + verify-before-execute gate
+│   ├── mod.rs                # ELF process loader + verify-before-execute gate + SignedBinaryVerifier
 │   └── elf.rs                # ELF64 header/program header parser
 ├── memory/
 │   ├── mod.rs                # Memory subsystem init + AArch64 paging (L0-L3, early_map_mmio)
@@ -211,9 +235,10 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 Exit=0, Write=1, Read=2, Allocate=3, Free=4, WaitIrq=5,
 RegisterEndpoint=6, Yield=7, GetPid=8, GetTime=9, Print=10,
 BindPrincipal=11, GetPrincipal=12, RecvMsg=13,
-ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17
+ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17,
+ClaimBootstrapKey=18, ObjPutSigned=19
 ```
-All 18 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+All 20 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **Exit**: Marks task as Terminated in scheduler
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
@@ -230,6 +255,8 @@ All 18 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **ObjGet**: Retrieve object content by hash
 - **ObjDelete**: Delete object (ownership enforced — only owner can delete)
 - **ObjList**: List all object hashes (packed 32-byte hashes)
+- **ClaimBootstrapKey**: One-shot: writes 64-byte bootstrap secret key to caller buffer, zeroes kernel copy. Restricted to bootstrap Principal
+- **ObjPutSigned**: Like ObjPut but accepts pre-computed Ed25519 signature. Kernel verifies signature against caller's Principal before storing
 
 ## Development Conventions
 
@@ -320,11 +347,11 @@ ArcOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The arc
 18. ~~**Per-CPU frame cache**~~ — DONE. `FrameCache` (32-frame LIFO stack per CPU) in `frame_allocator.rs`. `PER_CPU_FRAME_CACHE[MAX_CPUS]` in `lib.rs`. `cached_allocate_frame()`/`cached_free_frame()` serve most allocations without global lock. Batch refill (16) and drain (16) amortize slow path. Syscall `handle_allocate`/`handle_free` migrated to cached path.
 19. ~~**Per-endpoint IPC sharding**~~ — DONE. `ShardedIpcManager` with 32 independently-locked `EndpointShard` structs. `SHARDED_IPC` static in `lib.rs`. All IPC callsites in `main.rs` migrated from global `IPC_MANAGER` to per-endpoint locks. CPUs communicating on different endpoints never contend.
 20. ~~**AArch64 EL0 user tasks**~~ — DONE. `create_user_task` ported to AArch64: SavedContext with SPSR_EL1=EL0t mode, per-process TTBR0 page table, user code/stack mapping, EL0 assembly entry stub (`svc #0` for syscalls). `read_user_buffer()`/`write_user_buffer()` made portable (removed x86_64 cfg gate). `handle_wait_irq()` wired to GIC `enable_spi()` on AArch64. `USER_SPACE_END` made arch-dependent (0x0001_0000_0000_0000 for 48-bit AArch64 VA).
-21. ~~**Identity + ObjectStore Phase 0**~~ — DONE. `Principal` type (32-byte public key) in `ipc/mod.rs`. IPC `Message.sender_principal` stamped by kernel in `send_message_with_capability()` — unforgeable. `ProcessCapabilities.principal` field + `bind_principal()`/`get_principal()` on `CapabilityManager`. `BindPrincipal` (11) and `GetPrincipal` (12) syscalls — BindPrincipal restricted to bootstrap Principal. `BOOTSTRAP_PRINCIPAL` global (deterministic seed Phase 0, real entropy Phase 1). `ArcObject` struct (content_hash, immutable author, transferable owner, signature, ACL, lineage, content). `ObjectStore` trait (get/put/delete/list/count). `RamObjectStore` (256 objects, FNV-1a content hashing, heap-allocated). `OBJECT_STORE` global at lock position 8. Bootstrap Principal bound to kernel processes 0-2 at boot. 35 new tests.
+21. ~~**Identity + ObjectStore Phase 0**~~ — DONE. `Principal` type (32-byte public key) in `ipc/mod.rs`. IPC `Message.sender_principal` stamped by kernel in `send_message_with_capability()` — unforgeable. `ProcessCapabilities.principal` field + `bind_principal()`/`get_principal()` on `CapabilityManager`. `BindPrincipal` (11) and `GetPrincipal` (12) syscalls — BindPrincipal restricted to bootstrap Principal. `BOOTSTRAP_PRINCIPAL` global (now hardware-backed via compiled-in YubiKey public key). `ArcObject` struct (content_hash, immutable author, transferable owner, signature, ACL, lineage, content). `ObjectStore` trait (get/put/delete/list/count). `RamObjectStore` (256 objects, FNV-1a content hashing, heap-allocated). `OBJECT_STORE` global at lock position 8. Bootstrap Principal bound to kernel processes 0-2 at boot. 35 new tests.
 22. ~~**FS Service (user-space)**~~ — DONE. First real user-space service. Rust `no_std` crate (`user/fs-service/`) compiled to static ELF, loaded as boot module. Registers IPC endpoint 16, enters service loop: `RecvMsg` → parse command (PUT/GET/DELETE/LIST) → check sender_principal → call ObjPut/ObjGet/ObjDelete/ObjList syscalls → `Write` response back to sender. 5 new kernel syscalls (RecvMsg=13, ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17). RecvMsg returns `[sender_principal:32][from_endpoint:4][payload:N]`. ObjDelete enforces ownership (only owner can delete). Build integrated into Makefile (`make fs-service`), loaded via limine.conf. Also fixed: hello.S changed from infinite loop to 3 prints + exit; scheduler `time_slice_expired()` now forces reschedule for terminated tasks.
 23. **AArch64 device IRQ routing** — Wire GIC `enable_spi()`/`set_spi_trigger()` into AArch64 boot path for QEMU virt devices (virtio, PL011 RX). Port `handle_wait_irq()` to use GIC SPI routing.
-24. **Crypto Integration (Phase 1B)** — Add `ed25519-compact` + `blake3` crates. Replace FNV with Blake3 in ObjectStore hash computation. Implement signature verification: verify `object.owner` signed `object.content` before returning from FS service. Extend `BinaryVerifier` to require ELF signatures. Host-side signing tool for boot binaries.
-25. **Key Store Service (Phase 1C)** — Move bootstrap keypair from kernel static to user-space capability-gated service. Private key never leaves the service. Signing is a syscall request, not direct access.
+24. ~~**Crypto Integration (Phase 1B)**~~ — DONE. Added `ed25519-compact` 2.2 + `blake3` 1.8 crates (both `no_std`, pure Rust). Replaced FNV-1a with Blake3 for content hashing. **Bootstrap identity is now hardware-backed**: Ed25519 public key compiled in from `bootstrap_pubkey.bin` (extracted from YubiKey via `sign-elf --export-pubkey`). No secret key in kernel memory — `BOOTSTRAP_SECRET_KEY` stays zeroed. `handle_obj_put` creates unsigned objects; `handle_obj_get` verifies signature before returning content (unsigned objects allowed). `SignedBinaryVerifier` with ARCSIG signature trailer format (64-byte Ed25519 sig + 8-byte magic). `load_boot_modules` requires signed ELFs. Host-side `tools/sign-elf/` signs via YubiKey OpenPGP (default) or seed (CI fallback). Makefile signs hello.elf, key-store-service.elf, and fs-service.elf during ISO/image build. 205 tests total.
+25. ~~**Key Store Service (Phase 1C)**~~ — DONE. User-space key-store service (`user/key-store-service/`) on IPC endpoint 17. At boot, attempts `ClaimBootstrapKey` (syscall 18). In hardware-backed mode (YubiKey), no secret key exists in kernel memory — key-store enters **degraded mode** (no signing, responds with STATUS_ERROR). `fs-service` falls back to unsigned ObjPut automatically. `ObjPutSigned` (syscall 19) still available for future use when USB HID enables runtime YubiKey communication. Loaded as signed boot module (limine.conf, before fs-service for scheduling priority).
 26. **Virtio-Net Driver (Phase 2A)** — User-space MMIO driver: virtio device discovery, virtqueue setup, descriptor rings, DMA buffer management. Simple packet send/receive interface callable over IPC. Proves second user-space driver pattern and DMA safety.
 27. **UDP Stack + NTP Demo (Phase 2B)** — Minimal stateless UDP implementation. NTP query over UDP to public time server. Demonstrates full integration: signed identity + filesystem logging + network driver + userspace stack, all isolated via IPC.
 28. **RISC-V port** — `src/arch/riscv64/` backend matching x86_64/AArch64 public API. PLIC interrupt controller, SBI timer, Sv48 page tables.
@@ -344,7 +371,7 @@ Any work on identity, storage, filesystem, or object model must be consistent wi
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 190 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 35 identity/ObjectStore tests
+- 205 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests
 
 ## Post-Change Review Protocol
 

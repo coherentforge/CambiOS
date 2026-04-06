@@ -1,0 +1,3 @@
+# Override parent project's bare-metal target — this is a host tool
+[build]
+target = "aarch64-apple-darwin"

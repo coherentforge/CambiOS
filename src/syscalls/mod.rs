@@ -88,6 +88,17 @@ pub enum SyscallNumber {
     /// obj_list(out_buf: *mut u8, out_buf_len: usize) -> isize
     /// List object hashes. Writes packed 32-byte hashes. Returns count of objects.
     ObjList = 17,
+
+    /// claim_bootstrap_key(out_sk_ptr: *mut u8) -> isize
+    /// One-shot: writes the 64-byte bootstrap Ed25519 secret key to the caller's
+    /// buffer and zeroes the kernel's copy. Restricted to bootstrap Principal.
+    /// Returns 64 on success, negative error if already claimed or unauthorized.
+    ClaimBootstrapKey = 18,
+
+    /// obj_put_signed(content_ptr: *const u8, content_len: usize, sig_ptr: *const u8, out_hash: *mut u8) -> isize
+    /// Store a pre-signed ArcObject. Kernel verifies the Ed25519 signature
+    /// against the caller's Principal before storing. Returns 0 or negative error.
+    ObjPutSigned = 19,
 }
 
 impl SyscallNumber {
@@ -112,6 +123,8 @@ impl SyscallNumber {
             15 => Some(Self::ObjGet),
             16 => Some(Self::ObjDelete),
             17 => Some(Self::ObjList),
+            18 => Some(Self::ClaimBootstrapKey),
+            19 => Some(Self::ObjPutSigned),
             _ => None,
         }
     }

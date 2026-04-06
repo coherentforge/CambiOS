@@ -312,30 +312,78 @@ Signatures from processes are verifiable as deriving from your identity without 
 
 ---
 
+### Revocation Model: Social Blocking + Eventual Consistency
+
+ArcOS does not have a central authority that can revoke identities. There is no certificate revocation list, no global kill switch, no admin who can delete you. Instead, revocation is **local** and **social** — the same way trust works between humans.
+
+There are two distinct mechanisms, serving different purposes:
+
+#### Local Blocking (Immediate, Kernel-Enforced)
+
+Every Principal maintains a **block list** — an immutable, append-only set of Principals that are denied IPC access. When a Principal is blocked, the kernel refuses IPC messages from that sender before they reach the recipient. This is the first line of defense: if you know a key is compromised, you block it immediately on your own machine.
+
+Block lists are published to the owner's SSB feed so peers can see who you've blocked, but the enforcement is local. You don't need anyone's permission to block, and no one can force you to unblock.
+
+**Implementation constraint:** The block list check sits in the IPC hot path (every message send). It must be O(1). A per-Principal hash set or bloom filter (with false-positive fallback to exact check) keeps this cheap. The block list is stored per-process in the capability manager, not in a global table — blocking is a per-identity decision, not a system-wide one.
+
+#### Revocation Publication (Social, Eventually Consistent)
+
+When a key is compromised or permanently retired, the owner (or their recovery quorum) publishes a signed proof to their append-only SSB feed. There are two types:
+
+**KeyRotationProof** — "My old key is retired; my new key is this one." The old key signs the proof if it's still accessible (see Key Lifecycle > Rotation above). If the old key is lost, the recovery quorum attests the rotation instead. The rotated identity is the *same* identity — files signed with the old key remain valid, linked through the rotation chain.
+
+**KeyRevocationProof** — "This key is dead. There is no successor." This is for permanent compromise where the owner cannot or does not wish to rotate. The revocation proof is signed by a quorum of social attestors (since the compromised key itself is untrusted). A revoked key has no continuity — it is a severed identity.
+
+Peers learn about revocations through normal SSB feed replication. When a peer sees a rotation or revocation proof in a feed they follow, they can choose to adopt the block — adding the old key to their own block list. This propagates outward through the social graph: your close contacts learn in seconds, their contacts in minutes, distant nodes eventually.
+
+#### The Bootstrap Principal: A Special Case
+
+The bootstrap Principal is not a person. It is a deterministic key derived from a seed, shared across the system at boot, used to sign kernel processes and boot modules. It cannot be socially revoked because it has no social graph — no SSB feed, no peers, no quorum.
+
+Bootstrap Principal revocation is a **system-level event**: firmware update, new seed, re-signing of boot modules. It is analogous to rotating a root CA certificate — rare, deliberate, and requires physical or administrative access to the machine. The social revocation model does not apply here, and should not be expected to.
+
+#### Properties
+
+| Property | Traditional CA | ArcOS Social Revocation |
+|----------|---------------|------------------------|
+| **Latency** | Seconds (CRL/OCSP) | Seconds to minutes (social graph replication) |
+| **Scope** | Global (everyone trusts the CA) | Local neighborhood (your peers, then their peers) |
+| **Authority** | Central (CA decides) | Distributed (each peer decides independently) |
+| **Censorship resistance** | Low (CA can revoke anyone) | High (revocation is a claim peers evaluate, not a directive) |
+| **Scaling cost** | O(n) global list | O(1) per-peer (adding strangers doesn't increase your revocation cost) |
+| **Offline resilience** | Fails (can't reach OCSP) | Degrades gracefully (local blocks still work, replication catches up) |
+
+#### Why This Is Sufficient
+
+This model trades **instant global revocation** for **local social revocation with eventual consistency**. The trade is worth it because:
+
+1. **Real-world identity already works this way.** When someone's identity is compromised, you tell the people who matter — your friends, your colleagues, your bank. You don't issue a global broadcast. The people who need to know find out fast; the people who don't need to know find out eventually or never.
+
+2. **The attacker's window is narrow.** An attacker with a stolen key cannot immediately impersonate you to your actual contacts — you notify them through a trusted side channel (in person, phone call, pre-shared signal) and they block instantly. The attacker can only fool strangers who haven't received the revocation yet, and strangers have low trust weight by default.
+
+3. **Central revocation is a central vulnerability.** Any system that can revoke you globally can be coerced, compromised, or corrupted into revoking you unjustly. ArcOS eliminates this attack surface entirely. No single entity — not even the OS itself — can erase your identity from the network.
+
+---
+
 ## Implementation Roadmap
 
-### Phase 0: Bootstrap Identity (unblocks FS)
+### Phase 0: Bootstrap Identity — Hardware-Backed (YubiKey)
 
-The minimum needed to make the filesystem object model coherent during development. Deliberately minimal. Explicitly temporary in implementation, permanent in interface.
+The bootstrap identity is the root of trust for the entire system. It uses a **hardware-backed Ed25519 key on a YubiKey** (OpenPGP smart card interface). The private key never leaves the YubiKey hardware — it cannot be extracted via software, memory dumps, or cold boot attacks.
+
+**Build-time signing:** The `sign-elf` tool communicates with the YubiKey to sign boot modules. The YubiKey performs Ed25519 signing internally; the host never sees the private key.
+
+**Compiled-in public key:** The YubiKey's Ed25519 public key is extracted once (`sign-elf --export-pubkey bootstrap_pubkey.bin`) and compiled into the kernel via `include_bytes!`. The kernel uses this key to verify boot module signatures and to restrict identity-binding operations.
+
+**No runtime secret key:** The kernel never holds the bootstrap secret key. The `BOOTSTRAP_SECRET_KEY` static remains zeroed. Runtime object signing is handled by user-space services with their own operational keys (currently degraded until USB HID enables runtime YubiKey communication).
+
+**Recovery model:** Two YubiKeys — one primary (daily use), one backup (physically separate secure storage). If the primary is lost, the backup can sign a key rotation proof. Biometric recovery (Phase 2) extends this further.
 
 ```rust
-struct IdentityContext {
-    device_entropy:        [u8; 32],          // available now
-    biometric_commitment:  Option<Hash>,       // None until Phase 2
-    social_attestation:    Option<Vec<Attestation>>, // None until Phase 3
-    temporal_proof:        Option<Timestamp>,  // None until Phase 2
-}
-
-fn derive_keypair(
-    context: &IdentityContext,
-    algorithm: SignatureAlgorithm,       // Classical, PostQuantum, or Hybrid
-) -> KeyPair;                            // algorithm-tagged, dynamic-sized
-
-fn sign(data: &[u8], keypair: &KeyPair) -> SignedField;   // dynamic-sized output
-fn verify(data: &[u8], sig: &SignedField, pubkey: &SignedField) -> bool;
+// bootstrap_pubkey.bin: 32-byte Ed25519 public key from YubiKey
+// Generated by: sign-elf --yubikey --export-pubkey bootstrap_pubkey.bin
+const BOOTSTRAP_PUBKEY: &[u8; 32] = include_bytes!("bootstrap_pubkey.bin");
 ```
-
-A `BootstrapIdentity` is generated at first boot from device entropy using **Ed25519** (classical mode). It is stored (as a key pair, not derived) in a fixed location. It is explicitly not the final identity model — it is a scaffold that makes the FS work while the real identity system is built above it. The bootstrap identity can be upgraded to Hybrid mode in Phase 1.5 via key rotation.
 
 The interface it exposes is the permanent interface — algorithm-agnostic, dynamic-sized. The implementation behind it changes. The interface does not.
 

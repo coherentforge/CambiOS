@@ -1,2 +1,9 @@
 /target
+user/*/target/
+tools/*/target/
 *.iso
+*.img
+*.elf
+*.o
+iso_root/
+.DS_Store

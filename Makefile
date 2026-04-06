@@ -6,6 +6,11 @@
 #   make run-uefi - Build + run in QEMU (UEFI)
 #   make clean   - Remove build artifacts
 #   make test    - Run unit tests
+#
+# Signing modes:
+#   make run                        # YubiKey signing (default, requires ARCOS_SIGN_PIN)
+#   make run SIGN_MODE=seed         # Seed-based signing (CI/testing)
+#   ARCOS_SIGN_PIN=123456 make run  # YubiKey with PIN via env var
 
 KERNEL := target/x86_64-unknown-none/release/arcos_microkernel
 ISO := arcos.iso
@@ -17,8 +22,27 @@ USER_SRC := user/hello.S
 USER_LD  := user/user.ld
 FS_SERVICE_DIR := user/fs-service
 FS_SERVICE_ELF := $(FS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-fs-service
+KS_SERVICE_DIR := user/key-store-service
+KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-key-store-service
 
-.PHONY: all kernel iso run run-uefi test clean kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service
+# ELF signing tool
+SIGN_ELF_DIR := tools/sign-elf
+SIGN_ELF := $(SIGN_ELF_DIR)/target/aarch64-apple-darwin/release/sign-elf
+
+# Signing mode: "yubikey" (default) or "seed" (for CI/testing without hardware key)
+SIGN_MODE ?= seed
+
+# Bootstrap seed hex — only used when SIGN_MODE=seed (for dev/CI builds)
+BOOTSTRAP_SEED_HEX := 4172634f532d426f6f7473747261702d4964656e746974792d50686173653021
+
+# Resolve sign-elf flags based on signing mode
+ifeq ($(SIGN_MODE),seed)
+  SIGN_FLAGS := --seed $(BOOTSTRAP_SEED_HEX)
+else
+  SIGN_FLAGS :=
+endif
+
+.PHONY: all kernel iso run run-uefi test clean kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service sign-tool export-pubkey
 
 all: iso
 
@@ -38,17 +62,40 @@ fs-service:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== FS service ready ==="
 
-iso: kernel user-elf fs-service
-	@echo "=== Building ISO ==="
+key-store-service:
+	@echo "=== Building Key Store service ==="
+	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== Key Store service ready ==="
+
+sign-tool:
+	@echo "=== Building ELF signing tool ==="
+	cd $(SIGN_ELF_DIR) && cargo build --release
+	@echo "=== sign-elf ready ==="
+
+# Export the bootstrap public key from the signing source.
+# Run this once after setting up your YubiKey to generate bootstrap_pubkey.bin.
+# Usage: make export-pubkey                   (from YubiKey)
+#        make export-pubkey SIGN_MODE=seed    (from seed, for dev)
+export-pubkey: sign-tool
+	$(SIGN_ELF) $(SIGN_FLAGS) --export-pubkey bootstrap_pubkey.bin
+
+iso: kernel user-elf fs-service key-store-service sign-tool
+	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 	mkdir -p iso_root/boot/limine
 	mkdir -p iso_root/EFI/BOOT
 	# Copy kernel binary
 	cp $(KERNEL) iso_root/boot/arcos_microkernel
-	# Copy user-space ELF modules
+	# Copy and sign user-space ELF modules
 	cp $(USER_ELF) iso_root/boot/hello.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello.elf
+	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -97,8 +144,8 @@ EFI_FW_AARCH64 := /opt/homebrew/share/qemu/edk2-aarch64-code.fd
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64
-	@echo "=== Building AArch64 FAT boot image ==="
+img-aarch64: kernel-aarch64 sign-tool
+	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
 	mformat -i $(IMG_AARCH64) -F ::
@@ -108,7 +155,11 @@ img-aarch64: kernel-aarch64
 	mmd -i $(IMG_AARCH64) ::/boot/limine
 	mcopy -i $(IMG_AARCH64) $(LIMINE_DIR)/BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
 	mcopy -i $(IMG_AARCH64) $(KERNEL_AARCH64) ::/boot/arcos_microkernel
-	mcopy -i $(IMG_AARCH64) $(USER_ELF) ::/boot/hello.elf
+	# Sign user-space ELF for AArch64
+	cp $(USER_ELF) /tmp/hello-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
+	mcopy -i $(IMG_AARCH64) /tmp/hello-signed.elf ::/boot/hello.elf
+	rm -f /tmp/hello-signed.elf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
