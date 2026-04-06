@@ -16,14 +16,52 @@ pub mod heap;
 #[cfg(target_arch = "x86_64")]
 pub mod paging;
 
-/// Paging stub for non-x86_64 targets.
+/// AArch64 page table implementation.
 ///
-/// Provides the same public API shape so portable modules (process.rs,
-/// loader, syscalls) compile. All functions `todo!()` at runtime.
+/// Implements a 4-level page table walk for 4KB granule, 48-bit virtual
+/// address space (levels L0-L3). Each level has 512 entries × 8 bytes = 4KB.
+///
+/// ## Address translation (4KB granule, 48-bit VA)
+/// ```text
+/// VA[47:39] → L0 index (9 bits, 512 entries)
+/// VA[38:30] → L1 index (9 bits, 512 entries)
+/// VA[29:21] → L2 index (9 bits, 512 entries)
+/// VA[20:12] → L3 index (9 bits, 512 entries)
+/// VA[11:0]  → page offset (12 bits, 4KB)
+/// ```
+///
+/// ## Descriptor format (4KB granule)
+/// ```text
+/// [0]     = Valid
+/// [1]     = Table (L0-L2) or Page (L3) — must be 1 for valid entries
+/// [4:2]   = AttrIndx (MAIR index: 0=Device, 1=Normal)
+/// [5]     = NS (non-secure)
+/// [7:6]   = AP — access permissions:
+///           00: EL1 RW, EL0 no access
+///           01: EL1 RW, EL0 RW
+///           10: EL1 RO, EL0 no access
+///           11: EL1 RO, EL0 RO
+/// [9:8]   = SH — shareability: 11=Inner Shareable
+/// [10]    = AF — Access Flag (must be 1 to avoid access fault)
+/// [47:12] = Output address (physical page frame)
+/// [53]    = PXN — Privileged eXecute Never
+/// [54]    = UXN/XN — User eXecute Never
+/// ```
+///
+/// ## TTBR split
+/// - TTBR0_EL1: user mapping (VA bit[55]=0, lower half)
+/// - TTBR1_EL1: kernel mapping (VA bit[55]=1, upper half, 0xFFFF...)
+///
+/// We use TTBR0_EL1 for process page tables (switched on context switch)
+/// and TTBR1_EL1 for the kernel page table (shared across all processes).
 #[cfg(not(target_arch = "x86_64"))]
 pub mod paging {
-    use super::frame_allocator::{FrameAllocator, PhysFrame};
+    use super::frame_allocator::{FrameAllocator, PhysFrame, PAGE_SIZE};
     use core::fmt;
+
+    // ========================================================================
+    // Error type (matches x86_64 version)
+    // ========================================================================
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PagingError {
@@ -39,83 +77,552 @@ pub mod paging {
         }
     }
 
-    /// Opaque page table handle for non-x86_64 targets.
+    // ========================================================================
+    // AArch64 descriptor bit definitions
+    // ========================================================================
+
+    /// Valid bit — entry is active
+    const DESC_VALID: u64 = 1 << 0;
+    /// Table descriptor (L0-L2) or Page descriptor (L3)
+    const DESC_TABLE: u64 = 1 << 1;
+    /// Access Flag — must be set to avoid access faults
+    const DESC_AF: u64 = 1 << 10;
+    /// Inner Shareable (for SMP coherency)
+    const DESC_ISH: u64 = 0b11 << 8;
+    /// AP[1]: EL0 accessible
+    const DESC_AP_EL0: u64 = 1 << 6;
+    /// AP[2]: Read-only
+    const DESC_AP_RO: u64 = 1 << 7;
+    /// AttrIndx=1 (Normal memory in MAIR — see boot config)
+    const DESC_ATTR_NORMAL: u64 = 1 << 2;
+    /// AttrIndx=0 (Device-nGnRnE in MAIR)
+    #[allow(dead_code)]
+    const DESC_ATTR_DEVICE: u64 = 0 << 2;
+    /// PXN: Privileged eXecute Never
+    const DESC_PXN: u64 = 1 << 53;
+    /// UXN: User eXecute Never
+    const DESC_UXN: u64 = 1 << 54;
+    /// Mask for output address bits [47:12]
+    const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    /// Number of entries per page table level
+    const ENTRIES_PER_TABLE: usize = 512;
+
+    // ========================================================================
+    // Page table handle
+    // ========================================================================
+
+    /// Handle to a root page table (L0).
+    ///
+    /// Wraps the physical address of the L0 table (the value that goes into
+    /// TTBR0_EL1 or was read from it).
     pub struct PageTableRef {
-        _cr3: u64,
+        /// Physical address of the L0 page table (TTBR0_EL1 value)
+        root_phys: u64,
     }
 
-    pub unsafe fn active_page_table() -> PageTableRef {
-        todo!("AArch64 paging: active_page_table")
+    /// Extract the HHDM offset for physical-to-virtual translation.
+    #[inline]
+    fn hhdm() -> u64 {
+        crate::hhdm_offset()
     }
 
-    pub unsafe fn page_table_from_cr3(cr3: u64) -> PageTableRef {
-        let _ = cr3;
-        todo!("AArch64 paging: page_table_from_cr3")
+    /// Convert a physical address to a virtual address via HHDM.
+    #[inline]
+    fn phys_to_virt(phys: u64) -> *mut u64 {
+        (phys + hhdm()) as *mut u64
     }
 
-    pub fn map_page(
-        _pt: &mut PageTableRef,
-        _virt_addr: u64,
-        _phys_addr: u64,
-        _flags: flags::PageFlags,
-        _frame_alloc: &mut FrameAllocator,
-    ) -> Result<(), PagingError> {
-        todo!("AArch64 paging: map_page")
+    /// Extract the L0 index from a 48-bit VA.
+    #[inline]
+    const fn l0_index(va: u64) -> usize {
+        ((va >> 39) & 0x1FF) as usize
+    }
+    /// Extract the L1 index from a 48-bit VA.
+    #[inline]
+    const fn l1_index(va: u64) -> usize {
+        ((va >> 30) & 0x1FF) as usize
+    }
+    /// Extract the L2 index from a 48-bit VA.
+    #[inline]
+    const fn l2_index(va: u64) -> usize {
+        ((va >> 21) & 0x1FF) as usize
+    }
+    /// Extract the L3 index from a 48-bit VA.
+    #[inline]
+    const fn l3_index(va: u64) -> usize {
+        ((va >> 12) & 0x1FF) as usize
     }
 
-    pub fn unmap_page(
-        _pt: &mut PageTableRef,
-        _virt_addr: u64,
-    ) -> Result<PhysFrame, PagingError> {
-        todo!("AArch64 paging: unmap_page")
+    /// Read a page table entry at a given level and index.
+    ///
+    /// # Safety
+    /// `table_phys` must be the physical address of a valid page table frame.
+    #[inline]
+    unsafe fn read_entry(table_phys: u64, index: usize) -> u64 {
+        debug_assert!(index < ENTRIES_PER_TABLE);
+        let ptr = phys_to_virt(table_phys);
+        // SAFETY: table_phys is a valid page table frame, index is in bounds.
+        // HHDM maps the frame to a valid VA. Volatile read for hardware coherency.
+        core::ptr::read_volatile(ptr.add(index))
     }
 
-    pub fn map_range(
-        _pt: &mut PageTableRef,
-        _virt_base: u64,
-        _phys_base: u64,
-        _count: usize,
-        _flags: flags::PageFlags,
-        _frame_alloc: &mut FrameAllocator,
-    ) -> Result<(), PagingError> {
-        todo!("AArch64 paging: map_range")
+    /// Write a page table entry at a given level and index.
+    ///
+    /// # Safety
+    /// `table_phys` must be the physical address of a valid page table frame.
+    #[inline]
+    unsafe fn write_entry(table_phys: u64, index: usize, value: u64) {
+        debug_assert!(index < ENTRIES_PER_TABLE);
+        let ptr = phys_to_virt(table_phys);
+        // SAFETY: Same as read_entry. Volatile write ensures hardware sees update.
+        core::ptr::write_volatile(ptr.add(index), value);
     }
 
-    pub fn translate(_pt: &PageTableRef, _virt_addr: u64) -> Option<u64> {
-        todo!("AArch64 paging: translate")
-    }
-
-    pub fn create_process_page_table(
-        _frame_alloc: &mut FrameAllocator,
+    /// Walk levels L0→L1→L2, allocating intermediate tables as needed.
+    /// Returns the physical address of the L3 table.
+    ///
+    /// At each level, if the entry is not valid, allocate a new frame,
+    /// zero it, and install a table descriptor pointing to it.
+    unsafe fn walk_to_l3(
+        root_phys: u64,
+        va: u64,
+        frame_alloc: &mut FrameAllocator,
     ) -> Result<u64, PagingError> {
-        todo!("AArch64 paging: create_process_page_table")
+        let indices = [l0_index(va), l1_index(va), l2_index(va)];
+        let mut table_phys = root_phys;
+
+        for &idx in &indices {
+            // SAFETY: table_phys is valid (root or newly allocated frame).
+            let entry = read_entry(table_phys, idx);
+            if entry & DESC_VALID != 0 {
+                // Entry exists — descend
+                table_phys = entry & ADDR_MASK;
+            } else {
+                // Allocate a new table frame
+                let frame = frame_alloc
+                    .allocate()
+                    .map_err(|_| PagingError::FrameAllocationFailed)?;
+                // Zero the new table
+                // SAFETY: frame.addr is a freshly allocated frame, HHDM maps it.
+                core::ptr::write_bytes(
+                    phys_to_virt(frame.addr) as *mut u8,
+                    0,
+                    PAGE_SIZE as usize,
+                );
+                // Install table descriptor: Valid + Table + ISH + AF + Normal
+                let desc = frame.addr | DESC_VALID | DESC_TABLE;
+                // SAFETY: table_phys and idx are valid.
+                write_entry(table_phys, idx, desc);
+                table_phys = frame.addr;
+            }
+        }
+
+        Ok(table_phys)
     }
 
+    /// Walk levels L0→L1→L2 (read-only, no allocation).
+    /// Returns the physical address of the L3 table, or None if any level is unmapped.
+    unsafe fn walk_to_l3_readonly(root_phys: u64, va: u64) -> Option<u64> {
+        let indices = [l0_index(va), l1_index(va), l2_index(va)];
+        let mut table_phys = root_phys;
+
+        for &idx in &indices {
+            // SAFETY: table_phys is valid.
+            let entry = read_entry(table_phys, idx);
+            if entry & DESC_VALID == 0 {
+                return None;
+            }
+            table_phys = entry & ADDR_MASK;
+        }
+
+        Some(table_phys)
+    }
+
+    // ========================================================================
+    // Public API (matches x86_64 paging module)
+    // ========================================================================
+
+    /// Get a handle to the active user page table (TTBR0_EL1).
+    ///
+    /// # Safety
+    /// HHDM offset must be set. TTBR0_EL1 must point to a valid L0 table.
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn active_page_table() -> PageTableRef {
+        let ttbr0: u64;
+        // SAFETY: Reading TTBR0_EL1 from EL1 is always safe.
+        core::arch::asm!(
+            "mrs {0}, ttbr0_el1",
+            out(reg) ttbr0,
+            options(nostack, nomem, preserves_flags),
+        );
+        PageTableRef {
+            root_phys: ttbr0 & ADDR_MASK,
+        }
+    }
+
+    /// Fallback for non-aarch64, non-x86_64 targets (test host).
+    #[cfg(not(target_arch = "aarch64"))]
+    pub unsafe fn active_page_table() -> PageTableRef {
+        PageTableRef { root_phys: 0 }
+    }
+
+    /// Get a page table handle from a physical address (TTBR0 value).
+    ///
+    /// Named `page_table_from_cr3` for API compatibility with x86_64 code.
+    ///
+    /// # Safety
+    /// `cr3` must be the physical address of a valid L0 page table.
+    pub unsafe fn page_table_from_cr3(cr3: u64) -> PageTableRef {
+        PageTableRef {
+            root_phys: cr3 & ADDR_MASK,
+        }
+    }
+
+    /// Map a single 4KB virtual page to a physical frame.
+    ///
+    /// Allocates intermediate page table levels (L1, L2, L3) as needed.
+    pub fn map_page(
+        pt: &mut PageTableRef,
+        virt_addr: u64,
+        phys_addr: u64,
+        page_flags: flags::PageFlags,
+        frame_alloc: &mut FrameAllocator,
+    ) -> Result<(), PagingError> {
+        let va = virt_addr & !0xFFF; // Page-align
+        let pa = phys_addr & !0xFFF;
+
+        // SAFETY: pt.root_phys is valid. frame_alloc may allocate.
+        let l3_phys = unsafe { walk_to_l3(pt.root_phys, va, frame_alloc)? };
+
+        let idx = l3_index(va);
+        // SAFETY: l3_phys is valid.
+        let existing = unsafe { read_entry(l3_phys, idx) };
+        if existing & DESC_VALID != 0 {
+            return Err(PagingError::AlreadyMapped);
+        }
+
+        // Build L3 page descriptor:
+        // Valid + Page(1) + AF + ISH + Normal memory + user flags
+        let desc = pa
+            | DESC_VALID
+            | DESC_TABLE  // At L3, bit[1]=1 means "page" descriptor
+            | DESC_AF
+            | DESC_ISH
+            | DESC_ATTR_NORMAL
+            | page_flags.0;
+
+        // SAFETY: l3_phys and idx are valid.
+        unsafe { write_entry(l3_phys, idx, desc) };
+
+        // Ensure the new mapping is visible
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb ishst", "isb", options(nostack));
+        }
+
+        Ok(())
+    }
+
+    /// Unmap a single 4KB page and return the physical frame.
+    pub fn unmap_page(
+        pt: &mut PageTableRef,
+        virt_addr: u64,
+    ) -> Result<PhysFrame, PagingError> {
+        let va = virt_addr & !0xFFF;
+
+        // SAFETY: pt.root_phys is valid.
+        let l3_phys = unsafe {
+            walk_to_l3_readonly(pt.root_phys, va)
+                .ok_or(PagingError::NotMapped)?
+        };
+
+        let idx = l3_index(va);
+        // SAFETY: l3_phys is valid.
+        let entry = unsafe { read_entry(l3_phys, idx) };
+        if entry & DESC_VALID == 0 {
+            return Err(PagingError::NotMapped);
+        }
+
+        let frame_phys = entry & ADDR_MASK;
+
+        // Clear the entry
+        // SAFETY: l3_phys and idx are valid.
+        unsafe { write_entry(l3_phys, idx, 0) };
+
+        // Invalidate TLB for this page
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::arch::tlb::shootdown_page(va);
+        }
+
+        Ok(PhysFrame { addr: frame_phys })
+    }
+
+    /// Map a contiguous range of virtual pages to contiguous physical frames.
+    pub fn map_range(
+        pt: &mut PageTableRef,
+        virt_base: u64,
+        phys_base: u64,
+        count: usize,
+        page_flags: flags::PageFlags,
+        frame_alloc: &mut FrameAllocator,
+    ) -> Result<(), PagingError> {
+        for i in 0..count {
+            let offset = i as u64 * PAGE_SIZE;
+            map_page(
+                pt,
+                virt_base + offset,
+                phys_base + offset,
+                page_flags,
+                frame_alloc,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Query the physical address mapped by a virtual address.
+    ///
+    /// Returns `None` if the page is not mapped.
+    pub fn translate(pt: &PageTableRef, virt_addr: u64) -> Option<u64> {
+        let va = virt_addr & !0xFFF;
+        let page_offset = virt_addr & 0xFFF;
+
+        // SAFETY: pt.root_phys is valid.
+        let l3_phys = unsafe { walk_to_l3_readonly(pt.root_phys, va)? };
+
+        let idx = l3_index(va);
+        // SAFETY: l3_phys is valid.
+        let entry = unsafe { read_entry(l3_phys, idx) };
+        if entry & DESC_VALID == 0 {
+            return None;
+        }
+
+        Some((entry & ADDR_MASK) + page_offset)
+    }
+
+    /// Create a new L0 page table for a user process.
+    ///
+    /// Allocates a fresh 4KB frame, zeros it, then copies the kernel-half
+    /// entries (L0 indices 256..512) from TTBR1_EL1 so kernel space is
+    /// mapped in every address space. Returns the physical address of the
+    /// new L0 table (suitable for loading into TTBR0_EL1).
+    ///
+    /// ## AArch64 vs x86_64
+    /// On x86_64, kernel entries live in the upper half of the PML4
+    /// (indices 256..512). On AArch64 with split TTBR0/TTBR1, the kernel
+    /// uses TTBR1_EL1 (addresses ≥ 0xFFFF_0000_0000_0000) and user uses
+    /// TTBR0_EL1 (addresses < 0x0001_0000_0000_0000). Since the kernel
+    /// lives in TTBR1 space, we do NOT need to copy kernel entries into
+    /// user page tables — they're entirely separate tables.
+    pub fn create_process_page_table(
+        frame_alloc: &mut FrameAllocator,
+    ) -> Result<u64, PagingError> {
+        let frame = frame_alloc
+            .allocate()
+            .map_err(|_| PagingError::FrameAllocationFailed)?;
+
+        // Zero the entire L0 table
+        // SAFETY: frame.addr is a freshly allocated frame, HHDM maps it.
+        unsafe {
+            core::ptr::write_bytes(
+                phys_to_virt(frame.addr) as *mut u8,
+                0,
+                PAGE_SIZE as usize,
+            );
+        }
+
+        // On AArch64 with TTBR0/TTBR1 split, user L0 tables are clean
+        // (no kernel entries to copy — kernel lives in TTBR1 space).
+        // If Limine uses a unified TTBR0 with kernel mapped in upper
+        // half, we'd need to copy entries here. For now, keep it clean.
+
+        Ok(frame.addr)
+    }
+
+    /// Free a process page table L0 frame.
+    ///
+    /// Only frees the L0 frame itself. Intermediate frames (L1/L2/L3)
+    /// must be freed by unmapping all user pages first.
     pub fn free_process_page_table(
-        _frame_alloc: &mut FrameAllocator,
-        _phys: u64,
+        frame_alloc: &mut FrameAllocator,
+        phys: u64,
     ) {
-        todo!("AArch64 paging: free_process_page_table")
+        let _ = frame_alloc.free(PhysFrame { addr: phys });
     }
 
-    /// Page table flags stub for non-x86_64 targets.
+    // ========================================================================
+    // Early boot MMIO mapping (no allocator needed)
+    // ========================================================================
+
+    /// Small pool of page-aligned 4KB frames for early boot page table
+    /// allocation, before the frame allocator is initialized.
+    ///
+    /// Limine's HHDM on AArch64 maps RAM but NOT device MMIO regions.
+    /// We need to map PL011 (0x0900_0000) and GIC (0x0800_0000) into
+    /// the kernel page table (TTBR1) before serial output works.
+    ///
+    /// 3 frames is enough for worst case: one each for L1, L2, L3 tables.
+    /// (L0 always exists — it's the root from TTBR1.)
+    #[repr(C, align(4096))]
+    struct BootstrapFrame([u8; 4096]);
+    static mut BOOTSTRAP_FRAMES: [BootstrapFrame; 3] = [
+        BootstrapFrame([0; 4096]),
+        BootstrapFrame([0; 4096]),
+        BootstrapFrame([0; 4096]),
+    ];
+    static BOOTSTRAP_NEXT: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+
+    /// Translate a kernel virtual address to physical by walking TTBR1.
+    ///
+    /// Kernel statics live at 0xFFFFFFFF80000000+ which is NOT the HHDM —
+    /// it's Limine's kernel mapping. We must walk TTBR1's page tables to
+    /// find the physical address.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn kernel_virt_to_phys(ttbr1_root: u64, va: u64) -> Option<u64> {
+        let l3_phys = walk_to_l3_readonly(ttbr1_root, va)?;
+        let idx = l3_index(va);
+        let entry = read_entry(l3_phys, idx);
+        if entry & DESC_VALID == 0 {
+            return None;
+        }
+        Some((entry & ADDR_MASK) + (va & 0xFFF))
+    }
+
+    /// Allocate one bootstrap frame (physical address).
+    /// Returns None if all 3 frames are exhausted.
+    ///
+    /// Uses TTBR1 page table walk to find the physical address of the
+    /// kernel static, since kernel statics are NOT in the HHDM.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn bootstrap_alloc(ttbr1_root: u64) -> Option<u64> {
+        let idx = BOOTSTRAP_NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if idx >= 3 {
+            return None;
+        }
+        let virt = &BOOTSTRAP_FRAMES[idx] as *const _ as u64;
+        kernel_virt_to_phys(ttbr1_root, virt)
+    }
+
+    /// Map a single 4KB MMIO page into the kernel page table (TTBR1_EL1).
+    ///
+    /// This function works before the heap and frame allocator are initialized.
+    /// It uses a small static pool of bootstrap frames for any missing
+    /// intermediate page table levels.
+    ///
+    /// The page is mapped as device memory (AttrIndx=0), kernel RW,
+    /// non-executable, inner-shareable.
+    ///
+    /// # Safety
+    /// - HHDM offset must already be set (via `set_hhdm_offset`).
+    /// - `phys_addr` must be a valid MMIO physical address (page-aligned).
+    /// - Must only be called during single-core boot.
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn early_map_mmio(phys_addr: u64) -> Result<(), &'static str> {
+        let pa = phys_addr & !0xFFF;
+        let hhdm_off = hhdm();
+        let va = pa + hhdm_off; // HHDM virtual address for this MMIO page
+
+        // Read TTBR1_EL1 (kernel page table root)
+        let ttbr1: u64;
+        // SAFETY: Reading TTBR1_EL1 from EL1 is always safe.
+        core::arch::asm!(
+            "mrs {0}, ttbr1_el1",
+            out(reg) ttbr1,
+            options(nostack, nomem, preserves_flags),
+        );
+        let root_phys = ttbr1 & ADDR_MASK;
+
+        // Walk L0 → L1 → L2, allocating missing levels from bootstrap pool
+        let indices = [l0_index(va), l1_index(va), l2_index(va)];
+        let mut table_phys = root_phys;
+
+        for &idx in &indices {
+            let entry = read_entry(table_phys, idx);
+            if entry & DESC_VALID != 0 {
+                // Entry exists — descend
+                table_phys = entry & ADDR_MASK;
+            } else {
+                // Allocate from bootstrap pool
+                let frame_phys = bootstrap_alloc(root_phys)
+                    .ok_or("early_map_mmio: bootstrap frames exhausted")?;
+                // Zero the new table via HHDM
+                core::ptr::write_bytes(
+                    phys_to_virt(frame_phys) as *mut u8,
+                    0,
+                    PAGE_SIZE as usize,
+                );
+                // Install table descriptor
+                let desc = frame_phys | DESC_VALID | DESC_TABLE;
+                write_entry(table_phys, idx, desc);
+                table_phys = frame_phys;
+            }
+        }
+
+        // Now table_phys is the L3 table. Write the page entry.
+        let idx = l3_index(va);
+        let existing = read_entry(table_phys, idx);
+        if existing & DESC_VALID != 0 {
+            // Already mapped — that's fine for MMIO
+            return Ok(());
+        }
+
+        // Device memory descriptor: Valid + Page + AF + ISH + AttrIndx=0 (Device)
+        // + PXN + UXN (never execute MMIO)
+        let desc = pa
+            | DESC_VALID
+            | DESC_TABLE  // At L3, bit[1]=1 means "page"
+            | DESC_AF
+            | DESC_ISH
+            | DESC_ATTR_DEVICE
+            | DESC_PXN
+            | DESC_UXN;
+
+        write_entry(table_phys, idx, desc);
+
+        // Ensure mapping is visible
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vale1is, {va}",
+            "dsb ish",
+            "isb",
+            va = in(reg) va >> 12,
+            options(nostack),
+        );
+
+        Ok(())
+    }
+
+    /// Page permission flags for AArch64 descriptors.
+    ///
+    /// These encode the AP[2:1], UXN, and PXN bits that get OR'd into
+    /// L3 page descriptors.
     pub mod flags {
-        /// Opaque page flags — will map to AArch64 descriptor attributes.
+        use super::*;
+
+        /// Wrapper for AArch64 L3 descriptor permission bits.
         #[derive(Debug, Clone, Copy)]
-        pub struct PageFlags(u64);
+        pub struct PageFlags(pub(super) u64);
 
-        pub const KERNEL_RO: PageFlags = PageFlags(0);
+        /// Kernel read-only: EL1 RO, no EL0 access, UXN + PXN
+        pub const KERNEL_RO: PageFlags = PageFlags(DESC_AP_RO | DESC_UXN | DESC_PXN);
 
+        /// Kernel read-write: EL1 RW, no EL0 access, UXN + PXN (no execute)
         pub fn kernel_rw() -> PageFlags {
-            PageFlags(0)
+            PageFlags(DESC_UXN | DESC_PXN)
         }
 
+        /// User read-only: EL0 readable, not writable, executable from EL0
+        /// (PXN set = kernel can't execute user pages)
         pub fn user_ro() -> PageFlags {
-            PageFlags(0)
+            PageFlags(DESC_AP_EL0 | DESC_AP_RO | DESC_PXN)
         }
 
+        /// User read-write: EL0 RW, UXN (no execute by default — W^X),
+        /// PXN (kernel can't execute user pages)
         pub fn user_rw() -> PageFlags {
-            PageFlags(0)
+            PageFlags(DESC_AP_EL0 | DESC_UXN | DESC_PXN)
         }
     }
 }

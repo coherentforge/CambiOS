@@ -74,9 +74,11 @@ impl TaskState {
 /// CPU context for a task (register state)
 ///
 /// Stores saved registers for context switching.
-/// On x86-64, includes GPRs, RIP, RSP, and flags.
+/// Architecture-specific: each target defines the register set, but all
+/// targets provide `new(entry_point, stack_pointer)` and `verify_integrity()`.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
+#[cfg(target_arch = "x86_64")]
 pub struct CpuContext {
     /// General purpose registers
     pub rax: u64,
@@ -102,6 +104,46 @@ pub struct CpuContext {
     pub rflags: u64,
 }
 
+/// CPU context for a task (AArch64 register state)
+///
+/// Stores callee-saved registers (x19-x30), SP, PC (ELR_EL1), and PSTATE
+/// (SPSR_EL1). Caller-saved registers (x0-x18) are not preserved across
+/// voluntary context switches (they are saved/restored by the ISR path in
+/// SavedContext instead).
+///
+/// ## Register layout (offsets for assembly)
+/// ```text
+/// x19=0, x20=8, x21=16, x22=24, x23=32, x24=40, x25=48, x26=56,
+/// x27=64, x28=72, x29(fp)=80, x30(lr)=88, sp=96, pc=104, pstate=112
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[cfg(target_arch = "aarch64")]
+pub struct CpuContext {
+    /// Callee-saved general purpose registers
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    /// Frame pointer (x29)
+    pub x29: u64,
+    /// Link register (x30) — return address
+    pub x30: u64,
+    /// Stack pointer
+    pub sp: u64,
+    /// Program counter (ELR_EL1 on exception entry)
+    pub pc: u64,
+    /// Processor state (SPSR_EL1 on exception entry)
+    pub pstate: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
 impl CpuContext {
     /// Create a new task context for given entry point and stack
     pub fn new(entry_point: u64, stack_pointer: u64) -> Self {
@@ -138,6 +180,56 @@ impl CpuContext {
         if (self.rflags & 0x0202) == 0 {
             return Err("IF flag must be set");
         }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl CpuContext {
+    /// Create a new task context for given entry point and stack
+    pub fn new(entry_point: u64, stack_pointer: u64) -> Self {
+        CpuContext {
+            x19: 0, x20: 0, x21: 0, x22: 0,
+            x23: 0, x24: 0, x25: 0, x26: 0,
+            x27: 0, x28: 0,
+            x29: 0,  // frame pointer
+            x30: entry_point,  // LR — context_restore will branch here
+            sp: stack_pointer,
+            pc: entry_point,
+            // EL0t: PSTATE with EL0, SP_EL0, interrupts enabled (DAIF clear)
+            pstate: 0x0,
+        }
+    }
+
+    /// Verify context is in valid state
+    pub fn verify_integrity(&self) -> Result<(), &'static str> {
+        if self.pc == 0 {
+            return Err("PC cannot be zero");
+        }
+        if self.sp == 0 {
+            return Err("SP cannot be zero");
+        }
+        Ok(())
+    }
+}
+
+/// CpuContext compiled out — provide a fallback for test/other targets
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct CpuContext {
+    pub pc: u64,
+    pub sp: u64,
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl CpuContext {
+    pub fn new(entry_point: u64, stack_pointer: u64) -> Self {
+        CpuContext { pc: entry_point, sp: stack_pointer }
+    }
+    pub fn verify_integrity(&self) -> Result<(), &'static str> {
+        if self.pc == 0 { return Err("PC cannot be zero"); }
+        if self.sp == 0 { return Err("SP cannot be zero"); }
         Ok(())
     }
 }
@@ -232,6 +324,10 @@ pub struct Task {
     pub cr3: u64,
     /// Logical CPU index that currently owns this task (0 = BSP).
     pub home_cpu: u16,
+    /// If true, task is pinned to home_cpu (IRQ affinity). Load balancer will not migrate.
+    pub pinned: bool,
+    /// If true, this task is currently in a ready queue. Prevents duplicate enqueuing.
+    pub in_ready_queue: bool,
 }
 
 impl Task {
@@ -251,6 +347,8 @@ impl Task {
             process_id: None,
             cr3: 0,
             home_cpu: 0,
+            pinned: false,
+            in_ready_queue: false,
         }
     }
 
@@ -276,6 +374,8 @@ impl Task {
             process_id: None,
             cr3: 0,
             home_cpu: 0,
+            pinned: false,
+            in_ready_queue: false,
         }
     }
 

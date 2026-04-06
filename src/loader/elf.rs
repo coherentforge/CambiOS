@@ -11,8 +11,18 @@ const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 /// ELF header constants
 const ELF_CLASS_64BIT: u8 = 2;
 const ELF_DATA_LITTLE_ENDIAN: u8 = 1;
-const ELF_MACHINE_X86_64: u16 = 0x3E;
 const ELF_TYPE_EXECUTABLE: u16 = 2;
+
+/// Expected ELF e_machine for the current target architecture.
+#[cfg(target_arch = "x86_64")]
+const ELF_MACHINE_EXPECTED: u16 = 0x3E; // EM_X86_64
+#[cfg(target_arch = "aarch64")]
+const ELF_MACHINE_EXPECTED: u16 = 0xB7; // EM_AARCH64
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const ELF_MACHINE_EXPECTED: u16 = 0x00; // unknown — will reject all ELFs
+
+/// Public re-export for `build_boot_elf()` to use.
+pub const ELF_MACHINE_CURRENT: u16 = ELF_MACHINE_EXPECTED;
 
 /// Errors that can occur during ELF parsing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,8 +166,8 @@ pub fn parse_header(binary: &[u8]) -> Result<Elf64Header, ElfError> {
         return Err(ElfError::InvalidEndianness);
     }
 
-    // Check x86-64
-    if header.e_machine != ELF_MACHINE_X86_64 {
+    // Check machine type matches current architecture
+    if header.e_machine != ELF_MACHINE_EXPECTED {
         return Err(ElfError::InvalidMachine);
     }
 

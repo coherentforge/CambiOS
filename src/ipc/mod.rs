@@ -22,6 +22,57 @@ pub struct EndpointId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProcessId(pub u32);
 
+// ============================================================================
+// Principal — cryptographic identity primitive
+// ============================================================================
+
+/// A cryptographic identity: an Ed25519 public key.
+///
+/// In Phase 0, this is just 32 opaque bytes (no crypto verification yet).
+/// The interface is permanent — the implementation gains real crypto in Phase 1.
+///
+/// Equality is based on the full 32-byte public key (constant-time is a
+/// Phase 1 concern when real keys are in play).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Principal {
+    pub public_key: [u8; 32],
+}
+
+impl Principal {
+    /// Create a Principal from a 32-byte public key.
+    pub const fn from_public_key(key: [u8; 32]) -> Self {
+        Principal { public_key: key }
+    }
+
+    /// The zero Principal — used as a sentinel / "no identity" marker.
+    pub const ZERO: Self = Principal { public_key: [0u8; 32] };
+
+    /// Check if this is the zero (unset) Principal.
+    pub fn is_zero(&self) -> bool {
+        self.public_key == [0u8; 32]
+    }
+}
+
+impl fmt::Debug for Principal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Show first 8 bytes hex for readability
+        write!(f, "Principal(")?;
+        for byte in &self.public_key[..8] {
+            write!(f, "{:02x}", byte)?;
+        }
+        write!(f, "...)")
+    }
+}
+
+impl fmt::Display for Principal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for byte in &self.public_key[..8] {
+            write!(f, "{:02x}", byte)?;
+        }
+        write!(f, "…")
+    }
+}
+
 /// A single IPC message with verification-friendly structure
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -29,6 +80,12 @@ pub struct Message {
     pub to: EndpointId,
     pub payload: [u8; 256], // Fixed-size for verification
     pub payload_len: usize,
+    /// Sender's cryptographic identity, stamped by the kernel.
+    ///
+    /// This field is NEVER set by user code. The kernel writes it in
+    /// `send_message_with_capability()` after the capability check passes.
+    /// Recipients can trust this field unconditionally — it is unforgeable.
+    pub sender_principal: Option<Principal>,
 }
 
 impl Message {
@@ -39,6 +96,7 @@ impl Message {
             to,
             payload: [0u8; 256],
             payload_len: 0,
+            sender_principal: None,
         }
     }
 
@@ -444,7 +502,8 @@ impl IpcManager {
             panic!("Failed to allocate IpcManager");
         }
         // SAFETY: All array fields are valid when zero-initialized:
-        // - Option<Message>::None = discriminant 0 = zeroed
+        // - Option<Message>::None = discriminant 0 = zeroed (Message.sender_principal
+        //   is only relevant inside Some(Message), which is constructed via enqueue)
         // - usize head/tail/count = 0 = zeroed
         // - SyncChannelState::Empty = first variant = discriminant 0
         // - Option<u32>::None = zeroed
@@ -506,18 +565,25 @@ impl IpcManager {
 
     /// Send a message with capability enforcement and interceptor check.
     ///
-    /// Pipeline: capability check → interceptor check → enqueue.
+    /// Pipeline: capability check → stamp sender_principal → interceptor check → enqueue.
+    ///
+    /// The kernel stamps `msg.sender_principal` from the sender's bound Principal
+    /// in the CapabilityManager. This is the sole code path that sets
+    /// sender_principal — user code cannot forge it.
     pub fn send_message_with_capability(
         &mut self,
         from_process: ProcessId,
         endpoint: EndpointId,
-        msg: Message,
+        mut msg: Message,
         cap_mgr: &capability::CapabilityManager,
     ) -> Result<(), IpcError> {
         // Layer 1: Capability check
         cap_mgr
             .verify_access(from_process, endpoint, CapabilityRights::SEND_ONLY)
             .map_err(|_| IpcError::PermissionDenied)?;
+
+        // Stamp sender identity (unforgeable — kernel sets this, never user code)
+        msg.sender_principal = cap_mgr.get_principal(from_process).ok();
 
         // Layer 2: Interceptor check (defense-in-depth)
         if let Some(ref interceptor) = self.interceptor {
@@ -701,6 +767,161 @@ pub enum SyncCallResult {
     /// No receiver — caller blocks until receiver + reply.
     CallerMustBlock,
 }
+
+// ============================================================================
+// Per-endpoint sharded IPC — eliminates global IPC_MANAGER serialization
+// ============================================================================
+
+use crate::Spinlock;
+
+/// Per-endpoint IPC shard: one queue + one sync channel, independently locked.
+///
+/// Each endpoint's async queue and sync channel are protected by a single
+/// Spinlock per shard. Two CPUs communicating on different endpoints never
+/// contend on the same lock.
+pub struct EndpointShard {
+    pub queue: EndpointQueue,
+    pub sync_channel: SyncChannel,
+}
+
+impl EndpointShard {
+    pub const fn new() -> Self {
+        EndpointShard {
+            queue: EndpointQueue::new(),
+            sync_channel: SyncChannel::new(),
+        }
+    }
+}
+
+/// Sharded IPC manager — per-endpoint locking eliminates global serialization.
+///
+/// Instead of one global lock for all 32 endpoints, each endpoint gets its
+/// own Spinlock. CPUs communicating on different endpoints never contend.
+///
+/// The interceptor is shared (read-only after boot), so it's stored separately
+/// and accessed without per-endpoint locking.
+pub struct ShardedIpcManager {
+    /// Per-endpoint shards, each independently locked.
+    pub shards: [Spinlock<EndpointShard>; MAX_ENDPOINTS],
+    /// Zero-trust interceptor (set once at boot, read-only thereafter).
+    /// Protected by its own lock since it's rarely accessed and never mutated
+    /// after boot.
+    interceptor: Spinlock<Option<Box<dyn interceptor::IpcInterceptor>>>,
+}
+
+impl ShardedIpcManager {
+    /// Create a new sharded IPC manager.
+    pub const fn new() -> Self {
+        ShardedIpcManager {
+            shards: [const { Spinlock::new(EndpointShard::new()) }; MAX_ENDPOINTS],
+            interceptor: Spinlock::new(None),
+        }
+    }
+
+    /// Install a zero-trust interceptor (called once during boot).
+    pub fn set_interceptor(&self, i: Box<dyn interceptor::IpcInterceptor>) {
+        *self.interceptor.lock() = Some(i);
+    }
+
+    /// Send a message to an endpoint (async).
+    pub fn send_message(&self, endpoint: EndpointId, msg: Message) -> Result<(), IpcError> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return Err(IpcError::EndpointNotFound);
+        }
+        self.shards[endpoint.0 as usize].lock().queue.enqueue(msg)
+    }
+
+    /// Receive a message from an endpoint (async).
+    pub fn recv_message(&self, endpoint: EndpointId) -> Option<Message> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return None;
+        }
+        self.shards[endpoint.0 as usize].lock().queue.dequeue()
+    }
+
+    /// Check if endpoint has pending messages.
+    pub fn has_message(&self, endpoint: EndpointId) -> bool {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return false;
+        }
+        !self.shards[endpoint.0 as usize].lock().queue.is_empty()
+    }
+
+    /// Synchronous send on a specific endpoint.
+    pub fn sync_send(
+        &self,
+        endpoint: EndpointId,
+        msg: Message,
+        sender_task_id: u32,
+    ) -> Result<SyncSendResult, IpcError> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return Err(IpcError::EndpointNotFound);
+        }
+        let mut shard = self.shards[endpoint.0 as usize].lock();
+        match shard.sync_channel.deposit_send(msg, sender_task_id)? {
+            Some(receiver_task) => Ok(SyncSendResult::ReceiverWoken(receiver_task)),
+            None => Ok(SyncSendResult::SenderMustBlock),
+        }
+    }
+
+    /// Synchronous receive on a specific endpoint.
+    pub fn sync_recv(
+        &self,
+        endpoint: EndpointId,
+        receiver_task_id: u32,
+    ) -> Result<SyncRecvResult, IpcError> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return Err(IpcError::EndpointNotFound);
+        }
+        let mut shard = self.shards[endpoint.0 as usize].lock();
+        match shard.sync_channel.pickup_recv(receiver_task_id)? {
+            Some((msg, wake_sender)) => Ok(SyncRecvResult::Message(msg, wake_sender)),
+            None => Ok(SyncRecvResult::ReceiverMustBlock),
+        }
+    }
+
+    /// Synchronous call on a specific endpoint.
+    pub fn sync_call(
+        &self,
+        endpoint: EndpointId,
+        msg: Message,
+        caller_task_id: u32,
+    ) -> Result<SyncCallResult, IpcError> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return Err(IpcError::EndpointNotFound);
+        }
+        let mut shard = self.shards[endpoint.0 as usize].lock();
+        match shard.sync_channel.deposit_call(msg, caller_task_id)? {
+            Some(receiver_task) => Ok(SyncCallResult::ReceiverWoken(receiver_task)),
+            None => Ok(SyncCallResult::CallerMustBlock),
+        }
+    }
+
+    /// Synchronous reply on a specific endpoint.
+    pub fn sync_reply(
+        &self,
+        endpoint: EndpointId,
+        reply: Message,
+    ) -> Result<u32, IpcError> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return Err(IpcError::EndpointNotFound);
+        }
+        self.shards[endpoint.0 as usize].lock().sync_channel.deposit_reply(reply)
+    }
+
+    /// Take reply message after being woken from sync_call.
+    pub fn take_reply(&self, endpoint: EndpointId) -> Option<Message> {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return None;
+        }
+        self.shards[endpoint.0 as usize].lock().sync_channel.take_reply()
+    }
+}
+
+// SAFETY: ShardedIpcManager contains Spinlocks (which are Send+Sync) and
+// a trait object behind a Spinlock. All fields are safe to share across threads.
+unsafe impl Send for ShardedIpcManager {}
+unsafe impl Sync for ShardedIpcManager {}
 
 #[cfg(test)]
 mod tests {
@@ -900,5 +1121,77 @@ mod tests {
         // Second send on busy channel — rejected
         let msg2 = Message::new(EndpointId(0), EndpointId(1));
         assert!(channel.deposit_send(msg2, 11).is_err());
+    }
+
+    // ========================================================================
+    // Principal + Message identity tests
+    // ========================================================================
+
+    #[test]
+    fn test_message_sender_principal_defaults_to_none() {
+        let msg = Message::new(EndpointId(0), EndpointId(1));
+        assert!(msg.sender_principal.is_none());
+    }
+
+    #[test]
+    fn test_send_with_capability_stamps_principal() {
+        use crate::ipc::capability::CapabilityManager;
+
+        let mut mgr = IpcManager::new();
+        let mut cap_mgr = CapabilityManager::new();
+
+        let proc_id = ProcessId(0);
+        let endpoint = EndpointId(5);
+        let principal = Principal::from_public_key([0xAA; 32]);
+
+        // Set up: register process, grant capability, bind Principal
+        cap_mgr.register_process(proc_id).unwrap();
+        cap_mgr.grant_capability(proc_id, endpoint, CapabilityRights::FULL).unwrap();
+        cap_mgr.bind_principal(proc_id, principal).unwrap();
+
+        // Send a message through the capability-checked path
+        let msg = Message::new(EndpointId(0), endpoint);
+        mgr.send_message_with_capability(proc_id, endpoint, msg, &cap_mgr).unwrap();
+
+        // Verify: the received message has sender_principal stamped by kernel
+        let received = mgr.recv_message(endpoint).unwrap();
+        assert_eq!(received.sender_principal, Some(principal));
+    }
+
+    #[test]
+    fn test_send_with_capability_no_principal_stamps_none() {
+        use crate::ipc::capability::CapabilityManager;
+
+        let mut mgr = IpcManager::new();
+        let mut cap_mgr = CapabilityManager::new();
+
+        let proc_id = ProcessId(0);
+        let endpoint = EndpointId(5);
+
+        // Register process with capability but NO Principal bound
+        cap_mgr.register_process(proc_id).unwrap();
+        cap_mgr.grant_capability(proc_id, endpoint, CapabilityRights::FULL).unwrap();
+
+        let msg = Message::new(EndpointId(0), endpoint);
+        mgr.send_message_with_capability(proc_id, endpoint, msg, &cap_mgr).unwrap();
+
+        // No Principal bound → Err from get_principal → None stamped
+        let received = mgr.recv_message(endpoint).unwrap();
+        assert!(received.sender_principal.is_none());
+    }
+
+    #[test]
+    fn test_direct_send_does_not_stamp_principal() {
+        // send_message() (non-capability path) does NOT stamp sender_principal.
+        // Only send_message_with_capability() does. This is by design:
+        // the kernel stamps identity only through the authorized path.
+        let mut mgr = IpcManager::new();
+        let endpoint = EndpointId(5);
+
+        let msg = Message::new(EndpointId(0), endpoint);
+        mgr.send_message(endpoint, msg).unwrap();
+
+        let received = mgr.recv_message(endpoint).unwrap();
+        assert!(received.sender_principal.is_none());
     }
 }

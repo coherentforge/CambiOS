@@ -55,6 +55,39 @@ pub enum SyscallNumber {
     /// print(buffer: *const u8, len: usize) -> isize
     /// Print a string to the kernel serial console (for debugging)
     Print = 10,
+
+    /// bind_principal(process_id: u32, pubkey_ptr: *const u8, pubkey_len: u32) -> i32
+    /// Bind a cryptographic Principal to a process. Restricted to the bootstrap
+    /// Principal (identity service). pubkey_len must be 32.
+    BindPrincipal = 11,
+
+    /// get_principal(out_buf: *mut u8, buf_len: u32) -> i32
+    /// Read the calling process's bound Principal (32-byte public key).
+    /// Returns 32 on success, or error if no Principal is bound.
+    GetPrincipal = 12,
+
+    /// recv_msg(endpoint: u32, buf: *mut u8, buf_len: usize) -> isize
+    /// Receive an IPC message with sender identity.
+    /// Writes to buf: [sender_principal:32][from_endpoint:4][payload:N]
+    /// Returns total bytes written (>= 36), 0 if no message, or negative error.
+    RecvMsg = 13,
+
+    /// obj_put(content_ptr: *const u8, content_len: usize, out_hash: *mut u8) -> isize
+    /// Store an ArcObject. Author/owner = caller's Principal.
+    /// Writes 32-byte content hash to out_hash. Returns 0 or negative error.
+    ObjPut = 14,
+
+    /// obj_get(hash_ptr: *const u8, out_buf: *mut u8, out_buf_len: usize) -> isize
+    /// Retrieve object content by hash. Returns bytes written or negative error.
+    ObjGet = 15,
+
+    /// obj_delete(hash_ptr: *const u8) -> isize
+    /// Delete an object. Only the owner can delete. Returns 0 or negative error.
+    ObjDelete = 16,
+
+    /// obj_list(out_buf: *mut u8, out_buf_len: usize) -> isize
+    /// List object hashes. Writes packed 32-byte hashes. Returns count of objects.
+    ObjList = 17,
 }
 
 impl SyscallNumber {
@@ -72,6 +105,13 @@ impl SyscallNumber {
             8 => Some(Self::GetPid),
             9 => Some(Self::GetTime),
             10 => Some(Self::Print),
+            11 => Some(Self::BindPrincipal),
+            12 => Some(Self::GetPrincipal),
+            13 => Some(Self::RecvMsg),
+            14 => Some(Self::ObjPut),
+            15 => Some(Self::ObjGet),
+            16 => Some(Self::ObjDelete),
+            17 => Some(Self::ObjList),
             _ => None,
         }
     }

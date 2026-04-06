@@ -263,6 +263,28 @@ pub unsafe fn unmask_irq(gsi: u32) {
     write_redir_entry(gsi, entry & !(REDIR_MASK as u64));
 }
 
+/// Re-route an existing I/O APIC pin to a different CPU.
+///
+/// Reads the current redirection entry (preserving vector, polarity, trigger)
+/// and updates only the destination APIC ID field. Used by SYS_WAIT_IRQ to
+/// implement IRQ affinity — routing a device IRQ to the CPU running the
+/// driver task.
+///
+/// # Safety
+/// I/O APIC must be initialized. The pin must already be configured.
+pub unsafe fn set_irq_destination(gsi: u32, dest_apic_id: u8) {
+    let max = MAX_REDIR_ENTRIES.load(Ordering::Acquire);
+    if gsi >= max {
+        return;
+    }
+    let entry = read_redir_entry(gsi);
+    // Clear destination field (bits 63:56 of the 64-bit entry = high DWORD bits 31:24)
+    // and set the new destination APIC ID.
+    let cleared = entry & !((0xFF_u64) << 56);
+    let new_entry = cleared | ((dest_apic_id as u64) << 56);
+    write_redir_entry(gsi, new_entry);
+}
+
 /// Get the maximum number of redirection entries (I/O APIC pins).
 pub fn max_entries() -> u32 {
     MAX_REDIR_ENTRIES.load(Ordering::Acquire)

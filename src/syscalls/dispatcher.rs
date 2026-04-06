@@ -27,8 +27,13 @@ pub struct SyscallContext {
 /// Maximum user buffer size for a single syscall (4 KB)
 const MAX_USER_BUFFER: usize = 4096;
 
-/// Canonical user-space address ceiling (x86-64 lower half)
+/// Canonical user-space address ceiling.
+/// x86_64: lower-half canonical addresses end at bit 47.
+/// AArch64: TTBR0 covers 0..2^48 with T0SZ=16 (48-bit VA).
+#[cfg(target_arch = "x86_64")]
 const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+#[cfg(not(target_arch = "x86_64"))]
+const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
 
 /// Read bytes from a user-space virtual address into a kernel buffer.
 ///
@@ -36,9 +41,8 @@ const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
 /// spans, then reads via HHDM. Returns the number of bytes copied.
 ///
 /// # Safety contract
-/// `cr3` must be a valid PML4 physical address for the calling process.
-/// Called from syscall context with interrupts disabled.
-#[cfg(target_arch = "x86_64")]
+/// `cr3` must be a valid page table root physical address for the calling
+/// process (PML4 on x86_64, L0 on AArch64). Called from syscall context.
 fn read_user_buffer(cr3: u64, user_addr: u64, len: usize, dst: &mut [u8]) -> Result<usize, SyscallError> {
     if len == 0 {
         return Ok(0);
@@ -96,9 +100,8 @@ fn read_user_buffer(cr3: u64, user_addr: u64, len: usize, dst: &mut [u8]) -> Res
 /// writes via HHDM. Returns the number of bytes written.
 ///
 /// # Safety contract
-/// `cr3` must be a valid PML4 physical address for the calling process.
-/// The target pages must be mapped writable in the process page table.
-#[cfg(target_arch = "x86_64")]
+/// `cr3` must be a valid page table root physical address for the calling
+/// process (PML4 on x86_64, L0 on AArch64). Target pages must be mapped writable.
 fn write_user_buffer(cr3: u64, user_addr: u64, src: &[u8]) -> Result<usize, SyscallError> {
     let len = src.len();
     if len == 0 {
@@ -195,6 +198,13 @@ impl SyscallDispatcher {
             SyscallNumber::GetPid => Self::handle_get_pid(args, ctx),
             SyscallNumber::GetTime => Self::handle_get_time(args, ctx),
             SyscallNumber::Print => Self::handle_print(args, ctx),
+            SyscallNumber::BindPrincipal => Self::handle_bind_principal(args, ctx),
+            SyscallNumber::GetPrincipal => Self::handle_get_principal(args, ctx),
+            SyscallNumber::RecvMsg => Self::handle_recv_msg(args, ctx),
+            SyscallNumber::ObjPut => Self::handle_obj_put(args, ctx),
+            SyscallNumber::ObjGet => Self::handle_obj_get(args, ctx),
+            SyscallNumber::ObjDelete => Self::handle_obj_delete(args, ctx),
+            SyscallNumber::ObjList => Self::handle_obj_list(args, ctx),
         }
     }
 
@@ -251,7 +261,6 @@ impl SyscallDispatcher {
 
         // Read user buffer into kernel
         let mut kbuf = [0u8; 256];
-        #[cfg(target_arch = "x86_64")]
         read_user_buffer(ctx.cr3, user_buf, len, &mut kbuf)?;
 
         // Build IPC message
@@ -318,7 +327,6 @@ impl SyscallDispatcher {
                 let payload = msg.payload();
                 let copy_len = core::cmp::min(payload.len(), max_len);
 
-                #[cfg(target_arch = "x86_64")]
                 write_user_buffer(ctx.cr3, user_buf, &payload[..copy_len])?;
 
                 Ok(copy_len as u64)
@@ -370,6 +378,10 @@ impl SyscallDispatcher {
     /// and returns the user virtual address.
     ///
     /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    ///
+    /// Performance: data frames are allocated from the per-CPU cache
+    /// (no global lock). FRAME_ALLOCATOR is only locked briefly for
+    /// map_page() calls that may need intermediate page table frames.
     fn handle_allocate(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let size = args.arg_usize(1);
 
@@ -391,16 +403,17 @@ impl SyscallDispatcher {
 
         let base_vaddr = vma.allocate_region(num_pages).ok_or(SyscallError::OutOfMemory)?;
 
-        let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
         let hhdm = crate::hhdm_offset();
 
         for i in 0..num_pages as usize {
             let page_vaddr = base_vaddr + (i as u64 * 4096);
 
-            let frame = match fa_guard.allocate() {
+            // Allocate data frame from per-CPU cache (fast path: no global lock)
+            let frame = match crate::cached_allocate_frame() {
                 Ok(f) => f,
                 Err(_) => {
                     // Rollback: unmap already-mapped pages and free their frames
+                    let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
                     for j in 0..i {
                         let rollback_vaddr = base_vaddr + (j as u64 * 4096);
                         // SAFETY: cr3 is valid, pages were just mapped above.
@@ -428,6 +441,8 @@ impl SyscallDispatcher {
             }
 
             // Map into process page table
+            // FRAME_ALLOCATOR only needed here for potential page table frame alloc
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
             // SAFETY: cr3 is valid (non-zero, checked above). Frame is fresh.
             unsafe {
                 let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
@@ -440,6 +455,7 @@ impl SyscallDispatcher {
                 )
                 .map_err(|_| SyscallError::OutOfMemory)?;
             }
+            drop(fa_guard); // Release between loop iterations
         }
 
         Ok(base_vaddr)
@@ -474,8 +490,7 @@ impl SyscallDispatcher {
             .and_then(|vma| vma.free_region(ptr))
             .ok_or(SyscallError::InvalidArg)?;
 
-        // Unmap each page and free its backing frame
-        let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+        // Unmap each page and return frame to per-CPU cache (fast path)
         for i in 0..vma_entry.num_pages as u64 {
             let page_vaddr = vma_entry.base_vaddr + i * 4096;
             // SAFETY: cr3 is valid (non-zero, checked above). These pages were
@@ -483,7 +498,7 @@ impl SyscallDispatcher {
             unsafe {
                 let mut pte = crate::memory::paging::page_table_from_cr3(ctx.cr3);
                 if let Ok(freed_frame) = crate::memory::paging::unmap_page(&mut pte, page_vaddr) {
-                    let _ = fa_guard.free(freed_frame);
+                    let _ = crate::cached_free_frame(freed_frame);
                 }
             }
         }
@@ -535,8 +550,36 @@ impl SyscallDispatcher {
         let irq = crate::interrupts::routing::IrqNumber(irq_num as u8);
         let _ = router_guard.register(irq, ctx.task_id, 128);
 
-        // Block the task until the IRQ fires
+        // Pin the task to this CPU and re-route the hardware IRQ so it fires
+        // on the same CPU as the waiting driver task. Eliminates cross-CPU
+        // wake scan in device_irq_handler.
         if let Some(sched) = sched_guard.as_mut() {
+            if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
+                task.pinned = true;
+            }
+
+            // Re-route device IRQ to this CPU via I/O APIC (x86_64) or GIC SPI (AArch64)
+            #[cfg(target_arch = "x86_64")]
+            {
+                let local_apic_id = unsafe {
+                    crate::arch::x86_64::percpu::current_percpu().apic_id() as u8
+                };
+                // SAFETY: I/O APIC is initialized before user tasks run.
+                unsafe {
+                    crate::arch::x86_64::ioapic::set_irq_destination(irq_num, local_apic_id);
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Enable the SPI in the GIC distributor so it can fire.
+                // AArch64 GIC routes SPIs to CPUs via affinity in the distributor;
+                // by default SPIs go to the CPU that enabled them.
+                if irq_num >= 32 {
+                    // SAFETY: GIC distributor is initialized before user tasks run.
+                    unsafe { crate::arch::aarch64::gic::enable_spi(irq_num); }
+                }
+            }
+
             sched
                 .block_task(ctx.task_id, crate::scheduler::BlockReason::IoWait(irq_num))
                 .map_err(|_| SyscallError::InvalidArg)?;
@@ -578,7 +621,6 @@ impl SyscallDispatcher {
         }
 
         let mut buf = [0u8; 256];
-        #[cfg(target_arch = "x86_64")]
         read_user_buffer(ctx.cr3, user_buf, len, &mut buf)?;
 
         for &byte in &buf[..len] {
@@ -586,5 +628,359 @@ impl SyscallDispatcher {
         }
 
         Ok(len as u64)
+    }
+
+    // ========================================================================
+    // Identity syscalls
+    // ========================================================================
+
+    /// SYS_BIND_PRINCIPAL: Bind a cryptographic Principal to a process.
+    ///
+    /// Args: arg1 = target process_id, arg2 = pubkey_ptr (user vaddr),
+    ///        arg3 = pubkey_len (must be 32)
+    ///
+    /// Restricted: only the bootstrap Principal can call this. This is the
+    /// identity service's privilege — it binds Principals to processes on
+    /// behalf of the system.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) only.
+    fn handle_bind_principal(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let target_pid = args.arg1_u32();
+        let pubkey_ptr = args.arg2;
+        let pubkey_len = args.arg_usize(3);
+
+        // Public key must be exactly 32 bytes (Ed25519)
+        if pubkey_len != 32 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Read the 32-byte public key from user buffer
+        let mut pubkey = [0u8; 32];
+        read_user_buffer(ctx.cr3, pubkey_ptr, 32, &mut pubkey)?;
+
+        // Restriction: only the bootstrap Principal can bind Principals.
+        // Check caller's own Principal against the global bootstrap Principal.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+            let caller_principal = cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?;
+
+            let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+            if caller_principal != bootstrap {
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
+        // Bind the Principal to the target process
+        let target = ProcessId(target_pid);
+        let principal = crate::ipc::Principal::from_public_key(pubkey);
+
+        let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+        let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+        cap_mgr
+            .bind_principal(target, principal)
+            .map_err(|_| SyscallError::PermissionDenied)?;
+
+        Ok(0)
+    }
+
+    /// SYS_GET_PRINCIPAL: Read the calling process's bound Principal.
+    ///
+    /// Args: arg1 = out_buf (user vaddr), arg2 = buf_len (must be >= 32)
+    ///
+    /// Writes 32 bytes of public key to the user buffer. Returns 32 on
+    /// success, or error if no Principal is bound to this process.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) only.
+    fn handle_get_principal(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let out_buf = args.arg1;
+        let buf_len = args.arg_usize(2);
+
+        if buf_len < 32 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Look up caller's Principal
+        let principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::InvalidArg)?
+        };
+
+        // Write the 32-byte public key to user buffer
+        write_user_buffer(ctx.cr3, out_buf, &principal.public_key)?;
+
+        Ok(32)
+    }
+
+    // ========================================================================
+    // IPC: RecvMsg (identity-aware receive)
+    // ========================================================================
+
+    /// SYS_RECV_MSG: Receive an IPC message with sender identity metadata.
+    ///
+    /// Args: arg1 = endpoint_id, arg2 = buf (user vaddr), arg3 = buf_len
+    ///
+    /// Writes to buf: [sender_principal:32][from_endpoint_le:4][payload:N]
+    /// Returns total bytes written (36 + payload_len), 0 if no message.
+    ///
+    /// Lock ordering: IPC_MANAGER(3) → CAPABILITY_MANAGER(4), then page tables.
+    fn handle_recv_msg(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let endpoint_id = args.arg1_u32();
+        let user_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        // Need at least 36 bytes for header (32 principal + 4 endpoint)
+        if buf_len < 36 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let endpoint = crate::ipc::EndpointId(endpoint_id);
+
+        // Lock ordering: IPC_MANAGER(3) → CAPABILITY_MANAGER(4)
+        let mut ipc_guard = crate::IPC_MANAGER.lock();
+        let cap_guard = crate::CAPABILITY_MANAGER.lock();
+
+        let ipc_mgr = ipc_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+        let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+        let msg = ipc_mgr
+            .recv_message_with_capability(ctx.process_id, endpoint, cap_mgr)
+            .map_err(|_| SyscallError::PermissionDenied)?;
+
+        // Drop locks before touching page tables
+        drop(cap_guard);
+        drop(ipc_guard);
+
+        match msg {
+            Some(msg) => {
+                let payload = msg.payload();
+                let payload_len = core::cmp::min(payload.len(), buf_len - 36);
+
+                // Build response: [principal:32][from:4][payload:N]
+                let mut header = [0u8; 36];
+
+                // sender_principal (32 bytes) — may be None (zeros)
+                if let Some(principal) = msg.sender_principal {
+                    header[0..32].copy_from_slice(&principal.public_key);
+                }
+
+                // from_endpoint (4 bytes, little-endian)
+                header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
+
+                // Write header
+                write_user_buffer(ctx.cr3, user_buf, &header)?;
+
+                // Write payload
+                if payload_len > 0 {
+                    write_user_buffer(ctx.cr3, user_buf + 36, &payload[..payload_len])?;
+                }
+
+                Ok((36 + payload_len) as u64)
+            }
+            None => Ok(0), // No message available
+        }
+    }
+
+    // ========================================================================
+    // ObjectStore syscalls
+    // ========================================================================
+
+    /// SYS_OBJ_PUT: Store an ArcObject in the object store.
+    ///
+    /// Args: arg1 = content_ptr (user vaddr), arg2 = content_len, arg3 = out_hash (user vaddr)
+    ///
+    /// Creates an ArcObject with author/owner = caller's Principal.
+    /// Writes 32-byte content hash to out_hash. Returns 0 on success.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(8) — sequential, not nested.
+    fn handle_obj_put(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let content_ptr = args.arg1;
+        let content_len = args.arg_usize(2);
+        let out_hash = args.arg3;
+
+        if content_len == 0 || content_len > MAX_USER_BUFFER {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Read content from user buffer
+        let mut kbuf = [0u8; 4096];
+        let copied = read_user_buffer(ctx.cr3, content_ptr, content_len, &mut kbuf)?;
+
+        // Get caller's Principal (required — anonymous puts are not allowed)
+        let principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        };
+
+        // Get current time for created_at
+        let ticks = crate::scheduler::Timer::get_ticks();
+
+        // Create ArcObject with caller as author and owner
+        let content_vec = {
+            extern crate alloc;
+            let mut v = alloc::vec::Vec::with_capacity(copied);
+            v.extend_from_slice(&kbuf[..copied]);
+            v
+        };
+        let obj = crate::fs::ArcObject::new(principal, content_vec, ticks);
+        let hash = obj.content_hash;
+
+        // Store in OBJECT_STORE (lock position 8)
+        let mut store_guard = crate::OBJECT_STORE.lock();
+        let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+        use crate::fs::ObjectStore;
+        store.put(obj).map_err(|e| match e {
+            crate::fs::StoreError::CapacityExceeded => SyscallError::OutOfMemory,
+            crate::fs::StoreError::InvalidObject => SyscallError::InvalidArg,
+            _ => SyscallError::InvalidArg,
+        })?;
+        drop(store_guard);
+
+        // Write hash to user buffer
+        write_user_buffer(ctx.cr3, out_hash, &hash)?;
+
+        Ok(0)
+    }
+
+    /// SYS_OBJ_GET: Retrieve object content by content hash.
+    ///
+    /// Args: arg1 = hash_ptr (user vaddr, 32 bytes), arg2 = out_buf, arg3 = out_buf_len
+    ///
+    /// Returns bytes written on success, or negative error.
+    ///
+    /// Lock ordering: OBJECT_STORE(8) only.
+    fn handle_obj_get(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let hash_ptr = args.arg1;
+        let out_buf = args.arg2;
+        let out_buf_len = args.arg_usize(3);
+
+        if out_buf_len == 0 || ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Read 32-byte hash from user
+        let mut hash = [0u8; 32];
+        read_user_buffer(ctx.cr3, hash_ptr, 32, &mut hash)?;
+
+        // Look up in OBJECT_STORE
+        let store_guard = crate::OBJECT_STORE.lock();
+        let store = store_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+        use crate::fs::ObjectStore;
+        let obj = store.get(&hash).map_err(|e| match e {
+            crate::fs::StoreError::NotFound => SyscallError::EndpointNotFound,
+            _ => SyscallError::InvalidArg,
+        })?;
+
+        let copy_len = core::cmp::min(obj.content.len(), out_buf_len);
+        let content_slice = &obj.content[..copy_len];
+
+        // Must copy before dropping lock (can't hold reference across drop)
+        let mut kbuf = [0u8; 4096];
+        kbuf[..copy_len].copy_from_slice(content_slice);
+        drop(store_guard);
+
+        write_user_buffer(ctx.cr3, out_buf, &kbuf[..copy_len])?;
+
+        Ok(copy_len as u64)
+    }
+
+    /// SYS_OBJ_DELETE: Delete an object from the store.
+    ///
+    /// Args: arg1 = hash_ptr (user vaddr, 32 bytes)
+    ///
+    /// Only the object's owner can delete. Returns 0 on success.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(8) — sequential.
+    fn handle_obj_delete(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let hash_ptr = args.arg1;
+
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Read 32-byte hash from user
+        let mut hash = [0u8; 32];
+        read_user_buffer(ctx.cr3, hash_ptr, 32, &mut hash)?;
+
+        // Get caller's Principal
+        let principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        };
+
+        // Check ownership then delete
+        let mut store_guard = crate::OBJECT_STORE.lock();
+        let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+        use crate::fs::ObjectStore;
+
+        // Verify caller is owner before deleting
+        {
+            let obj = store.get(&hash).map_err(|_| SyscallError::EndpointNotFound)?;
+            if obj.owner != principal.public_key {
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
+        store.delete(&hash).map_err(|_| SyscallError::EndpointNotFound)?;
+
+        Ok(0)
+    }
+
+    /// SYS_OBJ_LIST: List all object hashes in the store.
+    ///
+    /// Args: arg1 = out_buf (user vaddr), arg2 = out_buf_len
+    ///
+    /// Writes packed 32-byte hashes. Returns number of objects listed.
+    ///
+    /// Lock ordering: OBJECT_STORE(8) only.
+    fn handle_obj_list(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let out_buf = args.arg1;
+        let out_buf_len = args.arg_usize(2);
+
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let max_objects = out_buf_len / 32;
+        if max_objects == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let store_guard = crate::OBJECT_STORE.lock();
+        let store = store_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+        use crate::fs::ObjectStore;
+        let listing = store.list().map_err(|_| SyscallError::InvalidArg)?;
+        drop(store_guard);
+
+        let count = core::cmp::min(listing.len(), max_objects);
+
+        // Write packed hashes to user buffer
+        for (i, (hash, _meta)) in listing.iter().take(count).enumerate() {
+            let offset = (i * 32) as u64;
+            write_user_buffer(ctx.cr3, out_buf + offset, hash)?;
+        }
+
+        Ok(count as u64)
     }
 }

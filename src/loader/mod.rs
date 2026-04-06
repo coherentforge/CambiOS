@@ -230,7 +230,6 @@ pub struct LoadedProcess {
 /// The caller is responsible for lock ordering if calling from a context
 /// where the global spinlocks are in play. During boot init (single-threaded),
 /// pass the raw references directly.
-#[cfg(target_arch = "x86_64")]
 pub fn load_elf_process(
     binary: &[u8],
     process_id: ProcessId,
@@ -282,24 +281,40 @@ pub fn load_elf_process(
         for page_idx in 0..num_pages {
             let page_vaddr = page_aligned_vaddr + (page_idx as u64 * PAGE_SIZE);
 
-            let frame = frame_alloc
-                .allocate()
-                .map_err(|_| LoaderError::FrameAllocationFailed)?;
+            // Check if this page was already mapped by a prior segment (e.g.,
+            // .text and .rodata sharing the same 4 KiB page). If so, reuse
+            // the existing frame instead of allocating and re-mapping.
+            let frame_phys = unsafe {
+                let pt = paging::page_table_from_cr3(cr3);
+                paging::translate(&pt, page_vaddr)
+            };
 
-            // Zero the frame via HHDM before copying data
-            // SAFETY: frame.addr is a freshly allocated physical frame. HHDM maps
-            // it to a valid kernel-accessible virtual address. We zero the full page.
-            unsafe {
-                core::ptr::write_bytes((frame.addr + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
-            }
+            let frame_addr = if let Some(existing_phys) = frame_phys {
+                // Page already mapped — reuse the existing frame
+                existing_phys
+            } else {
+                // Allocate a new frame
+                let frame = frame_alloc
+                    .allocate()
+                    .map_err(|_| LoaderError::FrameAllocationFailed)?;
 
-            // SAFETY: cr3 is a valid PML4 from create_process_page_table(). The
-            // frame is freshly allocated and zeroed.
-            unsafe {
-                let mut pt = paging::page_table_from_cr3(cr3);
-                paging::map_page(&mut pt, page_vaddr, frame.addr, flags, frame_alloc)
-                    .map_err(|_| LoaderError::PagingFailed)?;
-            }
+                // Zero the frame via HHDM before copying data
+                // SAFETY: frame.addr is a freshly allocated physical frame. HHDM maps
+                // it to a valid kernel-accessible virtual address. We zero the full page.
+                unsafe {
+                    core::ptr::write_bytes((frame.addr + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
+                }
+
+                // SAFETY: cr3 is a valid PML4 from create_process_page_table(). The
+                // frame is freshly allocated and zeroed.
+                unsafe {
+                    let mut pt = paging::page_table_from_cr3(cr3);
+                    paging::map_page(&mut pt, page_vaddr, frame.addr, flags, frame_alloc)
+                        .map_err(|_| LoaderError::PagingFailed)?;
+                }
+
+                frame.addr
+            };
 
             // Copy file data into this page (if any falls within this page)
             let page_start_in_segment = if page_idx == 0 {
@@ -325,7 +340,7 @@ pub fn load_elf_process(
                 // and writable. src and dst don't overlap.
                 unsafe {
                     let src = binary.as_ptr().add(src_offset as usize);
-                    let dst = (frame.addr + hhdm + copy_offset_in_page) as *mut u8;
+                    let dst = (frame_addr + hhdm + copy_offset_in_page) as *mut u8;
                     core::ptr::copy_nonoverlapping(src, dst, copy_len);
                 }
             }
@@ -377,10 +392,11 @@ pub fn load_elf_process(
     let saved_ctx = saved_ctx_addr as *mut crate::arch::SavedContext;
 
     // SAFETY: saved_ctx points within the freshly allocated kernel stack.
-    // The SavedContext is fully initialized with USER_CS/USER_SS (ring 3
-    // selectors) and the ELF entry point / user stack top. iretq will pop
-    // this to transition to ring 3.
+    // The SavedContext is fully initialized with the ELF entry point and
+    // user stack top. On x86_64 iretq pops this to ring 3; on AArch64 eret
+    // returns to EL0 using elr_el1/spsr_el1.
     unsafe {
+        #[cfg(target_arch = "x86_64")]
         core::ptr::write(
             saved_ctx,
             crate::arch::SavedContext {
@@ -394,6 +410,18 @@ pub fn load_elf_process(
                 ss: crate::arch::gdt::USER_SS as u64,
             },
         );
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ctx = crate::arch::SavedContext {
+                gpr: [0u64; 31],
+                elr_el1: metadata.entry_point,
+                // SPSR_EL1 = EL0t (bits[3:0]=0b0000), DAIF clear = interrupts enabled
+                spsr_el1: 0x0,
+                sp_el0: DEFAULT_STACK_TOP,
+            };
+            // x29 (FP) and x30 (LR) are zero — first entry has no caller
+            core::ptr::write(saved_ctx, ctx);
+        }
     }
 
     // --- Step 8: Register task in scheduler ---
@@ -431,7 +459,6 @@ pub fn load_elf_process(
 ///
 /// The resulting ELF passes `DefaultVerifier`: entry is within the segment,
 /// segment is in user space, and it's read-execute only (no W^X violation).
-#[cfg(target_arch = "x86_64")]
 pub fn build_boot_elf(code: &[u8], entry_vaddr: u64) -> alloc::vec::Vec<u8> {
     use elf::{Elf64Header, Elf64ProgramHeader, phdr_type, phdr_flags};
 
@@ -466,7 +493,7 @@ pub fn build_boot_elf(code: &[u8], entry_vaddr: u64) -> alloc::vec::Vec<u8> {
         abi_version: 0,
         _padding: [0; 7],
         e_type: 2,  // ET_EXEC
-        e_machine: 0x3E, // x86-64
+        e_machine: elf::ELF_MACHINE_CURRENT,
         e_version: 1,
         e_entry: entry_vaddr,
         e_phoff: ehdr_size as u64,
@@ -550,7 +577,7 @@ mod tests {
             abi_version: 0,
             _padding: [0; 7],
             e_type: 2,  // ET_EXEC
-            e_machine: 0x3E, // x86-64
+            e_machine: elf::ELF_MACHINE_CURRENT,
             e_version: 1,
             e_entry: entry,
             e_phoff: ehdr_size as u64,

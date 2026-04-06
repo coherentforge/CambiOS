@@ -3,7 +3,7 @@
 //! Enforces fine-grained access control for IPC operations.
 //! Each process holds capabilities that grant rights to communicate with endpoints.
 
-use crate::ipc::{ProcessId, EndpointId, CapabilityRights};
+use crate::ipc::{ProcessId, EndpointId, CapabilityRights, Principal};
 use crate::process::MAX_PROCESSES;
 extern crate alloc;
 use alloc::boxed::Box;
@@ -41,7 +41,7 @@ pub struct Capability {
 }
 
 /// Capability table for a single process
-/// 
+///
 /// Each process can hold up to 32 capabilities (endpoint access rights).
 /// Designed for verification: bounded set, explicit tracking.
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +52,10 @@ pub struct ProcessCapabilities {
     capabilities: [Option<Capability>; 32],
     /// Number of active capabilities
     count: u8,
+    /// Cryptographic identity bound to this process.
+    /// Set via BindPrincipal syscall. Once bound, cannot be rebound without
+    /// explicit unbind (prevents identity theft).
+    principal: Option<Principal>,
 }
 
 impl ProcessCapabilities {
@@ -61,6 +65,7 @@ impl ProcessCapabilities {
             process_id,
             capabilities: [None; 32],
             count: 0,
+            principal: None,
         }
     }
 
@@ -334,6 +339,47 @@ impl CapabilityManager {
         self.process_count
     }
 
+    /// Bind a Principal (cryptographic identity) to a process.
+    ///
+    /// Once bound, the Principal cannot be rebound without explicit unbind.
+    /// This prevents identity theft — a process cannot assume another's identity.
+    pub fn bind_principal(
+        &mut self,
+        process_id: ProcessId,
+        principal: Principal,
+    ) -> Result<(), CapabilityError> {
+        if process_id.0 >= MAX_PROCESSES as u32 {
+            return Err(CapabilityError::InvalidOperation);
+        }
+
+        let caps = self.process_caps[process_id.0 as usize]
+            .as_mut()
+            .ok_or(CapabilityError::ProcessNotFound)?;
+
+        if caps.principal.is_some() {
+            return Err(CapabilityError::InvalidOperation); // Already bound
+        }
+
+        caps.principal = Some(principal);
+        Ok(())
+    }
+
+    /// Get the Principal bound to a process.
+    pub fn get_principal(
+        &self,
+        process_id: ProcessId,
+    ) -> Result<Principal, CapabilityError> {
+        if process_id.0 >= MAX_PROCESSES as u32 {
+            return Err(CapabilityError::InvalidOperation);
+        }
+
+        let caps = self.process_caps[process_id.0 as usize]
+            .as_ref()
+            .ok_or(CapabilityError::ProcessNotFound)?;
+
+        caps.principal.ok_or(CapabilityError::ProcessNotFound)
+    }
+
     /// Delegate a capability to another process.
     ///
     /// Pipeline: interceptor check → capability validation → grant.
@@ -580,5 +626,64 @@ mod tests {
                 delegate: false,
             }
         ).is_err());
+    }
+
+    // ========================================================================
+    // Principal binding tests
+    // ========================================================================
+
+    #[test]
+    fn test_bind_and_get_principal() {
+        let mut mgr = CapabilityManager::new();
+        let proc_id = ProcessId(1);
+        let principal = Principal::from_public_key([0xAA; 32]);
+
+        mgr.register_process(proc_id).unwrap();
+        mgr.bind_principal(proc_id, principal).unwrap();
+
+        let retrieved = mgr.get_principal(proc_id).unwrap();
+        assert_eq!(retrieved, principal);
+    }
+
+    #[test]
+    fn test_bind_principal_rejects_double_bind() {
+        let mut mgr = CapabilityManager::new();
+        let proc_id = ProcessId(1);
+        let p1 = Principal::from_public_key([0xAA; 32]);
+        let p2 = Principal::from_public_key([0xBB; 32]);
+
+        mgr.register_process(proc_id).unwrap();
+        mgr.bind_principal(proc_id, p1).unwrap();
+
+        // Second bind should fail — prevents identity theft
+        assert!(mgr.bind_principal(proc_id, p2).is_err());
+
+        // Original Principal is preserved
+        assert_eq!(mgr.get_principal(proc_id).unwrap(), p1);
+    }
+
+    #[test]
+    fn test_get_principal_unregistered_process() {
+        let mgr = CapabilityManager::new();
+        assert!(mgr.get_principal(ProcessId(99)).is_err());
+    }
+
+    #[test]
+    fn test_get_principal_no_principal_bound() {
+        let mut mgr = CapabilityManager::new();
+        let proc_id = ProcessId(1);
+        mgr.register_process(proc_id).unwrap();
+
+        // Registered but no Principal bound yet
+        assert!(mgr.get_principal(proc_id).is_err());
+    }
+
+    #[test]
+    fn test_bind_principal_unregistered_process() {
+        let mut mgr = CapabilityManager::new();
+        let principal = Principal::from_public_key([0xAA; 32]);
+
+        // Not registered — should fail
+        assert!(mgr.bind_principal(ProcessId(99), principal).is_err());
     }
 }

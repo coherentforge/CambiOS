@@ -24,7 +24,7 @@ extern crate alloc;
 //
 // PER_CPU_SCHEDULER[*](1) → PER_CPU_TIMER[*](2) → IPC_MANAGER(3) →
 // CAPABILITY_MANAGER(4) → PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) →
-// INTERRUPT_ROUTER(7)
+// INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
 //
 // Lower-numbered locks must be acquired before higher-numbered ones.
 // Sequential (non-nested) acquisitions are always safe — release the first
@@ -39,11 +39,38 @@ extern crate alloc;
 //   create_elf_user_task: PROCESS_TABLE(5) + FRAME_ALLOCATOR(6) nested  ✓
 //   ipc_send_and_notify:  IPC_MANAGER(3) released, then SCHEDULER(1)   ✓ (sequential)
 //   sync_ipc_*:           IPC_MANAGER(3) released, then SCHEDULER(1)   ✓ (sequential)
+//
+// ============================================================================
+// Scalability constraints (known architectural limits)
+// ============================================================================
+//
+// These are documented here for future work, not immediate fixes.
+//
+// SCHEDULER:
+//   - MAX_TASKS=32 is the hard ceiling across all CPUs. With 256 CPUs, most
+//     cores idle. Needs per-CPU task arrays or dynamic allocation.
+//   - find_next_ready_task() does a two-pass O(32) scan on every timer tick
+//     (100Hz × cpu_count). Replace with per-priority run queues or bitmap.
+//   - on_timer_isr() uses try_lock(): if the scheduler lock is contended,
+//     the timer tick is silently skipped (no preemption, no time accounting).
+//
+// IPC:
+//   - Single global IPC_MANAGER lock serializes all endpoints across all CPUs.
+//     Needs per-endpoint sharding or lock-free queues.
+//   - MAX_ENDPOINTS=32, queue depth=16. Under load, QueueFull rejections.
+//   - Capability verify_access() is O(32) per message send/recv.
+//
+// MEMORY:
+//   - Single global FRAME_ALLOCATOR lock; allocate() scans up to 8192 bitmap
+//     words under fragmentation. Needs per-CPU free-lists or zone allocators.
+//   - map_range() holds FRAME_ALLOCATOR for N page allocations (e.g., 262
+//     frames for a 1MB allocation). Should batch or use per-CPU caches.
+//   - Kernel heap is first-fit linked-list with no size-class segregation.
 
 use alloc::boxed::Box;
 use limine::BaseRevision;
 use limine::request::{
-    FramebufferRequest, HhdmRequest, MemoryMapRequest, MpRequest, RsdpRequest,
+    FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RsdpRequest,
     RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
 };
 #[cfg(target_arch = "x86_64")]
@@ -56,7 +83,9 @@ use arcos_core::interrupts::{IrqNumber, InterruptContext};
 use arcos_core::process::ProcessTable;
 
 // Use the global statics from the library crate
-use arcos_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, INTERRUPT_ROUTER};
+use arcos_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, INTERRUPT_ROUTER, BOOTSTRAP_PRINCIPAL, OBJECT_STORE};
+
+
 
 // ============================================================================
 // Limine boot protocol requests
@@ -98,6 +127,12 @@ static MP_REQUEST: MpRequest = MpRequest::new();
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new()
     .with_size(256 * 1024);
 
+/// Request boot modules (ELF binaries loaded by Limine from boot media).
+/// Modules are specified in limine.conf with `module_path` directives.
+#[used]
+#[unsafe(link_section = ".requests")]
+static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
 /// Limine requests section markers.
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -114,9 +149,77 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 /// symbol matches what limine.conf expects.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
-    // Disable interrupts immediately — no IDT is loaded yet, so any
-    // stray hardware interrupt would triple-fault the CPU.
+    // Disable interrupts immediately — no exception vector table is loaded yet.
+    #[cfg(target_arch = "x86_64")]
     x86_64::instructions::interrupts::disable();
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Masking DAIF at EL1 boot is always safe. Limine should have
+    // already done this, but be defensive.
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nostack, nomem)); }
+
+    // Store HHDM offset FIRST — AArch64 needs it for ALL MMIO addresses
+    // (PL011 UART, GIC). Limine on AArch64 does NOT identity-map device MMIO
+    // in TTBR0 — only RAM is identity-mapped. All MMIO must go through HHDM.
+    if let Some(hhdm_response) = HHDM_REQUEST.get_response() {
+        arcos_core::set_hhdm_offset(hhdm_response.offset());
+    }
+
+    // AArch64: Diagnose and map MMIO devices before any I/O.
+    // Limine's HHDM only covers RAM, not device MMIO.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Read TCR_EL1 to determine actual VA width
+        let tcr: u64;
+        core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr, options(nostack, nomem));
+        let t1sz = (tcr >> 16) & 0x3F;
+        // VA bits for TTBR1 = 64 - T1SZ
+        // If T1SZ=25 → 39-bit VA → TTBR1 covers 0xFFFFFF8000000000+
+        // If T1SZ=16 → 48-bit VA → TTBR1 covers 0xFFFF000000000000+
+
+        // Widen TCR_EL1.T1SZ to 16 (48-bit VA space) if it's smaller,
+        // so that the full HHDM range is addressable.
+        if t1sz > 16 {
+            let new_tcr = (tcr & !(0x3F << 16)) | (16 << 16);
+            core::arch::asm!(
+                "msr tcr_el1, {}",
+                "isb",
+                in(reg) new_tcr,
+                options(nostack),
+            );
+        }
+
+        // Now map MMIO devices into TTBR1
+        use arcos_core::memory::paging::early_map_mmio;
+        // PL011 UART0 at 0x0900_0000 (QEMU virt)
+        if let Err(_) = early_map_mmio(0x0900_0000) {
+            // Can't print — UART isn't mapped yet. Just halt.
+            loop { core::arch::asm!("wfe", options(nostack, nomem)); }
+        }
+        // GIC Distributor at 0x0800_0000 (QEMU virt) — map 64KB region.
+        // Failure is fatal: scheduling requires GIC for timer interrupts.
+        for page in 0..16u64 {
+            if let Err(_) = early_map_mmio(0x0800_0000 + page * 0x1000) {
+                loop { core::arch::asm!("wfe", options(nostack, nomem)); }
+            }
+        }
+        // GIC Redistributor at 0x080A_0000 (QEMU virt)
+        // Each CPU's GICR frame is 128KB (0x20000 stride, two 64KB frames).
+        // Map enough for 4 CPUs: 4 × 32 pages = 128 pages = 512KB.
+        for page in 0..128u64 {
+            if let Err(_) = early_map_mmio(0x080A_0000 + page * 0x1000) {
+                loop { core::arch::asm!("wfe", options(nostack, nomem)); }
+            }
+        }
+    }
+
+    // Early diagnostic on AArch64: write to PL011 via HHDM to confirm entry
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let hhdm = arcos_core::hhdm_offset();
+        let uart = (0x0900_0000u64 + hhdm) as *mut u8;
+        // SAFETY: PL011 UART0 at HHDM address. Just mapped via early_map_mmio.
+        core::ptr::write_volatile(uart, b'K');
+    }
 
     // Initialize serial output FIRST so panic messages are visible
     // SAFETY: Called once as the first init step. No other code accesses SERIAL1 yet.
@@ -125,17 +228,11 @@ unsafe extern "C" fn kmain() -> ! {
     // Verify Limine protocol is supported (panics with a message if not)
     assert!(BASE_REVISION.is_supported(), "Limine base revision not supported!");
 
-    println!("=== ArcOS Microkernel [v.8] ===");
+    println!("=== ArcOS Microkernel [v0.1.0] ===");
     println!("Booted via Limine\n");
 
-    // Report HHDM offset and store globally
-    if let Some(hhdm_response) = HHDM_REQUEST.get_response() {
-        let offset = hhdm_response.offset();
-        arcos_core::set_hhdm_offset(offset);
-        println!("HHDM offset: {:#x}", offset);
-    } else {
-        println!("WARNING: No HHDM response from bootloader");
-    }
+    let hhdm_offset = arcos_core::hhdm_offset();
+    println!("HHDM offset: {:#x}", hhdm_offset);
 
     // Report memory map
     if let Some(memmap_response) = MEMORY_MAP_REQUEST.get_response() {
@@ -187,39 +284,55 @@ unsafe extern "C" fn kmain() -> ! {
     init_frame_allocator();
 
     // Load our GDT (replaces Limine's) — must be before IDT and syscall init
-    // SAFETY: Single-threaded boot, interrupts disabled. The new GDT includes
-    // kernel/user segments and a TSS for ring transitions.
+    // On AArch64: no-op (EL1/EL0 managed via exception levels).
+    // SAFETY: Single-threaded boot, interrupts disabled.
     unsafe { arcos_core::arch::gdt::init(); }
     println!("✓ GDT loaded (kernel CS={:#x}, SS={:#x})",
         arcos_core::arch::gdt::KERNEL_CS,
         arcos_core::arch::gdt::KERNEL_SS,
     );
 
-    // Save the kernel CR3 for restoring address space after user tasks
+    // Save the kernel page table root for restoring address space after user tasks
     {
-        let cr3: u64;
-        // SAFETY: Reading CR3 is safe at ring 0. Returns the PML4 physical address.
-        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)); }
-        arcos_core::set_kernel_cr3(cr3);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let cr3: u64;
+            // SAFETY: Reading CR3 is safe at ring 0. Returns the PML4 physical address.
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)); }
+            arcos_core::set_kernel_cr3(cr3);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ttbr1: u64;
+            // SAFETY: Reading TTBR1_EL1 is safe at EL1. This is the kernel page table.
+            unsafe { core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1, options(nostack, nomem)); }
+            arcos_core::set_kernel_cr3(ttbr1);
+        }
     }
 
-    // Initialize core hardware (IDT, etc.)
-    // SAFETY: Single-threaded boot, GDT already loaded. Sets up exception handlers.
-    unsafe {
-        arcos_core::interrupts::init();
+    // Initialize exception/interrupt vector table
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: Single-threaded boot, GDT already loaded. Sets up exception handlers.
+        unsafe { arcos_core::interrupts::init(); }
+        println!("✓ IDT loaded");
     }
-    println!("✓ IDT loaded");
 
-    // Initialize SYSCALL/SYSRET MSRs
-    // SAFETY: GDT loaded, single-threaded boot. Configures STAR/LSTAR/SFMASK/EFER.
+    // Initialize SYSCALL/SYSRET MSRs (x86_64) or VBAR_EL1 exception vectors (AArch64)
+    // SAFETY: GDT loaded, single-threaded boot.
     unsafe { arcos_core::arch::syscall::init(); }
+    #[cfg(target_arch = "x86_64")]
     println!("✓ SYSCALL/SYSRET configured");
+    #[cfg(target_arch = "aarch64")]
+    println!("✓ Exception vector table loaded (VBAR_EL1)");
 
     // Initialize microkernel subsystems
     process_table_init();  // Must be before scheduler (user tasks need process table)
     scheduler_init();
     ipc_init();
     capability_manager_init();
+    bootstrap_identity_init();  // Must be after capability_manager_init (binds to processes)
+    object_store_init();        // Must be after heap init (heap-allocated)
 
     println!("✓ Task scheduler initialized");
     println!("✓ IPC subsystem ready");
@@ -238,28 +351,62 @@ unsafe extern "C" fn kmain() -> ! {
 
     println!("\nStarting scheduler event loop...\n");
 
-    // Initialize hardware interrupts (APIC timer + I/O APIC + device IRQs)
-    // Disables PIC, enables Local APIC, parses ACPI for I/O APIC,
-    // calibrates APIC timer at 100Hz, routes device IRQs.
-    // Must be done AFTER all subsystems are initialized.
+    // Initialize hardware interrupts — architecture-specific
     println!("Initializing hardware interrupts...");
-    let rsdp_phys = RSDP_REQUEST.get_response()
-        .map(|r| r.address() as u64)
-        .unwrap_or(0);
 
-    // Map ACPI physical memory into the HHDM before parsing.
-    // With Limine base revision 3, ACPI_RECLAIMABLE/NVS regions and the BIOS
-    // area (where the RSDP lives) are NOT part of the HHDM. We must map them
-    // explicitly so parse_acpi() can access them at (phys + hhdm_offset).
-    map_acpi_regions(rsdp_phys);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x86_64: APIC timer + I/O APIC + device IRQs
+        // Disables PIC, enables Local APIC, parses ACPI for I/O APIC,
+        // calibrates APIC timer at 100Hz, routes device IRQs.
+        let rsdp_phys = RSDP_REQUEST.get_response()
+            .map(|r| r.address() as u64)
+            .unwrap_or(0);
 
-    // SAFETY: All subsystems initialized (scheduler, timer, IPC, IDT, heap).
-    // HHDM offset is set. rsdp_phys is from Limine (0 = not available).
-    // ACPI regions mapped into HHDM above.
-    unsafe {
-        arcos_core::interrupts::init_hardware_interrupts(100, rsdp_phys);
+        // Map ACPI physical memory into the HHDM before parsing.
+        map_acpi_regions(rsdp_phys);
+
+        // SAFETY: All subsystems initialized. HHDM offset is set.
+        unsafe {
+            arcos_core::interrupts::init_hardware_interrupts(100, rsdp_phys);
+        }
+        println!("✓ APIC-driven scheduling active\n");
     }
-    println!("✓ APIC-driven scheduling active\n");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // AArch64: GIC + ARM Generic Timer
+        // SAFETY: Single-threaded boot, interrupts masked. GIC MMIO at QEMU virt addresses.
+        unsafe {
+            // Read the BSP's MPIDR_EL1 for hardware affinity identification
+            let bsp_mpidr: u64;
+            core::arch::asm!("mrs {}, mpidr_el1", out(reg) bsp_mpidr, options(nostack, nomem));
+            // Initialize per-CPU data (TPIDR_EL1) for BSP
+            arcos_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
+            println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
+
+            // Initialize GIC CPU interface (ICC system registers)
+            arcos_core::arch::aarch64::gic::init();
+            println!("  ✓ GIC CPU interface enabled");
+
+            // Initialize GIC Distributor (SPI routing, priorities)
+            // QEMU virt physical addresses, translated through HHDM
+            const GICD_PHYS: u64 = 0x0800_0000;
+            const GICR_PHYS: u64 = 0x080A_0000;
+            let hhdm = arcos_core::hhdm_offset();
+            arcos_core::arch::aarch64::gic::init_distributor(GICD_PHYS + hhdm);
+            println!("  ✓ GIC Distributor initialized");
+
+            // Initialize GIC Redistributor for BSP (PPI 30 = timer)
+            arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, 0);
+            println!("  ✓ GIC Redistributor initialized (CPU 0)");
+
+            // Start ARM Generic Timer at 100 Hz
+            arcos_core::arch::aarch64::timer::init(100);
+            println!("  ✓ ARM Generic Timer started (100 Hz)");
+        }
+        println!("✓ GIC + timer scheduling active\n");
+    }
 
     // ================================================================
     // Phase 2: Start Application Processors (SMP)
@@ -283,6 +430,12 @@ unsafe extern "C" fn kmain() -> ! {
 
 /// Kernel heap size: 4 MB (plenty for kernel-level Box/Vec allocations)
 const KERNEL_HEAP_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Actual physical base chosen by init_kernel_heap(). Used by init_frame_allocator()
+/// to reserve the correct region regardless of where RAM starts (x86: 0x200000,
+/// AArch64 QEMU virt: somewhere above 0x4000_0000).
+static KERNEL_HEAP_PHYS_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Initialize the kernel heap allocator from the Limine physical memory map.
 ///
@@ -318,9 +471,18 @@ fn init_kernel_heap() {
     let phys_base = phys_base + safe_offset;
     let region_len = region_len - safe_offset;
 
+    assert!(
+        region_len >= KERNEL_HEAP_SIZE,
+        "Largest usable region too small after skipping low memory ({:#x} < {:#x})",
+        region_len, KERNEL_HEAP_SIZE,
+    );
+
     // Use only what we need from this region
     let heap_size = KERNEL_HEAP_SIZE as usize;
     let virt_base = phys_base as usize + hhdm_offset as usize;
+
+    // Record the actual physical base so init_frame_allocator() can reserve it
+    KERNEL_HEAP_PHYS_BASE.store(phys_base, core::sync::atomic::Ordering::Release);
 
     // SAFETY: virt_base is a valid writable address in the HHDM region, covering
     // heap_size bytes of usable physical memory reported by Limine. Called once.
@@ -362,10 +524,12 @@ fn init_frame_allocator() {
     }
 
     // Pass 2: Reserve regions we're already using
-    // - First 1 MB (real-mode area, BIOS data, etc.)
+    // - First 1 MB: x86 real-mode/BIOS area (not applicable on AArch64)
+    #[cfg(target_arch = "x86_64")]
     fa.reserve_region(0, 0x100000);
-    // - Kernel heap: 4 MB at physical 0x200000
-    fa.reserve_region(0x200000, KERNEL_HEAP_SIZE);
+    // - Kernel heap (base was chosen dynamically by init_kernel_heap)
+    let heap_phys = KERNEL_HEAP_PHYS_BASE.load(core::sync::atomic::Ordering::Acquire);
+    fa.reserve_region(heap_phys, KERNEL_HEAP_SIZE);
     // - Process heaps: 32 × 1 MB starting at 0x800000
     fa.reserve_region(
         arcos_core::process::PROCESS_HEAP_BASE,
@@ -382,13 +546,14 @@ fn init_frame_allocator() {
     );
 }
 
-/// Map ACPI-related physical memory into the HHDM.
+/// Map ACPI-related physical memory into the HHDM (x86_64 only).
 ///
 /// With Limine base revision 3, only Usable, Bootloader-reclaimable,
 /// Executable/modules, and Framebuffer regions are in the HHDM.
 /// ACPI_RECLAIMABLE, ACPI_NVS, and RESERVED regions (where RSDP and
 /// ACPI tables reside) are NOT mapped. We must explicitly map them
 /// so `parse_acpi()` can read them via the standard `phys + hhdm` path.
+#[cfg(target_arch = "x86_64")]
 fn map_acpi_regions(rsdp_phys: u64) {
     use limine::memory_map::EntryType;
     use arcos_core::FRAME_ALLOCATOR;
@@ -448,7 +613,7 @@ fn map_acpi_regions(rsdp_phys: u64) {
 fn scheduler_init() {
     // Create and initialize scheduler — allocate directly on heap to avoid
     // large stack temporaries (Scheduler contains [Option<Task>; 32])
-    let mut scheduler = Box::new(Scheduler::new());
+    let mut scheduler = Scheduler::new_boxed();
     if let Err(e) = scheduler.init() {
         println!("✗ Scheduler init failed: {:?}", e);
         arcos_core::halt();
@@ -477,14 +642,20 @@ fn scheduler_init() {
         Priority::NORMAL,
     );
 
-    // Create a ring 3 user-mode task with its own address space (hand-rolled)
-    create_user_task(&mut scheduler);
+    // Create user-mode tasks with their own address spaces
+    {
+        // Create a user-mode task with its own address space (hand-rolled)
+        create_user_task(&mut scheduler);
 
-    // Create a second ring 3 task via the ELF loader pipeline (verify-before-execute)
-    create_elf_user_task(&mut scheduler);
+        // Create a second user task via the ELF loader pipeline (verify-before-execute)
+        create_elf_user_task(&mut scheduler);
+    }
+
+    // Load ELF binaries from Limine boot modules (filesystem-free loading)
+    load_boot_modules(&mut scheduler);
 
     // Register all initial tasks in the global task→CPU map (all on CPU 0)
-    for slot in 0..32u32 {
+    for slot in 0..arcos_core::MAX_TASKS as u32 {
         if scheduler.get_task_pub(TaskId(slot)).is_some() {
             arcos_core::set_task_cpu(slot, 0);
         }
@@ -517,10 +688,11 @@ fn scheduler_init() {
 /// Per-task kernel stack size (8 KB)
 const TASK_STACK_SIZE: usize = 8192;
 
-/// Allocate a kernel stack and initialize a SavedContext for first dispatch.
+/// Allocate a kernel stack and initialize a SavedContext for first dispatch (x86_64).
 ///
 /// Returns the initial saved_rsp (pointer to SavedContext on the new stack).
 /// The iretq in the ISR stub will pop this context and jump to entry_point.
+#[cfg(target_arch = "x86_64")]
 fn alloc_task_stack(entry_point: u64) -> u64 {
     use alloc::alloc::{alloc, Layout};
     use arcos_core::arch::SavedContext;
@@ -561,10 +733,53 @@ fn alloc_task_stack(entry_point: u64) -> u64 {
     saved_ctx_addr
 }
 
+/// Allocate a kernel stack and initialize a SavedContext for first dispatch (AArch64).
+///
+/// Returns the initial saved_sp (pointer to SavedContext on the new stack).
+/// The timer ISR stub's eret will pop this context and jump to entry_point.
+#[cfg(target_arch = "aarch64")]
+fn alloc_task_stack(entry_point: u64) -> u64 {
+    use alloc::alloc::{alloc, Layout};
+    use arcos_core::arch::SavedContext;
+    use core::mem::size_of;
+
+    let layout = Layout::from_size_align(TASK_STACK_SIZE, 16)
+        .expect("Invalid stack layout");
+    // SAFETY: Layout is valid (TASK_STACK_SIZE=8192, align=16).
+    let stack_base = unsafe { alloc(layout) };
+    if stack_base.is_null() {
+        panic!("Failed to allocate kernel stack");
+    }
+
+    let stack_top = stack_base as u64 + TASK_STACK_SIZE as u64;
+
+    // Place a SavedContext at the top of the stack
+    let saved_ctx_addr = stack_top - size_of::<SavedContext>() as u64;
+    let saved_ctx = saved_ctx_addr as *mut SavedContext;
+
+    // SAFETY: saved_ctx points to a valid, aligned, writable location within the
+    // newly allocated stack. The SavedContext is initialized with the entry point
+    // in elr_el1 and SPSR_EL1 set for EL1h with interrupts enabled (DAIF clear).
+    unsafe {
+        // Zero-initialize all GPRs
+        let mut ctx = core::mem::zeroed::<SavedContext>();
+        ctx.elr_el1 = entry_point;
+        // SPSR_EL1: EL1h (M[3:0]=0b0101=5), DAIF clear (interrupts enabled)
+        ctx.spsr_el1 = 0x5;
+        // SP_EL0: not used for kernel tasks, set to stack top as scratch
+        ctx.sp_el0 = stack_top;
+        core::ptr::write(saved_ctx, ctx);
+    }
+
+    saved_ctx_addr
+}
+
 /// Task A entry point — kernel-mode loop
 ///
-/// Runs in Ring 0. Prints periodic status to prove context switching works.
-/// Must never return (no return address on stack after iretq).
+/// Runs in Ring 0 (x86_64) or EL1 (AArch64).
+/// Prints periodic status to prove context switching works.
+/// Must never return.
+#[cfg(target_arch = "x86_64")]
 fn task_a_entry() -> ! {
     // Test SYSCALL from ring 0: invoke SYS_GET_PID (number 8)
     let pid: i64;
@@ -586,19 +801,14 @@ fn task_a_entry() -> ! {
             lateout("r10") _,
         );
     }
-    arcos_core::println!("[Task A] SYSCALL test: GetPid returned {}", pid);
+    arcos_core::println!("[Task A] SYSCALL test: GetPid returned {} — idle", pid);
 
-    let mut counter: u64 = 0;
-    loop {
-        counter = counter.wrapping_add(1);
-        if counter % 500_000 == 0 {
-            arcos_core::println!("[Task A] alive ({})", counter / 500_000);
-        }
-        core::hint::spin_loop();
-    }
+    // Idle: halt until next interrupt, repeat (low power, no output)
+    loop { hlt(); }
 }
 
-/// Task B entry point — kernel-mode loop
+/// Task B entry point — kernel-mode loop (x86_64)
+#[cfg(target_arch = "x86_64")]
 fn task_b_entry() -> ! {
     // Test SYSCALL from ring 0: invoke SYS_GET_TIME (number 9)
     let ticks: i64;
@@ -618,20 +828,67 @@ fn task_b_entry() -> ! {
             lateout("r10") _,
         );
     }
-    arcos_core::println!("[Task B] SYSCALL test: GetTime returned {}", ticks);
+    arcos_core::println!("[Task B] SYSCALL test: GetTime returned {} — idle", ticks);
 
-    let mut counter: u64 = 0;
-    loop {
-        counter = counter.wrapping_add(1);
-        if counter % 500_000 == 0 {
-            arcos_core::println!("[Task B] alive ({})", counter / 500_000);
-        }
-        core::hint::spin_loop();
+    // Idle: halt until next interrupt, repeat (low power, no output)
+    loop { hlt(); }
+}
+
+/// Task A entry point — kernel-mode loop (AArch64)
+///
+/// Runs at EL1. Uses SVC #0 to invoke syscalls (x8=number, x0-x5=args).
+#[cfg(target_arch = "aarch64")]
+fn task_a_entry() -> ! {
+    // Test SVC syscall: SYS_GET_PID (number 8)
+    let pid: u64;
+    // SAFETY: We are at EL1 with the exception vector table installed.
+    // x8=8 invokes SYS_GET_PID. Result is returned in x0.
+    unsafe {
+        core::arch::asm!(
+            "mov x8, #8",
+            "svc #0",
+            lateout("x0") pid,
+            out("x8") _,
+            out("x1") _, out("x2") _, out("x3") _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _, out("x18") _,
+        );
     }
+    arcos_core::println!("[Task A] SVC test: GetPid returned {} — idle", pid);
+
+    // Idle: wait for interrupt, repeat (low power, no output)
+    loop { arcos_core::wfi(); }
+}
+
+/// Task B entry point — kernel-mode loop (AArch64)
+#[cfg(target_arch = "aarch64")]
+fn task_b_entry() -> ! {
+    // Test SVC syscall: SYS_GET_TIME (number 9)
+    let ticks: u64;
+    // SAFETY: Same as task_a_entry — EL1 SVC with full clobber list.
+    unsafe {
+        core::arch::asm!(
+            "mov x8, #9",
+            "svc #0",
+            lateout("x0") ticks,
+            out("x8") _,
+            out("x1") _, out("x2") _, out("x3") _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _, out("x18") _,
+        );
+    }
+    arcos_core::println!("[Task B] SVC test: GetTime returned {} — idle", ticks);
+
+    // Idle: wait for interrupt, repeat (low power, no output)
+    loop { arcos_core::wfi(); }
 }
 
 // ============================================================================
-// Ring 3 user-mode task
+// User-mode task constants and entry stubs
 // ============================================================================
 
 /// User virtual address where user code is mapped
@@ -641,15 +898,16 @@ const USER_STACK_TOP: u64 = 0x80_0000;
 /// User stack size in pages
 const USER_STACK_PAGES: usize = 4; // 16 KB
 
-// User-mode entry function (pure assembly, position-independent).
+// User-mode entry function — x86_64 (pure assembly, position-independent).
 //
 // Runs in Ring 3:
 //   1. Calls SYS_GET_PID (syscall 8) — result in RAX
 //   2. Converts PID to ASCII, patches message template on the user stack
 //   3. Calls SYS_PRINT (syscall 10) — prints "[User N] Ring 3 OK!\n"
-//   4. Infinite spin loop — gets preempted by timer ISR normally
+//   4. Calls SYS_EXIT (syscall 0) — clean exit
 //
 // This code is copied to a user-accessible page. Must be fully self-contained
+#[cfg(target_arch = "x86_64")]
 // (no references to kernel symbols, no relocations).
 core::arch::global_asm!(
     ".section .text.user,\"ax\"",
@@ -691,7 +949,12 @@ core::arch::global_asm!(
 
     "add rsp, 24",
 
-    // Infinite spin loop — timer ISR will preempt us
+    // SYS_EXIT = 0: clean exit after printing
+    "xor edi, edi",
+    "mov rax, 0",
+    "syscall",
+
+    // Should not reach here — safety spin
     ".Luser_spin:",
     "pause",
     "jmp .Luser_spin",
@@ -704,24 +967,98 @@ core::arch::global_asm!(
     ".section .text",             // Switch back to normal text section
 );
 
+// User-mode entry function — AArch64 (pure assembly, position-independent).
+//
+// Runs at EL0:
+//   1. Calls SYS_GET_PID (x8=8) — result in x0
+//   2. Converts PID to ASCII, patches message template on the user stack
+//   3. Calls SYS_PRINT (x8=10, x0=buffer, x1=length) — prints "[User N] EL0 OK!\n"
+//   4. Calls SYS_EXIT (x8=0) — clean exit
+//
+// This code is copied to a user-accessible page. Must be fully self-contained
+// (no references to kernel symbols, no relocations).
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    ".section .text.user,\"ax\"",
+    ".global user_task_entry",
+    ".global user_task_entry_end",
+    "user_task_entry:",
+
+    // SYS_GET_PID = 8, result in x0
+    "mov x8, #8",
+    "svc #0",
+    // x0 = PID
+
+    // Convert PID to ASCII digit and save in callee-saved register
+    "add w19, w0, #0x30",          // PID → '0'..'9' (w19 = callee-saved)
+
+    // Load message template address (PC-relative)
+    "adr x20, .Lmsg_a64",
+
+    // Copy 24 bytes of template to stack (stack is RW, code page is RO)
+    // Message is 19 bytes but we copy 24 (3 × 8) for alignment.
+    "sub sp, sp, #32",             // 32 bytes (16-aligned)
+    "ldp x2, x3, [x20]",          // bytes 0..15
+    "stp x2, x3, [sp]",
+    "ldr x2, [x20, #16]",         // bytes 16..23 (3 extra bytes past message end)
+    "str x2, [sp, #16]",
+
+    // Patch PID digit at offset 6: "[User X]" → "[User N]"
+    "strb w19, [sp, #6]",
+
+    // SYS_PRINT = 10: x0=buffer, x1=length
+    "mov x0, sp",
+    "mov x1, #19",
+    "mov x8, #10",
+    "svc #0",
+
+    "add sp, sp, #32",
+
+    // SYS_EXIT = 0: clean exit after printing
+    "mov x0, #0",
+    "mov x8, #0",
+    "svc #0",
+
+    // Should not reach here — safety spin
+    ".Luser_spin_a64:",
+    "mov x8, #7",                  // SYS_YIELD
+    "svc #0",
+    "b .Luser_spin_a64",
+
+    // Message template (X is patched at runtime with actual PID digit)
+    // 19 bytes: "[User X] EL0 OK!\n" + padding to 24 for safe 8-byte loads
+    ".Lmsg_a64:",
+    ".ascii \"[User X] EL0 OK!\\n\"",  // 19 bytes
+    ".balign 8, 0",                     // Pad to 8-byte boundary for safe ldp
+
+    "user_task_entry_end:",
+    ".section .text",
+);
+
+#[cfg(target_arch = "x86_64")]
 extern "C" {
     fn user_task_entry();
     fn user_task_entry_end();
 }
 
-/// Create a ring 3 user-mode task with its own address space.
+#[cfg(target_arch = "aarch64")]
+extern "C" {
+    fn user_task_entry();
+    fn user_task_entry_end();
+}
+
+/// Create a user-mode task with its own address space.
 ///
-/// Steps:
-/// 1. Create a process with its own PML4 (kernel half cloned)
+/// Portable across x86_64 and AArch64. Steps:
+/// 1. Create a process with its own page table (PML4 on x86, L0 on AArch64)
 /// 2. Allocate + map user code page at USER_CODE_VADDR
 /// 3. Allocate + map user stack pages at USER_STACK_TOP
 /// 4. Copy user entry code to the user code page
-/// 5. Allocate a kernel stack (for ISR/syscall from ring 3)
-/// 6. Set up SavedContext with USER_CS/USER_SS for iretq → ring 3
+/// 5. Allocate a kernel stack (for ISR/syscall from user mode)
+/// 6. Set up SavedContext for return to user mode (iretq on x86, eret on AArch64)
 /// 7. Register the task in the scheduler
 fn create_user_task(scheduler: &mut Scheduler) {
     use arcos_core::arch::SavedContext;
-    use arcos_core::arch::gdt;
     use arcos_core::memory::paging;
     use arcos_core::memory::frame_allocator::PAGE_SIZE;
     use arcos_core::FRAME_ALLOCATOR;
@@ -818,26 +1155,43 @@ fn create_user_task(scheduler: &mut Scheduler) {
     }
     let kstack_top = kstack_base as u64 + TASK_STACK_SIZE as u64;
 
-    // --- Step 5: Set up SavedContext for iretq → ring 3 ---
+    // --- Step 5: Set up SavedContext for return to user mode ---
     let saved_ctx_addr = kstack_top - size_of::<SavedContext>() as u64;
     let saved_ctx = saved_ctx_addr as *mut SavedContext;
 
-    // SAFETY: saved_ctx points within the freshly allocated kernel stack at
-    // (kstack_top - sizeof(SavedContext)). The SavedContext is fully initialized
-    // with USER_CS/USER_SS (ring 3 selectors) and USER_CODE_VADDR/USER_STACK_TOP.
-    // iretq will pop this to transition to ring 3.
-    unsafe {
-        core::ptr::write(saved_ctx, SavedContext {
-            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0,
-            r9: 0, r8: 0, rbp: 0, rdi: 0, rsi: 0, rdx: 0,
-            rcx: 0, rbx: 0, rax: 0,
-            // iretq pops: RIP, CS, RFLAGS, RSP, SS
-            rip: USER_CODE_VADDR,               // Entry point in user space
-            cs: gdt::USER_CS as u64,            // Ring 3 code segment
-            rflags: 0x202,                       // IF set (interrupts enabled)
-            rsp: USER_STACK_TOP,                // User stack pointer
-            ss: gdt::USER_SS as u64,            // Ring 3 data segment
-        });
+    #[cfg(target_arch = "x86_64")]
+    {
+        use arcos_core::arch::gdt;
+        // SAFETY: saved_ctx points within the freshly allocated kernel stack.
+        // iretq will pop this to transition to ring 3.
+        unsafe {
+            core::ptr::write(saved_ctx, SavedContext {
+                r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0,
+                r9: 0, r8: 0, rbp: 0, rdi: 0, rsi: 0, rdx: 0,
+                rcx: 0, rbx: 0, rax: 0,
+                rip: USER_CODE_VADDR,
+                cs: gdt::USER_CS as u64,
+                rflags: 0x202,                   // IF set (interrupts enabled)
+                rsp: USER_STACK_TOP,
+                ss: gdt::USER_SS as u64,
+            });
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: saved_ctx points within the freshly allocated kernel stack.
+        // eret with SPSR_EL1=EL0t will return to user mode.
+        unsafe {
+            let mut ctx = core::mem::zeroed::<SavedContext>();
+            // ELR_EL1: return address = user entry point
+            ctx.elr_el1 = USER_CODE_VADDR;
+            // SPSR_EL1: EL0t (M[3:0]=0b0000=0), DAIF clear (interrupts enabled)
+            // EL0t = exception level 0, SP_EL0 stack pointer
+            ctx.spsr_el1 = 0x0;
+            // SP_EL0: user stack pointer
+            ctx.sp_el0 = USER_STACK_TOP;
+            core::ptr::write(saved_ctx, ctx);
+        }
     }
 
     // --- Step 6: Register task in scheduler ---
@@ -860,9 +1214,12 @@ fn create_user_task(scheduler: &mut Scheduler) {
             println!("  ✗ Failed to create user task: {:?}", e);
         }
     }
+
+    // --- Step 7: Register capabilities for this user process ---
+    register_process_capabilities(process_id);
 }
 
-/// Create a ring 3 user-mode task via the ELF loader pipeline.
+/// Create a user-mode task via the ELF loader pipeline.
 ///
 /// Wraps the same `user_task_entry` assembly into a minimal ELF binary, then
 /// loads it through `load_elf_process()` with the DefaultVerifier. This
@@ -898,6 +1255,10 @@ fn create_elf_user_task(scheduler: &mut Scheduler) {
         scheduler,
     ) {
         Ok(result) => {
+            // Must drop locks before acquiring CAPABILITY_MANAGER (lower in hierarchy)
+            drop(fa_guard);
+            drop(pt_guard);
+            register_process_capabilities(process_id);
             println!("  ✓ ELF-loaded task {} (ring 3) created → process {} [verified]",
                 result.task_id.0, result.process_id.0);
         }
@@ -907,26 +1268,167 @@ fn create_elf_user_task(scheduler: &mut Scheduler) {
     }
 }
 
+/// Register send+receive capabilities for a user process on all endpoints.
+///
+/// Called when creating user-mode processes (3, 4, boot modules) so their
+/// capabilities are registered after the process table entry exists.
+///
+/// Grants send/receive on endpoints 0-31 (full range) and binds the
+/// bootstrap Principal to the process (boot modules are trusted).
+fn register_process_capabilities(process_id: ProcessId) {
+    let mut guard = CAPABILITY_MANAGER.lock();
+    let cap_mgr = match guard.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    if let Err(e) = cap_mgr.register_process(process_id) {
+        println!("  ✗ Failed to register caps for process {}: {}", process_id.0, e);
+        return;
+    }
+    // Grant send/receive on all endpoints (boot modules are trusted)
+    for endpoint_id in 0..arcos_core::ipc::MAX_ENDPOINTS as u32 {
+        let _ = cap_mgr.grant_capability(
+            process_id,
+            EndpointId(endpoint_id),
+            CapabilityRights { send: true, receive: true, delegate: false },
+        );
+    }
+    // Bind bootstrap Principal to boot module processes (they're trusted)
+    let bootstrap = BOOTSTRAP_PRINCIPAL.load();
+    if !bootstrap.is_zero() {
+        let _ = cap_mgr.bind_principal(process_id, bootstrap);
+    }
+}
+
+/// Load ELF binaries from Limine boot modules.
+///
+/// Iterates all modules provided by the bootloader (specified in limine.conf
+/// via `module_path` directives). Each module is treated as a complete ELF
+/// binary and loaded through the full verify-before-execute pipeline.
+///
+/// Process IDs are assigned starting at 5 (0-4 are used by kernel tasks
+/// and the existing hand-built user tasks).
+fn load_boot_modules(scheduler: &mut Scheduler) {
+    use arcos_core::loader::{self, DefaultVerifier};
+    use arcos_core::FRAME_ALLOCATOR;
+
+    let module_response = match MODULE_REQUEST.get_response() {
+        Some(r) => r,
+        None => {
+            println!("  No boot modules (ModuleRequest not answered)");
+            return;
+        }
+    };
+
+    let modules = module_response.modules();
+    if modules.is_empty() {
+        println!("  No boot modules found");
+        return;
+    }
+
+    println!("Loading {} boot module(s)...", modules.len());
+
+    let verifier = DefaultVerifier::new();
+    let mut loaded_count = 0u32;
+
+    for (i, module) in modules.iter().enumerate() {
+        let path = module.path().to_bytes();
+        let size = module.size();
+        let addr = module.addr();
+
+        // Display module info (path is a CStr, convert to str for printing)
+        let path_str = core::str::from_utf8(path).unwrap_or("<invalid utf8>");
+        println!("  Module {}: {} ({} bytes at {:#x})", i, path_str, size, addr as u64);
+
+        if size == 0 {
+            println!("    ✗ Skipped (empty module)");
+            continue;
+        }
+
+        // SAFETY: Limine loaded this module into memory and provides a valid
+        // address and size. The memory is part of the bootloader-reclaimable
+        // region and is accessible via the HHDM. We create a read-only slice
+        // for the duration of ELF loading.
+        let binary = unsafe { core::slice::from_raw_parts(addr, size as usize) };
+
+        // Check for ELF magic before attempting to load
+        if binary.len() < 4 || &binary[0..4] != b"\x7fELF" {
+            println!("    ✗ Skipped (not an ELF binary)");
+            continue;
+        }
+
+        // Assign process IDs starting at 5
+        let process_id = ProcessId(5 + loaded_count);
+
+        let mut pt_guard = PROCESS_TABLE.lock();
+        let mut fa_guard = FRAME_ALLOCATOR.lock();
+        let pt = match pt_guard.as_mut() {
+            Some(pt) => pt,
+            None => {
+                println!("    ✗ ProcessTable not initialized");
+                continue;
+            }
+        };
+
+        match loader::load_elf_process(
+            binary,
+            process_id,
+            Priority::NORMAL,
+            &verifier,
+            pt,
+            &mut fa_guard,
+            scheduler,
+        ) {
+            Ok(result) => {
+                // Drop locks before acquiring CAPABILITY_MANAGER
+                drop(fa_guard);
+                drop(pt_guard);
+                register_process_capabilities(process_id);
+                println!(
+                    "    ✓ Loaded as task {} → process {} (entry={:#x})",
+                    result.task_id.0, result.process_id.0, result.entry_point
+                );
+                loaded_count += 1;
+            }
+            Err(e) => {
+                println!("    ✗ ELF load failed: {}", e);
+            }
+        }
+    }
+
+    if loaded_count > 0 {
+        println!("✓ Loaded {} module(s) as user processes", loaded_count);
+    }
+}
+
 /// Initialize IPC subsystem
 fn ipc_init() {
     let mut ipc = IpcManager::new_boxed();
 
-    // Install zero-trust IPC interceptor
+    // Install zero-trust IPC interceptor on legacy IPC_MANAGER
     use arcos_core::ipc::interceptor::DefaultInterceptor;
     ipc.set_interceptor(Box::new(DefaultInterceptor::new()));
 
     *IPC_MANAGER.lock() = Some(ipc);
-    println!("✓ IPC manager ready [interceptor active]");
+
+    // Also install interceptor on the sharded IPC manager
+    arcos_core::SHARDED_IPC.set_interceptor(Box::new(DefaultInterceptor::new()));
+
+    println!("✓ IPC manager ready [interceptor active, per-endpoint sharding enabled]");
 }
 
-/// Initialize capability manager
+/// Initialize capability manager.
+///
+/// Only registers processes 0-2 (kernel tasks created in process_table_init).
+/// User processes 3-4 are registered later when create_user_task / create_elf_user_task
+/// call into the capability manager after their process table entries exist.
 fn capability_manager_init() {
-    *CAPABILITY_MANAGER.lock() = Some(CapabilityManager::new_boxed());
-    
     let mut guard = CAPABILITY_MANAGER.lock();
-    let cap_mgr = guard.as_mut().unwrap();
+    let cap_mgr = guard.insert(CapabilityManager::new_boxed());
 
-    for task_id in 0..5 {
+    // Only register processes that already exist in the process table (0-2).
+    // Processes 3+ are registered on-demand when user tasks are created.
+    for task_id in 0..3u32 {
         let process_id = ProcessId(task_id);
         if let Err(e) = cap_mgr.register_process(process_id) {
             println!("  ✗ Failed to register process {}: {}", task_id, e);
@@ -965,6 +1467,52 @@ fn capability_manager_init() {
     println!("  ✓ Capability manager initialized with {} processes", cap_mgr.process_count());
 }
 
+/// Initialize bootstrap identity.
+///
+/// Generates a deterministic 32-byte "bootstrap public key" and binds it as
+/// the Principal for all kernel processes (0-2). This Principal is used to
+/// restrict BindPrincipal syscall — only the bootstrap identity can bind
+/// Principals to other processes.
+///
+/// Phase 0: deterministic seed (no real crypto). Phase 1: RDRAND / device entropy.
+fn bootstrap_identity_init() {
+    use arcos_core::ipc::Principal;
+
+    // Phase 0 deterministic seed: "ArcOS-Bootstrap-Identity-Phase0!"
+    // This is 32 ASCII bytes. Real entropy replaces this in Phase 1.
+    let seed: [u8; 32] = *b"ArcOS-Bootstrap-Identity-Phase0!";
+    let bootstrap = Principal::from_public_key(seed);
+
+    // Store globally for BindPrincipal restriction check
+    BOOTSTRAP_PRINCIPAL.store(bootstrap);
+
+    // Bind the bootstrap Principal to all kernel processes (0-2)
+    let mut cap_guard = CAPABILITY_MANAGER.lock();
+    if let Some(cap_mgr) = cap_guard.as_mut() {
+        for pid in 0..3u32 {
+            if let Err(e) = cap_mgr.bind_principal(ProcessId(pid), bootstrap) {
+                println!("  ✗ Failed to bind bootstrap Principal to process {}: {}", pid, e);
+            }
+        }
+    }
+    drop(cap_guard);
+
+    println!("✓ Bootstrap identity bound (Phase 0 deterministic seed)");
+    println!("  Principal: {}", bootstrap);
+}
+
+/// Initialize the object store (RAM-backed, Phase 0).
+///
+/// Lock ordering position: 8 (after INTERRUPT_ROUTER at 7).
+fn object_store_init() {
+    use arcos_core::fs::ram::RamObjectStore;
+
+    let store = RamObjectStore::new_boxed();
+    *OBJECT_STORE.lock() = Some(store);
+
+    println!("✓ Object store initialized (RAM, capacity: {} objects)", arcos_core::fs::ram::MAX_OBJECTS);
+}
+
 /// Initialize process table
 fn process_table_init() {
     let mut pt = ProcessTable::new_boxed(arcos_core::hhdm_offset());
@@ -987,26 +1535,24 @@ fn process_table_init() {
 /// Helper: Send IPC message and wake receiver
 ///
 /// This is the pattern drivers use to send to services.
-/// Locks are acquired sequentially (non-nested), so global order does not apply.
-/// IPC_MANAGER released before SCHEDULER acquired.
+/// Uses per-endpoint sharded IPC — only locks the target endpoint shard,
+/// not the global IPC_MANAGER. Different endpoints on different CPUs
+/// never contend on the same lock.
 #[allow(dead_code)]
 fn ipc_send_and_notify(endpoint: EndpointId, msg: Message) -> bool {
-    // Queue the message (IPC_MANAGER can be held independently)
-    {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        if ipc_mgr.send_message(endpoint, msg).is_err() {
-            return false; // ipc_mgr lock released here
-        }
-    } // ipc_mgr lock released here
+    // Queue the message via sharded IPC (per-endpoint lock only)
+    if arcos_core::SHARDED_IPC.send_message(endpoint, msg).is_err() {
+        return false;
+    }
 
-    // Try to wake the highest-priority receiver across all CPUs.
-    // Scans each CPU's scheduler for the best receiver blocked on this endpoint.
+    // Try to wake the highest-priority receiver across online CPUs.
+    // Only scans ONLINE_CPU_COUNT schedulers (not all MAX_CPUS=256).
     {
         let mut best: Option<TaskId> = None;
         let mut best_priority = arcos_core::scheduler::Priority::IDLE;
+        let cpu_count = arcos_core::ONLINE_CPU_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize;
 
-        for cpu in 0..arcos_core::MAX_CPUS {
+        for cpu in 0..cpu_count {
             let guard = PER_CPU_SCHEDULER[cpu].lock();
             if let Some(sched) = guard.as_ref() {
                 if let Some(tid) = sched.find_highest_priority_receiver(endpoint.0) {
@@ -1034,18 +1580,14 @@ fn ipc_send_and_notify(endpoint: EndpointId, msg: Message) -> bool {
 /// Returns message if available, blocks caller if queue is empty.
 #[allow(dead_code)]
 fn ipc_recv_or_block(current_task: TaskId, endpoint: EndpointId) -> Option<Message> {
-    // Try to get message from queue
-    {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        if let Some(msg) = ipc_mgr.recv_message(endpoint) {
-            return Some(msg);
-        }
+    // Try to get message via sharded IPC (per-endpoint lock only)
+    if let Some(msg) = arcos_core::SHARDED_IPC.recv_message(endpoint) {
+        return Some(msg);
     }
 
     // Queue is empty - block caller on its local CPU's scheduler
     arcos_core::block_local_task(current_task, BlockReason::MessageWait(endpoint.0));
-    
+
     None
 }
 
@@ -1094,51 +1636,39 @@ fn ipc_recv_with_capability(
 fn sync_ipc_send(sender_task: TaskId, endpoint: EndpointId, msg: Message) -> bool {
     use arcos_core::ipc::SyncSendResult;
 
-    // Step 1: Deposit message in sync channel
-    let result = {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        ipc_mgr.sync_send(endpoint, msg, sender_task.0)
-    };
+    // Deposit via sharded IPC (per-endpoint lock only)
+    let result = arcos_core::SHARDED_IPC.sync_send(endpoint, msg, sender_task.0);
 
     match result {
         Ok(SyncSendResult::ReceiverWoken(receiver_task_id)) => {
-            // Receiver was waiting — wake it on its owning CPU
             arcos_core::wake_task_on_cpu(TaskId(receiver_task_id));
-            true // Sender continues (not blocked)
+            true
         }
         Ok(SyncSendResult::SenderMustBlock) => {
-            // No receiver — block sender on local CPU
             arcos_core::block_local_task(sender_task, BlockReason::SyncSendWait(endpoint.0));
-            false // Sender blocked
+            false
         }
-        Err(_) => false, // Channel busy or invalid
+        Err(_) => false,
     }
 }
 
 /// Synchronous receive: pick up message or block until one arrives
 ///
-/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+/// Uses per-endpoint sharded IPC — endpoint lock released before scheduler.
 #[allow(dead_code)]
 fn sync_ipc_recv(receiver_task: TaskId, endpoint: EndpointId) -> Option<Message> {
     use arcos_core::ipc::SyncRecvResult;
 
-    let result = {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        ipc_mgr.sync_recv(endpoint, receiver_task.0)
-    };
+    let result = arcos_core::SHARDED_IPC.sync_recv(endpoint, receiver_task.0);
 
     match result {
         Ok(SyncRecvResult::Message(msg, wake_sender)) => {
-            // Got message — wake sender on its owning CPU
             if let Some(sender_task_id) = wake_sender {
                 arcos_core::wake_task_on_cpu(TaskId(sender_task_id));
             }
             Some(msg)
         }
         Ok(SyncRecvResult::ReceiverMustBlock) => {
-            // No message — block receiver on local CPU
             arcos_core::block_local_task(receiver_task, BlockReason::SyncRecvWait(endpoint.0));
             None
         }
@@ -1148,47 +1678,31 @@ fn sync_ipc_recv(receiver_task: TaskId, endpoint: EndpointId) -> Option<Message>
 
 /// Synchronous call: send message + block until reply (RPC pattern)
 ///
-/// This is the primary IPC pattern for driver↔service communication:
-/// 1. Caller deposits request
-/// 2. Caller blocks until service replies
-/// 3. Service picks up via sync_recv, processes, calls sync_reply
-/// 4. Caller wakes with reply message
-///
-/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+/// Uses per-endpoint sharded IPC — endpoint lock released before scheduler.
 #[allow(dead_code)]
 fn sync_ipc_call(caller_task: TaskId, endpoint: EndpointId, msg: Message) {
     use arcos_core::ipc::SyncCallResult;
 
-    let result = {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        ipc_mgr.sync_call(endpoint, msg, caller_task.0)
-    };
+    let result = arcos_core::SHARDED_IPC.sync_call(endpoint, msg, caller_task.0);
 
     match result {
         Ok(SyncCallResult::ReceiverWoken(receiver_task_id)) => {
-            // Wake receiver on its owning CPU, block caller on local CPU
             arcos_core::wake_task_on_cpu(TaskId(receiver_task_id));
             arcos_core::block_local_task(caller_task, BlockReason::SyncReplyWait(endpoint.0));
         }
         Ok(SyncCallResult::CallerMustBlock) => {
-            // No receiver yet — block caller on local CPU
             arcos_core::block_local_task(caller_task, BlockReason::SyncReplyWait(endpoint.0));
         }
-        Err(_) => {} // Channel busy
+        Err(_) => {}
     }
 }
 
 /// Synchronous reply: complete an RPC cycle by sending reply to blocked caller
 ///
-/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
+/// Uses per-endpoint sharded IPC — endpoint lock released before scheduler.
 #[allow(dead_code)]
 fn sync_ipc_reply(endpoint: EndpointId, reply: Message) -> bool {
-    let caller_task = {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        ipc_mgr.sync_reply(endpoint, reply)
-    };
+    let caller_task = arcos_core::SHARDED_IPC.sync_reply(endpoint, reply);
 
     match caller_task {
         Ok(caller_task_id) => {
@@ -1246,14 +1760,10 @@ pub fn dispatch_interrupt(irq: IrqNumber, timestamp_ticks: u64) {
     );
     let _ = msg.set_payload(&message_data);
 
-    // Step 4: Queue message (IPC_MANAGER)
-    {
-        let mut ipc_guard = IPC_MANAGER.lock();
-        let ipc_mgr = ipc_guard.as_mut().unwrap();
-        if ipc_mgr.send_message(EndpointId(route.irq.0 as u32), msg).is_err() {
-            return; // Failed to queue
-        }
-    } // ipc_mgr lock released here
+    // Step 4: Queue message via sharded IPC (per-endpoint lock only)
+    if arcos_core::SHARDED_IPC.send_message(EndpointId(route.irq.0 as u32), msg).is_err() {
+        return; // Failed to queue
+    }
     
     // Step 5: Wake the driver task on its owning CPU
     arcos_core::wake_task_on_cpu(route.handler_task);
@@ -1267,7 +1777,7 @@ pub fn dispatch_interrupt(irq: IrqNumber, timestamp_ticks: u64) {
 /// BSP polls this to know when all APs are ready.
 static AP_READY_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// AP entry point — called by Limine when an AP is woken via `goto_address`.
+/// AP entry point — x86_64 (called by Limine when an AP is woken via `goto_address`).
 ///
 /// Each AP arrives in 64-bit long mode with its own 64KB stack (provided by Limine),
 /// the kernel page tables active, and interrupts disabled.
@@ -1277,6 +1787,7 @@ static AP_READY_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 ///
 /// # Safety
 /// Called by the Limine MP protocol machinery. Must never return.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     let cpu_index = cpu.extra.load(core::sync::atomic::Ordering::Acquire) as usize;
     let apic_id = cpu.lapic_id;
@@ -1310,9 +1821,8 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // can be dispatched, and its own Timer for tick accounting.
     {
         use arcos_core::scheduler::{Scheduler, Timer, TimerConfig};
-        use alloc::boxed::Box;
 
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = Scheduler::new_boxed();
         if scheduler.init().is_err() {
             // Non-fatal: AP will just idle without a scheduler
         } else {
@@ -1338,6 +1848,76 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     }
 }
 
+/// AP entry point — AArch64 (called by Limine when an AP is woken via `goto_address`).
+///
+/// Each AP arrives at EL1 with its own stack (provided by Limine),
+/// kernel page tables active, and interrupts masked (DAIF.I set).
+///
+/// `cpu.lapic_id` on AArch64 is the MPIDR_EL1 value for the AP.
+/// `cpu.extra` holds the logical CPU index assigned by the BSP.
+///
+/// # Safety
+/// Called by the Limine MP protocol machinery. Must never return.
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
+    let cpu_index = cpu.extra.load(core::sync::atomic::Ordering::Acquire) as usize;
+    let mpidr_aff = cpu.mpidr;
+
+    // Step 1: Per-CPU EL1 config (no-op on AArch64)
+    arcos_core::arch::gdt::init_for_cpu(cpu_index);
+
+    // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
+    // SAFETY: Called once per AP during init.
+    arcos_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
+
+    // Step 3: Install exception vector table (per-CPU VBAR_EL1)
+    // SAFETY: Exception vector table is shared and already initialized by BSP.
+    arcos_core::arch::syscall::init();
+
+    // Step 4: Initialize GIC CPU interface for this AP
+    // SAFETY: GIC distributor already initialized by BSP.
+    arcos_core::arch::aarch64::gic::init();
+
+    // Step 5: Initialize GIC Redistributor for this AP
+    // SAFETY: GICR physical base at QEMU virt address, translated through HHDM.
+    const GICR_PHYS: u64 = 0x080A_0000;
+    let hhdm = arcos_core::hhdm_offset();
+    arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
+
+    // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
+    // SAFETY: BSP has completed timer::init(), COUNTER_FREQ and TIMER_RELOAD are set.
+    arcos_core::arch::aarch64::timer::init_ap();
+
+    // Step 7: Initialize per-CPU scheduler and timer
+    {
+        use arcos_core::scheduler::{Scheduler, Timer, TimerConfig};
+
+        let mut scheduler = Scheduler::new_boxed();
+        if scheduler.init().is_err() {
+            // Non-fatal: AP will just idle without a scheduler
+        } else {
+            *PER_CPU_SCHEDULER[cpu_index].lock() = Some(scheduler);
+        }
+
+        if let Ok(mut timer) = Timer::new(TimerConfig::HZ_100) {
+            let _ = timer.init();
+            *PER_CPU_TIMER[cpu_index].lock() = Some(timer);
+        }
+    }
+
+    // Step 8: Signal BSP that this AP is ready
+    AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+
+    // Step 9: Enable interrupts and enter idle loop
+    // SAFETY: All AP-local hardware is initialized.
+    core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); // Unmask IRQ
+
+    loop {
+        arcos_core::wfi();
+    }
+}
+
 /// Distribute tasks from CPU 0 to APs for balanced scheduling.
 ///
 /// Called after all APs are online with their own schedulers.
@@ -1354,14 +1934,14 @@ fn distribute_tasks_to_aps() {
 
     // Collect migratable task IDs from CPU 0's scheduler
     // Skip idle task (0) — each CPU has its own idle task
-    let mut migratable: [Option<TaskId>; 32] = [None; 32];
+    let mut migratable: [Option<TaskId>; 256] = [None; 256];
     let mut count = 0;
 
     {
         let guard = PER_CPU_SCHEDULER[0].lock();
         if let Some(sched) = guard.as_ref() {
             // Tasks 1..N that are Ready (not Running or Blocked on hardware)
-            for slot in 1..32u32 {
+            for slot in 1..arcos_core::MAX_TASKS as u32 {
                 let tid = TaskId(slot);
                 if let Some(task) = sched.get_task_pub(tid) {
                     if task.state == arcos_core::scheduler::TaskState::Ready {
@@ -1426,12 +2006,19 @@ unsafe fn start_application_processors() {
         }
     };
 
-    let bsp_lapic_id = mp_response.bsp_lapic_id();
+    #[cfg(target_arch = "x86_64")]
+    let bsp_id: u64 = mp_response.bsp_lapic_id() as u64;
+    #[cfg(target_arch = "aarch64")]
+    let bsp_id: u64 = mp_response.bsp_mpidr();
+
     let cpus = mp_response.cpus();
     let total_cpus = cpus.len();
 
     // Count APs (non-BSP CPUs)
-    let ap_count = cpus.iter().filter(|c| c.lapic_id != bsp_lapic_id).count();
+    #[cfg(target_arch = "x86_64")]
+    let ap_count = cpus.iter().filter(|c| c.lapic_id as u64 != bsp_id).count();
+    #[cfg(target_arch = "aarch64")]
+    let ap_count = cpus.iter().filter(|c| c.mpidr != bsp_id).count();
 
     if ap_count == 0 {
         println!("  Single-CPU system (BSP only)");
@@ -1443,7 +2030,11 @@ unsafe fn start_application_processors() {
     // Assign logical CPU indices and wake each AP
     let mut cpu_index: usize = 1; // BSP = 0, APs start at 1
     for cpu in cpus.iter() {
-        if cpu.lapic_id == bsp_lapic_id {
+        #[cfg(target_arch = "x86_64")]
+        let is_bsp = cpu.lapic_id as u64 == bsp_id;
+        #[cfg(target_arch = "aarch64")]
+        let is_bsp = cpu.mpidr == bsp_id;
+        if is_bsp {
             continue; // Skip BSP
         }
 
@@ -1483,23 +2074,34 @@ unsafe fn start_application_processors() {
 
 /// Main microkernel event loop
 ///
-/// Now that scheduling is interrupt-driven (APIC timer → vector 32 → timer_isr_stub),
-/// this loop serves as the idle task. It halts the CPU until the next interrupt,
+/// Scheduling is interrupt-driven (timer ISR → scheduler tick + context switch).
+/// This loop serves as the idle task. It halts/waits until the next interrupt,
 /// reducing power consumption.
 ///
 /// The timer ISR handles all tick counting, time slice accounting, and scheduling.
-/// Periodic invariant verification runs inline between halts.
+/// Periodic diagnostics run between halts, gated by tick count (not idle wakeups)
+/// for deterministic frequency regardless of interrupt rate.
 fn microkernel_loop() -> ! {
-    let mut idle_count: u64 = 0;
+    // Enable interrupts before entering the idle loop
+    #[cfg(target_arch = "x86_64")]
+    x86_64::instructions::interrupts::enable();
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: All hardware initialized (GIC, timer, VBAR_EL1).
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); }
+
+    // Tick-based gating: deterministic frequency regardless of interrupt rate.
+    // Status every 10s (1000 ticks @ 100Hz), invariants every 60s (6000 ticks).
+    let mut last_status_tick: u64 = 0;
+    let mut last_verify_tick: u64 = 0;
 
     loop {
-        idle_count += 1;
+        let ticks = Timer::get_ticks();
 
-        // Periodic status reporting (every ~1000 interrupts worth of idle cycles)
-        if idle_count % 1000 == 0 {
-            let ticks = Timer::get_ticks();
-            if ticks > 0 {
-                let scheduler = arcos_core::local_scheduler().lock();
+        // Periodic status reporting (every ~10 seconds)
+        if ticks >= last_status_tick + 1000 {
+            last_status_tick = ticks;
+            // Use try_lock to avoid blocking the idle loop under contention
+            if let Some(scheduler) = arcos_core::local_scheduler().try_lock() {
                 if let Some(sched) = scheduler.as_ref() {
                     let stats = sched.stats();
                     println!(
@@ -1513,24 +2115,28 @@ fn microkernel_loop() -> ! {
             }
         }
 
-        // Periodic invariant verification (every ~10000 idle cycles)
-        if idle_count % 10000 == 0 {
-            let scheduler = arcos_core::local_scheduler().lock();
-            if let Some(sched) = scheduler.as_ref() {
-                if let Err(e) = sched.verify_invariants() {
-                    println!("✗ Scheduler invariant violated: {}", e);
-                    arcos_core::halt();
+        // Periodic invariant verification (every ~60 seconds)
+        if ticks >= last_verify_tick + 6000 {
+            last_verify_tick = ticks;
+            if let Some(scheduler) = arcos_core::local_scheduler().try_lock() {
+                if let Some(sched) = scheduler.as_ref() {
+                    if let Err(e) = sched.verify_invariants() {
+                        println!("✗ Scheduler invariant violated: {}", e);
+                        arcos_core::halt();
+                    }
                 }
             }
         }
 
         // Load balancing: migrate tasks from overloaded to underloaded CPUs
+        // (internally throttled to once per BALANCE_INTERVAL_TICKS)
         arcos_core::try_load_balance();
 
-        // Halt CPU until next interrupt (timer, keyboard, etc.)
-        // The `hlt` instruction stops the CPU until an interrupt fires.
-        // On interrupt: CPU wakes → runs ISR → returns here → loops back to hlt.
+        // Halt/wait CPU until next interrupt (timer, keyboard, etc.)
+        #[cfg(target_arch = "x86_64")]
         hlt();
+        #[cfg(target_arch = "aarch64")]
+        arcos_core::wfi();
     }
 }
 

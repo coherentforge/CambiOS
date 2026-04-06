@@ -123,7 +123,14 @@ pub const MAX_PROCESSES: usize = 32;
 /// Base physical address for process heaps.
 /// Each process gets its own heap at: PROCESS_HEAP_BASE + (pid * HEAP_SIZE).
 ///
-/// Starts at 8MB to avoid conflicts with the kernel heap (4MB at 0x200000).
+/// x86_64: 8MB — above the kernel heap (4MB at 0x200000), within low RAM.
+/// AArch64 (QEMU virt): RAM starts at 0x4000_0000 (1 GiB). Physical addresses
+/// below that are MMIO (GIC, UART, etc). We use 0x4080_0000 (1 GiB + 8 MiB).
+#[cfg(target_arch = "x86_64")]
+pub const PROCESS_HEAP_BASE: u64 = 0x800000;
+#[cfg(target_arch = "aarch64")]
+pub const PROCESS_HEAP_BASE: u64 = 0x4080_0000;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const PROCESS_HEAP_BASE: u64 = 0x800000;
 pub const HEAP_SIZE: u64 = 0x100000; // 1MB per process
 

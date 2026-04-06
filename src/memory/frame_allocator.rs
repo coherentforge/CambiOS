@@ -14,9 +14,14 @@ use core::fmt;
 /// Page / frame size: 4 KiB
 pub const PAGE_SIZE: u64 = 4096;
 
-/// Maximum supported physical memory: 4 GiB
-/// (131072 frames × 4 KiB = 4 GiB)
-const MAX_FRAMES: usize = 131072;
+/// Maximum supported physical address: 2 GiB
+/// (524288 frames × 4 KiB = 2 GiB)
+///
+/// Must cover the highest physical address used on any platform:
+/// - x86_64 QEMU: RAM at 0x0, typically ≤ 512 MB
+/// - AArch64 QEMU virt: RAM at 0x40000000 (1 GiB), needs frames up to ~1.25 GiB
+/// Bitmap cost: 524288 bits = 64 KiB (acceptable for kernel .bss)
+const MAX_FRAMES: usize = 524288;
 
 /// Bitmap words needed: 131072 / 64 = 2048
 const BITMAP_WORDS: usize = MAX_FRAMES / 64;
@@ -242,6 +247,114 @@ impl fmt::Debug for FrameAllocator {
     }
 }
 
+// ============================================================================
+// Per-CPU frame cache — reduces global FRAME_ALLOCATOR lock contention
+// ============================================================================
+
+/// Per-CPU frame cache capacity. 32 frames = 128 KB of pre-cached memory.
+/// Sized to cover typical single-syscall allocations (≤128 KB) without
+/// touching the global allocator.
+const CACHE_CAPACITY: usize = 32;
+
+/// Number of frames to refill from the global allocator at once.
+/// Half the cache — balances refill frequency vs. lock hold time.
+const REFILL_COUNT: usize = 16;
+
+/// Number of frames to drain back to the global allocator when the cache
+/// is full. Draining makes room for freed frames and returns memory to
+/// the global pool for other CPUs.
+const DRAIN_COUNT: usize = 16;
+
+/// Per-CPU frame cache — LIFO stack of pre-allocated physical frames.
+///
+/// Reduces global `FRAME_ALLOCATOR` lock contention by serving most
+/// allocations and frees from a CPU-local pool. The global allocator
+/// is only touched on refill (cache empty) and drain (cache full).
+///
+/// Thread safety: wrapped in a per-CPU Spinlock in `lib.rs`. Only the
+/// owning CPU accesses its cache, so contention is effectively zero.
+pub struct FrameCache {
+    /// Physical addresses of cached free frames (LIFO stack).
+    stack: [u64; CACHE_CAPACITY],
+    /// Number of valid frames in the cache (top-of-stack index).
+    count: usize,
+}
+
+impl FrameCache {
+    /// Create an empty frame cache.
+    pub const fn new() -> Self {
+        FrameCache {
+            stack: [0; CACHE_CAPACITY],
+            count: 0,
+        }
+    }
+
+    /// Pop a frame from the local cache. Returns `None` if empty.
+    pub fn pop(&mut self) -> Option<PhysFrame> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(PhysFrame { addr: self.stack[self.count] })
+    }
+
+    /// Push a frame to the local cache.
+    ///
+    /// Returns `Some(frame)` if the cache is full (caller must return it
+    /// to the global allocator). Returns `None` on success.
+    pub fn push(&mut self, frame: PhysFrame) -> Option<PhysFrame> {
+        if self.count >= CACHE_CAPACITY {
+            return Some(frame);
+        }
+        self.stack[self.count] = frame.addr;
+        self.count += 1;
+        None
+    }
+
+    /// Refill the cache from the global allocator.
+    ///
+    /// Allocates up to `REFILL_COUNT` frames and pushes them onto the stack.
+    /// Returns the number of frames obtained.
+    pub fn refill(&mut self, global: &mut FrameAllocator) -> usize {
+        let want = REFILL_COUNT.min(CACHE_CAPACITY - self.count);
+        let mut got = 0;
+        for _ in 0..want {
+            match global.allocate() {
+                Ok(frame) => {
+                    self.stack[self.count] = frame.addr;
+                    self.count += 1;
+                    got += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    /// Drain frames from the cache back to the global allocator.
+    ///
+    /// Pops up to `DRAIN_COUNT` frames and frees them globally,
+    /// making room for new local frees.
+    pub fn drain(&mut self, global: &mut FrameAllocator) -> usize {
+        let n = DRAIN_COUNT.min(self.count);
+        for _ in 0..n {
+            self.count -= 1;
+            let _ = global.free(PhysFrame { addr: self.stack[self.count] });
+        }
+        n
+    }
+
+    /// Number of cached frames.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +453,99 @@ mod tests {
         assert_eq!(alloc.free_count(), 1);
         let frame = alloc.allocate().unwrap();
         assert_eq!(frame.addr, 0x101000);
+    }
+
+    // ================================================================
+    // FrameCache tests
+    // ================================================================
+
+    #[test]
+    fn test_cache_push_pop() {
+        let mut cache = FrameCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        // Push a frame
+        let frame = PhysFrame { addr: 0x1000 };
+        assert!(cache.push(frame).is_none());
+        assert_eq!(cache.len(), 1);
+
+        // Pop it back
+        let popped = cache.pop().unwrap();
+        assert_eq!(popped.addr, 0x1000);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_cache_lifo_order() {
+        let mut cache = FrameCache::new();
+        cache.push(PhysFrame { addr: 0x1000 });
+        cache.push(PhysFrame { addr: 0x2000 });
+        cache.push(PhysFrame { addr: 0x3000 });
+
+        assert_eq!(cache.pop().unwrap().addr, 0x3000); // LIFO
+        assert_eq!(cache.pop().unwrap().addr, 0x2000);
+        assert_eq!(cache.pop().unwrap().addr, 0x1000);
+    }
+
+    #[test]
+    fn test_cache_full_returns_overflow() {
+        let mut cache = FrameCache::new();
+        for i in 0..CACHE_CAPACITY {
+            assert!(cache.push(PhysFrame { addr: (i as u64) * 0x1000 }).is_none());
+        }
+        assert_eq!(cache.len(), CACHE_CAPACITY);
+
+        // Next push should return the overflow frame
+        let overflow = cache.push(PhysFrame { addr: 0xFF000 });
+        assert!(overflow.is_some());
+        assert_eq!(overflow.unwrap().addr, 0xFF000);
+        assert_eq!(cache.len(), CACHE_CAPACITY); // Unchanged
+    }
+
+    #[test]
+    fn test_cache_pop_empty() {
+        let mut cache = FrameCache::new();
+        assert!(cache.pop().is_none());
+    }
+
+    #[test]
+    fn test_cache_refill() {
+        let mut alloc = FrameAllocator::new();
+        alloc.add_region(0x100000, 0x100000); // 256 frames
+        alloc.finalize();
+
+        let mut cache = FrameCache::new();
+        let got = cache.refill(&mut alloc);
+        assert_eq!(got, REFILL_COUNT);
+        assert_eq!(cache.len(), REFILL_COUNT);
+        assert_eq!(alloc.free_count(), 256 - REFILL_COUNT);
+    }
+
+    #[test]
+    fn test_cache_drain() {
+        let mut alloc = FrameAllocator::new();
+        alloc.add_region(0x100000, 0x100000); // 256 frames
+        alloc.finalize();
+
+        let mut cache = FrameCache::new();
+        cache.refill(&mut alloc);
+        assert_eq!(cache.len(), REFILL_COUNT);
+
+        let drained = cache.drain(&mut alloc);
+        assert_eq!(drained, DRAIN_COUNT.min(REFILL_COUNT));
+        assert_eq!(alloc.free_count(), 256); // All returned
+    }
+
+    #[test]
+    fn test_cache_refill_exhaustion() {
+        let mut alloc = FrameAllocator::new();
+        alloc.add_region(0x100000, 0x4000); // Only 4 frames
+        alloc.finalize();
+
+        let mut cache = FrameCache::new();
+        let got = cache.refill(&mut alloc);
+        assert_eq!(got, 4); // Got all available, less than REFILL_COUNT
+        assert_eq!(cache.len(), 4);
     }
 }

@@ -44,34 +44,114 @@ static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 pub mod exceptions {
     use x86_64::structures::idt::InterruptStackFrame;
 
-    /// Division by zero exception handler
+    /// Division by zero exception handler.
+    ///
+    /// User-mode: terminate the faulting task.
+    /// Kernel-mode: unrecoverable — halt.
     pub extern "x86-interrupt" fn divide_by_zero(stack_frame: InterruptStackFrame) {
-        crate::println!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
-        crate::halt();
+        let cs = stack_frame.code_segment;
+        let is_user = (cs & 0x3) == 3;
+
+        if is_user {
+            if let Some(task_id) = crate::terminate_current_task() {
+                crate::println!(
+                    "  [DivZero] Task {} killed: RIP={:#x}",
+                    task_id.0, stack_frame.instruction_pointer.as_u64()
+                );
+            }
+        } else {
+            crate::println!(
+                "\n!!! KERNEL DIVIDE BY ZERO !!!\n{:#?}",
+                stack_frame
+            );
+            crate::halt();
+        }
     }
 
-    /// General protection fault handler
+    /// General protection fault handler.
+    ///
+    /// User-mode GPF: terminate the faulting task.
+    /// Kernel-mode GPF: unrecoverable — halt with diagnostics.
     pub extern "x86-interrupt" fn general_protection_fault(
         stack_frame: InterruptStackFrame,
         error_code: u64,
     ) {
-        crate::println!(
-            "EXCEPTION: GENERAL PROTECTION FAULT (code: {:#x})\n{:#?}",
-            error_code, stack_frame
-        );
-        crate::halt();
+        // CS RPL bits [1:0] indicate the privilege level of the interrupted code.
+        // CPL=3 (user mode) if bits [1:0] of CS == 3.
+        let cs = stack_frame.code_segment;
+        let is_user = (cs & 0x3) == 3;
+
+        if is_user {
+            if let Some(task_id) = crate::terminate_current_task() {
+                crate::println!(
+                    "  [GPF] Task {} killed: code={:#x} RIP={:#x}",
+                    task_id.0, error_code, stack_frame.instruction_pointer.as_u64()
+                );
+            }
+        } else {
+            crate::println!(
+                "\n!!! KERNEL GPF !!!\n  Error code: {:#x}\n{:#?}",
+                error_code, stack_frame
+            );
+            crate::halt();
+        }
     }
 
-    /// Page fault handler
+    /// Page fault handler (vector 14).
+    ///
+    /// Distinguishes user-mode faults (terminate the offending task) from
+    /// kernel-mode faults (unrecoverable — panic with diagnostics).
+    ///
+    /// ## Error code bits (x86_64)
+    /// - Bit 0 (PRESENT): 0 = page not present, 1 = protection violation
+    /// - Bit 1 (WRITE): 0 = read access, 1 = write access
+    /// - Bit 2 (USER): 0 = kernel mode, 1 = user mode
+    /// - Bit 4 (INSTRUCTION_FETCH): 1 = caused by instruction fetch
     pub extern "x86-interrupt" fn page_fault(
         stack_frame: InterruptStackFrame,
         error_code: x86_64::structures::idt::PageFaultErrorCode,
     ) {
-        crate::println!(
-            "EXCEPTION: PAGE FAULT (code: {:#?})\n{:#?}",
-            error_code, stack_frame
-        );
-        crate::halt();
+        use x86_64::registers::control::Cr2;
+        use x86_64::structures::idt::PageFaultErrorCode;
+
+        let faulting_addr = Cr2::read_raw();
+        let is_user = error_code.contains(PageFaultErrorCode::USER_MODE);
+        let is_write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
+        let is_present = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+        let is_fetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
+
+        if is_user {
+            // User-mode page fault: terminate the faulting task
+            let fault_type = if is_present { "protection" } else { "not-present" };
+            let access = if is_fetch { "execute" } else if is_write { "write" } else { "read" };
+
+            if let Some(task_id) = crate::terminate_current_task() {
+                crate::println!(
+                    "  [PageFault] Task {} killed: {} {} at {:#x} (RIP={:#x})",
+                    task_id.0, fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
+                );
+            } else {
+                crate::println!(
+                    "  [PageFault] User fault at {:#x} but no current task to kill",
+                    faulting_addr
+                );
+            }
+
+            // Return from the handler — the task is now Terminated.
+            // The next timer tick will context-switch to a Ready task.
+            // The terminated task's iretq frame is still on the stack,
+            // but the scheduler will never schedule it again.
+        } else {
+            // Kernel-mode page fault: unrecoverable — halt with diagnostics
+            let fault_type = if is_present { "protection" } else { "not-present" };
+            let access = if is_fetch { "execute" } else if is_write { "write" } else { "read" };
+
+            crate::println!(
+                "\n!!! KERNEL PAGE FAULT !!!\n  Address: {:#x}\n  Type: {} {}\n  Error code: {:?}\n{:#?}",
+                faulting_addr, fault_type, access, error_code, stack_frame
+            );
+            crate::halt();
+        }
     }
 
     /// Double fault handler (non-recoverable)
@@ -105,28 +185,47 @@ pub mod device_irqs {
 
     /// Common device IRQ handler — wakes blocked tasks and sends EOI.
     ///
-    /// Called from each per-GSI ISR stub. Iterates all online CPUs' per-CPU
-    /// schedulers to wake tasks blocked on this IRQ. Uses `try_lock()` on
-    /// each PER_CPU_SCHEDULER (IrqSpinlock) to avoid deadlock.
+    /// Called from each per-GSI ISR stub. If the IRQ has a registered handler
+    /// (via SYS_WAIT_IRQ + interrupt routing table), uses TASK_CPU_MAP for a
+    /// targeted single-CPU wake. Otherwise falls back to scanning all CPUs.
     ///
-    /// **Known latency bound (Phase 4a):** If try_lock() fails due to lock
-    /// contention on a remote CPU's scheduler, that CPU's blocked task will
-    /// not be woken until the next timer tick (~10ms at 100Hz). This is
-    /// acceptable for most device IRQs. For latency-sensitive drivers,
-    /// Phase 4b (IRQ affinity — routing device IRQs to a specific CPU and
-    /// pinning SYS_WAIT_IRQ tasks to that CPU) eliminates the cross-CPU
-    /// wake entirely.
+    /// IRQ affinity (set by SYS_WAIT_IRQ) routes the interrupt to the same
+    /// CPU as the pinned driver task, so the targeted path is the common case
+    /// for registered device IRQs.
     fn device_irq_handler(gsi: u32) {
-        // Wake tasks waiting on this IRQ across all online CPUs
-        let count = crate::arch::x86_64::percpu::cpu_count() as usize;
-        for cpu in 0..count {
-            if let Some(mut sched_guard) = crate::PER_CPU_SCHEDULER[cpu].try_lock() {
-                if let Some(sched) = sched_guard.as_mut() {
-                    sched.wake_irq_waiters(gsi);
+        let mut woken = false;
+
+        // Fast path: look up the registered handler task for this IRQ and
+        // wake only on its owning CPU (avoids N-CPU scan).
+        if let Some(router_guard) = crate::INTERRUPT_ROUTER.try_lock() {
+            let irq = crate::interrupts::routing::IrqNumber(gsi as u8);
+            if let Some(route) = router_guard.lookup(irq) {
+                let task_id = route.handler_task;
+                drop(router_guard);
+                if let Some(cpu) = crate::get_task_cpu(task_id.0) {
+                    let cpu = cpu as usize;
+                    if let Some(mut sched_guard) = crate::PER_CPU_SCHEDULER[cpu].try_lock() {
+                        if let Some(sched) = sched_guard.as_mut() {
+                            sched.wake_irq_waiters(gsi);
+                            woken = true;
+                        }
+                    }
                 }
             }
-            // If try_lock() fails, the task will be woken on the next timer tick
         }
+
+        // Slow path: no registered handler, or try_lock failed — scan all CPUs
+        if !woken {
+            let count = crate::arch::x86_64::percpu::cpu_count() as usize;
+            for cpu in 0..count {
+                if let Some(mut sched_guard) = crate::PER_CPU_SCHEDULER[cpu].try_lock() {
+                    if let Some(sched) = sched_guard.as_mut() {
+                        sched.wake_irq_waiters(gsi);
+                    }
+                }
+            }
+        }
+
         // EOI must always be sent, regardless of whether we woke a task
         // SAFETY: We are in an APIC-delivered interrupt handler.
         // The I/O APIC routes this interrupt through the Local APIC,

@@ -9,6 +9,9 @@ pub mod timer;
 pub use task::{Task, TaskId, TaskState, Priority, CpuContext, ScheduleError, BlockReason};
 pub use timer::{Timer, TimerConfig, AdaptiveTickMode};
 use core::fmt;
+use alloc::vec::Vec;
+use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 
 /// Platform-agnostic context switch info returned from `on_timer_isr`.
 ///
@@ -73,11 +76,26 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
     }
 }
 
-/// Maximum number of tasks in the system
-/// Maximum tasks in the system.
-/// Kept at 32 to avoid huge stack allocations in Scheduler::new().
-/// Can be made dynamic in the future with Box<[Option<Task>; N]>
-const MAX_TASKS: usize = 32;
+/// Maximum number of tasks in the system.
+///
+/// Raised from 32 to 256 to support real multi-core workloads. The task array
+/// is heap-allocated (Vec), so this does not risk stack overflow. Per-priority
+/// ready queues keep scheduling O(1) despite the larger task count.
+const MAX_TASKS: usize = 256;
+
+/// Number of priority bands for the ready queues.
+///
+/// Band mapping: priority / 64 → band index (0..3).
+///   Band 0: IDLE (priority 0-63)
+///   Band 1: LOW  (priority 64-127)
+///   Band 2: NORMAL (priority 128-191)
+///   Band 3: HIGH + CRITICAL (priority 192-255)
+const NUM_PRIORITY_BANDS: usize = 4;
+
+/// Map a task priority to a ready-queue band index.
+fn priority_to_band(p: Priority) -> usize {
+    (p.0 as usize / 64).min(NUM_PRIORITY_BANDS - 1)
+}
 
 /// Scheduler state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,22 +106,29 @@ pub enum SchedulerState {
     Paused,
 }
 
-/// Round-robin task scheduler
+/// Priority-aware task scheduler with per-band ready queues.
 ///
 /// Invariants:
-/// - Exactly one task is Running
-/// - All Ready tasks have consistent state
-/// - Only Running task has access to CPU
-/// - Timer ticks decrement time_remaining
+/// - Exactly one task is Running (tracked by `current_task`)
+/// - Ready tasks are enqueued in their priority band's VecDeque
+/// - Timer ticks decrement `time_remaining` on the running task
+/// - `runnable_count` tracks non-idle Ready + Running tasks
+///
+/// The task array is heap-allocated (Vec) so MAX_TASKS can scale without
+/// risking stack overflow. Ready queues provide O(1) scheduling by popping
+/// from the highest non-empty band.
 pub struct Scheduler {
-    /// All tasks in the system (dynamic storage)
-    tasks: [Option<Task>; MAX_TASKS],
-    /// Number of active tasks
+    /// All tasks indexed by TaskId (heap-allocated)
+    tasks: Vec<Option<Task>>,
+    /// Per-priority-band ready queues. Band 3 (highest) checked first.
+    /// Uses lazy removal: stale entries (Blocked/Terminated) are skipped on pop.
+    ready_queues: [VecDeque<TaskId>; NUM_PRIORITY_BANDS],
+    /// Number of active tasks (present in the tasks array)
     task_count: usize,
+    /// Number of non-idle runnable tasks (Ready + Running, excluding idle task 0)
+    runnable_count: usize,
     /// Currently running task ID
     current_task: Option<TaskId>,
-    /// Index for round-robin selection
-    ready_index: usize,
     /// Number of scheduler ticks
     total_ticks: u64,
     /// Scheduler state
@@ -111,16 +136,40 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// Create a new scheduler
+    /// Create a new scheduler.
+    ///
+    /// The task Vec and ready-queue VecDeques are heap-allocated, so only
+    /// ~128 bytes of Scheduler metadata lands on the stack. Safe for
+    /// 256KB boot stacks even at MAX_TASKS=256+.
     pub fn new() -> Self {
         Scheduler {
-            tasks: [const { None }; MAX_TASKS],
+            tasks: {
+                let mut v = Vec::with_capacity(MAX_TASKS);
+                v.resize_with(MAX_TASKS, || None);
+                v
+            },
+            ready_queues: [
+                VecDeque::with_capacity(MAX_TASKS),
+                VecDeque::with_capacity(MAX_TASKS),
+                VecDeque::with_capacity(MAX_TASKS),
+                VecDeque::with_capacity(MAX_TASKS),
+            ],
             task_count: 0,
+            runnable_count: 0,
             current_task: None,
-            ready_index: 0,
             total_ticks: 0,
             state: SchedulerState::Uninitialized,
         }
+    }
+
+    /// Heap-allocate a Scheduler directly.
+    ///
+    /// Equivalent to `Box::new(Scheduler::new())` but makes the intent
+    /// explicit: the Vec/VecDeque internals are on the heap, and the
+    /// Scheduler metadata struct (~128 bytes) passes through the stack
+    /// only briefly during the Box move.
+    pub fn new_boxed() -> Box<Self> {
+        Box::new(Self::new())
     }
 
     /// Initialize scheduler with idle task
@@ -157,10 +206,14 @@ impl Scheduler {
             .ok_or(ScheduleError::NoReadyTasks)?;
 
         let task_id = TaskId(slot as u32);
-        let task = Task::new(task_id, entry_point, stack_pointer, priority);
+        let mut task = Task::new(task_id, entry_point, stack_pointer, priority);
+        task.in_ready_queue = true;
 
+        let band = priority_to_band(priority);
         self.tasks[slot] = Some(task);
         self.task_count += 1;
+        self.runnable_count += 1;
+        self.ready_queues[band].push_back(task_id);
 
         Ok(task_id)
     }
@@ -183,10 +236,14 @@ impl Scheduler {
             .ok_or(ScheduleError::NoReadyTasks)?;
 
         let task_id = TaskId(slot as u32);
-        let task = Task::new_with_stack(task_id, entry_point, saved_rsp, stack_top, priority);
+        let mut task = Task::new_with_stack(task_id, entry_point, saved_rsp, stack_top, priority);
+        task.in_ready_queue = true;
 
+        let band = priority_to_band(priority);
         self.tasks[slot] = Some(task);
         self.task_count += 1;
+        self.runnable_count += 1;
+        self.ready_queues[band].push_back(task_id);
 
         Ok(task_id)
     }
@@ -214,6 +271,11 @@ impl Scheduler {
     fn time_slice_expired(&self) -> bool {
         if let Some(task_id) = self.current_task {
             if let Some(task) = self.get_task(task_id) {
+                // Force reschedule if current task is no longer Running
+                // (e.g., terminated via SYS_EXIT or killed by page fault)
+                if task.state != TaskState::Running {
+                    return true;
+                }
                 return task.time_slice_expired();
             }
         }
@@ -221,20 +283,36 @@ impl Scheduler {
     }
 
     /// Perform a context switch - select next ready task by priority
-    /// 
+    ///
     /// Transitions scheduler to Running state on first invocation.
     pub fn schedule(&mut self) -> Result<TaskId, ScheduleError> {
-        // Save current task state
+        // Save current task state — push to ready queue if it was Running
         if let Some(task_id) = self.current_task {
-            if let Some(task) = self.get_task_mut(task_id) {
-                if task.state == TaskState::Running {
-                    task.state = TaskState::Ready;
-                    task.reset_time_slice();
+            // Extract priority before mutating, to avoid overlapping borrows
+            let enqueue_band = {
+                if let Some(task) = self.tasks.get_mut(task_id.0 as usize).and_then(|t| t.as_mut()) {
+                    if task.state == TaskState::Running {
+                        task.state = TaskState::Ready;
+                        task.reset_time_slice();
+                        if !task.in_ready_queue {
+                            task.in_ready_queue = true;
+                            Some(priority_to_band(task.priority))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            };
+            if let Some(band) = enqueue_band {
+                self.ready_queues[band].push_back(task_id);
             }
         }
 
-        // Find next ready task
+        // Find next ready task (O(1) via priority queues)
         let next_task = self.find_next_ready_task()?;
 
         // Update task state
@@ -244,62 +322,39 @@ impl Scheduler {
         }
 
         self.current_task = Some(next_task);
-        
+
         // Transition to Running state on first schedule
         if self.state == SchedulerState::Initialized {
             self.state = SchedulerState::Running;
         }
-        
+
         Ok(next_task)
     }
 
-    /// Find the next ready task using priority-based selection
-    /// 
-    /// Algorithm:
-    /// 1. Find the highest priority among all ready tasks
-    /// 2. Round-robin within that priority level
-    /// 3. Falls back to idle task (always ready) if nothing else found
+    /// Find the next ready task using per-priority-band queues — O(1) amortized.
+    ///
+    /// Pops from the highest non-empty band. Stale entries (tasks that were
+    /// blocked/terminated since being enqueued) are lazily skipped.
+    /// Round-robin within each band is automatic: push_back on enqueue,
+    /// pop_front on schedule.
     fn find_next_ready_task(&mut self) -> Result<TaskId, ScheduleError> {
-        // First pass: find highest ready priority
-        let mut max_priority: Option<Priority> = None;
-        for task_opt in self.tasks.iter() {
-            if let Some(task) = task_opt {
-                if task.state == TaskState::Ready {
-                    if let Some(current_max) = max_priority {
-                        if task.priority > current_max {
-                            max_priority = Some(task.priority);
-                        }
-                    } else {
-                        max_priority = Some(task.priority);
+        // Check bands from highest (3) to lowest (0)
+        for band in (0..NUM_PRIORITY_BANDS).rev() {
+            while let Some(tid) = self.ready_queues[band].pop_front() {
+                let idx = tid.0 as usize;
+                if let Some(Some(task)) = self.tasks.get_mut(idx) {
+                    if task.state == TaskState::Ready {
+                        task.in_ready_queue = false;
+                        return Ok(tid);
                     }
+                    // Stale entry — task was blocked/terminated since enqueuing
+                    task.in_ready_queue = false;
                 }
             }
         }
 
-        // Second pass: round-robin within the highest priority band
-        if let Some(target_priority) = max_priority {
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: usize = MAX_TASKS * 2;
-
-            loop {
-                let index = (self.ready_index + attempts) % MAX_TASKS;
-
-                if let Some(task) = &self.tasks[index] {
-                    if task.state == TaskState::Ready && task.priority == target_priority {
-                        self.ready_index = (index + 1) % MAX_TASKS;
-                        return Ok(task.id);
-                    }
-                }
-
-                attempts += 1;
-                if attempts >= MAX_ATTEMPTS {
-                    break;
-                }
-            }
-        }
-
-        // Fallback: idle task (always ready) if nothing else found
-        if let Some(task) = self.get_task(TaskId(0)) {
+        // Fallback: idle task (always ready as last resort)
+        if let Some(Some(task)) = self.tasks.get(0) {
             if task.state == TaskState::Ready {
                 return Ok(TaskId(0));
             }
@@ -368,20 +423,12 @@ impl Scheduler {
     /// 
     /// TaskId is an index into the tasks array. Direct indexing is O(1).
     fn get_task(&self, id: TaskId) -> Option<&Task> {
-        if id.0 as usize >= MAX_TASKS {
-            return None;
-        }
-        self.tasks[id.0 as usize].as_ref()
+        self.tasks.get(id.0 as usize)?.as_ref()
     }
 
     /// Get mutable task by ID - O(1) direct indexing
-    /// 
-    /// TaskId is an index into the tasks array. Direct indexing is O(1).
     fn get_task_mut(&mut self, id: TaskId) -> Option<&mut Task> {
-        if id.0 as usize >= MAX_TASKS {
-            return None;
-        }
-        self.tasks[id.0 as usize].as_mut()
+        self.tasks.get_mut(id.0 as usize)?.as_mut()
     }
 
     /// Public mutable task accessor (for setting process_id/CR3 after creation)
@@ -417,7 +464,7 @@ impl Scheduler {
         if task_id == TaskId(0) {
             return Err(ScheduleError::InvalidTaskState);
         }
-        
+
         if let Some(task) = self.get_task_mut(task_id) {
             // Can only block Running or Ready tasks
             if task.state != TaskState::Running && task.state != TaskState::Ready {
@@ -426,12 +473,10 @@ impl Scheduler {
 
             task.state = TaskState::Blocked;
             task.block_reason = Some(reason);
+            // in_ready_queue left as-is; stale entry cleaned lazily on pop
+            self.runnable_count = self.runnable_count.saturating_sub(1);
 
             // If we blocked the current running task, reschedule immediately.
-            // This performs the logical state transition (picks next task).
-            // The actual CPU context switch happens via:
-            // - Timer ISR: next interrupt will restore the newly scheduled task
-            // - Explicit switch: caller can invoke perform_context_switch after this
             if self.current_task == Some(task_id) {
                 return self.schedule().map(|_| ());
             }
@@ -447,7 +492,8 @@ impl Scheduler {
     /// Moves task from Blocked to Ready state.
     /// Returns the task ID of the task that was woken.
     pub fn wake_task(&mut self, task_id: TaskId) -> Result<TaskId, ScheduleError> {
-        if let Some(task) = self.get_task_mut(task_id) {
+        let band = {
+            let task = self.get_task_mut(task_id).ok_or(ScheduleError::TaskNotFound)?;
             if task.state != TaskState::Blocked {
                 return Err(ScheduleError::InvalidTaskState);
             }
@@ -455,11 +501,23 @@ impl Scheduler {
             task.state = TaskState::Ready;
             task.block_reason = None;
             task.reset_time_slice();
+            let b = priority_to_band(task.priority);
+            if !task.in_ready_queue {
+                task.in_ready_queue = true;
+                Some(b)
+            } else {
+                None
+            }
+        };
 
-            Ok(task_id)
-        } else {
-            Err(ScheduleError::TaskNotFound)
+        if let Some(b) = band {
+            self.ready_queues[b].push_back(task_id);
         }
+        if task_id != TaskId(0) {
+            self.runnable_count += 1;
+        }
+
+        Ok(task_id)
     }
 
     /// Wake all tasks blocked on a specific hardware IRQ.
@@ -471,7 +529,10 @@ impl Scheduler {
     ///
     /// Returns the number of tasks woken.
     pub fn wake_irq_waiters(&mut self, irq: u32) -> usize {
+        // Collect task IDs + bands to enqueue (avoids borrow overlap with self.ready_queues)
+        let mut to_enqueue: [(TaskId, usize); 32] = [(TaskId(0), 0); 32];
         let mut woken = 0;
+
         for slot in self.tasks.iter_mut() {
             if let Some(task) = slot {
                 if task.state == TaskState::Blocked {
@@ -480,12 +541,25 @@ impl Scheduler {
                             task.state = TaskState::Ready;
                             task.block_reason = None;
                             task.reset_time_slice();
+                            if !task.in_ready_queue {
+                                task.in_ready_queue = true;
+                                if woken < to_enqueue.len() {
+                                    to_enqueue[woken] = (task.id, priority_to_band(task.priority));
+                                }
+                            }
                             woken += 1;
                         }
                     }
                 }
             }
         }
+
+        // Enqueue woken tasks into ready queues
+        for i in 0..woken.min(to_enqueue.len()) {
+            let (tid, band) = to_enqueue[i];
+            self.ready_queues[band].push_back(tid);
+        }
+        self.runnable_count += woken;
         woken
     }
 
@@ -517,31 +591,21 @@ impl Scheduler {
         highest_priority_task.map(|(id, _)| id)
     }
 
-    /// Verify scheduler invariants
+    /// Verify scheduler invariants.
+    ///
+    /// Uses `current_task` directly instead of scanning all tasks — O(1).
     pub fn verify_invariants(&self) -> Result<(), &'static str> {
-        // Count running tasks - should be exactly 1
-        let running_count = self
-            .tasks
-            .iter()
-            .filter(|t| t.as_ref().map(|task| task.state == TaskState::Running).unwrap_or(false))
-            .count();
-
-        if running_count != 1 {
-            return Err("Scheduler invariant: must have exactly one running task");
-        }
-
-        // Verify current_task matches RunningTask
-        if let Some(task_id) = self.current_task {
-            if let Some(task) = self.get_task(task_id) {
-                if task.state != TaskState::Running {
-                    return Err("Scheduler invariant: current task not in Running state");
+        // Verify current_task exists and is Running
+        match self.current_task {
+            Some(task_id) => {
+                match self.get_task(task_id) {
+                    Some(task) if task.state == TaskState::Running => Ok(()),
+                    Some(_) => Err("Scheduler invariant: current task not in Running state"),
+                    None => Err("Scheduler invariant: current task id not found"),
                 }
-            } else {
-                return Err("Scheduler invariant: current task id not found");
             }
+            None => Err("Scheduler invariant: no current task set"),
         }
-
-        Ok(())
     }
 
     /// Perform real CPU context switch (jumps to next task, never returns)
@@ -598,7 +662,7 @@ impl Scheduler {
         }
 
         let idx = task_id.0 as usize;
-        if idx >= MAX_TASKS {
+        if idx >= self.tasks.len() {
             return Err(ScheduleError::TaskNotFound);
         }
 
@@ -608,6 +672,10 @@ impl Scheduler {
                     // Put it back — shouldn't remove Running tasks
                     self.tasks[idx] = Some(task);
                     return Err(ScheduleError::InvalidTaskState);
+                }
+                if task.state == TaskState::Ready {
+                    self.runnable_count = self.runnable_count.saturating_sub(1);
+                    // Stale queue entry cleaned lazily on pop
                 }
                 self.task_count -= 1;
                 Ok(task)
@@ -626,7 +694,7 @@ impl Scheduler {
         }
 
         let idx = task.id.0 as usize;
-        if idx >= MAX_TASKS {
+        if idx >= self.tasks.len() {
             return Err(ScheduleError::TaskNotFound);
         }
         if self.tasks[idx].is_some() {
@@ -634,8 +702,19 @@ impl Scheduler {
         }
 
         let task_id = task.id;
+        let is_ready = task.state == TaskState::Ready;
+        let band = priority_to_band(task.priority);
         self.tasks[idx] = Some(task);
         self.task_count += 1;
+
+        // Enqueue Ready tasks into the appropriate priority band
+        if is_ready {
+            if let Some(t) = self.tasks[idx].as_mut() {
+                t.in_ready_queue = true;
+            }
+            self.ready_queues[band].push_back(task_id);
+            self.runnable_count += 1;
+        }
         Ok(task_id)
     }
 
@@ -646,25 +725,24 @@ impl Scheduler {
 
     /// Count non-idle runnable tasks (Ready + Running, excluding idle task 0).
     ///
-    /// This is the load metric used by the load balancer: how many tasks are
-    /// competing for CPU time on this scheduler.
+    /// O(1) — maintained incrementally by state-transition methods.
     pub fn active_runnable_count(&self) -> usize {
-        self.tasks[1..].iter().filter(|t| {
-            t.as_ref().map(|task| {
-                task.state == TaskState::Ready || task.state == TaskState::Running
-            }).unwrap_or(false)
-        }).count()
+        self.runnable_count
     }
 
     /// Pick a Ready non-idle task suitable for migration.
     ///
-    /// Returns the first Ready task found (excluding idle task 0 and the
-    /// currently running task). Returns None if no migratable task exists.
+    /// Peeks into ready queues (highest band first) for a non-pinned task.
+    /// Does not dequeue — the load balancer will remove via `remove_task()`.
     pub fn pick_migratable_task(&self) -> Option<TaskId> {
-        for slot in 1..MAX_TASKS {
-            if let Some(task) = &self.tasks[slot] {
-                if task.state == TaskState::Ready {
-                    return Some(task.id);
+        for band in (0..NUM_PRIORITY_BANDS).rev() {
+            for tid in self.ready_queues[band].iter() {
+                let idx = tid.0 as usize;
+                if idx == 0 { continue; } // skip idle
+                if let Some(Some(task)) = self.tasks.get(idx) {
+                    if task.state == TaskState::Ready && !task.pinned {
+                        return Some(*tid);
+                    }
                 }
             }
         }
@@ -1087,6 +1165,32 @@ mod tests {
         sched.init().unwrap();
         let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
         sched.block_task(t1, BlockReason::IoWait(0)).unwrap();
+        assert_eq!(sched.pick_migratable_task(), None);
+    }
+
+    #[test]
+    fn test_pick_migratable_task_skips_pinned() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Pin t1 (IRQ affinity) — should be skipped
+        if let Some(task) = sched.get_task_mut_pub(t1) {
+            task.pinned = true;
+        }
+        // Should skip pinned t1 and pick t2
+        assert_eq!(sched.pick_migratable_task(), Some(t2));
+    }
+
+    #[test]
+    fn test_pick_migratable_task_none_when_all_pinned() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        if let Some(task) = sched.get_task_mut_pub(t1) {
+            task.pinned = true;
+        }
+        // Only non-idle task is pinned — nothing migratable
         assert_eq!(sched.pick_migratable_task(), None);
     }
 }

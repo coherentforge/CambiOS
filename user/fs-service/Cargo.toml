@@ -1,0 +1,11 @@
+[package]
+name = "arcos-fs-service"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "s"        # Size-optimized (small ELF)
+lto = true
+codegen-units = 1
+strip = false          # Keep symbols for kernel loader debug
+panic = "abort"

@@ -9,29 +9,37 @@ For the filesystem object model that depends on identity, see [filesystem.md](fi
 
 ## The Core Claim
 
-In ArcOS, **everything has a source**. A file is not bytes at a path. A file is a signed artifact with a creator and an owner. A message is not data in a queue. A message is an assertion made by an identity. A process is not a PID. A process runs under an identity that determines what capabilities it can hold.
+In ArcOS, everything is an object with an attributable source. Files are signed artifacts with a creator and an owner. Messages are assertions made by an identity. Processes run under an identity with tokenized capabilities. 
 
-Identity is not a feature layered on top of the system. It is a primitive that the system is built on.
+Identity is primitive and the system is built on that.
 
 ---
 
 ## What Identity Is Not
 
-Before defining what ArcOS identity is, it is worth being explicit about what it is not.
+Briefly:
 
-**It is not a username.** Usernames are human-readable labels assigned by a central authority (the OS, the service, the corporation). They can be reassigned, revoked, or duplicated across systems. ArcOS has no username system.
+**It is not a username.** A human-readable label assigned by a central authority can be reassigned, revoked, or duplicated across systems. ArcOS has no username system.
 
-**It is not a password.** Passwords are shared secrets. They must be stored somewhere (the server, the credential manager, your memory), and anything stored can be stolen, leaked, or forgotten. ArcOS has no password authentication.
+**It is not password based.** Passwords are shared secrets too easily stolen, leaked, or forgotten. ArcOS has no password authentication.
 
-**It is not an account.** Accounts are records in someone else's database. They are granted by an authority, can be suspended, and cease to exist when the service does. ArcOS identities exist independently of any service.
+**It is not an account.** Accounts exist in someone else's database, are granted by an authority, can be suspended, and cease to exist when the service does. 
 
-**It is not a certificate from a CA.** Certificate authorities are trusted third parties. They can be compromised, coerced, or simply shut down. ArcOS does not depend on any certificate authority.
+**It is not a certificate from a CA.** Certificate authorities can be compromised, coerced, or simply disappear. ArcOS does not delegate trust to any claimed authority.
+
+---
+
+## Authentication vs. Identity
+
+Daily Access vs. Identity Establishment
+
+Daily use should be frictionless. Password or otherwise traditionally secured workstation access will be integral to the UX, another topic outside the scope of this document.
 
 ---
 
 ## What Identity Is
 
-An ArcOS identity is a **cryptographic key pair** generated locally, controlled exclusively by its owner, verifiable by anyone, and dependent on no external authority for its existence. The identity layer is **algorithm-agnostic** — all key material, signatures, and verification are mediated through dynamic-sized fields so the system can transition between classical and post-quantum schemes without structural changes.
+An ArcOS identity is irrevocable. A **cryptographic key pair** is generated locally, controlled exclusively by its holder, verifiable by anyone, and dependent on no external authority for its existence. The identity layer is **algorithm-agnostic** — all key material, signatures, and verification are mediated through dynamic-sized fields so the system can transition between classical and post-quantum schemes without structural changes.
 
 ```
 Identity {
@@ -143,23 +151,15 @@ OwnershipTransfer {
 }
 ```
 
-This creates an auditable chain of custody. Every ownership change is a signed, content-addressed object that can be independently verified.
-
-Ownership transfer is the primitive that higher-level protocols build on — financial exchange, licensing, delegation. Those protocols belong in userspace, not in the identity layer. See [finex.md](finex.md) (forthcoming) for the negotiated exchange protocol.
+Every ownership change is a signed, content-addressed object. The auditable chain of custody can be independently verified. Ownership transfer is the primitive that higher-level protocols build on: financial exchange, licensing, delegation. Those are userspace protocols, and do not belong in the identity layer, listed here for context. See finex.md (forthcoming) for the negotiated exchange protocol.
 
 ### What This Enables
 
-**Provenance is structural, not metadata.** Attribution cannot be stripped because the creator field is immutable and ownership is verified by signature, not stored as an editable string.
+Provenance is structural. Because the creator field is immutable and ownership verified by signature, attribution cannot be stripped or forged. Forking any document produces a new object with the original hash in lineage - the chain of attribution is permanent and traceable without anyone's cooperation.
 
-**Sharing is replication of a signed object.** A file you push to a peer is the same object as the file on your disk. Not a copy with a back-reference. The same signed artifact, verifiable as yours regardless of where it lives.
+Sharing is replication of the same signed artifact, it's not a copy with back-referencing. A file you push to a peer is verifiable as yours regardless of where it lives. A sovereign cloud host stores objects as ciphertext they cannot read, forge, or credibly deny origins of.
 
-**Sovereign cloud hosting is trivially correct.** The host stores a signed, encrypted object. They cannot read it (encrypted with owner's key). They cannot forge it (signature verification fails without the private key). They cannot deny its origin (the signature is proof).
-
-**Forking produces a lineage chain.** If you edit someone else's document, you produce a new file with yourself as creator and the original's hash in the lineage field. Attribution traces through the chain. Creative lineage is structural, not a courtesy.
-
-**The append-only social log is just a file.** The SSB-inspired social protocol described in the networking architecture is not a separate concept — it is a sequence of signed file objects whose lineage chain is the log. The same identity primitive underlies both.
-
-**Commerce is native.** Ownership transfer over signed objects with auditable chains of custody means the identity layer provides the primitive for exchange — a userspace finex module builds negotiation, terms, and settlement on top.
+The append-only social log is not a separate concept. Each post is an ArcObject. Linking by lineage creates the social log. Commerce is not a separate layer either. The identity primitive provides for the exchange primitive; a userspace finex module builds negotiation, terms, and settlement on top. 
 
 ---
 
@@ -175,13 +175,13 @@ In a pure key-pair model, losing the private key means losing the identity. Ever
 
 The biological insight is this: **biometric data is not a private key, but it is a powerful entropy source for key derivation.**
 
-You do not sign with your retina. You derive a key *from* your biometric profile (or a committed representation of it) such that possession of a matching biological sample is required to regenerate the key. The key is not stored anywhere. It is derived from something you cannot lose because it is part of you.
+You do not sign with your retina. You derive a key *from* your biometric profile (or a committed representation of it) such that possession of a matching biological sample is required to regenerate the key. The key is not stored anywhere. We derive keys from things inherent to being alive.
 
 The primary biometric modalities, in order of preference:
 
-1. **Retinal scan** — the vascular pattern of the retina is unique to each individual, stable over a lifetime, and not casually observable or shared in normal social contexts. It is the strongest biometric anchor available.
-2. **Facial geometry** — 3D facial structure provides a secondary modality. Less stable than retinal patterns (changes with age, injury) but widely accessible via commodity hardware.
-3. **DNA/epigenetic profiling** (future fallback) — if society collectively decides that genomic identity is acceptable and the privacy infrastructure matures sufficiently, DNA-derived entropy could serve as an additional or alternative modality. This is deferred — not because it lacks technical merit, but because the social and ethical consensus does not yet exist.
+1. **Retinal scan** 
+2. **Facial geometry**
+3. **DNA/epigenetic profiling** (future fallback)
 
 ```
 private_key = KDF(biometric_commitment, device_context, social_attestation)
@@ -196,7 +196,7 @@ No single biometric is perfectly unique in isolation. Identical twins have nearl
 ```
 IdentityContext {
     biometric_commitment:  Option<BiometricHash>,    // committed biometric profile (ZKP)
-                                                     // retinal scan, facial geometry, ZKP, or DNA (future)
+                                                     // retinal scan, facial geometry, or DNA (future)
     device_entropy:        [u8; 32],                 // hardware-bound randomness
     social_attestation:    Option<Vec<Attestation>>, // quorum of trusted contacts
     temporal_proof:        Option<Timestamp>,        // continuity across time
@@ -207,8 +207,7 @@ The biometric modalities, in order of current preference:
 
 1. **Retinal scan** — vascular patterns are distinct even between identical twins (shaped by stochastic developmental processes, not genetics alone). Stable over a lifetime.
 2. **Facial geometry** — 3D facial structure diverges with age and life experience. Widely accessible via commodity hardware.
-3. **Zero-knowledge proof** — proof of possession of a biometric profile without revealing the profile itself. Functions as both a privacy layer *and* an independent biometric modality — the proof is the credential.
-4. **DNA/epigenetic profiling** (future) — deferred until social and ethical consensus exists. Slots into the context vector as an additional field when ready.
+3. **DNA/epigenetic profiling** (future) — deferred until social and ethical consensus exists. Slots into the context vector as an additional field when ready.
 
 Combined with device entropy (hardware-bound) and social attestation (community-bound), the context vector produces a unique identity even in adversarial edge cases.
 
@@ -229,8 +228,6 @@ ZKP: "I possess a biometric sample consistent with the committed profile,
 
 The commitment (a hash of the biometric profile) is public and stored with the identity. The raw biometric data never leaves the device. Verification is proof of biological consistency, not disclosure of biological data.
 
-This makes ZKP both a privacy mechanism and a biometric modality in its own right — the proof itself is the credential. You don't present a retinal scan to a verifier; you present a proof that you possess a scan matching your committed profile.
-
 This is an active research area (biometric ZKPs). ArcOS does not implement it now. But the interface is designed to accommodate it when it matures.
 
 ### Key Recovery via Biometric Context
@@ -248,7 +245,7 @@ Recovery protocol:
 6. File lineage chains updated with rotation record
 ```
 
-The private key is never stored. It is derived. The derivation inputs are things you are (biology) and people who know you (social graph). You cannot lose all of them simultaneously without losing your life and your entire social network.
+The private key is never stored. It is derived. The derivation inputs are things you are (biology) and people who know you (social graph). Losing them all would be tricky at best.
 
 ---
 
@@ -256,11 +253,11 @@ The private key is never stored. It is derived. The derivation inputs are things
 
 ### The Social Graph as Identity Infrastructure
 
-ArcOS's SSB-inspired social layer is not separate from identity — it is identity infrastructure. The append-only signed logs of your peers are a verifiable record of their interaction with you over time. A quorum of peers attesting to your identity is not a social nicety. It is a cryptographic recovery mechanism.
+ArcOS's SSB-inspired social layer is core identity infrastructure. The append-only signed logs of your peers are a verifiable record of their interaction with you over time. A quorum of peers attesting to your identity is more than a social nicety. It is a cryptographic recovery mechanism.
 
 This maps directly onto DAO (Decentralized Autonomous Organization) governance models: quorum decisions, on-log attestation, authority without central control. A recovery quorum functions like a DAO vote — a threshold of known parties must attest before a key rotation is authorized.
 
-The NAO framing — Natural Autonomous Organization — extends this toward biological and social systems as the model for decentralized governance. An identity system grounded in biological context and social attestation is a NAO-native design: authority derives from nature (biology) and community (social graph), not from institutions.
+The NAO framing — Networked/Natural Autonomous Organization — extends this toward biological and social systems as the model for decentralized governance. An identity system grounded in biological context and social attestation is a NAO-native design: authority derives from nature (biology) and community (social graph), not from institutions.
 
 ### Enrollment: The Cold-Start Problem
 
@@ -272,7 +269,11 @@ The proposed resolution is that enrollment is a **witnessed social act**, not a 
 - The enrollment record is signed by the witnesses and stored in their append-only logs
 - A new identity's provenance is traceable to the community that witnessed its creation
 
+A new identity's trust weight reflects the depth and history of its attestation graph — not a binary trusted/untrusted distinction, but a continuous signal that grows with genuine interaction.
+
 This mirrors how human identity has always worked at its most fundamental level: community recognition, not institutional registration. You exist as an identity because people who know you attest to your existence. ArcOS makes this explicit and cryptographic.
+
+Bootstrapping the system requires real human group interaction. 
 
 ---
 
@@ -334,7 +335,7 @@ fn sign(data: &[u8], keypair: &KeyPair) -> SignedField;   // dynamic-sized outpu
 fn verify(data: &[u8], sig: &SignedField, pubkey: &SignedField) -> bool;
 ```
 
-A `BootstrapIdentity` is generated at first boot from device entropy using **Ed25519** (classical mode). It is stored (as a key pair, not derived) in a fixed location. It is explicitly not the final identity model — it is a scaffold that makes the FS work while the real identity system is built above it. The bootstrap identity can be upgraded to Hybrid mode in Phase 1 via key rotation.
+A `BootstrapIdentity` is generated at first boot from device entropy using **Ed25519** (classical mode). It is stored (as a key pair, not derived) in a fixed location. It is explicitly not the final identity model — it is a scaffold that makes the FS work while the real identity system is built above it. The bootstrap identity can be upgraded to Hybrid mode in Phase 1.5 via key rotation.
 
 The interface it exposes is the permanent interface — algorithm-agnostic, dynamic-sized. The implementation behind it changes. The interface does not.
 
@@ -343,6 +344,10 @@ The interface it exposes is the permanent interface — algorithm-agnostic, dyna
 The key store becomes a proper userspace service, capability-gated. The raw private key leaves the bootstrap static and enters a managed service. Signing is a request to the service, not a direct call.
 
 Hardware-backed key storage (TPM) integrated where available.
+
+### Phase 1.5: Post-Quantum Upgrade
+
+ML-DSA-65 implementation integrated into the key store. New identities default to Hybrid mode (Ed25519 + ML-DSA-65). Existing Ed25519 identities can upgrade via key rotation — the rotation proof is dual-signed (old Ed25519 key signs the new Hybrid key, establishing continuity). File verification dispatches on the `SignatureAlgorithm` tag and validates accordingly.
 
 ### Phase 2: Biometric Commitment
 
@@ -353,10 +358,6 @@ This requires ZKP infrastructure and biometric scanning integration — future w
 ### Phase 3: Social Attestation and Recovery
 
 Social graph quorum recovery. The `social_attestation` field in IdentityContext becomes populated from the SSB-inspired social layer. Key rotation via quorum attestation is implemented. The cold-start enrollment protocol is defined.
-
-### Phase 1.5: Post-Quantum Upgrade
-
-ML-DSA-65 implementation integrated into the key store. New identities default to Hybrid mode (Ed25519 + ML-DSA-65). Existing Ed25519 identities can upgrade via key rotation — the rotation proof is dual-signed (old Ed25519 key signs the new Hybrid key, establishing continuity). File verification dispatches on the `SignatureAlgorithm` tag and validates accordingly.
 
 ### Phase 4: Full DID Integration
 
@@ -384,7 +385,14 @@ These must hold after every change to identity-related code:
 
 ## Open Questions
 
-These are known unknowns. They are not blockers for Phase 0, but they must be resolved before their respective phases.
+These are known unknowns.
+
+Phase 1.5 blockers:
+
+- **ML-DSA-65 `no_std` implementation** — Which Rust crate for ML-DSA-65 works in `no_std` bare-metal? `pqcrypto-dilithium` wraps C; `ml-dsa` (RustCrypto) is pure Rust but may need maturity review. Stack usage for lattice operations on a 256KB boot stack needs measurement.
+- **Hybrid signature verification cost** — Dual verification (Ed25519 + ML-DSA-65) on every file access approximately doubles CPU cost. Is per-file caching of verification results sufficient, or does hot-path file access need a session-scoped verification bypass?
+
+Further future unresolved:
 
 - **ZKP library selection** — Which ZKP system is appropriate for biometric proofs? Groth16, PLONK, STARKs? The choice affects proof size, verification time, and trusted setup requirements.
 - **Retinal scanning hardware** — What consumer-grade retinal scanning APIs exist? Integration with mobile/desktop hardware (e.g., IR camera arrays). Phase 2 may require partnership with hardware vendors or standardization efforts.
@@ -393,6 +401,5 @@ These are known unknowns. They are not blockers for Phase 0, but they must be re
 - **DNA as future modality** — Under what conditions (social consensus, privacy infrastructure maturity, regulatory clarity) would DNA/epigenetic profiling be activated? What governance mechanism decides this — per-user opt-in, community vote, or protocol-level upgrade?
 - **Process key scoping** — How is the process_capability_hash computed? What prevents a process from claiming a broader scope than it was granted?
 - **Rotation during social graph unavailability** — If a key is lost and the social graph is offline (no network), how is recovery handled? Is there a time-limited local recovery path?
-- **ML-DSA-65 `no_std` implementation** — Which Rust crate for ML-DSA-65 works in `no_std` bare-metal? `pqcrypto-dilithium` wraps C; `ml-dsa` (RustCrypto) is pure Rust but may need maturity review. Stack usage for lattice operations on a 256KB boot stack needs measurement.
-- **Hybrid signature verification cost** — Dual verification (Ed25519 + ML-DSA-65) on every file access approximately doubles CPU cost. Is per-file caching of verification results sufficient, or does hot-path file access need a session-scoped verification bypass?
 - **Post-quantum DID encoding** — `did:key` multicodec for ML-DSA-65 is not yet standardized. ArcOS may need to define a provisional encoding and migrate when the standard lands. What is the compatibility strategy?
+- **Portable identity sessions** — If identity is a Principal and not a machine, any ArcOS terminal becomes your terminal when you authenticate. What does a guest session on foreign hardware look like? What capabilities does it get? What happens to locally-cached objects on logout? This is a UX and security design question that sits at the intersection of the key store service and the consent model.

@@ -1,0 +1,296 @@
+# ArcOS Security Architecture
+
+This document maps the zero-trust enforcement points in the ArcOS microkernel — what's enforced, where, and how. It is a living reference. When an enforcement point moves from scaffolding to real, or a new layer is added, this document gets updated.
+
+For the foundational security *decision* (why capabilities, why zero-trust), see [ADR-000](docs/adr/000-zta-and-cap.md).
+For the enforcement *pipeline* decision (why three layers, why this ordering), see [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md).
+
+---
+
+## Enforcement Status Summary
+
+| Enforcement Point | Status | Blocks on Failure | Location |
+|---|---|---|---|
+| ELF entry point validation | **Enforced** | Binary not loaded | `loader/mod.rs:154` |
+| ELF kernel space rejection | **Enforced** | Binary not loaded | `loader/mod.rs:165` |
+| ELF W^X enforcement | **Enforced** | Binary not loaded | `loader/mod.rs:172` |
+| ELF segment overlap detection | **Enforced** | Binary not loaded | `loader/mod.rs:180` |
+| ELF memory limit | **Enforced** | Binary not loaded | `loader/mod.rs:192` |
+| Capability check (IPC send) | **Enforced** | `PermissionDenied` | `ipc/mod.rs:519` |
+| Capability check (IPC recv) | **Enforced** | `PermissionDenied` | `ipc/mod.rs:546` |
+| Capability delegation validation | **Enforced** | `AccessDenied` | `capability.rs:386` |
+| Interceptor: syscall pre-dispatch | **Scaffolding** | Always allows (hook wired, policy permissive) | `dispatcher.rs:179` |
+| Interceptor: IPC send policy | **Enforced** | `PermissionDenied` | `ipc/mod.rs:525` |
+| Interceptor: IPC recv policy | **Enforced** | `PermissionDenied` | `ipc/mod.rs:552` |
+| Interceptor: delegation policy | **Enforced** | `AccessDenied` | `capability.rs:379` |
+| Per-process syscall allowlists | **Not implemented** | — | — |
+| Runtime behavioral monitoring (AI) | **Not implemented** | — | — |
+| Capability revocation | **Not implemented** | — | — |
+| Capability audit logging | **Not implemented** | — | — |
+| Cryptographic capabilities | **Not implemented** | — | — |
+
+**Enforced** = real check that returns an error and blocks the operation on failure.
+**Scaffolding** = hook is wired into the call path but the default policy is permissive.
+**Not implemented** = no code exists yet.
+
+---
+
+## The Three-Layer Enforcement Pipeline
+
+Every IPC operation passes through three independent enforcement layers. Bypassing one does not bypass the others.
+
+```
+Process makes SYS_WRITE or SYS_READ syscall
+    |
+    v
++-----------------------------------------------+
+|  Layer 1: Interceptor pre-dispatch             |
+|  IpcInterceptor::on_syscall()                  |
+|  - Per-process syscall allowlist               |
+|  - Status: SCAFFOLDING (always allows)         |
+|  - File: syscalls/dispatcher.rs:179            |
++-----------------------------------------------+
+    |
+    v
++-----------------------------------------------+
+|  Layer 2: Capability verification              |
+|  CapabilityManager::verify_access()            |
+|  - Process must hold correct rights for        |
+|    the target endpoint (SEND or RECV)          |
+|  - Status: ENFORCED                            |
+|  - File: ipc/capability.rs:109-128             |
++-----------------------------------------------+
+    |
+    v
++-----------------------------------------------+
+|  Layer 3: Interceptor post-capability          |
+|  IpcInterceptor::on_send() / on_recv()         |
+|  - Endpoint bounds check                       |
+|  - Payload size limit (256 bytes)              |
+|  - No self-send                                |
+|  - Status: ENFORCED                            |
+|  - File: ipc/interceptor.rs:146-181            |
++-----------------------------------------------+
+    |
+    v
+  IPC operation proceeds
+```
+
+### Why Three Layers Instead of One
+
+A single capability check would be sufficient if capabilities were the only thing that could go wrong. They aren't:
+
+- **Layer 1** catches a compromised process that tries to invoke syscalls outside its profile. A serial driver that only needs `Write` and `WaitIrq` should never call `Allocate`. Even if it holds capabilities, it shouldn't be making that syscall at all.
+
+- **Layer 2** is the core access control. Capabilities are unforgeable kernel-managed tokens. If you don't hold the right token, the operation fails. This is the load-bearing wall.
+
+- **Layer 3** catches structural violations that capabilities don't address: oversized payloads (buffer overflow prevention), out-of-bounds endpoints (kernel memory safety), self-send (deadlock prevention). These are invariants about the *message*, not the *authority*.
+
+Each layer is independently useful. Together, they make exploitation require three independent bypasses.
+
+---
+
+## ELF Verification Gate
+
+The verifier runs before the loader allocates any resources. A binary that fails verification causes zero side effects — no frames allocated, no pages mapped, no process created.
+
+```
+Raw ELF binary bytes
+    |
+    v
+Parse ELF header + collect LOAD segments
+    |
+    v
++-----------------------------------------------+
+|  BinaryVerifier::verify()                      |
+|  1. Entry point falls within a LOAD segment    |
+|  2. All segments in user space (< canonical)   |
+|  3. No segment is both writable AND executable  |
+|  4. No overlapping segment virtual addresses    |
+|  5. Total memory footprint <= 256 MB            |
++-----------------------------------------------+
+    |                          |
+    | Allow                    | Deny(reason)
+    v                          v
+  Allocate frames,           Return error immediately.
+  create page table,         No resources consumed.
+  map segments,
+  create process.
+```
+
+### What the Verifier Prevents
+
+| Attack | Check | Result |
+|---|---|---|
+| Jump to kernel code | Entry point must be in a LOAD segment | `EntryPointOutOfRange` |
+| Map pages into kernel space | All segments < 0x0000_8000_0000_0000 | `SegmentInKernelSpace` |
+| Self-modifying shellcode | No page is W+X simultaneously | `WritableAndExecutable` |
+| Aliased memory confused deputy | Segments must not overlap | `OverlappingSegments` |
+| OOM denial of service | Total memory <= 256 MB | `ExcessiveMemory` |
+
+### Can a Binary Bypass the Verifier?
+
+No. `load_elf_process()` takes `verifier: &dyn BinaryVerifier` as a required parameter. The verify call is unconditional — there is no code path that skips it. The only way to load a binary without verification is to write a new loader that doesn't call the verifier, which requires modifying kernel code.
+
+---
+
+## Capability System
+
+### What a Capability Is
+
+A capability is a kernel-managed `(endpoint, rights)` pair. User-space cannot see, touch, or fabricate capabilities. They exist only inside the kernel's `CapabilityManager`.
+
+```
+Capability {
+    endpoint: EndpointId,     // Which IPC endpoint
+    rights: CapabilityRights, // What operations are allowed
+}
+
+CapabilityRights {
+    send: bool,      // Can send messages to this endpoint
+    receive: bool,   // Can receive messages from this endpoint
+    delegate: bool,  // Can grant this capability to another process
+}
+```
+
+### How Capabilities Are Created
+
+There are exactly two paths:
+
+1. **SYS_REGISTER_ENDPOINT** — A process registers a new IPC endpoint. The kernel grants the registering process full rights (send + recv + delegate) on that endpoint. This is the only way to create a new capability from nothing.
+
+2. **Delegation** — A process that holds a capability with `delegate = true` can grant a subset of its rights to another process. You cannot delegate more rights than you hold. You cannot delegate without the delegate right.
+
+### What Prevents Forgery
+
+- `ProcessCapabilities` is a private struct inside `capability.rs`. No public constructor.
+- Capabilities are stored in a kernel-managed table indexed by process ID. User-space has no pointer to this table.
+- The only mutations are through `CapabilityManager` methods, which enforce all invariants.
+- There is no syscall that says "give me a capability for endpoint X." The only paths are register (you create the endpoint) or delegate (someone who has it gives it to you).
+
+### Delegation Flow
+
+```
+Process A holds: Capability { endpoint: 5, rights: send + delegate }
+Process A delegates to Process B: rights = send (no delegate)
+
+Checks:
+  1. Interceptor: on_delegate(A, B, endpoint=5, rights=send) → Allow?
+  2. A has delegate right on endpoint 5? → Yes
+  3. A holds at least the rights being delegated (send)? → Yes
+  4. Grant to B: Capability { endpoint: 5, rights: send }
+
+Result: B can send to endpoint 5. B cannot delegate further.
+```
+
+### What Delegation Cannot Do
+
+- **Escalate rights.** A process with send-only cannot delegate recv. A process without delegate cannot delegate at all.
+- **Self-delegate.** The interceptor rejects source == target.
+- **Exceed 32 capabilities per process.** The per-process table has a hard limit.
+
+---
+
+## Interceptor Details
+
+The `IpcInterceptor` trait defines four hooks. The `DefaultInterceptor` provides baseline policy. Custom interceptors can be substituted for stricter enforcement.
+
+### Hook: on_syscall (Layer 1)
+
+**Current status: Scaffolding.** Always returns `Allow`.
+
+This hook fires before the syscall dispatcher routes to a handler. It receives the caller's process ID and the syscall number. The intended use is per-process syscall allowlists:
+
+```
+Serial driver profile: [Write, WaitIrq, Yield, GetPid]
+Filesystem driver profile: [Read, Write, Allocate, Free, RegisterEndpoint, Yield]
+```
+
+A process that attempts a syscall outside its profile gets `PermissionDenied` before any work happens. The hook is wired at `dispatcher.rs:179` — only the policy logic is missing.
+
+### Hook: on_send (Layer 3)
+
+**Current status: Enforced.** Three checks:
+
+1. Endpoint ID < MAX_ENDPOINTS (32) — prevents out-of-bounds access
+2. Payload length <= 256 bytes — prevents buffer overflow
+3. Sender process ID != endpoint ID — prevents self-send deadlock
+
+### Hook: on_recv (Layer 3)
+
+**Current status: Enforced.** One check:
+
+1. Endpoint ID < MAX_ENDPOINTS (32) — prevents out-of-bounds access
+
+### Hook: on_delegate (Layer 3)
+
+**Current status: Enforced.** Two checks:
+
+1. Endpoint ID < MAX_ENDPOINTS (32) — prevents out-of-bounds access
+2. Source process ID != target process ID — prevents self-delegation
+
+### Substituting a Custom Interceptor
+
+The interceptor is a trait object (`Box<dyn IpcInterceptor>`). At boot, `main.rs` installs the `DefaultInterceptor`. A production deployment could install a stricter interceptor that:
+
+- Reads per-process syscall profiles from a policy table
+- Logs all capability exercises to an audit buffer
+- Connects to the AI security engine for behavioral analysis
+- Enforces rate limits on IPC send frequency
+
+The swap is a single line: `ipc.set_interceptor(Box::new(MyInterceptor::new()))`.
+
+---
+
+## Gap Analysis
+
+### What's Needed for Full Zero-Trust
+
+| Gap | Impact | Difficulty | Where It Plugs In |
+|---|---|---|---|
+| **Per-process syscall allowlists** | A compromised process can invoke any syscall it has arguments for | Medium | `on_syscall` hook — policy logic, not plumbing |
+| **Capability revocation** | A capability granted in error cannot be taken back | Medium | `CapabilityManager` needs `revoke()` method + API to trigger it |
+| **Audit logging** | No forensic trail of capability exercises | Low | Interceptor hooks already see every operation; need a log sink |
+| **Runtime behavioral AI** | No detection of anomalous capability usage patterns | High | Interceptor hooks are the integration points; needs AI inference engine |
+| **Cryptographic capabilities** | Capabilities don't work across networked ArcOS nodes | High | Replace kernel tables with signed tokens (HMAC or Ed25519) |
+| **Capability expiry** | Granted capabilities last forever | Low | Add TTL field to `Capability`, check in `verify_access()` |
+| **IPC rate limiting** | No defense against IPC flooding DoS | Medium | `on_send` hook — track send count per process per interval |
+
+### Priority Order
+
+1. **Per-process syscall allowlists** — Highest impact for lowest effort. The hook exists. Just needs policy tables.
+2. **Audit logging** — Every security incident investigation starts with "what happened?" Need the log before it matters.
+3. **Capability revocation** — Required before any real multi-service deployment. A driver update needs to revoke the old driver's capabilities.
+4. **IPC rate limiting** — Defense against the most obvious DoS vector.
+5. **Runtime behavioral AI** — The big win, but requires the AI inference engine to exist first.
+6. **Capability expiry** — Nice-to-have; most useful for temporary delegations.
+7. **Cryptographic capabilities** — Only matters when ArcOS nodes communicate. Network stack comes first.
+
+---
+
+## Test Coverage
+
+| Component | Tests | What They Cover |
+|---|---|---|
+| Capability manager | 56 | Grant, revoke, verify, delegation, escalation prevention, capacity limits |
+| IPC interceptor | 11 | Payload validation, bounds checks, self-send, delegation policy, syscall filtering |
+| ELF verifier | 10 | W^X, kernel space rejection, overlapping segments, memory limits, entry point validation |
+| IPC + capability integration | via QEMU | SYS_WRITE and SYS_READ exercise the full three-layer pipeline end-to-end |
+
+---
+
+## Architectural Invariants
+
+These properties must hold after every change to security-related code:
+
+1. **No binary runs without verification.** Every path from raw bytes to executing code passes through `BinaryVerifier::verify()`.
+
+2. **No IPC without capability.** Every `send_message` and `recv_message` passes through `verify_access()`. There is no "internal" send that skips the check.
+
+3. **No delegation without authorization.** `can_delegate()` enforces that the source holds the delegate right and is not escalating beyond its own rights.
+
+4. **Interceptor is not optional.** The interceptor is set at boot and cannot be removed at runtime. Every IPC operation passes through it. The interceptor and capability check are independent — bypassing one does not bypass the other.
+
+5. **Verification before allocation.** The ELF verifier runs before any frame allocation, page mapping, or process creation. A denied binary consumes zero resources.
+
+6. **Deny by default.** A new process holds zero capabilities. It cannot do anything until explicitly granted access.
