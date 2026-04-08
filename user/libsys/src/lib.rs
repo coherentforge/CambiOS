@@ -31,16 +31,23 @@ const SYS_OBJ_PUT_SIGNED: u64 = 19;
 fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let ret: i64;
     // SAFETY: Invokes the kernel syscall handler via the SYSCALL instruction.
-    // The kernel validates all arguments. rcx and r11 are clobbered by the
-    // CPU (saved RIP and RFLAGS respectively).
+    // The kernel validates all arguments.
+    //
+    // Clobbers: The CPU clobbers RCX (saved RIP) and R11 (saved RFLAGS).
+    // The kernel syscall stub does NOT restore RDI, RSI, RDX, R8, R9, R10
+    // (they are caller-saved in the SysV ABI and discarded when the
+    // SyscallFrame is cleaned up with `add rsp, 56`).
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") num as i64 => ret,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
+            inlateout("rdi") arg1 => _,
+            inlateout("rsi") arg2 => _,
+            inlateout("rdx") arg3 => _,
             lateout("rcx") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
             lateout("r11") _,
             options(nostack),
         );
@@ -51,15 +58,19 @@ fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 #[inline(always)]
 fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     let ret: i64;
-    // SAFETY: Same as syscall_raw3. rcx carries the 4th argument in our ABI.
+    // SAFETY: Same as syscall_raw3. RCX carries the 4th argument in our ABI,
+    // but is still clobbered on return (CPU writes saved RIP there).
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") num as i64 => ret,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
+            inlateout("rdi") arg1 => _,
+            inlateout("rsi") arg2 => _,
+            inlateout("rdx") arg3 => _,
             inlateout("rcx") arg4 => _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
             lateout("r11") _,
             options(nostack),
         );

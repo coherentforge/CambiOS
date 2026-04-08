@@ -125,7 +125,7 @@ impl NetDriver {
             return None;
         }
         // Use smaller of device's max and our max
-        let rx_qsize = core::cmp::min(rx_qsize, virtqueue::MAX_QUEUE_SIZE);
+        let rx_qsize = core::cmp::min(rx_qsize, 32); // Limit to avoid stack overflow
 
         let rx_queue = VirtQueue::new(rx_qsize)?;
         transport.set_queue_pfn(rx_queue.pfn());
@@ -138,7 +138,7 @@ impl NetDriver {
             sys::print(b"[NET] TX queue size is 0\n");
             return None;
         }
-        let tx_qsize = core::cmp::min(tx_qsize, virtqueue::MAX_QUEUE_SIZE);
+        let tx_qsize = core::cmp::min(tx_qsize, 32); // Limit to avoid stack overflow
 
         let tx_queue = VirtQueue::new(tx_qsize)?;
         transport.set_queue_pfn(tx_queue.pfn());
@@ -389,25 +389,20 @@ pub extern "C" fn _start() -> ! {
 
     sys::print(b"[NET] Found virtio-net PCI device\n");
 
-    // Step 2: Find the I/O BAR (BAR 0 for legacy virtio)
-    // Try all BARs — the I/O BAR might not be BAR 0 on all configurations
+    // Step 2: Find the I/O BAR for legacy virtio transport.
+    // The BAR address for I/O ports is always < 64K on x86.
     let mut io_base: u16 = 0;
     for b in 0..6 {
-        if dev.bars[b].is_io && dev.bars[b].addr != 0 {
-            io_base = dev.bars[b].addr as u16;
+        let addr = dev.bars[b].addr;
+        if addr != 0 && addr < 0x10000 {
+            io_base = addr as u16;
             break;
         }
     }
     if io_base == 0 {
-        // Fallback: check if BAR0 looks like an I/O port (addr < 0x10000)
-        if dev.bars[0].addr != 0 && dev.bars[0].addr < 0x10000 {
-            sys::print(b"[NET] BAR 0 appears to be I/O (addr < 64K), using it\n");
-            io_base = dev.bars[0].addr as u16;
-        } else {
-            sys::print(b"[NET] No I/O BAR found\n");
-            sys::register_endpoint(NET_ENDPOINT);
-            no_device_loop();
-        }
+        sys::print(b"[NET] No I/O BAR found\n");
+        sys::register_endpoint(NET_ENDPOINT);
+        no_device_loop();
     }
 
     // Step 3: Initialize the virtio device + queues

@@ -77,8 +77,10 @@ fn used_ring_offset(queue_size: u16) -> usize {
     (desc_avail_bytes + 4095) & !4095
 }
 
-/// Maximum queue size we support. Keeps the pending array on the stack.
-pub const MAX_QUEUE_SIZE: u16 = 256;
+/// Maximum queue size we support. Kept small (32) to fit pending buffer
+/// tracking on the user stack without a heap allocator. Two VirtQueues
+/// with 32-entry pending arrays = 2 × 32 × 32 bytes = 2 KB.
+pub const MAX_QUEUE_SIZE: u16 = 32;
 
 /// A single virtqueue with hostile-device validation.
 pub struct VirtQueue {
