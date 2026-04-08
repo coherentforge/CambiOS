@@ -826,3 +826,25 @@ pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
         );
     }
 }
+
+/// Voluntary context switch (AArch64 stub).
+///
+/// AArch64 user-space syscalls are not yet fully implemented, so this is
+/// a placeholder that halts until preempted. The x86_64 implementation
+/// uses a proper synthetic SavedContext + scheduler call.
+///
+/// # Safety
+/// Must be called on the kernel stack. Scheduler lock must not be held.
+pub unsafe fn yield_save_and_switch() {
+    // TODO: Implement AArch64 voluntary context switch with proper
+    // SavedContext + scheduler integration (requires SVC kernel-stack
+    // entry rewrite, mirroring x86_64 changes).
+    // SAFETY: WFI is safe to execute at EL1 with interrupts unmasked.
+    unsafe {
+        core::arch::asm!(
+            "msr daifclr, #2",  // enable interrupts
+            "wfi",              // wait for timer to preempt us
+            options(nomem, nostack),
+        );
+    }
+}

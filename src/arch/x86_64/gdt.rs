@@ -225,10 +225,11 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
     }
 }
 
-/// Update the kernel stack pointer (RSP0) in the current CPU's TSS.
+/// Update the kernel stack pointer (RSP0) in the current CPU's TSS and PerCpu.
 ///
-/// Called during context switches to ensure that interrupts and `syscall`
-/// from ring 3 always land on the current task's kernel stack.
+/// Called during context switches to ensure that interrupts from ring 3 land
+/// on the current task's kernel stack (via TSS.RSP0) and that SYSCALL entry
+/// can switch to the kernel stack (via PerCpu.kernel_rsp0).
 ///
 /// # Safety
 /// Must be called with interrupts disabled (e.g., from within an ISR or
@@ -243,6 +244,12 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
     unsafe {
         let tss_ptr = &raw mut CPU_TSS[cpu_idx];
         (*tss_ptr).rsp0 = rsp0;
+    }
+    // Also update PerCpu.kernel_rsp0 — read by syscall_entry (gs:[24]) to
+    // switch RSP from user stack to kernel stack on SYSCALL.
+    // SAFETY: Called with interrupts disabled; only this CPU's PerCpu is written.
+    unsafe {
+        super::percpu::current_percpu_mut().set_kernel_rsp0(rsp0);
     }
 }
 

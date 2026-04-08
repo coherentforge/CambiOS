@@ -25,6 +25,13 @@ pub const MAX_CPUS: usize = 256;
 /// IA32_GS_BASE MSR — holds the base address for GS segment reads
 const IA32_GS_BASE: u32 = 0xC000_0101;
 
+// Assembly-visible field offsets (must match #[repr(C)] layout above).
+// Used by `syscall_entry` to access kernel_rsp0 and user_rsp_scratch via GS.
+/// GS-relative offset of `PerCpu.kernel_rsp0`
+pub const PERCPU_KERNEL_RSP0: usize = 24;
+/// GS-relative offset of `PerCpu.user_rsp_scratch`
+pub const PERCPU_USER_RSP_SCRATCH: usize = 32;
+
 // ============================================================================
 // PerCpu struct
 // ============================================================================
@@ -43,6 +50,8 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 /// |  12    | apic_id          |  4   |
 /// |  16    | current_task_id  |  4   |
 /// |  20    | interrupt_depth  |  4   |
+/// |  24    | kernel_rsp0      |  8   |
+/// |  32    | user_rsp_scratch |  8   |
 #[repr(C)]
 pub struct PerCpu {
     /// Pointer to self — enables `mov rax, gs:[0]` to get the PerCpu pointer.
@@ -56,6 +65,14 @@ pub struct PerCpu {
     current_task_id: u32,
     /// Interrupt nesting depth (0 = thread context, >0 = ISR context)
     interrupt_depth: u32,
+    /// Kernel stack pointer for the current task. Read by `syscall_entry` to
+    /// switch RSP from user to kernel stack on SYSCALL. Updated by
+    /// `set_kernel_stack()` on every context switch.
+    kernel_rsp0: u64,
+    /// Scratch space for saving user RSP during SYSCALL entry. The stub writes
+    /// `mov gs:[PERCPU_USER_RSP_SCRATCH], rsp` before switching to the kernel
+    /// stack, then pushes the saved value onto the kernel stack.
+    user_rsp_scratch: u64,
 }
 
 // SAFETY: PerCpu is only accessed by its owning CPU (via GS base), so there
@@ -74,6 +91,8 @@ impl PerCpu {
             apic_id: 0,
             current_task_id: 0,
             interrupt_depth: 0,
+            kernel_rsp0: 0,
+            user_rsp_scratch: 0,
         }
     }
 
@@ -124,6 +143,15 @@ impl PerCpu {
     #[inline]
     pub fn in_interrupt(&self) -> bool {
         self.interrupt_depth > 0
+    }
+
+    /// Set the kernel stack pointer for SYSCALL entry.
+    ///
+    /// Called by `set_kernel_stack()` on every context switch so that
+    /// `syscall_entry` can read `gs:[PERCPU_KERNEL_RSP0]` to switch RSP.
+    #[inline]
+    pub fn set_kernel_rsp0(&mut self, rsp0: u64) {
+        self.kernel_rsp0 = rsp0;
     }
 }
 
@@ -266,13 +294,13 @@ mod tests {
     #[test]
     fn test_percpu_size_and_alignment() {
         // PerCpu must be repr(C) with known layout
-        assert_eq!(mem::size_of::<PerCpu>(), 24); // 8 + 4 + 4 + 4 + 4
+        assert_eq!(mem::size_of::<PerCpu>(), 40); // 8 + 4 + 4 + 4 + 4 + 8 + 8
         assert!(mem::align_of::<PerCpu>() >= 8); // pointer alignment
     }
 
     #[test]
     fn test_percpu_field_offsets() {
-        // Verify offsets match the documented layout table
+        // Verify offsets match the documented layout table and assembly constants
         let p = PerCpu::new();
         let base = &p as *const _ as usize;
         assert_eq!(&p.self_ptr as *const _ as usize - base, 0);
@@ -280,6 +308,8 @@ mod tests {
         assert_eq!(&p.apic_id as *const _ as usize - base, 12);
         assert_eq!(&p.current_task_id as *const _ as usize - base, 16);
         assert_eq!(&p.interrupt_depth as *const _ as usize - base, 20);
+        assert_eq!(&p.kernel_rsp0 as *const _ as usize - base, PERCPU_KERNEL_RSP0);
+        assert_eq!(&p.user_rsp_scratch as *const _ as usize - base, PERCPU_USER_RSP_SCRATCH);
     }
 
     #[test]
@@ -290,6 +320,8 @@ mod tests {
         assert_eq!(p.apic_id, 0);
         assert_eq!(p.current_task_id, 0);
         assert_eq!(p.interrupt_depth, 0);
+        assert_eq!(p.kernel_rsp0, 0);
+        assert_eq!(p.user_rsp_scratch, 0);
     }
 
     #[test]
@@ -323,9 +355,17 @@ mod tests {
     }
 
     #[test]
+    fn test_percpu_kernel_rsp0() {
+        let mut p = PerCpu::new();
+        assert_eq!(p.kernel_rsp0, 0);
+        p.set_kernel_rsp0(0xFFFF_8000_0010_0000);
+        assert_eq!(p.kernel_rsp0, 0xFFFF_8000_0010_0000);
+    }
+
+    #[test]
     fn test_max_cpus_reasonable() {
         // Ensure MAX_CPUS doesn't cause unreasonable memory usage
-        // 256 CPUs * 24 bytes = 6144 bytes — well within BSS budget
+        // 256 CPUs * 40 bytes = 10240 bytes — well within BSS budget
         assert!(MAX_CPUS * mem::size_of::<PerCpu>() < 65536);
     }
 

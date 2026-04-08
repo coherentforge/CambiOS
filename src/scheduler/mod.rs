@@ -78,6 +78,44 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
     }
 }
 
+/// Voluntary yield handler: save context and schedule next task.
+///
+/// Unlike `on_timer_isr`, this:
+/// - Uses regular lock (not try_lock) — caller must not hold the scheduler lock
+/// - Always saves current_rsp (even for Blocked/Terminated tasks)
+/// - Does not tick the timer or wake IRQ waiters
+/// - Does not send EOI (no hardware interrupt to acknowledge)
+///
+/// Called from `yield_save_and_switch` (assembly trampoline) with interrupts
+/// disabled. The caller built a synthetic SavedContext on the kernel stack;
+/// current_rsp points to it.
+pub fn on_voluntary_yield(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
+    let mut sched_guard = crate::local_scheduler().lock();
+    if let Some(sched) = sched_guard.as_mut() {
+        let new_rsp = sched.voluntary_yield(current_rsp);
+
+        if new_rsp != current_rsp {
+            // Context switch occurred — collect platform hint
+            let hint = sched.current_task_ref().map(|task| {
+                let page_table_root = if task.cr3 != 0 {
+                    task.cr3
+                } else {
+                    crate::kernel_cr3()
+                };
+                ContextSwitchHint {
+                    kernel_stack_top: task.kernel_stack_top,
+                    page_table_root,
+                }
+            });
+            (new_rsp, hint)
+        } else {
+            (current_rsp, None)
+        }
+    } else {
+        (current_rsp, None)
+    }
+}
+
 /// Maximum number of tasks in the system.
 ///
 /// Raised from 32 to 256 to support real multi-core workloads. The task array
@@ -430,6 +468,44 @@ impl Scheduler {
                 }
             }
             Err(_) => current_rsp, // Schedule failed, keep current
+        }
+    }
+
+    /// Voluntary context switch — called from `on_voluntary_yield`.
+    ///
+    /// Always saves `current_rsp` to `task.saved_rsp`, regardless of task state.
+    /// This is critical: the caller built a synthetic SavedContext on the kernel
+    /// stack that must be preserved. Unlike `isr_tick_and_schedule`, which skips
+    /// Blocked tasks (to preserve earlier synthetic contexts), this function
+    /// always overwrites because the caller IS the one building the context.
+    ///
+    /// Unconditionally calls `schedule()` to select the next task.
+    pub fn voluntary_yield(&mut self, current_rsp: u64) -> u64 {
+        // Always save RSP — the caller built a SavedContext that must be
+        // preserved for correct resumption regardless of task state.
+        if let Some(task_id) = self.current_task {
+            if let Some(task) = self.get_task_mut(task_id) {
+                task.saved_rsp = current_rsp;
+            }
+        }
+
+        // Select next task
+        match self.schedule() {
+            Ok(next_task) => {
+                if let Some(task) = self.get_task(next_task) {
+                    let rsp = task.saved_rsp;
+                    if rsp == 0 {
+                        crate::println!(
+                            "\n!!! ZERO RSP in voluntary_yield: task {} (state={:?}) !!!",
+                            next_task.0, task.state
+                        );
+                    }
+                    rsp
+                } else {
+                    current_rsp
+                }
+            }
+            Err(_) => current_rsp, // No other task to run — resume current
         }
     }
 

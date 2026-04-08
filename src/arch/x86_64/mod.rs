@@ -406,12 +406,8 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
 
 /// Halt with interrupts enabled until preempted by the timer ISR.
 ///
-/// Switches to the given kernel stack before enabling interrupts, because
-/// the SYSCALL handler runs on the user stack (SYSCALL doesn't switch RSP).
-/// If the timer ISR's CR3 switch ran on the user stack, the page table
-/// change would remap the stack to a different physical page (the new task's
-/// zeroed user stack), corrupting all local variables. The kernel stack is
-/// in HHDM space, which is mapped identically in all page tables.
+/// Used by AArch64 SVC handler for SYS_EXIT (x86_64 now uses
+/// `yield_save_and_switch` instead). Kept for AArch64 compatibility.
 ///
 /// # Safety
 /// `kernel_stack_top` must be a valid, mapped kernel stack address (HHDM).
@@ -435,4 +431,165 @@ pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
             options(noreturn),
         );
     }
+}
+
+// ============================================================================
+// Voluntary context switch — yield_save_and_switch
+// ============================================================================
+//
+// Assembly trampoline for voluntary context switching from syscall handlers.
+//
+// Builds a synthetic SavedContext (identical layout to the timer ISR's) on the
+// current kernel stack, calls yield_inner (Rust) to save it and schedule the
+// next task, then restores from the (potentially different) SavedContext and
+// does iretq.
+//
+// When the yielding task is later re-scheduled (by the timer ISR or another
+// yield_save_and_switch), iretq goes to .Lyield_resume, which re-enables
+// interrupts and returns to the syscall handler that called us.
+//
+// Stack layout after the push sequence (SavedContext, low → high):
+//   [rsp+0]   r15          ← RSP points here (arg to yield_inner)
+//   [rsp+8]   r14
+//   ...
+//   [rsp+112] rax
+//   [rsp+120] rip          = .Lyield_resume
+//   [rsp+128] cs           = current CS (KERNEL_CS)
+//   [rsp+136] rflags       (IF=0, saved under cli)
+//   [rsp+144] rsp          = entry RSP (caller's stack with return address)
+//   [rsp+152] ss           = current SS (KERNEL_SS)
+
+extern "C" {
+    /// Voluntary context switch.
+    ///
+    /// Saves all registers as a SavedContext on the kernel stack, calls the
+    /// scheduler to pick the next task, and restores from the next task's
+    /// SavedContext via iretq. When the calling task is later re-scheduled,
+    /// this function returns normally to its caller.
+    ///
+    /// # Safety
+    /// Must be called on the kernel stack (not user stack). The caller must
+    /// not hold the scheduler lock. Interrupts may be enabled or disabled on
+    /// entry — they are disabled during the save/switch and re-enabled at
+    /// resume.
+    pub fn yield_save_and_switch();
+}
+
+core::arch::global_asm!(
+    ".global yield_save_and_switch",
+    "yield_save_and_switch:",
+
+    // ---- Disable interrupts for atomic save ----
+    "cli",
+
+    // ---- Build synthetic iretq frame (same layout as CPU interrupt entry) ----
+    // Order: SS, RSP, RFLAGS, CS, RIP (high address → low address on stack)
+    "mov rax, ss",
+    "push rax",                 // SS
+
+    "lea rax, [rsp + 8]",      // Entry RSP (before SS push; points to return addr)
+    "push rax",                 // RSP
+
+    "pushfq",                   // RFLAGS (IF=0 since cli)
+
+    "mov rax, cs",
+    "push rax",                 // CS (KERNEL_CS)
+
+    "lea rax, [rip + .Lyield_resume]",
+    "push rax",                 // RIP = .Lyield_resume
+
+    // ---- Push all GPRs (same order as timer_isr_stub) ----
+    // RAX was clobbered above — its value is irrelevant (caller-saved).
+    "push rax",                 // RAX (clobbered, but SavedContext needs the slot)
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+
+    // ---- Call Rust scheduler ----
+    // RSP → SavedContext (identical layout to timer ISR's)
+    "mov rdi, rsp",
+    "cld",
+    "call yield_inner",
+    // RAX = new_rsp (same or different task's SavedContext)
+
+    // ---- Restore from (potentially new) SavedContext ----
+    "mov rsp, rax",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "iretq",
+
+    // ---- Resume point for yielded tasks ----
+    // iretq restores: RIP=here, CS=KERNEL_CS, RFLAGS(IF=0), RSP, SS.
+    // Re-enable interrupts (handler was running with sti before yield).
+    ".Lyield_resume:",
+    "sti",
+    "ret",                      // Return to caller of yield_save_and_switch
+);
+
+/// Rust handler for voluntary context switch.
+///
+/// Called from `yield_save_and_switch` assembly. Receives the current task's
+/// SavedContext RSP, saves it, calls schedule(), and returns the next task's
+/// SavedContext RSP. Performs platform-specific post-switch (TSS, CR3).
+///
+/// Does NOT send APIC EOI — this is a voluntary switch, not a hardware interrupt.
+#[unsafe(no_mangle)]
+extern "C" fn yield_inner(current_rsp: u64) -> u64 {
+    let (new_rsp, hint) = crate::scheduler::on_voluntary_yield(current_rsp);
+
+    // Platform-specific post-switch: update TSS.RSP0 and CR3
+    // (same as timer_isr_inner, minus EOI)
+    if let Some(hint) = hint {
+        if hint.kernel_stack_top != 0 {
+            // SAFETY: Called with interrupts disabled (cli in trampoline).
+            // hint.kernel_stack_top is the next task's kernel stack top.
+            unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
+        }
+        if hint.page_table_root != 0 {
+            unsafe {
+                // SAFETY: Reading CR3 is always safe at ring 0.
+                let current_cr3: u64;
+                core::arch::asm!(
+                    "mov {}, cr3",
+                    out(reg) current_cr3,
+                    options(nostack, nomem),
+                );
+                if current_cr3 != hint.page_table_root {
+                    // SAFETY: hint.page_table_root is a valid PML4 physical address
+                    // from create_process_page_table(). Kernel half is shared.
+                    core::arch::asm!(
+                        "mov cr3, {}",
+                        in(reg) hint.page_table_root,
+                        options(nostack, preserves_flags),
+                    );
+                }
+            }
+        }
+    }
+
+    new_rsp
 }

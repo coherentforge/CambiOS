@@ -222,27 +222,33 @@ impl SyscallDispatcher {
 
     /// SYS_EXIT: Terminate the calling task.
     ///
-    /// Marks the task as Terminated in the scheduler. The scheduler will
-    /// skip terminated tasks and the next timer tick will context-switch
-    /// to a ready task.
+    /// Marks the task as Terminated, then yields to the scheduler via
+    /// `yield_save_and_switch`. The Terminated task is never re-scheduled,
+    /// so the yield effectively does not return.
     fn handle_exit(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let exit_code = args.arg1_u32();
 
         // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held
-        let mut sched_guard = crate::local_scheduler().lock();
-        if let Some(sched) = sched_guard.as_mut() {
-            if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
-                task.state = crate::scheduler::TaskState::Terminated;
+        {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_mut() {
+                if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
+                    task.state = crate::scheduler::TaskState::Terminated;
+                }
             }
         }
-        drop(sched_guard);
 
         crate::println!(
             "  [Exit] pid={} task={} code={}",
             ctx.process_id.0, ctx.task_id.0, exit_code
         );
 
-        Ok(exit_code as u64)
+        // Yield to next task. Terminated tasks are never re-scheduled,
+        // so this loop effectively does not return.
+        // SAFETY: We are on the kernel stack, scheduler lock is not held.
+        loop {
+            unsafe { crate::arch::yield_save_and_switch(); }
+        }
     }
 
     // ========================================================================
@@ -533,20 +539,15 @@ impl SyscallDispatcher {
 
     /// SYS_YIELD: Voluntarily yield CPU to the scheduler.
     ///
-    /// Moves the calling task from Running → Ready so the scheduler can
-    /// pick a different task on the next tick. Returns immediately; the
-    /// actual context switch happens at the next timer ISR.
-    fn handle_yield(_args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        let mut sched_guard = crate::local_scheduler().lock();
-        if let Some(sched) = sched_guard.as_mut() {
-            if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
-                if task.state == crate::scheduler::TaskState::Running {
-                    task.state = crate::scheduler::TaskState::Ready;
-                    task.time_remaining = 0; // Force reschedule on next tick
-                }
-            }
-        }
-
+    /// Performs an immediate voluntary context switch via `yield_save_and_switch`.
+    /// The scheduler moves the Running task to Ready, picks the next task, and
+    /// switches. When this task is re-scheduled, execution resumes here and
+    /// returns Ok(0) to user space.
+    fn handle_yield(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        // Don't change task state — yield_save_and_switch calls schedule(),
+        // which correctly moves Running → Ready and re-enqueues.
+        // SAFETY: We are on the kernel stack, scheduler lock is not held.
+        unsafe { crate::arch::yield_save_and_switch(); }
         Ok(0)
     }
 
@@ -555,7 +556,8 @@ impl SyscallDispatcher {
     /// Args: arg1 = irq_number
     ///
     /// Registers the task as the handler for the given IRQ (if not already
-    /// registered) and blocks the task until the IRQ fires.
+    /// registered), blocks until the IRQ fires, then returns. Uses the
+    /// restart pattern: block → yield → return on wake.
     fn handle_wait_irq(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let irq_num = args.arg1_u32();
 
@@ -563,52 +565,64 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
+        // Register this task as the IRQ handler and pin to this CPU (one-time setup).
         // Lock ordering: PER_CPU_SCHEDULER(1) → INTERRUPT_ROUTER(7)
-        let mut sched_guard = crate::local_scheduler().lock();
-        let mut router_guard = crate::INTERRUPT_ROUTER.lock();
+        {
+            let mut sched_guard = crate::local_scheduler().lock();
+            let mut router_guard = crate::INTERRUPT_ROUTER.lock();
 
-        // Register this task as the IRQ handler (ignore if already registered)
-        let irq = crate::interrupts::routing::IrqNumber(irq_num as u8);
-        let _ = router_guard.register(irq, ctx.task_id, 128);
+            let irq = crate::interrupts::routing::IrqNumber(irq_num as u8);
+            let _ = router_guard.register(irq, ctx.task_id, 128);
 
-        // Pin the task to this CPU and re-route the hardware IRQ so it fires
-        // on the same CPU as the waiting driver task. Eliminates cross-CPU
-        // wake scan in device_irq_handler.
-        if let Some(sched) = sched_guard.as_mut() {
-            if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
-                task.pinned = true;
-            }
+            if let Some(sched) = sched_guard.as_mut() {
+                if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
+                    task.pinned = true;
+                }
 
-            // Re-route device IRQ to this CPU via I/O APIC (x86_64) or GIC SPI (AArch64)
-            #[cfg(target_arch = "x86_64")]
-            {
-                let local_apic_id = unsafe {
-                    crate::arch::x86_64::percpu::current_percpu().apic_id() as u8
-                };
-                // SAFETY: I/O APIC is initialized before user tasks run.
-                unsafe {
-                    crate::arch::x86_64::ioapic::set_irq_destination(irq_num, local_apic_id);
+                // Re-route device IRQ to this CPU via I/O APIC (x86_64) or GIC SPI (AArch64)
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let local_apic_id = unsafe {
+                        crate::arch::x86_64::percpu::current_percpu().apic_id() as u8
+                    };
+                    // SAFETY: I/O APIC is initialized before user tasks run.
+                    unsafe {
+                        crate::arch::x86_64::ioapic::set_irq_destination(irq_num, local_apic_id);
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if irq_num >= 32 {
+                        // SAFETY: GIC distributor is initialized before user tasks run.
+                        unsafe { crate::arch::aarch64::gic::enable_spi(irq_num); }
+                    }
                 }
             }
-            #[cfg(target_arch = "aarch64")]
-            {
-                // Enable the SPI in the GIC distributor so it can fire.
-                // AArch64 GIC routes SPIs to CPUs via affinity in the distributor;
-                // by default SPIs go to the CPU that enabled them.
-                if irq_num >= 32 {
-                    // SAFETY: GIC distributor is initialized before user tasks run.
-                    unsafe { crate::arch::aarch64::gic::enable_spi(irq_num); }
-                }
-            }
-
-            sched
-                .block_task(ctx.task_id, crate::scheduler::BlockReason::IoWait(irq_num))
-                .map_err(|_| SyscallError::InvalidArg)?;
+            // Drop locks before yield
         }
 
-        drop(router_guard);
-        drop(sched_guard);
-
+        // Block and yield. The device ISR wakes this task (IoWait → Ready).
+        // CRITICAL: Disable interrupts before block_task to prevent the timer
+        // ISR from seeing Blocked state before yield_save_and_switch saves context.
+        // See handle_recv_msg for detailed race explanation.
+        // SAFETY: Disabling interrupts is safe at kernel privilege level.
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+        {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_mut() {
+                let _ = sched.block_task(
+                    ctx.task_id,
+                    crate::scheduler::BlockReason::IoWait(irq_num),
+                );
+            }
+            // IrqSpinlock drop: restores IF to disabled (our cli)
+        }
+        // SAFETY: We are on the kernel stack, scheduler lock is not held.
+        unsafe { crate::arch::yield_save_and_switch(); }
+        // Woken by device ISR — IRQ has fired
         Ok(0)
     }
 
@@ -765,54 +779,63 @@ impl SyscallDispatcher {
 
         let endpoint = crate::ipc::EndpointId(endpoint_id);
 
-        // Lock ordering: IPC_MANAGER(3) → CAPABILITY_MANAGER(4)
-        let mut ipc_guard = crate::IPC_MANAGER.lock();
-        let cap_guard = crate::CAPABILITY_MANAGER.lock();
+        // Restart loop: try to receive, block + yield if empty, re-check on wake.
+        // Eliminates the two-step wake pattern — user space gets the message
+        // directly without needing to retry.
+        loop {
+            // Lock ordering: IPC_MANAGER(3) → CAPABILITY_MANAGER(4)
+            let msg = {
+                let mut ipc_guard = crate::IPC_MANAGER.lock();
+                let cap_guard = crate::CAPABILITY_MANAGER.lock();
 
-        let ipc_mgr = ipc_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
-        let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+                let ipc_mgr = ipc_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+                let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
 
-        let msg = ipc_mgr
-            .recv_message_with_capability(ctx.process_id, endpoint, cap_mgr)
-            .map_err(|_| SyscallError::PermissionDenied)?;
+                ipc_mgr
+                    .recv_message_with_capability(ctx.process_id, endpoint, cap_mgr)
+                    .map_err(|_| SyscallError::PermissionDenied)?
+                // Drop IPC/capability locks here
+            };
 
-        // Drop locks before touching page tables
-        drop(cap_guard);
-        drop(ipc_guard);
-
-        match msg {
-            Some(msg) => {
+            if let Some(msg) = msg {
                 let payload = msg.payload();
                 let payload_len = core::cmp::min(payload.len(), buf_len - 36);
 
                 // Build response: [principal:32][from:4][payload:N]
                 let mut header = [0u8; 36];
 
-                // sender_principal (32 bytes) — may be None (zeros)
                 if let Some(principal) = msg.sender_principal {
                     header[0..32].copy_from_slice(&principal.public_key);
                 }
-
-                // from_endpoint (4 bytes, little-endian)
                 header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
 
-                // Write header
                 write_user_buffer(ctx.cr3, user_buf, &header)?;
-
-                // Write payload
                 if payload_len > 0 {
                     write_user_buffer(ctx.cr3, user_buf + 36, &payload[..payload_len])?;
                 }
 
-                Ok((36 + payload_len) as u64)
+                return Ok((36 + payload_len) as u64);
             }
-            None => {
-                // No message available — block the calling task until a
-                // message arrives on this endpoint. The IPC send path
-                // (handle_write) calls wake_message_waiters() after enqueue.
-                //
-                // Lock ordering: PER_CPU_SCHEDULER(1) — IPC/capability locks
-                // already dropped above.
+
+            // No message — block and yield. The IPC send path
+            // (handle_write) calls wake_message_waiters() after enqueue.
+            //
+            // CRITICAL: Disable interrupts BEFORE block_task to prevent a
+            // race with the timer ISR. If the ISR fires between block_task
+            // (state=Blocked) and yield_save_and_switch (saves saved_rsp),
+            // the ISR skips saving RSP (because !Running), leaving stale
+            // saved_rsp. When the task is later woken, iretq restores from
+            // garbage → triple fault. cli ensures the ISR cannot observe
+            // the Blocked state before yield saves the correct context.
+            // IrqSpinlock preserves the disabled state on drop.
+            // yield_save_and_switch also does cli (redundant) then saves
+            // and switches. .Lyield_resume does sti on wake.
+            // SAFETY: Disabling interrupts is safe at kernel privilege level.
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+            #[cfg(target_arch = "aarch64")]
+            unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+            {
                 let mut sched_guard = crate::local_scheduler().lock();
                 if let Some(sched) = sched_guard.as_mut() {
                     let _ = sched.block_task(
@@ -820,8 +843,13 @@ impl SyscallDispatcher {
                         crate::scheduler::BlockReason::MessageWait(endpoint_id),
                     );
                 }
-                Ok(0)
+                // IrqSpinlock drop: restores IF to our cli state (disabled)
             }
+            // Interrupts still disabled — yield_save_and_switch saves
+            // correct context before any ISR can see the Blocked state.
+            // SAFETY: We are on the kernel stack, scheduler lock is not held.
+            unsafe { crate::arch::yield_save_and_switch(); }
+            // Woken — loop back and re-check the queue
         }
     }
 
