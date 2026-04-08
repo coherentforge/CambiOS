@@ -207,7 +207,7 @@ impl NetDriver {
         }
 
         // Notify device that RX buffers are available
-        self.transport.notify_queue(RX_QUEUE);
+        let _ = self.transport.notify_queue(RX_QUEUE);
     }
 
     /// Send a packet. Copies data to TX bounce buffer with virtio-net header,
@@ -242,21 +242,33 @@ impl NetDriver {
             return false;
         }
 
-        // Notify device
-        self.transport.notify_queue(TX_QUEUE_IDX);
+        // Notify device and wait for TX completion.
+        //
+        // QEMU TCG processes virtio TX in its event loop, not synchronously
+        // on the notify port write. The event loop runs when the guest does
+        // hlt. We use SYS_YIELD to relinquish our time slice — the idle task
+        // runs hlt, QEMU completes the TX, and when we're re-scheduled the
+        // used ring is updated.
+        if !self.transport.notify_queue(TX_QUEUE_IDX) {
+            return false;
+        }
 
-        // Poll for TX completion (synchronous — simple for now)
-        for _ in 0..1000 {
+        // Quick check in case QEMU completed it synchronously
+        if self.tx_queue.pop_used().is_some() {
+            return true;
+        }
+
+        // Yield → idle → hlt → QEMU processes TX → we get re-scheduled
+        for _ in 0..20 {
+            sys::yield_now();
+            // After yield, if the timer preempted us and idle ran hlt,
+            // the TX should be done. Check immediately.
             if let Some((_pending, _len)) = self.tx_queue.pop_used() {
-                return true; // Sent successfully
-            }
-            // Spin briefly
-            for _ in 0..100 {
-                core::hint::spin_loop();
+                return true;
             }
         }
 
-        false // Timed out
+        false
     }
 
     /// Poll for a received packet. Returns the number of payload bytes
@@ -303,7 +315,7 @@ impl NetDriver {
                     self.rx_queue.push_buffer(
                         buf.paddr, buf.vaddr, buf.size, true,
                     );
-                    self.transport.notify_queue(RX_QUEUE);
+                    let _ = self.transport.notify_queue(RX_QUEUE);
                     return;
                 }
             }

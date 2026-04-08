@@ -395,10 +395,15 @@ impl Scheduler {
     pub fn isr_tick_and_schedule(&mut self, current_rsp: u64) -> u64 {
         self.total_ticks += 1;
 
-        // Save current task's context RSP and tick its time slice
+        // Save current task's context RSP and tick its time slice.
+        // Only save RSP for Running tasks — Blocked/Terminated tasks have a
+        // synthetic SavedContext on their kernel stack that must be preserved
+        // so they resume correctly when woken/re-scheduled.
         if let Some(task_id) = self.current_task {
             if let Some(task) = self.get_task_mut(task_id) {
-                task.saved_rsp = current_rsp;
+                if task.state == TaskState::Running {
+                    task.saved_rsp = current_rsp;
+                }
                 task.tick();
             }
         }
@@ -412,7 +417,14 @@ impl Scheduler {
         match self.schedule() {
             Ok(next_task) => {
                 if let Some(task) = self.get_task(next_task) {
-                    task.saved_rsp
+                    let rsp = task.saved_rsp;
+                    if rsp == 0 {
+                        crate::println!(
+                            "\n!!! ZERO RSP: schedule picked task {} (state={:?}, kstack_top={:#x}, saved_rsp=0) !!!",
+                            next_task.0, task.state, task.kernel_stack_top
+                        );
+                    }
+                    rsp
                 } else {
                     current_rsp // Shouldn't happen
                 }
@@ -478,11 +490,11 @@ impl Scheduler {
             // in_ready_queue left as-is; stale entry cleaned lazily on pop
             self.runnable_count = self.runnable_count.saturating_sub(1);
 
-            // If we blocked the current running task, reschedule immediately.
-            if self.current_task == Some(task_id) {
-                return self.schedule().map(|_| ());
-            }
-
+            // The actual context switch is performed by the caller (e.g.,
+            // suspend_to_kernel_stack in the syscall handler, or the timer
+            // ISR detecting a non-Running current_task). Calling schedule()
+            // here would change current_task without switching contexts,
+            // desynchronizing the scheduler from the running CPU.
             Ok(())
         } else {
             Err(ScheduleError::TaskNotFound)
@@ -557,6 +569,46 @@ impl Scheduler {
         }
 
         // Enqueue woken tasks into ready queues
+        for i in 0..woken.min(to_enqueue.len()) {
+            let (tid, band) = to_enqueue[i];
+            self.ready_queues[band].push_back(tid);
+        }
+        self.runnable_count += woken;
+        woken
+    }
+
+    /// Wake all tasks blocked waiting for a message on a specific endpoint.
+    ///
+    /// Scans for tasks with `BlockReason::MessageWait(endpoint)` and moves
+    /// them from Blocked → Ready. Called from the IPC send path after a
+    /// message is enqueued, so the receiver can pick it up.
+    ///
+    /// Returns the number of tasks woken.
+    pub fn wake_message_waiters(&mut self, endpoint: u32) -> usize {
+        let mut to_enqueue: [(TaskId, usize); 32] = [(TaskId(0), 0); 32];
+        let mut woken = 0;
+
+        for slot in self.tasks.iter_mut() {
+            if let Some(task) = slot {
+                if task.state == TaskState::Blocked {
+                    if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
+                        if ep == endpoint {
+                            task.state = TaskState::Ready;
+                            task.block_reason = None;
+                            task.reset_time_slice();
+                            if !task.in_ready_queue {
+                                task.in_ready_queue = true;
+                                if woken < to_enqueue.len() {
+                                    to_enqueue[woken] = (task.id, priority_to_band(task.priority));
+                                }
+                            }
+                            woken += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         for i in 0..woken.min(to_enqueue.len()) {
             let (tid, band) = to_enqueue[i];
             self.ready_queues[band].push_back(tid);

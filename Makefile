@@ -28,6 +28,8 @@ KS_SERVICE_DIR := user/key-store-service
 KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-key-store-service
 NET_DRIVER_DIR := user/virtio-net
 NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-net
+UDP_STACK_DIR := user/udp-stack
+UDP_STACK_ELF := $(UDP_STACK_DIR)/target/x86_64-unknown-none/release/arcos-udp-stack
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -46,7 +48,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net udp-stack sign-tool export-pubkey
 
 all: iso
 
@@ -80,6 +82,13 @@ virtio-net:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Virtio-Net driver ready ==="
 
+udp-stack:
+	@echo "=== Building UDP stack ==="
+	cd $(UDP_STACK_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== UDP stack ready ==="
+
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release
@@ -92,7 +101,7 @@ sign-tool:
 export-pubkey: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) --export-pubkey bootstrap_pubkey.bin
 
-iso: kernel user-elf fs-service key-store-service virtio-net
+iso: kernel user-elf fs-service key-store-service virtio-net udp-stack
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -105,11 +114,13 @@ iso: kernel user-elf fs-service key-store-service virtio-net
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
 	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
+	cp $(UDP_STACK_ELF) iso_root/boot/udp-stack.elf
 	# Sign all modules (single invocation avoids repeated card contention)
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/udp-stack.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf

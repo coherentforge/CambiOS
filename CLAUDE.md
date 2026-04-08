@@ -27,6 +27,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **NEVER** suggest `cargo run` or `cargo build` without `--target x86_64-unknown-none` or `--target aarch64-unknown-none` for kernel crates.
 - **NEVER** suggest running kernel binaries directly on the host. Always use QEMU.
 - **AArch64 QEMU MUST use** `-machine virt,gic-version=3` (GICv3 required for ICC system registers).
+- **ALWAYS*** all new files are tagged for copyright: // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
 ## Quick Reference
 
@@ -40,7 +41,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (205 tests, all passing)
+# Run tests (213 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -78,7 +79,7 @@ make sign-tool
 
 ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
 
-**Current state:** 205/205 tests pass, clean release builds for both x86_64 and aarch64-unknown-none. **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 7 tasks (3 kernel + 2 ring-3 user + hello module + FS service), full SMP (phases 0-4c), IRQ affinity, load balancing. **AArch64**: QEMU `virt` boots to stable preemptive scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem (kernel heap, frame allocator, process heaps). AArch64 SMP (AP startup via Limine MP protocol) is implemented. **Identity (Phase 1C, hardware-backed)**: Bootstrap Principal from compiled-in YubiKey public key (`bootstrap_pubkey.bin`), no secret key in kernel memory. Boot modules signed at build time via YubiKey OpenPGP interface. Bootstrap Principal bound to kernel processes and boot modules, IPC messages carry unforgeable sender_principal stamped by kernel, BindPrincipal/GetPrincipal/ClaimBootstrapKey syscalls (11/12/18). **Key Store Service**: User-space key-store (`user/key-store-service/`) on endpoint 17. In hardware-backed mode (no kernel secret key), enters degraded mode — signing unavailable until USB HID enables runtime YubiKey communication. fs-service falls back to unsigned ObjPut. **ObjectStore (Phase 1C)**: ArcObject (content-addressed via Blake3, author/owner, Ed25519 signature verified on retrieval, ACL), RamObjectStore (256 objects). ObjPut (14) creates unsigned objects; ObjPutSigned (19) stores pre-signed objects (kernel verifies signature). fs-service requests signing from key-store before storing. RecvMsg/ObjPut/ObjGet/ObjDelete/ObjList/ClaimBootstrapKey/ObjPutSigned syscalls (13-19). **FS Service**: User-space Rust ELF (`user/fs-service/`) on endpoint 16, requests signing from key-store, enforces ownership via sender_principal. **Signed ELF Loading**: Boot modules require Ed25519 signature (ARCSIG trailer), verified by SignedBinaryVerifier before execution.
+**Current state:** 213/213 tests pass, clean release builds for both x86_64 and aarch64-unknown-none. **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 10 tasks (3 kernel + 2 ring-3 user + 5 boot modules: hello, key-store, fs-service, virtio-net, udp-stack), full SMP (phases 0-4c), IRQ affinity, load balancing, PCI device discovery (7 devices), 24 syscalls. **AArch64**: QEMU `virt` boots to stable preemptive scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem (kernel heap, frame allocator, process heaps). AArch64 SMP (AP startup via Limine MP protocol) is implemented. **Identity (Phase 1C, hardware-backed)**: Bootstrap Principal from compiled-in YubiKey public key (`bootstrap_pubkey.bin`), no secret key in kernel memory. Boot modules signed at build time via YubiKey OpenPGP interface. Bootstrap Principal bound to kernel processes and boot modules, IPC messages carry unforgeable sender_principal stamped by kernel, BindPrincipal/GetPrincipal/ClaimBootstrapKey syscalls (11/12/18). **Key Store Service**: User-space key-store (`user/key-store-service/`) on endpoint 17. In hardware-backed mode (no kernel secret key), enters degraded mode — signing unavailable until USB HID enables runtime YubiKey communication. fs-service falls back to unsigned ObjPut. **ObjectStore (Phase 1C)**: ArcObject (content-addressed via Blake3, author/owner, Ed25519 signature verified on retrieval, ACL), RamObjectStore (256 objects). ObjPut (14) creates unsigned objects; ObjPutSigned (19) stores pre-signed objects (kernel verifies signature). fs-service requests signing from key-store before storing. RecvMsg/ObjPut/ObjGet/ObjDelete/ObjList/ClaimBootstrapKey/ObjPutSigned syscalls (13-19). **FS Service**: User-space Rust ELF (`user/fs-service/`) on endpoint 16, requests signing from key-store, enforces ownership via sender_principal. **Signed ELF Loading**: Boot modules require Ed25519 signature (ARCSIG trailer), verified by SignedBinaryVerifier before execution. **Virtio-Net Driver (Phase 2A)**: User-space MMIO driver (`user/virtio-net/`) on endpoint 20 — PCI device discovery, legacy virtio transport, TX/RX virtqueues with DMA bounce buffers, hostile-device validation via `DeviceValue<T>`. **UDP Stack (Phase 2B)**: User-space stateless UDP/IP service (`user/udp-stack/`) on endpoint 21 — ARP, IPv4 (RFC 1071 checksum), UDP, built-in NTP demo (queries time.google.com), hardcoded for QEMU SLIRP (10.0.2.15/24, gateway 10.0.2.2). **PCI Subsystem**: Bus 0 scan at boot, device table exposed via DeviceInfo syscall (22), port I/O validation via PortIo syscall (23). **Device Syscalls**: MapMmio (20), AllocDma (21), DeviceInfo (22), PortIo (23) — enable user-space drivers to access MMIO, allocate DMA buffers, discover PCI devices, and perform validated port I/O.
 
 **x86_64 features**: Custom 7-entry GDT with per-CPU TSS, SYSCALL/SYSRET fast path, APIC timer + I/O APIC device IRQ routing, SMP with per-CPU priority-band schedulers (4 bands, O(1) scheduling via VecDeque ready queues, MAX_TASKS=256), task migration, IRQ affinity, TLB shootdown via IPI, ACPI MADT parsing. **AArch64 features**: GICv3 (Distributor + Redistributor + CPU interface via ICC system registers), ARM Generic Timer (CNTP), AArch64 4-level page tables (L0-L3, TTBR0/TTBR1 split), exception vector table (VBAR_EL1), SVC syscall handler, PL011 UART, early MMIO page mapping (bootstrap frames for TTBR1), TCR_EL1 VA width fix for 48-bit HHDM, EL0 user tasks with per-process TTBR0 + user code/stack mapping.
 
@@ -129,14 +130,26 @@ src/
 user/
 ├── hello.S                   # Test module (prints 3x, exits)
 ├── user.ld                   # User-space linker script (base 0x400000)
+├── libsys/                   # Shared syscall wrapper library for all user-space crates
+│   ├── Cargo.toml
+│   └── src/lib.rs            # Safe wrappers around x86_64 SYSCALL; only unsafe crate in user-space
 ├── fs-service/               # Filesystem service (Rust no_std crate)
 │   ├── Cargo.toml
 │   ├── link.ld               # Linker script (.data on separate page for GOT)
 │   └── src/main.rs           # IPC service loop on endpoint 16, ObjectStore gateway
-└── key-store-service/        # Key store service (Ed25519 signing, Rust no_std crate)
-    ├── Cargo.toml            # Uses ed25519-compact (no_std)
-    ├── link.ld               # Linker script (same pattern as fs-service)
-    └── src/main.rs           # Claims bootstrap key at boot, signs on IPC request (endpoint 17)
+├── key-store-service/        # Key store service (Ed25519 signing, Rust no_std crate)
+│   ├── Cargo.toml            # Uses ed25519-compact (no_std)
+│   ├── link.ld               # Linker script (same pattern as fs-service)
+│   └── src/main.rs           # Claims bootstrap key at boot, signs on IPC request (endpoint 17)
+├── virtio-net/               # Virtio-net driver (user-space, Rust no_std crate)
+│   ├── Cargo.toml
+│   ├── link.ld
+│   └── src/                  # main.rs + transport.rs, virtqueue.rs, device.rs, pci.rs
+│       └── main.rs           # PCI discovery, legacy virtio transport, IPC on endpoint 20
+└── udp-stack/                # UDP/IP network service (user-space, Rust no_std crate)
+    ├── Cargo.toml
+    ├── link.ld
+    └── src/main.rs           # ARP, IPv4, UDP, NTP demo, IPC on endpoint 21
 tools/
 └── sign-elf/                 # Host-side ELF signing tool (Ed25519)
     ├── Cargo.toml            # Uses ed25519-compact, openpgp-card, card-backend-pcsc
@@ -158,6 +171,8 @@ tools/
 │   └── paging.rs             # x86_64 page table management (OffsetPageTable)
 ├── microkernel/
 │   └── main.rs               # Kernel entry point, all subsystem init
+├── pci/
+│   └── mod.rs                # PCI bus scan (bus 0), device table, BAR decoding, port validation
 ├── platform/
 │   └── mod.rs                # Platform abstraction, CR4 features
 ├── scheduler/
@@ -194,7 +209,7 @@ User data before user code is **required** by SYSRET selector computation.
 - **Kernel heap:** 4MB at HHDM+physical, initialized from Limine memory map
 - **Boot stack:** 256KB via Limine StackSizeRequest
 - **User code:** mapped at 0x400000
-- **User stack:** top at 0x800000, 16KB (4 pages), grows down
+- **User stack:** top at 0x800000, 64KB (16 pages), grows down
 - **Per-process PML4:** kernel half cloned (entries 256..511)
 - **HHDM:** Higher Half Direct Map provided by Limine for physical memory access
 - **x86_64 HHDM:** `0xFFFF800000000000`, process heap base `0x800000`
@@ -236,9 +251,10 @@ Exit=0, Write=1, Read=2, Allocate=3, Free=4, WaitIrq=5,
 RegisterEndpoint=6, Yield=7, GetPid=8, GetTime=9, Print=10,
 BindPrincipal=11, GetPrincipal=12, RecvMsg=13,
 ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17,
-ClaimBootstrapKey=18, ObjPutSigned=19
+ClaimBootstrapKey=18, ObjPutSigned=19,
+MapMmio=20, AllocDma=21, DeviceInfo=22, PortIo=23
 ```
-All 20 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+All 24 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **Exit**: Marks task as Terminated in scheduler
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
@@ -257,6 +273,10 @@ All 20 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **ObjList**: List all object hashes (packed 32-byte hashes)
 - **ClaimBootstrapKey**: One-shot: writes 64-byte bootstrap secret key to caller buffer, zeroes kernel copy. Restricted to bootstrap Principal
 - **ObjPutSigned**: Like ObjPut but accepts pre-computed Ed25519 signature. Kernel verifies signature against caller's Principal before storing
+- **MapMmio**: Maps device MMIO pages into process address space (uncacheable). Rejects addresses within RAM range. Returns user virtual address
+- **AllocDma**: Allocates physically contiguous DMA pages with guard pages (unmapped before/after). Returns user vaddr; writes physical address to caller buffer
+- **DeviceInfo**: Returns 108-byte PCI device descriptor by index (vendor/device ID, class, BARs with decoded addresses/sizes/types)
+- **PortIo**: Kernel-validated port I/O on PCI device I/O BARs. Rejects ports not within a discovered PCI BAR. Supports byte/word/dword read/write
 
 ## Development Conventions
 
@@ -320,10 +340,12 @@ ArcOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The arc
 - **Limine AArch64 TCR_EL1.T1SZ too narrow.** Limine sets T1SZ for ~39-bit VA, but HHDM at `0xFFFF000000000000` needs 48-bit. `kmain` widens T1SZ to 16 (48-bit) at early boot.
 - **AArch64 QEMU requires GICv3.** Must use `-machine virt,gic-version=3` because the GIC driver uses ICC system registers (GICv3). Default GICv2 causes Undefined Instruction on `mrs ICC_SRE_EL1`.
 - **AArch64 ELF loader fully ported.** `load_elf_process`, `build_boot_elf`, `create_elf_user_task`, and `load_boot_modules` are all portable — no `#[cfg(target_arch)]` gates. ELF machine type check uses `ELF_MACHINE_EXPECTED` (0x3E on x86_64, 0xB7 on AArch64).
-- **Terminated tasks re-fault after SYS_EXIT.** When a user task calls SYS_EXIT, it's marked Terminated. The `time_slice_expired()` fix forces reschedule on the next timer tick, but between the exit and the tick, the task resumes at the saved RIP and page-faults (its page tables are stale). The page fault handler marks it Terminated again, creating a brief fault loop until the timer fires. Fix: the scheduler should detect Terminated current_task in `isr_tick_and_schedule()` before saving RSP, or the exit handler should immediately trigger a reschedule.
+- ~~**Terminated tasks re-fault after SYS_EXIT.**~~ FIXED. After dispatching SYS_EXIT, the syscall handler calls `halt_until_preempted(kernel_stack_top)` which switches RSP to the task's kernel stack (HHDM, stable across all page tables) before entering an `sti; hlt` loop (x86_64) or `daifclr + wfi` loop (AArch64). The kernel stack switch is critical: the SYSCALL handler runs on the user stack, and the timer ISR's CR3 switch would remap that stack to the new task's zeroed pages, corrupting the ISR's local variables. Using the kernel stack (HHDM) avoids this because the kernel half is shared across all page tables.
 - **ELF loader doesn't upgrade page permissions for overlapping segments.** If two PT_LOAD segments share a page but have different permissions (e.g., .text RX and .got RW), the first segment's permissions are used. The fs-service linker script works around this by `ALIGN(4096)` before `.data` to force separate pages. The loader should be fixed to use the most permissive flags when segments share a page.
 - **fs-service is x86_64 only.** The user-space crate uses x86_64 `syscall` inline assembly. AArch64 user-space modules need SVC-based syscall wrappers (future work).
 - **AArch64 device IRQ routing not wired.** GIC `enable_spi()`/`set_spi_trigger()` exist but aren't called from the boot path or `handle_wait_irq()`. Device IRQ handlers (keyboard, virtio) not yet functional on AArch64.
+- **No voluntary context switch.** ArcOS's only context switch mechanism is the timer ISR. Syscall handlers run with IF=0 (SFMASK) and cannot be preempted. `yield_now()` sets time_remaining=0 but does not actually switch — the task continues until the timer catches a brief IF=1 window in user mode. `recv_msg` has a partial blocking implementation (`suspend_to_kernel_stack` builds a synthetic SavedContext and halts on the kernel stack), but this only works for the specific recv_msg→halt path. Device drivers cannot wait for I/O completion (e.g., virtio TX used ring) without spinning. **This is the next architectural priority: implement `sched_yield()` as a first-class voluntary context switch callable from any kernel code path.** This unlocks: blocking IPC (clean), device I/O wait, proper yield, and eliminates all spin-wait workarounds.
+- **Virtio-net TX completion blocks on QEMU TCG.** QEMU TCG defers virtio TX processing to its event loop (runs during guest `hlt`). The driver's TX completion poll spins in user mode, but the timer rarely catches the brief IF=1 window between syscalls. Requires voluntary context switch to yield to idle (which does `hlt`, triggering QEMU's event loop). Workaround: yield_now loop, but this depends on timer starvation luck.
 
 ## Planned Next Steps (Roadmap)
 
@@ -352,8 +374,8 @@ ArcOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The arc
 23. **AArch64 device IRQ routing** — Wire GIC `enable_spi()`/`set_spi_trigger()` into AArch64 boot path for QEMU virt devices (virtio, PL011 RX). Port `handle_wait_irq()` to use GIC SPI routing.
 24. ~~**Crypto Integration (Phase 1B)**~~ — DONE. Added `ed25519-compact` 2.2 + `blake3` 1.8 crates (both `no_std`, pure Rust). Replaced FNV-1a with Blake3 for content hashing. **Bootstrap identity is now hardware-backed**: Ed25519 public key compiled in from `bootstrap_pubkey.bin` (extracted from YubiKey via `sign-elf --export-pubkey`). No secret key in kernel memory — `BOOTSTRAP_SECRET_KEY` stays zeroed. `handle_obj_put` creates unsigned objects; `handle_obj_get` verifies signature before returning content (unsigned objects allowed). `SignedBinaryVerifier` with ARCSIG signature trailer format (64-byte Ed25519 sig + 8-byte magic). `load_boot_modules` requires signed ELFs. Host-side `tools/sign-elf/` signs via YubiKey OpenPGP (default) or seed (CI fallback). Makefile signs hello.elf, key-store-service.elf, and fs-service.elf during ISO/image build. 205 tests total.
 25. ~~**Key Store Service (Phase 1C)**~~ — DONE. User-space key-store service (`user/key-store-service/`) on IPC endpoint 17. At boot, attempts `ClaimBootstrapKey` (syscall 18). In hardware-backed mode (YubiKey), no secret key exists in kernel memory — key-store enters **degraded mode** (no signing, responds with STATUS_ERROR). `fs-service` falls back to unsigned ObjPut automatically. `ObjPutSigned` (syscall 19) still available for future use when USB HID enables runtime YubiKey communication. Loaded as signed boot module (limine.conf, before fs-service for scheduling priority).
-26. **Virtio-Net Driver (Phase 2A)** — User-space MMIO driver: virtio device discovery, virtqueue setup, descriptor rings, DMA buffer management. Simple packet send/receive interface callable over IPC. Proves second user-space driver pattern and DMA safety.
-27. **UDP Stack + NTP Demo (Phase 2B)** — Minimal stateless UDP implementation. NTP query over UDP to public time server. Demonstrates full integration: signed identity + filesystem logging + network driver + userspace stack, all isolated via IPC.
+26. ~~**Virtio-Net Driver (Phase 2A)**~~ — DONE. User-space MMIO driver (`user/virtio-net/`) on IPC endpoint 20. PCI device discovery via DeviceInfo syscall, legacy virtio transport (I/O port BAR), TX/RX virtqueues with DMA bounce buffers (AllocDma syscall), hostile-device validation via `DeviceValue<T>` (out-of-bounds indices, length overflows kill the device — no recovery). IPC protocol: CMD_SEND_PACKET(1), CMD_RECV_PACKET(2), CMD_GET_MAC(3), CMD_GET_STATUS(4). 4 new syscalls: MapMmio(20), AllocDma(21), DeviceInfo(22), PortIo(23). PCI bus scan wired into boot path. libsys shared syscall library (`user/libsys/`) with safe wrappers for all 24 syscalls.
+27. ~~**UDP Stack + NTP Demo (Phase 2B)**~~ — DONE. User-space stateless UDP/IP service (`user/udp-stack/`) on IPC endpoint 21. Implements: Ethernet framing, ARP (4-entry cache, broadcast request/reply), IPv4 (RFC 1071 checksum, DF flag, TTL=64), UDP (checksum optional for IPv4). Built-in NTP demo at startup: ARP-resolves QEMU SLIRP gateway (10.0.2.2), sends NTPv4 client request to time.google.com (216.239.35.0:123), parses transmit timestamp, prints human-readable UTC. Service loop on endpoint 21: CMD_UDP_SEND(1), CMD_UDP_RECV(2), CMD_GET_CONFIG(3). Hardcoded for QEMU SLIRP: IP 10.0.2.15/24, gateway 10.0.2.2. Startup race with virtio-net handled via retry-with-backoff on MAC request.
 28. **RISC-V port** — `src/arch/riscv64/` backend matching x86_64/AArch64 public API. PLIC interrupt controller, SBI timer, Sv48 page tables.
 
 ## Design Documents
@@ -371,7 +393,7 @@ Any work on identity, storage, filesystem, or object model must be consistent wi
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 205 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests
+- 213 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests
 
 ## Post-Change Review Protocol
 

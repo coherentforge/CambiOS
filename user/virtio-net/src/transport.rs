@@ -144,8 +144,8 @@ impl LegacyTransport {
     }
 
     /// Notify the device that the given queue has new available buffers.
-    pub fn notify_queue(&self, queue_idx: u16) {
-        self.write16(REG_QUEUE_NOTIFY, queue_idx);
+    pub fn notify_queue(&self, queue_idx: u16) -> bool {
+        sys::port_write16(self.io_base + REG_QUEUE_NOTIFY, queue_idx).is_ok()
     }
 
     /// Read and acknowledge the ISR status (clears the interrupt).

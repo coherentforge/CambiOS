@@ -591,14 +591,27 @@ pub unsafe fn init() {
     unsafe { interrupts::init() };
 }
 
-/// Halt the system
+/// Halt the system — permanently stops this CPU.
+///
+/// Disables interrupts before halting so the timer ISR cannot preempt us.
+/// This makes kernel panics and unrecoverable faults truly fatal instead
+/// of silently recovering via the timer.
 pub fn halt() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: CLI disables interrupts, HLT suspends the CPU. With interrupts
+    // disabled, no interrupt can wake the CPU — this is a permanent stop.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: DAIFSET #0xF masks all exceptions (IRQ, FIQ, SError, Debug).
+    // Subsequent WFI will sleep forever.
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+
     loop {
         #[cfg(target_arch = "x86_64")]
         hlt();
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: WFI is always safe at EL1 — it halts the core until the next
-        // interrupt (or event from SEV).
+        // SAFETY: WFI with all exceptions masked — permanent halt.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         core::hint::spin_loop();

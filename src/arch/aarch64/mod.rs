@@ -764,13 +764,13 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
     use crate::ipc::ProcessId;
 
     // Look up the calling task and its metadata from the per-CPU scheduler
-    let (task_id, process_id, cr3) = {
+    let (task_id, process_id, cr3, kernel_stack_top) = {
         let sched = crate::local_scheduler().lock();
         match sched.as_ref().and_then(|s| {
             let tid = s.current_task()?;
             let task = s.current_task_ref()?;
             let pid = task.process_id.unwrap_or(ProcessId(tid.0 as u32));
-            Some((tid, pid, task.cr3))
+            Some((tid, pid, task.cr3, task.kernel_stack_top))
         }) {
             Some(info) => info,
             None => return SyscallError::InvalidArg as i64 as u64,
@@ -786,9 +786,43 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
     let args = SyscallArgs::new(arg1, arg2, arg3, arg4, arg5, arg6);
 
     let result = match SyscallDispatcher::dispatch(syscall_num, args, &ctx) {
-        Ok(val) => val as i64,
+        Ok(val) => {
+            // SYS_EXIT (0): task is now Terminated — do not ERET back to
+            // user space. Switch to the kernel stack (SVC handler may run
+            // on the user stack via SP_EL0, which would be remapped by a
+            // TTBR0 switch in the timer ISR) then halt until preempted.
+            if syscall_num == 0 {
+                halt_until_preempted(kernel_stack_top);
+            }
+            val as i64
+        }
         Err(e) => e.as_i64(),
     };
 
     result as u64
+}
+
+/// Halt with interrupts enabled until preempted by the timer ISR.
+///
+/// Switches to the given kernel stack before enabling interrupts.
+/// The SVC handler may run on the user stack (SP_EL0). If the timer ISR's
+/// TTBR0 switch ran on the user stack, the page table change would remap
+/// the stack to different physical memory. The kernel stack is in the
+/// HHDM, which is mapped identically across all page tables.
+///
+/// # Safety
+/// `kernel_stack_top` must be a valid, mapped kernel stack address (HHDM).
+/// The scheduler lock must NOT be held.
+pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {kstack}",
+            "2:",
+            "msr daifclr, #2",
+            "wfi",
+            "b 2b",
+            kstack = in(reg) kernel_stack_top,
+            options(noreturn),
+        );
+    }
 }

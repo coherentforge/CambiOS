@@ -148,9 +148,17 @@ pub mod exceptions {
             let fault_type = if is_present { "protection" } else { "not-present" };
             let access = if is_fetch { "execute" } else if is_write { "write" } else { "read" };
 
+            // Identify which task/CPU triggered the fault
+            // SAFETY: GS base is initialized during boot (BSP and AP).
+            let cpu_id = unsafe { crate::arch::percpu::current_cpu_id() };
+            let task_id = crate::local_scheduler().try_lock().and_then(|guard| {
+                guard.as_ref().and_then(|s| s.current_task().map(|t| t.0))
+            });
+
             crate::println!(
-                "\n!!! KERNEL PAGE FAULT !!!\n  Address: {:#x}\n  Type: {} {}\n  Error code: {:?}\n{:#?}",
-                faulting_addr, fault_type, access, error_code, stack_frame
+                "\n!!! KERNEL PAGE FAULT !!!\n  Address: {:#x}\n  Type: {} {}\n  Error code: {:?}\n  CPU={}, task={}\n{:#?}",
+                faulting_addr, fault_type, access, error_code,
+                cpu_id, task_id.unwrap_or(0xFFFF), stack_frame
             );
             crate::halt();
         }

@@ -292,6 +292,19 @@ impl SyscallDispatcher {
             .send_message_with_capability(ctx.process_id, endpoint, msg, cap_mgr)
             .map_err(|_| SyscallError::PermissionDenied)?;
 
+        // Drop IPC/capability locks before acquiring scheduler (lock ordering)
+        drop(cap_guard);
+        drop(ipc_guard);
+
+        // Wake any tasks blocked waiting for a message on this endpoint.
+        // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held.
+        {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_mut() {
+                sched.wake_message_waiters(endpoint_id);
+            }
+        }
+
         Ok(len as u64)
     }
 
@@ -793,7 +806,22 @@ impl SyscallDispatcher {
 
                 Ok((36 + payload_len) as u64)
             }
-            None => Ok(0), // No message available
+            None => {
+                // No message available — block the calling task until a
+                // message arrives on this endpoint. The IPC send path
+                // (handle_write) calls wake_message_waiters() after enqueue.
+                //
+                // Lock ordering: PER_CPU_SCHEDULER(1) — IPC/capability locks
+                // already dropped above.
+                let mut sched_guard = crate::local_scheduler().lock();
+                if let Some(sched) = sched_guard.as_mut() {
+                    let _ = sched.block_task(
+                        ctx.task_id,
+                        crate::scheduler::BlockReason::MessageWait(endpoint_id),
+                    );
+                }
+                Ok(0)
+            }
         }
     }
 

@@ -197,13 +197,13 @@ extern "C" fn syscall_handler_inner(frame: *const SyscallFrame) -> i64 {
     use crate::ipc::ProcessId;
 
     // Look up the calling task and its metadata from the scheduler
-    let (task_id, process_id, cr3) = {
+    let (task_id, process_id, cr3, kernel_stack_top) = {
         let sched = crate::local_scheduler().lock();
         match sched.as_ref().and_then(|s| {
             let tid = s.current_task()?;
             let task = s.current_task_ref()?;
             let pid = task.process_id.unwrap_or(ProcessId(tid.0 as u32));
-            Some((tid, pid, task.cr3))
+            Some((tid, pid, task.cr3, task.kernel_stack_top))
         }) {
             Some(info) => info,
             None => return SyscallError::InvalidArg.as_i64(),
@@ -222,7 +222,119 @@ extern "C" fn syscall_handler_inner(frame: *const SyscallFrame) -> i64 {
     );
 
     match SyscallDispatcher::dispatch(frame.number, args, &ctx) {
-        Ok(val) => val as i64,
+        Ok(val) => {
+            // SYS_EXIT (0): task is Terminated — halt on kernel stack.
+            if frame.number == 0 {
+                super::halt_until_preempted(kernel_stack_top);
+            }
+
+            // Check if the dispatcher blocked this task (e.g., recv_msg with
+            // empty queue). If so, save the user-return state to the kernel
+            // stack and halt — the timer ISR switches away, and when the task
+            // is woken later, iretq returns it to user space with RAX=0.
+            // If the dispatcher blocked this task (e.g., recv_msg with empty
+            // queue), save user-return state to the kernel stack and halt.
+            // The timer ISR detects the Blocked task and context-switches away.
+            // When woken later, iretq restores to user space with RAX=val.
+            if val == 0 && kernel_stack_top != 0 {
+                let is_blocked = {
+                    let sched = crate::local_scheduler().lock();
+                    sched.as_ref().and_then(|s| {
+                        s.current_task_ref().map(|t| {
+                            t.state == crate::scheduler::TaskState::Blocked
+                        })
+                    }).unwrap_or(false)
+                };
+                if is_blocked {
+                    suspend_to_kernel_stack(frame, kernel_stack_top, task_id, val as u64);
+                }
+            }
+
+            val as i64
+        }
         Err(e) => e.as_i64(),
     }
+}
+
+/// Save the user-return state to the kernel stack and halt.
+///
+/// Called when a syscall blocks the current task (e.g., recv_msg with empty
+/// queue). Builds a SavedContext on the task's kernel stack that, when
+/// restored by the timer ISR's iretq, returns to user space as if the
+/// syscall returned `return_value`.
+///
+/// The SYSCALL entry stub pushed registers onto the user stack in this order
+/// (high address to low): RCX(user RIP), R11(user RFLAGS), RBX, RBP,
+/// R12-R15, then the SyscallFrame (R9, R8, R10, RDX, RSI, RDI, RAX).
+/// The `frame` pointer points to the SyscallFrame (lowest address).
+fn suspend_to_kernel_stack(
+    frame: &SyscallFrame,
+    kernel_stack_top: u64,
+    task_id: crate::scheduler::TaskId,
+    return_value: u64,
+) -> ! {
+    use super::SavedContext;
+    use super::gdt;
+    use core::mem::size_of;
+
+    let frame_base = frame as *const SyscallFrame as u64;
+
+    // Read callee-saved registers and user return state from the SYSCALL
+    // frame on the user stack. Layout above the SyscallFrame (7 fields):
+    //   +56: R15, +64: R14, +72: R13, +80: R12, +88: RBP, +96: RBX,
+    //   +104: R11 (user RFLAGS), +112: RCX (user RIP)
+    // SAFETY: These addresses are within the SYSCALL frame pushed by
+    // syscall_entry, on the current (user) stack, still accessible.
+    let (r15, r14, r13, r12, rbp, rbx, user_rflags, user_rip, user_rsp) = unsafe {
+        (
+            *((frame_base + 56) as *const u64),
+            *((frame_base + 64) as *const u64),
+            *((frame_base + 72) as *const u64),
+            *((frame_base + 80) as *const u64),
+            *((frame_base + 88) as *const u64),
+            *((frame_base + 96) as *const u64),
+            *((frame_base + 104) as *const u64),  // R11 = user RFLAGS
+            *((frame_base + 112) as *const u64),  // RCX = user RIP
+            frame_base + 120,                      // user RSP (above all pushes)
+        )
+    };
+
+    // Build SavedContext on the kernel stack (same position as the initial
+    // dispatch context — kstack_top - sizeof(SavedContext)).
+    let saved_ctx_addr = kernel_stack_top - size_of::<SavedContext>() as u64;
+
+    // SAFETY: saved_ctx_addr is within the task's kernel stack (heap-allocated,
+    // in HHDM space). The SavedContext will be restored by the timer ISR's
+    // iretq, returning to user space at user_rip with RAX=return_value.
+    unsafe {
+        core::ptr::write(saved_ctx_addr as *mut SavedContext, SavedContext {
+            r15, r14, r13, r12,
+            r11: 0, r10: 0, r9: 0, r8: 0,
+            rbp,
+            rdi: 0, rsi: 0, rdx: 0, rcx: 0,
+            rbx,
+            rax: return_value,
+            rip: user_rip,
+            cs: gdt::USER_CS as u64,
+            rflags: user_rflags,
+            rsp: user_rsp,
+            ss: gdt::USER_SS as u64,
+        });
+    }
+
+    // Update saved_rsp in the scheduler so the ISR dispatches from here
+    {
+        let mut sched_guard = crate::local_scheduler().lock();
+        if let Some(sched) = sched_guard.as_mut() {
+            if let Some(task) = sched.get_task_mut_pub(task_id) {
+                task.saved_rsp = saved_ctx_addr;
+            }
+        }
+    }
+
+    // Halt BELOW the SavedContext on the kernel stack. The timer ISR will
+    // push its own 160-byte frame downward from RSP — if we halted at
+    // kernel_stack_top, that frame would overwrite our synthetic context.
+    // Halting at saved_ctx_addr puts the ISR frame below the context.
+    super::halt_until_preempted(saved_ctx_addr);
 }

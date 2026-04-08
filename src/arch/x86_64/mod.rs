@@ -393,7 +393,7 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
         }
     }
 
-    // Send End-of-Interrupt to PIC (MUST happen before iretq)
+    // Send End-of-Interrupt to APIC (MUST happen before iretq)
     // SAFETY: We are in a hardware interrupt handler (vector 32 = timer).
     // SAFETY: APIC is initialized before interrupts are enabled.
     // Writing to the EOI register signals completion of this interrupt.
@@ -402,4 +402,37 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
     }
 
     new_rsp
+}
+
+/// Halt with interrupts enabled until preempted by the timer ISR.
+///
+/// Switches to the given kernel stack before enabling interrupts, because
+/// the SYSCALL handler runs on the user stack (SYSCALL doesn't switch RSP).
+/// If the timer ISR's CR3 switch ran on the user stack, the page table
+/// change would remap the stack to a different physical page (the new task's
+/// zeroed user stack), corrupting all local variables. The kernel stack is
+/// in HHDM space, which is mapped identically in all page tables.
+///
+/// # Safety
+/// `kernel_stack_top` must be a valid, mapped kernel stack address (HHDM).
+/// The scheduler lock must NOT be held.
+pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
+    // SAFETY: We switch RSP to a valid kernel stack, then enable interrupts
+    // and halt. The timer ISR fires within 10ms (100Hz), detects the
+    // Terminated current_task, and context-switches to a Ready task. The
+    // ISR's iretq goes to the new task — this code is never resumed.
+    //
+    // The `noreturn` option tells the compiler this never returns, matching
+    // the `-> !` return type.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {kstack}",
+            "2:",
+            "sti",
+            "hlt",
+            "jmp 2b",
+            kstack = in(reg) kernel_stack_top,
+            options(noreturn),
+        );
+    }
 }
