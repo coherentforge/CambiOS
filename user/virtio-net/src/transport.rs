@@ -58,27 +58,42 @@ impl LegacyTransport {
     // -- Register access (all go through the kernel PortIo syscall) ----------
 
     fn read8(&self, offset: u16) -> u8 {
-        sys::port_read8(self.io_base + offset).unwrap_or(0xFF)
+        match sys::port_read8(self.io_base + offset) {
+            Ok(v) => v,
+            Err(_) => { sys::print(b"[NET] port_read8 ERR\n"); 0xFF }
+        }
     }
 
     fn write8(&self, offset: u16, val: u8) {
-        let _ = sys::port_write8(self.io_base + offset, val);
+        if sys::port_write8(self.io_base + offset, val).is_err() {
+            sys::print(b"[NET] port_write8 ERR\n");
+        }
     }
 
     fn read16(&self, offset: u16) -> u16 {
-        sys::port_read16(self.io_base + offset).unwrap_or(0xFFFF)
+        match sys::port_read16(self.io_base + offset) {
+            Ok(v) => v,
+            Err(_) => { sys::print(b"[NET] port_read16 ERR\n"); 0xFFFF }
+        }
     }
 
     fn write16(&self, offset: u16, val: u16) {
-        let _ = sys::port_write16(self.io_base + offset, val);
+        if sys::port_write16(self.io_base + offset, val).is_err() {
+            sys::print(b"[NET] port_write16 ERR\n");
+        }
     }
 
     fn read32(&self, offset: u16) -> u32 {
-        sys::port_read32(self.io_base + offset).unwrap_or(0xFFFFFFFF)
+        match sys::port_read32(self.io_base + offset) {
+            Ok(v) => v,
+            Err(_) => { sys::print(b"[NET] port_read32 ERR\n"); 0xFFFFFFFF }
+        }
     }
 
     fn write32(&self, offset: u16, val: u32) {
-        let _ = sys::port_write32(self.io_base + offset, val);
+        if sys::port_write32(self.io_base + offset, val).is_err() {
+            sys::print(b"[NET] port_write32 ERR\n");
+        }
     }
 
     // -- Device lifecycle ----------------------------------------------------

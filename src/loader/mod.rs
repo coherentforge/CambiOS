@@ -27,8 +27,8 @@ use core::mem::size_of;
 /// Per-task kernel stack size (8 KB) — matches main.rs
 const KERNEL_STACK_SIZE: usize = 8192;
 
-/// Default user stack: 4 pages (16 KB)
-const DEFAULT_STACK_PAGES: usize = 4;
+/// Default user stack: 16 pages (64 KB)
+const DEFAULT_STACK_PAGES: usize = 16;
 
 /// Default user stack top virtual address
 const DEFAULT_STACK_TOP: u64 = 0x80_0000;

@@ -390,13 +390,25 @@ pub extern "C" fn _start() -> ! {
     sys::print(b"[NET] Found virtio-net PCI device\n");
 
     // Step 2: Find the I/O BAR (BAR 0 for legacy virtio)
-    let io_bar = &dev.bars[0];
-    if !io_bar.is_io || io_bar.addr == 0 {
-        sys::print(b"[NET] BAR 0 is not an I/O BAR\n");
-        sys::register_endpoint(NET_ENDPOINT);
-        no_device_loop();
+    // Try all BARs — the I/O BAR might not be BAR 0 on all configurations
+    let mut io_base: u16 = 0;
+    for b in 0..6 {
+        if dev.bars[b].is_io && dev.bars[b].addr != 0 {
+            io_base = dev.bars[b].addr as u16;
+            break;
+        }
     }
-    let io_base = io_bar.addr as u16;
+    if io_base == 0 {
+        // Fallback: check if BAR0 looks like an I/O port (addr < 0x10000)
+        if dev.bars[0].addr != 0 && dev.bars[0].addr < 0x10000 {
+            sys::print(b"[NET] BAR 0 appears to be I/O (addr < 64K), using it\n");
+            io_base = dev.bars[0].addr as u16;
+        } else {
+            sys::print(b"[NET] No I/O BAR found\n");
+            sys::register_endpoint(NET_ENDPOINT);
+            no_device_loop();
+        }
+    }
 
     // Step 3: Initialize the virtio device + queues
     let mut driver = match NetDriver::init(io_base) {

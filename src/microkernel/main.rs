@@ -331,11 +331,11 @@ unsafe extern "C" fn kmain() -> ! {
 
     // Initialize microkernel subsystems
     process_table_init();  // Must be before scheduler (user tasks need process table)
-    scheduler_init();
     ipc_init();
     capability_manager_init();
     bootstrap_identity_init();  // Must be after capability_manager_init (binds to processes)
     object_store_init();        // Must be after heap init (heap-allocated)
+    scheduler_init();           // Must be after bootstrap_identity_init (boot modules need signing key)
 
     println!("✓ Task scheduler initialized");
     println!("✓ IPC subsystem ready");
@@ -386,6 +386,13 @@ unsafe extern "C" fn kmain() -> ! {
                     dev.bus, dev.device, dev.function,
                     dev.vendor_id, dev.device_id,
                     dev.class, dev.subclass);
+                for b in 0..6 {
+                    if dev.bars[b] != 0 {
+                        println!("    BAR{}: {:#x} size={} {}",
+                            b, dev.bars[b], dev.bar_sizes[b],
+                            if dev.bar_is_io[b] { "I/O" } else { "MMIO" });
+                    }
+                }
             }
         }
         println!();
@@ -914,7 +921,7 @@ const USER_CODE_VADDR: u64 = 0x40_0000;
 /// User virtual address for the top of the user stack (grows down)
 const USER_STACK_TOP: u64 = 0x80_0000;
 /// User stack size in pages
-const USER_STACK_PAGES: usize = 4; // 16 KB
+const USER_STACK_PAGES: usize = 16; // 64 KB
 
 // User-mode entry function — x86_64 (pure assembly, position-independent).
 //

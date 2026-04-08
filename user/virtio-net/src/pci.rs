@@ -47,11 +47,16 @@ impl PciDeviceInfo {
 
         let mut bars = [BarInfo::default(); 6];
         for i in 0..6 {
-            let off = 12 + i * 16;
+            let o = 12 + i * 16;
             bars[i] = BarInfo {
-                addr: u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8])),
-                size: u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap_or([0; 4])),
-                is_io: buf[off + 12] != 0,
+                addr: u64::from_le_bytes([
+                    buf[o], buf[o+1], buf[o+2], buf[o+3],
+                    buf[o+4], buf[o+5], buf[o+6], buf[o+7],
+                ]),
+                size: u32::from_le_bytes([
+                    buf[o+8], buf[o+9], buf[o+10], buf[o+11],
+                ]),
+                is_io: buf[o + 12] != 0,
             };
         }
 
