@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 //!
 //! Replaces the Limine-provided GDT with our own that includes:
@@ -126,7 +128,8 @@ struct GdtDescriptor {
 /// After this, all code using the old Limine selectors (0x28/0x30) will
 /// use the new selectors (0x08/0x10).
 pub unsafe fn init() {
-    init_for_cpu(0);
+    // SAFETY: Caller ensures single-threaded init with interrupts disabled.
+    unsafe { init_for_cpu(0) };
 }
 
 /// Load a per-CPU GDT, reload segment registers, install the TSS, and load TR.
@@ -166,7 +169,7 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
 
     // SAFETY: CPU_TSS is a static array with stable addresses. We index within
     // bounds (asserted above). Taking a raw pointer to read the address is safe.
-    let tss_ptr = &raw const CPU_TSS[cpu_index];
+    let tss_ptr = unsafe { &raw const CPU_TSS[cpu_index] };
     let tss_addr = tss_ptr as u64;
     let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
 
@@ -181,14 +184,16 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
 
     // SAFETY: Interrupts disabled, called once per CPU. We write the TSS
     // descriptor into this CPU's GDT slots 5 and 6 (within bounds).
-    let gdt_ptr = &raw mut CPU_GDT[cpu_index];
-    (*gdt_ptr)[5] = low;
-    (*gdt_ptr)[6] = high;
+    unsafe {
+        let gdt_ptr = &raw mut CPU_GDT[cpu_index];
+        (*gdt_ptr)[5] = low;
+        (*gdt_ptr)[6] = high;
+    }
 
     // ---- Load this CPU's GDT ----
     // SAFETY: descriptor.base points to this CPU's static GDT array, limit is
     // computed from its actual size. GDT entries are correctly formed above.
-    let gdt_ref = &*(&raw const CPU_GDT[cpu_index]);
+    let gdt_ref = unsafe { &*(&raw const CPU_GDT[cpu_index]) };
     let descriptor = GdtDescriptor {
         limit: (core::mem::size_of_val(gdt_ref) - 1) as u16,
         base: gdt_ref.as_ptr() as u64,
@@ -196,24 +201,28 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
 
     // SAFETY: descriptor is a valid GDT pseudo-descriptor pointing to our static GDT.
     // Interrupts are disabled so no handler can reference stale selectors.
-    core::arch::asm!(
-        "lgdt [{0}]",
-        in(reg) &descriptor,
-        options(nostack, preserves_flags),
-    );
+    unsafe {
+        core::arch::asm!(
+            "lgdt [{0}]",
+            in(reg) &descriptor,
+            options(nostack, preserves_flags),
+        );
+    }
 
     // SAFETY: CS and data segment registers must be reloaded to activate the new GDT.
     // gdt_reload_segments uses a far-return to switch CS=0x08 and sets DS/ES/FS/GS/SS=0x10.
-    gdt_reload_segments();
+    unsafe { gdt_reload_segments() };
 
     // ---- Load Task Register with TSS selector ----
     // SAFETY: TSS descriptor is in GDT slots 5-6 at selector 0x28. The descriptor
     // is type=0x9 (Available 64-bit TSS). ltr marks it Busy. Called once per CPU.
-    core::arch::asm!(
-        "ltr {0:x}",
-        in(reg) TSS_SELECTOR,
-        options(nostack, nomem),
-    );
+    unsafe {
+        core::arch::asm!(
+            "ltr {0:x}",
+            in(reg) TSS_SELECTOR,
+            options(nostack, nomem),
+        );
+    }
 }
 
 /// Update the kernel stack pointer (RSP0) in the current CPU's TSS.
@@ -228,11 +237,13 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
 pub unsafe fn set_kernel_stack(rsp0: u64) {
     // SAFETY: Called with interrupts disabled. Per-CPU data is initialized.
     // current_percpu() returns this CPU's PerCpu (via GS base).
-    let cpu_idx = super::percpu::current_percpu().cpu_id() as usize;
+    let cpu_idx = unsafe { super::percpu::current_percpu() }.cpu_id() as usize;
     // SAFETY: cpu_idx is in 0..MAX_CPUS (set during percpu init).
     // CPU_TSS is a static array; we write only the rsp0 field of our CPU's entry.
-    let tss_ptr = &raw mut CPU_TSS[cpu_idx];
-    (*tss_ptr).rsp0 = rsp0;
+    unsafe {
+        let tss_ptr = &raw mut CPU_TSS[cpu_idx];
+        (*tss_ptr).rsp0 = rsp0;
+    }
 }
 
 /// Set an Interrupt Stack Table entry in the current CPU's TSS.
@@ -249,10 +260,12 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
 pub unsafe fn set_ist(index: usize, stack_top: u64) {
     assert!(index < 7, "IST index must be 0..6");
     // SAFETY: Called with interrupts disabled. Per-CPU data is initialized.
-    let cpu_idx = super::percpu::current_percpu().cpu_id() as usize;
+    let cpu_idx = unsafe { super::percpu::current_percpu() }.cpu_id() as usize;
     // SAFETY: cpu_idx is in 0..MAX_CPUS. We write only the IST entry.
-    let tss_ptr = &raw mut CPU_TSS[cpu_idx];
-    (*tss_ptr).ist[index] = stack_top;
+    unsafe {
+        let tss_ptr = &raw mut CPU_TSS[cpu_idx];
+        (*tss_ptr).ist[index] = stack_top;
+    }
 }
 
 extern "C" {

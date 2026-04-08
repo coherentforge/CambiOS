@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Timer tick management for tick-based scheduling
 //!
 //! Handles timer interrupts and signals scheduling points.

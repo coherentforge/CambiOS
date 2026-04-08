@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 /// Process management, heap allocation, and virtual memory area tracking
 ///
 /// Manages per-process state including memory allocators and VMA tracking.

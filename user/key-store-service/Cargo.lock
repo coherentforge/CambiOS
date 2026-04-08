@@ -6,8 +6,13 @@ version = 4
 name = "arcos-key-store-service"
 version = "0.1.0"
 dependencies = [
+ "arcos-libsys",
  "ed25519-compact",
 ]
+
+[[package]]
+name = "arcos-libsys"
+version = "0.1.0"
 
 [[package]]
 name = "ed25519-compact"

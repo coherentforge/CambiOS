@@ -1,7 +1,12 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 [package]
 name = "arcos-fs-service"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
 
 [profile.release]
 opt-level = "s"        # Size-optimized (small ELF)

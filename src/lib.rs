@@ -1,6 +1,11 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![allow(dead_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 //! ArcOS Microkernel - Verification-Ready Core
 //!
@@ -28,6 +33,8 @@ pub mod syscalls;
 pub mod process;
 pub mod acpi;
 pub mod fs;
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
 
 // Kernel heap allocator — initialized from Limine memory map in kmain
 #[cfg(not(test))]
@@ -576,11 +583,12 @@ pub fn kernel_cr3() -> u64 {
 /// no prior IDT loaded, interrupts disabled).
 pub unsafe fn init() {
     // SAFETY: Called once during boot; serial port 0x3F8 is the standard COM1 address.
-    io::init();
-    memory::init();
+    unsafe { io::init() };
+    // SAFETY: Called once during boot; memory subsystem not yet initialized.
+    unsafe { memory::init() };
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Called once during boot with interrupts disabled; IDT not yet loaded.
-    interrupts::init();
+    unsafe { interrupts::init() };
 }
 
 /// Halt the system

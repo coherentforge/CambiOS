@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Memory management subsystem
 //!
 //! Handles memory initialization, paging, and allocation strategies.
@@ -164,7 +166,7 @@ pub mod paging {
         let ptr = phys_to_virt(table_phys);
         // SAFETY: table_phys is a valid page table frame, index is in bounds.
         // HHDM maps the frame to a valid VA. Volatile read for hardware coherency.
-        core::ptr::read_volatile(ptr.add(index))
+        unsafe { core::ptr::read_volatile(ptr.add(index)) }
     }
 
     /// Write a page table entry at a given level and index.
@@ -176,7 +178,7 @@ pub mod paging {
         debug_assert!(index < ENTRIES_PER_TABLE);
         let ptr = phys_to_virt(table_phys);
         // SAFETY: Same as read_entry. Volatile write ensures hardware sees update.
-        core::ptr::write_volatile(ptr.add(index), value);
+        unsafe { core::ptr::write_volatile(ptr.add(index), value) };
     }
 
     /// Walk levels L0→L1→L2, allocating intermediate tables as needed.
@@ -192,29 +194,32 @@ pub mod paging {
         let indices = [l0_index(va), l1_index(va), l2_index(va)];
         let mut table_phys = root_phys;
 
-        for &idx in &indices {
-            // SAFETY: table_phys is valid (root or newly allocated frame).
-            let entry = read_entry(table_phys, idx);
-            if entry & DESC_VALID != 0 {
-                // Entry exists — descend
-                table_phys = entry & ADDR_MASK;
-            } else {
-                // Allocate a new table frame
-                let frame = frame_alloc
-                    .allocate()
-                    .map_err(|_| PagingError::FrameAllocationFailed)?;
-                // Zero the new table
-                // SAFETY: frame.addr is a freshly allocated frame, HHDM maps it.
-                core::ptr::write_bytes(
-                    phys_to_virt(frame.addr) as *mut u8,
-                    0,
-                    PAGE_SIZE as usize,
-                );
-                // Install table descriptor: Valid + Table + ISH + AF + Normal
-                let desc = frame.addr | DESC_VALID | DESC_TABLE;
-                // SAFETY: table_phys and idx are valid.
-                write_entry(table_phys, idx, desc);
-                table_phys = frame.addr;
+        // SAFETY: Caller guarantees root_phys is a valid page table. Each
+        // iteration either descends into an existing valid table or allocates
+        // a fresh zeroed frame and installs a table descriptor.
+        unsafe {
+            for &idx in &indices {
+                let entry = read_entry(table_phys, idx);
+                if entry & DESC_VALID != 0 {
+                    // Entry exists — descend
+                    table_phys = entry & ADDR_MASK;
+                } else {
+                    // Allocate a new table frame
+                    let frame = frame_alloc
+                        .allocate()
+                        .map_err(|_| PagingError::FrameAllocationFailed)?;
+                    // Zero the new table
+                    // SAFETY: frame.addr is a freshly allocated frame, HHDM maps it.
+                    core::ptr::write_bytes(
+                        phys_to_virt(frame.addr) as *mut u8,
+                        0,
+                        PAGE_SIZE as usize,
+                    );
+                    // Install table descriptor: Valid + Table + ISH + AF + Normal
+                    let desc = frame.addr | DESC_VALID | DESC_TABLE;
+                    write_entry(table_phys, idx, desc);
+                    table_phys = frame.addr;
+                }
             }
         }
 
@@ -227,13 +232,16 @@ pub mod paging {
         let indices = [l0_index(va), l1_index(va), l2_index(va)];
         let mut table_phys = root_phys;
 
-        for &idx in &indices {
-            // SAFETY: table_phys is valid.
-            let entry = read_entry(table_phys, idx);
-            if entry & DESC_VALID == 0 {
-                return None;
+        // SAFETY: Caller guarantees root_phys is a valid page table.
+        // Each level descends through valid table descriptors.
+        unsafe {
+            for &idx in &indices {
+                let entry = read_entry(table_phys, idx);
+                if entry & DESC_VALID == 0 {
+                    return None;
+                }
+                table_phys = entry & ADDR_MASK;
             }
-            table_phys = entry & ADDR_MASK;
         }
 
         Some(table_phys)
@@ -251,11 +259,13 @@ pub mod paging {
     pub unsafe fn active_page_table() -> PageTableRef {
         let ttbr0: u64;
         // SAFETY: Reading TTBR0_EL1 from EL1 is always safe.
-        core::arch::asm!(
-            "mrs {0}, ttbr0_el1",
-            out(reg) ttbr0,
-            options(nostack, nomem, preserves_flags),
-        );
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, ttbr0_el1",
+                out(reg) ttbr0,
+                options(nostack, nomem, preserves_flags),
+            );
+        }
         PageTableRef {
             root_phys: ttbr0 & ADDR_MASK,
         }
@@ -303,14 +313,18 @@ pub mod paging {
         }
 
         // Build L3 page descriptor:
-        // Valid + Page(1) + AF + ISH + Normal memory + user flags
+        // Valid + Page(1) + AF + ISH + memory type + user flags
+        let is_device = page_flags.0 & flags::DEVICE_MEMORY_FLAG != 0;
+        let attr = if is_device { DESC_ATTR_DEVICE } else { DESC_ATTR_NORMAL };
+        // Strip the internal DEVICE_MEMORY_FLAG before writing to hardware
+        let hw_flags = page_flags.0 & !flags::DEVICE_MEMORY_FLAG;
         let desc = pa
             | DESC_VALID
             | DESC_TABLE  // At L3, bit[1]=1 means "page" descriptor
             | DESC_AF
             | DESC_ISH
-            | DESC_ATTR_NORMAL
-            | page_flags.0;
+            | attr
+            | hw_flags;
 
         // SAFETY: l3_phys and idx are valid.
         unsafe { write_entry(l3_phys, idx, desc) };
@@ -481,13 +495,17 @@ pub mod paging {
     /// find the physical address.
     #[cfg(target_arch = "aarch64")]
     unsafe fn kernel_virt_to_phys(ttbr1_root: u64, va: u64) -> Option<u64> {
-        let l3_phys = walk_to_l3_readonly(ttbr1_root, va)?;
-        let idx = l3_index(va);
-        let entry = read_entry(l3_phys, idx);
-        if entry & DESC_VALID == 0 {
-            return None;
+        // SAFETY: Caller guarantees ttbr1_root is the TTBR1 root page table.
+        // walk_to_l3_readonly and read_entry access valid HHDM-mapped tables.
+        unsafe {
+            let l3_phys = walk_to_l3_readonly(ttbr1_root, va)?;
+            let idx = l3_index(va);
+            let entry = read_entry(l3_phys, idx);
+            if entry & DESC_VALID == 0 {
+                return None;
+            }
+            Some((entry & ADDR_MASK) + (va & 0xFFF))
         }
-        Some((entry & ADDR_MASK) + (va & 0xFFF))
     }
 
     /// Allocate one bootstrap frame (physical address).
@@ -501,8 +519,13 @@ pub mod paging {
         if idx >= 3 {
             return None;
         }
-        let virt = &BOOTSTRAP_FRAMES[idx] as *const _ as u64;
-        kernel_virt_to_phys(ttbr1_root, virt)
+        // SAFETY: idx is bounds-checked above (< 3). BOOTSTRAP_FRAMES is a static
+        // array — accessing it during single-core boot is safe (no aliasing).
+        // kernel_virt_to_phys walks valid TTBR1 page tables.
+        unsafe {
+            let virt = &BOOTSTRAP_FRAMES[idx] as *const _ as u64;
+            kernel_virt_to_phys(ttbr1_root, virt)
+        }
     }
 
     /// Map a single 4KB MMIO page into the kernel page table (TTBR1_EL1).
@@ -524,72 +547,78 @@ pub mod paging {
         let hhdm_off = hhdm();
         let va = pa + hhdm_off; // HHDM virtual address for this MMIO page
 
-        // Read TTBR1_EL1 (kernel page table root)
-        let ttbr1: u64;
-        // SAFETY: Reading TTBR1_EL1 from EL1 is always safe.
-        core::arch::asm!(
-            "mrs {0}, ttbr1_el1",
-            out(reg) ttbr1,
-            options(nostack, nomem, preserves_flags),
-        );
-        let root_phys = ttbr1 & ADDR_MASK;
+        // SAFETY: All operations below access HHDM-mapped page tables and
+        // bootstrap frames during single-core boot. Inline asm reads/writes
+        // system registers from EL1. Caller guarantees HHDM offset is set
+        // and phys_addr is a valid MMIO address.
+        unsafe {
+            // Read TTBR1_EL1 (kernel page table root)
+            let ttbr1: u64;
+            // SAFETY: Reading TTBR1_EL1 from EL1 is always safe.
+            core::arch::asm!(
+                "mrs {0}, ttbr1_el1",
+                out(reg) ttbr1,
+                options(nostack, nomem, preserves_flags),
+            );
+            let root_phys = ttbr1 & ADDR_MASK;
 
-        // Walk L0 → L1 → L2, allocating missing levels from bootstrap pool
-        let indices = [l0_index(va), l1_index(va), l2_index(va)];
-        let mut table_phys = root_phys;
+            // Walk L0 → L1 → L2, allocating missing levels from bootstrap pool
+            let indices = [l0_index(va), l1_index(va), l2_index(va)];
+            let mut table_phys = root_phys;
 
-        for &idx in &indices {
-            let entry = read_entry(table_phys, idx);
-            if entry & DESC_VALID != 0 {
-                // Entry exists — descend
-                table_phys = entry & ADDR_MASK;
-            } else {
-                // Allocate from bootstrap pool
-                let frame_phys = bootstrap_alloc(root_phys)
-                    .ok_or("early_map_mmio: bootstrap frames exhausted")?;
-                // Zero the new table via HHDM
-                core::ptr::write_bytes(
-                    phys_to_virt(frame_phys) as *mut u8,
-                    0,
-                    PAGE_SIZE as usize,
-                );
-                // Install table descriptor
-                let desc = frame_phys | DESC_VALID | DESC_TABLE;
-                write_entry(table_phys, idx, desc);
-                table_phys = frame_phys;
+            for &idx in &indices {
+                let entry = read_entry(table_phys, idx);
+                if entry & DESC_VALID != 0 {
+                    // Entry exists — descend
+                    table_phys = entry & ADDR_MASK;
+                } else {
+                    // Allocate from bootstrap pool
+                    let frame_phys = bootstrap_alloc(root_phys)
+                        .ok_or("early_map_mmio: bootstrap frames exhausted")?;
+                    // Zero the new table via HHDM
+                    core::ptr::write_bytes(
+                        phys_to_virt(frame_phys) as *mut u8,
+                        0,
+                        PAGE_SIZE as usize,
+                    );
+                    // Install table descriptor
+                    let desc = frame_phys | DESC_VALID | DESC_TABLE;
+                    write_entry(table_phys, idx, desc);
+                    table_phys = frame_phys;
+                }
             }
+
+            // Now table_phys is the L3 table. Write the page entry.
+            let idx = l3_index(va);
+            let existing = read_entry(table_phys, idx);
+            if existing & DESC_VALID != 0 {
+                // Already mapped — that's fine for MMIO
+                return Ok(());
+            }
+
+            // Device memory descriptor: Valid + Page + AF + ISH + AttrIndx=0 (Device)
+            // + PXN + UXN (never execute MMIO)
+            let desc = pa
+                | DESC_VALID
+                | DESC_TABLE  // At L3, bit[1]=1 means "page"
+                | DESC_AF
+                | DESC_ISH
+                | DESC_ATTR_DEVICE
+                | DESC_PXN
+                | DESC_UXN;
+
+            write_entry(table_phys, idx, desc);
+
+            // Ensure mapping is visible
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vale1is, {va}",
+                "dsb ish",
+                "isb",
+                va = in(reg) va >> 12,
+                options(nostack),
+            );
         }
-
-        // Now table_phys is the L3 table. Write the page entry.
-        let idx = l3_index(va);
-        let existing = read_entry(table_phys, idx);
-        if existing & DESC_VALID != 0 {
-            // Already mapped — that's fine for MMIO
-            return Ok(());
-        }
-
-        // Device memory descriptor: Valid + Page + AF + ISH + AttrIndx=0 (Device)
-        // + PXN + UXN (never execute MMIO)
-        let desc = pa
-            | DESC_VALID
-            | DESC_TABLE  // At L3, bit[1]=1 means "page"
-            | DESC_AF
-            | DESC_ISH
-            | DESC_ATTR_DEVICE
-            | DESC_PXN
-            | DESC_UXN;
-
-        write_entry(table_phys, idx, desc);
-
-        // Ensure mapping is visible
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vale1is, {va}",
-            "dsb ish",
-            "isb",
-            va = in(reg) va >> 12,
-            options(nostack),
-        );
 
         Ok(())
     }
@@ -624,6 +653,16 @@ pub mod paging {
         pub fn user_rw() -> PageFlags {
             PageFlags(DESC_AP_EL0 | DESC_UXN | DESC_PXN)
         }
+
+        /// Bit 62 is unused in AArch64 descriptors — we repurpose it as an
+        /// internal flag to signal device memory (AttrIndx=0 instead of 1).
+        pub(super) const DEVICE_MEMORY_FLAG: u64 = 1 << 62;
+
+        /// User MMIO: EL0 RW, device memory (uncacheable), no execute.
+        /// For mapping device MMIO regions into user-space processes.
+        pub fn user_mmio() -> PageFlags {
+            PageFlags(DESC_AP_EL0 | DESC_UXN | DESC_PXN | DEVICE_MEMORY_FLAG)
+        }
     }
 }
 
@@ -655,7 +694,7 @@ static MEMORY_STATE: AtomicU8 = AtomicU8::new(MemoryInitState::Uninitialized as 
 /// Must be called once during boot. Currently a placeholder.
 pub unsafe fn init() {
     // SAFETY: configure_memory only writes an atomic; no actual unsafe memory ops yet.
-    configure_memory();
+    unsafe { configure_memory() };
     MEMORY_STATE.store(MemoryInitState::Ready as u8, Ordering::Release);
 }
 
@@ -697,5 +736,5 @@ pub unsafe fn get_page_table() -> Option<&'static mut PageTable> {
     // SAFETY: CR3 points to a valid PML4 frame set up by Limine or create_process_page_table.
     // Adding the HHDM offset gives a kernel-accessible virtual address. The borrow is
     // 'static because the page table lives as long as the kernel does.
-    Some(&mut *virt_addr)
+    Some(unsafe { &mut *virt_addr })
 }

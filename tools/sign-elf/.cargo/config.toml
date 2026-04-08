@@ -1,3 +1,5 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 # Override parent project's bare-metal target — this is a host tool
 [build]
 target = "aarch64-apple-darwin"

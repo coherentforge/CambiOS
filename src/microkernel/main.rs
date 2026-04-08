@@ -1,5 +1,8 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 #![no_std]
 #![no_main]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 //! ArcOS Microkernel Main
 //!
@@ -228,7 +231,7 @@ unsafe extern "C" fn kmain() -> ! {
     // Verify Limine protocol is supported (panics with a message if not)
     assert!(BASE_REVISION.is_supported(), "Limine base revision not supported!");
 
-    println!("=== ArcOS Microkernel [v0.1.0] ===");
+    println!("=== ArcOS Microkernel [v0.2.0] ===");
     println!("Booted via Limine\n");
 
     let hhdm_offset = arcos_core::hhdm_offset();
@@ -370,7 +373,22 @@ unsafe extern "C" fn kmain() -> ! {
         unsafe {
             arcos_core::interrupts::init_hardware_interrupts(100, rsdp_phys);
         }
-        println!("✓ APIC-driven scheduling active\n");
+        println!("✓ APIC-driven scheduling active");
+
+        // PCI bus scan — discover devices for user-space drivers
+        // SAFETY: Single-threaded boot, interrupts just enabled but no PCI drivers yet.
+        unsafe { arcos_core::pci::scan() };
+        let pci_count = arcos_core::pci::device_count();
+        println!("✓ PCI: {} device(s) discovered", pci_count);
+        for i in 0..pci_count {
+            if let Some(dev) = arcos_core::pci::get_device(i) {
+                println!("  PCI {:02x}:{:02x}.{} — {:04x}:{:04x} class {:02x}:{:02x}",
+                    dev.bus, dev.device, dev.function,
+                    dev.vendor_id, dev.device_id,
+                    dev.class, dev.subclass);
+            }
+        }
+        println!();
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1801,27 +1819,27 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
     // Step 1: Load this AP's GDT + TSS (replaces Limine's)
     // SAFETY: Interrupts disabled, called once per AP.
-    arcos_core::arch::gdt::init_for_cpu(cpu_index);
+    unsafe { arcos_core::arch::gdt::init_for_cpu(cpu_index) };
 
     // Step 2: Initialize per-CPU data (writes GS base MSR)
     // SAFETY: GDT loaded (GS base will be overwritten by percpu init). One-time per AP.
-    arcos_core::arch::x86_64::percpu::init_ap(cpu_index, apic_id);
+    unsafe { arcos_core::arch::x86_64::percpu::init_ap(cpu_index, apic_id) };
 
     // Step 3: Load the shared IDT (configured by BSP)
     // SAFETY: BSP has fully configured and loaded the IDT.
-    arcos_core::interrupts::load_idt_ap();
+    unsafe { arcos_core::interrupts::load_idt_ap() };
 
     // Step 4: Initialize SYSCALL/SYSRET MSRs (per-CPU)
     // SAFETY: GDT loaded, per-CPU init done.
-    arcos_core::arch::syscall::init();
+    unsafe { arcos_core::arch::syscall::init() };
 
     // Step 5: Enable this AP's Local APIC
     // SAFETY: BSP already mapped the APIC MMIO page (shared page tables).
-    arcos_core::arch::x86_64::apic::init_ap();
+    unsafe { arcos_core::arch::x86_64::apic::init_ap() };
 
     // Step 6: Configure APIC timer using BSP's calibration values
     // SAFETY: BSP has completed configure_timer() and stored the initial count.
-    arcos_core::arch::x86_64::apic::configure_timer_ap();
+    unsafe { arcos_core::arch::x86_64::apic::configure_timer_ap() };
 
     // Step 7: Initialize per-CPU scheduler and timer
     // Each AP needs its own Scheduler (with idle task) so migrated tasks
@@ -1870,30 +1888,31 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     let cpu_index = cpu.extra.load(core::sync::atomic::Ordering::Acquire) as usize;
     let mpidr_aff = cpu.mpidr;
 
-    // Step 1: Per-CPU EL1 config (no-op on AArch64)
-    arcos_core::arch::gdt::init_for_cpu(cpu_index);
+    // SAFETY: All steps below are called exactly once per AP during the AP
+    // startup sequence. BSP has already initialized shared hardware (GIC
+    // distributor, timer frequency). Each unsafe call initialises per-CPU
+    // state (TPIDR_EL1, VBAR_EL1, GIC CPU interface, GICR, timer).
+    unsafe {
+        // Step 1: Per-CPU EL1 config (no-op on AArch64)
+        arcos_core::arch::gdt::init_for_cpu(cpu_index);
 
-    // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
-    // SAFETY: Called once per AP during init.
-    arcos_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
+        // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
+        arcos_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
 
-    // Step 3: Install exception vector table (per-CPU VBAR_EL1)
-    // SAFETY: Exception vector table is shared and already initialized by BSP.
-    arcos_core::arch::syscall::init();
+        // Step 3: Install exception vector table (per-CPU VBAR_EL1)
+        arcos_core::arch::syscall::init();
 
-    // Step 4: Initialize GIC CPU interface for this AP
-    // SAFETY: GIC distributor already initialized by BSP.
-    arcos_core::arch::aarch64::gic::init();
+        // Step 4: Initialize GIC CPU interface for this AP
+        arcos_core::arch::aarch64::gic::init();
 
-    // Step 5: Initialize GIC Redistributor for this AP
-    // SAFETY: GICR physical base at QEMU virt address, translated through HHDM.
-    const GICR_PHYS: u64 = 0x080A_0000;
-    let hhdm = arcos_core::hhdm_offset();
-    arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
+        // Step 5: Initialize GIC Redistributor for this AP
+        const GICR_PHYS: u64 = 0x080A_0000;
+        let hhdm = arcos_core::hhdm_offset();
+        arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
 
-    // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
-    // SAFETY: BSP has completed timer::init(), COUNTER_FREQ and TIMER_RELOAD are set.
-    arcos_core::arch::aarch64::timer::init_ap();
+        // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
+        arcos_core::arch::aarch64::timer::init_ap();
+    }
 
     // Step 7: Initialize per-CPU scheduler and timer
     {
@@ -1918,7 +1937,9 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
     // Step 9: Enable interrupts and enter idle loop
     // SAFETY: All AP-local hardware is initialized.
-    core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); // Unmask IRQ
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); // Unmask IRQ
+    }
 
     loop {
         arcos_core::wfi();

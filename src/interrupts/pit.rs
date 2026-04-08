@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! 8253/8254 PIT (Programmable Interval Timer) driver
 //!
 //! Configures the PIT Channel 0 to generate periodic timer interrupts
@@ -51,15 +53,17 @@ pub unsafe fn init(frequency_hz: u32) -> u16 {
         }
     };
 
-    let mut cmd_port = Port::<u8>::new(PIT_COMMAND);
-    let mut data_port = Port::<u8>::new(PIT_CHANNEL0);
+    unsafe {
+        let mut cmd_port = Port::<u8>::new(PIT_COMMAND);
+        let mut data_port = Port::<u8>::new(PIT_CHANNEL0);
 
-    // Send command: Channel 0, lobyte/hibyte, rate generator
-    cmd_port.write(PIT_CMD_CHANNEL0_RATE);
+        // Send command: Channel 0, lobyte/hibyte, rate generator
+        cmd_port.write(PIT_CMD_CHANNEL0_RATE);
 
-    // Send divisor (low byte first, then high byte)
-    data_port.write((divisor & 0xFF) as u8);
-    data_port.write((divisor >> 8) as u8);
+        // Send divisor (low byte first, then high byte)
+        data_port.write((divisor & 0xFF) as u8);
+        data_port.write((divisor >> 8) as u8);
+    }
 
     divisor
 }

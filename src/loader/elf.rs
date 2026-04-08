@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! ELF binary format parser for x86-64
 //!
 //! Minimal ELF parser designed for verification-ready process loading.

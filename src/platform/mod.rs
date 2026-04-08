@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Platform abstraction layer
 //!
 //! Provides hardware-specific capabilities. Abstract enough for verification

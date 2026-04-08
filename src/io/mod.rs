@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! I/O subsystem for bootloader communication
 //!
 //! Provides abstractions for serial port communication and display output.
@@ -93,9 +95,9 @@ pub unsafe fn init() {
     #[cfg(target_arch = "x86_64")]
     {
         let mut guard = SERIAL1.lock();
-        let mut port = SerialPort::new(0x3f8);
         // SAFETY: 0x3F8 is the standard COM1 I/O port address.
         // Called once during single-core boot.
+        let mut port = unsafe { SerialPort::new(0x3f8) };
         port.init();
         *guard = Some(port);
     }

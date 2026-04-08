@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Architecture-specific code (x86-64)
 //!
 //! Implements CPU-specific primitives like context switching,
@@ -18,7 +20,9 @@
 pub mod apic;
 pub mod gdt;
 pub mod ioapic;
+pub mod msr;
 pub mod percpu;
+pub mod portio;
 pub mod syscall;
 pub mod tlb;
 

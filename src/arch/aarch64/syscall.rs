@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Syscall entry — AArch64
 //!
 //! AArch64 uses the SVC instruction (Supervisor Call) for syscalls, which
@@ -32,14 +34,17 @@ pub unsafe fn init() {
         static exception_vector_table: u8;
     }
 
-    let vbar = &exception_vector_table as *const u8 as u64;
+    // SAFETY: exception_vector_table is a properly aligned (.balign 2048)
+    // static symbol defined in mod.rs via global_asm!. Writing VBAR_EL1
+    // from EL1 during boot is safe.
+    unsafe {
+        let vbar = &exception_vector_table as *const u8 as u64;
 
-    // SAFETY: Writing VBAR_EL1 from EL1 during boot is safe. The vector
-    // table is a properly aligned (.balign 2048) static symbol.
-    core::arch::asm!(
-        "msr vbar_el1, {0}",
-        "isb",
-        in(reg) vbar,
-        options(nostack),
-    );
+        core::arch::asm!(
+            "msr vbar_el1, {0}",
+            "isb",
+            in(reg) vbar,
+            options(nostack),
+        );
+    }
 }

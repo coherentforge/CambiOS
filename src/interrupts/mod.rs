@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Interrupt handling subsystem
 //!
 //! Manages interrupt descriptor tables, exception handlers, and interrupt routing.
@@ -290,10 +292,14 @@ pub mod device_irqs {
 pub unsafe fn register_device_isrs() {
     use crate::arch::x86_64::ioapic::DEVICE_VECTOR_BASE;
 
-    let idt = &mut *(&raw mut IDT);
-    for (gsi, handler) in device_irqs::HANDLERS.iter().enumerate() {
-        let vector = DEVICE_VECTOR_BASE as usize + gsi;
-        idt[vector].set_handler_fn(*handler);
+    // SAFETY: Single-threaded init before IDT reload. IDT is a mutable static
+    // but no concurrent access is possible with interrupts disabled.
+    unsafe {
+        let idt = &mut *(&raw mut IDT);
+        for (gsi, handler) in device_irqs::HANDLERS.iter().enumerate() {
+            let vector = DEVICE_VECTOR_BASE as usize + gsi;
+            idt[vector].set_handler_fn(*handler);
+        }
     }
 }
 
@@ -302,9 +308,11 @@ pub unsafe fn register_device_isrs() {
 /// Call `init_hardware_interrupts()` separately after kernel subsystems are ready.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn init() {
-    configure_idt();
     // SAFETY: Single-threaded init — interrupts are disabled, no concurrent access.
-    (*(&raw const IDT)).load();
+    unsafe {
+        configure_idt();
+        (*(&raw const IDT)).load();
+    }
     IDT_LOADED.store(true, Ordering::Release);
 }
 
@@ -333,25 +341,27 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 
     // Step 1: Disable PIC — remap to 0xF0-0xFF and mask all lines
     // SAFETY: Called during single-threaded boot with interrupts disabled.
-    apic::disable_pic();
+    unsafe { apic::disable_pic(); }
     crate::println!("  PIC disabled (remapped to 0xF0, masked)");
 
     // Step 2: Enable Local APIC
     // SAFETY: HHDM offset is set, single-threaded boot, interrupts disabled.
-    apic::detect_and_init().expect("APIC initialization failed");
+    unsafe { apic::detect_and_init().expect("APIC initialization failed"); }
 
     // Step 2b: Initialize per-CPU data for BSP
     // SAFETY: APIC is initialized (ID readable). Single-threaded boot, interrupts disabled.
-    let bsp_apic_id = apic::read_apic_id();
+    let bsp_apic_id = unsafe { apic::read_apic_id() };
     {
-        crate::arch::x86_64::percpu::init_bsp(bsp_apic_id);
+        // SAFETY: Single-threaded boot, BSP only, APIC ID is valid.
+        unsafe { crate::arch::x86_64::percpu::init_bsp(bsp_apic_id); }
         crate::println!("  Per-CPU data initialized (BSP, APIC ID={})", bsp_apic_id);
     }
 
     // Step 3: Parse ACPI and initialize I/O APIC (if RSDP available)
     let acpi_info = if rsdp_phys != 0 {
         crate::println!("  Parsing ACPI tables (RSDP @ {:#x})...", rsdp_phys);
-        match crate::acpi::parse_acpi(rsdp_phys) {
+        // SAFETY: rsdp_phys is a valid RSDP address from Limine. Single-threaded boot.
+        match unsafe { crate::acpi::parse_acpi(rsdp_phys) } {
             Ok(info) => {
                 crate::println!(
                     "  MADT: {} I/O APIC(s), {} override(s), LAPIC @ {:#x}",
@@ -359,7 +369,8 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
                 );
 
                 // Initialize the primary I/O APIC
-                match ioapic::init(&info) {
+                // SAFETY: ACPI info is valid, single-threaded boot.
+                match unsafe { ioapic::init(&info) } {
                     Ok(()) => crate::println!("  ✓ I/O APIC initialized"),
                     Err(e) => crate::println!("  WARNING: I/O APIC init failed: {}", e),
                 }
@@ -381,17 +392,23 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
         fn timer_isr_stub();
     }
     // SAFETY: Single-threaded init. timer_isr_stub is our global_asm symbol.
-    (&mut (*(&raw mut IDT)))[apic::TIMER_VECTOR as usize]
-        .set_handler_addr(x86_64::VirtAddr::new(timer_isr_stub as *const () as u64));
+    // IDT is a mutable static but no concurrent access with interrupts disabled.
+    unsafe {
+        (&mut (*(&raw mut IDT)))[apic::TIMER_VECTOR as usize]
+            .set_handler_addr(x86_64::VirtAddr::new(timer_isr_stub as *const () as u64));
+    }
 
     // Step 4b: Register spurious interrupt handler at vector 0xFF
     // SAFETY: Single-threaded init, within IDT bounds.
-    (&mut (*(&raw mut IDT)))[0xFF_usize]
-        .set_handler_fn(exceptions::spurious_interrupt);
+    unsafe {
+        (&mut (*(&raw mut IDT)))[0xFF_usize]
+            .set_handler_fn(exceptions::spurious_interrupt);
+    }
 
     // Step 4c: Register device ISR handlers at vectors 33-56 (if I/O APIC available)
     if acpi_info.is_some() {
-        register_device_isrs();
+        // SAFETY: Single-threaded init, IDT not yet reloaded.
+        unsafe { register_device_isrs(); }
         crate::println!("  Device ISR handlers registered (vectors 33-56)");
     }
 
@@ -399,8 +416,10 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
     // SAFETY: Single-threaded init, within IDT bounds.
     {
         use crate::arch::x86_64::tlb;
-        (&mut (*(&raw mut IDT)))[tlb::TLB_SHOOTDOWN_VECTOR as usize]
-            .set_handler_fn(tlb::tlb_shootdown_isr);
+        unsafe {
+            (&mut (*(&raw mut IDT)))[tlb::TLB_SHOOTDOWN_VECTOR as usize]
+                .set_handler_fn(tlb::tlb_shootdown_isr);
+        }
         crate::println!("  TLB shootdown handler registered (vector {:#x})", tlb::TLB_SHOOTDOWN_VECTOR);
     }
 
@@ -411,40 +430,42 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
         let layout = Layout::from_size_align(IST_STACK_SIZE, 16)
             .expect("IST stack layout");
         // SAFETY: Kernel heap is initialized. Layout is valid.
-        let ist_base = alloc(layout);
+        let ist_base = unsafe { alloc(layout) };
         if ist_base.is_null() {
             panic!("Failed to allocate double-fault IST stack");
         }
         let ist_top = ist_base as u64 + IST_STACK_SIZE as u64;
 
         // SAFETY: Interrupts disabled, single-threaded.
-        gdt::set_ist(0, ist_top);
+        unsafe { gdt::set_ist(0, ist_top); }
 
         // Wire double-fault IDT entry to use IST1 (hardware IST index 1 = TSS.ist[0])
         // SAFETY: Single-threaded init, IDT not yet reloaded.
-        (*(&raw mut IDT)).double_fault
-            .set_handler_fn(exceptions::double_fault)
-            .set_stack_index(0); // x86_64 crate: 0 maps to IST1
+        unsafe {
+            (*(&raw mut IDT)).double_fault
+                .set_handler_fn(exceptions::double_fault)
+                .set_stack_index(0); // x86_64 crate: 0 maps to IST1
+        }
 
         crate::println!("  IST1 (double-fault): {:#x}", ist_top);
     }
 
     // Step 6a: Reload IDT with all handlers (timer, device ISRs, exceptions)
     // SAFETY: IDT is fully configured. Reloading makes the CPU pick up all handlers.
-    (*(&raw const IDT)).load();
+    unsafe { (*(&raw const IDT)).load(); }
 
     // Step 6b: Configure I/O APIC device IRQ routing (after IDT loaded)
     if let Some(ref info) = acpi_info {
-        ioapic::configure_device_irqs(info, bsp_apic_id as u8);
+        // SAFETY: IDT loaded, I/O APIC initialized. Single-threaded boot.
+        unsafe { ioapic::configure_device_irqs(info, bsp_apic_id as u8); }
         crate::println!("  ✓ Device IRQs routed via I/O APIC");
     }
 
     // Step 7: Calibrate and start APIC timer
     // SAFETY: APIC is enabled, PIC is disabled, interrupts still off.
-    let _bus_freq = apic::configure_timer(timer_frequency_hz);
+    let _bus_freq = unsafe { apic::configure_timer(timer_frequency_hz) };
 
-    // Step 8: Enable interrupts
-    // SAFETY: All interrupt infrastructure is initialized.
+    // Step 8: Enable interrupts — all interrupt infrastructure is initialized.
     x86_64::instructions::interrupts::enable();
     crate::println!("  ✓ Interrupts enabled (APIC timer + device IRQs)");
 }
@@ -458,11 +479,13 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 unsafe fn configure_idt() {
     // SAFETY: Single-threaded init — interrupts disabled, no concurrent IDT access.
     // Each set_handler_fn registers a valid extern "x86-interrupt" handler.
-    (*(&raw mut IDT)).divide_error.set_handler_fn(exceptions::divide_by_zero);
-    (*(&raw mut IDT)).general_protection_fault
-        .set_handler_fn(exceptions::general_protection_fault);
-    (*(&raw mut IDT)).page_fault.set_handler_fn(exceptions::page_fault);
-    (*(&raw mut IDT)).double_fault.set_handler_fn(exceptions::double_fault);
+    unsafe {
+        (*(&raw mut IDT)).divide_error.set_handler_fn(exceptions::divide_by_zero);
+        (*(&raw mut IDT)).general_protection_fault
+            .set_handler_fn(exceptions::general_protection_fault);
+        (*(&raw mut IDT)).page_fault.set_handler_fn(exceptions::page_fault);
+        (*(&raw mut IDT)).double_fault.set_handler_fn(exceptions::double_fault);
+    }
 }
 
 /// Request interrupt with verification contract
@@ -500,5 +523,5 @@ pub fn idt_loaded() -> bool {
 pub unsafe fn load_idt_ap() {
     // SAFETY: IDT is fully configured by BSP (IDT_LOADED is true).
     // The IDT is a global static — same virtual address on all CPUs.
-    (*(&raw const IDT)).load();
+    unsafe { (*(&raw const IDT)).load(); }
 }

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Architecture abstraction layer
 //!
 //! Re-exports the active architecture's primitives. Portable modules (spinlock)
@@ -12,6 +14,7 @@
 //!    GDT/privilege setup, syscall entry
 
 // Portable modules (no architecture-specific code)
+pub mod mmio;
 pub mod spinlock;
 
 // Architecture-specific modules

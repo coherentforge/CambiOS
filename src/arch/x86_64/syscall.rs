@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! SYSCALL/SYSRET fast system call entry path
 //!
 //! When a process executes the `syscall` instruction:
@@ -56,39 +58,6 @@ pub struct SyscallFrame {
 }
 
 // ============================================================================
-// MSR helpers
-// ============================================================================
-
-#[inline(always)]
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let (low, high): (u32, u32);
-    // SAFETY: Caller ensures the MSR index is valid and we are at ring 0.
-    core::arch::asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack),
-    );
-    ((high as u64) << 32) | (low as u64)
-}
-
-#[inline(always)]
-unsafe fn wrmsr(msr: u32, value: u64) {
-    let low = value as u32;
-    let high = (value >> 32) as u32;
-    // SAFETY: Caller ensures the MSR index is valid, value is well-formed,
-    // and we are at ring 0.
-    core::arch::asm!(
-        "wrmsr",
-        in("ecx") msr,
-        in("eax") low,
-        in("edx") high,
-        options(nomem, nostack),
-    );
-}
-
-// ============================================================================
 // Initialization
 // ============================================================================
 
@@ -101,35 +70,35 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 /// Must be called during single-threaded init after the GDT is loaded
 /// and before any task executes `syscall`.
 pub unsafe fn init() {
-    // STAR MSR: segment selectors for SYSCALL and SYSRET
-    //
-    //   Bits 47:32 = SYSCALL target:
-    //     CS = STAR[47:32]        = 0x08 (KERNEL_CS)
-    //     SS = STAR[47:32] + 8    = 0x10 (KERNEL_SS)
-    //
-    //   Bits 63:48 = SYSRET base:
-    //     SS = STAR[63:48] + 8  | 3 = 0x1B (USER_SS)
-    //     CS = STAR[63:48] + 16 | 3 = 0x23 (USER_CS)  [64-bit mode]
-    let star = ((gdt::KERNEL_SS as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
-    // SAFETY: MSR_STAR is a valid MSR on all x86_64 CPUs. Value encodes our GDT selectors.
-    wrmsr(MSR_STAR, star);
+    // SAFETY: All MSR reads/writes below target valid MSRs on x86_64 CPUs.
+    // Caller ensures single-threaded init after GDT is loaded, at ring 0.
+    unsafe {
+        // STAR MSR: segment selectors for SYSCALL and SYSRET
+        //
+        //   Bits 47:32 = SYSCALL target:
+        //     CS = STAR[47:32]        = 0x08 (KERNEL_CS)
+        //     SS = STAR[47:32] + 8    = 0x10 (KERNEL_SS)
+        //
+        //   Bits 63:48 = SYSRET base:
+        //     SS = STAR[63:48] + 8  | 3 = 0x1B (USER_SS)
+        //     CS = STAR[63:48] + 16 | 3 = 0x23 (USER_CS)  [64-bit mode]
+        let star = ((gdt::KERNEL_SS as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
+        super::msr::write(MSR_STAR, star);
 
-    // LSTAR: target RIP for SYSCALL instruction
-    extern "C" {
-        fn syscall_entry();
+        // LSTAR: target RIP for SYSCALL instruction
+        extern "C" {
+            fn syscall_entry();
+        }
+        super::msr::write(MSR_LSTAR, syscall_entry as *const () as u64);
+
+        // SFMASK: RFLAGS bits to CLEAR on SYSCALL entry
+        // 0x200 = IF — disable interrupts until the handler explicitly re-enables them
+        super::msr::write(MSR_SFMASK, 0x200);
+
+        // Enable System Call Extensions in EFER
+        let efer = super::msr::read(MSR_EFER);
+        super::msr::write(MSR_EFER, efer | EFER_SCE);
     }
-    // SAFETY: MSR_LSTAR is valid; syscall_entry is our global_asm symbol.
-    wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
-
-    // SFMASK: RFLAGS bits to CLEAR on SYSCALL entry
-    // 0x200 = IF — disable interrupts until the handler explicitly re-enables them
-    // SAFETY: MSR_SFMASK is valid; 0x200 clears only the IF flag.
-    wrmsr(MSR_SFMASK, 0x200);
-
-    // Enable System Call Extensions in EFER
-    // SAFETY: MSR_EFER is valid; we read-modify-write only the SCE bit.
-    let efer = rdmsr(MSR_EFER);
-    wrmsr(MSR_EFER, efer | EFER_SCE);
 }
 
 // ============================================================================

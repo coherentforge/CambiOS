@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! ArcOS ELF Signing Tool
 //!
 //! Signs ELF binaries with an Ed25519 signature for the ArcOS kernel's
@@ -103,7 +105,6 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    // Resolve signing mode: --seed/--seed-file → Seed, otherwise → YubiKey
     let mode = if let Some(hex) = seed_hex {
         SigningMode::Seed(parse_hex_seed(&hex))
     } else if let Some(path) = seed_file {
@@ -113,12 +114,10 @@ fn parse_args() -> Args {
         });
         SigningMode::Seed(parse_hex_seed(content.trim()))
     } else {
-        // YubiKey mode — check env var for PIN
         let pin = pin.or_else(|| env::var("ARCOS_SIGN_PIN").ok());
         SigningMode::YubiKey { pin }
     };
 
-    // Resolve action
     let action = if let Some(path) = export_pubkey {
         Action::ExportPubkey(path)
     } else if print_pubkey {
@@ -129,7 +128,7 @@ fn parse_args() -> Args {
             output: output_path,
         }
     } else {
-        eprintln!("No action specified. Provide an ELF file, --print-pubkey, or --export-pubkey.");
+        eprintln!("No action specified.");
         process::exit(1);
     };
 
@@ -137,31 +136,18 @@ fn parse_args() -> Args {
 }
 
 fn print_usage(prog: &str) {
-    eprintln!("ArcOS ELF Signing Tool v0.2.0");
+    eprintln!("ArcOS ELF Signing Tool v0.3.0");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!(
-        "  {} <elf-file> [options]              Sign via YubiKey (default)",
-        prog
-    );
-    eprintln!(
-        "  {} --seed <hex> <elf-file> [options]  Sign via seed (CI/testing)",
-        prog
-    );
-    eprintln!(
-        "  {} --print-pubkey [--seed <hex>]     Print public key (hex)",
-        prog
-    );
-    eprintln!(
-        "  {} --export-pubkey <path> [--seed <hex>]  Export raw 32-byte pubkey",
-        prog
-    );
+    eprintln!("  {} <elf-file> [options]               Sign via YubiKey (default)", prog);
+    eprintln!("  {} --seed <hex> <elf-file> [options]   Sign via seed (CI/testing)", prog);
+    eprintln!("  {} --print-pubkey [--seed <hex>]      Print public key (hex)", prog);
+    eprintln!("  {} --export-pubkey <path>             Export raw 32-byte pubkey", prog);
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --output, -o <path>   Write signed binary to <path> (default: in-place)");
     eprintln!("  --pin <pin>           YubiKey OpenPGP PIN (or set ARCOS_SIGN_PIN env var)");
     eprintln!("  --seed <hex>          Use seed-derived key (64 hex chars = 32 bytes)");
-    eprintln!("  --seed-file <path>    Read seed hex from file");
 }
 
 // ============================================================================
@@ -177,22 +163,21 @@ fn seed_get_pubkey(seed: &[u8; 32]) -> [u8; 32] {
 
 fn seed_sign(data: &[u8], seed: &[u8; 32]) -> [u8; 64] {
     let kp = KeyPair::from_seed(Seed::new(*seed));
-    let sig = kp.sk.sign(data, None);
+    let hash = blake3::hash(data);
+    let sig = kp.sk.sign(hash.as_bytes(), None);
     let mut out = [0u8; 64];
     out.copy_from_slice(sig.as_ref());
     out
 }
 
 // ============================================================================
-// YubiKey-based signing (via OpenPGP smart card)
+// YubiKey-based signing (via OpenPGP smart card / PCSC)
 // ============================================================================
 
 fn yubikey_resolve_pin(pin: &Option<String>) -> String {
     if let Some(p) = pin {
         return p.clone();
     }
-
-    // Prompt interactively
     eprint!("YubiKey OpenPGP PIN: ");
     io::stderr().flush().ok();
     rpassword::read_password().unwrap_or_else(|e| {
@@ -201,110 +186,109 @@ fn yubikey_resolve_pin(pin: &Option<String>) -> String {
     })
 }
 
-/// Open the first available YubiKey, verify the signing PIN, and read the public key.
-/// Returns (public_key, low-level access for signing).
-fn yubikey_get_pubkey(pin: &Option<String>) -> [u8; 32] {
-    let pin_str = yubikey_resolve_pin(pin);
-
+/// Read the Ed25519 public key from the YubiKey (no PIN needed).
+fn yubikey_get_pubkey() -> [u8; 32] {
     let mut card = open_openpgp_card();
     let mut tx = card.transaction().unwrap_or_else(|e| {
         eprintln!("Failed to start card transaction: {}", e);
         process::exit(1);
     });
 
-    // Verify User Signing PIN (PW1 for signing)
-    tx.verify_user_signing_pin(secrecy::SecretString::from(pin_str))
-        .unwrap_or_else(|e| {
-            eprintln!("PIN verification failed: {}", e);
-            eprintln!("Check your YubiKey OpenPGP User PIN.");
-            process::exit(1);
-        });
-
-    // Read the signing public key
-    let pk_material = tx
-        .public_key_material(openpgp_card::ocard::KeyType::Signing)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read public key from YubiKey: {}", e);
-            eprintln!("Is an Ed25519 signing key configured on the OpenPGP applet?");
-            process::exit(1);
-        });
-
-    extract_ed25519_pubkey(&pk_material)
-}
-
-/// Sign data using the YubiKey. Returns (signature, public_key).
-fn yubikey_sign(data: &[u8], pin: &Option<String>) -> ([u8; 64], [u8; 32]) {
-    let pin_str = yubikey_resolve_pin(pin);
-
-    let mut card = open_openpgp_card();
-    let mut tx = card.transaction().unwrap_or_else(|e| {
-        eprintln!("Failed to start card transaction: {}", e);
-        process::exit(1);
-    });
-
-    // Verify User Signing PIN
-    tx.verify_user_signing_pin(secrecy::SecretString::from(pin_str))
-        .unwrap_or_else(|e| {
-            eprintln!("PIN verification failed: {}", e);
-            process::exit(1);
-        });
-
-    // Read public key
     let pk_material = tx
         .public_key_material(openpgp_card::ocard::KeyType::Signing)
         .unwrap_or_else(|e| {
             eprintln!("Failed to read public key: {}", e);
             process::exit(1);
         });
+
+    extract_ed25519_pubkey(&pk_material)
+}
+
+/// Sign data using the YubiKey. Retries on transient card errors.
+fn yubikey_sign(data: &[u8], pin: &Option<String>) -> ([u8; 64], [u8; 32]) {
+    let pin_str = yubikey_resolve_pin(pin);
+
+    for attempt in 0..5 {
+        if attempt > 0 {
+            eprintln!("  Retrying ({}/5)...", attempt + 1);
+            std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+        }
+
+        match yubikey_sign_attempt(data, &pin_str) {
+            Ok(pair) => return pair,
+            Err(e) => {
+                let msg = format!("{}", e);
+                if msg.contains("blocked") || msg.contains("Security status") {
+                    eprintln!("PIN/auth error: {}", e);
+                    eprintln!("Unblock: gpg --card-edit > admin > passwd > 2");
+                    process::exit(1);
+                }
+                if attempt < 4 {
+                    eprintln!("  Card error: {}", e);
+                    continue;
+                }
+                eprintln!("YubiKey signing failed after 5 attempts: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn yubikey_sign_attempt(
+    data: &[u8],
+    pin: &str,
+) -> Result<([u8; 64], [u8; 32]), openpgp_card::Error> {
+    let mut card = open_openpgp_card();
+    let mut tx = card.transaction()?;
+
+    let pk_material =
+        tx.public_key_material(openpgp_card::ocard::KeyType::Signing)?;
     let pubkey = extract_ed25519_pubkey(&pk_material);
 
-    // Sign via the low-level card API
+    tx.verify_user_signing_pin(secrecy::SecretString::from(pin.to_string()))?;
+
+    // Hash the data first — send only 32 bytes to the card instead of the
+    // full binary. This avoids multi-APDU chains that macOS CryptoTokenKit
+    // interrupts, and is architecturally cleaner (hardware signs a hash).
+    let hash = blake3::hash(data);
+
     let sig_bytes = tx
         .card()
-        .signature_for_hash(openpgp_card::ocard::crypto::Hash::EdDSA(data))
-        .unwrap_or_else(|e| {
-            eprintln!("YubiKey signing failed: {}", e);
-            if data.len() > 60_000 {
-                eprintln!(
-                    "Binary is {} bytes — may exceed YubiKey's buffer limit.",
-                    data.len()
-                );
-            }
-            process::exit(1);
-        });
+        .signature_for_hash(openpgp_card::ocard::crypto::Hash::EdDSA(hash.as_bytes()))?;
 
     if sig_bytes.len() != 64 {
-        eprintln!(
-            "Unexpected signature length: {} (expected 64)",
-            sig_bytes.len()
-        );
-        process::exit(1);
+        return Err(openpgp_card::Error::InternalError(
+            format!("Unexpected signature length: {}", sig_bytes.len()),
+        ));
     }
     let mut sig = [0u8; 64];
     sig.copy_from_slice(&sig_bytes);
 
-    (sig, pubkey)
+    Ok((sig, pubkey))
 }
 
-/// Open the first available OpenPGP smart card via PCSC.
 fn open_openpgp_card() -> openpgp_card::Card<openpgp_card::state::Open> {
     use card_backend_pcsc::PcscBackend;
 
+    // Kill scdaemon to release card
+    let _ = std::process::Command::new("gpgconf")
+        .args(["--kill", "scdaemon"])
+        .output();
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     let mut cards_iter = PcscBackend::cards(None).unwrap_or_else(|e| {
         eprintln!("Failed to access smart card reader: {}", e);
-        eprintln!("Is pcscd running? Is the YubiKey plugged in?");
         process::exit(1);
     });
 
     let backend = loop {
         match cards_iter.next() {
             Some(Ok(b)) => break b,
-            Some(Err(e)) => {
-                eprintln!("Warning: skipping card with error: {}", e);
-                continue;
-            }
+            Some(Err(_)) => continue,
             None => {
-                eprintln!("No smart card found. Insert your YubiKey and try again.");
+                eprintln!("No smart card found. Insert your YubiKey.");
                 process::exit(1);
             }
         }
@@ -316,20 +300,14 @@ fn open_openpgp_card() -> openpgp_card::Card<openpgp_card::state::Open> {
     })
 }
 
-/// Extract raw 32-byte Ed25519 public key from OpenPGP card public key material.
 fn extract_ed25519_pubkey(
     pk: &openpgp_card::ocard::crypto::PublicKeyMaterial,
 ) -> [u8; 32] {
-    use openpgp_card::ocard::crypto::PublicKeyMaterial;
-
     match pk {
-        PublicKeyMaterial::E(ecc_pub) => {
+        openpgp_card::ocard::crypto::PublicKeyMaterial::E(ecc_pub) => {
             let raw = ecc_pub.data();
             if raw.len() != 32 {
-                eprintln!(
-                    "Public key is {} bytes, expected 32 (Ed25519). Wrong key type?",
-                    raw.len()
-                );
+                eprintln!("Public key is {} bytes, expected 32.", raw.len());
                 process::exit(1);
             }
             let mut pk = [0u8; 32];
@@ -337,8 +315,7 @@ fn extract_ed25519_pubkey(
             pk
         }
         _ => {
-            eprintln!("Card signing key is not Ed25519/ECC. Configure an Ed25519 key.");
-            eprintln!("Use: gpg --edit-key <keyid>  or  ykman openpgp keys generate sig");
+            eprintln!("Card signing key is not Ed25519/ECC.");
             process::exit(1);
         }
     }
@@ -348,7 +325,6 @@ fn extract_ed25519_pubkey(
 // ELF signing
 // ============================================================================
 
-/// Read an ELF binary, stripping any existing signature trailer.
 fn read_binary_for_signing(path: &str) -> Vec<u8> {
     let mut binary = fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read '{}': {}", path, e);
@@ -368,7 +344,6 @@ fn read_binary_for_signing(path: &str) -> Vec<u8> {
     binary
 }
 
-/// Write a signed ELF file with the ARCSIG trailer appended.
 fn write_signed_elf(path: &str, output: Option<&str>, original: &[u8], sig: &[u8; 64], pk: &[u8; 32]) {
     let mut binary = original.to_vec();
     binary.extend_from_slice(sig);
@@ -393,16 +368,13 @@ fn main() {
     let args = parse_args();
 
     match (&args.mode, &args.action) {
-        // ---- Print public key (hex) ----
         (SigningMode::Seed(seed), Action::PrintPubkey) => {
             println!("{}", hex_encode(&seed_get_pubkey(seed)));
         }
-        (SigningMode::YubiKey { pin }, Action::PrintPubkey) => {
-            let pk = yubikey_get_pubkey(pin);
+        (SigningMode::YubiKey { .. }, Action::PrintPubkey) => {
+            let pk = yubikey_get_pubkey();
             println!("{}", hex_encode(&pk));
         }
-
-        // ---- Export raw public key to file ----
         (SigningMode::Seed(seed), Action::ExportPubkey(path)) => {
             let pk = seed_get_pubkey(seed);
             fs::write(path, pk).unwrap_or_else(|e| {
@@ -412,8 +384,8 @@ fn main() {
             eprintln!("Exported 32-byte public key to '{}'", path);
             eprintln!("  Key: {}", hex_encode(&pk));
         }
-        (SigningMode::YubiKey { pin }, Action::ExportPubkey(path)) => {
-            let pk = yubikey_get_pubkey(pin);
+        (SigningMode::YubiKey { .. }, Action::ExportPubkey(path)) => {
+            let pk = yubikey_get_pubkey();
             fs::write(path, pk).unwrap_or_else(|e| {
                 eprintln!("Failed to write '{}': {}", path, e);
                 process::exit(1);
@@ -421,8 +393,6 @@ fn main() {
             eprintln!("Exported 32-byte public key to '{}'", path);
             eprintln!("  Key: {}", hex_encode(&pk));
         }
-
-        // ---- Sign ELF file ----
         (SigningMode::Seed(seed), Action::SignFile { path, output }) => {
             let binary = read_binary_for_signing(path);
             let sig = seed_sign(&binary, seed);
@@ -444,20 +414,13 @@ fn main() {
 fn parse_hex_seed(hex: &str) -> [u8; 32] {
     let hex = hex.trim();
     if hex.len() != 64 {
-        eprintln!(
-            "Seed must be 64 hex characters (32 bytes), got {}",
-            hex.len()
-        );
+        eprintln!("Seed must be 64 hex characters (32 bytes), got {}", hex.len());
         process::exit(1);
     }
     let mut bytes = [0u8; 32];
     for i in 0..32 {
         bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
-            eprintln!(
-                "Invalid hex at position {}: '{}'",
-                i * 2,
-                &hex[i * 2..i * 2 + 2]
-            );
+            eprintln!("Invalid hex at position {}", i * 2);
             process::exit(1);
         });
     }

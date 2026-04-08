@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Interrupt routing system
 //!
 //! Maps hardware IRQs to driver tasks and delivers interrupt context

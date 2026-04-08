@@ -1,10 +1,13 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 [package]
 name = "sign-elf"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "ArcOS ELF signing tool — Ed25519 via YubiKey or seed"
 
 [dependencies]
+blake3 = "1.8"
 ed25519-compact = "2.2"
 openpgp-card = "0.6"
 card-backend-pcsc = "0.5"

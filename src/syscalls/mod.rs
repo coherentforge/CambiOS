@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Syscall definitions and numbers
 //!
 //! Defines the syscall ABI and interfaces that userspace drivers use
@@ -99,6 +101,31 @@ pub enum SyscallNumber {
     /// Store a pre-signed ArcObject. Kernel verifies the Ed25519 signature
     /// against the caller's Principal before storing. Returns 0 or negative error.
     ObjPutSigned = 19,
+
+    /// map_mmio(phys_addr: u64, num_pages: u32) -> u64
+    /// Map device MMIO into the calling process's address space with uncacheable
+    /// attributes. Returns user-space virtual address, or negative error.
+    /// Kernel validates the physical address is not in RAM regions.
+    MapMmio = 20,
+
+    /// alloc_dma(num_pages: u32, flags: u32) -> (vaddr: u64, paddr: u64)
+    /// Allocate physically contiguous DMA-capable pages with guard pages on
+    /// both sides. Returns user vaddr in the return value, writes paddr to
+    /// the u64 pointed to by arg3. Flags reserved for future IOMMU hints.
+    AllocDma = 21,
+
+    /// device_info(index: u32, out_buf: *mut u8, buf_len: u32) -> i32
+    /// Query PCI device info by index. Writes a fixed-format device descriptor
+    /// to out_buf. Returns 0 on success, negative error if index out of range.
+    DeviceInfo = 22,
+
+    /// port_io(port: u16, value: u32, flags: u32) -> u32
+    /// Read or write an x86 I/O port. The kernel validates the port is within
+    /// a PCI device's I/O BAR range.
+    /// flags bit 0: direction (0=read, 1=write)
+    /// flags bits 2:1: width (0=byte, 1=word, 2=dword)
+    /// Returns: read value (for reads), 0 (for writes), or negative error.
+    PortIo = 23,
 }
 
 impl SyscallNumber {
@@ -125,6 +152,10 @@ impl SyscallNumber {
             17 => Some(Self::ObjList),
             18 => Some(Self::ClaimBootstrapKey),
             19 => Some(Self::ObjPutSigned),
+            20 => Some(Self::MapMmio),
+            21 => Some(Self::AllocDma),
+            22 => Some(Self::DeviceInfo),
+            23 => Some(Self::PortIo),
             _ => None,
         }
     }

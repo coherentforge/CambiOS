@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! ARM Generic Timer driver — AArch64
 //!
 //! Replaces x86_64's APIC timer (which requires PIT-based calibration).
@@ -109,22 +111,25 @@ pub unsafe fn init(frequency_hz: u32) {
     // Record boot timestamp
     BOOT_COUNTER.store(read_counter(), Ordering::Release);
 
-    // Set the countdown value
-    // SAFETY: Writing CNTP_TVAL_EL0 from EL1 is safe.
-    core::arch::asm!(
-        "msr cntp_tval_el0, {0}",
-        in(reg) reload as u64,
-        options(nostack, nomem),
-    );
+    // SAFETY: Writing CNTP_TVAL_EL0 and CNTP_CTL_EL0 from EL1 during boot
+    // with interrupts masked is safe. This is the standard ARM Generic Timer
+    // init sequence.
+    unsafe {
+        // Set the countdown value
+        core::arch::asm!(
+            "msr cntp_tval_el0, {0}",
+            in(reg) reload as u64,
+            options(nostack, nomem),
+        );
 
-    // Enable the timer: CNTP_CTL_EL0 bit[0]=ENABLE, bit[1]=IMASK(0=unmask)
-    // SAFETY: Writing CNTP_CTL_EL0 from EL1 is safe.
-    core::arch::asm!(
-        "mov {tmp}, #1",
-        "msr cntp_ctl_el0, {tmp}",
-        "isb",
-        tmp = out(reg) _,
-    );
+        // Enable the timer: CNTP_CTL_EL0 bit[0]=ENABLE, bit[1]=IMASK(0=unmask)
+        core::arch::asm!(
+            "mov {tmp}, #1",
+            "msr cntp_ctl_el0, {tmp}",
+            "isb",
+            tmp = out(reg) _,
+        );
+    }
 
     crate::println!(
         "  ARM Generic Timer: freq={}Hz reload={} ({}Hz tick)",
@@ -143,11 +148,13 @@ pub unsafe fn init(frequency_hz: u32) {
 pub unsafe fn rearm() {
     let reload = TIMER_RELOAD.load(Ordering::Relaxed) as u64;
     // SAFETY: Writing CNTP_TVAL_EL0 from EL1 in a timer ISR is safe.
-    core::arch::asm!(
-        "msr cntp_tval_el0, {0}",
-        in(reg) reload,
-        options(nostack, nomem),
-    );
+    unsafe {
+        core::arch::asm!(
+            "msr cntp_tval_el0, {0}",
+            in(reg) reload,
+            options(nostack, nomem),
+        );
+    }
 }
 
 /// Initialize the timer on an AP (same frequency as BSP).
@@ -160,22 +167,24 @@ pub unsafe fn init_ap() {
         panic!("ARM timer: BSP timer not initialized before AP");
     }
 
-    // Set countdown
-    // SAFETY: Writing CNTP_TVAL_EL0 from EL1 is safe.
-    core::arch::asm!(
-        "msr cntp_tval_el0, {0}",
-        in(reg) reload,
-        options(nostack, nomem),
-    );
+    // SAFETY: Writing CNTP_TVAL_EL0 and CNTP_CTL_EL0 from EL1 during AP
+    // startup with interrupts masked is safe.
+    unsafe {
+        // Set countdown
+        core::arch::asm!(
+            "msr cntp_tval_el0, {0}",
+            in(reg) reload,
+            options(nostack, nomem),
+        );
 
-    // Enable
-    // SAFETY: Writing CNTP_CTL_EL0 from EL1 is safe.
-    core::arch::asm!(
-        "mov {tmp}, #1",
-        "msr cntp_ctl_el0, {tmp}",
-        "isb",
-        tmp = out(reg) _,
-    );
+        // Enable
+        core::arch::asm!(
+            "mov {tmp}, #1",
+            "msr cntp_ctl_el0, {tmp}",
+            "isb",
+            tmp = out(reg) _,
+        );
+    }
 }
 
 /// Stop the timer (disable interrupts).
@@ -185,11 +194,13 @@ pub unsafe fn init_ap() {
 pub unsafe fn stop() {
     // CNTP_CTL_EL0 = 0 (disable)
     // SAFETY: Writing CNTP_CTL_EL0 from EL1 is safe.
-    core::arch::asm!(
-        "msr cntp_ctl_el0, xzr",
-        "isb",
-        options(nostack, nomem),
-    );
+    unsafe {
+        core::arch::asm!(
+            "msr cntp_ctl_el0, xzr",
+            "isb",
+            options(nostack, nomem),
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! I/O APIC driver for routing external device interrupts
 //!
 //! The I/O APIC (typically at 0xFEC00000) replaces the legacy 8259 PIC for
@@ -84,8 +86,10 @@ unsafe fn ioapic_read(reg: u32) -> u32 {
     let base = IO_APIC_BASE_VIRT.load(Ordering::Relaxed);
     // SAFETY: base is a valid MMIO address mapped with NO_CACHE.
     // Write register index to IOREGSEL, then read data from IOWIN.
-    core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
-    core::ptr::read_volatile((base + IOWIN) as *const u32)
+    unsafe {
+        core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
+        core::ptr::read_volatile((base + IOWIN) as *const u32)
+    }
 }
 
 /// Write an I/O APIC register via the indirect access mechanism.
@@ -96,8 +100,10 @@ unsafe fn ioapic_read(reg: u32) -> u32 {
 unsafe fn ioapic_write(reg: u32, value: u32) {
     let base = IO_APIC_BASE_VIRT.load(Ordering::Relaxed);
     // SAFETY: Same as ioapic_read — MMIO, NO_CACHE mapped.
-    core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
-    core::ptr::write_volatile((base + IOWIN) as *mut u32, value);
+    unsafe {
+        core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
+        core::ptr::write_volatile((base + IOWIN) as *mut u32, value);
+    }
 }
 
 // ============================================================================
@@ -109,9 +115,12 @@ unsafe fn ioapic_write(reg: u32, value: u32) {
 /// # Safety
 /// I/O APIC must be initialized. Pin must be in range.
 unsafe fn read_redir_entry(pin: u32) -> u64 {
-    let low = ioapic_read(redir_low(pin)) as u64;
-    let high = ioapic_read(redir_high(pin)) as u64;
-    (high << 32) | low
+    // SAFETY: Caller ensures I/O APIC is initialized and pin is in range.
+    unsafe {
+        let low = ioapic_read(redir_low(pin)) as u64;
+        let high = ioapic_read(redir_high(pin)) as u64;
+        (high << 32) | low
+    }
 }
 
 /// Write a full 64-bit redirection table entry for the given pin.
@@ -122,8 +131,12 @@ unsafe fn read_redir_entry(pin: u32) -> u64 {
 unsafe fn write_redir_entry(pin: u32, entry: u64) {
     // Write high DWORD first (with mask bit set in low to avoid spurious delivery),
     // then low DWORD with the actual configuration.
-    ioapic_write(redir_high(pin), (entry >> 32) as u32);
-    ioapic_write(redir_low(pin), entry as u32);
+    // SAFETY: Caller ensures I/O APIC is initialized, pin is in range,
+    // and the entry is correctly formed.
+    unsafe {
+        ioapic_write(redir_high(pin), (entry >> 32) as u32);
+        ioapic_write(redir_low(pin), entry as u32);
+    }
 }
 
 // ============================================================================
@@ -158,9 +171,10 @@ pub unsafe fn init(acpi_info: &AcpiInterruptInfo) -> Result<(), &'static str> {
             | PageTableFlags::WRITE_THROUGH;
 
         let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
-        let mut pt = crate::memory::paging::active_page_table();
         // SAFETY: phys_base is the I/O APIC address from ACPI MADT.
         // We map it uncached for MMIO access. AlreadyMapped is OK.
+        // active_page_table() reads CR3 which requires ring 0.
+        let mut pt = unsafe { crate::memory::paging::active_page_table() };
         let _ = crate::memory::paging::map_page(
             &mut pt, virt_base, phys_base, flags, &mut fa_guard,
         );
@@ -168,20 +182,25 @@ pub unsafe fn init(acpi_info: &AcpiInterruptInfo) -> Result<(), &'static str> {
 
     IO_APIC_BASE_VIRT.store(virt_base, Ordering::Release);
 
-    // Read version register to get max redirection entries
-    let ver = ioapic_read(IOAPICVER);
-    let max_entries = ((ver >> 16) & 0xFF) + 1; // Bits 23:16 = max redir entry index
-    MAX_REDIR_ENTRIES.store(max_entries, Ordering::Release);
+    // SAFETY: I/O APIC MMIO is mapped above. We read version/ID registers
+    // and mask all redirection entries. All register accesses go through
+    // the validated MMIO base address.
+    unsafe {
+        // Read version register to get max redirection entries
+        let ver = ioapic_read(IOAPICVER);
+        let max_entries = ((ver >> 16) & 0xFF) + 1; // Bits 23:16 = max redir entry index
+        MAX_REDIR_ENTRIES.store(max_entries, Ordering::Release);
 
-    let id = ioapic_read(IOAPICID) >> 24;
-    crate::println!(
-        "  I/O APIC: id={} phys={:#x} virt={:#x} pins={}",
-        id, phys_base, virt_base, max_entries
-    );
+        let id = ioapic_read(IOAPICID) >> 24;
+        crate::println!(
+            "  I/O APIC: id={} phys={:#x} virt={:#x} pins={}",
+            id, phys_base, virt_base, max_entries
+        );
 
-    // Mask all entries initially (set mask bit, vector 0)
-    for pin in 0..max_entries {
-        write_redir_entry(pin, REDIR_MASK as u64);
+        // Mask all entries initially (set mask bit, vector 0)
+        for pin in 0..max_entries {
+            write_redir_entry(pin, REDIR_MASK as u64);
+        }
     }
 
     Ok(())
@@ -234,7 +253,8 @@ pub unsafe fn route_irq(
     let high: u32 = (dest_apic_id as u32) << 24;
 
     let entry = ((high as u64) << 32) | (low as u64);
-    write_redir_entry(gsi, entry);
+    // SAFETY: I/O APIC is initialized (caller contract). GSI bounds checked above.
+    unsafe { write_redir_entry(gsi, entry) };
 }
 
 /// Mask (disable) a specific I/O APIC pin.
@@ -246,8 +266,11 @@ pub unsafe fn mask_irq(gsi: u32) {
     if gsi >= max {
         return;
     }
-    let entry = read_redir_entry(gsi);
-    write_redir_entry(gsi, entry | REDIR_MASK as u64);
+    // SAFETY: I/O APIC is initialized (caller contract). GSI bounds checked above.
+    unsafe {
+        let entry = read_redir_entry(gsi);
+        write_redir_entry(gsi, entry | REDIR_MASK as u64);
+    }
 }
 
 /// Unmask (enable) a specific I/O APIC pin.
@@ -259,8 +282,11 @@ pub unsafe fn unmask_irq(gsi: u32) {
     if gsi >= max {
         return;
     }
-    let entry = read_redir_entry(gsi);
-    write_redir_entry(gsi, entry & !(REDIR_MASK as u64));
+    // SAFETY: I/O APIC is initialized (caller contract). GSI bounds checked above.
+    unsafe {
+        let entry = read_redir_entry(gsi);
+        write_redir_entry(gsi, entry & !(REDIR_MASK as u64));
+    }
 }
 
 /// Re-route an existing I/O APIC pin to a different CPU.
@@ -277,12 +303,15 @@ pub unsafe fn set_irq_destination(gsi: u32, dest_apic_id: u8) {
     if gsi >= max {
         return;
     }
-    let entry = read_redir_entry(gsi);
-    // Clear destination field (bits 63:56 of the 64-bit entry = high DWORD bits 31:24)
-    // and set the new destination APIC ID.
-    let cleared = entry & !((0xFF_u64) << 56);
-    let new_entry = cleared | ((dest_apic_id as u64) << 56);
-    write_redir_entry(gsi, new_entry);
+    // SAFETY: I/O APIC is initialized (caller contract). GSI bounds checked above.
+    unsafe {
+        let entry = read_redir_entry(gsi);
+        // Clear destination field (bits 63:56 of the 64-bit entry = high DWORD bits 31:24)
+        // and set the new destination APIC ID.
+        let cleared = entry & !((0xFF_u64) << 56);
+        let new_entry = cleared | ((dest_apic_id as u64) << 56);
+        write_redir_entry(gsi, new_entry);
+    }
 }
 
 /// Get the maximum number of redirection entries (I/O APIC pins).
@@ -321,7 +350,9 @@ pub unsafe fn configure_device_irqs(
             None => (Polarity::BusDefault, TriggerMode::BusDefault),
         };
 
-        route_irq(gsi, vector, bsp_apic_id, polarity, trigger);
+        // SAFETY: I/O APIC is initialized (caller contract). IDT device handlers
+        // are registered (caller contract). Vector and GSI are derived from ACPI data.
+        unsafe { route_irq(gsi, vector, bsp_apic_id, polarity, trigger) };
         crate::println!(
             "  IRQ {}: {} → GSI {} → vector {} (dest=CPU {})",
             isa_irq, name, gsi, vector, bsp_apic_id

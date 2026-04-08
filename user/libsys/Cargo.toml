@@ -1,0 +1,6 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
+[package]
+name = "arcos-libsys"
+version = "0.1.0"
+edition = "2021"

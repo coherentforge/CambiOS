@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! ArcOS Object Store — content-addressed signed object storage
 //!
 //! The native ArcOS storage model. Files are not bytes-at-a-path; they are

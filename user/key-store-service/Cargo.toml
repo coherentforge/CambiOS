@@ -1,9 +1,12 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 [package]
 name = "arcos-key-store-service"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arcos-libsys = { path = "../libsys" }
 ed25519-compact = { version = "2.2", default-features = false }
 
 [profile.release]

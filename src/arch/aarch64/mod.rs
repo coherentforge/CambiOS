@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Architecture-specific code (AArch64)
 //!
 //! Implements CPU-specific primitives for ARMv8-A (AArch64 execution state).
@@ -85,11 +87,13 @@ pub mod gdt {
         // SAFETY: Writing SP_EL1 from EL1 is always valid when using SP_EL0
         // as the current stack (SPSel=0). The value is the top of the task's
         // kernel stack, allocated during task creation.
-        core::arch::asm!(
-            "msr sp_el1, {0}",
-            in(reg) stack_top,
-            options(nostack, nomem),
-        );
+        unsafe {
+            core::arch::asm!(
+                "msr sp_el1, {0}",
+                in(reg) stack_top,
+                options(nostack, nomem),
+            );
+        }
     }
 }
 

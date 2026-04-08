@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Round-robin scheduler for the microkernel
 //!
 //! Implements preemptive multitasking with tick-based time slicing.
@@ -639,8 +641,10 @@ impl Scheduler {
             crate::halt();
         };
 
-        // Perform the actual context switch via arch module
-        crate::arch::context_switch(current_ctx, next_ctx);
+        // SAFETY: Both task contexts are valid — from_task was just saved,
+        // to_task was initialized at creation. context_switch is an extern "C"
+        // assembly function that saves/restores register state.
+        unsafe { crate::arch::context_switch(current_ctx, next_ctx) };
     }
 
     // ========================================================================

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Syscall dispatcher and handlers
 //!
 //! Routes syscalls from userspace to kernel handlers with zero-trust
@@ -207,6 +209,10 @@ impl SyscallDispatcher {
             SyscallNumber::ObjList => Self::handle_obj_list(args, ctx),
             SyscallNumber::ClaimBootstrapKey => Self::handle_claim_bootstrap_key(args, ctx),
             SyscallNumber::ObjPutSigned => Self::handle_obj_put_signed(args, ctx),
+            SyscallNumber::MapMmio => Self::handle_map_mmio(args, ctx),
+            SyscallNumber::AllocDma => Self::handle_alloc_dma(args, ctx),
+            SyscallNumber::DeviceInfo => Self::handle_device_info(args, ctx),
+            SyscallNumber::PortIo => Self::handle_port_io(args, ctx),
         }
     }
 
@@ -1124,5 +1130,319 @@ impl SyscallDispatcher {
         write_user_buffer(ctx.cr3, out_hash, &hash)?;
 
         Ok(0)
+    }
+
+    // ========================================================================
+    // Device / DMA support
+    // ========================================================================
+
+    /// SYS_MAP_MMIO: Map device MMIO into user-space.
+    ///
+    /// Args: arg1 = physical address (page-aligned), arg2 = num_pages
+    ///
+    /// Maps a device MMIO region into the calling process with uncacheable
+    /// page attributes. The kernel validates the physical address is not in
+    /// a RAM region (only device MMIO ranges are permitted).
+    ///
+    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    fn handle_map_mmio(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let phys_addr = args.arg1;
+        let num_pages = args.arg2_u32();
+
+        if num_pages == 0 || num_pages > 256 {
+            return Err(SyscallError::InvalidArg);
+        }
+        if phys_addr & 0xFFF != 0 {
+            return Err(SyscallError::InvalidArg); // Must be page-aligned
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Security: reject mapping RAM regions as MMIO.
+        // MMIO should be above RAM or in known device ranges.
+        // On x86_64 QEMU, RAM is typically 0..128MB. Device MMIO is above 0xFE00_0000.
+        // We reject anything in the frame allocator's tracked range as a conservative check.
+        {
+            let fa_guard = crate::FRAME_ALLOCATOR.lock();
+            let max_ram = fa_guard.total_count() as u64 * 4096;
+            if phys_addr < max_ram {
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
+        // Allocate virtual address range via VMA tracker
+        let mut pt_guard = crate::PROCESS_TABLE.lock();
+        let vma = pt_guard
+            .as_mut()
+            .and_then(|pt| pt.vma_mut(ctx.process_id))
+            .ok_or(SyscallError::InvalidArg)?;
+
+        let base_vaddr = vma
+            .allocate_region(num_pages)
+            .ok_or(SyscallError::OutOfMemory)?;
+
+        // Map each page with uncacheable (MMIO) flags
+        let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+        for i in 0..num_pages as u64 {
+            let page_vaddr = base_vaddr + i * 4096;
+            let page_phys = phys_addr + i * 4096;
+
+            // SAFETY: cr3 is valid, phys_addr is validated above.
+            unsafe {
+                let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
+                crate::memory::paging::map_page(
+                    &mut pt,
+                    page_vaddr,
+                    page_phys,
+                    crate::memory::paging::flags::user_mmio(),
+                    &mut fa_guard,
+                )
+                .map_err(|_| SyscallError::OutOfMemory)?;
+            }
+        }
+        drop(fa_guard);
+        drop(pt_guard);
+
+        Ok(base_vaddr)
+    }
+
+    /// SYS_ALLOC_DMA: Allocate physically contiguous DMA-capable pages.
+    ///
+    /// Args: arg1 = num_pages, arg2 = flags (reserved), arg3 = out_paddr_ptr
+    ///
+    /// Allocates contiguous physical frames with guard pages (unmapped pages
+    /// on both sides) to contain device overflows. Maps into the calling
+    /// process and writes the physical address to *out_paddr_ptr.
+    ///
+    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    fn handle_alloc_dma(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let num_pages = args.arg1_u32();
+        let _flags = args.arg2_u32(); // Reserved for IOMMU hints
+        let out_paddr_ptr = args.arg3;
+
+        if num_pages == 0 || num_pages > 64 {
+            return Err(SyscallError::InvalidArg);
+        }
+        if out_paddr_ptr == 0 || out_paddr_ptr >= USER_SPACE_END {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Allocate contiguous physical frames
+        let base_frame = {
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+            fa_guard
+                .allocate_contiguous(num_pages as usize)
+                .map_err(|_| SyscallError::OutOfMemory)?
+        };
+        let base_phys = base_frame.addr;
+
+        // Allocate virtual address range: num_pages + 2 guard pages (before/after)
+        let total_pages = num_pages + 2;
+        let mut pt_guard = crate::PROCESS_TABLE.lock();
+        let vma = pt_guard
+            .as_mut()
+            .and_then(|pt| pt.vma_mut(ctx.process_id))
+            .ok_or(SyscallError::InvalidArg)?;
+
+        let region_vaddr = vma
+            .allocate_region(total_pages)
+            .ok_or(SyscallError::OutOfMemory)?;
+
+        // The actual DMA mapping starts after the first guard page
+        let dma_vaddr = region_vaddr + 4096;
+
+        let hhdm = crate::hhdm_offset();
+        let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+
+        // Map the DMA pages (guard pages at region_vaddr and region_vaddr + (num_pages+1)*4096
+        // are left unmapped — any device overflow faults into unmapped memory)
+        for i in 0..num_pages as u64 {
+            let page_vaddr = dma_vaddr + i * 4096;
+            let page_phys = base_phys + i * 4096;
+
+            // Zero the frame
+            // SAFETY: Freshly allocated contiguous frame, HHDM-mapped.
+            unsafe {
+                core::ptr::write_bytes((page_phys + hhdm) as *mut u8, 0, 4096);
+            }
+
+            // SAFETY: cr3 is valid, frame is fresh.
+            unsafe {
+                let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
+                crate::memory::paging::map_page(
+                    &mut pt,
+                    page_vaddr,
+                    page_phys,
+                    crate::memory::paging::flags::user_rw(),
+                    &mut fa_guard,
+                )
+                .map_err(|_| SyscallError::OutOfMemory)?;
+            }
+        }
+        drop(fa_guard);
+        drop(pt_guard);
+
+        // Write physical address to user buffer
+        let paddr_bytes = base_phys.to_le_bytes();
+        write_user_buffer(ctx.cr3, out_paddr_ptr, &paddr_bytes)?;
+
+        Ok(dma_vaddr)
+    }
+
+    /// SYS_DEVICE_INFO: Query PCI device info by index.
+    ///
+    /// Args: arg1 = device index, arg2 = out_buf ptr, arg3 = buf_len
+    ///
+    /// Writes a fixed-format device descriptor to the user buffer:
+    ///   [vendor_id:2][device_id:2][class:1][subclass:1][bus:1][device:1]
+    ///   [function:1][pad:1][bar_count:1][pad:1]
+    ///   [bar0_addr:8][bar0_size:4][pad:4] × 6
+    /// Total: 12 + 6×16 = 108 bytes
+    #[cfg(target_arch = "x86_64")]
+    fn handle_device_info(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let index = args.arg1_u32() as usize;
+        let out_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        const DESCRIPTOR_SIZE: usize = 108;
+
+        if buf_len < DESCRIPTOR_SIZE {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let dev = crate::pci::get_device(index).ok_or(SyscallError::InvalidArg)?;
+
+        let mut desc = [0u8; DESCRIPTOR_SIZE];
+        // Header: vendor, device, class, subclass, bus, dev, func, pad, bar_count, pad
+        desc[0..2].copy_from_slice(&dev.vendor_id.to_le_bytes());
+        desc[2..4].copy_from_slice(&dev.device_id.to_le_bytes());
+        desc[4] = dev.class;
+        desc[5] = dev.subclass;
+        desc[6] = dev.bus;
+        desc[7] = dev.device;
+        desc[8] = dev.function;
+        desc[9] = 0; // pad
+        // Count non-zero BARs
+        desc[10] = dev.bars.iter().filter(|&&b| b != 0).count() as u8;
+        desc[11] = 0; // pad
+
+        // BARs: 6 × [addr:8][size:4][is_io:1][pad:3]
+        for i in 0..6 {
+            let offset = 12 + i * 16;
+            desc[offset..offset + 8].copy_from_slice(&dev.bars[i].to_le_bytes());
+            desc[offset + 8..offset + 12].copy_from_slice(&dev.bar_sizes[i].to_le_bytes());
+            desc[offset + 12] = if dev.bar_is_io[i] { 1 } else { 0 };
+            // remaining pad bytes already zero
+        }
+
+        write_user_buffer(ctx.cr3, out_buf, &desc)?;
+
+        Ok(0)
+    }
+
+    /// SYS_DEVICE_INFO stub for non-x86_64 targets (PCI not yet supported).
+    #[cfg(not(target_arch = "x86_64"))]
+    fn handle_device_info(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Err(SyscallError::Enosys)
+    }
+
+    /// SYS_PORT_IO: Validated port I/O from user-space.
+    ///
+    /// Args: arg1 = port (u16), arg2 = value (for writes), arg3 = flags
+    ///   flags bit 0: 0=read, 1=write
+    ///   flags bits 2:1: 0=byte, 1=word, 2=dword
+    ///
+    /// The kernel validates the port is within a PCI device's I/O BAR range
+    /// before performing the operation. This prevents user-space from accessing
+    /// arbitrary ports (PIC, PIT, PCI config space, etc.).
+    #[cfg(target_arch = "x86_64")]
+    fn handle_port_io(args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        let port = args.arg1 as u16;
+        let value = args.arg2 as u32;
+        let flags = args.arg3 as u32;
+        let is_write = (flags & 1) != 0;
+        let width = (flags >> 1) & 0x3; // 0=byte, 1=word, 2=dword
+
+        // Validate port is within a PCI device I/O BAR
+        if !crate::pci::is_port_in_pci_bar(port) {
+            return Err(SyscallError::PermissionDenied);
+        }
+
+        // Validate width alignment
+        match width {
+            1 if port & 1 != 0 => return Err(SyscallError::InvalidArg), // word: 2-byte aligned
+            2 if port & 3 != 0 => return Err(SyscallError::InvalidArg), // dword: 4-byte aligned
+            0 | 1 | 2 => {}
+            _ => return Err(SyscallError::InvalidArg),
+        }
+
+        if is_write {
+            match width {
+                0 => {
+                    // SAFETY: Port validated against PCI I/O BARs above.
+                    let p = unsafe { crate::arch::x86_64::portio::Port8::new(port) };
+                    p.write(value as u8);
+                }
+                1 => {
+                    // SAFETY: Port validated, 2-byte aligned.
+                    let p = unsafe { crate::arch::x86_64::portio::Port16::new(port) };
+                    p.write(value as u16);
+                }
+                2 => {
+                    // SAFETY: Port validated, 4-byte aligned. Use inline asm for 32-bit.
+                    unsafe {
+                        core::arch::asm!(
+                            "out dx, eax",
+                            in("dx") port,
+                            in("eax") value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Ok(0)
+        } else {
+            let result = match width {
+                0 => {
+                    // SAFETY: Port validated against PCI I/O BARs above.
+                    let p = unsafe { crate::arch::x86_64::portio::Port8::new(port) };
+                    p.read() as u64
+                }
+                1 => {
+                    // SAFETY: Port validated, 2-byte aligned.
+                    let p = unsafe { crate::arch::x86_64::portio::Port16::new(port) };
+                    p.read() as u64
+                }
+                2 => {
+                    // SAFETY: Port validated, 4-byte aligned. 32-bit IN.
+                    let v: u32;
+                    unsafe {
+                        core::arch::asm!(
+                            "in eax, dx",
+                            in("dx") port,
+                            out("eax") v,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                    }
+                    v as u64
+                }
+                _ => unreachable!(),
+            };
+            Ok(result)
+        }
+    }
+
+    /// SYS_PORT_IO stub for non-x86_64 targets.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn handle_port_io(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Err(SyscallError::Enosys)
     }
 }

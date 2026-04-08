@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! ArcOS Filesystem Service — user-space ObjectStore gateway
 //!
 //! Runs as a ring-3 process. Registers IPC endpoint 16, receives
@@ -13,6 +15,9 @@
 
 #![no_std]
 #![no_main]
+#![deny(unsafe_code)]
+
+use arcos_libsys as sys;
 
 // ============================================================================
 // Panic handler (required for no_std)
@@ -20,146 +25,8 @@
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // Print panic message if possible, then exit
-    let msg = b"[FS] PANIC!\n";
-    sys_print(msg);
-    sys_exit(1);
-}
-
-// ============================================================================
-// Syscall wrappers (x86_64 SYSCALL instruction)
-// ============================================================================
-
-/// Raw syscall with up to 3 arguments.
-#[inline(always)]
-fn syscall3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
-    let ret: i64;
-    // SAFETY: Invokes the kernel syscall handler via the SYSCALL instruction.
-    // The kernel validates all arguments. rcx and r11 are clobbered by the
-    // CPU (saved RIP and RFLAGS respectively).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") num as i64 => ret,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Raw syscall with 4 arguments.
-#[inline(always)]
-fn syscall4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
-    let ret: i64;
-    // SAFETY: Same as syscall3. RCX is the 4th arg register in our ABI.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") num as i64 => ret,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
-            inlateout("rcx") arg4 => _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Raw syscall with 1 argument.
-#[inline(always)]
-fn syscall1(num: u64, arg1: u64) -> i64 {
-    syscall3(num, arg1, 0, 0)
-}
-
-/// Raw syscall with 0 arguments.
-#[inline(always)]
-fn syscall0(num: u64) -> i64 {
-    syscall3(num, 0, 0, 0)
-}
-
-// Syscall numbers (must match kernel src/syscalls/mod.rs)
-const SYS_EXIT: u64 = 0;
-const SYS_WRITE: u64 = 1;
-const SYS_REGISTER_ENDPOINT: u64 = 6;
-const SYS_YIELD: u64 = 7;
-const SYS_GET_PID: u64 = 8;
-const SYS_PRINT: u64 = 10;
-const SYS_RECV_MSG: u64 = 13;
-const SYS_OBJ_PUT: u64 = 14;
-const SYS_OBJ_GET: u64 = 15;
-const SYS_OBJ_DELETE: u64 = 16;
-const SYS_OBJ_LIST: u64 = 17;
-const SYS_OBJ_PUT_SIGNED: u64 = 19;
-
-fn sys_exit(code: u32) -> ! {
-    syscall1(SYS_EXIT, code as u64);
-    loop {}
-}
-
-fn sys_print(msg: &[u8]) {
-    syscall3(SYS_PRINT, msg.as_ptr() as u64, msg.len() as u64, 0);
-}
-
-fn sys_register_endpoint(endpoint_id: u32) -> i64 {
-    syscall3(SYS_REGISTER_ENDPOINT, endpoint_id as u64, 0, 0)
-}
-
-fn sys_yield() {
-    syscall0(SYS_YIELD);
-}
-
-fn sys_get_pid() -> u32 {
-    syscall0(SYS_GET_PID) as u32
-}
-
-/// Send IPC message (Write syscall).
-fn sys_write(endpoint: u32, buf: &[u8]) -> i64 {
-    syscall3(SYS_WRITE, endpoint as u64, buf.as_ptr() as u64, buf.len() as u64)
-}
-
-/// Receive IPC message with sender identity.
-/// Returns total bytes in buf, or 0 if no message, or negative error.
-/// buf layout: [sender_principal:32][from_endpoint:4][payload:N]
-fn sys_recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
-    syscall3(SYS_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
-}
-
-/// Store object. Writes 32-byte hash to out_hash. Returns 0 or negative error.
-fn sys_obj_put(content: &[u8], out_hash: &mut [u8; 32]) -> i64 {
-    syscall3(SYS_OBJ_PUT, content.as_ptr() as u64, content.len() as u64, out_hash.as_mut_ptr() as u64)
-}
-
-/// Get object content by hash. Returns bytes read or negative error.
-fn sys_obj_get(hash: &[u8; 32], out_buf: &mut [u8]) -> i64 {
-    syscall3(SYS_OBJ_GET, hash.as_ptr() as u64, out_buf.as_mut_ptr() as u64, out_buf.len() as u64)
-}
-
-/// Delete object by hash. Returns 0 or negative error.
-fn sys_obj_delete(hash: &[u8; 32]) -> i64 {
-    syscall1(SYS_OBJ_DELETE, hash.as_ptr() as u64)
-}
-
-/// List object hashes. Returns count of objects.
-fn sys_obj_list(out_buf: &mut [u8]) -> i64 {
-    syscall3(SYS_OBJ_LIST, out_buf.as_mut_ptr() as u64, out_buf.len() as u64, 0)
-}
-
-/// Store a pre-signed object. Kernel verifies the signature.
-fn sys_obj_put_signed(content: &[u8], sig: &[u8; 64], out_hash: &mut [u8; 32]) -> i64 {
-    syscall4(
-        SYS_OBJ_PUT_SIGNED,
-        content.as_ptr() as u64,
-        content.len() as u64,
-        sig.as_ptr() as u64,
-        out_hash.as_mut_ptr() as u64,
-    )
+    sys::print(b"[FS] PANIC!\n");
+    sys::exit(1);
 }
 
 // ============================================================================
@@ -183,7 +50,7 @@ fn request_sign(content: &[u8]) -> Option<[u8; 64]> {
     let req_len = 1 + content.len();
 
     // Send to key-store endpoint
-    let ret = sys_write(KS_ENDPOINT, &req[..req_len]);
+    let ret = sys::write(KS_ENDPOINT, &req[..req_len]);
     if ret < 0 {
         return None; // Key-store not available
     }
@@ -192,7 +59,7 @@ fn request_sign(content: &[u8]) -> Option<[u8; 64]> {
     let mut resp_buf = [0u8; 256];
     // Poll a few times for the response (key-store needs to be scheduled)
     for _ in 0..20 {
-        let n = sys_recv_msg(FS_ENDPOINT, &mut resp_buf);
+        let n = sys::recv_msg(FS_ENDPOINT, &mut resp_buf);
         if n > 0 {
             let total = n as usize;
             if total >= 36 + 65 {
@@ -209,7 +76,7 @@ fn request_sign(content: &[u8]) -> Option<[u8; 64]> {
             // we drop it and return None (fallback to unsigned).
             return None;
         }
-        sys_yield();
+        sys::yield_now();
     }
     None // Timed out
 }
@@ -254,10 +121,10 @@ fn handle_put(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8])
 
     // Try signed path: request signature from key-store, then ObjPutSigned
     let ret = if let Some(sig) = request_sign(payload) {
-        sys_obj_put_signed(payload, &sig, &mut hash)
+        sys::obj_put_signed(payload, &sig, &mut hash)
     } else {
         // Fallback: unsigned ObjPut (key-store not yet available)
-        sys_obj_put(payload, &mut hash)
+        sys::obj_put(payload, &mut hash)
     };
 
     if ret < 0 {
@@ -287,7 +154,7 @@ fn handle_get(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8])
     let mut content_buf = [0u8; 255]; // 256 - 1 status byte
     let read_len = core::cmp::min(max_content, 255);
 
-    let ret = sys_obj_get(&hash, &mut content_buf[..read_len]);
+    let ret = sys::obj_get(&hash, &mut content_buf[..read_len]);
 
     if ret < 0 {
         response[0] = STATUS_NOT_FOUND;
@@ -318,7 +185,7 @@ fn handle_delete(payload: &[u8], sender_principal: &[u8; 32], response: &mut [u8
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&payload[..32]);
 
-    let ret = sys_obj_delete(&hash);
+    let ret = sys::obj_delete(&hash);
 
     response[0] = match ret {
         0 => STATUS_OK,
@@ -340,7 +207,7 @@ fn handle_list(response: &mut [u8]) -> usize {
     let mut hash_buf = [0u8; 224]; // 7 * 32
     let actual_buf_len = core::cmp::min(buf_size, 224);
 
-    let ret = sys_obj_list(&mut hash_buf[..actual_buf_len]);
+    let ret = sys::obj_list(&mut hash_buf[..actual_buf_len]);
 
     if ret < 0 {
         response[0] = STATUS_INVALID;
@@ -360,27 +227,28 @@ fn handle_list(response: &mut [u8]) -> usize {
 // Entry point
 // ============================================================================
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    let _pid = sys_get_pid();
+    let _pid = sys::get_pid();
 
-    sys_print(b"[FS] Filesystem service starting\n");
+    sys::print(b"[FS] Filesystem service starting\n");
 
     // Register our IPC endpoint
-    sys_register_endpoint(FS_ENDPOINT);
+    sys::register_endpoint(FS_ENDPOINT);
 
-    sys_print(b"[FS] Endpoint 16 registered, entering service loop\n");
+    sys::print(b"[FS] Endpoint 16 registered, entering service loop\n");
 
     // Service loop: receive message, dispatch command, send response
     let mut recv_buf = [0u8; 256]; // [principal:32][from:4][payload:N]
     let mut resp_buf = [0u8; 256];
 
     loop {
-        let n = sys_recv_msg(FS_ENDPOINT, &mut recv_buf);
+        let n = sys::recv_msg(FS_ENDPOINT, &mut recv_buf);
 
         if n <= 0 {
             // No message — yield and retry. Silence means healthy.
-            sys_yield();
+            sys::yield_now();
             continue;
         }
         let total = n as usize;
@@ -414,6 +282,6 @@ pub extern "C" fn _start() -> ! {
         };
 
         // Send response back to sender's endpoint
-        sys_write(from_endpoint, &resp_buf[..resp_len]);
+        sys::write(from_endpoint, &resp_buf[..resp_len]);
     }
 }

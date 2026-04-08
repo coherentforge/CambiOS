@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Task and process definitions for the microkernel scheduler
 //!
 //! Defines task state, context, and lifecycle for verification-ready scheduling.

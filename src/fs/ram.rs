@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! RAM-backed ObjectStore implementation
 //!
 //! Fixed-capacity (256 objects), heap-allocated, linear scan.

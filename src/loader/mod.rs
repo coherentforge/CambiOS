@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Userspace process loader with verify-before-execute security gate
 //!
 //! Loads ELF binaries into isolated per-process address spaces. Every binary
@@ -244,8 +246,8 @@ const MAX_TRUSTED_KEYS: usize = 4;
 /// a valid signature trailer signed by one of the trusted public keys.
 ///
 /// The binary must have an `ARCSIG\x01\x00` trailer containing a 64-byte
-/// Ed25519 signature over the original ELF bytes. The signature must verify
-/// against at least one of the configured trusted keys.
+/// Ed25519 signature over the Blake3 hash of the original ELF bytes.
+/// The signature must verify against at least one of the configured trusted keys.
 pub struct SignedBinaryVerifier {
     /// Trusted public keys (Ed25519, 32 bytes each).
     /// At least one must have signed the binary.
@@ -282,9 +284,13 @@ impl BinaryVerifier for SignedBinaryVerifier {
             None => return VerifyResult::Deny(DenyReason::MissingSignature),
         };
 
-        // 2. Verify signature against at least one trusted key
+        // 2. Verify signature against at least one trusted key.
+        //    The signature covers blake3(elf_bytes), not the raw bytes.
+        //    This allows hardware signing keys (YubiKey) to sign a 32-byte hash
+        //    instead of piping entire binaries through the smart card interface.
+        let elf_hash = crate::fs::content_hash(elf_bytes);
         let sig_valid = self.trusted_keys[..self.key_count].iter().any(|pk| {
-            crate::fs::verify_signature(pk, elf_bytes, &crate::fs::SignatureBytes { data: sig_bytes })
+            crate::fs::verify_signature(pk, &elf_hash, &crate::fs::SignatureBytes { data: sig_bytes })
         });
         if !sig_valid {
             return VerifyResult::Deny(DenyReason::InvalidSignature);
@@ -973,8 +979,10 @@ mod tests {
     // --- Signature trailer tests ---
 
     /// Helper: sign a binary and append the ARCSIG trailer.
+    /// Signs blake3(binary), not the raw binary — matches the verifier.
     fn sign_binary(binary: &[u8], sk_bytes: &[u8; 64]) -> alloc::vec::Vec<u8> {
-        let sig = crate::fs::sign_content(sk_bytes, binary);
+        let hash = crate::fs::content_hash(binary);
+        let sig = crate::fs::sign_content(sk_bytes, &hash);
         let mut signed = binary.to_vec();
         signed.extend_from_slice(&sig.data);
         signed.extend_from_slice(SIGNATURE_TRAILER_MAGIC);

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 /// Spinlock implementations for synchronizing kernel state
 ///
 /// Two variants:

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Per-CPU data — AArch64 implementation
 //!
 //! AArch64 uses TPIDR_EL1 (Thread ID Register, EL1) as the per-CPU data
@@ -150,19 +152,21 @@ pub fn cpu_count() -> u32 {
 /// Must be called once during single-threaded boot on the BSP.
 pub unsafe fn init_bsp(mpidr_aff: u64) {
     // SAFETY: Single-threaded boot, no concurrent access to PER_CPU_DATA[0].
-    let percpu = &raw mut PER_CPU_DATA[0];
-    (*percpu).self_ptr = percpu as *const PerCpu;
-    (*percpu).cpu_id = 0;
-    (*percpu).mpidr_aff = mpidr_aff;
-    (*percpu).current_task_id = 0;
-    (*percpu).interrupt_depth = 0;
+    // Writing TPIDR_EL1 from EL1 is always safe. percpu has 'static lifetime.
+    unsafe {
+        let percpu = &raw mut PER_CPU_DATA[0];
+        (*percpu).self_ptr = percpu as *const PerCpu;
+        (*percpu).cpu_id = 0;
+        (*percpu).mpidr_aff = mpidr_aff;
+        (*percpu).current_task_id = 0;
+        (*percpu).interrupt_depth = 0;
 
-    // SAFETY: Writing TPIDR_EL1 from EL1 is always safe. percpu has 'static lifetime.
-    core::arch::asm!(
-        "msr tpidr_el1, {0}",
-        in(reg) percpu as u64,
-        options(nostack, nomem),
-    );
+        core::arch::asm!(
+            "msr tpidr_el1, {0}",
+            in(reg) percpu as u64,
+            options(nostack, nomem),
+        );
+    }
 
     CPU_COUNT.store(1, core::sync::atomic::Ordering::Release);
 }
@@ -176,19 +180,21 @@ pub unsafe fn init_ap(cpu_index: usize, mpidr_aff: u64) {
     assert!(cpu_index > 0 && cpu_index < MAX_CPUS, "AP cpu_index out of range");
 
     // SAFETY: Each AP initializes only its own PER_CPU_DATA slot.
-    let percpu = &raw mut PER_CPU_DATA[cpu_index];
-    (*percpu).self_ptr = percpu as *const PerCpu;
-    (*percpu).cpu_id = cpu_index as u32;
-    (*percpu).mpidr_aff = mpidr_aff;
-    (*percpu).current_task_id = 0;
-    (*percpu).interrupt_depth = 0;
+    // Writing TPIDR_EL1 from EL1 on this AP is safe.
+    unsafe {
+        let percpu = &raw mut PER_CPU_DATA[cpu_index];
+        (*percpu).self_ptr = percpu as *const PerCpu;
+        (*percpu).cpu_id = cpu_index as u32;
+        (*percpu).mpidr_aff = mpidr_aff;
+        (*percpu).current_task_id = 0;
+        (*percpu).interrupt_depth = 0;
 
-    // SAFETY: Writing TPIDR_EL1 from EL1 on this AP is safe.
-    core::arch::asm!(
-        "msr tpidr_el1, {0}",
-        in(reg) percpu as u64,
-        options(nostack, nomem),
-    );
+        core::arch::asm!(
+            "msr tpidr_el1, {0}",
+            in(reg) percpu as u64,
+            options(nostack, nomem),
+        );
+    }
 
     CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 }
@@ -206,12 +212,14 @@ pub unsafe fn current_percpu() -> &'static PerCpu {
     let ptr: u64;
     // SAFETY: TPIDR_EL1 was set to a valid PerCpu pointer during init.
     // The pointed-to data has 'static lifetime (lives in PER_CPU_DATA array).
-    core::arch::asm!(
-        "mrs {0}, tpidr_el1",
-        out(reg) ptr,
-        options(nostack, readonly, preserves_flags),
-    );
-    &*(ptr as *const PerCpu)
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, tpidr_el1",
+            out(reg) ptr,
+            options(nostack, readonly, preserves_flags),
+        );
+        &*(ptr as *const PerCpu)
+    }
 }
 
 /// Get the current CPU's PerCpu data (mutable).
@@ -225,12 +233,14 @@ pub unsafe fn current_percpu_mut() -> &'static mut PerCpu {
     let ptr: u64;
     // SAFETY: Same as current_percpu; additionally, caller guarantees
     // exclusive access (e.g., interrupts masked or in ISR context).
-    core::arch::asm!(
-        "mrs {0}, tpidr_el1",
-        out(reg) ptr,
-        options(nostack, readonly, preserves_flags),
-    );
-    &mut *(ptr as *mut PerCpu)
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, tpidr_el1",
+            out(reg) ptr,
+            options(nostack, readonly, preserves_flags),
+        );
+        &mut *(ptr as *mut PerCpu)
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! TLB management — AArch64
 //!
 //! AArch64 has hardware-assisted TLB maintenance via TLBI instructions.

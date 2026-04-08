@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Userspace syscall library
 //!
 //! Provides convenient wrapper functions for drivers to invoke syscalls.

@@ -1,3 +1,5 @@
+/* Copyright (C) 2024-2026 Jason Ricca. All rights reserved. */
+
 // ArcOS user-space test program — "hello" module
 //
 // Loaded by Limine as a boot module, executed in ring 3.

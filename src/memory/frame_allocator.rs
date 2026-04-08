@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Physical frame allocator
 //!
 //! Bitmap-based allocator for 4 KiB physical pages. Initialized from the
@@ -175,6 +177,58 @@ impl FrameAllocator {
             return Ok(PhysFrame {
                 addr: frame_idx as u64 * PAGE_SIZE,
             });
+        }
+
+        Err(FrameAllocError::OutOfMemory)
+    }
+
+    /// Allocate `count` physically contiguous 4 KiB frames.
+    ///
+    /// Scans the bitmap for a run of `count` consecutive free bits.
+    /// Returns the physical address of the first frame, or an error.
+    /// All frames in the run are marked as allocated.
+    ///
+    /// For DMA buffers where the device needs contiguous physical memory.
+    pub fn allocate_contiguous(&mut self, count: usize) -> Result<PhysFrame, FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::NotInitialized);
+        }
+
+        if count == 0 || count > 64 {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+
+        if count > self.free_frames {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+
+        // Scan for a run of `count` consecutive free frames
+        let mut run_start: usize = 0;
+        let mut run_len: usize = 0;
+
+        for idx in 0..self.total_frames {
+            if self.is_set(idx) {
+                // Allocated — reset the run
+                run_len = 0;
+            } else {
+                // Free frame
+                if run_len == 0 {
+                    run_start = idx;
+                }
+                run_len += 1;
+
+                if run_len == count {
+                    // Found a sufficient run — mark all frames as allocated
+                    for i in run_start..run_start + count {
+                        self.set_bit(i);
+                    }
+                    self.free_frames -= count;
+
+                    return Ok(PhysFrame {
+                        addr: run_start as u64 * PAGE_SIZE,
+                    });
+                }
+            }
         }
 
         Err(FrameAllocError::OutOfMemory)
@@ -547,5 +601,122 @@ mod tests {
         let got = cache.refill(&mut alloc);
         assert_eq!(got, 4); // Got all available, less than REFILL_COUNT
         assert_eq!(cache.len(), 4);
+    }
+
+    // ================================================================
+    // Contiguous allocation tests
+    // ================================================================
+
+    #[test]
+    fn test_allocate_contiguous_basic() {
+        let mut fa = FrameAllocator::new();
+        // Add a region of 100 frames starting at physical address 0x100000
+        fa.add_region(0x100000, 100 * 4096);
+        fa.finalize();
+
+        // Allocate 4 contiguous frames
+        let base = fa.allocate_contiguous(4).unwrap();
+        assert_eq!(base.addr % 4096, 0); // Page-aligned
+
+        // Allocate another contiguous run — should succeed and be different
+        let base2 = fa.allocate_contiguous(4).unwrap();
+        assert_ne!(base.addr, base2.addr);
+    }
+
+    #[test]
+    fn test_allocate_contiguous_too_large() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096); // Only 10 frames
+        fa.finalize();
+
+        // Request 20 contiguous frames — should fail
+        assert_eq!(fa.allocate_contiguous(20), Err(FrameAllocError::OutOfMemory));
+    }
+
+    #[test]
+    fn test_allocate_contiguous_exact_fit() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 8 * 4096); // Exactly 8 frames
+        fa.finalize();
+
+        // Allocate all 8 as contiguous
+        let base = fa.allocate_contiguous(8).unwrap();
+        assert_eq!(base.addr, 0x100000);
+        assert_eq!(fa.free_count(), 0);
+
+        // No more room
+        assert_eq!(fa.allocate_contiguous(1), Err(FrameAllocError::OutOfMemory));
+    }
+
+    #[test]
+    fn test_allocate_contiguous_fragmented() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096); // 10 frames
+        fa.finalize();
+
+        // Allocate every other frame to fragment the bitmap
+        // Frames at indices 256..266 (0x100000 = frame 256)
+        let f0 = fa.allocate().unwrap(); // frame 256
+        let _f1 = fa.allocate().unwrap(); // frame 257
+        let f2 = fa.allocate().unwrap(); // frame 258
+        let _f3 = fa.allocate().unwrap(); // frame 259
+        let f4 = fa.allocate().unwrap(); // frame 260
+
+        // Free alternating frames to create gaps
+        fa.free(f0).unwrap(); // free 256
+        fa.free(f2).unwrap(); // free 258
+        fa.free(f4).unwrap(); // free 260
+
+        // Now free: 256, 258, 260, 261, 262, 263, 264, 265 (8 free total)
+        // But 256 and 258 are isolated (257, 259 are allocated)
+        // Longest contiguous run: 261-265 = 5 frames
+
+        // Request 4 contiguous — should succeed from the tail run
+        let base = fa.allocate_contiguous(4).unwrap();
+        assert!(base.addr >= 0x100000);
+
+        // Request 5 contiguous — should fail now (only scattered frames left)
+        assert_eq!(fa.allocate_contiguous(5), Err(FrameAllocError::OutOfMemory));
+    }
+
+    #[test]
+    fn test_allocate_contiguous_zero_count() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096);
+        fa.finalize();
+
+        assert_eq!(fa.allocate_contiguous(0), Err(FrameAllocError::OutOfMemory));
+    }
+
+    #[test]
+    fn test_allocate_contiguous_over_max() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 100 * 4096);
+        fa.finalize();
+
+        // 65 exceeds the 64-page max
+        assert_eq!(fa.allocate_contiguous(65), Err(FrameAllocError::OutOfMemory));
+    }
+
+    #[test]
+    fn test_allocate_contiguous_not_initialized() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096);
+        // No finalize()
+        assert_eq!(fa.allocate_contiguous(4), Err(FrameAllocError::NotInitialized));
+    }
+
+    #[test]
+    fn test_allocate_contiguous_free_count_correct() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 50 * 4096); // 50 frames
+        fa.finalize();
+        assert_eq!(fa.free_count(), 50);
+
+        fa.allocate_contiguous(16).unwrap();
+        assert_eq!(fa.free_count(), 34);
+
+        fa.allocate_contiguous(16).unwrap();
+        assert_eq!(fa.free_count(), 18);
     }
 }

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Page table management
 //!
 //! Provides kernel page table operations on top of the Limine-provided identity
@@ -87,7 +89,7 @@ pub unsafe fn active_page_table() -> OffsetPageTable<'static> {
     // SAFETY: CR3 points to a valid PML4 frame. HHDM offset (set by Limine) maps
     // all physical memory to the higher half, so (phys + hhdm) is a valid virtual
     // address for this frame. Caller ensures only one mutable reference exists.
-    OffsetPageTable::new(&mut *virt, VirtAddr::new(hhdm))
+    unsafe { OffsetPageTable::new(&mut *virt, VirtAddr::new(hhdm)) }
 }
 
 /// Get an OffsetPageTable for a specific PML4 physical address via HHDM.
@@ -101,7 +103,7 @@ pub unsafe fn page_table_from_cr3(pml4_phys: u64) -> OffsetPageTable<'static> {
     // SAFETY: pml4_phys was obtained from create_process_page_table() or Cr3::read();
     // both produce valid PML4 physical addresses. HHDM maps it to a valid VA.
     // Caller ensures only one mutable reference exists.
-    OffsetPageTable::new(&mut *virt, VirtAddr::new(hhdm))
+    unsafe { OffsetPageTable::new(&mut *virt, VirtAddr::new(hhdm)) }
 }
 
 /// Map a single 4 KiB virtual page to a physical frame.
@@ -271,5 +273,14 @@ pub mod flags {
     /// User data: present, writable, user-accessible
     pub fn user_rw() -> PageTableFlags {
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
+    }
+
+    /// User MMIO: present, writable, user-accessible, uncacheable (NO_CACHE).
+    /// For mapping device MMIO regions into user-space processes.
+    pub fn user_mmio() -> PageTableFlags {
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_CACHE
     }
 }

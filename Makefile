@@ -1,3 +1,5 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 # ArcOS Makefile - Build kernel and Limine bootable ISO
 #
 # Usage:
@@ -24,6 +26,8 @@ FS_SERVICE_DIR := user/fs-service
 FS_SERVICE_ELF := $(FS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-fs-service
 KS_SERVICE_DIR := user/key-store-service
 KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-key-store-service
+NET_DRIVER_DIR := user/virtio-net
+NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-net
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -42,7 +46,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net sign-tool export-pubkey
 
 all: iso
 
@@ -69,6 +73,13 @@ key-store-service:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Key Store service ready ==="
 
+virtio-net:
+	@echo "=== Building Virtio-Net driver ==="
+	cd $(NET_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== Virtio-Net driver ready ==="
+
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release
@@ -81,7 +92,7 @@ sign-tool:
 export-pubkey: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) --export-pubkey bootstrap_pubkey.bin
 
-iso: kernel user-elf fs-service key-store-service sign-tool
+iso: kernel user-elf fs-service key-store-service virtio-net
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -89,13 +100,16 @@ iso: kernel user-elf fs-service key-store-service sign-tool
 	mkdir -p iso_root/EFI/BOOT
 	# Copy kernel binary
 	cp $(KERNEL) iso_root/boot/arcos_microkernel
-	# Copy and sign user-space ELF modules
+	# Copy user-space ELF modules
 	cp $(USER_ELF) iso_root/boot/hello.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello.elf
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
+	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
+	# Sign all modules (single invocation avoids repeated card contention)
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -123,6 +137,7 @@ run: iso
 		-serial mon:stdio \
 		-smp 2 \
 		-m 128M \
+		-device virtio-net-pci \
 		-no-reboot
 
 run-uefi: iso

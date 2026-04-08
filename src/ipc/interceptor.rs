@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Zero-Trust IPC Interceptor
 //!
 //! Policy enforcement layer that sits between capability checks and actual IPC

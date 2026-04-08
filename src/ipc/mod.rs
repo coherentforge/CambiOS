@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Inter-Process Communication (IPC) for microkernel
 //!
 //! Defines message-passing primitives for communication between microkernel,

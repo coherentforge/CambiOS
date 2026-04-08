@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 /// Buddy Allocator for Process Heaps
 ///
 /// Pure bookkeeping allocator: tracks slot allocation via bitmaps without

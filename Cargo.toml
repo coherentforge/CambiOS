@@ -1,3 +1,5 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 [package]
 name = "arcos"
 version = "0.1.0"

@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! Capability-based security manager
 //!
 //! Enforces fine-grained access control for IPC operations.

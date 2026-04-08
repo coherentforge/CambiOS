@@ -1,3 +1,5 @@
+// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
 //! TLB shootdown via Inter-Processor Interrupts
 //!
 //! When one CPU modifies shared page tables (unmap, permission change), other
@@ -87,11 +89,13 @@ fn lock_release() {
 pub unsafe fn invlpg(virt_addr: u64) {
     // SAFETY: `invlpg` invalidates the TLB entry for the page containing
     // the given virtual address. Ring 0 only.
-    core::arch::asm!(
-        "invlpg [{}]",
-        in(reg) virt_addr,
-        options(nostack, preserves_flags),
-    );
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) virt_addr,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 /// Flush the entire TLB by reloading CR3.
@@ -102,9 +106,11 @@ pub unsafe fn invlpg(virt_addr: u64) {
 pub unsafe fn flush_all_local() {
     // SAFETY: Reading and writing CR3 is safe at ring 0. Writing the same
     // value back flushes all non-global TLB entries.
-    let cr3: u64;
-    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-    core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
 }
 
 // ============================================================================
@@ -161,7 +167,8 @@ pub extern "x86-interrupt" fn tlb_shootdown_isr(
 /// Must be called at ring 0. The page table modification that necessitated
 /// this shootdown must already be visible (written to memory) before calling.
 pub unsafe fn shootdown_page(virt_addr: u64) {
-    shootdown_range(virt_addr, 1);
+    // SAFETY: Caller ensures ring 0 and page table changes are visible.
+    unsafe { shootdown_range(virt_addr, 1) };
 }
 
 /// Invalidate a range of pages across all CPUs.
@@ -173,40 +180,45 @@ pub unsafe fn shootdown_page(virt_addr: u64) {
 /// # Safety
 /// Must be called at ring 0. Page table changes must be visible in memory.
 pub unsafe fn shootdown_range(virt_addr: u64, page_count: u32) {
-    // Always flush locally first
-    if page_count <= MAX_INDIVIDUAL_PAGES {
-        for i in 0..page_count as u64 {
-            invlpg(virt_addr + i * 4096);
+    // SAFETY: Caller ensures ring 0 and page table changes are visible in memory.
+    // All unsafe operations below (invlpg, flush_all_local, send_ipi) require
+    // ring 0, which the caller guarantees.
+    unsafe {
+        // Always flush locally first
+        if page_count <= MAX_INDIVIDUAL_PAGES {
+            for i in 0..page_count as u64 {
+                invlpg(virt_addr + i * 4096);
+            }
+        } else {
+            flush_all_local();
         }
-    } else {
-        flush_all_local();
+
+        // If only one CPU is online, we're done
+        let online = super::percpu::cpu_count();
+        if online <= 1 {
+            return;
+        }
+
+        // Serialize shootdown requests
+        lock_acquire();
+
+        // Fill the request
+        SHOOTDOWN.start_addr.store(virt_addr, Ordering::Release);
+        SHOOTDOWN.page_count.store(page_count, Ordering::Release);
+        // pending = number of *other* CPUs (all online minus self)
+        let remote_cpus = online - 1;
+        SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
+
+        // Send IPI to all other CPUs
+        super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR);
+
+        // Spin until all remote CPUs have processed the request
+        while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+
+        lock_release();
     }
-
-    // If only one CPU is online, we're done
-    let online = super::percpu::cpu_count();
-    if online <= 1 {
-        return;
-    }
-
-    // Serialize shootdown requests
-    lock_acquire();
-
-    // Fill the request
-    SHOOTDOWN.start_addr.store(virt_addr, Ordering::Release);
-    SHOOTDOWN.page_count.store(page_count, Ordering::Release);
-    // pending = number of *other* CPUs (all online minus self)
-    let remote_cpus = online - 1;
-    SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
-
-    // Send IPI to all other CPUs
-    super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR);
-
-    // Spin until all remote CPUs have processed the request
-    while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
-    }
-
-    lock_release();
 }
 
 /// Flush the entire TLB on all CPUs.
@@ -214,29 +226,33 @@ pub unsafe fn shootdown_range(virt_addr: u64, page_count: u32) {
 /// # Safety
 /// Must be called at ring 0.
 pub unsafe fn shootdown_all() {
-    // Flush locally
-    flush_all_local();
+    // SAFETY: Caller ensures ring 0. All unsafe operations below (flush_all_local,
+    // send_ipi) require ring 0, which the caller guarantees.
+    unsafe {
+        // Flush locally
+        flush_all_local();
 
-    let online = super::percpu::cpu_count();
-    if online <= 1 {
-        return;
+        let online = super::percpu::cpu_count();
+        if online <= 1 {
+            return;
+        }
+
+        lock_acquire();
+
+        // page_count = 0 signals "full flush" to the ISR
+        SHOOTDOWN.start_addr.store(0, Ordering::Release);
+        SHOOTDOWN.page_count.store(0, Ordering::Release);
+        let remote_cpus = online - 1;
+        SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
+
+        super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR);
+
+        while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+
+        lock_release();
     }
-
-    lock_acquire();
-
-    // page_count = 0 signals "full flush" to the ISR
-    SHOOTDOWN.start_addr.store(0, Ordering::Release);
-    SHOOTDOWN.page_count.store(0, Ordering::Release);
-    let remote_cpus = online - 1;
-    SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
-
-    super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR);
-
-    while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
-    }
-
-    lock_release();
 }
 
 // ============================================================================
@@ -269,14 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_initial_state() {
-        // Lock should not be held initially
-        assert!(!LOCK.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn test_lock_acquire_release() {
-        // Verify lock can be acquired and released
+        // Verify lock can be acquired and released (also covers initial state:
+        // lock_acquire spins until LOCK is false, so it implicitly asserts
+        // the lock is available before acquiring).
         lock_acquire();
         assert!(LOCK.load(Ordering::Relaxed));
         lock_release();
