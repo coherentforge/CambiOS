@@ -370,8 +370,10 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
             unsafe { crate::arch::gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
+            // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
+            // Writing CR3 switches user page tables; hint.page_table_root was
+            // validated by the scheduler. TLB flush is implicit on CR3 write.
             unsafe {
-                // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
                 let current_cr3: u64;
                 core::arch::asm!(
                     "mov {}, cr3",
@@ -570,8 +572,10 @@ extern "C" fn yield_inner(current_rsp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
+            // SAFETY: Reading CR3 is always safe at ring 0. Writing CR3
+            // switches user page tables; hint.page_table_root was validated
+            // by the scheduler. Interrupts are disabled (cli in trampoline).
             unsafe {
-                // SAFETY: Reading CR3 is always safe at ring 0.
                 let current_cr3: u64;
                 core::arch::asm!(
                     "mov {}, cr3",

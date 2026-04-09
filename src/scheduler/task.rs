@@ -300,7 +300,21 @@ impl fmt::Display for BlockReason {
     }
 }
 
-/// Task metadata and state
+/// Task metadata and state.
+///
+/// # Invariants (for formal verification)
+///
+/// - If `state == Running`, this task is `current_task` on exactly one CPU.
+/// - If `state == Blocked`, `block_reason` must be `Some`.
+/// - If `state == Ready` or `Running`, `block_reason` must be `None`.
+/// - `in_ready_queue == true` iff the task's ID is present in a scheduler VecDeque.
+/// - `kernel_stack_top == 0` only for the idle task (uses boot stack).
+/// - `cr3 == 0` means the task uses the kernel page table (no per-process table).
+/// - `saved_rsp == 0` means the task is currently executing (no saved context).
+/// - `saved_rsp != 0` points to a valid `SavedContext` on this task's kernel stack.
+/// - `home_cpu` matches the CPU index whose scheduler owns this task.
+/// - `id.0 < MAX_TASKS` always (enforced by scheduler slot allocation).
+/// - Terminated tasks are never re-enqueued or rescheduled.
 #[derive(Clone)]
 pub struct Task {
     pub id: TaskId,

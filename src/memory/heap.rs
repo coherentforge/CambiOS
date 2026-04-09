@@ -25,10 +25,24 @@ struct FreeBlock {
     next: *mut FreeBlock,
 }
 
-/// Kernel heap allocator state
+/// Kernel heap allocator state.
 ///
 /// Uses a sorted free-list with first-fit allocation and block coalescing on free.
 /// Protected by a simple spinlock for multicore safety.
+///
+/// # Invariants (for formal verification)
+///
+/// - The free list is sorted by ascending address. For any node `n`,
+///   `n.next` is either null or points to a higher address.
+/// - Adjacent free blocks are coalesced: no two consecutive free blocks
+///   exist where `node_addr + node_size == next_node_addr`.
+/// - Every free block has `size >= MIN_BLOCK_SIZE` (16 bytes).
+/// - All free block pointers fall within `[heap_base, heap_base + heap_size)`.
+/// - The sum of all free block sizes plus all allocated block sizes equals
+///   `heap_size` (no memory is leaked or double-counted).
+/// - After `initialized == true`, `heap_base` and `heap_size` are immutable.
+/// - The allocator header `[block_base, block_total_size]` at `(user_ptr - 16)`
+///   is only valid for pointers returned by `alloc()`.
 pub struct KernelHeapAllocator {
     /// Head of the free block list (sorted by address for coalescing)
     free_list: *mut FreeBlock,

@@ -19,33 +19,102 @@ pub struct PlatformInfo {
 /// Available CPU features for the platform
 #[derive(Debug, Clone, Copy)]
 pub struct PlatformFeatures {
+    #[cfg(target_arch = "x86_64")]
     pub pae: bool,         // Physical Address Extension
+    #[cfg(target_arch = "x86_64")]
     pub pse: bool,         // Page Size Extension
+    #[cfg(target_arch = "x86_64")]
     pub tsc: bool,         // Time Stamp Counter
+    #[cfg(target_arch = "x86_64")]
     pub msr: bool,         // Model Specific Registers
+    #[cfg(target_arch = "x86_64")]
     pub apic: bool,        // APIC available
+    #[cfg(target_arch = "aarch64")]
+    pub neon: bool,        // Advanced SIMD (NEON)
+    #[cfg(target_arch = "aarch64")]
+    pub gicv3: bool,       // GICv3 interrupt controller
+    #[cfg(target_arch = "aarch64")]
+    pub generic_timer: bool, // ARM Generic Timer
 }
 
 impl PlatformInfo {
     /// Detect current platform capabilities
     pub fn detect() -> Self {
-        PlatformInfo {
-            vendor: "x86-64",
-            architecture: "x86_64",
-            features: PlatformFeatures {
-                pae: true,
-                pse: true,
-                tsc: true,
-                msr: true,
-                apic: true,
-            },
+        #[cfg(target_arch = "x86_64")]
+        {
+            PlatformInfo {
+                vendor: "x86-64",
+                architecture: "x86_64",
+                features: PlatformFeatures {
+                    pae: true,
+                    pse: true,
+                    tsc: true,
+                    msr: true,
+                    apic: true,
+                },
+            }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (implementer, part_number) = Self::read_midr();
+            let vendor = match implementer {
+                0x41 => "ARM",
+                0x42 => "Broadcom",
+                0x43 => "Cavium",
+                0x44 => "DEC",
+                0x4E => "NVIDIA",
+                0x50 => "APM",
+                0x51 => "Qualcomm",
+                0x56 => "Marvell",
+                0x61 => "Apple",
+                0x69 => "Intel",
+                _    => "Unknown",
+            };
+            let _ = part_number; // Available for future model identification
+            PlatformInfo {
+                vendor,
+                architecture: "aarch64",
+                features: PlatformFeatures {
+                    // ARMv8-A mandatory features
+                    neon: true,
+                    // Assumed true — ArcOS requires GICv3 (see CLAUDE.md)
+                    gicv3: true,
+                    // ARM Generic Timer is mandatory in ARMv8-A
+                    generic_timer: true,
+                },
+            }
+        }
+    }
+
+    /// Read MIDR_EL1 (Main ID Register) on AArch64.
+    ///
+    /// Returns (implementer, part_number) for CPU identification.
+    #[cfg(target_arch = "aarch64")]
+    fn read_midr() -> (u8, u16) {
+        let midr: u64;
+        // SAFETY: MIDR_EL1 is readable at EL1. It is a read-only register
+        // that identifies the CPU implementation.
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, midr_el1",
+                out(reg) midr,
+                options(nostack, nomem),
+            );
+        }
+        let implementer = ((midr >> 24) & 0xFF) as u8;
+        let part_number = ((midr >> 4) & 0xFFF) as u16;
+        (implementer, part_number)
     }
 
     /// Verify required features are available
     pub fn verify_requirements(&self) -> Result<(), &'static str> {
+        #[cfg(target_arch = "x86_64")]
         if !self.features.pae {
             return Err("PAE required");
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !self.features.gicv3 {
+            return Err("GICv3 required");
         }
         Ok(())
     }
@@ -69,12 +138,18 @@ pub fn enable_features() -> Result<(), &'static str> {
 
 /// Get CPU vendor string
 pub fn cpu_vendor() -> &'static str {
-    "x86-64"
+    #[cfg(target_arch = "x86_64")]
+    { "x86-64" }
+    #[cfg(target_arch = "aarch64")]
+    { PlatformInfo::detect().vendor }
 }
 
 /// Get CPU model string
 pub fn cpu_model() -> &'static str {
-    "Generic x86-64"
+    #[cfg(target_arch = "x86_64")]
+    { "Generic x86-64" }
+    #[cfg(target_arch = "aarch64")]
+    { "ARMv8-A" }
 }
 
 /// Interface for platform verification
@@ -195,20 +270,13 @@ impl PowerManager {
             PowerState::C0 => {
                 // Not idle
             }
-            PowerState::C1 => {
+            PowerState::C1 | PowerState::C2 | PowerState::C3 => {
                 #[cfg(target_arch = "x86_64")]
                 // SAFETY: HLT is safe at ring 0; wakes on next interrupt.
                 unsafe { x86_64::instructions::hlt(); }
-                #[cfg(not(target_arch = "x86_64"))]
-                core::hint::spin_loop();
-            }
-            PowerState::C2 | PowerState::C3 => {
-                // Would use MWAIT (x86) or WFI (ARM) in real implementation
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: HLT is safe at ring 0; wakes on next interrupt.
-                unsafe { x86_64::instructions::hlt(); }
-                #[cfg(not(target_arch = "x86_64"))]
-                core::hint::spin_loop();
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: WFI is safe at EL1; wakes on next interrupt or event.
+                unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
             }
         }
     }

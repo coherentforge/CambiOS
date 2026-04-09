@@ -33,6 +33,17 @@ const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 /// Each bit represents a 4 KiB frame:
 /// - 0 = free
 /// - 1 = allocated or reserved
+///
+/// # Invariants (for formal verification)
+///
+/// - `total_frames <= MAX_FRAMES` (524288, covering 0–2 GiB physical).
+/// - `free_frames <= total_frames` always.
+/// - `free_frames` equals the number of 0-bits in `bitmap[0..total_frames]`.
+/// - `search_hint < BITMAP_WORDS` (wraps around on overflow).
+/// - A frame is allocated iff its bit is set: `bitmap[idx/64] & (1 << (idx%64)) != 0`.
+/// - Frames outside `0..total_frames` have their bits permanently set to 1.
+/// - Once `initialized == true`, the bitmap is consistent and ready for use.
+/// - Thread safety: caller must hold the FRAME_ALLOCATOR spinlock (lock order 6).
 pub struct FrameAllocator {
     /// Allocation bitmap (1 = used, 0 = free)
     bitmap: [u64; BITMAP_WORDS],

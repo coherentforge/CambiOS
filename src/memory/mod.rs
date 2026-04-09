@@ -330,6 +330,8 @@ pub mod paging {
         unsafe { write_entry(l3_phys, idx, desc) };
 
         // Ensure the new mapping is visible
+        // SAFETY: DSB+ISB barrier sequence is valid at EL1 and has no
+        // side effects beyond flushing the pipeline and TLB.
         #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("dsb ishst", "isb", options(nostack));

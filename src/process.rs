@@ -42,6 +42,15 @@ pub struct VmaEntry {
 /// Uses a simple bump allocator for virtual addresses. Freed address
 /// ranges are not reused (the 47-bit user address space is large enough
 /// that exhaustion is not a practical concern for a microkernel).
+///
+/// # Invariants (for formal verification)
+///
+/// - `count <= MAX_VMAS` (64).
+/// - `next_vaddr >= VMA_ALLOC_BASE` and is always page-aligned.
+/// - `next_vaddr < USER_SPACE_END` (0x0000_8000_0000_0000).
+/// - All `Some` entries have `base_vaddr` page-aligned and within user space.
+/// - No two `Some` entries overlap in their virtual address ranges.
+/// - `count` equals the number of `Some` entries in `entries`.
 pub struct VmaTracker {
     entries: [Option<VmaEntry>; MAX_VMAS],
     count: usize,
@@ -136,7 +145,19 @@ pub const PROCESS_HEAP_BASE: u64 = 0x4080_0000;
 pub const PROCESS_HEAP_BASE: u64 = 0x800000;
 pub const HEAP_SIZE: u64 = 0x100000; // 1MB per process
 
-/// Process descriptor with heap allocator and VMA tracking
+/// Process descriptor with heap allocator and VMA tracking.
+///
+/// # Invariants (for formal verification)
+///
+/// - `cr3 == 0` means the process uses the kernel page table (kernel tasks).
+/// - `cr3 != 0` is a valid physical address of a PML4/L0 page table with
+///   kernel-half entries (256..511 on x86_64) cloned from the kernel PML4.
+/// - `phys_base` is page-aligned and within the physical address range
+///   covered by the frame allocator.
+/// - `virt_base == phys_base + hhdm_offset` (HHDM mapping for kernel access).
+/// - All VMA entries in `vma` reference user-space addresses in the lower
+///   canonical half (< `USER_SPACE_END`).
+/// - `allocator` offsets are relative to `phys_base`/`virt_base`, not absolute.
 pub struct ProcessDescriptor {
     /// Pure bookkeeping allocator (returns offsets, no memory I/O)
     pub allocator: BuddyAllocator,
@@ -211,13 +232,13 @@ impl ProcessTable {
     /// We cannot rely on zeroed memory == `None` because the compiler may
     /// assign discriminant 0 to `Some` for `Option<ProcessDescriptor>` on
     /// bare-metal targets (observed on `x86_64-unknown-none` release builds).
-    pub fn new_boxed(hhdm_offset: u64) -> Box<Self> {
+    pub fn new_boxed(hhdm_offset: u64) -> Option<Box<Self>> {
         use alloc::alloc::{alloc, Layout};
         let layout = Layout::new::<Self>();
         // SAFETY: layout is non-zero-sized (ProcessTable contains arrays).
         let ptr = unsafe { alloc(layout) as *mut Self };
         if ptr.is_null() {
-            panic!("Failed to allocate ProcessTable");
+            return None;
         }
         // SAFETY: ptr is valid, properly aligned, and large enough for ProcessTable.
         // We initialize every field before constructing the Box.
@@ -226,7 +247,7 @@ impl ProcessTable {
                 core::ptr::addr_of_mut!((*ptr).processes[i]).write(None);
             }
             core::ptr::addr_of_mut!((*ptr).hhdm_offset).write(hhdm_offset);
-            Box::from_raw(ptr)
+            Some(Box::from_raw(ptr))
         }
     }
 

@@ -34,13 +34,13 @@ impl RamObjectStore {
     /// Create a new empty RAM store directly on the heap.
     ///
     /// Uses manual allocation because the struct is too large for the
-    /// 256KB boot stack.
-    pub fn new_boxed() -> Box<Self> {
+    /// 256KB boot stack. Returns `None` if the heap is exhausted.
+    pub fn new_boxed() -> Option<Box<Self>> {
         let layout = Layout::new::<Self>();
         // SAFETY: Layout is non-zero-sized (contains array of 256 Option<ArcObject>).
         let ptr = unsafe { alloc(layout) as *mut Self };
         if ptr.is_null() {
-            panic!("Failed to allocate RamObjectStore");
+            return None;
         }
         // SAFETY: We write every field before constructing the Box.
         // Cannot use alloc_zeroed because Option<ArcObject> contains Vec<u8>
@@ -51,7 +51,7 @@ impl RamObjectStore {
                 core::ptr::addr_of_mut!((*ptr).objects[i]).write(None);
             }
             core::ptr::addr_of_mut!((*ptr).count).write(0);
-            Box::from_raw(ptr)
+            Some(Box::from_raw(ptr))
         }
     }
 
@@ -144,7 +144,7 @@ mod tests {
     use crate::ipc::Principal;
 
     fn make_store() -> Box<RamObjectStore> {
-        RamObjectStore::new_boxed()
+        RamObjectStore::new_boxed().expect("test: failed to allocate RamObjectStore")
     }
 
     fn make_object(data: &[u8]) -> ArcObject {

@@ -2,9 +2,9 @@
 
 > *Your computer... is not your own.*
 
-Right now, before your OS boots, before your kernel loads, before any software you chose runs — a separate processor with its own OS, its own network stack, and its own keys is already running. You didn't install it. You can't audit it. You can't turn it off. On Intel machines it's called the Management Engine. On AMD it's the Platform Security Processor. It has DMA access to your memory. It runs whether your machine is on or off, as long as it has power. 
+Before your OS boots, before your kernel loads, before any software you chose runs — a separate processor with its own OS, network stack, and private keys is already running. You didn't install it, and you can't uninstall, audit, or turn it off. Intel machines run the Management Engine. On AMD it's the Platform Security Processor. It has DMA access to your memory. It runs whether your machine is on or off, as long as it has power. 
 
-This is not a conspiracy theory. It is documented hardware design. Even Apple's Secure Enclave cannot be verified all the way down.
+This is not a conspiracy theory. It is documented hardware design. Even Apple's Secure Enclave cannot be verified for security. 
 
 Almost everything running on top of this foundation — whether Windows, macOS, Linux — layers additional extraction: telemetry baked into the kernel, analytics in the bootloader, identifiers that follow you across reinstalls. The software stack most people trust with their most sensitive data was designed, at a fundamental level, around interests that are not theirs.
 
@@ -14,9 +14,9 @@ Ready to take it back? ArcOS is your response.
 
 ## What ArcOS Is
 
-ArcOS is a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer that is verifiably yours.
+ArcOS (in development) is a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer system for interaction that is verifiably yours. Closing it requires sovereign silicon - and that's part of where this is going. Until then, ArcOS is a complete software foundation with no extraction above the hardware line: a formally-verified microkernel, memory-safe, cryptographic identity, zero-trust networking, and AI-powered security that works for the owner rather than the vendor.
 
-At its foundation is a microkernel written from first principles in Rust:
+At its foundation is a microkernel written for formal verification from first principles in Rust:
 
 - **Every process is isolated.** Device drivers, networking, and filesystems run in user-space. The kernel attack surface is minimal by design.
 - **Every binary is verified before it runs.** Cryptographic identity is threaded through the entire stack — from boot modules to IPC messages to stored objects.
@@ -42,9 +42,9 @@ The long-term answer is open hardware all the way down. We're building toward th
 
 Built by one person. In two weeks of coding:
 
-- **213/213 unit tests passing.** Clean release builds on both x86_64 and AArch64.
+- **218/218 unit tests passing.** Clean release builds on both x86_64 and AArch64.
 - **x86_64 boots to stable preemptive SMP multitasking** in QEMU: 2 CPUs, 10 concurrent tasks, APIC timer at 100Hz, IRQ affinity, load balancing, PCI device discovery, 24 syscalls.
-- **AArch64 boots to stable preemptive SMP scheduling** in QEMU: GICv3, ARM Generic Timer at 100Hz, EL0 user tasks with per-process page tables.
+- **AArch64 boots to stable preemptive SMP scheduling** in QEMU: GICv3, ARM Generic Timer at 100Hz, EL0 user tasks with per-process page tables, voluntary context switch (`yield_save_and_switch`), all boot modules building for both targets via shared `libsys` syscall wrappers.
 
 **The security model is real and running:**
 - Cryptographic identity backed by hardware YubiKey — no secret key in kernel memory. Open secure element long-term.

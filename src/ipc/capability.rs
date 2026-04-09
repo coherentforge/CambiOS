@@ -211,13 +211,15 @@ impl CapabilityManager {
     }
 
     /// Create a new capability manager directly on the heap.
-    pub fn new_boxed() -> Box<Self> {
+    ///
+    /// Returns `None` if heap allocation fails.
+    pub fn new_boxed() -> Option<Box<Self>> {
         use alloc::alloc::{alloc, Layout};
         let layout = Layout::new::<Self>();
         // SAFETY: layout is non-zero-sized (CapabilityManager contains arrays).
         let ptr = unsafe { alloc(layout) as *mut Self };
         if ptr.is_null() {
-            panic!("Failed to allocate CapabilityManager");
+            return None;
         }
         // SAFETY: Cannot use alloc_zeroed because Option<ProcessCapabilities> may
         // use niche optimization (bool fields), so all-zeros might not be None.
@@ -227,7 +229,7 @@ impl CapabilityManager {
             core::ptr::addr_of_mut!((*ptr).process_caps)
                 .write([None; MAX_PROCESSES]);
             core::ptr::addr_of_mut!((*ptr).process_count).write(0u16);
-            Box::from_raw(ptr)
+            Some(Box::from_raw(ptr))
         }
     }
 

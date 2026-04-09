@@ -923,13 +923,13 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
     use crate::ipc::ProcessId;
 
     // Look up the calling task and its metadata from the per-CPU scheduler
-    let (task_id, process_id, cr3, kernel_stack_top) = {
+    let (task_id, process_id, cr3) = {
         let sched = crate::local_scheduler().lock();
         match sched.as_ref().and_then(|s| {
             let tid = s.current_task()?;
             let task = s.current_task_ref()?;
             let pid = task.process_id.unwrap_or(ProcessId(tid.0 as u32));
-            Some((tid, pid, task.cr3, task.kernel_stack_top))
+            Some((tid, pid, task.cr3))
         }) {
             Some(info) => info,
             None => return SyscallError::InvalidArg as i64 as u64,
@@ -944,17 +944,11 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
 
     let args = SyscallArgs::new(arg1, arg2, arg3, arg4, arg5, arg6);
 
+    // SYS_EXIT is handled by handle_exit(), which loops on
+    // yield_save_and_switch() and never returns. Other blocking syscalls
+    // (recv_msg, wait_irq) yield internally and return when woken.
     let result = match SyscallDispatcher::dispatch(syscall_num, args, &ctx) {
-        Ok(val) => {
-            // SYS_EXIT (0): task is now Terminated — do not ERET back to
-            // user space. Switch to the kernel stack (SVC handler may run
-            // on the user stack via SP_EL0, which would be remapped by a
-            // TTBR0 switch in the timer ISR) then halt until preempted.
-            if syscall_num == 0 {
-                halt_until_preempted(kernel_stack_top);
-            }
-            val as i64
-        }
+        Ok(val) => val as i64,
         Err(e) => e.as_i64(),
     };
 
@@ -990,24 +984,196 @@ pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
     }
 }
 
-/// Voluntary context switch (AArch64 stub).
+// ============================================================================
+// Voluntary context switch — yield_save_and_switch
+// ============================================================================
+//
+// Assembly trampoline for voluntary context switching from syscall handlers.
+//
+// Builds a synthetic SavedContext (identical layout to the timer ISR's) on the
+// kernel stack, calls yield_inner (Rust) to save it and schedule the next task,
+// then restores from the (potentially different) SavedContext and does eret.
+//
+// When the yielding task is later re-scheduled (by the timer ISR or another
+// yield_save_and_switch), eret goes to .Lyield_resume, which re-enables
+// interrupts and returns to the syscall handler that called us.
+//
+// Stack layout after the sub (SavedContext, low → high):
+//   [sp+0]     x0               ← SP points here (arg to yield_inner)
+//   [sp+8]     x1
+//   ...
+//   [sp+240]   x30
+//   [sp+248]   elr_el1          = .Lyield_resume
+//   [sp+256]   spsr_el1         = EL1h + DAIF.I masked
+//   [sp+264]   sp_el0           = saved user SP
+//
+// Total frame: 288 bytes (272 payload + 16 padding for alignment).
+
+extern "C" {
+    /// Voluntary context switch.
+    ///
+    /// Saves all registers as a SavedContext on the kernel stack, calls the
+    /// scheduler to pick the next task, and restores from the next task's
+    /// SavedContext via eret. When the calling task is later re-scheduled,
+    /// this function returns normally to its caller.
+    ///
+    /// # Safety
+    /// Must be called on the kernel stack (SP_EL1, not user stack). The caller
+    /// must not hold the scheduler lock. Interrupts may be enabled or disabled
+    /// on entry — they are masked during the save/switch and re-enabled at
+    /// resume.
+    pub fn yield_save_and_switch();
+}
+
+core::arch::global_asm!(
+    ".global yield_save_and_switch",
+    "yield_save_and_switch:",
+
+    // ---- Mask IRQs for atomic save ----
+    "msr daifset, #2",
+
+    // ---- Read SP_EL0 via SPSel toggle ----
+    // Save x0 temporarily on the kernel stack, read SP_EL0, restore x0.
+    // We use the SPSel toggle because QEMU traps mrs/msr SP_EL0 directly.
+    "str x0,  [sp, #-16]!",       // push x0 (pre-decrement SP_EL1)
+    "msr spsel, #0",               // SP = SP_EL0
+    "mov x0, sp",                  // x0 = SP_EL0 value
+    "msr spsel, #1",               // SP = SP_EL1 (back to kernel stack)
+    "str x0,  [sp, #8]",          // save SP_EL0 next to x0
+    "ldr x0,  [sp], #16",         // restore x0, pop temp area
+
+    // ---- Allocate SavedContext (288 bytes, 16-aligned) ----
+    "sub sp, sp, #288",
+
+    // ---- Save x0-x30 ----
+    "stp x0,  x1,  [sp, #0]",
+    "stp x2,  x3,  [sp, #16]",
+    "stp x4,  x5,  [sp, #32]",
+    "stp x6,  x7,  [sp, #48]",
+    "stp x8,  x9,  [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    "str x30,      [sp, #240]",
+
+    // ---- Save synthetic system registers ----
+    // ELR_EL1 = .Lyield_resume (where eret will return to)
+    "adr x2, .Lyield_resume",
+    "str x2, [sp, #248]",          // elr_el1
+
+    // SPSR_EL1 = EL1h (0x5) + IRQ masked (bit 7) + FIQ masked (bit 6)
+    // D and A left unmasked for normal kernel operation.
+    // Resume label will unmask I.
+    "mov x2, #0xC5",
+    "str x2, [sp, #256]",          // spsr_el1
+
+    // SP_EL0 from temp save area above the frame (entry_sp - 8 = sp + 280)
+    "ldr x2, [sp, #280]",
+    "str x2, [sp, #264]",          // sp_el0
+
+    // ---- Call Rust scheduler ----
+    // x0 = pointer to SavedContext (identical layout to timer ISR's)
+    "mov x0, sp",
+    "bl yield_inner",
+    // x0 = new SP (same or different task's SavedContext)
+
+    // ---- Restore from (potentially new) SavedContext ----
+    "mov sp, x0",
+
+    // Restore system registers
+    "ldr x2, [sp, #248]",          // elr_el1
+    "ldr x3, [sp, #256]",          // spsr_el1
+    "ldr x4, [sp, #264]",          // sp_el0
+    "msr elr_el1, x2",
+    "msr spsr_el1, x3",
+    // Restore SP_EL0 via SPSel toggle (same technique as timer_isr_stub)
+    "msr spsel, #0",               // SP = SP_EL0
+    "mov sp, x4",                  // SP_EL0 = saved value
+    "msr spsel, #1",               // SP = SP_EL1 (back to SavedContext)
+
+    // Restore x0-x30
+    "ldp x0,  x1,  [sp, #0]",
+    "ldp x2,  x3,  [sp, #16]",
+    "ldp x4,  x5,  [sp, #32]",
+    "ldp x6,  x7,  [sp, #48]",
+    "ldp x8,  x9,  [sp, #64]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x26, x27, [sp, #208]",
+    "ldp x28, x29, [sp, #224]",
+    "ldr x30,      [sp, #240]",
+    // Deallocate SavedContext frame
+    "add sp, sp, #288",
+    // Return from exception — eret restores PC and PSTATE from ELR/SPSR
+    "eret",
+
+    // ---- Resume point for yielded tasks ----
+    // eret restores: PC = here, PSTATE = EL1h + DAIF.I masked.
+    // Re-enable interrupts (handler was running with IRQs enabled before yield).
+    ".Lyield_resume:",
+    "msr daifclr, #2",             // unmask IRQs
+    "ret",                          // return to caller of yield_save_and_switch
+);
+
+/// Rust handler for voluntary context switch.
 ///
-/// AArch64 user-space syscalls are not yet fully implemented, so this is
-/// a placeholder that halts until preempted. The x86_64 implementation
-/// uses a proper synthetic SavedContext + scheduler call.
+/// Called from `yield_save_and_switch` assembly. Receives the current task's
+/// SavedContext SP, saves it, calls schedule(), and returns the next task's
+/// SavedContext SP. Performs AArch64-specific post-switch (SP_EL1, TTBR0_EL1).
 ///
-/// # Safety
-/// Must be called on the kernel stack. Scheduler lock must not be held.
-pub unsafe fn yield_save_and_switch() {
-    // TODO: Implement AArch64 voluntary context switch with proper
-    // SavedContext + scheduler integration (requires SVC kernel-stack
-    // entry rewrite, mirroring x86_64 changes).
-    // SAFETY: WFI is safe to execute at EL1 with interrupts unmasked.
-    unsafe {
-        core::arch::asm!(
-            "msr daifclr, #2",  // enable interrupts
-            "wfi",              // wait for timer to preempt us
-            options(nomem, nostack),
-        );
+/// Does NOT send GIC EOI — this is a voluntary switch, not a hardware interrupt.
+#[unsafe(no_mangle)]
+extern "C" fn yield_inner(current_sp: u64) -> u64 {
+    let (new_sp, hint) = crate::scheduler::on_voluntary_yield(current_sp);
+
+    // AArch64-specific post-switch: update kernel stack and TTBR0 (page table)
+    // (same as timer_isr_inner, minus GIC acknowledge/EOI and timer rearm)
+    if let Some(hint) = hint {
+        if hint.kernel_stack_top != 0 {
+            // SAFETY: Called with interrupts masked (daifset in trampoline).
+            // hint.kernel_stack_top is the next task's kernel stack top.
+            unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
+        }
+        if hint.page_table_root != 0 {
+            // SAFETY: Reading TTBR0_EL1 is always safe at EL1. Writing
+            // TTBR0_EL1 switches user page tables; hint.page_table_root
+            // was validated by the scheduler. Interrupts are disabled.
+            unsafe {
+                let current_ttbr0: u64;
+                core::arch::asm!(
+                    "mrs {0}, ttbr0_el1",
+                    out(reg) current_ttbr0,
+                    options(nostack, nomem),
+                );
+                if current_ttbr0 != hint.page_table_root {
+                    // SAFETY: hint.page_table_root is a valid user page table
+                    // physical address. TLB invalidation required after switch.
+                    core::arch::asm!(
+                        "msr ttbr0_el1, {0}",
+                        "isb",
+                        "tlbi vmalle1",
+                        "dsb ish",
+                        "isb",
+                        in(reg) hint.page_table_root,
+                        options(nostack),
+                    );
+                }
+            }
+        }
     }
+
+    new_sp
 }

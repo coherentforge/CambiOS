@@ -129,6 +129,7 @@ pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
 /// TPIDR_EL1 must have been initialized via `init_bsp()` or `init_ap()`.
 #[cfg(target_arch = "aarch64")]
 pub fn local_scheduler() -> &'static IrqSpinlock<Option<Box<Scheduler>>> {
+    // SAFETY: TPIDR_EL1 initialized per function doc; cpu_id is a pure read.
     let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
     &PER_CPU_SCHEDULER[cpu_id]
 }
@@ -136,6 +137,7 @@ pub fn local_scheduler() -> &'static IrqSpinlock<Option<Box<Scheduler>>> {
 /// Get the current CPU's timer lock (AArch64).
 #[cfg(target_arch = "aarch64")]
 pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
+    // SAFETY: TPIDR_EL1 initialized per function doc; cpu_id is a pure read.
     let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
     &PER_CPU_TIMER[cpu_id]
 }
@@ -480,6 +482,7 @@ pub static PER_CPU_FRAME_CACHE: [Spinlock<FrameCache>; MAX_CPUS] =
 /// Get the current CPU's frame cache lock.
 #[cfg(target_arch = "x86_64")]
 pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
+    // SAFETY: GS base initialized at boot; cpu_id is a pure read.
     let cpu_id = unsafe { arch::x86_64::percpu::current_percpu().cpu_id() } as usize;
     &PER_CPU_FRAME_CACHE[cpu_id]
 }
@@ -487,6 +490,7 @@ pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
 /// Get the current CPU's frame cache lock (AArch64).
 #[cfg(target_arch = "aarch64")]
 pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
+    // SAFETY: TPIDR_EL1 initialized at boot; cpu_id is a pure read.
     let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
     &PER_CPU_FRAME_CACHE[cpu_id]
 }

@@ -75,7 +75,14 @@ impl fmt::Display for Principal {
     }
 }
 
-/// A single IPC message with verification-friendly structure
+/// A single IPC message with verification-friendly structure.
+///
+/// # Invariants (for formal verification)
+///
+/// - `payload_len <= 256` (enforced by `set_payload()`).
+/// - `sender_principal` is `None` on construction and set only by the kernel
+///   in `send_message_with_capability()`. User code cannot forge this field.
+/// - `from` and `to` are valid `EndpointId` values (< `MAX_ENDPOINTS`).
 #[derive(Debug, Clone)]
 pub struct Message {
     pub from: EndpointId,
@@ -495,13 +502,15 @@ impl IpcManager {
 
     /// Create a new IPC manager directly on the heap.
     /// Avoids stack overflow from the ~163KB struct.
-    pub fn new_boxed() -> Box<Self> {
+    ///
+    /// Returns `None` if heap allocation fails.
+    pub fn new_boxed() -> Option<Box<Self>> {
         use alloc::alloc::{alloc_zeroed, Layout};
         let layout = Layout::new::<Self>();
         // SAFETY: layout is non-zero-sized (IpcManager contains arrays).
         let ptr = unsafe { alloc_zeroed(layout) as *mut Self };
         if ptr.is_null() {
-            panic!("Failed to allocate IpcManager");
+            return None;
         }
         // SAFETY: All array fields are valid when zero-initialized:
         // - Option<Message>::None = discriminant 0 = zeroed (Message.sender_principal
@@ -512,7 +521,7 @@ impl IpcManager {
         // Write the interceptor field explicitly (fat pointer — don't rely on zeroed).
         unsafe {
             core::ptr::addr_of_mut!((*ptr).interceptor).write(None);
-            Box::from_raw(ptr)
+            Some(Box::from_raw(ptr))
         }
     }
 
