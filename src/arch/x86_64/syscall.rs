@@ -139,11 +139,6 @@ core::arch::global_asm!(
     // No swapgs needed — user code cannot modify GS base (FSGSBASE not enabled).
     "mov gs:[32], rsp",     // Save user RSP to PerCpu.user_rsp_scratch
     "mov rsp, gs:[24]",     // Load kernel RSP from PerCpu.kernel_rsp0
-    // DEBUG: catch kernel_rsp0==0 before it causes a confusing #PF
-    "test rsp, rsp",
-    "jnz 3f",
-    "ud2",                  // #UD: kernel_rsp0 was 0 — set_kernel_stack never called
-    "3:",
 
     // ---- Push user RSP onto kernel stack ----
     "push qword ptr gs:[32]",  // user RSP (for restoration on return)
