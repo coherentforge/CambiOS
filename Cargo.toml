@@ -1,5 +1,10 @@
 # Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
+[workspace]
+# User-space crates and tools are built separately (different targets, linker scripts).
+# Exclude them from the kernel workspace to prevent accidental cross-compilation.
+exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user/udp-stack", "user/shell", "user/libsys", "tools/sign-elf"]
+
 [package]
 name = "arcos"
 version = "0.1.0"

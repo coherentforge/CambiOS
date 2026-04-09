@@ -330,6 +330,10 @@ pub struct Task {
     pub pinned: bool,
     /// If true, this task is currently in a ready queue. Prevents duplicate enqueuing.
     pub in_ready_queue: bool,
+    /// Parent task that will be woken when this task exits (set by Spawn syscall).
+    pub parent_task: Option<TaskId>,
+    /// Exit code stored when the task terminates (for WaitTask to collect).
+    pub exit_code: u32,
 }
 
 impl Task {
@@ -351,6 +355,8 @@ impl Task {
             home_cpu: 0,
             pinned: false,
             in_ready_queue: false,
+            parent_task: None,
+            exit_code: 0,
         }
     }
 
@@ -378,6 +384,8 @@ impl Task {
             home_cpu: 0,
             pinned: false,
             in_ready_queue: false,
+            parent_task: None,
+            exit_code: 0,
         }
     }
 

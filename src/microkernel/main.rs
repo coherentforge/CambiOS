@@ -77,6 +77,7 @@ use limine::request::{
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::hlt;
 use arcos_core::println;
+use arcos_core::{BOOT_MODULE_REGISTRY, NEXT_PROCESS_ID};
 use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, BlockReason, TaskId};
 use arcos_core::ipc::{EndpointId, IpcManager, Message, ProcessId, CapabilityRights};
 use arcos_core::ipc::capability::CapabilityManager;
@@ -469,7 +470,6 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     // Enter idle loop — all scheduling is now interrupt-driven
-    // APIC timer fires vector 32 → timer_isr_stub → scheduler tick + context switch.
     microkernel_loop();
 }
 
@@ -748,6 +748,7 @@ fn register_process_capabilities(process_id: ProcessId) {
 fn load_boot_modules(scheduler: &mut Scheduler) {
     use arcos_core::loader::{self, SignedBinaryVerifier};
     use arcos_core::FRAME_ALLOCATOR;
+    use arcos_core::boot_modules::strip_module_name;
 
     let module_response = match MODULE_REQUEST.get_response() {
         Some(r) => r,
@@ -824,6 +825,11 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 drop(fa_guard);
                 drop(pt_guard);
                 register_process_capabilities(process_id);
+
+                // Register in boot module registry for runtime Spawn syscall
+                let short_name = strip_module_name(path);
+                BOOT_MODULE_REGISTRY.lock().register(short_name, addr, size as usize);
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.0, result.process_id.0, result.entry_point
@@ -839,6 +845,9 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
     if loaded_count > 0 {
         println!("✓ Loaded {} signed module(s) as user processes", loaded_count);
     }
+
+    // Set the next process ID for runtime Spawn syscall
+    NEXT_PROCESS_ID.store(5 + loaded_count, core::sync::atomic::Ordering::Release);
 }
 
 /// Initialize IPC subsystem
@@ -1533,16 +1542,50 @@ fn microkernel_loop() -> ! {
     #[cfg(target_arch = "x86_64")]
     x86_64::instructions::interrupts::enable();
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: All hardware initialized (GIC, timer, VBAR_EL1).
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); }
+    {
+        // Drain any pending GIC interrupts from boot that were never acknowledged.
+        // Without this, the GIC won't deliver new interrupts.
+        unsafe {
+            loop {
+                let intid = arcos_core::arch::aarch64::gic::acknowledge_irq();
+                if intid >= 1020 { break; }
+                arcos_core::arch::aarch64::gic::write_eoi();
+            }
+        }
+        // Rearm the timer so the first tick fires cleanly.
+        unsafe { arcos_core::arch::aarch64::timer::rearm(); }
+        // SAFETY: All hardware initialized (GIC, timer, VBAR_EL1).
+        unsafe { core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); }
+    }
 
     // Tick-based gating: deterministic frequency regardless of interrupt rate.
     // Status every 10s (1000 ticks @ 100Hz), invariants every 60s (6000 ticks).
     let mut last_status_tick: u64 = 0;
     let mut last_verify_tick: u64 = 0;
 
+    #[cfg(target_arch = "aarch64")]
+    let mut aarch64_dbg_done = false;
+
     loop {
         let ticks = Timer::get_ticks();
+
+        // AArch64 debug: after a few WFI cycles, report ISR counters
+        #[cfg(target_arch = "aarch64")]
+        if !aarch64_dbg_done {
+            let isr_count = arcos_core::arch::aarch64::TIMER_ISR_COUNT
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if isr_count > 0 {
+                let sched_ok = arcos_core::arch::aarch64::TIMER_SCHED_OK
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let ctx_sw = arcos_core::arch::aarch64::TIMER_CTX_SWITCH
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "  [DBG] ISR fired {} times, sched_lock_ok={}, ctx_switches={}, ticks={}",
+                    isr_count, sched_ok, ctx_sw, ticks
+                );
+                aarch64_dbg_done = true;
+            }
+        }
 
         // Periodic status reporting (every ~10 seconds)
         if ticks >= last_status_tick + 1000 {

@@ -33,6 +33,7 @@ pub mod syscalls;
 pub mod process;
 pub mod acpi;
 pub mod fs;
+pub mod boot_modules;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
 
@@ -238,12 +239,22 @@ pub fn terminate_current_task() -> Option<scheduler::TaskId> {
     None
 }
 
+/// Test stub for wake_task_on_cpu (per-CPU infrastructure unavailable in tests).
+#[cfg(test)]
+pub fn wake_task_on_cpu(_task_id: scheduler::TaskId) -> bool {
+    false
+}
+
 // ============================================================================
 // Load balancing
 // ============================================================================
 
 /// Number of online CPUs (BSP = 1, incremented by each AP that completes init).
 pub static ONLINE_CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Next process ID to assign (atomically incremented by Spawn syscall).
+/// Boot sets this after load_boot_modules to the next free slot.
+pub static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(5);
 
 /// Minimum tick interval between balance attempts (1 second at 100Hz).
 const BALANCE_INTERVAL_TICKS: u64 = 100;
@@ -449,6 +460,11 @@ pub static INTERRUPT_ROUTER: Spinlock<InterruptRoutingTable> = Spinlock::new(Int
 /// Initialized at boot after all other subsystems. Phase 0 uses RamObjectStore
 /// (fixed-capacity, RAM-backed). Phase 1+ adds disk-backed implementations.
 pub static OBJECT_STORE: Spinlock<Option<Box<fs::ram::RamObjectStore>>> = Spinlock::new(None);
+
+/// Boot module registry — maps module names to Limine module memory.
+/// Read-only after boot. Used by the Spawn syscall to find modules by name.
+pub static BOOT_MODULE_REGISTRY: Spinlock<boot_modules::BootModuleRegistry> =
+    Spinlock::new(boot_modules::BootModuleRegistry::new());
 
 // ============================================================================
 // Per-CPU frame cache — reduces global FRAME_ALLOCATOR lock contention

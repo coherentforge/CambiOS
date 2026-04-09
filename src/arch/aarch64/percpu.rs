@@ -38,8 +38,9 @@ pub const MAX_CPUS: usize = 256;
 /// |   8    | cpu_id           |  4   |
 /// |  12    | (pad)            |  4   |
 /// |  16    | mpidr_aff        |  8   |
-/// |  24    | current_task_id  |  4   |
-/// |  28    | interrupt_depth  |  4   |
+/// |  24    | kernel_stack_top |  8   |
+/// |  32    | current_task_id  |  4   |
+/// |  36    | interrupt_depth  |  4   |
 #[repr(C)]
 pub struct PerCpu {
     /// Pointer to self — enables `mrs x0, tpidr_el1` + load to get the struct.
@@ -48,6 +49,10 @@ pub struct PerCpu {
     cpu_id: u32,
     /// MPIDR affinity value (hardware CPU identity, used for SGIs)
     mpidr_aff: u64,
+    /// Kernel stack top for the current task. Updated on every context switch
+    /// via `set_kernel_stack()`. Read by exception stubs from EL0 to switch
+    /// to the correct kernel stack (offset 24 from TPIDR_EL1).
+    kernel_stack_top: u64,
     /// Task ID currently running on this CPU (0 = idle/none)
     current_task_id: u32,
     /// Interrupt nesting depth (0 = thread context, >0 = ISR context)
@@ -68,6 +73,7 @@ impl PerCpu {
             self_ptr: core::ptr::null(),
             cpu_id: 0,
             mpidr_aff: 0,
+            kernel_stack_top: 0,
             current_task_id: 0,
             interrupt_depth: 0,
         }
@@ -253,9 +259,11 @@ mod tests {
         // Verify offsets match the documented layout (used in assembly)
         assert_eq!(mem::offset_of!(PerCpu, self_ptr), 0);
         assert_eq!(mem::offset_of!(PerCpu, cpu_id), 8);
+        // pad at 12
         assert_eq!(mem::offset_of!(PerCpu, mpidr_aff), 16);
-        assert_eq!(mem::offset_of!(PerCpu, current_task_id), 24);
-        assert_eq!(mem::offset_of!(PerCpu, interrupt_depth), 28);
+        assert_eq!(mem::offset_of!(PerCpu, kernel_stack_top), 24);
+        assert_eq!(mem::offset_of!(PerCpu, current_task_id), 32);
+        assert_eq!(mem::offset_of!(PerCpu, interrupt_depth), 36);
     }
 
     #[test]

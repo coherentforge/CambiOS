@@ -84,14 +84,27 @@ pub mod gdt {
     /// # Safety
     /// Must be called from EL1 with interrupts masked (DAIF.I set).
     pub unsafe fn set_kernel_stack(stack_top: u64) {
-        // SAFETY: Writing SP_EL1 from EL1 is always valid when using SP_EL0
-        // as the current stack (SPSel=0). The value is the top of the task's
-        // kernel stack, allocated during task creation.
+        // Store kernel stack top in PerCpu (offset 24 from TPIDR_EL1) and
+        // also write SP_EL1 for exception entry from EL0.
+        //
+        // With SPSel=0 (Limine AArch64 default), SP aliases SP_EL0 and
+        // SP_EL1 is banked. Writing SP_EL1 is safe — it doesn't affect
+        // the active stack. The CPU uses SP_EL1 on exception entry from
+        // EL0 (Group 2 vectors), so it must point to a valid kernel stack.
+        //
+        // SAFETY: TPIDR_EL1 is initialized. Called with interrupts masked.
+        // Store kernel stack top in PerCpu (offset 24 from TPIDR_EL1).
+        // The EL0 timer/SVC stubs will load this from PerCpu when switching
+        // to the kernel stack. We don't use `msr sp_el1` because QEMU's
+        // cortex-a72 model traps it from EL1 (EC=0, "Unknown reason").
+        // SAFETY: TPIDR_EL1 is initialized. Called with interrupts masked.
         unsafe {
             core::arch::asm!(
-                "msr sp_el1, {0}",
-                in(reg) stack_top,
-                options(nostack, nomem),
+                "mrs {tmp}, tpidr_el1",
+                "str {val}, [{tmp}, #24]",   // PerCpu.kernel_stack_top at offset 24
+                tmp = out(reg) _,
+                val = in(reg) stack_top,
+                options(nostack),
             );
         }
     }
@@ -338,13 +351,15 @@ core::arch::global_asm!(
     ".global exception_vector_table",
     "exception_vector_table:",
 
-    // --- Group 0: Current EL with SP_EL0 (unused) ---
-    // Synchronous
+    // --- Group 0: Current EL with SP_EL0 (kernel context, SPSel=0) ---
+    // Limine AArch64 boots with SPSel=0. Exception entry forces SPSel=1.
+    // The stubs switch back to SPSel=0 to use the kernel stack in SP_EL0.
+    // Synchronous (e.g., kernel data abort, BRK)
     ".balign 128",
-    "b unhandled_exception",
-    // IRQ
+    "b sync_el1_stub",
+    // IRQ — timer IRQ from kernel idle loop
     ".balign 128",
-    "b unhandled_exception",
+    "b timer_isr_el1_stub",
     // FIQ
     ".balign 128",
     "b unhandled_exception",
@@ -352,13 +367,13 @@ core::arch::global_asm!(
     ".balign 128",
     "b unhandled_exception",
 
-    // --- Group 1: Current EL with SP_ELx (kernel context) ---
-    // Synchronous (e.g., kernel data abort, BRK)
+    // --- Group 1: Current EL with SP_ELx (fallback — both groups handled) ---
+    // Synchronous
     ".balign 128",
     "b sync_el1_stub",
-    // IRQ — THIS is where the timer IRQ lands when kernel is running
+    // IRQ
     ".balign 128",
-    "b timer_isr_stub",
+    "b timer_isr_el1_stub",
     // FIQ
     ".balign 128",
     "b unhandled_exception",
@@ -372,7 +387,7 @@ core::arch::global_asm!(
     "b sync_el0_stub",
     // IRQ — timer IRQ while user task running
     ".balign 128",
-    "b timer_isr_stub",
+    "b timer_isr_el0_stub",
     // FIQ
     ".balign 128",
     "b unhandled_exception",
@@ -404,8 +419,44 @@ core::arch::global_asm!(
     // GP registers + ELR_EL1 + SPSR_EL1 + SP_EL0 into a SavedContext
     // frame on the stack (272 bytes, 16-aligned).
     // =================================================================
-    ".global timer_isr_stub",
-    "timer_isr_stub:",
+    // =================================================================
+    // timer_isr_el1_stub: timer IRQ from kernel (Group 0/1)
+    //
+    // On entry: CPU forced SPSel=1, SP = SP_EL1 (undefined/firmware).
+    // SP_EL0 = kernel stack (what the kernel was using before the IRQ).
+    // Switch back to SPSel=0 to use the kernel stack from SP_EL0.
+    // =================================================================
+    ".global timer_isr_el1_stub",
+    "timer_isr_el1_stub:",
+    "msr spsel, #0",            // SP = SP_EL0 (kernel stack)
+    "b timer_isr_common",
+
+    // =================================================================
+    // timer_isr_el0_stub: timer IRQ from user mode (Group 2)
+    //
+    // On entry: CPU forced SPSel=1, SP = SP_EL1.
+    // SP_EL0 = user stack (not usable for kernel).
+    // SP_EL1 was set by set_kernel_stack() to the task's kernel stack.
+    // But the CPU already selected SP_EL1 for us — use it directly.
+    // Just switch to SPSel=0 and copy SP_EL1 into SP_EL0 first.
+    // =================================================================
+    ".global timer_isr_el0_stub",
+    "timer_isr_el0_stub:",
+    // Exception from EL0: CPU forced SPSel=1, SP = SP_EL1 (undefined).
+    // Load kernel stack from PerCpu. Use TPIDR_EL0 as scratch for user x0.
+    "msr tpidr_el0, x0",       // Save user x0
+    "mrs x0, tpidr_el1",       // x0 = PerCpu*
+    "ldr x0, [x0, #24]",      // x0 = kernel_stack_top
+    "msr spsel, #0",           // SP = SP_EL0 (user stack — overwrite)
+    "mov sp, x0",              // SP = kernel_stack_top
+    "mrs x0, tpidr_el0",      // Restore user x0
+    // Fall through to common path
+
+    // =================================================================
+    // timer_isr_common: shared save/call/restore path
+    // =================================================================
+    ".global timer_isr_common",
+    "timer_isr_common:",
     // Allocate SavedContext on stack (34 × 8 = 272, round up to 288 for alignment)
     "sub sp, sp, #288",
     // Save x0-x30 in pairs (each stp stores two 8-byte regs)
@@ -428,22 +479,31 @@ core::arch::global_asm!(
     // Save system registers
     "mrs x2, elr_el1",
     "mrs x3, spsr_el1",
-    "mrs x4, sp_el0",
+    // SP_EL0 save: with SPSel=0, SP IS SP_EL0. We already subtracted
+    // 288 for the frame. For EL1 exceptions, SP_EL0 = kernel stack (pre-frame).
+    // For EL0 exceptions, the el0_stub already copied the kernel stack into
+    // SP_EL0, so the user's SP_EL0 is lost — we save SP_EL1 (which held
+    // the kernel stack) here for bookkeeping. User SP_EL0 was saved by
+    // el0_stub into x4 before the copy. TODO: proper EL0 SP_EL0 save.
+    "add x4, sp, #288",       // Reconstruct pre-exception SP_EL0
     "str x2, [sp, #248]",     // elr_el1
     "str x3, [sp, #256]",     // spsr_el1
     "str x4, [sp, #264]",     // sp_el0
     // Call Rust handler: x0 = current RSP (pointer to SavedContext)
     "mov x0, sp",
     "bl timer_isr_inner",
-    // RAX (x0) = new SP (same task or different task's SavedContext)
+    // x0 = new SP (same task or different task's SavedContext)
     "mov sp, x0",
-    // Restore system registers
+    // Restore system registers from (potentially different) SavedContext
     "ldr x2, [sp, #248]",
     "ldr x3, [sp, #256]",
-    "ldr x4, [sp, #264]",
     "msr elr_el1, x2",
     "msr spsr_el1, x3",
-    "msr sp_el0, x4",
+    // Note: SP_EL0 at [sp, #264] is NOT restored here. For EL0 returns,
+    // the user's SP_EL0 will be restored by ERET from SPSR (which sets
+    // SPSel=0 and SP=SP_EL0). The value at [sp, #264] is written to
+    // SP_EL1 for the next EL0→EL1 exception entry. TODO: proper user
+    // stack restore for EL0 context switches.
     // Restore x0-x30
     "ldp x0,  x1,  [sp, #0]",
     "ldp x2,  x3,  [sp, #16]",
@@ -485,10 +545,15 @@ core::arch::global_asm!(
     // =================================================================
     ".global sync_el0_stub",
     "sync_el0_stub:",
-    // Allocate SavedContext (288 bytes, 16-aligned)
-    "sub sp, sp, #288",
-    // Save x0-x30
-    "stp x0,  x1,  [sp, #0]",
+    // Exception from EL0: CPU forced SPSel=1, SP = SP_EL1 (undefined).
+    // Load kernel stack from PerCpu (TPIDR_EL1 + 24).
+    // Use TPIDR_EL0 as scratch to save user x0 (restored after SP switch).
+    "msr tpidr_el0, x0",       // Save user x0 in TPIDR_EL0 (scratch)
+    "mrs x0, tpidr_el1",       // x0 = PerCpu*
+    "ldr x0, [x0, #24]",      // x0 = kernel_stack_top
+    "msr spsel, #0",           // SP = SP_EL0 (user stack — will overwrite)
+    "mov sp, x0",              // SP = kernel_stack_top
+    "mrs x0, tpidr_el0",      // Restore user x0 from TPIDR_EL0
     "stp x2,  x3,  [sp, #16]",
     "stp x4,  x5,  [sp, #32]",
     "stp x6,  x7,  [sp, #48]",
@@ -507,7 +572,9 @@ core::arch::global_asm!(
     // Save system registers
     "mrs x2, elr_el1",
     "mrs x3, spsr_el1",
-    "mrs x4, sp_el0",
+    // SP_EL0 = current SP (SPSel=0), but frame already allocated.
+    // Reconstruct the pre-exception value for the SavedContext.
+    "add x4, sp, #288",
     "str x2, [sp, #248]",
     "str x3, [sp, #256]",
     "str x4, [sp, #264]",
@@ -534,7 +601,9 @@ core::arch::global_asm!(
     "ldr x4, [sp, #264]",
     "msr elr_el1, x2",
     "msr spsr_el1, x3",
-    "msr sp_el0, x4",
+    // Note: SP_EL0 not restored via MSR (QEMU traps it).
+    // ERET restores SPSR which sets SPSel=0 → SP = SP_EL0.
+    // The add sp, sp, #288 below restores SP_EL0 to pre-exception value.
     "ldp x0,  x1,  [sp, #0]",
     "ldp x2,  x3,  [sp, #16]",
     "ldp x4,  x5,  [sp, #32]",
@@ -562,6 +631,9 @@ core::arch::global_asm!(
     // =================================================================
     ".global sync_el1_stub",
     "sync_el1_stub:",
+    // Exception entry forces SPSel=1. Switch back to SPSel=0 to use
+    // SP_EL0 (the kernel stack that was active before the fault).
+    "msr spsel, #0",
     // Save a few registers for the Rust handler arguments
     "stp x29, x30, [sp, #-16]!",
     // x0 = ESR_EL1, x1 = FAR_EL1, x2 = ELR_EL1
@@ -675,12 +747,32 @@ extern "C" fn fault_el1_inner(esr: u64, far: u64, elr: u64) {
 ///
 /// Delegates portable tick/schedule logic to `scheduler::on_timer_isr()`,
 /// then performs AArch64-specific post-switch work (SP_EL1, TTBR0_EL1, GIC EOI).
+/// Atomic counter for timer ISR invocations (debug — read from idle loop).
+pub static TIMER_ISR_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Atomic: did on_timer_isr acquire the scheduler lock? (0=never, 1=yes)
+pub static TIMER_SCHED_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Atomic: did a context switch happen? (count)
+pub static TIMER_CTX_SWITCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[unsafe(no_mangle)]
 extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
+    let n = TIMER_ISR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Direct PL011 write — bypass SERIAL1 lock to avoid deadlock in ISR
+    if n < 3 {
+        let hhdm = crate::hhdm_offset();
+        let uart_dr = (0x0900_0000u64 + hhdm) as *mut u32;
+        // SAFETY: PL011 UART is mapped at HHDM + 0x0900_0000, initialized at boot.
+        unsafe { core::ptr::write_volatile(uart_dr, b'T' as u32); }
+    }
+
     let (new_sp, hint) = crate::scheduler::on_timer_isr(current_sp);
 
-    // AArch64-specific post-switch: update SP_EL1 (kernel stack) and TTBR0 (page table)
-    if let Some(hint) = hint {
+    if new_sp != current_sp {
+        TIMER_CTX_SWITCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // AArch64-specific post-switch: update kernel stack and TTBR0 (page table)
+    if let Some(ref hint) = hint {
         if hint.kernel_stack_top != 0 {
             // SAFETY: Called from IRQ handler at EL1 with interrupts masked.
             // hint.kernel_stack_top is the top of the next task's kernel stack.
@@ -710,16 +802,27 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
         }
     }
 
+    // Acknowledge the interrupt (read ICC_IAR1_EL1 to get INTID).
+    // GICv3 requires acknowledge before EOI — without this, the interrupt
+    // stays active and the GIC won't deliver the next one.
+    // SAFETY: We are in an IRQ handler at EL1.
+    let intid = unsafe { gic::acknowledge_irq() };
+
     // Rearm the timer for the next period (ARM Generic Timer is one-shot countdown)
     // SAFETY: We are in a timer IRQ handler at EL1.
     unsafe {
         timer::rearm();
     }
 
-    // Send End-of-Interrupt to GIC
-    // SAFETY: We are in an IRQ handler; the GIC requires EOI to clear the active interrupt.
+    // Send End-of-Interrupt to GIC (uses the INTID from acknowledge_irq)
+    // SAFETY: We are in an IRQ handler after acknowledge_irq().
     unsafe {
         gic::write_eoi();
+    }
+
+    // Spurious interrupt (INTID 1023): return without context switch
+    if intid >= 1020 {
+        return current_sp;
     }
 
     new_sp

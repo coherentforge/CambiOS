@@ -22,27 +22,27 @@ ArcOS starts from the position that **the only way to build a secure system is t
 
 These are non-negotiable. They constrain every design decision. When two goals conflict, these principles break the tie.
 
-### 1. Security Is Architecture, Not Policy
+### 1. Security as Architecture (Not Policy)
 
-Security is not a feature that gets added. It is a structural property of the system. Every component — the kernel, the scheduler, the IPC mechanism, the driver model, the networking stack — is designed so that compromise of any single component cannot propagate to others. This is achieved through isolation (microkernel), verification (pre-execution analysis), and least privilege (capabilities).
+Security isn't a feature that gets added. We're making security a structural property of the system. Every component — the kernel, the scheduler, the IPC mechanism, the driver model, the networking stack — is designed so that compromise of any single component cannot propagate to others. This is achieved through signing (keys), isolation (IPC), verification (pre-execution analysis), and least privilege (capabilities).
 
 ### 2. Minimal Kernel, Maximal Isolation
 
-The kernel does exactly five things: manage CPU time, manage physical memory, route messages between isolated processes, enforce capabilities, and handle hardware interrupts. Everything else — device drivers, file systems, networking, graphics, audio, AI inference — runs in user-space processes with no special privileges beyond what capabilities explicitly grant.
+arcOS kernel does exactly five things: manage CPU time, manage physical memory, route messages between isolated processes, enforce capabilities, and handle hardware interrupts. Everything else — device drivers, file systems, networking, graphics, audio, AI inference — runs in user-space processes with no special privileges beyond what capabilities explicitly grant.
 
 A smaller kernel means a smaller attack surface. A smaller attack surface means fewer places where a vulnerability grants total control.
 
 ### 3. No Telemetry. No Backdoors. No Exceptions.
 
-ArcOS will never phone home. It will never collect usage data. It will never contain a mechanism — hidden or documented — that allows remote access without the explicit, informed, per-session consent of the machine's owner. This is not a privacy "feature." It is a guarantee that is architecturally enforced: there is no telemetry subsystem to compromise because there is no telemetry subsystem.
+arcOS will never phone home - there is no home to phone. It will never collect usage data. It will never contain a mechanism — hidden or documented — that allows remote access without the explicit, informed, per-session consent of the machine's owner. This is not a privacy "feature." It is a guarantee that is architecturally enforced: there is no telemetry subsystem to compromise because there is no telemetry subsystem.
 
 ### 4. AI as Infrastructure, Not Application
 
-AI is not a chatbot bolted onto the desktop. AI is a structural component of the operating system — the same way virtual memory or preemptive scheduling is a structural component. It verifies code before execution. It detects anomalous behavior at runtime. It adapts legacy applications to run on unfamiliar hardware. It assists the kernel in live-patching itself without downtime. These are not optional features. They are capabilities that the system depends on.
+We aren't strapping a little chat-boy on the desktop here. AI/LLM compose a structural component of the operating system — the same way virtual memory or preemptive scheduling is a structural component. Checking code before execution, detecting anomalous behavior at runtime, adapting legacy applications to run on unfamiliar hardware, live-patching if and when updates are needed - all supervised by fast and light specialized models. These are capabilities that the system depends on to function, to safeguard user data and ensure malicious code is caught and sandboxed, and to truly improve overall UX.
 
 ### 5. Identity Is Cryptographic, Not Secret-Based
 
-Passwords are shared secrets. Shared secrets get stolen. ArcOS replaces password-based authentication with cryptographic identity — key pairs, attestation, zero-knowledge proofs. You don't prove who you are by knowing a secret. You prove who you are by demonstrating possession of a key that only you control. Identity is decentralized: no central authority can revoke your existence.
+If a passwords is a shared secrets, we all know what happens when two people try to keep one. Shared secrets are almost always compromised in the end. ArcOS replaces password-based authentication with cryptographic identity — key pairs, attestation, zero-knowledge proofs. You don't prove who you are by knowing a secret. You prove who you are by demonstrating possession of a key that only you control. Identity is decentralized: no central authority can revoke your existence.
 
 ### 6. The Network Is Hostile
 
@@ -349,7 +349,7 @@ ArcOS explores a spatial interface model:
 
 Your data lives where you put it. Not where a corporation decides to store it.
 
-- **Self-directed storage** — ArcOS integrates with cloud storage, but the user chooses where. Personal encrypted buckets — potentially hosted by a foundation or cooperative entity aligned with ArcOS's values, or by any S3-compatible provider, or on your own hardware. The OS doesn't care. It sees a storage endpoint with a capability.
+- **Self-directed storage** — ArcOS integrates with cloud storage, but the user chooses where. Personal encrypted buckets — potentially hosted by a foundation or cooperative entity aligned with ArcOS's values, or by any S3-compatible provider, or on your own hardware. The OS doesn't care. Once configured, it sees a storage endpoint with a proper capability and that's where your data goes.
 - **No third-party scanning** — Data at rest in your sovereign storage is encrypted with your keys. The hosting provider cannot read it. They cannot scan it. They cannot hand it to a government or train an AI on it. They store ciphertext. That's it.
 - **Local-first, sync-second** — Data originates locally. It syncs to remote storage for backup and multi-device access. If the remote storage disappears, you still have your data. If the network goes down, you still have your data. Cloud is a convenience, not a dependency.
 
@@ -377,24 +377,18 @@ The social protocol (described in the Networking section) provides the infrastru
 
 ### Current: x86_64
 
-The primary development target. ArcOS boots via the Limine protocol, runs a custom GDT with per-CPU TSS, uses SYSCALL/SYSRET for fast system call entry, and schedules preemptively via the Local APIC timer. SMP is fully operational: per-CPU schedulers, task migration, load balancing, TLB shootdown.
+The primary development target. ArcOS boots via the Limine protocol, runs a custom GDT with per-CPU TSS, uses SYSCALL/SYSRET for fast system call entry, and schedules preemptively via the Local APIC timer. SMP is fully operational: per-CPU schedulers, task migration, load balancing, TLB shootdown. User-space services run in ring 3 — a filesystem service, key store, virtio-net network driver, and UDP/IP stack all communicate through capability-checked IPC. PCI device discovery, DMA allocation, and MMIO mapping are exposed to user-space drivers through validated syscalls.
 
-### In Progress: AArch64
+### Current: AArch64
 
-The architecture abstraction has been validated. A complete `src/arch/aarch64/` backend exists with the full API surface matching x86_64 — SavedContext, context switching, GICv3 interrupt controller, TLB shootdown (TLBI instructions), per-CPU data (TPIDR_EL1), and SVC-based syscall entry. The cfg-gating is wired and the portable code compiles against either backend.
+AArch64 boots on QEMU `virt` (GICv3 required) and runs preemptive scheduling with EL0 user tasks. The full memory subsystem is operational — kernel heap, bitmap frame allocator, per-process page tables with TTBR0/TTBR1 split. GICv3 (Distributor + Redistributor + ICC system registers), ARM Generic Timer at 100Hz, PL011 UART, SVC-based syscall entry, and SMP (AP startup via Limine MP protocol) are all implemented.
 
-What remains is filling in the assembly and hardware access — the function bodies are scaffolding stubs today. The implementation work:
+What remains to reach parity with x86_64:
 
-- Exception level configuration (EL1/EL0) instead of GDT/ring transitions
-- SVC instruction handler instead of SYSCALL/SYSRET
-- GICv3 MMIO register access instead of APIC
-- ARM Generic Timer (CNTV) instead of PIT/APIC timer
-- AArch64 4-level page table entry format
-- PL011 UART instead of 16550
-- TLBI broadcast instead of IPI-based TLB shootdown
-- QEMU `virt` machine target for testing
-
-Limine supports AArch64, so the boot protocol is shared.
+- Device IRQ routing (GIC SPI wiring for virtio, PL011 RX)
+- User-space service port (libsys SVC syscall wrappers)
+- Voluntary context switch (currently a `wfi` stub)
+- Bare-metal testing beyond QEMU
 
 ### Future Considerations
 
@@ -419,27 +413,35 @@ Some boundaries are as important as goals. ArcOS will never:
 
 ### What Exists Today
 
-The microkernel is real and running. It boots on x86_64 hardware (via QEMU), schedules preemptively across multiple CPUs, runs user-space tasks in ring 3, handles system calls, manages per-process page tables, routes IPC with capability checks, and performs load-balanced SMP scheduling with task migration. It is not a design document. It is working code with 134 passing tests.
+The microkernel is real and running on both x86_64 and AArch64. It is not a design document. It is working code — comprehensive unit tests pass on host, and integration testing runs in QEMU.
+
+**Kernel fundamentals** are complete: preemptive SMP scheduling with per-CPU priority-band schedulers, load balancing and task migration, per-process page tables with W^X enforcement, capability-checked IPC with zero-trust interception, and a full syscall interface (24 syscalls covering process lifecycle, memory, IPC, identity, storage, and device access).
+
+**Identity** is hardware-backed. A YubiKey-derived Ed25519 bootstrap principal is compiled into the kernel. Boot modules are signed at build time and verified before execution. IPC messages carry unforgeable sender principals stamped by the kernel. A user-space key store service manages signing.
+
+**Storage** uses content-addressed objects — Blake3 hashes, Ed25519 signatures verified on retrieval, ownership enforced per-principal. A user-space filesystem service mediates access through IPC.
+
+**Networking** has a working vertical slice: a user-space virtio-net driver discovers PCI devices, manages TX/RX virtqueues with DMA bounce buffers, and exposes packet send/receive over IPC. A stateless UDP/IP stack sits on top — ARP, IPv4, UDP, with a working NTP demo that queries an external time server through QEMU's SLIRP network.
 
 ### What Comes Next
 
-In rough priority order, acknowledging that the territory gets less mapped the further out we go:
+The v1 target is an interactive, network-capable, identity-rooted OS running on real hardware with persistent storage. In rough dependency order:
 
-1. **User-space driver framework** — The kernel can dispatch interrupts and route IPC. The next step is building the framework that lets user-space drivers register for hardware, receive interrupt notifications, and expose services to other processes. The first targets: a simple block device driver and a framebuffer graphics driver.
+1. **Shell** — Interactive command-line shell over serial. Process spawning, command parsing, wait-for-exit. Makes everything else demonstrable.
 
-2. **Virtual File System** — A VFS service that presents a unified file namespace to applications. Concrete file system implementations (FAT32 for USB media, a native ArcOS format for internal storage) plug in as separate services behind the VFS.
+2. **Bare-metal boot** — Bootable USB image for x86_64 UEFI (targeting a Dell Precision 3630). Limine already supports this — primarily a tooling task.
 
-3. **Basic shell and user interface** — Enough to interact with the system without QEMU serial output. A text console first, then a graphical shell.
+3. **Real NIC driver** — User-space driver for the Intel I219-LM (e1000e family) on the bare-metal target. Same IPC interface as virtio-net so the UDP stack works unmodified on top.
 
-4. **AArch64 port (implementation)** — The architecture scaffolding is done (API surface matches x86_64, cfg-gating wired). Next: fill in the assembly stubs to make it boot on QEMU `virt` machine. GICv3, ARM Generic Timer, PL011 UART, exception vector table.
+4. **DHCP and DNS** — User-space services over the UDP stack. Dynamic IP assignment and name resolution. Eliminates hardcoded addresses.
 
-5. **Networking stack** — TCP/IP for interoperability, plus the beginning of the overlay network. User-space network driver, socket API exposed through IPC.
+5. **TCP stack** — Connection state machine, retransmission, sliding window. Required for TLS and any serious network interaction.
 
-6. **AI engine integration** — The pre-execution verifier is already a trait-based gate. The next step is plugging in actual AI inference: start with a lightweight syscall classifier for runtime behavioral analysis, then expand to binary analysis.
+6. **Persistent storage** — Virtio-blk driver (QEMU) and real disk driver (bare metal) backing the object store. Content-addressed objects survive reboot.
 
-7. **Identity system** — Key generation, storage (software keys first, hardware-backed later), challenge-response authentication between processes and between machines.
+7. **Mesh networking** — Yggdrasil-inspired peer service mapping Ed25519 principals to IPv6 overlay addresses. The beginning of identity-routed, encrypted networking without DNS or IP assignment.
 
-8. **Compatibility layer prototype** — Run a simple Linux binary through system call translation. This is the proof of concept for the compatibility AI. It starts as a hand-coded translation table and evolves toward AI-assisted mapping.
+8. **AI integration** — The pre-execution verifier is already a trait-based gate. Next: plug in actual inference — a lightweight syscall classifier for runtime behavioral analysis, expanding to binary analysis and anomaly detection.
 
 ### What We Don't Know Yet
 

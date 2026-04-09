@@ -126,6 +126,21 @@ pub enum SyscallNumber {
     /// flags bits 2:1: width (0=byte, 1=word, 2=dword)
     /// Returns: read value (for reads), 0 (for writes), or negative error.
     PortIo = 23,
+
+    /// console_read(buf: *mut u8, max_len: usize) -> isize
+    /// Read bytes from the serial console into buf. Returns the number of
+    /// bytes read (0 if no data available). Non-blocking (polling mode).
+    ConsoleRead = 24,
+
+    /// spawn(name_ptr: *const u8, name_len: usize) -> isize
+    /// Spawn a boot module by name. Returns the new task ID on success,
+    /// or negative error. The spawned task's parent is the caller.
+    Spawn = 25,
+
+    /// wait_task(child_task_id: u32) -> isize
+    /// Block until the specified child task exits. Returns the child's
+    /// exit code. Only the parent (spawner) can wait on a child.
+    WaitTask = 26,
 }
 
 impl SyscallNumber {
@@ -156,6 +171,9 @@ impl SyscallNumber {
             21 => Some(Self::AllocDma),
             22 => Some(Self::DeviceInfo),
             23 => Some(Self::PortIo),
+            24 => Some(Self::ConsoleRead),
+            25 => Some(Self::Spawn),
+            26 => Some(Self::WaitTask),
             _ => None,
         }
     }

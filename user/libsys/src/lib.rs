@@ -2,9 +2,17 @@
 
 //! ArcOS user-space syscall library
 //!
-//! Safe wrappers around x86_64 SYSCALL instruction. This is the ONLY crate
-//! in user-space that contains `unsafe` code. All other user-space crates
-//! should use `#![forbid(unsafe_code)]` and call these safe functions.
+//! Safe wrappers around architecture-specific syscall instructions. This is
+//! the ONLY crate in user-space that contains `unsafe` code. All other
+//! user-space crates should use `#![forbid(unsafe_code)]` and call these
+//! safe functions.
+//!
+//! ## Architecture conventions
+//!
+//! | Arch    | Instruction | Syscall # | Args       | Return |
+//! |---------|-------------|-----------|------------|--------|
+//! | x86_64  | `syscall`   | RAX       | RDI..R9    | RAX    |
+//! | AArch64 | `svc #0`    | x8        | x0..x5     | x0     |
 
 #![no_std]
 
@@ -27,6 +35,11 @@ const SYS_OBJ_PUT_SIGNED: u64 = 19;
 // Raw syscall primitives — the ONLY unsafe code in user-space
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// x86_64: SYSCALL instruction
+// ----------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let ret: i64;
@@ -55,6 +68,7 @@ fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     let ret: i64;
@@ -72,6 +86,90 @@ fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
             lateout("r9") _,
             lateout("r10") _,
             lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ----------------------------------------------------------------------------
+// AArch64: SVC #0 instruction
+// ----------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: Invokes the kernel SVC handler via `svc #0`.
+    // The kernel validates all arguments.
+    //
+    // AArch64 convention: x8 = syscall number, x0-x5 = args, x0 = return.
+    // The SVC exception saves/restores all registers via the exception
+    // vector stub (sync_el0_stub), so only x0 is modified on return
+    // (the stub writes the return value into the saved x0 slot).
+    //
+    // Clobbers: x0 (return value). x1-x7 and x8 are restored by the kernel's
+    // exception return path, but we mark them clobbered defensively since
+    // the kernel could change its ABI without breaking us.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            inlateout("x0") arg1 as i64 => ret,
+            inlateout("x1") arg2 => _,
+            inlateout("x2") arg3 => _,
+            inlateout("x8") num => _,
+            // x3-x7 not used but may be clobbered by future kernel changes
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
+            // x9-x15 are caller-saved (corruptible) in AAPCS64
+            lateout("x9") _,
+            lateout("x10") _,
+            lateout("x11") _,
+            lateout("x12") _,
+            lateout("x13") _,
+            lateout("x14") _,
+            lateout("x15") _,
+            // x16-x17 are intra-procedure-call scratch
+            lateout("x16") _,
+            lateout("x17") _,
+            // x18 is platform register (caller-saved)
+            lateout("x18") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: Same as syscall_raw3. x3 carries the 4th argument.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            inlateout("x0") arg1 as i64 => ret,
+            inlateout("x1") arg2 => _,
+            inlateout("x2") arg3 => _,
+            inlateout("x3") arg4 => _,
+            inlateout("x8") num => _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
+            lateout("x9") _,
+            lateout("x10") _,
+            lateout("x11") _,
+            lateout("x12") _,
+            lateout("x13") _,
+            lateout("x14") _,
+            lateout("x15") _,
+            lateout("x16") _,
+            lateout("x17") _,
+            lateout("x18") _,
             options(nostack),
         );
     }
@@ -223,4 +321,34 @@ pub fn port_read32(port: u16) -> Result<u32, i64> {
 pub fn port_write32(port: u16, value: u32) -> Result<(), i64> {
     let r = port_io(port, value, 0b101); // write, dword
     if r < 0 { Err(r) } else { Ok(()) }
+}
+
+// ============================================================================
+// Shell / interactive syscalls
+// ============================================================================
+
+const SYS_CONSOLE_READ: u64 = 24;
+const SYS_SPAWN: u64 = 25;
+const SYS_WAIT_TASK: u64 = 26;
+const SYS_GET_TIME: u64 = 9;
+
+/// Read bytes from the serial console (non-blocking).
+/// Returns the number of bytes read (0 if no data available).
+pub fn console_read(buf: &mut [u8]) -> i64 {
+    syscall_raw3(SYS_CONSOLE_READ, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+}
+
+/// Spawn a boot module by name. Returns the new task ID, or negative error.
+pub fn spawn(name: &[u8]) -> i64 {
+    syscall_raw3(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0)
+}
+
+/// Block until the specified child task exits. Returns the child's exit code.
+pub fn wait_task(task_id: u32) -> i64 {
+    syscall_raw3(SYS_WAIT_TASK, task_id as u64, 0, 0)
+}
+
+/// Get system time in ticks.
+pub fn get_time() -> u64 {
+    syscall_raw3(SYS_GET_TIME, 0, 0, 0) as u64
 }

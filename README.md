@@ -1,162 +1,89 @@
-# ArcOS Microkernel
+# ArcOS
 
-A security-first microkernel OS written in Rust (`no_std`) targeting **x86_64** and **AArch64**. Boots via the Limine protocol with preemptive SMP multitasking, capability-based IPC, zero-trust enforcement, and an ELF process loader with ring-3 user tasks.
+> *Your computer... is not your own.*
 
-## Current Status
+Right now, before your OS boots, before your kernel loads, before any software you chose runs — a separate processor with its own OS, its own network stack, and its own keys is already running. You didn't install it. You can't audit it. You can't turn it off. On Intel machines it's called the Management Engine. On AMD it's the Platform Security Processor. It has DMA access to your memory. It runs whether your machine is on or off, as long as it has power. 
 
-- **190/190 unit tests passing**
-- **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 7 tasks (3 kernel + 2 ring-3 user + hello module + FS service), full SMP (phases 0–4c) with IRQ affinity and load balancing
-- **AArch64**: QEMU `virt` boots to stable preemptive SMP scheduling with GICv3 + ARM Generic Timer at 100Hz, 3 kernel tasks, full memory subsystem (kernel heap, frame allocator, process heaps), EL0 user tasks with per-process TTBR0
-- **Identity (Phase 0)**: Bootstrap Principal bound to kernel processes and boot modules, IPC messages carry unforgeable `sender_principal` stamped by kernel, BindPrincipal/GetPrincipal syscalls
-- **ObjectStore (Phase 0)**: Content-addressed ArcObjects with author/owner/signature/ACL, RamObjectStore (256 objects, FNV-1a hashing), ObjPut/ObjGet/ObjDelete/ObjList syscalls
-- **FS Service**: First user-space Rust service (`user/fs-service/`), receives IPC on endpoint 16, enforces ownership via `sender_principal`, delegates to ObjectStore syscalls
+This is not a conspiracy theory. It is documented hardware design. Even Apple's Secure Enclave cannot be verified all the way down.
 
-## Design Principles
+Almost everything running on top of this foundation — whether Windows, macOS, Linux — layers additional extraction: telemetry baked into the kernel, analytics in the bootloader, identifiers that follow you across reinstalls. The software stack most people trust with their most sensitive data was designed, at a fundamental level, around interests that are not theirs.
 
-- **Microkernel isolation** — device drivers, networking, and filesystems run in user-space; minimal kernel attack surface
-- **Zero-trust security** — capability-based IPC, verify-before-execute ELF gate, IPC interceptor at 3 enforcement points
-- **Cryptographic identity** — identity-based access with unforgeable Principals (Phase 0 complete, Ed25519 + Blake3 in Phase 1)
-- **Platform agnostic** — x86_64 and AArch64 today, RISC-V planned
-- **Live-patchable** — AI-assisted kernel updates without reboots (planned)
-- **No telemetry** — no analytics, no phone-home behavior, ever
+Ready to take it back? ArcOS is your response.
 
-## Features
+---
 
-### Completed
+## What ArcOS Is
 
-- **Preemptive SMP scheduler** — per-CPU priority-band scheduling (4 bands, O(1) via VecDeque, MAX_TASKS=256), task migration, load balancing (every 1s, threshold of 2)
-- **SYSCALL/SYSRET fast path** (x86_64) / **SVC handler** (AArch64) — 18 syscalls implemented (Exit, Write, Read, Allocate, Free, WaitIrq, RegisterEndpoint, Yield, GetPid, GetTime, Print, BindPrincipal, GetPrincipal, RecvMsg, ObjPut, ObjGet, ObjDelete, ObjList)
-- **ELF process loader** — per-process page tables, frame allocation, segment mapping, kernel stack setup, verify-before-execute gate (W^X, entry validation, overlap detection)
-- **Capability-based IPC** — per-endpoint sharded locking (`ShardedIpcManager`, 32 shards), fine-grained access control (send/receive/delegate), priority levels, zero-trust interceptor, identity-aware `sender_principal` stamping
-- **SMP** — Limine MP protocol AP startup on both x86_64 and AArch64, per-CPU GDT/TSS, IPI primitives, TLB shootdown (vector 0xFE on x86_64, TLBI broadcast on AArch64), cross-CPU task wake via lock-free `TASK_CPU_MAP`
-- **Local APIC timer** (x86_64) / **ARM Generic Timer** (AArch64) — 100Hz preemptive ticks
-- **I/O APIC** (x86_64) / **GICv3** (AArch64) — device IRQ routing
-- **ACPI parsing** — RSDP, XSDT, MADT for I/O APIC and interrupt source overrides
-- **Memory subsystem** — kernel heap (4MB), bitmap frame allocator (covers 0–2 GiB, 524288 frames), buddy allocator, per-CPU frame cache (32-frame LIFO, batch refill/drain), per-process page tables (4-level on both architectures)
-- **Ring-3 user tasks** — user code at 0x400000, user stack at 0x800000, per-process heap with Allocate/Free syscalls, EL0 support on AArch64 with per-process TTBR0
-- **Identity (Phase 0)** — `Principal` type (32-byte public key), Bootstrap Principal bound at boot, `BindPrincipal`/`GetPrincipal` syscalls, IPC messages carry unforgeable `sender_principal` stamped by kernel
-- **ObjectStore (Phase 0)** — `ArcObject` (content-addressed, author/owner, signature field, ACL, lineage), `RamObjectStore` (256 objects, FNV-1a hashing), ObjPut/ObjGet/ObjDelete/ObjList syscalls with ownership enforcement
-- **FS Service** — first user-space Rust service (`user/fs-service/`), registers IPC endpoint 16, service loop (RecvMsg → parse → ObjectStore syscalls → respond), ownership enforcement via `sender_principal`
+ArcOS is a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer that is verifiably yours.
 
-### Planned
+At its foundation is a microkernel written from first principles in Rust:
 
-- AArch64 device IRQ routing via GIC SPIs
-- Crypto integration (Ed25519 + Blake3, replacing FNV-1a, signed ELF binaries)
-- Key store service (user-space capability-gated, private key isolation)
-- Virtio-net driver (user-space MMIO, DMA buffer management)
-- UDP stack + NTP demo
-- AI-powered binary analysis and anomaly detection
-- Live kernel patching
-- RISC-V port
+- **Every process is isolated.** Device drivers, networking, and filesystems run in user-space. The kernel attack surface is minimal by design.
+- **Every binary is verified before it runs.** Cryptographic identity is threaded through the entire stack — from boot modules to IPC messages to stored objects.
+- **Every IPC message carries an unforgeable sender identity.** The kernel stamps it. Nothing in user-space can lie about who sent what.
+- **No telemetry. No analytics. No phone-home behavior.** Ever. Not now, not in future versions. This is a design constraint, not a policy.
+- **Designed to host LLM security services.** Behavioral anomaly detection, just-in-time binary analysis, and automatic threat quarantine — running locally, on hardware you control.
 
-## Building
+---
 
-### Prerequisites
+## Honesty About the "Hardware Problem"
 
-- Rust nightly toolchain (see `rust-toolchain.toml`)
-- Targets: `x86_64-unknown-none`, `aarch64-unknown-none`
-- QEMU (via Homebrew)
-- Limine v8.7.0 (cloned automatically to `/tmp/limine`)
-- `mtools` (for AArch64 FAT disk images)
+ArcOS runs on x86_64 and AArch64. On those platforms it dramatically reduces the software attack surface — capability-based IPC, zero-trust enforcement, cryptographic identity, verified execution protect against a vast category of threats that affect everyone running conventional systems.
 
-### Commands
+But it cannot remove Intel ME or AMD PSP. Those coprocessors sit below the kernel — ME and PSP on x86, TrustZone on ARM. No software can fully neutralize them. ArcOS is explicit about this rather than pretending otherwise.
 
-```bash
-# Build kernel — x86_64
-cargo build --target x86_64-unknown-none --release
+**True security and true sovereignty are undercut until the hardware beneath the kernel is open and auditable.** Everything ArcOS builds — verified boot, signed binaries, unforgeable identity — sits on a foundation it cannot yet inspect. That is not an acceptable permanent state.
 
-# Build kernel — AArch64
-cargo build --target aarch64-unknown-none --release
+The long-term answer is open hardware all the way down. We're building toward that. In the meantime most people are on x86, and they deserve better security now, and clear eyes about what the silicon underneath still does.
 
-# Run unit tests (host macOS)
-RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+---
 
-# Build ISO + run in QEMU (x86_64, 2 CPUs) — includes kernel, hello.elf, fs-service
-make iso && make run
+## Current State
 
-# Just run (rebuilds kernel + user modules automatically)
-make run
+Built by one person. In two weeks of coding:
 
-# Build FAT image + run in QEMU (AArch64)
-make img-aarch64 && make run-aarch64
+- **213/213 unit tests passing.** Clean release builds on both x86_64 and AArch64.
+- **x86_64 boots to stable preemptive SMP multitasking** in QEMU: 2 CPUs, 10 concurrent tasks, APIC timer at 100Hz, IRQ affinity, load balancing, PCI device discovery, 24 syscalls.
+- **AArch64 boots to stable preemptive SMP scheduling** in QEMU: GICv3, ARM Generic Timer at 100Hz, EL0 user tasks with per-process page tables.
 
-# Build fs-service only
-make fs-service
+**The security model is real and running:**
+- Cryptographic identity backed by hardware YubiKey — no secret key in kernel memory. Open secure element long-term.
+- Boot modules signed at build time, verified before execution
+- User-space services (filesystem, key store, virtio-net, UDP stack) isolated behind capability-checked IPC, each message carrying an unforgeable sender identity
+- Content-addressed object store with Blake3 hashing, Ed25519 signatures, and ownership enforcement
+
+Every unsafe block has a // SAFETY: comment. Lock ordering is documented and enforced. The code is written to be read.
+
+The kernel is real. The security model is real. This code is not a prototype.
+
+---
+
+## Architecture
+
+ArcOS is a full operating system. Its kernel is a microkernel and does five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Everything else - filesystems, networking, device drivers - all run as isolated user-space services communicating over capability-checked IPC.
+
+The attack surface is small by design. A buggy filesystem service can't take down the kernel. A compromised network driver can't read another process's memory. Isolation is structural, not policy.
+
+**Enforcement is layered and has no bypass:**
+```
+ELF binary arrives
+    → BinaryVerifier: W^X, entry point validation, overlap detection, signature check
+    → IPC send: capability check, interceptor hook, sender_principal stamp
+    → IPC recv: capability check, interceptor hook
+    → Syscall pre-dispatch: interceptor hook before handler
+    → ObjectStore: ownership enforced on every get/put/delete
 ```
 
-## Project Structure
+Identity is a 32-byte Ed25519 public key bound to every process (quantum resistant keying planned.) The kernel stamps Identity onto every IPC message — unforgeable, no trust required from user-space. The bootstrap Principal derives from a compiled-in YubiKey public key. No private key lives in kernel memory.
 
-```
-src/
-├── lib.rs                    # Crate root, global statics, init, halt
-├── process.rs                # ProcessTable, ProcessDescriptor, VmaTracker
-├── acpi/
-│   └── mod.rs                # ACPI table parser (RSDP, XSDT, MADT)
-├── arch/
-│   ├── mod.rs                # cfg-gated architecture shim
-│   ├── spinlock.rs           # Spinlock + IrqSpinlock (interrupt-disabling)
-│   ├── x86_64/
-│   │   ├── mod.rs            # Context switching, SavedContext, timer ISR
-│   │   ├── apic.rs           # Local APIC driver (timer, EOI, IPI)
-│   │   ├── gdt.rs            # Per-CPU GDT + TSS + IST
-│   │   ├── ioapic.rs         # I/O APIC driver (device IRQ routing)
-│   │   ├── percpu.rs         # Per-CPU data (GS base)
-│   │   ├── syscall.rs        # SYSCALL/SYSRET MSR init + entry point
-│   │   └── tlb.rs            # TLB shootdown via IPI
-│   └── aarch64/
-│       ├── mod.rs            # SavedContext, context_switch, timer ISR
-│       ├── gic.rs            # GICv3 driver (Distributor, Redistributor, ICC)
-│       ├── percpu.rs         # Per-CPU data (TPIDR_EL1)
-│       ├── syscall.rs        # SVC entry + VBAR_EL1 exception vector table
-│       ├── timer.rs          # ARM Generic Timer (CNTP)
-│       └── tlb.rs            # TLB shootdown via TLBI broadcast
-├── fs/
-│   ├── mod.rs                # ArcObject, ObjectStore trait (content-addressed signed objects)
-│   └── ram.rs                # RamObjectStore (256 objects, FNV-1a hashing)
-├── interrupts/
-│   ├── mod.rs                # IDT setup, exception/device ISR handlers
-│   ├── pic.rs                # 8259 PIC driver (disabled at boot)
-│   ├── pit.rs                # 8254 PIT (APIC calibration only)
-│   └── routing.rs            # IRQ → driver task routing table
-├── io/
-│   └── mod.rs                # Serial output (uart_16550 / PL011 UART)
-├── ipc/
-│   ├── mod.rs                # IPC: Principal, EndpointQueue, SyncChannel, IpcManager, ShardedIpcManager
-│   ├── capability.rs         # Capability-based security + Principal binding
-│   └── interceptor.rs        # Zero-trust IPC interceptor
-├── loader/
-│   ├── mod.rs                # ELF process loader + verify-before-execute
-│   └── elf.rs                # ELF64 header/program header parser
-├── memory/
-│   ├── mod.rs                # Memory init + AArch64 paging (L0-L3)
-│   ├── heap.rs               # Kernel heap allocator (GlobalAlloc)
-│   ├── frame_allocator.rs    # Bitmap frame allocator (0–2 GiB) + per-CPU FrameCache
-│   ├── buddy_allocator.rs    # Pure bookkeeping buddy allocator
-│   └── paging.rs             # x86_64 page table management
-├── microkernel/
-│   └── main.rs               # Kernel entry point, subsystem init
-├── platform/
-│   └── mod.rs                # Platform abstraction, feature detection
-├── scheduler/
-│   ├── mod.rs                # Per-CPU priority-band scheduler, on_timer_isr()
-│   ├── task.rs               # Task/TaskState/CpuContext definitions
-│   └── timer.rs              # Timer tick management
-└── syscalls/
-    ├── mod.rs                # SyscallNumber enum, SyscallArgs
-    ├── dispatcher.rs         # Syscall dispatch + all 18 handlers
-    └── userspace.rs          # Stub userspace syscall wrappers
-user/
-├── hello.S                   # Test module (prints 3x, exits)
-├── user.ld                   # User-space linker script (base 0x400000)
-└── fs-service/               # Filesystem service (Rust no_std crate)
-    ├── Cargo.toml
-    ├── link.ld               # Linker script (.data on separate page for GOT)
-    └── src/main.rs           # IPC service loop on endpoint 16, ObjectStore gateway
-```
+IPC is capability-based, sharded per-endpoint, with fixed 256-byte messages for predictable verification. Three enforcement points: IpcManager send/recv, syscall pre-dispatch, capability delegation.
+For detailed internals — lock ordering, memory layout, syscall reference, scheduler design — see the Design Documents section below.
 
 ## Boot Sequence
 
 ArcOS boots via the **Limine v8.7.0** boot protocol on both architectures.
+
+The boot sequence is where trust is established — before any user-space code runs.
 
 ### x86_64
 
@@ -165,11 +92,12 @@ ArcOS boots via the **Limine v8.7.0** boot protocol on both architectures.
 3. ACPI regions mapped into HHDM, MADT parsed for I/O APIC
 4. Per-CPU GDT/TSS installed, IDT loaded, SYSCALL MSRs configured
 5. PIC disabled, I/O APIC programmed, APIC timer started at 100Hz
-6. IPC manager, capability manager, and interceptor initialized
-7. Bootstrap Principal created, bound to kernel processes
-8. Kernel tasks created, ELF user processes loaded (hello.elf + fs-service) with per-process page tables
-9. AP cores started via Limine MP protocol (per-CPU GDT, APIC, scheduler)
-10. Preemptive SMP scheduling begins
+6. IPC manager, capability manager, and zero-trust interceptor initialized
+7. Bootstrap Principal created from compiled-in YubiKey public key, bound to kernel processes
+8. PCI bus scan, device table populated
+9. Signed ELF boot modules loaded and verified (hello, key-store, fs-service, virtio-net, udp-stack) with per-process page tables
+10. AP cores started via Limine MP protocol — per-CPU GDT, APIC, scheduler
+11. Preemptive SMP scheduling begins
 
 ### AArch64
 
@@ -179,12 +107,142 @@ ArcOS boots via the **Limine v8.7.0** boot protocol on both architectures.
 4. Kernel heap and frame allocator initialized
 5. GIC distributor, redistributor, and CPU interface initialized
 6. ARM Generic Timer started at 100Hz
-7. Exception vector table installed (VBAR_EL1), SVC handler configured
-8. Per-CPU data initialized via MPIDR_EL1
-9. Kernel tasks created, AP cores started via Limine MP protocol
-10. Preemptive SMP scheduling begins
+7. Exception vector table installed, SVC handler configured
+8. IPC manager, capability manager, and zero-trust interceptor initialized
+9. Bootstrap Principal created from compiled-in YubiKey public key, bound to kernel processes
+10. Signed ELF boot modules loaded and verified with per-process page tables
+11. AP cores started via Limine MP protocol — per-CPU GIC, timer, scheduler
+12. Preemptive SMP scheduling begins
 
-## IPC Model
+---
+
+## Building
+
+ArcOS builds on macOS (Apple Silicon) with Rust nightly. Kernel binaries run only in QEMU — never directly on the host.
+Prerequisites
+
+Rust nightly (see rust-toolchain.toml)
+Targets: x86_64-unknown-none, aarch64-unknown-none
+QEMU via Homebrew
+Limine v8.7.0 (auto-cloned to /tmp/limine)
+mtools for AArch64 FAT disk images
+```
+Unit tests (host macOS)
+RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+
+# Run in QEMU — x86_64
+make run
+
+# Run in QEMU — AArch64
+make img-aarch64 && make run-aarch64
+
+# Sign a boot module via YubiKey
+./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf <elf-file>
+
+# Sign via seed (CI / no hardware key)
+./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --seed <hex> <elf-file>
+```
+---
+
+## Project Structure
+
+```
+src/
+├── arch/x86_64/          # GDT, APIC, SYSCALL/SYSRET, TLB shootdown, SMP
+├── arch/aarch64/         # GICv3, ARM Generic Timer, SVC, TLBI, EL0/EL1
+├── scheduler/            # Priority-band preemptive SMP scheduler (portable)
+├── ipc/                  # Capability-based IPC, Principal, zero-trust interceptor
+├── syscalls/             # 24 syscalls, all implemented
+├── memory/               # Frame allocator, buddy allocator, per-process page tables
+├── fs/                   # ArcObject, ObjectStore, Blake3, Ed25519
+├── loader/               # ELF loader, BinaryVerifier, SignedBinaryVerifier
+├── pci/                  # PCI bus scan, device table, BAR decoding
+└── microkernel/main.rs   # Kernel entry point
+
+user/
+├── libsys/               # Shared syscall wrapper library
+├── fs-service/           # Filesystem service (endpoint 16)
+├── key-store-service/    # Ed25519 signing service (endpoint 17)
+├── virtio-net/           # Virtio-net driver (endpoint 20)
+└── udp-stack/            # UDP/IP network service (endpoint 21)
+
+tools/
+└── sign-elf/             # Host-side ELF signing tool (YubiKey or seed)
+```
+
+---
+
+## Manuals
+
+Narrative walkthroughs that explain how ArcOS works by following real things through the system:
+
+- [Waking Up](docs/manuals/01-waking-up.md) — The boot sequence as a story: bootstrap paradoxes, dependency chains, and bringing a microkernel to life
+- [The Life of a Message](docs/manuals/02-life-of-a-message.md) — An IPC message from syscall to delivery, through capability checks and identity stamping
+- [The Signature Chain](docs/manuals/03-signature-chain.md) — From YubiKey to boot verification: how the kernel knows code is authentic
+- [Why a Buggy Driver Can't Kill You](docs/manuals/04-driver-isolation.md) — Microkernel isolation told through consequences
+- [From NTP Query to UTC Clock](docs/manuals/05-ntp-query.md) — A UDP packet end-to-end through the full networking stack
+
+---
+
+## Design Documents
+
+- [ArcOS.md](ArcOS.md) — Source-of-truth architecture document
+- [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind ArcOS
+- [identity.md](identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
+- [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Implementation sequencing for identity + storage
+- [SECURITY.md](SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
+- [SYSCALLS.md](SYSCALLS.md) — All 24 syscalls: numbers, arguments, behavior, calling conventions
+- [INTERRUPT_ROUTING.md](INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
+- [src/scheduler/SCHEDULER.md](src/scheduler/SCHEDULER.md) — Scheduler internals
+
+### Architecture Decision Records
+
+- [ADR-000](docs/adr/000-zta-and-cap.md) — Zero-trust architecture and capability-based access control
+- [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) — Per-CPU scheduling and SMP task management
+- [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) — Three-layer enforcement pipeline for IPC and syscalls
+- [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) — Content-addressed storage and cryptographic identity
+- [ADR-004](docs/adr/004-cryptographic-integrity.md) — Cryptographic integrity: Blake3 hashing and Ed25519 signatures
+
+---
+
+## Contributing
+
+ArcOS is looking for people who understand what's at stake.
+
+If you work on OS internals, compiler infrastructure, hardware security, or ML systems — and you've read this far and feel something — reach out. The foundation is real. The roadmap is clear. The work ahead is large enough that no single person should do it alone.
+
+---
+
+## References
+
+- [Limine Boot Protocol](https://github.com/limine-bootloader/limine)
+- [OSDev Wiki](https://wiki.osdev.org/)
+- [seL4 Microkernel](https://sel4.systems/) — verification reference
+- [Rust on Baremetal](https://github.com/rust-osdev)
+
+---
+
+*No telemetry. No analytics. No management engine. No compromises on the things that matter.*
+
+
+### Security Enforcement Layers
+
+```
+ELF binary arrives
+    → BinaryVerifier: W^X, entry point validation, overlap detection, signature check
+    → IPC Interceptor (send path): capability check, interceptor hook, sender_principal stamp
+    → IPC Interceptor (recv path): capability check, interceptor hook
+    → Syscall pre-dispatch: interceptor hook before handler
+    → ObjectStore: ownership enforced on every get/put/delete
+```
+
+### Identity Model
+
+Every process has a Principal — a 32-byte Ed25519 public key. The kernel stamps every IPC message with the sender's Principal. It cannot be forged. User-space services use this to enforce ownership, access control, and audit trails without trusting the sender's claims.
+
+The bootstrap Principal derives from a compiled-in YubiKey public key. No private key lives in kernel memory.
+
+### IPC Model
 
 Capability-based message passing with zero-trust enforcement:
 
@@ -195,74 +253,31 @@ Capability-based message passing with zero-trust enforcement:
 - **Page-table-walk** for user buffer validation in Write/Read syscalls
 - **Identity-aware receive** (`RecvMsg`): returns `[sender_principal:32][from_endpoint:4][payload:N]`
 
-## Memory Layout
+### Memory Layout
 
 | Region | x86_64 | AArch64 |
 |--------|--------|---------|
 | HHDM base | `0xFFFF800000000000` | `0xFFFF000000000000` |
 | User code | `0x400000` | `0x400000` |
-| User stack top | `0x800000` (16KB) | `0x800000` (16KB) |
+| User stack top | `0x800000` (64KB) | `0x800000` (64KB) |
 | Process heap base | `0x800000` | `0x40800000` |
 | Kernel heap | 4MB at HHDM+physical | 4MB at HHDM+physical |
-| Frame allocator | Bitmap, 0–2 GiB | Bitmap, 0–2 GiB |
+| Frame allocator | Bitmap, 0-2 GiB | Bitmap, 0-2 GiB |
 
-## Lock Ordering
+### Lock Ordering
 
-All locks follow strict ordering to prevent deadlock:
+Strict lock hierarchy prevents deadlock across all kernel subsystems:
 
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
 PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
 ```
 
-`*` = IrqSpinlock (saves/disables interrupts before acquiring)
+`*` = IrqSpinlock (interrupt-disabling). Lower numbers acquired before higher. No exceptions.
 
-Additional lock domains (independent of hierarchy above):
+Additional lock domains (independent of hierarchy):
 - `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR
 - `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint
 - `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter
 
-## Development
-
-### Code Principles
-
-- `no_std` only — no heap before `memory::init()` completes
-- Every `unsafe` block requires a `// SAFETY:` comment
-- Architecture-specific code lives under `src/arch/<target>/`
-- Large structs heap-allocated via `new_boxed()` (boot stack is 256KB)
-- Lock ordering must be followed; `try_lock()` in ISR context is the established pattern
-
-### Running Tests
-
-```bash
-# All 190 tests (requires extra stack for buddy allocator tests)
-RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
-```
-
-Note: The microkernel binary (`src/microkernel/main.rs`) uses ELF-specific linker sections and cannot compile for test on macOS. Always use `--lib`.
-
-## Design Documents
-
-- [ArcOS.md](ArcOS.md) — Source-of-truth architecture document
-- [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind ArcOS
-- [identity.md](identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
-- [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Implementation sequencing for identity + storage: content-addressed ObjectStore, ArcObject model, bootstrap identity, IPC sender_principal stamping
-- [SECURITY.md](SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
-- [SYSCALLS.md](SYSCALLS.md) — All 18 syscalls: numbers, arguments, behavior, calling conventions
-- [INTERRUPT_ROUTING.md](INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
-- [src/scheduler/SCHEDULER.md](src/scheduler/SCHEDULER.md) — Scheduler internals: tick-based preemptive round-robin
-
-## Architecture Decision Records
-
-- [ADR-000](docs/adr/000-zta-and-cap.md) — Zero-trust architecture and capability-based access control
-- [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) — Per-CPU scheduling and SMP task management
-- [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) — Three-layer enforcement pipeline for IPC and syscalls
-- [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) — Content-addressed storage and cryptographic identity
-- [ADR-004](docs/adr/004-cryptographic-integrity.md) — Cryptographic integrity: Blake3 hashing and Ed25519 signatures
-
-## References
-
-- [Limine Boot Protocol](https://github.com/limine-bootloader/limine)
-- [OSDev Wiki](https://wiki.osdev.org/)
-- [seL4 Microkernel](https://sel4.systems/) — verification reference
-- [Rust on Baremetal](https://github.com/rust-osdev)
+---

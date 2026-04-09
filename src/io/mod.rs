@@ -137,6 +137,51 @@ macro_rules! println {
     }};
 }
 
+/// Read a single byte from the serial console, if one is available.
+///
+/// Returns `Some(byte)` if data was waiting, `None` otherwise.
+/// Used by the ConsoleRead syscall for polling-mode serial input.
+pub fn read_byte() -> Option<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Hold SERIAL1 lock to ensure init has completed, but we read
+        // COM1 registers directly (uart_16550 doesn't expose a try-receive).
+        let mut guard = SERIAL1.lock();
+        let _serial = guard.as_mut()?;
+
+        // SAFETY: Reading Line Status Register (base+5) and Data Register
+        // (base+0) are side-effect-free reads. The port was initialized at boot.
+        use x86_64::instructions::port::Port;
+        let base = 0x3F8u16;
+        let lsr: u8 = unsafe { Port::new(base + 5).read() };
+        if lsr & 0x01 != 0 {
+            let data: u8 = unsafe { Port::new(base).read() };
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut guard = SERIAL1.lock();
+        let serial = guard.as_mut()?;
+
+        // PL011: check UARTFR.RXFE (bit 4). If clear, data is available.
+        // SAFETY: base points to the PL011 MMIO region, initialized at boot.
+        unsafe {
+            let fr = core::ptr::read_volatile((serial.base + Pl011::UARTFR) as *const u32);
+            const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
+            if fr & UARTFR_RXFE == 0 {
+                let data = core::ptr::read_volatile((serial.base + Pl011::UARTDR) as *const u32);
+                Some(data as u8)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Interface trait for verification and integration testing
 pub trait OutputWriter {
     fn write_byte(&mut self, byte: u8);

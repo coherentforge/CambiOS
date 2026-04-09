@@ -213,6 +213,9 @@ impl SyscallDispatcher {
             SyscallNumber::AllocDma => Self::handle_alloc_dma(args, ctx),
             SyscallNumber::DeviceInfo => Self::handle_device_info(args, ctx),
             SyscallNumber::PortIo => Self::handle_port_io(args, ctx),
+            SyscallNumber::ConsoleRead => Self::handle_console_read(args, ctx),
+            SyscallNumber::Spawn => Self::handle_spawn(args, ctx),
+            SyscallNumber::WaitTask => Self::handle_wait_task(args, ctx),
         }
     }
 
@@ -229,13 +232,24 @@ impl SyscallDispatcher {
         let exit_code = args.arg1_u32();
 
         // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held
-        {
+        let parent_to_wake = {
             let mut sched_guard = crate::local_scheduler().lock();
             if let Some(sched) = sched_guard.as_mut() {
                 if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
                     task.state = crate::scheduler::TaskState::Terminated;
+                    task.exit_code = exit_code;
+                    task.parent_task
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+
+        // Wake parent if it's blocked in WaitTask
+        if let Some(parent_id) = parent_to_wake {
+            crate::wake_task_on_cpu(parent_id);
         }
 
         crate::println!(
@@ -1500,5 +1514,207 @@ impl SyscallDispatcher {
     #[cfg(not(target_arch = "x86_64"))]
     fn handle_port_io(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
         Err(SyscallError::Enosys)
+    }
+
+    // ========================================================================
+    // Shell / interactive: ConsoleRead, Spawn, WaitTask
+    // ========================================================================
+
+    /// SYS_CONSOLE_READ: Read bytes from the serial console (polling mode).
+    ///
+    /// Args: arg1 = user buffer pointer, arg2 = max_len
+    /// Returns: number of bytes read (0 if no data available)
+    fn handle_console_read(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let user_buf = args.arg1;
+        let max_len = args.arg_usize(2);
+
+        if max_len == 0 {
+            return Ok(0);
+        }
+        if max_len > MAX_USER_BUFFER {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Try to read one byte (polling — non-blocking)
+        match crate::io::read_byte() {
+            Some(byte) => {
+                // Write the byte to user buffer
+                let kbuf = [byte];
+                write_user_buffer(ctx.cr3, user_buf, &kbuf)?;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// SYS_SPAWN: Spawn a boot module by name.
+    ///
+    /// Args: arg1 = name_ptr (user), arg2 = name_len
+    /// Returns: new task ID on success, negative error otherwise.
+    ///
+    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6), then
+    /// CAPABILITY_MANAGER(4) separately after dropping the first two.
+    fn handle_spawn(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::loader::{self, SignedBinaryVerifier};
+        use crate::scheduler::Priority;
+        use crate::ipc::ProcessId;
+        use core::sync::atomic::Ordering;
+
+        let name_ptr = args.arg1;
+        let name_len = args.arg_usize(2);
+
+        if name_len == 0 || name_len > 64 {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Read module name from user memory
+        let mut name_buf = [0u8; 64];
+        read_user_buffer(ctx.cr3, name_ptr, name_len, &mut name_buf)?;
+        let name = &name_buf[..name_len];
+
+        // Look up module in boot module registry
+        let (module_addr, module_size) = crate::BOOT_MODULE_REGISTRY
+            .lock()
+            .find_by_name(name)
+            .ok_or(SyscallError::InvalidArg)?;
+
+        // SAFETY: module_addr points to Limine EXECUTABLE_AND_MODULES memory,
+        // which is valid for the kernel's lifetime via HHDM.
+        let binary = unsafe { core::slice::from_raw_parts(module_addr, module_size) };
+
+        // Allocate a new process ID
+        let pid = crate::NEXT_PROCESS_ID.fetch_add(1, Ordering::AcqRel);
+        let process_id = ProcessId(pid);
+
+        // Use signed verifier with bootstrap key
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        let verifier = SignedBinaryVerifier::with_key(bootstrap.public_key);
+
+        // Lock ordering: SCHEDULER(1) → PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+        let mut sched_guard = crate::local_scheduler().lock();
+        let mut pt_guard = crate::PROCESS_TABLE.lock();
+        let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+
+        let sched = sched_guard.as_mut().ok_or(SyscallError::OutOfMemory)?;
+        let pt = pt_guard.as_mut().ok_or(SyscallError::OutOfMemory)?;
+
+        let result = loader::load_elf_process(
+            binary,
+            process_id,
+            Priority::NORMAL,
+            &verifier,
+            pt,
+            &mut fa_guard,
+            sched,
+        ).map_err(|_| SyscallError::OutOfMemory)?;
+
+        let new_task_id = result.task_id;
+
+        // Set parent on the new task so handle_exit can wake us
+        if let Some(task) = sched.get_task_mut_pub(new_task_id) {
+            task.parent_task = Some(ctx.task_id);
+        }
+
+        // Register task in CPU map
+        let cpu_id = {
+            #[cfg(target_arch = "x86_64")]
+            { unsafe { crate::arch::x86_64::percpu::current_percpu().cpu_id() } }
+            #[cfg(target_arch = "aarch64")]
+            { unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } }
+        };
+        crate::set_task_cpu(new_task_id.0, cpu_id as u16);
+
+        // Drop all locks before acquiring CAPABILITY_MANAGER(4)
+        // Note: CAPABILITY_MANAGER is level 4, lower than SCHEDULER(1), but
+        // we already released SCHEDULER. The ordering constraint is about
+        // simultaneous holding, not sequential acquisition.
+        drop(sched_guard);
+        drop(fa_guard);
+        drop(pt_guard);
+
+        // Register capabilities for the new process (CAPABILITY_MANAGER lock = level 4)
+        {
+            let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+            if let Some(cap_mgr) = cap_guard.as_mut() {
+                let _ = cap_mgr.register_process(process_id);
+                // Grant send/receive on all endpoints (spawned processes are trusted boot modules)
+                for ep in 0..crate::ipc::MAX_ENDPOINTS as u32 {
+                    let _ = cap_mgr.grant_capability(
+                        process_id,
+                        crate::ipc::EndpointId(ep),
+                        crate::ipc::CapabilityRights { send: true, receive: true, delegate: false },
+                    );
+                }
+                // Bind bootstrap Principal
+                if !bootstrap.is_zero() {
+                    let _ = cap_mgr.bind_principal(process_id, bootstrap);
+                }
+            }
+        }
+
+        crate::println!(
+            "  [Spawn] '{}' → task {} process {} (parent=task {})",
+            core::str::from_utf8(name).unwrap_or("?"),
+            new_task_id.0, process_id.0, ctx.task_id.0
+        );
+
+        Ok(new_task_id.0 as u64)
+    }
+
+    /// SYS_WAIT_TASK: Block until a child task exits.
+    ///
+    /// Args: arg1 = child task ID
+    /// Returns: child's exit code
+    fn handle_wait_task(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::scheduler::{TaskState, BlockReason};
+
+        let child_id = crate::scheduler::TaskId(args.arg1_u32());
+
+        // Check the child task's state
+        {
+            let mut sched_guard = crate::local_scheduler().lock();
+            let sched = sched_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+            let child = sched.get_task_mut_pub(child_id)
+                .ok_or(SyscallError::InvalidArg)?;
+
+            // Only the parent can wait on a child
+            if child.parent_task != Some(ctx.task_id) {
+                return Err(SyscallError::PermissionDenied);
+            }
+
+            // If already terminated, return exit code immediately
+            if child.state == TaskState::Terminated {
+                return Ok(child.exit_code as u64);
+            }
+
+            // Block the caller until the child exits
+            if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
+                task.state = TaskState::Blocked;
+                task.block_reason = Some(BlockReason::ChildWait);
+            }
+        }
+
+        // Yield — when the child exits, handle_exit wakes us via wake_task_on_cpu
+        // SAFETY: Scheduler lock is released, we are on the kernel stack.
+        unsafe { crate::arch::yield_save_and_switch(); }
+
+        // We've been woken — child should be terminated now. Read exit code.
+        {
+            let sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_ref() {
+                if let Some(child) = sched.get_task_pub(child_id) {
+                    return Ok(child.exit_code as u64);
+                }
+            }
+        }
+
+        Ok(0)
     }
 }
