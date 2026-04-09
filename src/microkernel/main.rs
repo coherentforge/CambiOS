@@ -1403,7 +1403,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
-    // Step 9: Set SP_EL1 and enable interrupts
+    // Step 9: Set SP_EL1 and enable IRQs
     // SAFETY: All AP-local hardware is initialized.
     unsafe {
         // Set SP_EL1 = current AP stack for exception entry
@@ -1415,7 +1415,8 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
             tmp = out(reg) _,
             options(nostack),
         );
-        core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); // Unmask IRQ
+        // Unmask IRQ — timer was started by init_ap(), GIC is configured
+        core::arch::asm!("msr daifclr, #2", options(nostack, nomem));
     }
 
     loop {

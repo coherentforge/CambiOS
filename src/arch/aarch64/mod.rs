@@ -682,25 +682,11 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
         _ => "other fault",
     };
 
-    // For EC=0 faults, capture CPACR and faulting instruction before terminating
-    let cpacr_fpen = if ec == 0 {
-        let cpacr: u64;
-        unsafe { core::arch::asm!("mrs {0}, cpacr_el1", out(reg) cpacr, options(nostack, nomem)); }
-        Some(((cpacr >> 20) & 0x3) as u8)
-    } else { None };
-
     if let Some(task_id) = crate::terminate_current_task() {
-        if let Some(fpen) = cpacr_fpen {
-            crate::println!(
-                "  [Fault] Task {} EC=0x0 at PC={:#x} CPACR.FPEN={}",
-                task_id.0, elr, fpen
-            );
-        } else {
-            crate::println!(
-                "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, EC={:#x})",
-                task_id.0, ec_name, fault_type, access, far, elr, ec
-            );
-        }
+        crate::println!(
+            "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
+            task_id.0, ec_name, fault_type, access, far, elr, dfsc
+        );
     } else {
         crate::println!(
             "  [Fault] {} at {:#x} (PC={:#x}) but no current task",
