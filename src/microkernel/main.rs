@@ -409,6 +409,17 @@ unsafe extern "C" fn kmain() -> ! {
             arcos_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
             println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
 
+            // Enable FP/NEON for EL0 and EL1 (CPACR_EL1.FPEN = 0b11).
+            // Without this, FP/NEON instructions from EL0 trap with EC=0x0.
+            // Rust-compiled user-space code uses NEON for zeroing (movi v0.2d).
+            core::arch::asm!(
+                "mrs {tmp}, cpacr_el1",
+                "orr {tmp}, {tmp}, #(3 << 20)",   // FPEN = 0b11
+                "msr cpacr_el1, {tmp}",
+                "isb",
+                tmp = out(reg) _,
+            );
+
             // Initialize GIC CPU interface (ICC system registers)
             arcos_core::arch::aarch64::gic::init();
             println!("  ✓ GIC CPU interface enabled");
@@ -477,7 +488,7 @@ unsafe extern "C" fn kmain() -> ! {
 // Kernel heap initialization from Limine memory map
 // ============================================================================
 
-/// Kernel heap size: 4 MB (plenty for kernel-level Box/Vec allocations)
+/// Kernel heap size: 4 MB (sufficient for kernel-level Box/Vec allocations)
 const KERNEL_HEAP_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Actual physical base chosen by init_kernel_heap(). Used by init_frame_allocator()
@@ -1363,9 +1374,18 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
-    // Step 9: Enable interrupts and enter idle loop
+    // Step 9: Set SP_EL1 and enable interrupts
     // SAFETY: All AP-local hardware is initialized.
     unsafe {
+        // Set SP_EL1 = current AP stack for exception entry
+        core::arch::asm!(
+            "mov {tmp}, sp",
+            "msr spsel, #1",
+            "mov sp, {tmp}",
+            "msr spsel, #0",
+            tmp = out(reg) _,
+            options(nostack),
+        );
         core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); // Unmask IRQ
     }
 
@@ -1554,6 +1574,19 @@ fn microkernel_loop() -> ! {
         }
         // Rearm the timer so the first tick fires cleanly.
         unsafe { arcos_core::arch::aarch64::timer::rearm(); }
+        // Set SP_EL1 = current kernel stack so the first timer ISR has a
+        // valid stack. Exception entry forces SPSel=1 → SP = SP_EL1.
+        // Uses SPSel toggle because QEMU traps `msr sp_el1`.
+        unsafe {
+            core::arch::asm!(
+                "mov {tmp}, sp",         // tmp = current SP (SP_EL0 = boot stack)
+                "msr spsel, #1",         // SP = SP_EL1
+                "mov sp, {tmp}",         // SP_EL1 = boot stack
+                "msr spsel, #0",         // SP = SP_EL0 (back)
+                tmp = out(reg) _,
+                options(nostack),
+            );
+        }
         // SAFETY: All hardware initialized (GIC, timer, VBAR_EL1).
         unsafe { core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); }
     }
@@ -1563,29 +1596,8 @@ fn microkernel_loop() -> ! {
     let mut last_status_tick: u64 = 0;
     let mut last_verify_tick: u64 = 0;
 
-    #[cfg(target_arch = "aarch64")]
-    let mut aarch64_dbg_done = false;
-
     loop {
         let ticks = Timer::get_ticks();
-
-        // AArch64 debug: after a few WFI cycles, report ISR counters
-        #[cfg(target_arch = "aarch64")]
-        if !aarch64_dbg_done {
-            let isr_count = arcos_core::arch::aarch64::TIMER_ISR_COUNT
-                .load(core::sync::atomic::Ordering::Relaxed);
-            if isr_count > 0 {
-                let sched_ok = arcos_core::arch::aarch64::TIMER_SCHED_OK
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                let ctx_sw = arcos_core::arch::aarch64::TIMER_CTX_SWITCH
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                println!(
-                    "  [DBG] ISR fired {} times, sched_lock_ok={}, ctx_switches={}, ticks={}",
-                    isr_count, sched_ok, ctx_sw, ticks
-                );
-                aarch64_dbg_done = true;
-            }
-        }
 
         // Periodic status reporting (every ~10 seconds)
         if ticks >= last_status_tick + 1000 {

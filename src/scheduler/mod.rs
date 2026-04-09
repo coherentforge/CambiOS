@@ -47,8 +47,6 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
 
     // Tick scheduler and potentially switch tasks
     if let Some(mut sched_guard) = crate::local_scheduler().try_lock() {
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::TIMER_SCHED_OK.store(1, core::sync::atomic::Ordering::Relaxed);
         if let Some(sched) = sched_guard.as_mut() {
             // Wake any tasks blocked on the timer IRQ (IoWait(0))
             sched.wake_irq_waiters(0);

@@ -1,11 +1,26 @@
 # ArcOS Microkernel — Claude Code Context
 
+## Formal Verification (Non-Negotiable Constraint)
+The microkernel must be written for future formal verification. Every design decision in kernel code should keep this achievable. Concretely:
+
+- **Pure logic separated from effects.** Algorithms that can be expressed as pure functions (e.g. BuddyAllocator) must be. Pure code is verifiable independently of hardware state.
+- **Explicit state machines.** All state is represented as enums with exhaustive match. No boolean flags standing in for state, no implicit state encoded in combinations of fields.
+- **Result/Option everywhere in kernel paths.** No panics, no unwrap(), no expect() in non-test kernel code. Every failure is a typed error that propagates explicitly.
+- **Bounded iteration.** No unbounded loops in kernel paths. Loop bounds must be statically knowable or asserted. Verifiers cannot reason about unbounded loops.
+unsafe minimized and isolated. Each unsafe block must be the smallest possible scope. Unsafe must be wrapped behind a safe abstraction boundary that can be audited and eventually replaced with a verified implementation.
+- **No trait objects in kernel hot paths.** Monomorphized generics are statically analyzable; dynamic dispatch is not.
+- **Invariants encoded in types, not comments.** If a value must be page-aligned, represent it as a newtype. If a region must be non-empty, make the empty case unrepresentable.
+- **Separation of specification from implementation.** When implementing a component, identify the properties it must satisfy (preconditions, postconditions, invariants) and make them explicit — as type constraints where possible, as documented contracts otherwise. These become the verification targets.
+
+The BuddyAllocator (pure bookkeeping, no hardware access, fully testable on host) is the template for how kernel logic should be structured. New kernel components will follow this pattern.
+
+
 ## Project Vision
 
 ArcOS is a next-gen AI-integrated operating system built on these principles:
 
 - **Security First:** Zero-trust architecture with real-time AI monitoring. No backdoors, no telemetry/telematics. Every process is verified at runtime.
-- **Microkernel Isolation:** Device drivers, networking, and file systems run in isolated user-space environments — minimal kernel attack surface.
+- **Microkernel Isolation:** Device drivers, networking, and file systems run in isolated user-space environments — aligned for future formal verification.
 - **AI-Powered Security:** Just-in-time code analysis pre-execution, behavioral anomaly detection, automatic quarantining of threats.
 - **Cryptographic Identity:** Identity-based access replaces passwords. Decentralized identity and networking — no reliance on legacy IP/DNS.
 - **AI Compatibility Layer:** AI-driven adaptation for running legacy Windows apps and cross-platform hardware support.
@@ -28,6 +43,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **NEVER** suggest running kernel binaries directly on the host. Always use QEMU.
 - **AArch64 QEMU MUST use** `-machine virt,gic-version=3` (GICv3 required for ICC system registers).
 - **ALWAYS*** all new files are tagged for copyright: // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+- **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
 
 ## Quick Reference
 

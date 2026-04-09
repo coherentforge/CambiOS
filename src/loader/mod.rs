@@ -490,8 +490,15 @@ pub fn load_elf_process(
     }
     let kstack_top = kstack_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Set up SavedContext at the top of the kernel stack for iretq → ring 3
-    let saved_ctx_addr = kstack_top - size_of::<crate::arch::SavedContext>() as u64;
+    // Set up SavedContext at the top of the kernel stack.
+    // On AArch64, the timer ISR stub uses a 288-byte frame (272-byte SavedContext
+    // rounded up to 16-byte alignment). The saved_rsp must match so that
+    // `add sp, sp, #288` on restore gives the exact kernel stack top.
+    #[cfg(target_arch = "aarch64")]
+    const ISR_FRAME_SIZE: u64 = 288;
+    #[cfg(target_arch = "x86_64")]
+    const ISR_FRAME_SIZE: u64 = size_of::<crate::arch::SavedContext>() as u64;
+    let saved_ctx_addr = kstack_top - ISR_FRAME_SIZE;
     let saved_ctx = saved_ctx_addr as *mut crate::arch::SavedContext;
 
     // SAFETY: saved_ctx points within the freshly allocated kernel stack.
