@@ -169,6 +169,9 @@ unsafe extern "C" fn kmain() -> ! {
     // AArch64: Diagnose and map MMIO devices before any I/O.
     // Limine's HHDM only covers RAM, not device MMIO.
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: Called at early boot (single-threaded, interrupts disabled).
+    // System register access (TCR_EL1, TTBR1_EL1) is valid at EL1.
+    // early_map_mmio() maps device MMIO into the HHDM page tables.
     unsafe {
         // Read TCR_EL1 to determine actual VA width
         let tcr: u64;
@@ -216,6 +219,8 @@ unsafe extern "C" fn kmain() -> ! {
 
     // Early diagnostic on AArch64: write to PL011 via HHDM to confirm entry
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: PL011 UART0 was mapped into HHDM by early_map_mmio above.
+    // write_volatile targets the UART data register (single-threaded boot).
     unsafe {
         let hhdm = arcos_core::hhdm_offset();
         let uart = (0x0900_0000u64 + hhdm) as *mut u8;
@@ -863,7 +868,13 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
 /// Initialize IPC subsystem
 fn ipc_init() {
-    let mut ipc = IpcManager::new_boxed();
+    let mut ipc = match IpcManager::new_boxed() {
+        Some(ipc) => ipc,
+        None => {
+            println!("✗ Failed to allocate IpcManager — halting");
+            arcos_core::halt();
+        }
+    };
 
     // Install zero-trust IPC interceptor on legacy IPC_MANAGER
     use arcos_core::ipc::interceptor::DefaultInterceptor;
@@ -884,7 +895,13 @@ fn ipc_init() {
 /// register_process_capabilities after their process table entries exist.
 fn capability_manager_init() {
     let mut guard = CAPABILITY_MANAGER.lock();
-    let cap_mgr = guard.insert(CapabilityManager::new_boxed());
+    let cap_mgr = match CapabilityManager::new_boxed() {
+        Some(cm) => guard.insert(cm),
+        None => {
+            println!("✗ Failed to allocate CapabilityManager — halting");
+            arcos_core::halt();
+        }
+    };
 
     // Only register processes that already exist in the process table (0-2).
     // Processes 3+ are registered on-demand when user tasks are created.
@@ -971,7 +988,13 @@ fn bootstrap_identity_init() {
 fn object_store_init() {
     use arcos_core::fs::ram::RamObjectStore;
 
-    let store = RamObjectStore::new_boxed();
+    let store = match RamObjectStore::new_boxed() {
+        Some(s) => s,
+        None => {
+            println!("✗ Failed to allocate RamObjectStore — halting");
+            arcos_core::halt();
+        }
+    };
     *OBJECT_STORE.lock() = Some(store);
 
     println!("✓ Object store initialized (RAM, capacity: {} objects)", arcos_core::fs::ram::MAX_OBJECTS);
@@ -979,7 +1002,13 @@ fn object_store_init() {
 
 /// Initialize process table
 fn process_table_init() {
-    let mut pt = ProcessTable::new_boxed(arcos_core::hhdm_offset());
+    let mut pt = match ProcessTable::new_boxed(arcos_core::hhdm_offset()) {
+        Some(pt) => pt,
+        None => {
+            println!("✗ Failed to allocate ProcessTable — halting");
+            arcos_core::halt();
+        }
+    };
     
     // Create process descriptors for the first 3 processes (matching task count)
     for i in 0..3 {
@@ -1565,6 +1594,8 @@ fn microkernel_loop() -> ! {
     {
         // Drain any pending GIC interrupts from boot that were never acknowledged.
         // Without this, the GIC won't deliver new interrupts.
+        // SAFETY: GIC is initialized. acknowledge_irq/write_eoi are ICC sysreg
+        // operations valid at EL1. Loop terminates when INTID >= 1020 (spurious).
         unsafe {
             loop {
                 let intid = arcos_core::arch::aarch64::gic::acknowledge_irq();
@@ -1573,10 +1604,13 @@ fn microkernel_loop() -> ! {
             }
         }
         // Rearm the timer so the first tick fires cleanly.
+        // SAFETY: Timer is initialized; writing CNTP_TVAL_EL0 is valid at EL1.
         unsafe { arcos_core::arch::aarch64::timer::rearm(); }
         // Set SP_EL1 = current kernel stack so the first timer ISR has a
         // valid stack. Exception entry forces SPSel=1 → SP = SP_EL1.
         // Uses SPSel toggle because QEMU traps `msr sp_el1`.
+        // SAFETY: SPSel toggle is valid at EL1. The current SP (boot stack)
+        // is valid kernel memory. No interrupts are active yet.
         unsafe {
             core::arch::asm!(
                 "mov {tmp}, sp",         // tmp = current SP (SP_EL0 = boot stack)

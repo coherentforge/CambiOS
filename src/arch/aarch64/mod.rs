@@ -682,11 +682,25 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
         _ => "other fault",
     };
 
+    // For EC=0 faults, capture CPACR and faulting instruction before terminating
+    let cpacr_fpen = if ec == 0 {
+        let cpacr: u64;
+        unsafe { core::arch::asm!("mrs {0}, cpacr_el1", out(reg) cpacr, options(nostack, nomem)); }
+        Some(((cpacr >> 20) & 0x3) as u8)
+    } else { None };
+
     if let Some(task_id) = crate::terminate_current_task() {
-        crate::println!(
-            "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, EC={:#x}, ESR={:#x})",
-            task_id.0, ec_name, fault_type, access, far, elr, ec, esr
-        );
+        if let Some(fpen) = cpacr_fpen {
+            crate::println!(
+                "  [Fault] Task {} EC=0x0 at PC={:#x} CPACR.FPEN={}",
+                task_id.0, elr, fpen
+            );
+        } else {
+            crate::println!(
+                "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, EC={:#x})",
+                task_id.0, ec_name, fault_type, access, far, elr, ec
+            );
+        }
     } else {
         crate::println!(
             "  [Fault] {} at {:#x} (PC={:#x}) but no current task",
@@ -725,6 +739,85 @@ extern "C" fn fault_el1_inner(esr: u64, far: u64, elr: u64) {
     crate::halt();
 }
 
+// ============================================================================
+// SavedContext field indices (for pointer-offset access)
+// ============================================================================
+
+/// Index of ELR_EL1 in SavedContext (gpr[0..31] then elr_el1 at index 31).
+const SAVED_CTX_ELR_INDEX: usize = 31;
+/// Index of SPSR_EL1 in SavedContext (index 32).
+const SAVED_CTX_SPSR_INDEX: usize = 32;
+/// Index of SP_EL0 in SavedContext (index 33).
+const SAVED_CTX_SP_EL0_INDEX: usize = 33;
+
+/// PL011 UART physical base address (QEMU virt machine).
+const PL011_PHYS: u64 = 0x0900_0000;
+
+/// Debug diagnostic: log the first few context switches via raw PL011 UART.
+///
+/// Only compiled in debug builds. Reads ELR and SP_EL0 from the new task's
+/// SavedContext and prints them as hex. Bypasses the serial lock because
+/// this runs inside the timer ISR with interrupts masked.
+#[cfg(debug_assertions)]
+fn debug_log_context_switch(current_sp: u64, new_sp: u64) {
+    /// Maximum number of context switches to log before going silent.
+    const MAX_DEBUG_SWITCHES: u32 = 5;
+
+    if new_sp == current_sp {
+        return;
+    }
+
+    static DBG_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = DBG_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n >= MAX_DEBUG_SWITCHES {
+        return;
+    }
+
+    let ctx = new_sp as *const u64;
+    // SAFETY: new_sp points to a valid SavedContext on a kernel stack.
+    // The SavedContext has 34 u64 fields (gpr[31], elr, spsr, sp_el0),
+    // so indices 31..33 are within bounds.
+    let elr = unsafe { *ctx.add(SAVED_CTX_ELR_INDEX) };
+    let sp_el0 = unsafe { *ctx.add(SAVED_CTX_SP_EL0_INDEX) };
+
+    let hhdm = crate::hhdm_offset();
+    // SAFETY: PL011 UART is mapped into the HHDM at early boot via
+    // early_map_mmio(). write_volatile is used because the UART data
+    // register is a memory-mapped I/O port.
+    let uart = (PL011_PHYS + hhdm) as *mut u32;
+
+    /// Write a byte string to PL011 UART.
+    ///
+    /// # Safety
+    /// `uart` must point to a valid, mapped PL011 data register.
+    unsafe fn uart_write_bytes(uart: *mut u32, bytes: &[u8]) {
+        for &b in bytes {
+            core::ptr::write_volatile(uart, b as u32);
+        }
+    }
+
+    /// Write a u64 value as 16-digit lowercase hex to PL011 UART.
+    ///
+    /// # Safety
+    /// `uart` must point to a valid, mapped PL011 data register.
+    unsafe fn uart_write_hex64(uart: *mut u32, val: u64) {
+        for i in (0..16).rev() {
+            let nibble = ((val >> (i * 4)) & 0xF) as u8;
+            let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+            core::ptr::write_volatile(uart, ch as u32);
+        }
+    }
+
+    // SAFETY: UART is mapped (see above). Called from ISR with interrupts masked.
+    unsafe {
+        uart_write_bytes(uart, b"\n[SW] ");
+        uart_write_hex64(uart, sp_el0);
+        uart_write_bytes(uart, b" elr=");
+        uart_write_hex64(uart, elr);
+        uart_write_bytes(uart, b"\n");
+    }
+}
+
 /// Rust handler called from the timer ISR stub.
 ///
 /// Receives the current task's saved SP (pointing to SavedContext on stack).
@@ -737,43 +830,9 @@ extern "C" fn fault_el1_inner(esr: u64, far: u64, elr: u64) {
 extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
     let (new_sp, hint) = crate::scheduler::on_timer_isr(current_sp);
 
-    // DEBUG: check sp_el0 in new SavedContext on first few switches
-    if new_sp != current_sp {
-        static DBG_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        let n = DBG_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 5 {
-            // Read sp_el0, elr, spsr from the new SavedContext
-            let ctx = new_sp as *const u64;
-            // SAFETY: new_sp points to a valid SavedContext on a kernel stack
-            let elr = unsafe { *ctx.add(31) };     // offset 248
-            let spsr = unsafe { *ctx.add(32) };    // offset 256
-            let sp_el0 = unsafe { *ctx.add(33) };  // offset 264
-            // Direct PL011 write (bypass SERIAL1 lock)
-            let hhdm = crate::hhdm_offset();
-            let uart = (0x0900_0000u64 + hhdm) as *mut u32;
-            // Print a mini diagnostic via raw UART writes
-            for &b in b"\n[SW] " {
-                unsafe { core::ptr::write_volatile(uart, b as u32); }
-            }
-            // Print sp_el0 in hex (simplified)
-            let val = sp_el0;
-            for i in (0..16).rev() {
-                let nibble = ((val >> (i * 4)) & 0xF) as u8;
-                let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-                unsafe { core::ptr::write_volatile(uart, ch as u32); }
-            }
-            for &b in b" elr=" {
-                unsafe { core::ptr::write_volatile(uart, b as u32); }
-            }
-            let val = elr;
-            for i in (0..16).rev() {
-                let nibble = ((val >> (i * 4)) & 0xF) as u8;
-                let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-                unsafe { core::ptr::write_volatile(uart, ch as u32); }
-            }
-            unsafe { core::ptr::write_volatile(uart, b'\n' as u32); }
-        }
-    }
+    // Debug diagnostic: log first few context switches (debug builds only).
+    #[cfg(debug_assertions)]
+    debug_log_context_switch(current_sp, new_sp);
 
     // AArch64-specific post-switch: update kernel stack and TTBR0 (page table)
     if let Some(ref hint) = hint {
@@ -783,8 +842,10 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
+            // SAFETY: Reading TTBR0_EL1 is always safe at EL1.
+            // Writing TTBR0_EL1 switches the user address space; the
+            // hint.page_table_root was validated by the scheduler.
             unsafe {
-                // SAFETY: Reading TTBR0_EL1 is always safe at EL1.
                 let current_ttbr0: u64;
                 core::arch::asm!(
                     "mrs {0}, ttbr0_el1",
@@ -792,12 +853,17 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
                     options(nostack, nomem),
                 );
                 if current_ttbr0 != hint.page_table_root {
-                    // SAFETY: hint.page_table_root is the physical address of a
-                    // valid user page table. Writing TTBR0_EL1 switches the user
-                    // address space. A DSB + ISB ensures the TLB sees the new table.
+                    // SAFETY: hint.page_table_root is a valid user page table
+                    // physical address. After writing TTBR0_EL1, we must
+                    // invalidate TLB entries to flush stale translations from
+                    // the previous address space. Without this, the CPU may
+                    // use cached translations and fault on valid pages.
                     core::arch::asm!(
                         "msr ttbr0_el1, {0}",
                         "isb",
+                        "tlbi vmalle1",     // Invalidate all EL0/EL1 TLB entries
+                        "dsb ish",          // Ensure TLB invalidation completes
+                        "isb",              // Synchronize context
                         in(reg) hint.page_table_root,
                         options(nostack),
                     );
@@ -921,6 +987,10 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
 /// `kernel_stack_top` must be a valid, mapped kernel stack address (HHDM).
 /// The scheduler lock must NOT be held.
 pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
+    // SAFETY: Caller guarantees kernel_stack_top is valid HHDM-mapped memory.
+    // Switching SP and unmasking IRQs is safe because the timer ISR will
+    // eventually preempt us, and the kernel stack is in the HHDM (identity-
+    // mapped across all page tables).
     unsafe {
         core::arch::asm!(
             "mov sp, {kstack}",

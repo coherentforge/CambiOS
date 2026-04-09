@@ -26,6 +26,10 @@ pub struct SyscallContext {
 // User-space buffer helpers
 // ============================================================================
 
+/// Maximum IRQ vector number for SYS_WAIT_IRQ (x86 IDT has 256 entries,
+/// vectors 224-255 are reserved for APIC/IPI).
+const MAX_DEVICE_IRQ: u32 = 224;
+
 /// Maximum user buffer size for a single syscall (4 KB)
 const MAX_USER_BUFFER: usize = 4096;
 
@@ -575,7 +579,7 @@ impl SyscallDispatcher {
     fn handle_wait_irq(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let irq_num = args.arg1_u32();
 
-        if irq_num >= 224 {
+        if irq_num >= MAX_DEVICE_IRQ {
             return Err(SyscallError::InvalidArg);
         }
 
@@ -596,6 +600,8 @@ impl SyscallDispatcher {
                 // Re-route device IRQ to this CPU via I/O APIC (x86_64) or GIC SPI (AArch64)
                 #[cfg(target_arch = "x86_64")]
                 {
+                    // SAFETY: GS base is valid after percpu_init; reading APIC ID is a
+                    // pure read from the per-CPU data structure.
                     let local_apic_id = unsafe {
                         crate::arch::x86_64::percpu::current_percpu().apic_id() as u8
                     };
@@ -1622,6 +1628,8 @@ impl SyscallDispatcher {
         }
 
         // Register task in CPU map
+        // SAFETY: GS/TPIDR_EL1 base is valid after percpu_init; reading
+        // cpu_id is a pure read from the per-CPU data structure.
         let cpu_id = {
             #[cfg(target_arch = "x86_64")]
             { unsafe { crate::arch::x86_64::percpu::current_percpu().cpu_id() } }

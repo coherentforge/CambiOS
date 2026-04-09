@@ -387,6 +387,9 @@ pub fn load_elf_process(
             // Check if this page was already mapped by a prior segment (e.g.,
             // .text and .rodata sharing the same 4 KiB page). If so, reuse
             // the existing frame instead of allocating and re-mapping.
+            // SAFETY: cr3 is a valid PML4/L0 physical address allocated by
+            // create_process. page_table_from_cr3 creates a temporary reference
+            // via the HHDM. translate performs a read-only walk.
             let frame_phys = unsafe {
                 let pt = paging::page_table_from_cr3(cr3);
                 paging::translate(&pt, page_vaddr)
@@ -701,6 +704,9 @@ mod tests {
             e_shstrndx: 0,
         };
 
+        // SAFETY: Elf64Header and Elf64ProgramHeader are #[repr(C)] structs.
+        // Reinterpreting them as byte slices is safe for memcpy into the
+        // test binary buffer. The slices don't outlive the struct references.
         // Write header
         let header_bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(
