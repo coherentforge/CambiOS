@@ -28,6 +28,8 @@ KS_SERVICE_DIR := user/key-store-service
 KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-key-store-service
 NET_DRIVER_DIR := user/virtio-net
 NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-net
+I219_DRIVER_DIR := user/i219-net
+I219_DRIVER_ELF := $(I219_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-i219-net
 UDP_STACK_DIR := user/udp-stack
 UDP_STACK_ELF := $(UDP_STACK_DIR)/target/x86_64-unknown-none/release/arcos-udp-stack
 SHELL_DIR := user/shell
@@ -40,6 +42,7 @@ USER_LD_AARCH64  := user/user-aarch64.ld
 FS_SERVICE_ELF_AARCH64 := $(FS_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-fs-service
 KS_SERVICE_ELF_AARCH64 := $(KS_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-key-store-service
 NET_DRIVER_ELF_AARCH64 := $(NET_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-virtio-net
+I219_DRIVER_ELF_AARCH64 := $(I219_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-i219-net
 UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/arcos-udp-stack
 SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/arcos-shell
 
@@ -60,7 +63,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean img-x86 run-img-x86 img-usb run-img-usb usb verify-usb kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net udp-stack shell user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean img-x86 run-img-x86 img-usb run-img-usb usb verify-usb kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net i219-net udp-stack shell user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -93,6 +96,13 @@ virtio-net:
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Virtio-Net driver ready ==="
+
+i219-net:
+	@echo "=== Building Intel I219-LM driver ==="
+	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== I219-LM driver ready ==="
 
 udp-stack:
 	@echo "=== Building UDP stack ==="
@@ -136,6 +146,13 @@ virtio-net-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== Virtio-Net driver (AArch64) ready ==="
 
+i219-net-aarch64:
+	@echo "=== Building Intel I219-LM driver (AArch64) ==="
+	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== I219-LM driver (AArch64) ready ==="
+
 udp-stack-aarch64:
 	@echo "=== Building UDP stack (AArch64) ==="
 	cd $(UDP_STACK_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -162,7 +179,7 @@ sign-tool:
 export-pubkey: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) --export-pubkey bootstrap_pubkey.bin
 
-iso: kernel user-elf fs-service key-store-service virtio-net udp-stack shell
+iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -175,6 +192,7 @@ iso: kernel user-elf fs-service key-store-service virtio-net udp-stack shell
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
 	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
+	cp $(I219_DRIVER_ELF) iso_root/boot/i219-net.elf
 	cp $(UDP_STACK_ELF) iso_root/boot/udp-stack.elf
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
 	# Sign all modules (single invocation avoids repeated card contention)
@@ -182,6 +200,7 @@ iso: kernel user-elf fs-service key-store-service virtio-net udp-stack shell
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/i219-net.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/udp-stack.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
 	# Copy Limine config (root + standard location)
@@ -228,7 +247,7 @@ run-uefi: iso
 # Usage: make img-x86 && sudo dd if=arcos-x86.img of=/dev/diskN bs=1M
 IMG_X86 := arcos-x86.img
 
-img-x86: kernel user-elf fs-service key-store-service virtio-net udp-stack shell sign-tool
+img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell sign-tool
 	@echo "=== Building x86_64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_X86)
 	dd if=/dev/zero of=$(IMG_X86) bs=1M count=64
@@ -244,21 +263,24 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net udp-stack shell
 	cp $(KS_SERVICE_ELF) /tmp/key-store-service-signed.elf
 	cp $(FS_SERVICE_ELF) /tmp/fs-service-signed.elf
 	cp $(NET_DRIVER_ELF) /tmp/virtio-net-signed.elf
+	cp $(I219_DRIVER_ELF) /tmp/i219-net-signed.elf
 	cp $(UDP_STACK_ELF) /tmp/udp-stack-signed.elf
 	cp $(SHELL_ELF) /tmp/shell-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/i219-net-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
 	mcopy -i $(IMG_X86) /tmp/hello-signed.elf ::/boot/hello.elf
 	mcopy -i $(IMG_X86) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_X86) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
 	mcopy -i $(IMG_X86) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
+	mcopy -i $(IMG_X86) /tmp/i219-net-signed.elf ::/boot/i219-net.elf
 	mcopy -i $(IMG_X86) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
 	mcopy -i $(IMG_X86) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf
+	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf
 	mcopy -i $(IMG_X86) limine.conf ::/limine.conf
 	mcopy -i $(IMG_X86) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_X86) ready ==="
@@ -413,7 +435,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool
+img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -429,21 +451,24 @@ img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-servic
 	cp $(KS_SERVICE_ELF_AARCH64) /tmp/key-store-service-signed.elf
 	cp $(FS_SERVICE_ELF_AARCH64) /tmp/fs-service-signed.elf
 	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
+	cp $(I219_DRIVER_ELF_AARCH64) /tmp/i219-net-signed.elf
 	cp $(UDP_STACK_ELF_AARCH64) /tmp/udp-stack-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/i219-net-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/hello-signed.elf ::/boot/hello.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
+	mcopy -i $(IMG_AARCH64) /tmp/i219-net-signed.elf ::/boot/i219-net.elf
 	mcopy -i $(IMG_AARCH64) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf
+	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
