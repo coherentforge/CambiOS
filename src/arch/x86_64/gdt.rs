@@ -34,7 +34,9 @@ pub const USER_CS: u16 = 0x23; // 0x20 | 3
 /// TSS selector (GDT index 5, occupies slots 5-6)
 pub const TSS_SELECTOR: u16 = 0x28;
 
-/// Number of GDT entries (5 normal + 2 for TSS = 7 u64 slots)
+/// HARDWARE: 7 GDT entries (null + kernel CS + kernel SS + user SS + user CS +
+/// TSS low + TSS high). SYSRET requires user data before user code; this exact
+/// layout is fixed by the SYSCALL/SYSRET MSR ABI.
 const GDT_ENTRIES: usize = 7;
 
 use super::percpu::MAX_CPUS;

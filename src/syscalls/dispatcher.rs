@@ -26,11 +26,17 @@ pub struct SyscallContext {
 // User-space buffer helpers
 // ============================================================================
 
-/// Maximum IRQ vector number for SYS_WAIT_IRQ (x86 IDT has 256 entries,
-/// vectors 224-255 are reserved for APIC/IPI).
+/// HARDWARE: x86 IDT has 256 entries; vectors 0-31 are CPU exceptions, 32-223 are
+/// device IRQs, 224-255 are reserved for APIC/IPI. SYS_WAIT_IRQ accepts < 224.
 const MAX_DEVICE_IRQ: u32 = 224;
 
-/// Maximum user buffer size for a single syscall (4 KB)
+/// SCAFFOLDING: maximum user buffer size for a single syscall (4 KiB).
+/// Why: bounds copy_from_user / copy_to_user; safety net against accidentally
+///      mapping huge ranges through the page-table-walk helpers.
+/// Replace when: a user-space service needs to read or write > 4 KiB in one
+///      syscall and gets a confusing failure at exactly the boundary. Channels
+///      (ADR-005) are the long-term answer for bulk data; until then this needs
+///      to grow on demand. See ASSUMPTIONS.md.
 const MAX_USER_BUFFER: usize = 4096;
 
 /// Canonical user-space address ceiling.

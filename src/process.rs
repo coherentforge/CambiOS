@@ -17,7 +17,12 @@ use alloc::boxed::Box;
 // Virtual Memory Area (VMA) tracking
 // ============================================================================
 
-/// Maximum number of tracked allocations per process
+/// SCAFFOLDING: maximum number of tracked memory regions per process.
+/// Why: bounded slot table for the bump-allocated VMA tracker, sized for current
+///      services which use only a handful of regions.
+/// Replace when: channels (ADR-005) attach shared-memory mappings as VMAs — the
+///      first service that holds 5+ channels is on the edge. Also pressure from
+///      any future mmap-style API. See ASSUMPTIONS.md.
 const MAX_VMAS: usize = 64;
 
 /// Base virtual address for dynamic user-space allocations.
@@ -126,9 +131,13 @@ impl VmaTracker {
     }
 }
 
-/// Maximum number of concurrent processes
-/// Note: Each ProcessDescriptor contains a ~20KB allocator (bitmap + order map).
-/// Kept small (32) to limit total footprint.
+/// SCAFFOLDING: maximum number of concurrent processes in the entire system.
+/// Why: each ProcessDescriptor contains a ~20 KB allocator (bitmap + order map),
+///      and the verification model wants a small bounded process set.
+/// Replace when: a real shell session + a couple of pipes brushes 32 (i.e. as soon
+///      as the v1 shell + spawn lands and a user runs anything non-trivial). Likely
+///      target 256+. Note: `MAX_ENDPOINTS` is paired with this and grows with it.
+///      See ASSUMPTIONS.md.
 pub const MAX_PROCESSES: usize = 32;
 
 /// Base physical address for process heaps.
@@ -143,7 +152,14 @@ pub const PROCESS_HEAP_BASE: u64 = 0x800000;
 pub const PROCESS_HEAP_BASE: u64 = 0x4080_0000;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const PROCESS_HEAP_BASE: u64 = 0x800000;
-pub const HEAP_SIZE: u64 = 0x100000; // 1MB per process
+/// SCAFFOLDING: per-process heap size (1 MiB).
+/// Why: fixed budget hardcoded into the per-PID address arithmetic
+///      (`PROCESS_HEAP_BASE + pid * HEAP_SIZE`). Conservative default that lets
+///      every PID get its heap at a deterministic offset.
+/// Replace when: udp-stack is already feeling this. The growth path is non-trivial
+///      because the value is baked into the address layout — needs a layout change,
+///      not a constant bump. See ASSUMPTIONS.md.
+pub const HEAP_SIZE: u64 = 0x100000;
 
 /// Process descriptor with heap allocator and VMA tracking.
 ///

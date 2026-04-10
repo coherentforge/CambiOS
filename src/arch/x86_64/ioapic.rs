@@ -51,7 +51,7 @@ const fn redir_high(pin: u32) -> u32 {
 /// First vector used for device interrupts (timer = 32, devices start at 33)
 pub const DEVICE_VECTOR_BASE: u8 = 33;
 
-/// Maximum GSI pins we support routing for
+/// HARDWARE: Intel I/O APIC has 24 redirection entries (GSI pins).
 pub const MAX_GSI_PINS: usize = 24;
 
 // Redirection entry bit fields (low DWORD)

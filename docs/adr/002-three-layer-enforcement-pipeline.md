@@ -1,9 +1,12 @@
 # ADR-002: Three-Layer Enforcement Pipeline for IPC and Syscalls
 
-- **Status:** Implemented
+- **Status:** Accepted
 - **Date:** 2026-04-04
 - **Depends on:** ADR-000 (Zero-Trust Architecture and Capability-Based Access Control)
+- **Superseded by parts of:** ADR-006 (Policy Service) reframes the Layer 1 hook as a thin client of an externalized policy service rather than as in-kernel policy code. The pipeline shape is unchanged.
 - **Context:** Wiring the zero-trust security model into the syscall and IPC hot paths
+
+> *For implementation status of each layer (enforced, scaffolding, designed) see [SECURITY.md § Enforcement Status Summary](../../SECURITY.md). This ADR captures the decision; status lives with the code.*
 
 ## Problem
 
@@ -54,9 +57,7 @@ Each layer is independently useful. Each layer returns a pass/fail decision. A f
 
 **Why it's first:** Rejecting an unauthorized syscall before any work happens is the cheapest possible enforcement. If a serial driver has no business calling `SYS_ALLOCATE`, we want to catch that before touching the capability manager or IPC state.
 
-**Implementation:** `IpcInterceptor::on_syscall(process_id, syscall_number)` is called at the top of `SyscallDispatcher::dispatch()`, before routing to any handler.
-
-**Current status:** The hook is wired. The default policy is permissive (allows all syscalls). Per-process syscall allowlists are the intended extension point.
+**Implementation:** `IpcInterceptor::on_syscall(process_id, syscall_number)` is called at the top of `SyscallDispatcher::dispatch()`, before routing to any handler. The hook itself is in-kernel; the *decision* it forwards is externalized to the policy service ([ADR-006](006-policy-service.md)).
 
 ### Layer 2: Capability Verification
 
@@ -64,9 +65,7 @@ Each layer is independently useful. Each layer returns a pass/fail decision. A f
 
 **Why it's in the middle:** This is the core access control. It runs after the pre-dispatch filter (which catches obviously wrong syscalls) but before the message is processed (so no state is modified for unauthorized operations).
 
-**Implementation:** `CapabilityManager::verify_access(process_id, endpoint, required_rights)` is called inside `send_message_with_capability()` and `recv_message_with_capability()`.
-
-**Current status:** Fully enforced. Returns `PermissionDenied` if the process lacks the required rights.
+**Implementation:** `CapabilityManager::verify_access(process_id, endpoint, required_rights)` is called inside `send_message_with_capability()` and `recv_message_with_capability()`. Returns `PermissionDenied` if the process lacks the required rights.
 
 ### Layer 3: Interceptor Post-Capability
 
@@ -74,9 +73,7 @@ Each layer is independently useful. Each layer returns a pass/fail decision. A f
 
 **Why it's last:** Capability verification confirms authority. Structural validation confirms sanity. These are orthogonal concerns. A process might legitimately hold send rights on an endpoint but construct a malformed message (oversized payload, out-of-bounds endpoint ID). Layer 3 catches what Layer 2 doesn't look for.
 
-**Implementation:** `IpcInterceptor::on_send(sender, endpoint, message)` and `IpcInterceptor::on_recv(receiver, endpoint)` are called after capability verification, before the IPC operation executes.
-
-**Current status:** Fully enforced. Default checks: endpoint bounds, payload size (256 bytes), no self-send, no self-delegation.
+**Implementation:** `IpcInterceptor::on_send(sender, endpoint, message)` and `IpcInterceptor::on_recv(receiver, endpoint)` are called after capability verification, before the IPC operation executes. Default checks: endpoint bounds, payload size (256 bytes — see [ADR-005](005-ipc-primitives-control-and-bulk.md) for why bulk data takes a separate path), no self-send, no self-delegation.
 
 ## The Interceptor Trait
 
@@ -138,15 +135,14 @@ If capability tables grow beyond 32 entries in the future, `verify_access` shoul
 
 ## Verification
 
-- 56 unit tests for capability manager (grant, verify, delegate, escalation prevention)
-- 11 unit tests for interceptor (all four hooks, each check path)
-- 10 unit tests for ELF verifier
-- End-to-end verification via `SYS_WRITE` and `SYS_READ` syscall paths in QEMU
+Test coverage of each layer (current counts and what they exercise) lives in [STATUS.md § Test coverage](../../STATUS.md#test-coverage). End-to-end verification runs through `SYS_WRITE` and `SYS_READ` syscall paths in QEMU.
 
 ## References
 
-- ADR-000: Zero-Trust Architecture and Capability-Based Access Control
-- SECURITY.md: Living enforcement status reference
+- [ADR-000](000-zta-and-cap.md): Zero-Trust Architecture and Capability-Based Access Control
+- [ADR-005](005-ipc-primitives-control-and-bulk.md): IPC Primitives — Control Path and Bulk Path
+- [ADR-006](006-policy-service.md): Policy Service — Externalized Policy Decisions
+- [SECURITY.md](../../SECURITY.md): Living enforcement status reference
 - `src/ipc/interceptor.rs`: IpcInterceptor trait + DefaultInterceptor
 - `src/ipc/capability.rs`: CapabilityManager + ProcessCapabilities
 - `src/ipc/mod.rs`: send/recv with capability + interceptor enforcement

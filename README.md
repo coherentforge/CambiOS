@@ -40,21 +40,15 @@ The long-term answer is open hardware all the way down. We're building toward th
 
 ## Current State
 
-Built by one person. In two weeks of coding:
+Built by one person, in a few months of coding. The full, current picture — what's built, what's in progress, what's planned, test counts, phase markers, known issues — lives in **[STATUS.md](STATUS.md)**.
 
-- **218/218 unit tests passing.** Clean release builds on both x86_64 and AArch64.
-- **x86_64 boots to stable preemptive SMP multitasking** in QEMU: 2 CPUs, 10 concurrent tasks, APIC timer at 100Hz, IRQ affinity, load balancing, PCI device discovery, 24 syscalls.
-- **AArch64 boots to stable preemptive SMP scheduling** in QEMU: GICv3, ARM Generic Timer at 100Hz, EL0 user tasks with per-process page tables, voluntary context switch (`yield_save_and_switch`), all boot modules building for both targets via shared `libsys` syscall wrappers.
+The headline:
 
-**The security model is real and running:**
-- Cryptographic identity backed by hardware YubiKey — no secret key in kernel memory. Open secure element long-term.
-- Boot modules signed at build time, verified before execution
-- User-space services (filesystem, key store, virtio-net, UDP stack) isolated behind capability-checked IPC, each message carrying an unforgeable sender identity
-- Content-addressed object store with Blake3 hashing, Ed25519 signatures, and ownership enforcement
+- ArcOS boots to stable preemptive SMP multitasking on **x86_64** and **AArch64** in QEMU. Both targets build clean in release.
+- The **security model is real and running**: cryptographic identity backed by a hardware YubiKey (no secret key in kernel memory), boot modules signed at build time and verified before execution, user-space services (filesystem, key store, virtio-net, UDP stack) isolated behind capability-checked IPC with every message carrying an unforgeable sender identity, content-addressed object store with Blake3 hashing and Ed25519 signatures.
+- Every `unsafe` block has a `// SAFETY:` comment. Lock ordering is documented and enforced. The code is written to be read.
 
-Every unsafe block has a // SAFETY: comment. Lock ordering is documented and enforced. The code is written to be read.
-
-The kernel is real. The security model is real. This code is not a prototype.
+The kernel is real. The security model is real. This is not a prototype.
 
 ---
 
@@ -186,14 +180,17 @@ Narrative walkthroughs that explain how ArcOS works by following real things thr
 
 ## Design Documents
 
+- [STATUS.md](STATUS.md) — Canonical "what is built" doc: subsystem status, phase markers, v1 roadmap, test counts, known issues
 - [ArcOS.md](ArcOS.md) — Source-of-truth architecture document
 - [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind ArcOS
 - [identity.md](identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
-- [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Implementation sequencing for identity + storage
+- [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Phase intent for identity + storage
+- [win-compat.md](win-compat.md) — Windows compatibility layer design (PE loader, AI-translated shims, sandboxed Principal)
 - [SECURITY.md](SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
-- [SYSCALLS.md](SYSCALLS.md) — All 24 syscalls: numbers, arguments, behavior, calling conventions
+- [SYSCALLS.md](SYSCALLS.md) — All syscalls: numbers, arguments, behavior, calling conventions
 - [INTERRUPT_ROUTING.md](INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
 - [src/scheduler/SCHEDULER.md](src/scheduler/SCHEDULER.md) — Scheduler internals
+- [CLAUDE.md](CLAUDE.md) — Kernel technical reference and required-reading map by subsystem
 
 ### Architecture Decision Records
 
@@ -202,6 +199,9 @@ Narrative walkthroughs that explain how ArcOS works by following real things thr
 - [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) — Three-layer enforcement pipeline for IPC and syscalls
 - [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) — Content-addressed storage and cryptographic identity
 - [ADR-004](docs/adr/004-cryptographic-integrity.md) — Cryptographic integrity: Blake3 hashing and Ed25519 signatures
+- [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) — IPC primitives: control path (256-byte messages) and bulk path (channels)
+- [ADR-006](docs/adr/006-policy-service.md) — Policy service: externalized policy decisions
+- [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) — Capability revocation and audit telemetry
 
 ---
 

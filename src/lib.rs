@@ -83,8 +83,11 @@ use memory::frame_allocator::FrameAllocator;
 /// RamObjectStore ~TBD) are heap-allocated via Box after the kernel heap is
 /// initialized from the Limine memory map.
 
-/// Maximum number of CPUs supported (matches xAPIC 8-bit APIC ID space).
-/// Re-exported from `arch::x86_64::percpu` for use in global arrays.
+/// SCAFFOLDING: maximum number of CPUs supported.
+/// Why: matches xAPIC 8-bit APIC ID space; statically-sized per-CPU arrays for
+///      schedulers, timers, and frame caches.
+/// Replace when: x2APIC support (32-bit IDs) lands, or a > 256-core target appears.
+///      Not a v1 concern. See ASSUMPTIONS.md.
 pub const MAX_CPUS: usize = 256;
 
 /// Per-CPU scheduler instances. Each CPU owns PER_CPU_SCHEDULER[cpu_id].
@@ -146,7 +149,11 @@ pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
 // Global task → CPU mapping (lock-free via atomics)
 // ============================================================================
 
-/// Maximum task slots (must match scheduler::MAX_TASKS).
+/// SCAFFOLDING: maximum task slots in the global TASK_CPU_MAP.
+/// Why: must equal `scheduler::MAX_TASKS` (the per-CPU bound). The TASK_CPU_MAP
+///      array is sized from this; lock-free cross-CPU wake reads it.
+/// Replace when: the per-CPU MAX_TASKS in scheduler/mod.rs grows. They are paired
+///      and must move together. See ASSUMPTIONS.md.
 pub const MAX_TASKS: usize = 256;
 
 /// Sentinel value meaning "task unassigned / no CPU".

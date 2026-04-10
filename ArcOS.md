@@ -381,14 +381,9 @@ The primary development target. ArcOS boots via the Limine protocol, runs a cust
 
 ### Current: AArch64
 
-AArch64 boots on QEMU `virt` (GICv3 required) and runs preemptive scheduling with EL0 user tasks. The full memory subsystem is operational — kernel heap, bitmap frame allocator, per-process page tables with TTBR0/TTBR1 split. GICv3 (Distributor + Redistributor + ICC system registers), ARM Generic Timer at 100Hz, PL011 UART, SVC-based syscall entry, and SMP (AP startup via Limine MP protocol) are all implemented.
+AArch64 boots on QEMU `virt` (GICv3 required) and runs preemptive scheduling with EL0 user tasks. The full memory subsystem is operational — kernel heap, bitmap frame allocator, per-process page tables with TTBR0/TTBR1 split. GICv3 (Distributor + Redistributor + ICC system registers), ARM Generic Timer at 100Hz, PL011 UART, SVC-based syscall entry, and SMP (AP startup via Limine MP protocol) are all implemented. All boot modules build for AArch64 via shared `libsys` syscall wrappers. Voluntary context switch is implemented for both architectures.
 
-What remains to reach parity with x86_64:
-
-- Device IRQ routing (GIC SPI wiring for virtio, PL011 RX)
-- User-space service port (libsys SVC syscall wrappers)
-- Voluntary context switch (currently a `wfi` stub)
-- Bare-metal testing beyond QEMU
+For the up-to-date list of remaining gaps (device IRQ routing on AArch64, SMP timer on AP, bare-metal testing) see [STATUS.md](STATUS.md).
 
 ### Future Considerations
 
@@ -411,37 +406,20 @@ Some boundaries are as important as goals. ArcOS will never:
 
 ## The Road Ahead
 
-### What Exists Today
+### What Exists Today (Summary)
 
-The microkernel is real and running on both x86_64 and AArch64. It is not a design document. It is working code — comprehensive unit tests pass on host, and integration testing runs in QEMU.
+The microkernel is real and running on both x86_64 and AArch64. It is not a design document. It is working code — comprehensive unit tests pass on host, and integration testing runs in QEMU. The headline:
 
-**Kernel fundamentals** are complete: preemptive SMP scheduling with per-CPU priority-band schedulers, load balancing and task migration, per-process page tables with W^X enforcement, capability-checked IPC with zero-trust interception, and a full syscall interface (24 syscalls covering process lifecycle, memory, IPC, identity, storage, and device access).
+- **Kernel fundamentals** are complete: preemptive SMP scheduling with per-CPU priority-band schedulers, load balancing and task migration, per-process page tables with W^X enforcement, capability-checked IPC with zero-trust interception.
+- **Identity** is hardware-backed. A YubiKey-derived Ed25519 bootstrap principal is compiled into the kernel; no secret key lives in kernel memory. Boot modules are signed at build time and verified before execution. IPC messages carry unforgeable sender principals stamped by the kernel.
+- **Storage** uses content-addressed objects — Blake3 hashes, Ed25519 signatures verified on retrieval, ownership enforced per-principal.
+- **Networking** has a working vertical slice: user-space virtio-net driver, stateless UDP/IP stack, and a working NTP demo that queries an external time server through QEMU's SLIRP network.
 
-**Identity** is hardware-backed. A YubiKey-derived Ed25519 bootstrap principal is compiled into the kernel. Boot modules are signed at build time and verified before execution. IPC messages carry unforgeable sender principals stamped by the kernel. A user-space key store service manages signing.
-
-**Storage** uses content-addressed objects — Blake3 hashes, Ed25519 signatures verified on retrieval, ownership enforced per-principal. A user-space filesystem service mediates access through IPC.
-
-**Networking** has a working vertical slice: a user-space virtio-net driver discovers PCI devices, manages TX/RX virtqueues with DMA bounce buffers, and exposes packet send/receive over IPC. A stateless UDP/IP stack sits on top — ARP, IPv4, UDP, with a working NTP demo that queries an external time server through QEMU's SLIRP network.
+For the canonical, kept-current breakdown — every subsystem, every phase, every test count, every known issue — see **[STATUS.md](STATUS.md)**. This file (ArcOS.md) is for *intent*, not *current state*.
 
 ### What Comes Next
 
-The v1 target is an interactive, network-capable, identity-rooted OS running on real hardware with persistent storage. In rough dependency order:
-
-1. **Shell** — Interactive command-line shell over serial. Process spawning, command parsing, wait-for-exit. Makes everything else demonstrable.
-
-2. **Bare-metal boot** — Bootable USB image for x86_64 UEFI (targeting a Dell Precision 3630). Limine already supports this — primarily a tooling task.
-
-3. **Real NIC driver** — User-space driver for the Intel I219-LM (e1000e family) on the bare-metal target. Same IPC interface as virtio-net so the UDP stack works unmodified on top.
-
-4. **DHCP and DNS** — User-space services over the UDP stack. Dynamic IP assignment and name resolution. Eliminates hardcoded addresses.
-
-5. **TCP stack** — Connection state machine, retransmission, sliding window. Required for TLS and any serious network interaction.
-
-6. **Persistent storage** — Virtio-blk driver (QEMU) and real disk driver (bare metal) backing the object store. Content-addressed objects survive reboot.
-
-7. **Mesh networking** — Yggdrasil-inspired peer service mapping Ed25519 principals to IPv6 overlay addresses. The beginning of identity-routed, encrypted networking without DNS or IP assignment.
-
-8. **AI integration** — The pre-execution verifier is already a trait-based gate. Next: plug in actual inference — a lightweight syscall classifier for runtime behavioral analysis, expanding to binary analysis and anomaly detection.
+The v1 target is an interactive, network-capable, identity-rooted OS running on real hardware with persistent storage. The dependency-ordered roadmap (shell → bare-metal boot → real NIC driver → DHCP/DNS → TCP → persistent storage → mesh networking → AI integration) lives in [STATUS.md § v1 Roadmap progress](STATUS.md#v1-roadmap-progress) so the order doesn't drift across documents. The architectural substrate that the post-shell items sit on — the bulk-data IPC channel primitive, externalized policy decisions, capability revocation, and audit telemetry — is described in [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-006](docs/adr/006-policy-service.md), and [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md).
 
 ### What We Don't Know Yet
 

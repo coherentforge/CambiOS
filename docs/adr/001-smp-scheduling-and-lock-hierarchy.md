@@ -370,7 +370,4 @@ The load balancer currently picks the first Ready task. For mixed-priority workl
 
 ## Verification
 
-- 134 unit tests pass (133 pass + 1 pre-existing flaky TLB ordering test)
-- Tests cover: scheduler creation, task lifecycle, block/wake, IRQ wake, priority scheduling, migration primitives (remove/accept/migrate_between), active_runnable_count, pick_migratable_task, idle task immutability
-- Debug and release builds compile with zero errors
-- QEMU verified with `-smp 1` and `-smp 2`: stable preemptive multitasking, task migration, cross-CPU wake, load balancer quiescence when balanced
+Test counts and what each scheduler test covers (creation, task lifecycle, block/wake, IRQ wake, priority scheduling, migration primitives, idle task immutability, etc.) live in [STATUS.md § Test coverage](../../STATUS.md#test-coverage). The current scheduler implementation reference is [SCHEDULER.md](../../src/scheduler/SCHEDULER.md). QEMU integration covers `-smp 1` and `-smp 2`: stable preemptive multitasking, task migration, cross-CPU wake, load balancer quiescence when balanced.

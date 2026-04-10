@@ -7,3 +7,4 @@ tools/*/target/
 *.o
 iso_root/
 .DS_Store
+*.log

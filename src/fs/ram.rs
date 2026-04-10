@@ -13,7 +13,12 @@ use alloc::alloc::{alloc, Layout};
 
 use super::{ArcObject, ObjectStore, ObjectMeta, StoreError, content_hash};
 
-/// Maximum number of objects in the RAM store.
+/// SCAFFOLDING: maximum number of objects in the RAM store.
+/// Why: Phase 0 RAM-backed store with a fixed-capacity array. Linear scan for
+///      get/delete/list is fine at this size.
+/// Replace when: persistent ObjectStore (Phase 4) lands — that backend will be
+///      dynamically sized and this constant goes away. Until then, the first
+///      time we want to store > 256 objects this is the wall. See ASSUMPTIONS.md.
 pub const MAX_OBJECTS: usize = 256;
 
 /// RAM-backed ObjectStore.

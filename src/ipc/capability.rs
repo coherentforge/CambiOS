@@ -42,10 +42,15 @@ pub struct Capability {
     pub rights: CapabilityRights,
 }
 
-/// Capability table for a single process
+/// Capability table for a single process.
 ///
-/// Each process can hold up to 32 capabilities (endpoint access rights).
-/// Designed for verification: bounded set, explicit tracking.
+/// SCAFFOLDING: 32 capabilities per process.
+/// Why: bounded set for verification; cache-line-friendly linear scan; matches
+///      `MAX_PROCESSES` and `MAX_ENDPOINTS` (a process can typically hold
+///      capabilities for ~half the system's endpoints).
+/// Replace when: Phase 3 work hits this — the policy service holds one capability
+///      per service it mediates, the audit consumer holds one per producer.
+///      32 will get tight fast. See ASSUMPTIONS.md.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessCapabilities {
     /// Process ID

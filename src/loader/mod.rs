@@ -24,16 +24,28 @@ use core::mem::size_of;
 // Constants
 // ============================================================================
 
-/// Per-task kernel stack size (8 KB) — matches main.rs
+/// SCAFFOLDING: per-task kernel stack size (8 KiB).
+/// Why: small because syscall handlers are currently shallow. Linux uses 16 KiB.
+/// Replace when: first deep call chain — recursive ELF verifier, signed-object
+///      validator with stack-allocated context, channel teardown that walks
+///      process tables. Watch for stack-overflow double-faults landing on IST1.
+///      See ASSUMPTIONS.md.
 const KERNEL_STACK_SIZE: usize = 8192;
 
-/// Default user stack: 16 pages (64 KB)
+/// SCAFFOLDING: default user stack 16 pages (64 KiB).
+/// Why: conservative default that fits all current services.
+/// Replace when: per-service decision; should become a process descriptor field
+///      rather than a constant once different services have different needs.
+///      See ASSUMPTIONS.md.
 const DEFAULT_STACK_PAGES: usize = 16;
 
 /// Default user stack top virtual address
 const DEFAULT_STACK_TOP: u64 = 0x80_0000;
 
-/// Maximum allowed total memory for a single process (256 MB)
+/// SCAFFOLDING: maximum total memory for a single process (256 MiB).
+/// Why: ELF verifier hard cap; prevents OOM via crafted binaries.
+/// Replace when: a legitimate user-space service needs > 256 MiB. Fine for now.
+///      See ASSUMPTIONS.md.
 const MAX_PROCESS_MEMORY: u64 = 256 * 1024 * 1024;
 
 /// Canonical user-space boundary (x86-64 lower half)
@@ -237,7 +249,12 @@ pub fn strip_signature_trailer(binary: &[u8]) -> Option<(&[u8], [u8; 64])> {
     Some((&binary[..sig_start], sig))
 }
 
-/// Maximum number of trusted signing keys.
+/// SCAFFOLDING: maximum number of trusted ELF signing keys.
+/// Why: bootstrap + a few rotation keys was enough for early development.
+/// Replace when: first time we have CI builder + your YubiKey + backup key +
+///      rotation key, the budget is gone with zero room for new signers. Coming
+///      up faster than other PKI items because CI signing is on the early v1 path.
+///      See ASSUMPTIONS.md.
 const MAX_TRUSTED_KEYS: usize = 4;
 
 /// Verifier that requires Ed25519 signature verification before executing.

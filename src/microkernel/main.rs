@@ -493,7 +493,11 @@ unsafe extern "C" fn kmain() -> ! {
 // Kernel heap initialization from Limine memory map
 // ============================================================================
 
-/// Kernel heap size: 4 MB (sufficient for kernel-level Box/Vec allocations)
+/// SCAFFOLDING: kernel heap size (4 MiB).
+/// Why: sufficient for current kernel-level Box/Vec allocations; conscious upper
+///      bound that makes memory accounting easy during early development.
+/// Replace when: Phase 3 channels + audit ring buffers + larger capability tables
+///      pressure this. First OOM in `Box::new()` is the signal. See ASSUMPTIONS.md.
 const KERNEL_HEAP_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Actual physical base chosen by init_kernel_heap(). Used by init_frame_allocator()

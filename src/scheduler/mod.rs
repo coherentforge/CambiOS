@@ -116,14 +116,16 @@ pub fn on_voluntary_yield(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) 
     }
 }
 
-/// Maximum number of tasks in the system.
-///
-/// Raised from 32 to 256 to support real multi-core workloads. The task array
-/// is heap-allocated (Vec), so this does not risk stack overflow. Per-priority
-/// ready queues keep scheduling O(1) despite the larger task count.
+/// SCAFFOLDING: maximum number of tasks per CPU.
+/// Why: heap-allocated per-CPU; raised from 32 to support multi-core workloads.
+///      Per-priority ready queues keep scheduling O(1) at this size.
+/// Replace when: a single CPU is regularly seeing > 100 active tasks, or AI
+///      inference services start spawning per-request worker tasks. Must stay
+///      in sync with the `MAX_TASKS` re-export in lib.rs and `TASK_CPU_MAP`'s
+///      array size. See ASSUMPTIONS.md.
 const MAX_TASKS: usize = 256;
 
-/// Number of priority bands for the ready queues.
+/// ARCHITECTURAL: priority taxonomy is 4 bands — Idle / Low / Normal / High+Critical.
 ///
 /// Band mapping: priority / 64 → band index (0..3).
 ///   Band 0: IDLE (priority 0-63)

@@ -95,9 +95,7 @@ make sign-tool
 
 ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
 
-**Current state:** 218/218 tests pass, clean release builds for both x86_64 and aarch64-unknown-none. **x86_64**: QEMU boots to stable preemptive multitasking with 2 CPUs (`-smp 2`), APIC timer at 100Hz, 6 tasks (1 idle + 5 boot modules: hello, key-store, fs-service, virtio-net, udp-stack), full SMP (phases 0-4c), IRQ affinity, load balancing, PCI device discovery (7 devices), 24 syscalls, voluntary context switch via `yield_save_and_switch`. **AArch64**: QEMU `virt` boots to stable preemptive scheduling with GICv3 + ARM Generic Timer at 100Hz, EL0 user tasks with voluntary context switch (`yield_save_and_switch` — full assembly, synthetic eret frame + scheduler integration), full memory subsystem (kernel heap, frame allocator, process heaps), platform detection via MIDR_EL1. AArch64 SMP (AP startup via Limine MP protocol) is implemented. All boot modules (hello, fs-service, key-store, virtio-net, udp-stack) build for both x86_64 and AArch64 via libsys shared syscall wrappers. **Identity (Phase 1C, hardware-backed)**: Bootstrap Principal from compiled-in YubiKey public key (`bootstrap_pubkey.bin`), no secret key in kernel memory. Boot modules signed at build time via YubiKey OpenPGP interface. Bootstrap Principal bound to kernel processes and boot modules, IPC messages carry unforgeable sender_principal stamped by kernel, BindPrincipal/GetPrincipal/ClaimBootstrapKey syscalls (11/12/18). **Key Store Service**: User-space key-store (`user/key-store-service/`) on endpoint 17. In hardware-backed mode (no kernel secret key), enters degraded mode — signing unavailable until USB HID enables runtime YubiKey communication. fs-service falls back to unsigned ObjPut. **ObjectStore (Phase 1C)**: ArcObject (content-addressed via Blake3, author/owner, Ed25519 signature verified on retrieval, ACL), RamObjectStore (256 objects). ObjPut (14) creates unsigned objects; ObjPutSigned (19) stores pre-signed objects (kernel verifies signature). fs-service requests signing from key-store before storing. RecvMsg/ObjPut/ObjGet/ObjDelete/ObjList/ClaimBootstrapKey/ObjPutSigned syscalls (13-19). **FS Service**: User-space Rust ELF (`user/fs-service/`) on endpoint 16, requests signing from key-store, enforces ownership via sender_principal. **Signed ELF Loading**: Boot modules require Ed25519 signature (ARCSIG trailer), verified by SignedBinaryVerifier before execution. **Virtio-Net Driver (Phase 2A)**: User-space MMIO driver (`user/virtio-net/`) on endpoint 20 — PCI device discovery, legacy virtio transport, TX/RX virtqueues with DMA bounce buffers, hostile-device validation via `DeviceValue<T>`. **UDP Stack (Phase 2B)**: User-space stateless UDP/IP service (`user/udp-stack/`) on endpoint 21 — ARP, IPv4 (RFC 1071 checksum), UDP, built-in NTP demo (queries time.google.com), hardcoded for QEMU SLIRP (10.0.2.15/24, gateway 10.0.2.2). **PCI Subsystem**: Bus 0 scan at boot, device table exposed via DeviceInfo syscall (22), port I/O validation via PortIo syscall (23). **Device Syscalls**: MapMmio (20), AllocDma (21), DeviceInfo (22), PortIo (23) — enable user-space drivers to access MMIO, allocate DMA buffers, discover PCI devices, and perform validated port I/O.
-
-**x86_64 features**: Custom 7-entry GDT with per-CPU TSS, SYSCALL/SYSRET fast path (kernel stack switch via PerCpu.kernel_rsp0, sti in handlers for preemptibility), voluntary context switch (`yield_save_and_switch` — synthetic iretq frame + scheduler call), APIC timer + I/O APIC device IRQ routing, SMP with per-CPU priority-band schedulers (4 bands, O(1) scheduling via VecDeque ready queues, MAX_TASKS=256), task migration, IRQ affinity, TLB shootdown via IPI, ACPI MADT parsing. **AArch64 features**: GICv3 (Distributor + Redistributor + CPU interface via ICC system registers), ARM Generic Timer (CNTP), AArch64 4-level page tables (L0-L3, TTBR0/TTBR1 split), exception vector table (VBAR_EL1), SVC syscall handler, voluntary context switch (`yield_save_and_switch` — synthetic eret frame + scheduler call, mirrors x86_64 pattern), PL011 UART, early MMIO page mapping (bootstrap frames for TTBR1), TCR_EL1 VA width fix for 48-bit HHDM, EL0 user tasks with per-process TTBR0 + user code/stack mapping, platform detection via MIDR_EL1.
+**Current state:** see [STATUS.md](STATUS.md). That file is the canonical source for what is built, what is in progress, and what is planned, including test counts, subsystem status, phase markers, v1 roadmap progress, and known issues. **This file (CLAUDE.md) is the technical reference for the kernel** — conventions, rules, lock ordering, build commands, required-reading map. Status info is intentionally not duplicated here so the two files cannot drift.
 
 ## Toolchain
 
@@ -315,6 +313,26 @@ All 24 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 
 7. **Never assume zeroed memory equals `None` for `Option<T>`.** Rust does not guarantee the Option discriminant layout — the compiler may assign discriminant 0 to `Some` (not `None`), especially for large structs on bare-metal targets. Always use explicit `core::ptr::write(None)` when initializing heap-allocated arrays of `Option<T>`.
 
+8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](ASSUMPTIONS.md). Templates:
+
+```rust
+/// SCAFFOLDING: <one-line statement of the constraint>
+/// Why: <verification or early-development rationale>
+/// Replace when: <observable trigger that should make a future maintainer revisit>
+const MAX_FOO: usize = 32;
+
+/// ARCHITECTURAL: <statement of the invariant the constant encodes>
+const NUM_PRIORITY_BANDS: usize = 4;
+
+/// HARDWARE: <ABI/spec reference that fixes this number>
+const MAX_GSI_PINS: usize = 24;
+
+/// TUNING: <what workload property this number trades off>
+const CACHE_CAPACITY: usize = 32;
+```
+
+When you add a new bound or change one, update the matching table in [ASSUMPTIONS.md](ASSUMPTIONS.md) in the same change. Step 8 of the Post-Change Review Protocol lists this as an explicit checklist item.
+
 ## Multi-Platform Strategy (x86_64, AArch64, RISC-V planned)
 
 ArcOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The architecture abstraction is in place:
@@ -353,81 +371,55 @@ ArcOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The arc
 - **Bootloader:** Limine 8.7.0 supports AArch64 UEFI. Same boot protocol, same request statics. AArch64 uses FAT disk image (not ISO) for QEMU boot.
 - **AArch64 MMIO must be explicitly mapped.** Limine's HHDM on AArch64 only covers RAM. Device MMIO (PL011, GIC) must be mapped into TTBR1 via `early_map_mmio()` at early boot.
 
-## Known Issues
+## Platform Gotchas
 
-- `SYS_WAIT_IRQ` wake path works for all routed IRQs (timer + device) with IRQ affinity. Registered device IRQs use targeted single-CPU wake via TASK_CPU_MAP. Unregistered IRQs fall back to all-CPU scan with `try_lock()` — if SCHEDULER lock is contended, wake is deferred to the next timer tick.
-- `pic.rs` / `pit.rs` still exist as modules but are no longer called from the boot path (PIC disabled, PIT used only for calibration in `apic.rs`)
-- `demo_syscalls`, legacy `handle_syscall`, `copy_from_user`/`copy_to_user`, and `register_example_interrupts` removed (superseded by SyscallDispatcher + page-table-walk helpers)
+These are persistent platform/bootloader quirks that any new code in the boot or hardware paths must respect. Status of *features* (what's built vs planned) lives in [STATUS.md](STATUS.md); this section is for things that won't go away.
+
 - **Limine base revision 3 HHDM gap (x86_64):** ACPI_RECLAIMABLE, ACPI_NVS, and RESERVED regions are NOT in the HHDM. `map_acpi_regions()` in `main.rs` explicitly maps small RESERVED regions (≤1MB) and all ACPI regions into the HHDM before ACPI parsing. SeaBIOS puts ACPI tables in RESERVED memory (not ACPI_RECLAIMABLE), so the RESERVED mapping is essential.
 - **Limine AArch64 HHDM does NOT map device MMIO.** PL011 UART (0x0900_0000), GIC Distributor (0x0800_0000), and GIC Redistributor (0x080A_0000) must be explicitly mapped into TTBR1 via `early_map_mmio()` before any I/O. Uses bootstrap frames from kernel .bss (physical address found by walking TTBR1 page tables, since kernel statics are NOT in HHDM).
 - **Limine AArch64 TCR_EL1.T1SZ too narrow.** Limine sets T1SZ for ~39-bit VA, but HHDM at `0xFFFF000000000000` needs 48-bit. `kmain` widens T1SZ to 16 (48-bit) at early boot.
 - **AArch64 QEMU requires GICv3.** Must use `-machine virt,gic-version=3` because the GIC driver uses ICC system registers (GICv3). Default GICv2 causes Undefined Instruction on `mrs ICC_SRE_EL1`.
-- **AArch64 ELF loader fully ported.** `load_elf_process`, `build_boot_elf`, `create_elf_user_task`, and `load_boot_modules` are all portable — no `#[cfg(target_arch)]` gates. ELF machine type check uses `ELF_MACHINE_EXPECTED` (0x3E on x86_64, 0xB7 on AArch64).
-- ~~**Terminated tasks re-fault after SYS_EXIT.**~~ FIXED. `handle_exit` marks the task Terminated and calls `yield_save_and_switch()`, which saves context and schedules the next task. The terminated task is never re-scheduled. Both x86_64 and AArch64 use full `yield_save_and_switch` implementations.
-- **ELF loader doesn't upgrade page permissions for overlapping segments.** If two PT_LOAD segments share a page but have different permissions (e.g., .text RX and .got RW), the first segment's permissions are used. The fs-service linker script works around this by `ALIGN(4096)` before `.data` to force separate pages. The loader should be fixed to use the most permissive flags when segments share a page.
-- ~~**fs-service is x86_64 only.**~~ FIXED. All user-space services use `libsys` shared syscall wrappers, which support both x86_64 (`syscall` instruction) and AArch64 (`svc #0`). All boot modules build for both targets.
-- **AArch64 device IRQ routing not wired.** GIC `enable_spi()`/`set_spi_trigger()` exist but aren't called from the boot path or `handle_wait_irq()`. Device IRQ handlers (keyboard, virtio) not yet functional on AArch64.
-- ~~**No voluntary context switch.**~~ FIXED. `yield_save_and_switch` builds a synthetic SavedContext (identical layout to the timer ISR's) on the kernel stack, calls `yield_inner` → `on_voluntary_yield` → `scheduler.voluntary_yield()`, then restores from the next task's SavedContext. x86_64 uses `iretq`; AArch64 uses `eret`. Both implementations save/restore all GPRs, system registers (RFLAGS/SPSR), user stack pointer (RSP/SP_EL0), and page table root (CR3/TTBR0_EL1). SYSCALL/SVC entry switches to the kernel stack. Blocking handlers (recv_msg, wait_irq) use a restart loop: disable interrupts → `block_task` → `yield_save_and_switch` → re-check on wake.
-- **Virtio-net TX completion may require yield to idle on QEMU TCG.** QEMU TCG defers virtio TX processing to its event loop (runs during guest `hlt`). With voluntary yield, the driver can block on WaitIrq and yield to idle (which does `hlt`, triggering QEMU's event loop), but the UDP stack's ARP retry/timeout logic may not yet exploit this fully — ARP resolution currently fails on boot.
+- **ELF loader doesn't merge overlapping segment permissions.** If two PT_LOAD segments share a page with different permissions (e.g., .text RX and .got RW), the first segment's permissions are used. User-space linker scripts work around this with `ALIGN(4096)` before `.data`. Loader fix is tracked in [STATUS.md](STATUS.md).
+- **`SYS_WAIT_IRQ` unregistered-IRQ wake fallback.** Registered device IRQs use targeted single-CPU wake via `TASK_CPU_MAP`. Unregistered IRQs fall back to all-CPU scan with `try_lock()` — if SCHEDULER lock is contended, wake is deferred to the next timer tick. Acceptable; not a bug.
 
-## Completed Milestones
+## Roadmap
 
-ELF loader + verify-before-execute gate (1-2), zero-trust IPC interceptor (3), 24 syscalls (4), multicore serial safety (5), APIC migration (6), SMP phases 0-4 including IrqSpinlock, per-CPU GDT/TSS, ACPI/MADT, I/O APIC, AP startup, IPI, TLB shootdown, per-CPU schedulers, task migration, load balancer (7-11), full AArch64 port — scaffolding through real assembly, hardware drivers, page tables, boot sequence, SMP, EL0 user tasks (12-16, 20), scheduler scalability with 256-task priority bands (17), per-CPU frame cache (18), per-endpoint IPC sharding (19), identity + ObjectStore phase 0 with hardware-backed bootstrap Principal (21), FS service on endpoint 16 (22), Blake3 + Ed25519 crypto with signed ELF loading (24), key-store service on endpoint 17 (25), virtio-net user-space driver with PCI discovery + DMA (26), UDP/IP stack + NTP demo (27), libsys shared syscall library.
+What's built, what's in progress, what's planned (including v1 ordering, phase markers, and known issues) all live in **[STATUS.md](STATUS.md)**. Architectural decisions live in the ADRs under [docs/adr/](docs/adr/). This file contains neither — it's the technical reference.
 
-## Planned Next Steps (Roadmap)
+## Required Reading by Subsystem
 
-### v1 Milestone — "Demonstrable OS"
-The v1 target is an interactive, network-capable, identity-rooted OS running on real hardware with persistent storage. Ordered by dependency:
+When working on a subsystem, read its design and implementation docs *before* writing code. This map exists so context doesn't get forgotten between sessions. If a doc is missing from the list it means the subsystem is small enough that the code is the documentation.
 
-1. **Shell** — Interactive command-line shell over serial/UART. Process spawning, command parsing, wait-for-exit. New syscalls: `Spawn` (load + run ELF by name), `WaitTask` (block until child exits). Makes everything else demonstrable. User-space service.
-2. **USB boot tooling (Dell 3630)** — Bootable FAT32 USB image for x86_64 UEFI. Limine already supports this — Makefile/tooling task. First bare-metal boot.
-3. **Intel I219-LM NIC driver** — User-space driver for the Dell 3630's Intel I219-LM (e1000e family, "Lewisville" PHY, MAC E4:B9:7A:EA:C3:7C). MMIO register access, TX/RX descriptor rings, interrupt-driven receive. Same IPC interface as virtio-net (CMD_SEND_PACKET/CMD_RECV_PACKET/CMD_GET_MAC/CMD_GET_STATUS) so the UDP stack works unmodified on top. Intel's public I219 Software Developer's Manual covers the register layout.
-4. **DHCP client** — User-space service over UDP stack. Dynamic IP/gateway/DNS assignment. Required for any non-SLIRP networking. Replaces hardcoded 10.0.2.x config.
-5. **DNS resolver** — User-space stub resolver over UDP. Caching, recursive query to DHCP-provided nameserver. Eliminates hardcoded IP addresses.
-6. **TCP stack** — Connection state machine (SYN/ACK/FIN), retransmission with exponential backoff, sliding window, congestion control (Reno or CUBIC). User-space service on its own IPC endpoint, layered on UDP stack's Ethernet/IP.
-7. **Virtio-blk driver** — User-space block device driver following the virtio-net pattern. Virtqueue-based read/write, DMA bounce buffers, IPC command interface. Proves persistent storage path in QEMU.
-8. **Persistent ObjectStore** — Backend `ObjectStore` implementation backed by virtio-blk (QEMU) or real disk driver (bare metal). Content-addressed Blake3 objects survive reboot. Replaces `RamObjectStore` for durable data.
-9. **ArcObject CLI** — Shell command that talks to fs-service over IPC. `arcobj put <data>`, `arcobj get <hash>`, `arcobj list`, `arcobj delete <hash>`. First interactive storage demo — user stores and retrieves signed, content-addressed data.
-10. **Yggdrasil peer service** — User-space mesh networking service. Ed25519 Principal → Yggdrasil `200:` IPv6 address (natural mapping). X25519 key exchange (derived from Ed25519 keys), Noise protocol handshake, spanning tree routing. Peers over UDP to bootstrap nodes. The beginning of identity-routed, encrypted networking without DNS/DHCP/IP assignment.
-
-### Post-v1 — Networking
-11. **TLS transport** — Minimal TLS 1.3 client (no_std). Ed25519/X25519 key exchange, AES-GCM or ChaCha20-Poly1305. Enables secure communication with legacy internet services. Depends on TCP.
-
-### Post-v1 — Storage
-12. **VFS / mount infrastructure** — Mount table, path resolution, namespace isolation per-process. FS service becomes a mountable filesystem rather than a flat object store.
-
-### Post-v1 — Identity
-13. **USB HID driver** — User-space driver for USB Human Interface Devices. Required prerequisite for runtime YubiKey communication. XHCI host controller, device enumeration, interrupt transfers.
-14. **Key-store runtime signing** — With USB HID, key-store exits degraded mode. Runtime Ed25519 signing via YubiKey CCID/OpenPGP interface. fs-service switches from unsigned ObjPut to ObjPutSigned.
-15. **DID resolution** — `did:key` method implementation per identity.md. Resolve Ed25519 Principals to DID documents. Foundation for federated identity and cross-device trust.
-16. **Identity revocation** — Revocation lists or short-lived attestations per identity.md. Key compromise recovery without losing object ownership history.
-
-### Post-v1 — Kernel Maturity
-17. **Process lifecycle cleanup** — Proper exit: reclaim page tables, frames, IPC endpoints, VMA regions on task termination. Orphan reaping. Fix terminated-task re-fault loop (scheduler should detect Terminated current_task before saving context).
-18. **Shared memory** — Named shared memory regions between processes via IPC. Map same physical frames into multiple TTBR0 page tables. Required for zero-copy IPC and efficient inter-service data transfer.
-19. **Signal delivery** — Async notification mechanism for processes. Kill, suspend, resume. Required for robust process management and graceful shutdown.
-20. **ELF loader segment permission merging** — When two PT_LOAD segments share a page with different permissions, use the most permissive flags. Removes the linker script `ALIGN(4096)` workaround in user-space crates.
-21. **Init process** — First user-space process (PID 1). Reads a boot manifest, spawns services in dependency order, monitors for crashes, restarts failed services. Replaces hardcoded boot module loading in `main.rs`.
-
-### Post-v1 — Platform
-22. **AArch64 device IRQ routing** — Wire GIC `enable_spi()`/`set_spi_trigger()` into AArch64 boot path for QEMU virt devices (virtio, PL011 RX). Port `handle_wait_irq()` to use GIC SPI routing.
-23. **AArch64 user-space services** — Port libsys syscall wrappers from x86_64 `syscall` instruction to AArch64 `svc`. Enable fs-service, key-store, virtio-net, and UDP stack to build and run on AArch64.
-24. **RISC-V port** — `src/arch/riscv64/` backend matching x86_64/AArch64 public API. PLIC interrupt controller, SBI timer, Sv48 page tables.
-
-### Post-v1 — AI Integration (Core Vision)
-25. **AI pre-execution code analysis** — JIT analysis of ELF binaries before execution. Integrate lightweight inference model (or IPC to an analysis service) into the `BinaryVerifier` pipeline. Flag suspicious syscall patterns, shellcode signatures, ROP gadget density.
-26. **Behavioral anomaly detection** — Runtime monitoring service that observes syscall patterns, IPC traffic, and memory allocation behavior per-process. Statistical baseline + deviation alerting. Quarantine recommendation via IPC to a policy service.
-27. **Automatic threat quarantine** — Policy service that receives anomaly alerts and can suspend, isolate (revoke IPC capabilities), or terminate processes. Kernel-enforced via existing capability + interceptor infrastructure.
-28. **AI compatibility layer** — AI-driven adaptation for running legacy application binaries. Syscall translation, library shimming, format detection. Long-term vision item.
+| Working on... | Read first | Then |
+|---|---|---|
+| **Scheduler / context switch / preemption** | [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) | This file's "Lock Ordering" and "Timer / Preemptive Scheduling" sections |
+| **IPC control path (256-byte messages)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/mod.rs`, `src/ipc/interceptor.rs` |
+| **IPC bulk path (channels — Phase 3)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (channels are the audit transport) |
+| **Capabilities, grant/revoke, delegation** | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) | `src/ipc/capability.rs` |
+| **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/interceptor.rs` |
+| **Audit telemetry / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | — |
+| **Identity / Principal / sender_principal** | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) (intent only) |
+| **ObjectStore / ArcObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
+| **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
+| **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
+| **Architecture port (RISC-V, etc.)** | This file's "Multi-Platform Strategy" section | `src/arch/x86_64/mod.rs` and `src/arch/aarch64/mod.rs` as the public API to match |
+| **Security review / threat model** | [SECURITY.md](SECURITY.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](PHILOSOPHY.md) | All ADRs |
+| **"Is X done yet?" / current state** | [STATUS.md](STATUS.md) | — |
 
 ## Design Documents
 
-These documents capture architectural decisions that upcoming implementation must align with:
+These documents capture architectural decisions that implementation must align with. Pure intent goes in the design docs and ADRs; current implementation status goes in [STATUS.md](STATUS.md).
 
-- **[identity.md](identity.md)** — Identity architecture: what identity means in ArcOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model. This is the authoritative design document for identity.
-- **[FS-and-ID-design-plan.md](FS-and-ID-design-plan.md)** — Implementation sequencing for identity + storage: content-addressed ObjectStore, ArcObject model (Blake3 hashes, signed artifacts), bootstrap identity, IPC sender_principal stamping, SSB-inspired social layer. Flows from identity.md.
+- **[ArcOS.md](ArcOS.md)** — Source-of-truth architecture document (vision, principles, what ArcOS *is*).
+- **[identity.md](identity.md)** — Identity architecture: what identity means in ArcOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model.
+- **[FS-and-ID-design-plan.md](FS-and-ID-design-plan.md)** — Phase intent for identity + storage. Content-addressed ObjectStore, ArcObject model, bootstrap identity, IPC sender_principal stamping. Flows from identity.md.
+- **[win-compat.md](win-compat.md)** — Windows compatibility layer design: sandboxed PE loader, AI-translated Win32 shim tiers, virtual registry/filesystem, sandboxed Principal model, target application phases (business → CAD → instrumentation).
+- **[PHILOSOPHY.md](PHILOSOPHY.md)** — Why ArcOS exists, the AI-watches-not-decides stance, the verification-first commitment.
+- **[SECURITY.md](SECURITY.md)** — Security posture, enforcement table, threat model.
+- **[ASSUMPTIONS.md](ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
+- **[docs/adr/](docs/adr/)** — Architecture decision records (ADRs 000-007). Read the ones in the Required Reading map for the subsystem you're touching.
 
-Any work on identity, storage, filesystem, or object model must be consistent with these documents. If implementation reveals a design problem, update the design doc — don't silently diverge.
+Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
 
 ## Verification Strategy
 
@@ -495,3 +487,23 @@ PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7) → OBJECT_STORE
 - New logic has corresponding unit tests in `#[cfg(test)]` modules
 - Edge cases are tested (boundary values, error paths, overflow)
 - Tests run on host macOS target — no x86 hardware dependencies in test code
+
+### 8. Documentation Sync
+Docs in this repo are categorized by how they relate to the code, and that determines whether they auto-refresh on a code change. **This step is required, not optional** — stale implementation docs are how priorities get forgotten between sessions.
+
+| Category | Files | Auto-refresh? | Rule |
+|---|---|---|---|
+| **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
+| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-007) | **No** — human only | ADRs are immutable history. If a decision is wrong or superseded, write a new ADR that supersedes it. Never edit an old ADR to reflect new code state. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
+| **design / source_of_truth** | [ArcOS.md](ArcOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
+| **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
+
+**Concrete checklist for the change you just made:**
+1. Did this change modify a subsystem listed in [STATUS.md](STATUS.md)'s subsystem table? → Update its row and bump `last_synced_to_code:`.
+2. Did this change move a phase forward (e.g., "Phase 3 in progress" → "Phase 3 done")? → Update the Phase markers table.
+3. Did this change touch the scheduler? → Re-read [SCHEDULER.md](src/scheduler/SCHEDULER.md) and update if anything in it is now wrong.
+4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments.
+5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference / Lock Ordering / Syscall Numbers tables.
+6. Did this change resolve a Platform Gotcha in CLAUDE.md or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
+7. Did this change cite a doc that doesn't exist yet? → Either create the doc or remove the citation.
+8. Did this change add or modify a numeric `const`, fixed-size array, or `MAX_*` bound in kernel code? → Tag it with `SCAFFOLDING` / `ARCHITECTURAL` / `HARDWARE` / `TUNING` per Development Convention 8, and add or update the row in [ASSUMPTIONS.md](ASSUMPTIONS.md). Unconscious bounds are not allowed.

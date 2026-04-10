@@ -1,6 +1,6 @@
 # ADR-003: Content-Addressed Storage and Cryptographic Identity
 
-- **Status:** Implemented (Phase 0)
+- **Status:** Accepted
 - **Date:** 2026-04-05
 - **Depends on:** ADR-000 (Zero-Trust Architecture and Capability-Based Access Control)
 - **Context:** Establishing the native storage and identity model — what a "file" is in ArcOS and how authorship, ownership, and provenance work
@@ -156,34 +156,31 @@ Position 8 reflects that the ObjectStore is the highest-level kernel subsystem �
 
 `BOOTSTRAP_PRINCIPAL` is outside the hierarchy — written once at boot, read-only thereafter.
 
-## Phase 0 Limitations
+## Phase Progression
 
-These are deliberate scope cuts, not design compromises:
+The interfaces (`Principal`, `ArcObject`, `bind_principal`/`get_principal`, `sender_principal` stamping, `ObjectStore` trait) are stable. The backing implementations evolve through phases:
 
-| Limitation | Phase 0 | Production target |
+| Aspect | Initial design (Phase 0) | Production target |
 |------------|---------|-------------------|
-| Content hashing | FNV-1a (fast, not cryptographic) | Blake3 (Phase 1) |
-| Signatures | Placeholder field, not verified | Ed25519 verification (Phase 1) |
-| Bootstrap identity | Deterministic seed | Real entropy + key store service |
-| Storage backing | RAM only (256 objects) | Block device + network peers |
-| Ownership transfer | Not implemented | Signed OwnershipTransfer objects (Phase 2) |
+| Content hashing | Stub | Blake3 (cryptographic) |
+| Signatures | Placeholder field | Ed25519 verification |
+| Bootstrap identity | Deterministic seed | Hardware-backed YubiKey root of trust |
+| Storage backing | RAM-only | Block device + network peers |
+| Ownership transfer | Not in scope | Signed OwnershipTransfer objects |
 
-The interfaces are final. The implementations upgrade in place.
+For which phase is currently realized in the code, see [STATUS.md § Phase markers](../../STATUS.md#phase-markers). The interfaces are final. The implementations upgrade in place.
 
 ## Verification
 
-- 35 new unit tests covering: Principal construction/equality, bind/get on CapabilityManager, sender_principal stamping, ArcObject construction/hashing, author immutability, RamObjectStore put/get/delete/list/capacity
-- All 190 tests pass
-- FS service boots and runs in QEMU (x86_64), receives IPC, enforces ownership
-- Clean release builds for both x86_64 and aarch64-unknown-none
+Test counts and what each test covers (Principal construction, IPC sender stamping, ArcObject hashing, RamObjectStore put/get/delete/list/capacity, etc.) live in [STATUS.md § Test coverage](../../STATUS.md#test-coverage).
 
 ## References
 
-- ADR-000: Zero-Trust Architecture and Capability-Based Access Control
+- [ADR-000](000-zta-and-cap.md): Zero-Trust Architecture and Capability-Based Access Control
+- [ADR-004](004-cryptographic-integrity.md): Cryptographic integrity (Blake3 + Ed25519)
 - [identity.md](../../identity.md): Identity architecture (authoritative design document)
-- [FS-and-ID-design-plan.md](../../FS-and-ID-design-plan.md): Implementation sequencing
+- [FS-and-ID-design-plan.md](../../FS-and-ID-design-plan.md): Phase intent for identity + storage
 - `src/fs/mod.rs`, `src/fs/ram.rs`: ArcObject and RamObjectStore
 - `src/ipc/mod.rs`: Principal type, sender_principal stamping
 - `src/ipc/capability.rs`: Principal binding on ProcessCapabilities
-- `src/syscalls/dispatcher.rs`: Syscalls 11–17
 - `user/fs-service/src/main.rs`: User-space FS service

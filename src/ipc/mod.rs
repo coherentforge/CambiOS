@@ -13,7 +13,12 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt;
 
-/// Maximum number of IPC endpoints (matches MAX_PROCESSES)
+/// SCAFFOLDING: maximum number of IPC endpoints in the system.
+/// Why: paired with `MAX_PROCESSES` (typically one endpoint per service).
+///      Sharded IPC has one shard per endpoint; the per-shard message queues
+///      and the global capability tables are sized from this.
+/// Replace when: `MAX_PROCESSES` grows. They are a pair and must move together.
+///      See ASSUMPTIONS.md.
 pub const MAX_ENDPOINTS: usize = 32;
 
 /// Message endpoint identifier
@@ -87,7 +92,10 @@ impl fmt::Display for Principal {
 pub struct Message {
     pub from: EndpointId,
     pub to: EndpointId,
-    pub payload: [u8; 256], // Fixed-size for verification
+    /// ARCHITECTURAL: 256-byte fixed-size control payload. The kernel reads
+    /// every byte of every control-IPC message; bulk data takes a separate path
+    /// (channels — see docs/adr/005-ipc-primitives-control-and-bulk.md).
+    pub payload: [u8; 256],
     pub payload_len: usize,
     /// Sender's cryptographic identity, stamped by the kernel.
     ///
@@ -205,12 +213,15 @@ impl CapabilityRights {
     };
 }
 
-/// Fixed-size message queue for intra-kernel endpoints
+/// Fixed-size message queue for intra-kernel endpoints.
 ///
-/// Stores up to 16 messages per endpoint. Designed for verification
-/// with predictable memory layout and bounded queue size.
+/// SCAFFOLDING: 16 messages per endpoint queue.
+/// Why: verification wants a predictable memory layout and bounded queue size.
+///      Pre-allocated 32 endpoints × 16 messages × ~280 B ≈ 140 KiB at boot.
+/// Replace when: Phase 3 audit telemetry channel (ADR-007) starts seeing bursts
+///      that overflow this — first dropped event is the trigger. Note: bumping
+///      this also bumps the boot memory cost linearly. See ASSUMPTIONS.md.
 ///
-/// Memory footprint: 32 queues × 16 messages × ~280 bytes per message ≈ 140KB
 /// Heap-allocated at boot via IpcManager::new_boxed().
 pub struct EndpointQueue {
     messages: [Option<Message>; 16],

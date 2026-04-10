@@ -158,18 +158,21 @@ Everything not in this list — drivers, networking, filesystem, application log
 
 The fundamental difference: ACLs answer "is this identity allowed?" Capabilities answer "does this process hold the right token?" The second question cannot be fooled by escalation because there is nothing to escalate to — you either have the token or you don't.
 
-## Implementation In ArcOS Today
+## Where This Lives in the Codebase
+
+The components this ADR describes:
 
 | Component | File | Role |
 |---|---|---|
 | `CapabilityManager` | `src/ipc/capability.rs` | System-wide capability tables, grant/revoke/verify |
-| `ProcessCapabilities` | `src/ipc/capability.rs` | Per-process capability table (32 slots) |
+| `ProcessCapabilities` | `src/ipc/capability.rs` | Per-process capability table |
 | `IpcInterceptor` trait | `src/ipc/interceptor.rs` | Zero-trust policy enforcement hooks |
 | `DefaultInterceptor` | `src/ipc/interceptor.rs` | Baseline policies (payload, bounds, self-send, escalation) |
 | `BinaryVerifier` trait | `src/loader/mod.rs` | Pre-execution ELF verification gate |
-| `DefaultVerifier` | `src/loader/mod.rs` | W^X, user-space bounds, overlap, memory limit |
 | `IpcManager` | `src/ipc/mod.rs` | Message passing with capability + interceptor checks |
 | `SyscallDispatcher` | `src/syscalls/dispatcher.rs` | Syscall entry with interceptor pre-dispatch |
+
+For the current implementation status of each item (enforced vs. scaffolding vs. designed), see [SECURITY.md § Enforcement Status Summary](../../SECURITY.md). For test counts, see [STATUS.md](../../STATUS.md).
 
 ### Lock ordering (security-critical globals)
 
@@ -198,24 +201,15 @@ PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7)
 
 ## Future Work
 
-### Cryptographic capabilities
-Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked ArcOS nodes without a central authority.
+The architectural extensions to the capability model have been moved into their own ADRs so that each can be debated, accepted, and implemented independently:
 
-### Per-process syscall allowlists
-The `on_syscall` interceptor hook exists but the default policy allows all defined syscalls. Production deployments should use per-process profiles restricting each service to its required syscalls.
+- **Per-process syscall allowlists, externalized policy decisions** — see [ADR-006: Policy Service](006-policy-service.md).
+- **Capability revocation, audit logging, AI-assisted anomaly detection (advisory only)** — see [ADR-007: Capability Revocation and Audit Telemetry](007-capability-revocation-and-telemetry.md).
+- **Bulk-data IPC path that does not weaken the capability model** — see [ADR-005: IPC Primitives — Control Path and Bulk Path](005-ipc-primitives-control-and-bulk.md).
 
-### AI-assisted anomaly detection
-Runtime behavioral analysis to detect capability misuse patterns — e.g., a process that suddenly starts exercising capabilities it holds but has never used before.
+The remaining open item not yet captured in its own ADR:
 
-### Capability audit log
-Append-only log of capability grants, revocations, and delegation events for post-incident forensics.
-
-## Verification
-
-- 56 unit tests cover the capability manager (grant, revoke, verify, delegation, escalation prevention)
-- 11 unit tests cover the IPC interceptor (payload, bounds, self-send, delegation, syscall filtering)
-- 10 unit tests cover the ELF verifier (W^X, kernel space, overlaps, memory limits, entry point)
-- Capability checks are exercised in integration via `SYS_WRITE` and `SYS_READ` syscall paths in QEMU
+**Cryptographic capabilities.** Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked ArcOS nodes without a central authority. Only relevant once mesh networking lands.
 
 ## References
 

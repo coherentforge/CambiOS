@@ -1,9 +1,11 @@
 # ADR-004: Cryptographic Integrity — Blake3 Hashing and Ed25519 Signatures
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-05
 - **Depends on:** ADR-003 (Content-Addressed Storage and Cryptographic Identity)
 - **Context:** Upgrading Phase 0 placeholder hashing and unsigned objects to production cryptography
+
+> *For implementation status (which phase markers are met, what's hardware-backed, what tests exist) see [STATUS.md](../../STATUS.md). This ADR is the decision; status lives with the code.*
 
 ## Problem
 

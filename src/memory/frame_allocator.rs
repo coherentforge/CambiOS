@@ -16,13 +16,19 @@ use core::fmt;
 /// Page / frame size: 4 KiB
 pub const PAGE_SIZE: u64 = 4096;
 
-/// Maximum supported physical address: 2 GiB
-/// (524288 frames × 4 KiB = 2 GiB)
+/// SCAFFOLDING: physical frame allocator covers the first 2 GiB only.
+/// (524288 frames × 4 KiB = 2 GiB; bitmap is 64 KiB in `.bss`.)
 ///
-/// Must cover the highest physical address used on any platform:
-/// - x86_64 QEMU: RAM at 0x0, typically ≤ 512 MB
+/// Currently fits both QEMU targets:
+/// - x86_64 QEMU: RAM at 0x0, typically ≤ 512 MiB
 /// - AArch64 QEMU virt: RAM at 0x40000000 (1 GiB), needs frames up to ~1.25 GiB
-/// Bitmap cost: 524288 bits = 64 KiB (acceptable for kernel .bss)
+///
+/// Why: bitmap-based allocator with .bss-sized bitmap is the simplest correct
+///      implementation; 2 GiB was generous for early development.
+/// Replace when: bare-metal Dell 3630 bring-up — that target has 16 GiB and will
+///      hit this immediately. The bitmap just needs to grow (or move to a tiered
+///      structure). This is a real production blocker, not verification scaffolding.
+///      See ASSUMPTIONS.md.
 const MAX_FRAMES: usize = 524288;
 
 /// Bitmap words needed: 131072 / 64 = 2048
@@ -316,18 +322,17 @@ impl fmt::Debug for FrameAllocator {
 // Per-CPU frame cache — reduces global FRAME_ALLOCATOR lock contention
 // ============================================================================
 
-/// Per-CPU frame cache capacity. 32 frames = 128 KB of pre-cached memory.
-/// Sized to cover typical single-syscall allocations (≤128 KB) without
-/// touching the global allocator.
+/// TUNING: per-CPU frame cache capacity (32 frames = 128 KiB). Trades global
+/// allocator lock contention against per-CPU memory parked unused. Sized to
+/// cover typical single-syscall allocations without touching the global lock.
+/// Needs benchmarks, not opinion, to change.
 const CACHE_CAPACITY: usize = 32;
 
-/// Number of frames to refill from the global allocator at once.
-/// Half the cache — balances refill frequency vs. lock hold time.
+/// TUNING: refill batch size — balances refill frequency vs. lock hold time.
 const REFILL_COUNT: usize = 16;
 
-/// Number of frames to drain back to the global allocator when the cache
-/// is full. Draining makes room for freed frames and returns memory to
-/// the global pool for other CPUs.
+/// TUNING: drain batch size — returns memory to the global pool for other CPUs
+/// when the cache is full. Same trade-off as REFILL_COUNT.
 const DRAIN_COUNT: usize = 16;
 
 /// Per-CPU frame cache — LIFO stack of pre-allocated physical frames.
