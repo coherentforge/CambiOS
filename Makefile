@@ -60,7 +60,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean img-x86 run-img-x86 kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net udp-stack shell user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean img-x86 run-img-x86 img-usb run-img-usb usb verify-usb kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net udp-stack shell user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -281,6 +281,126 @@ run-img-x86: img-x86
 		-m 128M \
 		-device virtio-net-pci \
 		-no-reboot
+
+# ============================================================================
+# USB boot image (GPT-partitioned, UEFI-bootable)
+# ============================================================================
+#
+# Builds a GPT-partitioned disk image with a single EFI System Partition
+# (ESP) containing all kernel + signed user-space modules. Suitable for
+# `dd`-ing to a USB stick and booting on bare-metal UEFI systems
+# (Dell 3630, etc.).
+#
+# Layout:
+#   LBA 0:        Protective MBR (created by sgdisk)
+#   LBA 1:        Primary GPT header
+#   LBA 2..33:    Primary GPT partition table
+#   LBA 2048:     ESP partition start (FAT32, type C12A7328-...)
+#   LBA -33..-1:  Backup GPT (header + table)
+#
+# Requires sgdisk (gptfdisk). Install via: brew install gptfdisk
+#
+# Usage:
+#   make img-usb               # Build the image
+#   make run-img-usb           # Test in QEMU UEFI
+#   make usb DEVICE=/dev/diskN # Write to USB (with confirmation)
+#   make verify-usb DEVICE=/dev/diskN # Read back and compare
+
+IMG_USB := arcos-usb.img
+IMG_USB_SIZE_MB := 96
+ESP_SIZE_MB := 64
+
+img-usb: img-x86
+	@command -v sgdisk >/dev/null 2>&1 || { \
+		echo "ERROR: sgdisk not found. Install with: brew install gptfdisk"; \
+		exit 1; \
+	}
+	@echo "=== Building GPT-partitioned USB image ==="
+	rm -f $(IMG_USB)
+	# Create blank disk image
+	dd if=/dev/zero of=$(IMG_USB) bs=1M count=$(IMG_USB_SIZE_MB) status=none
+	# Create GPT with a single ESP partition starting at LBA 2048 (1 MiB).
+	# Partition type C12A7328-F81F-11D2-BA4B-00A0C93EC93B = EFI System Partition.
+	sgdisk --clear \
+		--new=1:2048:+$(ESP_SIZE_MB)M \
+		--typecode=1:EF00 \
+		--change-name=1:"ArcOS ESP" \
+		$(IMG_USB) >/dev/null
+	# Embed the FAT32 ESP image at LBA 2048 (offset = 2048 * 512 = 1 MiB).
+	dd if=$(IMG_X86) of=$(IMG_USB) bs=1M seek=1 conv=notrunc status=none
+	@echo "=== $(IMG_USB) ready ($(IMG_USB_SIZE_MB) MiB, GPT + FAT32 ESP) ==="
+	@echo "Test in QEMU:    make run-img-usb"
+	@echo "Write to USB:    make usb DEVICE=/dev/diskN"
+
+# Test the GPT image in QEMU UEFI (validates before writing to USB)
+run-img-usb: img-usb
+	@cp $(EFI_VARS_X86) /tmp/arcos-efivars.fd
+	qemu-system-x86_64 \
+		-drive file=$(IMG_USB),format=raw \
+		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
+		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
+		-serial mon:stdio \
+		-smp 2 \
+		-m 128M \
+		-device virtio-net-pci \
+		-no-reboot
+
+# Write the GPT image to a USB stick (with safety prompt).
+# Usage: make usb DEVICE=/dev/diskN
+usb: img-usb
+	@if [ -z "$(DEVICE)" ]; then \
+		echo "ERROR: specify the target device:"; \
+		echo "  make usb DEVICE=/dev/diskN"; \
+		echo ""; \
+		echo "Available external disks:"; \
+		diskutil list external 2>/dev/null || diskutil list; \
+		exit 1; \
+	fi
+	@if [ ! -b "$(DEVICE)" ] && [ ! -c "$(DEVICE)" ]; then \
+		echo "ERROR: $(DEVICE) is not a block/character device"; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "============================================================"
+	@echo "  WARNING: This will OVERWRITE all data on $(DEVICE)"
+	@echo "============================================================"
+	@diskutil info $(DEVICE) 2>/dev/null | grep -E "(Device.*Identifier|Media Name|Disk Size|Protocol)" || true
+	@echo ""
+	@printf "Type 'yes' to continue: "
+	@read confirm && [ "$$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
+	@echo "Unmounting $(DEVICE)..."
+	@diskutil unmountDisk $(DEVICE) 2>/dev/null || true
+	@echo "Writing $(IMG_USB) to $(DEVICE) (this may take a minute)..."
+	sudo dd if=$(IMG_USB) of=$(DEVICE) bs=1M
+	sync
+	@echo "Ejecting $(DEVICE)..."
+	@diskutil eject $(DEVICE) 2>/dev/null || true
+	@echo ""
+	@echo "✓ USB ready. Boot the target machine from this device."
+
+# Verify a USB stick by reading it back and comparing to the source image.
+# Usage: make verify-usb DEVICE=/dev/diskN
+verify-usb:
+	@if [ -z "$(DEVICE)" ]; then \
+		echo "ERROR: specify the device: make verify-usb DEVICE=/dev/diskN"; \
+		exit 1; \
+	fi
+	@if [ ! -f $(IMG_USB) ]; then \
+		echo "ERROR: $(IMG_USB) not found. Run 'make img-usb' first."; \
+		exit 1; \
+	fi
+	@echo "Reading $(IMG_USB_SIZE_MB) MiB from $(DEVICE)..."
+	@diskutil unmountDisk $(DEVICE) 2>/dev/null || true
+	sudo dd if=$(DEVICE) of=/tmp/arcos-usb-readback.img bs=1M count=$(IMG_USB_SIZE_MB) status=progress
+	@echo "Comparing to $(IMG_USB)..."
+	@if cmp -s /tmp/arcos-usb-readback.img $(IMG_USB); then \
+		echo "✓ USB matches source image (verified $(IMG_USB_SIZE_MB) MiB)"; \
+		rm -f /tmp/arcos-usb-readback.img; \
+	else \
+		echo "✗ MISMATCH: USB does not match $(IMG_USB)"; \
+		echo "  Readback saved to /tmp/arcos-usb-readback.img for inspection"; \
+		exit 1; \
+	fi
 
 test:
 	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
