@@ -22,6 +22,10 @@
 //!                     → [status:1][src_ip:4][src_port:2][payload:N]
 //!     3 = GET_CONFIG: [cmd:1]
 //!                     → [status:1][our_ip:4][our_mac:6]
+//!     4 = SET_CONFIG: [cmd:1][ip:4][gateway:4][netmask:4]
+//!                     → [status:1]
+//!     5 = DHCP_SEND:  [cmd:1][src_port:2][dst_port:2][payload:N]
+//!                     → [status:1]   (sends broadcast, src IP 0.0.0.0)
 //!
 //!   Status: 0=OK, 1=ERROR, 2=NO_DATA
 //!
@@ -73,6 +77,11 @@ const UDP_ENDPOINT: u32 = 21;
 const CMD_UDP_SEND: u8 = 1;
 const CMD_UDP_RECV: u8 = 2;
 const CMD_GET_CONFIG: u8 = 3;
+/// Update IP/gateway/netmask at runtime (used by DHCP client).
+const CMD_SET_CONFIG: u8 = 4;
+/// Send a UDP packet with broadcast Ethernet MAC and source IP 0.0.0.0
+/// (used by DHCP client for DISCOVER/REQUEST before we have an IP).
+const CMD_DHCP_SEND: u8 = 5;
 
 // Status codes
 const STATUS_OK: u8 = 0;
@@ -84,10 +93,43 @@ const NET_CMD_SEND: u8 = 1;
 const NET_CMD_RECV: u8 = 2;
 const NET_CMD_GET_MAC: u8 = 3;
 
-// QEMU SLIRP network configuration
-const OUR_IP: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
-const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
+// Network configuration — initially hardcoded for QEMU SLIRP, but can be
+// updated at runtime via CMD_SET_CONFIG (used by the DHCP client to push
+// a lease into the stack). Single-threaded user-space service, so plain
+// static mut is sound.
+static mut OUR_IP: [u8; 4] = [10, 0, 2, 15];
+static mut GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+static mut SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
+
+/// Read the current configured IP. Single-threaded service — no race.
+fn our_ip() -> [u8; 4] {
+    // SAFETY: Single-threaded user-space service, no concurrent access.
+    #[allow(unsafe_code)]
+    unsafe { OUR_IP }
+}
+
+fn gateway_ip() -> [u8; 4] {
+    // SAFETY: Single-threaded user-space service.
+    #[allow(unsafe_code)]
+    unsafe { GATEWAY_IP }
+}
+
+fn subnet_mask() -> [u8; 4] {
+    // SAFETY: Single-threaded user-space service.
+    #[allow(unsafe_code)]
+    unsafe { SUBNET_MASK }
+}
+
+/// Update network configuration (called by DHCP client after lease).
+fn set_network_config(ip: [u8; 4], gateway: [u8; 4], mask: [u8; 4]) {
+    // SAFETY: Single-threaded user-space service, no concurrent access.
+    #[allow(unsafe_code)]
+    unsafe {
+        OUR_IP = ip;
+        GATEWAY_IP = gateway;
+        SUBNET_MASK = mask;
+    }
+}
 
 // NTP server: time.google.com (216.239.35.0)
 const NTP_SERVER_IP: [u8; 4] = [216, 239, 35, 0];
@@ -461,7 +503,7 @@ fn arp_resolve(
     }
 
     // Build and send ARP request
-    let arp_payload = build_arp_request(our_mac, &OUR_IP, target_ip);
+    let arp_payload = build_arp_request(our_mac, &our_ip(), target_ip);
     let mut frame = [0u8; 256];
     let frame_len = build_eth_frame(
         &mut frame,
@@ -506,12 +548,14 @@ fn resolve_next_hop(
     our_mac: &[u8; 6],
     dst_ip: &[u8; 4],
 ) -> Option<[u8; 6]> {
-    let on_subnet = OUR_IP[0] & SUBNET_MASK[0] == dst_ip[0] & SUBNET_MASK[0]
-        && OUR_IP[1] & SUBNET_MASK[1] == dst_ip[1] & SUBNET_MASK[1]
-        && OUR_IP[2] & SUBNET_MASK[2] == dst_ip[2] & SUBNET_MASK[2]
-        && OUR_IP[3] & SUBNET_MASK[3] == dst_ip[3] & SUBNET_MASK[3];
+    let our = our_ip();
+    let mask = subnet_mask();
+    let on_subnet = our[0] & mask[0] == dst_ip[0] & mask[0]
+        && our[1] & mask[1] == dst_ip[1] & mask[1]
+        && our[2] & mask[2] == dst_ip[2] & mask[2]
+        && our[3] & mask[3] == dst_ip[3] & mask[3];
 
-    let hop_ip = if on_subnet { *dst_ip } else { GATEWAY_IP };
+    let hop_ip = if on_subnet { *dst_ip } else { gateway_ip() };
     arp_resolve(cache, our_mac, &hop_ip)
 }
 
@@ -538,7 +582,7 @@ fn udp_send(
     let udp_len = build_udp_packet(&mut udp_buf, src_port, dst_port, payload);
 
     let mut ip_buf = [0u8; 256];
-    let ip_len = build_ip_packet(&mut ip_buf, &OUR_IP, dst_ip, IP_PROTO_UDP, &udp_buf[..udp_len]);
+    let ip_len = build_ip_packet(&mut ip_buf, &our_ip(), dst_ip, IP_PROTO_UDP, &udp_buf[..udp_len]);
 
     let mut frame = [0u8; 256];
     let frame_len = build_eth_frame(&mut frame, &dst_mac, our_mac, ETHERTYPE_IPV4, &ip_buf[..ip_len]);
@@ -703,6 +747,8 @@ fn service_loop(cache: &mut ArpCache, our_mac: &[u8; 6]) -> ! {
             CMD_UDP_SEND => handle_udp_send(cache, our_mac, cmd_data, &mut resp_buf),
             CMD_UDP_RECV => handle_udp_recv(cmd_data, &mut resp_buf),
             CMD_GET_CONFIG => handle_get_config(our_mac, &mut resp_buf),
+            CMD_SET_CONFIG => handle_set_config(cmd_data, &mut resp_buf),
+            CMD_DHCP_SEND => handle_dhcp_send(our_mac, cmd_data, &mut resp_buf),
             _ => {
                 resp_buf[0] = STATUS_ERROR;
                 1
@@ -767,9 +813,75 @@ fn handle_udp_recv(data: &[u8], resp: &mut [u8]) -> usize {
 
 fn handle_get_config(our_mac: &[u8; 6], resp: &mut [u8]) -> usize {
     resp[0] = STATUS_OK;
-    resp[1..5].copy_from_slice(&OUR_IP);
+    resp[1..5].copy_from_slice(&our_ip());
     resp[5..11].copy_from_slice(our_mac);
     11
+}
+
+/// Update the network configuration. Used by the DHCP client to push
+/// a lease (IP/gateway/netmask) into the stack.
+///
+/// Expected payload: [ip:4][gateway:4][netmask:4]
+fn handle_set_config(data: &[u8], resp: &mut [u8]) -> usize {
+    if data.len() < 12 {
+        resp[0] = STATUS_ERROR;
+        return 1;
+    }
+    let mut ip = [0u8; 4];
+    let mut gw = [0u8; 4];
+    let mut mask = [0u8; 4];
+    ip.copy_from_slice(&data[0..4]);
+    gw.copy_from_slice(&data[4..8]);
+    mask.copy_from_slice(&data[8..12]);
+    set_network_config(ip, gw, mask);
+    sys::print(b"[UDP] Network config updated: IP=");
+    print_ip(&ip);
+    sys::print(b" GW=");
+    print_ip(&gw);
+    sys::print(b"\n");
+    resp[0] = STATUS_OK;
+    1
+}
+
+/// Send a packet using the broadcast Ethernet MAC, source IP 0.0.0.0,
+/// and destination IP 255.255.255.255. Used by the DHCP client for
+/// DISCOVER/REQUEST messages where we don't yet have an IP or know
+/// the server's MAC.
+///
+/// Expected payload: [src_port:2][dst_port:2][udp_payload:N]
+fn handle_dhcp_send(our_mac: &[u8; 6], data: &[u8], resp: &mut [u8]) -> usize {
+    if data.len() < 4 {
+        resp[0] = STATUS_ERROR;
+        return 1;
+    }
+    let src_port = get_be16(&data[0..2]);
+    let dst_port = get_be16(&data[2..4]);
+    let payload = &data[4..];
+
+    // Build UDP packet with src=0.0.0.0, dst=255.255.255.255
+    let zero_ip = [0u8; 4];
+    let bcast_ip = [255u8; 4];
+
+    if payload.len() > MAX_UDP_PAYLOAD {
+        resp[0] = STATUS_ERROR;
+        return 1;
+    }
+
+    let mut udp_buf = [0u8; 256];
+    let udp_len = build_udp_packet(&mut udp_buf, src_port, dst_port, payload);
+
+    let mut ip_buf = [0u8; 256];
+    let ip_len = build_ip_packet(&mut ip_buf, &zero_ip, &bcast_ip, IP_PROTO_UDP, &udp_buf[..udp_len]);
+
+    let mut frame = [0u8; 256];
+    let frame_len = build_eth_frame(&mut frame, &BROADCAST_MAC, our_mac, ETHERTYPE_IPV4, &ip_buf[..ip_len]);
+
+    if net_send_frame(&frame[..frame_len]) {
+        resp[0] = STATUS_OK;
+    } else {
+        resp[0] = STATUS_ERROR;
+    }
+    1
 }
 
 // ============================================================================
@@ -845,11 +957,12 @@ pub extern "C" fn _start() -> ! {
 
     // Step 2: ARP resolve gateway
     let mut cache = ArpCache::new();
+    let gw = gateway_ip();
     sys::print(b"[UDP] ARP: resolving gateway ");
-    print_ip(&GATEWAY_IP);
+    print_ip(&gw);
     sys::print(b"\n");
 
-    match arp_resolve(&mut cache, &our_mac, &GATEWAY_IP) {
+    match arp_resolve(&mut cache, &our_mac, &gw) {
         Some(gw_mac) => {
             sys::print(b"[UDP] Gateway MAC: ");
             print_mac(&gw_mac);
