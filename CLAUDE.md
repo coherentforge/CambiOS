@@ -57,7 +57,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (218 tests, all passing)
+# Run tests (229 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -195,7 +195,7 @@ tools/
 │   └── timer.rs              # Timer tick management
 └── syscalls/
     ├── mod.rs                # SyscallNumber enum, SyscallArgs
-    ├── dispatcher.rs         # Syscall dispatch + handlers (all 11 implemented)
+    ├── dispatcher.rs         # Syscall dispatch + handlers (all 28 implemented)
     └── userspace.rs          # Stub userspace syscall wrappers
 ```
 
@@ -271,10 +271,12 @@ RegisterEndpoint=6, Yield=7, GetPid=8, GetTime=9, Print=10,
 BindPrincipal=11, GetPrincipal=12, RecvMsg=13,
 ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17,
 ClaimBootstrapKey=18, ObjPutSigned=19,
-MapMmio=20, AllocDma=21, DeviceInfo=22, PortIo=23
+MapMmio=20, AllocDma=21, DeviceInfo=22, PortIo=23,
+ConsoleRead=24, Spawn=25, WaitTask=26,
+RevokeCapability=27
 ```
-All 24 syscalls are implemented in `src/syscalls/dispatcher.rs`:
-- **Exit**: Marks task as Terminated in scheduler
+All 28 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+- **Exit**: Marks task as Terminated in scheduler and calls `CapabilityManager::revoke_all_for_process()` to reclaim endpoint capabilities (see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
 - **Allocate**: VMA tracker assigns virtual address, frame allocation + map into process page tables (with rollback on OOM)
@@ -296,6 +298,10 @@ All 24 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **AllocDma**: Allocates physically contiguous DMA pages with guard pages (unmapped before/after). Returns user vaddr; writes physical address to caller buffer
 - **DeviceInfo**: Returns 108-byte PCI device descriptor by index (vendor/device ID, class, BARs with decoded addresses/sizes/types)
 - **PortIo**: Kernel-validated port I/O on PCI device I/O BARs. Rejects ports not within a discovered PCI BAR. Supports byte/word/dword read/write
+- **ConsoleRead**: Non-blocking read of bytes from the serial console into a user buffer
+- **Spawn**: Create a new process from a named boot module; parent is the caller
+- **WaitTask**: Block until a named child task exits; returns the child's exit code
+- **RevokeCapability**: Revoke a capability held by another process on an endpoint. Wave 1 authority = bootstrap Principal only; grantor / holder-of-`revoke`-right / policy service paths land in Wave 4. Args will refactor from `(pid, endpoint)` to a single `CapabilityHandle` in Wave 2 once channels force a system-wide capability registry. See [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)
 
 ## Development Conventions
 
@@ -427,7 +433,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 218 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test
+- 229 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3 Wave 1)
 
 ## Post-Change Review Protocol
 

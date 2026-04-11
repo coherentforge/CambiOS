@@ -747,7 +747,7 @@ fn register_process_capabilities(process_id: ProcessId) {
         let _ = cap_mgr.grant_capability(
             process_id,
             EndpointId(endpoint_id),
-            CapabilityRights { send: true, receive: true, delegate: false },
+            CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
         );
     }
     // Bind bootstrap Principal to boot module processes (they're trusted)
@@ -939,6 +939,7 @@ fn capability_manager_init() {
                         send: true,
                         receive: true,
                         delegate: false,
+                        revoke: false,
                     },
                 );
             }

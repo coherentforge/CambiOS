@@ -141,6 +141,19 @@ pub enum SyscallNumber {
     /// Block until the specified child task exits. Returns the child's
     /// exit code. Only the parent (spawner) can wait on a child.
     WaitTask = 26,
+
+    /// revoke_capability(target_process_id: u32, endpoint_id: u32) -> i32
+    /// Revoke a capability held by another process on a given endpoint.
+    /// Per ADR-007 §"Who can revoke", Wave 1 restricts this to the bootstrap
+    /// Principal; other authority paths (original grantor, holder of `revoke`
+    /// right, policy service) land in Wave 4.
+    ///
+    /// Args are `(target_process_id, endpoint_id)` in Wave 1 for simplicity.
+    /// Wave 2 refactors this to a single `CapabilityHandle` once channels
+    /// force a system-wide capability registry into existence.
+    ///
+    /// Returns 0 on success, negative error code on failure.
+    RevokeCapability = 27,
 }
 
 impl SyscallNumber {
@@ -174,6 +187,7 @@ impl SyscallNumber {
             24 => Some(Self::ConsoleRead),
             25 => Some(Self::Spawn),
             26 => Some(Self::WaitTask),
+            27 => Some(Self::RevokeCapability),
             _ => None,
         }
     }

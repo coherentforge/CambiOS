@@ -14,7 +14,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 
 ## At a glance
 
-- **218 unit tests passing** on host (`x86_64-apple-darwin`)
+- **229 unit tests passing** on host (`x86_64-apple-darwin`)
 - **x86_64**: clean release build, boots in QEMU with 2 CPUs, 7 boot modules running (hello, fs-service, key-store, virtio-net, i219-net, udp-stack, shell)
 - **AArch64**: clean release build, boots in QEMU `virt`, all 7 modules running, full SMP (single-CPU mode tested; SMP timer-on-AP issue tracked)
 - **Bare metal**: USB boot tooling complete (`make img-usb` builds GPT image; `make usb DEVICE=/dev/diskN` writes safely); not yet tested on target hardware (Dell Precision 3630)
@@ -29,7 +29,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **Preemptive context switch** | Done | Timer ISR with full register save, context switch hint, TLB shootdown | `src/arch/*/mod.rs` | [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) |
 | **Capability-based IPC (control path)** | Done | 256-byte fixed messages, three-layer enforcement, sender_principal stamping, sharded per-endpoint | `src/ipc/` | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
 | **Capability bulk path (channels)** | Designed, not implemented | Shared memory channels for data plane | — | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
-| **Capability revocation** | Designed, not implemented | `SYS_REVOKE_CAPABILITY` + atomic teardown | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
+| **Capability revocation** | Done (Wave 1, bootstrap-only) | `SYS_REVOKE_CAPABILITY` (#27), `CapabilityManager::revoke()`, `revoke_all_for_process()` wired into `handle_exit`. Authority = bootstrap Principal only; grantor/revoke-right paths defer to Wave 4. Audit emit, channel mapping cleanup, policy cache invalidation, and active holder notification are in-code stubs citing Wave 2/3/4. | `src/ipc/capability.rs`, `src/syscalls/dispatcher.rs` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Audit telemetry** | Designed, not implemented | Kernel→userspace event channel for AI observability | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Policy service** | Designed, not implemented | User-space externalization of `on_syscall` decisions | — | [ADR-006](docs/adr/006-policy-service.md) |
 | **Cryptographic identity** | Done (Phase 1C, hardware-backed) | Bootstrap Principal from compiled-in YubiKey pubkey, IPC sender stamping, BindPrincipal/GetPrincipal syscalls | `src/ipc/`, `bootstrap_pubkey.bin` | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
@@ -80,7 +80,7 @@ ArcOS uses informal phases to mark identity/storage milestones. These phases are
 | **Phase 1C** | Key-store service degraded mode + signed ObjectStore puts. fs-service requests signing from key-store before ObjPut; falls back to unsigned when key-store is in degraded mode (no runtime YubiKey). | **Done** |
 | **Phase 2A** | First user-space hardware driver. Virtio-net with PCI discovery, virtqueues, DMA bounce buffers, hostile-device validation. | **Done** |
 | **Phase 2B** | First user-space network service. Stateless UDP/IP over virtio-net, with NTP demo. | **Done** |
-| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: ADRs 005-007 drafted, implementation pending** |
+| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: Wave 1 (revocation primitive) landed; Wave 2 (channels), Wave 3 (telemetry), Wave 4 (policy service) pending** |
 | **Phase 4** | Persistent storage. Virtio-blk driver, disk-backed ObjectStore, ArcObject CLI in shell. | **Planned** |
 | **Phase 5** | Identity-routed networking. Yggdrasil peer service, Ed25519→IPv6 mapping, mesh routing without DNS. | **Planned** |
 | **Phase 6** | Biometric commitment + key recovery. Retinal/facial ZKP enrollment, social attestation, key rotation protocol. | **Planned (post-v1)** |
@@ -110,7 +110,7 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | Subsystem | Tests | Notes |
 |---|---|---|
 | Scheduler | 35 | Creation, init, lifecycle, schedule, time slice, block/wake, IRQ/message wake, idle immutability, migration primitives, invariants |
-| Capability manager | 11 | Grant, verify, delegation, escalation prevention, capacity limits, Principal bind/get |
+| Capability manager | 22 | Grant, verify, delegation, escalation prevention, capacity limits, Principal bind/get, revocation authority checks, revoke_all_for_process cleanup, error-path coverage |
 | IPC interceptor | 13 | Payload validation, bounds, self-send, delegation policy, syscall filtering, custom interceptors |
 | ELF verifier | 14 | W^X, kernel space rejection, overlapping segments, memory limits, entry point boundary cases, signed binary verifier |
 | IPC sender_principal | 4 | Default None, kernel stamping, no-principal path, direct send bypass |
@@ -119,7 +119,7 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | Memory subsystem | ~30 | Buddy allocator, frame allocator, heap, paging primitives |
 | AArch64 portable logic | 12 | PerCpu offsets, GIC register math, page table descriptor flags |
 | Other | ~70 | Timer, IPC sync channel, ProcessTable, VMA tracker, syscall args, etc. |
-| **Total** | **218** | All passing on `x86_64-apple-darwin` |
+| **Total** | **229** | All passing on `x86_64-apple-darwin` |
 
 Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 
@@ -128,7 +128,7 @@ Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 - **AArch64 SMP timer on AP**: PPI 30 (ARM Generic Timer) does not fire on the second CPU in QEMU `virt`. Single-CPU mode works fully. Investigation pending; may be a QEMU configuration issue or a missing GIC redistributor configuration step on the AP path.
 - **AArch64 device IRQ routing**: GIC `enable_spi()` / `set_spi_trigger()` exist as functions but are not called from the boot path or `handle_wait_irq()`. Device IRQs (virtio, PL011 RX) are not yet functional on AArch64.
 - **ELF loader doesn't merge overlapping segment permissions**: If two PT_LOAD segments share a page with different permissions, the first segment's permissions win. Worked around in user-space linker scripts via `ALIGN(4096)` before `.data`. Loader fix is roadmap item 20.
-- **Process lifecycle cleanup is partial**: `handle_exit` marks the task Terminated but doesn't reclaim page tables, frames, IPC endpoints, or VMA regions. Roadmap item 17.
+- **Process lifecycle cleanup is partial**: `handle_exit` marks the task Terminated and (as of Phase 3 Wave 1) reclaims endpoint capabilities via `revoke_all_for_process()`, but still doesn't reclaim page tables, frames, IPC endpoint subscriptions, or VMA regions. Roadmap item 17.
 - **Virtio-net TX completion may require yield to idle on QEMU TCG**: QEMU TCG defers virtio TX processing to its event loop, which runs during guest `hlt`. The driver yields and the idle task hlts, which works for small bursts but the UDP stack's ARP retry/timeout logic doesn't yet exploit this fully.
 
 ## Cross-references

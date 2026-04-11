@@ -226,6 +226,7 @@ impl SyscallDispatcher {
             SyscallNumber::ConsoleRead => Self::handle_console_read(args, ctx),
             SyscallNumber::Spawn => Self::handle_spawn(args, ctx),
             SyscallNumber::WaitTask => Self::handle_wait_task(args, ctx),
+            SyscallNumber::RevokeCapability => Self::handle_revoke_capability(args, ctx),
         }
     }
 
@@ -262,9 +263,30 @@ impl SyscallDispatcher {
             crate::wake_task_on_cpu(parent_id);
         }
 
+        // Reclaim capability table entries for the exiting process.
+        // Lock ordering: CAPABILITY_MANAGER(4) — SCHEDULER(1) was already
+        // released above, so we can safely acquire a higher-numbered lock.
+        //
+        // Per ADR-007 §"What this gives us", process exit invokes
+        // revoke_all_for_process() to prevent stale capabilities from
+        // accumulating in the capability table.
+        //
+        // Note: this reclaims endpoint capabilities only. VMA regions,
+        // page table frames, and IPC endpoint subscriptions are not yet
+        // reclaimed — see STATUS.md "Process lifecycle cleanup is partial"
+        // known issue. Those are separate work items.
+        let revoked_count = {
+            let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+            if let Some(cap_mgr) = cap_guard.as_mut() {
+                cap_mgr.revoke_all_for_process(ctx.process_id).unwrap_or(0)
+            } else {
+                0
+            }
+        };
+
         crate::println!(
-            "  [Exit] pid={} task={} code={}",
-            ctx.process_id.0, ctx.task_id.0, exit_code
+            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s))",
+            ctx.process_id.0, ctx.task_id.0, exit_code, revoked_count
         );
 
         // Yield to next task. Terminated tasks are never re-scheduled,
@@ -1662,7 +1684,7 @@ impl SyscallDispatcher {
                     let _ = cap_mgr.grant_capability(
                         process_id,
                         crate::ipc::EndpointId(ep),
-                        crate::ipc::CapabilityRights { send: true, receive: true, delegate: false },
+                        crate::ipc::CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
                     );
                 }
                 // Bind bootstrap Principal
@@ -1728,6 +1750,62 @@ impl SyscallDispatcher {
                 }
             }
         }
+
+        Ok(0)
+    }
+
+    /// SYS_REVOKE_CAPABILITY: Revoke a capability held by another process on
+    /// a given endpoint.
+    ///
+    /// Args: arg1 = target_process_id (u32), arg2 = endpoint_id (u32)
+    ///
+    /// Authority — Wave 1 (per ADR-007 §"Who can revoke"):
+    ///   Only the bootstrap Principal can call this. Matches the restriction
+    ///   pattern of `handle_bind_principal` and `handle_claim_bootstrap_key`.
+    ///
+    /// Wave 4 will relax this to also accept: the original grantor of the
+    /// capability, and any process holding the `revoke` right on the endpoint
+    /// (once the policy service exists as the mediator for those paths).
+    ///
+    /// Wave 2 will refactor the argument shape from `(pid, endpoint)` to a
+    /// single `CapabilityHandle`, once channels force a system-wide capability
+    /// registry into existence.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) — no higher locks held.
+    fn handle_revoke_capability(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let target_pid = crate::ipc::ProcessId(args.arg1_u32());
+        let endpoint_id = crate::ipc::EndpointId(args.arg2_u32());
+
+        // Read the bootstrap Principal once at the syscall boundary.
+        // Passed into CapabilityManager::revoke() as the authority reference,
+        // so the primitive stays testable without touching globals.
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+
+        // Lock ordering: CAPABILITY_MANAGER(4)
+        let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+        let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+        // Look up the caller's bound Principal.
+        let revoker_principal = cap_mgr
+            .get_principal(ctx.process_id)
+            .map_err(|_| SyscallError::PermissionDenied)?;
+
+        // Delegate to the primitive. revoke() performs the authority check
+        // (revoker_principal == bootstrap) and the table mutation atomically
+        // under the lock we hold.
+        cap_mgr
+            .revoke(target_pid, endpoint_id, revoker_principal, bootstrap)
+            .map_err(|e| match e {
+                crate::ipc::capability::CapabilityError::AccessDenied => SyscallError::PermissionDenied,
+                crate::ipc::capability::CapabilityError::ProcessNotFound => SyscallError::InvalidArg,
+                crate::ipc::capability::CapabilityError::EndpointNotFound => SyscallError::EndpointNotFound,
+                _ => SyscallError::InvalidArg,
+            })?;
+
+        crate::println!(
+            "  [RevokeCapability] caller_pid={} target_pid={} endpoint={} — revoked",
+            ctx.process_id.0, target_pid.0, endpoint_id.0
+        );
 
         Ok(0)
     }

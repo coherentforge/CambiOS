@@ -179,12 +179,23 @@ pub trait MessageQueue {
     fn is_full(&self) -> bool;
 }
 
-/// Capability-based security model for IPC
+/// Capability-based security model for IPC.
+///
+/// Per ADR-007 §"Capability table changes", `delegate` and `revoke` are
+/// independent rights. Holding `delegate` does not imply `revoke`: a process
+/// may be permitted to share authority without being permitted to take it
+/// back, which is the right behavior for audit-trail-style delegations.
+///
+/// In Wave 1 the `revoke` field exists but no policy path consults it yet.
+/// `SYS_REVOKE_CAPABILITY` is bootstrap-Principal-only until Wave 4 lands the
+/// policy service that mediates the "holder-of-revoke-right can call revoke"
+/// path described in ADR-007 §"Who can revoke".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityRights {
     pub send: bool,
     pub receive: bool,
     pub delegate: bool,
+    pub revoke: bool,
 }
 
 impl CapabilityRights {
@@ -192,24 +203,28 @@ impl CapabilityRights {
         send: false,
         receive: false,
         delegate: false,
+        revoke: false,
     };
 
     pub const FULL: Self = CapabilityRights {
         send: true,
         receive: true,
         delegate: true,
+        revoke: true,
     };
 
     pub const SEND_ONLY: Self = CapabilityRights {
         send: true,
         receive: false,
         delegate: false,
+        revoke: false,
     };
 
     pub const RECV_ONLY: Self = CapabilityRights {
         send: false,
         receive: true,
         delegate: false,
+        revoke: false,
     };
 }
 
