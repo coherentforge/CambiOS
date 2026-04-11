@@ -337,6 +337,12 @@ const MAX_GSI_PINS: usize = 24;
 const CACHE_CAPACITY: usize = 32;
 ```
 
+**SCAFFOLDING bounds must be sized for the v1 endgame, not today's workload.** When picking a SCAFFOLDING value, do not pick "the smallest number that works today" with the plan to resize later. Extrapolate forward across the full v1 sequence: Phase 3 (channels, policy service, audit telemetry), Phase 4 (persistent ObjectStore + virtio-blk), Phase 5 (Yggdrasil mesh networking), the init process spawning services from a boot manifest, and per-service state growth as the kernel matures. A bound that is comfortably above today's usage but gets crossed during v1 development is the worst case — it looks fine at review time and silently becomes a bottleneck during the waves where changing it is most disruptive. The rule:
+
+1. Estimate **(a)** current workload, **(b)** v1 workload after all phases land, **(c)** memory cost at candidate multiples of the v1 estimate.
+2. Pick the smallest value where the v1 estimate is approximately **≤ 25% of the bound** AND the memory cost is still comfortable. "≤ 25%" means the bound has ~4× headroom above the v1 estimate — enough that a surprising workload or an unplanned consumer (a new audit channel, a second policy cache) does not push against the wall.
+3. Record the math in the row for that constant in [ASSUMPTIONS.md](ASSUMPTIONS.md) — the "Why this number" column should show the v1 workload estimate and the memory cost, not just "big enough."
+
 When you add a new bound or change one, update the matching table in [ASSUMPTIONS.md](ASSUMPTIONS.md) in the same change. Step 8 of the Post-Change Review Protocol lists this as an explicit checklist item.
 
 ## Multi-Platform Strategy (x86_64, AArch64, RISC-V planned)
@@ -402,6 +408,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **IPC control path (256-byte messages)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/mod.rs`, `src/ipc/interceptor.rs` |
 | **IPC bulk path (channels — Phase 3)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (channels are the audit transport) |
 | **Capabilities, grant/revoke, delegation** | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) | `src/ipc/capability.rs` |
+| **Process tables / tier configuration / boot-time object sizing** | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md), [ADR-009](docs/adr/009-purpose-tiers-scope.md) | `src/process.rs`, `src/ipc/capability.rs`, [ASSUMPTIONS.md § Tier policies](ASSUMPTIONS.md) |
 | **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/interceptor.rs` |
 | **Audit telemetry / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | — |
 | **Identity / Principal / sender_principal** | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) (intent only) |
@@ -423,7 +430,8 @@ These documents capture architectural decisions that implementation must align w
 - **[PHILOSOPHY.md](PHILOSOPHY.md)** — Why ArcOS exists, the AI-watches-not-decides stance, the verification-first commitment.
 - **[SECURITY.md](SECURITY.md)** — Security posture, enforcement table, threat model.
 - **[ASSUMPTIONS.md](ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
-- **[docs/adr/](docs/adr/)** — Architecture decision records (ADRs 000-007). Read the ones in the Required Reading map for the subsystem you're touching.
+- **[GOVERNANCE.md](GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
+- **[docs/adr/](docs/adr/)** — Architecture decision records (ADRs 000-009). Read the ones in the Required Reading map for the subsystem you're touching.
 
 Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
 
@@ -456,6 +464,11 @@ make run            # x86_64
 make run-aarch64    # AArch64
 ```
 All builds must pass with zero errors. Do not skip any step.
+
+**Flag pre-existing warnings.** Any warning surfaced by `cargo build` / `cargo test` — even pre-existing and unrelated to the current change — must be acknowledged, not silently passed through. Warnings accumulate, and "pre-existing and unrelated" is how technical debt becomes invisible. Two acceptable responses:
+
+- **Tiny and safe → fix it in the same change.** Unused imports, unused variables, dead `let` bindings, trivially redundant casts. These take seconds and clearing them keeps build output clean for the next change.
+- **Otherwise → report and track.** Surface the warning explicitly to the user (file:line, warning text, one-line note) and add it to [STATUS.md](STATUS.md)'s "Known issues" section (or another tracked list) so it is not forgotten. Silent pass-through is not acceptable, because build noise is how formal-verification prep and human review lose signal.
 
 ### 2. Safety Audit
 - Every `unsafe` block has a `// SAFETY:` comment explaining the invariants
@@ -500,7 +513,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 | Category | Files | Auto-refresh? | Rule |
 |---|---|---|---|
 | **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
-| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-007) | **No** — human only | ADRs are immutable history. If a decision is wrong or superseded, write a new ADR that supersedes it. Never edit an old ADR to reflect new code state. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
+| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-009) | **No** — human only | ADRs are immutable history. If a decision is wrong or superseded, write a new ADR that supersedes it. Never edit an old ADR to reflect new code state. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
 | **design / source_of_truth** | [ArcOS.md](ArcOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 

@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide numeric bound catalog
 auto_refresh: required
-last_synced_to_code: 2026-04-10
+last_synced_to_code: 2026-04-11
 authoritative_for: every fixed numeric bound, fixed-size array, hard limit in kernel code — what kind of bound it is, why this number, and what triggers re-evaluation
 -->
 
@@ -136,6 +136,20 @@ These are performance knobs. Picking a number without measurements is guessing. 
 | `REFILL_COUNT` / `DRAIN_COUNT` | 16 / 16 | [src/memory/frame_allocator.rs:326](src/memory/frame_allocator.rs#L326) | Batch size for cache refill/drain — amortizes the global lock cost. |
 | `MAX_INDIVIDUAL_PAGES` (TLB shootdown) | 32 | [src/arch/x86_64/tlb.rs:31](src/arch/x86_64/tlb.rs#L31) | Threshold for `invlpg` per-page vs. full CR3 reload. Above 32, full reload is cheaper. Verified empirically by other kernels; not measured for ArcOS. |
 | `MAX_OVERRIDES` (ACPI MADT) | 16 | [src/acpi/mod.rs:187](src/acpi/mod.rs#L187) | Realistic firmware override count. |
+
+#### Tier policies (Wave 2a pending code site)
+
+These three rows capture the default `TableSizingPolicy` per deployment tier introduced by [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and [ADR-009](docs/adr/009-purpose-tiers-scope.md). Each policy is a 5-field struct — `min_slots`, `max_slots`, `ram_budget_ppm`, `ram_budget_floor`, `ram_budget_ceiling` — that drives the boot-time process/capability table sizing computation. They are TUNING because the defaults are starting points chosen from estimated workload density; the right values depend on what each tier's deployments actually run, and will shift as real workload data arrives. The kernel binary is identical across tiers per ADR-009; what differs is the `TableSizingPolicy` value compiled in from the tier's configuration.
+
+The "Where" column currently points at ADR-008 because `src/config/tier.rs` does not yet exist — the module lands in Wave 2a. When Wave 2a merges, these rows flip to `src/config/tier.rs:<line>`.
+
+| Policy | Value | Where | What it trades off |
+|---|---|---|---|
+| `TIER1_POLICY` (ArcOS-Embedded) | `{ min_slots: 32, max_slots: 256, ram_budget_ppm: 15_000, ram_budget_floor: 2 MiB, ram_budget_ceiling: 8 MiB }` | [docs/adr/008-boot-time-sized-object-tables.md § Decision](docs/adr/008-boot-time-sized-object-tables.md) (Wave 2a moves to `src/config/tier.rs`) | 1.5% of RAM, clamped 2-8 MiB, for 32-256 slots. Embedded deployments run small, stable sets of fixed-function processes; 256-slot ceiling reflects "more than this is probably the wrong tier." Tunable per deployment via custom tier config. |
+| `TIER2_POLICY` (ArcOS-Standard, no AI) | `{ min_slots: 128, max_slots: 4096, ram_budget_ppm: 20_000, ram_budget_floor: 16 MiB, ram_budget_ceiling: 64 MiB }` | [docs/adr/008-boot-time-sized-object-tables.md § Decision](docs/adr/008-boot-time-sized-object-tables.md) (Wave 2a moves to `src/config/tier.rs`) | 2% of RAM, clamped 16-64 MiB, for 128-4096 slots. Sized for a typical single-user desktop or workstation. Shared multi-user machines or heavy build farms raise the ceiling in a custom tier config. |
+| `TIER3_POLICY` (ArcOS-Full) | `{ min_slots: 256, max_slots: 65536, ram_budget_ppm: 30_000, ram_budget_floor: 64 MiB, ram_budget_ceiling: 512 MiB }` | [docs/adr/008-boot-time-sized-object-tables.md § Decision](docs/adr/008-boot-time-sized-object-tables.md) (Wave 2a moves to `src/config/tier.rs`) | 3% of RAM, clamped 64-512 MiB, for 256-65536 slots. Sized for heavy general-purpose workloads (large builds, many user applications, AI services with per-request workers). 65536 is a default, not a physical limit. |
+
+**Revisit when:** ADR-008 § "Post-Change Review Protocol" note — changes to per-process kernel state (new fields in `ProcessDescriptor`, `ProcessCapabilities`, etc.) shift `SLOT_OVERHEAD`, which changes how many slots fit in a given budget. When that happens, the tier defaults may need to move so the binding constraint (slot count vs. budget) stays where the policy intended. The first real workload data from bare-metal Tier 3 deployment is also a revisit trigger.
 
 ## Adding or changing a bound
 
