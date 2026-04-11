@@ -4,6 +4,8 @@
 
 This is the source document for ArcOS. Everything else — contributor guides, marketing copy, technical references — derives from what's written here. If a decision contradicts this document, this document wins or this document gets updated. There is no third option.
 
+The architectural commitments that this document carries narratively are made formal and cite-able in **[ADR-009](docs/adr/009-purpose-tiers-scope.md)** — purpose statements, deployment tiers, hardware floors, and scope boundaries. Governance and funding commitments are in **[GOVERNANCE.md](GOVERNANCE.md)**. When a future decision needs a stable reference for what ArcOS *is*, cite ADR-009. When it needs a reference for how ArcOS is *run*, cite GOVERNANCE.md.
+
 ---
 
 ## The Problem
@@ -39,6 +41,8 @@ arcOS will never phone home - there is no home to phone. It will never collect u
 ### 4. AI as Infrastructure, Not Application
 
 We aren't strapping a little chat-boy on the desktop here. AI/LLM compose a structural component of the operating system — the same way virtual memory or preemptive scheduling is a structural component. Checking code before execution, detecting anomalous behavior at runtime, adapting legacy applications to run on unfamiliar hardware, live-patching if and when updates are needed - all supervised by fast and light specialized models. These are capabilities that the system depends on to function, to safeguard user data and ensure malicious code is caught and sandboxed, and to truly improve overall UX.
+
+This applies at the tiers of ArcOS that include AI components (see [ADR-009 § Deployment Tiers](docs/adr/009-purpose-tiers-scope.md)). ArcOS is delivered in three tiers: an embedded tier with no AI, a standard tier with no AI but with the full non-AI feature set, and a full tier with all AI components. On tiers without AI, the features described above degrade gracefully to non-AI alternatives where they exist or are absent where they do not. The architecture is the same across all tiers; the set of user-space services compiled into the boot image is what differs.
 
 ### 5. Identity Is Cryptographic, Not Secret-Based
 
@@ -371,6 +375,10 @@ The social protocol (described in the Networking section) provides the infrastru
 - **Feeds as a native UI element** — The social feed (from the SSB-inspired append-only logs) is rendered by the OS, not by a web browser pointed at a platform. This means the OS controls the rendering: no injected ads, no manipulated ordering, no dark patterns.
 - **Group spaces** — Groups of people (teams, families, communities) can share a region of the spatial interface. Shared documents, group conversations, and collaborative projects live in a shared space that all members can navigate. Access is controlled by capabilities, not by a platform's permission model.
 
+### UX Tier Dependencies
+
+The spatial interface, workflow AI, and contextual adaptation described above require local LLM inference and are features of the full (Tier 3) deployment of ArcOS. On Tier 2 (no AI), ArcOS provides a traditional windowing shell with the same security, privacy, and sovereignty properties as Tier 3 but without the contextual adaptation. On Tier 1 (embedded), most UX features are absent by design — embedded deployments are typically headless or use a minimal console. This is graceful degradation, not missing functionality: a Tier 2 deployment is a complete, usable operating system with a traditional but modern shell; a Tier 1 deployment is a complete, usable embedded kernel. See [ADR-009](docs/adr/009-purpose-tiers-scope.md) for the full tier model.
+
 ---
 
 ## Platform Support
@@ -388,6 +396,16 @@ For the up-to-date list of remaining gaps (device IRQ routing on AArch64, SMP ti
 ### Future Considerations
 
 ArcOS's architecture does not assume x86 or ARM. The platform abstraction is a defined interface. If RISC-V, or something that doesn't exist yet, becomes relevant — the interface accommodates it. But we don't design for hypothetical targets. We design for a clean abstraction, and clean abstractions naturally extend.
+
+### Deployment Tiers
+
+ArcOS is delivered in three compile-time tiers. The kernel is the same across tiers; what differs is which user-space services are included in the boot image. Full details in [ADR-009](docs/adr/009-purpose-tiers-scope.md).
+
+- **Tier 1 — ArcOS-Embedded** — 256 MB to 1 GB RAM. Full microkernel, minimal core services. No AI. No shell beyond minimal console. No compositor. For fixed-function devices where ArcOS's security architecture is valuable but AI inference is not available.
+- **Tier 2 — ArcOS-Standard** — 1 GB to 16 GB RAM. Full microkernel, full core services, hand-coded Windows compatibility, traditional windowing shell. No AI components. For users who want ArcOS's security, privacy, and sovereignty commitments on hardware that cannot run local LLMs, or who prefer not to run AI components.
+- **Tier 3 — ArcOS-Full** — 8 GB+ RAM, ideally with GPU or NPU for AI workloads. Everything. The spatial UX, the security AI watcher, AI-assisted Windows compatibility, the full native ecosystem. The primary development target and the tier that embodies the full ArcOS vision.
+
+The tiers are user choices informed by hardware guidance, not kernel classifications. Hardware provenance (commodity vs vendor-audited vs fully open) is a separate axis and is discussed in [ADR-009's Hardware Supply Chain section](docs/adr/009-purpose-tiers-scope.md).
 
 ---
 
