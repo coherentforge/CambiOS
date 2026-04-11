@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-10
+last_synced_to_code: 2026-04-11
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
@@ -30,6 +30,8 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **Capability-based IPC (control path)** | Done | 256-byte fixed messages, three-layer enforcement, sender_principal stamping, sharded per-endpoint | `src/ipc/` | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
 | **Capability bulk path (channels)** | Designed, not implemented | Shared memory channels for data plane | — | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
 | **Capability revocation** | Done (Wave 1, bootstrap-only) | `SYS_REVOKE_CAPABILITY` (#27), `CapabilityManager::revoke()`, `revoke_all_for_process()` wired into `handle_exit`. Authority = bootstrap Principal only; grantor/revoke-right paths defer to Wave 4. Audit emit, channel mapping cleanup, policy cache invalidation, and active holder notification are in-code stubs citing Wave 2/3/4. | `src/ipc/capability.rs`, `src/syscalls/dispatcher.rs` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
+| **Boot-time-sized kernel object tables** | Designed, Wave 2a pending | `MAX_PROCESSES` → runtime `num_slots` computed from per-tier `TableSizingPolicy`, dedicated kernel object table region outside the kernel heap. Wave 2a (tables + region), Wave 2b (`CreateProcess` capability), Wave 2c (`CapabilityHandle` refactor + `ProcessId` generation counter), Wave 2d (channels on the new foundation). | — | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) |
+| **Deployment tiers / scope** | Designed, policy-only | Three tiers (Tier 1 ArcOS-Embedded, Tier 2 ArcOS-Standard, Tier 3 ArcOS-Full). Single kernel binary across tiers; tier selection is an install-time choice that decides which `TableSizingPolicy` and which user-space services are loaded. No code gate yet. | — | [ADR-009](docs/adr/009-purpose-tiers-scope.md), [GOVERNANCE.md](GOVERNANCE.md) |
 | **Audit telemetry** | Designed, not implemented | Kernel→userspace event channel for AI observability | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Policy service** | Designed, not implemented | User-space externalization of `on_syscall` decisions | — | [ADR-006](docs/adr/006-policy-service.md) |
 | **Cryptographic identity** | Done (Phase 1C, hardware-backed) | Bootstrap Principal from compiled-in YubiKey pubkey, IPC sender stamping, BindPrincipal/GetPrincipal syscalls | `src/ipc/`, `bootstrap_pubkey.bin` | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
@@ -80,7 +82,7 @@ ArcOS uses informal phases to mark identity/storage milestones. These phases are
 | **Phase 1C** | Key-store service degraded mode + signed ObjectStore puts. fs-service requests signing from key-store before ObjPut; falls back to unsigned when key-store is in degraded mode (no runtime YubiKey). | **Done** |
 | **Phase 2A** | First user-space hardware driver. Virtio-net with PCI discovery, virtqueues, DMA bounce buffers, hostile-device validation. | **Done** |
 | **Phase 2B** | First user-space network service. Stateless UDP/IP over virtio-net, with NTP demo. | **Done** |
-| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: Wave 1 (revocation primitive) landed; Wave 2 (channels), Wave 3 (telemetry), Wave 4 (policy service) pending** |
+| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: Wave 1 (revocation primitive) landed; Wave 2 in progress — see [ADR-008 § Migration Path](docs/adr/008-boot-time-sized-object-tables.md) for the 2a.0→2a→2b→2c→2d decomposition; Wave 3 (telemetry), Wave 4 (policy service) pending** |
 | **Phase 4** | Persistent storage. Virtio-blk driver, disk-backed ObjectStore, ArcObject CLI in shell. | **Planned** |
 | **Phase 5** | Identity-routed networking. Yggdrasil peer service, Ed25519→IPv6 mapping, mesh routing without DNS. | **Planned** |
 | **Phase 6** | Biometric commitment + key recovery. Retinal/facial ZKP enrollment, social attestation, key rotation protocol. | **Planned (post-v1)** |
@@ -137,7 +139,9 @@ Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 - [identity.md](identity.md) — identity architecture (Phases 0-7 are defined here)
 - [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — settled decisions for the identity + storage layer
 - [SECURITY.md](SECURITY.md) — enforcement status table (security-specific subset of this document)
+- [GOVERNANCE.md](GOVERNANCE.md) — project governance, deployment tiers, scope boundaries (companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md))
+- [ASSUMPTIONS.md](ASSUMPTIONS.md) — catalog of every numeric bound in kernel code with SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING category
 - [README.md](README.md) — public-facing summary
 - [SCHEDULER.md](src/scheduler/SCHEDULER.md) — scheduler implementation reference
-- [docs/adr/](docs/adr/) — architecture decision records
+- [docs/adr/](docs/adr/) — architecture decision records (ADRs 000-009)
 - [CLAUDE.md](CLAUDE.md) — kernel technical reference and required-reading map

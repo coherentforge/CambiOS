@@ -17,3 +17,7 @@ rustflags = [
     "-C", "link-arg=-z", "-C", "link-arg=noexecstack",
     "-C", "relocation-model=static",
 ]
+
+[alias]
+kbuild = "build --target x86_64-unknown-none"
+ktest = "test --lib"

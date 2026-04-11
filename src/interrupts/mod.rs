@@ -18,6 +18,7 @@ extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
 use x86_64::structures::idt::InterruptDescriptorTable;
+#[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub mod routing;

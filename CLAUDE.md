@@ -109,67 +109,45 @@ ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targetin
 
 ## Architecture
 
+### Kernel (`src/`)
+
 ```
 src/
 ├── lib.rs                    # Crate root, global statics, init, halt
 ├── process.rs                # ProcessTable, ProcessDescriptor, VmaTracker
+├── boot_modules.rs           # Boot module registry (name → physical range)
 ├── acpi/
 │   └── mod.rs                # ACPI table parser (RSDP, XSDT, MADT)
 ├── arch/
 │   ├── mod.rs                # cfg-gated architecture shim (re-exports active backend)
 │   ├── spinlock.rs           # Spinlock + IrqSpinlock (interrupt-disabling)
 │   ├── x86_64/
-│   │   ├── mod.rs            # Context switching, SavedContext, timer_isr_inner
-│   │   ├── apic.rs           # Local APIC driver (timer, EOI, PIC disable)
+│   │   ├── mod.rs            # SavedContext, context_switch, timer_isr_inner, yield_save_and_switch
+│   │   ├── apic.rs           # Local APIC driver (timer, EOI, PIC disable, IPI primitives)
 │   │   ├── gdt.rs            # Per-CPU GDT + TSS + IST (SMP-ready)
 │   │   ├── ioapic.rs         # I/O APIC driver (device IRQ routing)
+│   │   ├── msr.rs            # Shared rdmsr/wrmsr wrappers used by apic/percpu/syscall
 │   │   ├── percpu.rs         # Per-CPU data (GS base), PerCpu struct
+│   │   ├── portio.rs         # Safe wrappers around in/out port I/O (Port8/16/32)
 │   │   ├── syscall.rs        # SYSCALL/SYSRET MSR init + kernel-stack entry stub
 │   │   └── tlb.rs            # TLB shootdown via IPI (vector 0xFE)
 │   └── aarch64/
-│       ├── mod.rs            # SavedContext, context_switch, timer_isr_inner (asm)
+│       ├── mod.rs            # SavedContext, context_switch, timer_isr_inner (asm), yield_save_and_switch
 │       ├── gic.rs            # GICv3 driver (Distributor, Redistributor, ICC sysregs)
 │       ├── percpu.rs         # Per-CPU data (TPIDR_EL1), PerCpu struct
 │       ├── syscall.rs        # SVC entry stub + VBAR_EL1 init
-│       ├── timer.rs          # ARM Generic Timer (CNTP_TVAL_EL0, 100Hz)
+│       ├── timer.rs          # ARM Generic Timer (CNTP_TVAL_EL0, 100 Hz)
 │       └── tlb.rs            # TLB shootdown via TLBI broadcast instructions
-├── interrupts/
-│   ├── mod.rs                # IDT setup, exception/device ISR handlers
-│   ├── pic.rs                # 8259 PIC driver (disabled at boot)
-│   ├── pit.rs                # 8254 PIT (calibration only)
-│   └── routing.rs            # IRQ → driver task routing table
 ├── fs/
 │   ├── mod.rs                # ArcObject, ObjectStore trait, Blake3 hashing, Ed25519 sign/verify
-│   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects, Blake3 hashing)
-user/
-├── hello.S                   # Test module (prints 3x, exits)
-├── user.ld                   # User-space linker script (base 0x400000)
-├── libsys/                   # Shared syscall wrapper library for all user-space crates
-│   ├── Cargo.toml
-│   └── src/lib.rs            # Safe wrappers around x86_64 SYSCALL; only unsafe crate in user-space
-├── fs-service/               # Filesystem service (Rust no_std crate)
-│   ├── Cargo.toml
-│   ├── link.ld               # Linker script (.data on separate page for GOT)
-│   └── src/main.rs           # IPC service loop on endpoint 16, ObjectStore gateway
-├── key-store-service/        # Key store service (Ed25519 signing, Rust no_std crate)
-│   ├── Cargo.toml            # Uses ed25519-compact (no_std)
-│   ├── link.ld               # Linker script (same pattern as fs-service)
-│   └── src/main.rs           # Claims bootstrap key at boot, signs on IPC request (endpoint 17)
-├── virtio-net/               # Virtio-net driver (user-space, Rust no_std crate)
-│   ├── Cargo.toml
-│   ├── link.ld
-│   └── src/                  # main.rs + transport.rs, virtqueue.rs, device.rs, pci.rs
-│       └── main.rs           # PCI discovery, legacy virtio transport, IPC on endpoint 20
-└── udp-stack/                # UDP/IP network service (user-space, Rust no_std crate)
-    ├── Cargo.toml
-    ├── link.ld
-    └── src/main.rs           # ARP, IPv4, UDP, NTP demo, IPC on endpoint 21
-tools/
-└── sign-elf/                 # Host-side ELF signing tool (Ed25519)
-    ├── Cargo.toml            # Uses ed25519-compact, openpgp-card, card-backend-pcsc
-    └── src/main.rs           # Signs ELF binaries via YubiKey or seed, ARCSIG trailer
+│   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects)
+├── interrupts/
+│   ├── mod.rs                # IDT setup, exception/device ISR handlers
+│   ├── pic.rs                # 8259 PIC driver (disabled at boot, x86_64 only)
+│   ├── pit.rs                # 8254 PIT (APIC calibration only, x86_64 only)
+│   └── routing.rs            # IRQ → driver task routing table (portable)
 ├── io/
-│   └── mod.rs                # Serial output (uart_16550), print!/println! macros
+│   └── mod.rs                # Serial output (uart_16550 / PL011), print!/println! macros
 ├── ipc/
 │   ├── mod.rs                # IPC: Principal, EndpointQueue, SyncChannel, IpcManager, ShardedIpcManager
 │   ├── capability.rs         # Capability-based security + Principal binding
@@ -179,16 +157,16 @@ tools/
 │   └── elf.rs                # ELF64 header/program header parser
 ├── memory/
 │   ├── mod.rs                # Memory subsystem init + AArch64 paging (L0-L3, early_map_mmio)
-│   ├── heap.rs               # Kernel heap allocator (linked-list, GlobalAlloc)
-│   ├── frame_allocator.rs    # Bitmap-based physical frame allocator (covers 0-2GiB) + per-CPU FrameCache
 │   ├── buddy_allocator.rs    # Pure bookkeeping buddy allocator
+│   ├── frame_allocator.rs    # Bitmap-based physical frame allocator (covers 0–2 GiB) + per-CPU FrameCache
+│   ├── heap.rs               # Kernel heap allocator (linked-list, GlobalAlloc)
 │   └── paging.rs             # x86_64 page table management (OffsetPageTable)
 ├── microkernel/
 │   └── main.rs               # Kernel entry point, all subsystem init
 ├── pci/
 │   └── mod.rs                # PCI bus scan (bus 0), device table, BAR decoding, port validation
 ├── platform/
-│   └── mod.rs                # Platform abstraction, CR4 features
+│   └── mod.rs                # Platform abstraction, CR4/CPU feature detection
 ├── scheduler/
 │   ├── mod.rs                # Priority-band scheduler with per-band VecDeque, on_timer_isr()
 │   ├── task.rs               # Task/TaskState/CpuContext definitions
@@ -197,6 +175,37 @@ tools/
     ├── mod.rs                # SyscallNumber enum, SyscallArgs
     ├── dispatcher.rs         # Syscall dispatch + handlers (all 28 implemented)
     └── userspace.rs          # Stub userspace syscall wrappers
+```
+
+### User-space services (`user/`)
+
+```
+user/
+├── user.ld                   # x86_64 user-space linker script (base 0x400000)
+├── user-aarch64.ld           # AArch64 user-space linker script
+├── hello.S                   # Test module (prints 3x, exits) — boot module
+├── libsys/                   # Shared syscall wrapper library — only unsafe user-space crate
+│   └── src/lib.rs            # Safe wrappers over x86_64 SYSCALL and AArch64 SVC
+├── fs-service/               # Filesystem service — boot module, IPC endpoint 16
+│   └── src/main.rs           # ObjectStore gateway (sender_principal enforcement)
+├── key-store-service/        # Key store service (Ed25519 signing) — boot module, IPC endpoint 17
+│   └── src/main.rs           # Claims bootstrap key at boot, signs ObjectStore puts
+├── virtio-net/               # Virtio-net driver — boot module, IPC endpoint 20
+│   └── src/                  # main.rs + transport.rs, virtqueue.rs, device.rs, pci.rs
+├── i219-net/                 # Intel I219-LM driver — boot module (Dell 3630 bare metal)
+│   └── src/                  # main.rs + mmio.rs, pci.rs, phy.rs, regs.rs, ring.rs
+├── udp-stack/                # UDP/IP network service — boot module, IPC endpoint 21
+│   └── src/main.rs           # ARP, IPv4, UDP, NTP demo
+└── shell/                    # Interactive serial shell — boot module
+    └── src/main.rs           # Command parsing over ConsoleRead
+```
+
+### Host-side tools (`tools/`)
+
+```
+tools/
+└── sign-elf/                 # Ed25519 ELF signing tool (YubiKey or seed) — produces ARCSIG trailer
+    └── src/main.rs
 ```
 
 ## Key Technical Details
@@ -514,7 +523,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 |---|---|---|---|
 | **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
 | **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-009) | **No** — human only | ADRs are immutable history. If a decision is wrong or superseded, write a new ADR that supersedes it. Never edit an old ADR to reflect new code state. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
-| **design / source_of_truth** | [ArcOS.md](ArcOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
+| **design / source_of_truth** | [ArcOS.md](ArcOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 
 **Concrete checklist for the change you just made:**
