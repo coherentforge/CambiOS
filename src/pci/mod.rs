@@ -154,11 +154,10 @@ const fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 /// `offset` must be dword-aligned (bits 1:0 = 0).
 unsafe fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let addr = config_address(bus, device, function, offset);
-    // SAFETY: CONFIG_ADDRESS and CONFIG_DATA are standard PCI ports.
-    unsafe {
-        outl(CONFIG_ADDRESS, addr);
-        inl(CONFIG_DATA)
-    }
+    // SAFETY: CONFIG_ADDRESS (0xCF8) is a standard PCI port. Selecting the config register.
+    unsafe { outl(CONFIG_ADDRESS, addr) };
+    // SAFETY: CONFIG_DATA (0xCFC) is a standard PCI port. Reading the selected register.
+    unsafe { inl(CONFIG_DATA) }
 }
 
 /// Write a 32-bit dword to PCI configuration space.
@@ -169,11 +168,10 @@ unsafe fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u3
 /// know what they are doing.
 unsafe fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     let addr = config_address(bus, device, function, offset);
-    // SAFETY: CONFIG_ADDRESS and CONFIG_DATA are standard PCI ports.
-    unsafe {
-        outl(CONFIG_ADDRESS, addr);
-        outl(CONFIG_DATA, value);
-    }
+    // SAFETY: CONFIG_ADDRESS (0xCF8) is a standard PCI port. Selecting the config register.
+    unsafe { outl(CONFIG_ADDRESS, addr) };
+    // SAFETY: CONFIG_DATA (0xCFC) is a standard PCI port. Writing the selected register.
+    unsafe { outl(CONFIG_DATA, value) };
 }
 
 // ---------------------------------------------------------------------------
@@ -218,17 +216,17 @@ unsafe fn decode_bars(
             bars[i] = addr;
             bar_is_io[i] = true;
 
-            // Size detection
-            // SAFETY: Standard BAR sizing protocol — save, write all-ones,
-            // read back, restore.
-            unsafe {
-                pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF);
-                let size_raw = pci_config_read32(bus, device, function, offset);
-                pci_config_write32(bus, device, function, offset, raw);
-                let size_mask = size_raw & 0xFFFF_FFFC;
-                if size_mask != 0 {
-                    bar_sizes[i] = (!size_mask).wrapping_add(1);
-                }
+            // Size detection: standard BAR sizing protocol — save, write
+            // all-ones, read back, restore.
+            // SAFETY: Standard PCI BAR sizing — writes all-ones to the BAR.
+            unsafe { pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF) };
+            // SAFETY: Read back the size mask.
+            let size_raw = unsafe { pci_config_read32(bus, device, function, offset) };
+            // SAFETY: Restore the original BAR value.
+            unsafe { pci_config_write32(bus, device, function, offset, raw) };
+            let size_mask = size_raw & 0xFFFF_FFFC;
+            if size_mask != 0 {
+                bar_sizes[i] = (!size_mask).wrapping_add(1);
             }
 
             i += 1;
@@ -248,29 +246,37 @@ unsafe fn decode_bars(
 
                 // Size detection for 64-bit BAR: write all-ones to both
                 // halves, read back, restore both.
-                // SAFETY: Standard BAR sizing — temporarily overwrites both
-                // BAR registers and restores them.
+                // SAFETY: Standard BAR sizing — write all-ones to low BAR.
+                unsafe { pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF) };
+                // SAFETY: Write all-ones to high BAR.
                 unsafe {
-                    pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF);
                     pci_config_write32(
                         bus, device, function, BAR_OFFSETS[i + 1], 0xFFFF_FFFF,
-                    );
-                    let size_lo =
-                        pci_config_read32(bus, device, function, offset);
-                    let _size_hi = pci_config_read32(
+                    )
+                };
+                // SAFETY: Read back low size mask.
+                let size_lo =
+                    unsafe { pci_config_read32(bus, device, function, offset) };
+                // SAFETY: Read back high size mask.
+                let _size_hi = unsafe {
+                    pci_config_read32(
                         bus, device, function, BAR_OFFSETS[i + 1],
-                    );
-                    pci_config_write32(bus, device, function, offset, raw);
+                    )
+                };
+                // SAFETY: Restore original low BAR value.
+                unsafe { pci_config_write32(bus, device, function, offset, raw) };
+                // SAFETY: Restore original high BAR value.
+                unsafe {
                     pci_config_write32(
                         bus, device, function, BAR_OFFSETS[i + 1], raw_hi,
-                    );
+                    )
+                };
 
-                    // For size, we only store the low 32-bit portion (sizes
-                    // > 4 GiB are uncommon and don't fit in bar_sizes[u32]).
-                    let size_mask = size_lo & 0xFFFF_FFF0;
-                    if size_mask != 0 {
-                        bar_sizes[i] = (!size_mask).wrapping_add(1);
-                    }
+                // For size, we only store the low 32-bit portion (sizes
+                // > 4 GiB are uncommon and don't fit in bar_sizes[u32]).
+                let size_mask = size_lo & 0xFFFF_FFF0;
+                if size_mask != 0 {
+                    bar_sizes[i] = (!size_mask).wrapping_add(1);
                 }
 
                 // Next BAR is the high half — mark it consumed
@@ -281,17 +287,17 @@ unsafe fn decode_bars(
                 // 32-bit MMIO BAR
                 bars[i] = (raw & 0xFFFF_FFF0) as u64;
 
-                // Size detection
-                // SAFETY: Standard BAR sizing protocol.
-                unsafe {
-                    pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF);
-                    let size_raw =
-                        pci_config_read32(bus, device, function, offset);
-                    pci_config_write32(bus, device, function, offset, raw);
-                    let size_mask = size_raw & 0xFFFF_FFF0;
-                    if size_mask != 0 {
-                        bar_sizes[i] = (!size_mask).wrapping_add(1);
-                    }
+                // Size detection: standard BAR sizing protocol.
+                // SAFETY: Write all-ones to the BAR.
+                unsafe { pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF) };
+                // SAFETY: Read back the size mask.
+                let size_raw =
+                    unsafe { pci_config_read32(bus, device, function, offset) };
+                // SAFETY: Restore the original BAR value.
+                unsafe { pci_config_write32(bus, device, function, offset, raw) };
+                let size_mask = size_raw & 0xFFFF_FFF0;
+                if size_mask != 0 {
+                    bar_sizes[i] = (!size_mask).wrapping_add(1);
                 }
 
                 i += 1;

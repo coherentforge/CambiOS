@@ -86,10 +86,11 @@ pub unsafe fn active_page_table() -> OffsetPageTable<'static> {
     let hhdm = crate::hhdm_offset();
     let virt = (phys + hhdm) as *mut PageTable;
 
-    // SAFETY: CR3 points to a valid PML4 frame. HHDM offset (set by Limine) maps
-    // all physical memory to the higher half, so (phys + hhdm) is a valid virtual
-    // address for this frame. Caller ensures only one mutable reference exists.
-    unsafe { OffsetPageTable::new(&mut *virt, VirtAddr::new(hhdm)) }
+    // SAFETY: CR3 points to a valid PML4 frame. HHDM maps phys to a valid VA.
+    // Caller ensures only one mutable reference exists.
+    let pml4_ref = unsafe { &mut *virt };
+    // SAFETY: pml4_ref is a valid, mutable page table reference. hhdm is the HHDM base.
+    unsafe { OffsetPageTable::new(pml4_ref, VirtAddr::new(hhdm)) }
 }
 
 /// Get an OffsetPageTable for a specific PML4 physical address via HHDM.
@@ -100,10 +101,11 @@ pub unsafe fn active_page_table() -> OffsetPageTable<'static> {
 pub unsafe fn page_table_from_cr3(pml4_phys: u64) -> OffsetPageTable<'static> {
     let hhdm = crate::hhdm_offset();
     let virt = (pml4_phys + hhdm) as *mut PageTable;
-    // SAFETY: pml4_phys was obtained from create_process_page_table() or Cr3::read();
-    // both produce valid PML4 physical addresses. HHDM maps it to a valid VA.
-    // Caller ensures only one mutable reference exists.
-    unsafe { OffsetPageTable::new(&mut *virt, VirtAddr::new(hhdm)) }
+    // SAFETY: pml4_phys was obtained from create_process_page_table() or Cr3::read().
+    // HHDM maps it to a valid VA. Caller ensures only one mutable reference exists.
+    let pml4_ref = unsafe { &mut *virt };
+    // SAFETY: pml4_ref is a valid, mutable page table reference. hhdm is the HHDM base.
+    unsafe { OffsetPageTable::new(pml4_ref, VirtAddr::new(hhdm)) }
 }
 
 /// Map a single 4 KiB virtual page to a physical frame.
@@ -228,14 +230,13 @@ pub fn create_process_page_table(
     let current_pml4_phys = current_pml4_frame.start_address().as_u64();
     let current_pml4 = (current_pml4_phys + hhdm) as *const PageTable;
 
-    // SAFETY: Both current_pml4 and new_pml4 are valid HHDM-mapped page tables.
-    // We copy entries 256..512 (the kernel half): 256 × 8 = 2048 bytes.
+    // SAFETY: current_pml4 is a valid HHDM-mapped page table. Computing offset into it.
+    let src = unsafe { (current_pml4 as *const u8).add(256 * 8) };
+    // SAFETY: new_pml4 is a valid HHDM-mapped page table. Computing offset into it.
+    let dst = unsafe { (new_pml4 as *mut u8).add(256 * 8) };
+    // SAFETY: We copy entries 256..512 (the kernel half): 256 × 8 = 2048 bytes.
     // Source and destination don't overlap (different physical frames).
-    unsafe {
-        let src = (current_pml4 as *const u8).add(256 * 8);
-        let dst = (new_pml4 as *mut u8).add(256 * 8);
-        core::ptr::copy_nonoverlapping(src, dst, 256 * 8);
-    }
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, 256 * 8) };
 
     Ok(pml4_phys)
 }
@@ -288,10 +289,10 @@ pub fn reclaim_process_page_tables(
     let hhdm = crate::hhdm_offset();
     let mut freed = 0usize;
 
+    let pml4_virt = (pml4_phys + hhdm) as *const PageTable;
     // SAFETY: pml4_phys is a valid PML4 physical address (precondition).
     // HHDM maps it to a kernel-accessible virtual address. The process
     // is terminated so no CPU has this PML4 loaded.
-    let pml4_virt = (pml4_phys + hhdm) as *const PageTable;
     let pml4 = unsafe { &*pml4_virt };
 
     // Walk only the user-half (entries 0..256). Each PRESENT entry

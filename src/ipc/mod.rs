@@ -618,10 +618,13 @@ impl IpcManager {
         // - SyncChannelState::Empty = first variant = discriminant 0
         // - Option<u32>::None = zeroed
         // Write the interceptor field explicitly (fat pointer — don't rely on zeroed).
-        unsafe {
-            core::ptr::addr_of_mut!((*ptr).interceptor).write(None);
-            Some(Box::from_raw(ptr))
-        }
+        // SAFETY: ptr is valid, non-null, and allocated above. Accessing the interceptor field.
+        let interceptor_ptr = unsafe { core::ptr::addr_of_mut!((*ptr).interceptor) };
+        // SAFETY: interceptor_ptr is valid — writing None (the only non-trivially-zeroed field).
+        unsafe { interceptor_ptr.write(None) };
+        // SAFETY: ptr was allocated via alloc_zeroed with the correct layout. All
+        // fields are now initialized (zeroed arrays + explicit interceptor write).
+        Some(unsafe { Box::from_raw(ptr) })
     }
 
     /// Install a zero-trust interceptor for IPC policy enforcement.

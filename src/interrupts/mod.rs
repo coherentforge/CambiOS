@@ -97,6 +97,12 @@ pub mod exceptions {
                     "  [DivZero] Task {} killed: RIP={:#x}",
                     task_id.0, stack_frame.instruction_pointer.as_u64()
                 );
+                // Yield away immediately — without this, iretq returns to
+                // the faulting instruction and re-faults at hardware speed.
+                loop {
+                    // SAFETY: Kernel stack, scheduler lock not held.
+                    unsafe { crate::arch::yield_save_and_switch(); }
+                }
             }
         } else {
             crate::println!(
@@ -126,6 +132,12 @@ pub mod exceptions {
                     "  [GPF] Task {} killed: code={:#x} RIP={:#x}",
                     task_id.0, error_code, stack_frame.instruction_pointer.as_u64()
                 );
+                // Yield away immediately — without this, iretq returns to
+                // the faulting instruction and re-faults at hardware speed.
+                loop {
+                    // SAFETY: Kernel stack, scheduler lock not held.
+                    unsafe { crate::arch::yield_save_and_switch(); }
+                }
             }
         } else {
             crate::println!(
@@ -169,17 +181,18 @@ pub mod exceptions {
                     "  [PageFault] Task {} killed: {} {} at {:#x} (RIP={:#x})",
                     task_id.0, fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
                 );
+                // Yield away immediately — without this, iretq returns to
+                // the faulting instruction and re-faults at hardware speed.
+                loop {
+                    // SAFETY: Kernel stack, scheduler lock not held.
+                    unsafe { crate::arch::yield_save_and_switch(); }
+                }
             } else {
                 crate::println!(
                     "  [PageFault] User fault at {:#x} but no current task to kill",
                     faulting_addr
                 );
             }
-
-            // Return from the handler — the task is now Terminated.
-            // The next timer tick will context-switch to a Ready task.
-            // The terminated task's iretq frame is still on the stack,
-            // but the scheduler will never schedule it again.
         } else {
             // Kernel-mode page fault: unrecoverable — halt with diagnostics
             let fault_type = if is_present { "protection" } else { "not-present" };
@@ -438,10 +451,11 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
         fn timer_isr_stub();
     }
     // SAFETY: Single-threaded init, interrupts disabled, IDT not yet reloaded.
-    // set_handler_addr is unsafe because the handler must follow the x86-interrupt ABI.
-    // timer_isr_stub is our global_asm naked entry point that does.
+    let idt_table = unsafe { idt_mut() };
+    // SAFETY: set_handler_addr is unsafe because the handler must follow the
+    // x86-interrupt ABI. timer_isr_stub is our global_asm naked entry point that does.
     unsafe {
-        idt_mut()[apic::TIMER_VECTOR as usize]
+        idt_table[apic::TIMER_VECTOR as usize]
             .set_handler_addr(x86_64::VirtAddr::new(timer_isr_stub as *const () as u64));
     }
 
@@ -484,10 +498,11 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 
         // Wire double-fault IDT entry to use IST1 (hardware IST index 1 = TSS.ist[0])
         // SAFETY: Single-threaded init, IDT not yet reloaded.
-        // set_stack_index is unsafe because an invalid IST index would corrupt
+        let idt_table = unsafe { idt_mut() };
+        // SAFETY: set_stack_index is unsafe because an invalid IST index would corrupt
         // the stack switch on exception. Index 0 maps to IST1 (allocated above).
         unsafe {
-            idt_mut()
+            idt_table
                 .double_fault
                 .set_handler_fn(exceptions::double_fault)
                 .set_stack_index(0); // x86_64 crate: 0 maps to IST1

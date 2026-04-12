@@ -51,13 +51,18 @@ impl RamObjectStore {
         // Cannot use alloc_zeroed because Option<ArcObject> contains Vec<u8>
         // (a fat pointer) — zeroed memory is not valid for Option<Vec>.
         // Instead, write None to each slot explicitly.
-        unsafe {
-            for i in 0..MAX_OBJECTS {
-                core::ptr::addr_of_mut!((*ptr).objects[i]).write(None);
-            }
-            core::ptr::addr_of_mut!((*ptr).count).write(0);
-            Some(Box::from_raw(ptr))
+        for i in 0..MAX_OBJECTS {
+            // SAFETY: ptr is valid, non-null. Accessing objects[i] field.
+            let slot = unsafe { core::ptr::addr_of_mut!((*ptr).objects[i]) };
+            // SAFETY: slot is a valid pointer within the allocated layout.
+            unsafe { slot.write(None) };
         }
+        // SAFETY: ptr is valid — accessing count field.
+        let count_ptr = unsafe { core::ptr::addr_of_mut!((*ptr).count) };
+        // SAFETY: count_ptr is valid — writing initial count.
+        unsafe { count_ptr.write(0) };
+        // SAFETY: All fields initialized. ptr was allocated with the correct layout.
+        Some(unsafe { Box::from_raw(ptr) })
     }
 
     /// Find the slot index for an object by content hash.

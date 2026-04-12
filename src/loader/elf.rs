@@ -212,12 +212,11 @@ pub fn get_program_header(
         return Err(ElfError::InvalidProgramHeaderOffset);
     }
 
-    // SAFETY: phdr_offset..phdr_end is within binary bounds (checked above).
-    // Using read_unaligned because the program header may not be naturally
-    // aligned within the binary slice.
-    let phdr = unsafe {
-        core::ptr::read_unaligned(binary.as_ptr().add(phdr_offset) as *const Elf64ProgramHeader)
-    };
+    // SAFETY: phdr_offset is within binary bounds (checked above).
+    let phdr_ptr = unsafe { binary.as_ptr().add(phdr_offset) } as *const Elf64ProgramHeader;
+    // SAFETY: phdr_offset..phdr_end is within binary bounds. Using read_unaligned
+    // because the program header may not be naturally aligned in the binary slice.
+    let phdr = unsafe { core::ptr::read_unaligned(phdr_ptr) };
 
     Ok(phdr)
 }

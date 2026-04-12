@@ -46,19 +46,18 @@ pub unsafe fn init(frequency_hz: u32) -> u16 {
         Some(raw) => raw as u16,
     };
 
-    // SAFETY: PIT_COMMAND (0x43) and PIT_CHANNEL0 (0x40) are standard x86 I/O
-    // ports. Called during single-threaded boot with interrupts disabled.
-    unsafe {
-        let mut cmd_port = Port::<u8>::new(PIT_COMMAND);
-        let mut data_port = Port::<u8>::new(PIT_CHANNEL0);
+    let mut cmd_port = Port::<u8>::new(PIT_COMMAND);
+    let mut data_port = Port::<u8>::new(PIT_CHANNEL0);
 
-        // Send command: Channel 0, lobyte/hibyte, rate generator
-        cmd_port.write(PIT_CMD_CHANNEL0_RATE);
+    // Send command: Channel 0, lobyte/hibyte, rate generator
+    // SAFETY: Writing PIT command byte is a standard 8254 operation.
+    unsafe { cmd_port.write(PIT_CMD_CHANNEL0_RATE) };
 
-        // Send divisor (low byte first, then high byte)
-        data_port.write((divisor & 0xFF) as u8);
-        data_port.write((divisor >> 8) as u8);
-    }
+    // Send divisor (low byte first, then high byte)
+    // SAFETY: Writing low byte of divisor to PIT Channel 0.
+    unsafe { data_port.write((divisor & 0xFF) as u8) };
+    // SAFETY: Writing high byte of divisor to PIT Channel 0.
+    unsafe { data_port.write((divisor >> 8) as u8) };
 
     divisor
 }

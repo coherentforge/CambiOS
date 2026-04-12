@@ -188,13 +188,12 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
 
     let high: u64 = (tss_addr >> 32) & 0xFFFF_FFFF;       // base 63:32
 
-    // SAFETY: Interrupts disabled, called once per CPU. We write the TSS
-    // descriptor into this CPU's GDT slots 5 and 6 (within bounds).
-    unsafe {
-        let gdt_ptr = &raw mut CPU_GDT[cpu_index];
-        (*gdt_ptr)[5] = low;
-        (*gdt_ptr)[6] = high;
-    }
+    // SAFETY: Interrupts disabled, called once per CPU. Accessing this CPU's GDT.
+    let gdt_ptr = unsafe { &raw mut CPU_GDT[cpu_index] };
+    // SAFETY: Writing TSS descriptor low DWORD into GDT slot 5 (within bounds).
+    unsafe { (*gdt_ptr)[5] = low };
+    // SAFETY: Writing TSS descriptor high DWORD into GDT slot 6 (within bounds).
+    unsafe { (*gdt_ptr)[6] = high };
 
     // ---- Load this CPU's GDT ----
     // SAFETY: descriptor.base points to this CPU's static GDT array, limit is
@@ -245,12 +244,10 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
     // SAFETY: Called with interrupts disabled. Per-CPU data is initialized.
     // current_percpu() returns this CPU's PerCpu (via GS base).
     let cpu_idx = unsafe { super::percpu::current_percpu() }.cpu_id() as usize;
-    // SAFETY: cpu_idx is in 0..MAX_CPUS (set during percpu init).
-    // CPU_TSS is a static array; we write only the rsp0 field of our CPU's entry.
-    unsafe {
-        let tss_ptr = &raw mut CPU_TSS[cpu_idx];
-        (*tss_ptr).rsp0 = rsp0;
-    }
+    // SAFETY: cpu_idx is in 0..MAX_CPUS (set during percpu init). Accessing our CPU's TSS.
+    let tss_ptr = unsafe { &raw mut CPU_TSS[cpu_idx] };
+    // SAFETY: Writing rsp0 field of our CPU's TSS entry.
+    unsafe { (*tss_ptr).rsp0 = rsp0 };
     // Also update PerCpu.kernel_rsp0 — read by syscall_entry (gs:[24]) to
     // switch RSP from user stack to kernel stack on SYSCALL.
     // SAFETY: Called with interrupts disabled; only this CPU's PerCpu is written.
@@ -274,11 +271,10 @@ pub unsafe fn set_ist(index: usize, stack_top: u64) {
     assert!(index < 7, "IST index must be 0..6");
     // SAFETY: Called with interrupts disabled. Per-CPU data is initialized.
     let cpu_idx = unsafe { super::percpu::current_percpu() }.cpu_id() as usize;
-    // SAFETY: cpu_idx is in 0..MAX_CPUS. We write only the IST entry.
-    unsafe {
-        let tss_ptr = &raw mut CPU_TSS[cpu_idx];
-        (*tss_ptr).ist[index] = stack_top;
-    }
+    // SAFETY: cpu_idx is in 0..MAX_CPUS. Accessing our CPU's TSS.
+    let tss_ptr = unsafe { &raw mut CPU_TSS[cpu_idx] };
+    // SAFETY: Writing the IST entry (index is checked above to be < 7).
+    unsafe { (*tss_ptr).ist[index] = stack_top };
 }
 
 extern "C" {

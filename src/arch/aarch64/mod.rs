@@ -687,6 +687,14 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
             "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
             task_id.0, ec_name, fault_type, access, far, elr, dfsc
         );
+        // Yield away immediately. The task is Terminated and will never be
+        // re-scheduled, so this loop does not return. Without this, the
+        // exception return (eret) goes back to the faulting PC and the
+        // task re-faults at hardware speed until the next timer tick.
+        loop {
+            // SAFETY: We are on the kernel stack, scheduler lock is not held.
+            unsafe { crate::arch::yield_save_and_switch(); }
+        }
     } else {
         crate::println!(
             "  [Fault] {} at {:#x} (PC={:#x}) but no current task",

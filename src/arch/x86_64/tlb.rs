@@ -104,11 +104,13 @@ pub unsafe fn invlpg(virt_addr: u64) {
 /// Must be called at ring 0.
 #[inline]
 pub unsafe fn flush_all_local() {
-    // SAFETY: Reading and writing CR3 is safe at ring 0. Writing the same
-    // value back flushes all non-global TLB entries.
+    let cr3: u64;
+    // SAFETY: Reading CR3 is safe at ring 0.
     unsafe {
-        let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+    }
+    // SAFETY: Writing the same CR3 value back flushes all non-global TLB entries.
+    unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
     }
 }
@@ -127,30 +129,30 @@ pub unsafe fn flush_all_local() {
 pub extern "x86-interrupt" fn tlb_shootdown_isr(
     _stack_frame: x86_64::structures::idt::InterruptStackFrame,
 ) {
-    // SAFETY: Reading atomics and executing invlpg/CR3 reload is safe in ISR context.
-    unsafe {
-        let page_count = SHOOTDOWN.page_count.load(Ordering::Acquire);
+    let page_count = SHOOTDOWN.page_count.load(Ordering::Acquire);
 
-        if page_count == 0 {
-            // Full flush requested
-            flush_all_local();
-        } else if page_count <= MAX_INDIVIDUAL_PAGES {
-            // Invalidate individual pages
-            let start = SHOOTDOWN.start_addr.load(Ordering::Acquire);
-            for i in 0..page_count as u64 {
-                invlpg(start + i * 4096);
-            }
-        } else {
-            // Too many pages — full flush is cheaper
-            flush_all_local();
+    if page_count == 0 {
+        // Full flush requested
+        // SAFETY: Ring 0 ISR context.
+        unsafe { flush_all_local() };
+    } else if page_count <= MAX_INDIVIDUAL_PAGES {
+        // Invalidate individual pages
+        let start = SHOOTDOWN.start_addr.load(Ordering::Acquire);
+        for i in 0..page_count as u64 {
+            // SAFETY: Ring 0 ISR context.
+            unsafe { invlpg(start + i * 4096) };
         }
-
-        // Signal completion
-        SHOOTDOWN.pending.fetch_sub(1, Ordering::AcqRel);
-
-        // SAFETY: We are in an APIC-delivered interrupt handler.
-        super::apic::write_eoi();
+    } else {
+        // Too many pages — full flush is cheaper
+        // SAFETY: Ring 0 ISR context.
+        unsafe { flush_all_local() };
     }
+
+    // Signal completion
+    SHOOTDOWN.pending.fetch_sub(1, Ordering::AcqRel);
+
+    // SAFETY: We are in an APIC-delivered interrupt handler.
+    unsafe { super::apic::write_eoi() };
 }
 
 // ============================================================================
@@ -180,45 +182,43 @@ pub unsafe fn shootdown_page(virt_addr: u64) {
 /// # Safety
 /// Must be called at ring 0. Page table changes must be visible in memory.
 pub unsafe fn shootdown_range(virt_addr: u64, page_count: u32) {
-    // SAFETY: Caller ensures ring 0 and page table changes are visible in memory.
-    // All unsafe operations below (invlpg, flush_all_local, send_ipi) require
-    // ring 0, which the caller guarantees.
-    unsafe {
-        // Always flush locally first
-        if page_count <= MAX_INDIVIDUAL_PAGES {
-            for i in 0..page_count as u64 {
-                invlpg(virt_addr + i * 4096);
-            }
-        } else {
-            flush_all_local();
+    // Always flush locally first
+    if page_count <= MAX_INDIVIDUAL_PAGES {
+        for i in 0..page_count as u64 {
+            // SAFETY: Caller ensures ring 0.
+            unsafe { invlpg(virt_addr + i * 4096) };
         }
-
-        // If only one CPU is online, we're done
-        let online = super::percpu::cpu_count();
-        if online <= 1 {
-            return;
-        }
-
-        // Serialize shootdown requests
-        lock_acquire();
-
-        // Fill the request
-        SHOOTDOWN.start_addr.store(virt_addr, Ordering::Release);
-        SHOOTDOWN.page_count.store(page_count, Ordering::Release);
-        // pending = number of *other* CPUs (all online minus self)
-        let remote_cpus = online - 1;
-        SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
-
-        // Send IPI to all other CPUs
-        super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR);
-
-        // Spin until all remote CPUs have processed the request
-        while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
-            core::hint::spin_loop();
-        }
-
-        lock_release();
+    } else {
+        // SAFETY: Caller ensures ring 0.
+        unsafe { flush_all_local() };
     }
+
+    // If only one CPU is online, we're done
+    let online = super::percpu::cpu_count();
+    if online <= 1 {
+        return;
+    }
+
+    // Serialize shootdown requests
+    lock_acquire();
+
+    // Fill the request
+    SHOOTDOWN.start_addr.store(virt_addr, Ordering::Release);
+    SHOOTDOWN.page_count.store(page_count, Ordering::Release);
+    // pending = number of *other* CPUs (all online minus self)
+    let remote_cpus = online - 1;
+    SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
+
+    // Send IPI to all other CPUs
+    // SAFETY: APIC is initialized and TLB_SHOOTDOWN_VECTOR is registered in all IDTs.
+    unsafe { super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR) };
+
+    // Spin until all remote CPUs have processed the request
+    while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+
+    lock_release();
 }
 
 /// Flush the entire TLB on all CPUs.
@@ -226,33 +226,30 @@ pub unsafe fn shootdown_range(virt_addr: u64, page_count: u32) {
 /// # Safety
 /// Must be called at ring 0.
 pub unsafe fn shootdown_all() {
-    // SAFETY: Caller ensures ring 0. All unsafe operations below (flush_all_local,
-    // send_ipi) require ring 0, which the caller guarantees.
-    unsafe {
-        // Flush locally
-        flush_all_local();
+    // SAFETY: Caller ensures ring 0.
+    unsafe { flush_all_local() };
 
-        let online = super::percpu::cpu_count();
-        if online <= 1 {
-            return;
-        }
-
-        lock_acquire();
-
-        // page_count = 0 signals "full flush" to the ISR
-        SHOOTDOWN.start_addr.store(0, Ordering::Release);
-        SHOOTDOWN.page_count.store(0, Ordering::Release);
-        let remote_cpus = online - 1;
-        SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
-
-        super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR);
-
-        while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
-            core::hint::spin_loop();
-        }
-
-        lock_release();
+    let online = super::percpu::cpu_count();
+    if online <= 1 {
+        return;
     }
+
+    lock_acquire();
+
+    // page_count = 0 signals "full flush" to the ISR
+    SHOOTDOWN.start_addr.store(0, Ordering::Release);
+    SHOOTDOWN.page_count.store(0, Ordering::Release);
+    let remote_cpus = online - 1;
+    SHOOTDOWN.pending.store(remote_cpus, Ordering::Release);
+
+    // SAFETY: APIC is initialized and TLB_SHOOTDOWN_VECTOR is registered in all IDTs.
+    unsafe { super::apic::send_ipi_all_excluding_self(TLB_SHOOTDOWN_VECTOR) };
+
+    while SHOOTDOWN.pending.load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+
+    lock_release();
 }
 
 // ============================================================================

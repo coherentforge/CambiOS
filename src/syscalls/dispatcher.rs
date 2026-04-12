@@ -2337,14 +2337,15 @@ impl SyscallDispatcher {
         } // drop PROCESS_TABLE(6)
 
         // TLB shootdown for unmapped ranges (lock-free).
-        // SAFETY: shootdown_range requires ring 0 and that the page table
-        // modifications (above) are already visible in memory.
         if shootdown_creator {
+            // SAFETY: shootdown_range requires ring 0 and that the page table
+            // modifications (above) are already visible in memory.
             unsafe {
                 crate::arch::tlb_shootdown_range(record.creator_vaddr, record.num_pages);
             }
         }
         if shootdown_peer {
+            // SAFETY: Same preconditions — page table modifications are visible.
             unsafe {
                 crate::arch::tlb_shootdown_range(record.peer_vaddr, record.num_pages);
             }

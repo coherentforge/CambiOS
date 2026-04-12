@@ -187,13 +187,17 @@ pub fn init(
     // storage (we allocated enough bytes, rounded up), we own the
     // region exclusively (just allocated from the frame allocator,
     // no aliases exist), and boot is single-threaded at this point.
-    unsafe {
-        for i in 0..num_slots {
-            process_ptr.add(i).write(None);
-        }
-        for i in 0..num_slots {
-            capability_ptr.add(i).write(None);
-        }
+    for i in 0..num_slots {
+        // SAFETY: process_ptr + i is within the allocated region (num_slots slots).
+        let slot = unsafe { process_ptr.add(i) };
+        // SAFETY: slot is a valid, aligned pointer within the region.
+        unsafe { slot.write(None) };
+    }
+    for i in 0..num_slots {
+        // SAFETY: capability_ptr + i is within the allocated region (num_slots slots).
+        let slot = unsafe { capability_ptr.add(i) };
+        // SAFETY: slot is a valid, aligned pointer within the region.
+        unsafe { slot.write(None) };
     }
 
     // SAFETY: All slots initialized above; pointers are valid and

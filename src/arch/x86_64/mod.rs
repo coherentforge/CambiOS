@@ -372,21 +372,21 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
             unsafe { crate::arch::gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
+            let current_cr3: u64;
             // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
-            // Writing CR3 switches user page tables; hint.page_table_root was
-            // validated by the scheduler. TLB flush is implicit on CR3 write.
             unsafe {
-                let current_cr3: u64;
                 core::arch::asm!(
                     "mov {}, cr3",
                     out(reg) current_cr3,
                     options(nostack, nomem),
                 );
-                if current_cr3 != hint.page_table_root {
-                    // SAFETY: hint.page_table_root is the physical address of a valid
-                    // PML4 set up by create_process_page_table(). Writing CR3 flushes
-                    // the TLB and switches address spaces. Kernel mappings (upper half)
-                    // are shared across all page tables.
+            }
+            if current_cr3 != hint.page_table_root {
+                // SAFETY: hint.page_table_root is the physical address of a valid
+                // PML4 set up by create_process_page_table(). Writing CR3 flushes
+                // the TLB and switches address spaces. Kernel mappings (upper half)
+                // are shared across all page tables.
+                unsafe {
                     core::arch::asm!(
                         "mov cr3, {}",
                         in(reg) hint.page_table_root,
@@ -617,19 +617,19 @@ extern "C" fn yield_inner(current_rsp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
-            // SAFETY: Reading CR3 is always safe at ring 0. Writing CR3
-            // switches user page tables; hint.page_table_root was validated
-            // by the scheduler. Interrupts are disabled (cli in trampoline).
+            let current_cr3: u64;
+            // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
             unsafe {
-                let current_cr3: u64;
                 core::arch::asm!(
                     "mov {}, cr3",
                     out(reg) current_cr3,
                     options(nostack, nomem),
                 );
-                if current_cr3 != hint.page_table_root {
-                    // SAFETY: hint.page_table_root is a valid PML4 physical address
-                    // from create_process_page_table(). Kernel half is shared.
+            }
+            if current_cr3 != hint.page_table_root {
+                // SAFETY: hint.page_table_root is a valid PML4 physical address
+                // from create_process_page_table(). Kernel half is shared.
+                unsafe {
                     core::arch::asm!(
                         "mov cr3, {}",
                         in(reg) hint.page_table_root,

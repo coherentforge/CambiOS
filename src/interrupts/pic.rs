@@ -45,54 +45,69 @@ pub const TIMER_VECTOR: u8 = PIC1_OFFSET; // Vector 32
 /// # Safety
 /// Must be called exactly once during boot, before enabling interrupts.
 pub unsafe fn init() {
-    // SAFETY: Called once during single-threaded boot with interrupts disabled.
-    // Ports 0x20/0x21 (master PIC) and 0xA0/0xA1 (slave PIC) are standard
-    // x86 I/O addresses. The ICW sequence (ICW1-ICW4) follows the Intel 8259
-    // specification with io_wait() delays between writes.
-    unsafe {
-        let mut pic1_cmd = Port::<u8>::new(PIC1_COMMAND);
-        let mut pic1_data = Port::<u8>::new(PIC1_DATA);
-        let mut pic2_cmd = Port::<u8>::new(PIC2_COMMAND);
-        let mut pic2_data = Port::<u8>::new(PIC2_DATA);
+    let mut pic1_cmd = Port::<u8>::new(PIC1_COMMAND);
+    let mut pic1_data = Port::<u8>::new(PIC1_DATA);
+    let mut pic2_cmd = Port::<u8>::new(PIC2_COMMAND);
+    let mut pic2_data = Port::<u8>::new(PIC2_DATA);
 
-        // Save current masks
-        let mask1: u8 = pic1_data.read();
-        let mask2: u8 = pic2_data.read();
+    // Save current masks
+    // SAFETY: Reading from PIC data port is a standard x86 I/O operation.
+    let mask1: u8 = unsafe { pic1_data.read() };
+    // SAFETY: Same — reading slave PIC data port.
+    let mask2: u8 = unsafe { pic2_data.read() };
 
-        // ICW1: Start initialization sequence (cascade mode, ICW4 needed)
-        pic1_cmd.write(ICW1_INIT | ICW1_ICW4);
-        io_wait();
-        pic2_cmd.write(ICW1_INIT | ICW1_ICW4);
-        io_wait();
+    // ICW1: Start initialization sequence (cascade mode, ICW4 needed)
+    // SAFETY: Writing PIC command byte is a standard ICW1 operation.
+    unsafe { pic1_cmd.write(ICW1_INIT | ICW1_ICW4) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
+    // SAFETY: Writing slave PIC command byte.
+    unsafe { pic2_cmd.write(ICW1_INIT | ICW1_ICW4) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
 
-        // ICW2: Set vector offsets
-        pic1_data.write(PIC1_OFFSET);
-        io_wait();
-        pic2_data.write(PIC2_OFFSET);
-        io_wait();
+    // ICW2: Set vector offsets
+    // SAFETY: ICW2 — setting master PIC vector offset.
+    unsafe { pic1_data.write(PIC1_OFFSET) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
+    // SAFETY: ICW2 — setting slave PIC vector offset.
+    unsafe { pic2_data.write(PIC2_OFFSET) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
 
-        // ICW3: Tell PICs about each other
-        pic1_data.write(4); // Slave PIC at IRQ2 (bit 2)
-        io_wait();
-        pic2_data.write(2); // Slave cascade identity (IRQ2)
-        io_wait();
+    // ICW3: Tell PICs about each other
+    // SAFETY: ICW3 — master: slave PIC at IRQ2.
+    unsafe { pic1_data.write(4) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
+    // SAFETY: ICW3 — slave: cascade identity.
+    unsafe { pic2_data.write(2) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
 
-        // ICW4: 8086 mode
-        pic1_data.write(ICW4_8086);
-        io_wait();
-        pic2_data.write(ICW4_8086);
-        io_wait();
+    // ICW4: 8086 mode
+    // SAFETY: ICW4 — master 8086 mode.
+    unsafe { pic1_data.write(ICW4_8086) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
+    // SAFETY: ICW4 — slave 8086 mode.
+    unsafe { pic2_data.write(ICW4_8086) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
 
-        // Mask all IRQs except IRQ 0 (timer) on master
-        // Mask = 0xFE means only IRQ 0 is enabled (bit 0 = 0 means unmasked)
-        pic1_data.write(0xFE);
-        io_wait();
-        // Mask all IRQs on slave
-        pic2_data.write(0xFF);
-        io_wait();
+    // Mask all IRQs except IRQ 0 (timer) on master
+    // SAFETY: Writing mask register.
+    unsafe { pic1_data.write(0xFE) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
+    // Mask all IRQs on slave
+    // SAFETY: Writing slave mask register.
+    unsafe { pic2_data.write(0xFF) };
+    // SAFETY: I/O delay via port 0x80 — standard x86 ~1µs wait.
+    unsafe { io_wait() };
 
-        let _ = (mask1, mask2); // Acknowledge saved masks (not restored)
-    }
+    let _ = (mask1, mask2); // Acknowledge saved masks (not restored)
 }
 
 /// Send End-of-Interrupt to the PIC(s)
@@ -103,17 +118,15 @@ pub unsafe fn init() {
 /// # Safety
 /// Must be called from an interrupt handler context for a valid IRQ.
 pub unsafe fn send_eoi(irq: u8) {
-    // SAFETY: Writing PIC_EOI (0x20) to the PIC command port is the standard
-    // EOI sequence. Called from ISR context after handling the interrupt.
-    unsafe {
-        let mut pic1_cmd = Port::<u8>::new(PIC1_COMMAND);
+    let mut pic1_cmd = Port::<u8>::new(PIC1_COMMAND);
 
-        if irq >= 8 {
-            let mut pic2_cmd = Port::<u8>::new(PIC2_COMMAND);
-            pic2_cmd.write(PIC_EOI);
-        }
-        pic1_cmd.write(PIC_EOI);
+    if irq >= 8 {
+        let mut pic2_cmd = Port::<u8>::new(PIC2_COMMAND);
+        // SAFETY: Writing PIC_EOI to slave PIC command port.
+        unsafe { pic2_cmd.write(PIC_EOI) };
     }
+    // SAFETY: Writing PIC_EOI to master PIC command port.
+    unsafe { pic1_cmd.write(PIC_EOI) };
 }
 
 /// Small I/O delay (needed between PIC commands)

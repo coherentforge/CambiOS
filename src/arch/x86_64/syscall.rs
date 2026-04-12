@@ -70,35 +70,36 @@ pub struct SyscallFrame {
 /// Must be called during single-threaded init after the GDT is loaded
 /// and before any task executes `syscall`.
 pub unsafe fn init() {
-    // SAFETY: All MSR reads/writes below target valid MSRs on x86_64 CPUs.
-    // Caller ensures single-threaded init after GDT is loaded, at ring 0.
-    unsafe {
-        // STAR MSR: segment selectors for SYSCALL and SYSRET
-        //
-        //   Bits 47:32 = SYSCALL target:
-        //     CS = STAR[47:32]        = 0x08 (KERNEL_CS)
-        //     SS = STAR[47:32] + 8    = 0x10 (KERNEL_SS)
-        //
-        //   Bits 63:48 = SYSRET base:
-        //     SS = STAR[63:48] + 8  | 3 = 0x1B (USER_SS)
-        //     CS = STAR[63:48] + 16 | 3 = 0x23 (USER_CS)  [64-bit mode]
-        let star = ((gdt::KERNEL_SS as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
-        super::msr::write(MSR_STAR, star);
+    // STAR MSR: segment selectors for SYSCALL and SYSRET
+    //
+    //   Bits 47:32 = SYSCALL target:
+    //     CS = STAR[47:32]        = 0x08 (KERNEL_CS)
+    //     SS = STAR[47:32] + 8    = 0x10 (KERNEL_SS)
+    //
+    //   Bits 63:48 = SYSRET base:
+    //     SS = STAR[63:48] + 8  | 3 = 0x1B (USER_SS)
+    //     CS = STAR[63:48] + 16 | 3 = 0x23 (USER_CS)  [64-bit mode]
+    let star = ((gdt::KERNEL_SS as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
+    // SAFETY: MSR_STAR is a valid MSR. Caller ensures single-threaded init at ring 0.
+    unsafe { super::msr::write(MSR_STAR, star) };
 
-        // LSTAR: target RIP for SYSCALL instruction
-        extern "C" {
-            fn syscall_entry();
-        }
-        super::msr::write(MSR_LSTAR, syscall_entry as *const () as u64);
-
-        // SFMASK: RFLAGS bits to CLEAR on SYSCALL entry
-        // 0x200 = IF — disable interrupts until the handler explicitly re-enables them
-        super::msr::write(MSR_SFMASK, 0x200);
-
-        // Enable System Call Extensions in EFER
-        let efer = super::msr::read(MSR_EFER);
-        super::msr::write(MSR_EFER, efer | EFER_SCE);
+    // LSTAR: target RIP for SYSCALL instruction
+    extern "C" {
+        fn syscall_entry();
     }
+    // SAFETY: MSR_LSTAR is a valid MSR. syscall_entry is our global_asm entry point.
+    unsafe { super::msr::write(MSR_LSTAR, syscall_entry as *const () as u64) };
+
+    // SFMASK: RFLAGS bits to CLEAR on SYSCALL entry
+    // 0x200 = IF — disable interrupts until the handler explicitly re-enables them
+    // SAFETY: MSR_SFMASK is a valid MSR.
+    unsafe { super::msr::write(MSR_SFMASK, 0x200) };
+
+    // Enable System Call Extensions in EFER
+    // SAFETY: MSR_EFER is a valid MSR.
+    let efer = unsafe { super::msr::read(MSR_EFER) };
+    // SAFETY: Writing EFER with SCE bit set is valid at ring 0.
+    unsafe { super::msr::write(MSR_EFER, efer | EFER_SCE) };
 }
 
 // ============================================================================

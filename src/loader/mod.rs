@@ -466,14 +466,12 @@ pub fn load_elf_process(
 
                 let src_offset = seg.file_offset + page_start_in_segment;
 
-                // SAFETY: collect_load_segments validated that
-                // file_offset + filesz <= binary.len(). The frame is HHDM-mapped
-                // and writable. src and dst don't overlap.
-                unsafe {
-                    let src = binary.as_ptr().add(src_offset as usize);
-                    let dst = (frame_addr + hhdm + copy_offset_in_page) as *mut u8;
-                    core::ptr::copy_nonoverlapping(src, dst, copy_len);
-                }
+                // SAFETY: src_offset is within binary.len() (validated by collect_load_segments).
+                let src = unsafe { binary.as_ptr().add(src_offset as usize) };
+                let dst = (frame_addr + hhdm + copy_offset_in_page) as *mut u8;
+                // SAFETY: src is within binary bounds, dst is an HHDM-mapped frame
+                // (writable), regions don't overlap, copy_len is bounded.
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, copy_len) };
             }
             // BSS (memsz > filesz) is already zeroed from the write_bytes above
         }
@@ -645,20 +643,23 @@ pub fn build_boot_elf(code: &[u8], entry_vaddr: u64) -> alloc::vec::Vec<u8> {
         e_shstrndx: 0,
     };
 
-    // SAFETY: Elf64Header is repr(C), POD. We copy its bytes into the buffer.
-    unsafe {
-        let header_bytes = core::slice::from_raw_parts(
+    // SAFETY: Elf64Header is repr(C), POD. Reinterpreting as bytes is valid.
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(
             &header as *const Elf64Header as *const u8,
             ehdr_size,
-        );
-        binary[..ehdr_size].copy_from_slice(header_bytes);
+        )
+    };
+    binary[..ehdr_size].copy_from_slice(header_bytes);
 
-        let phdr_bytes = core::slice::from_raw_parts(
+    // SAFETY: Elf64ProgramHeader is repr(C), POD. Reinterpreting as bytes is valid.
+    let phdr_bytes = unsafe {
+        core::slice::from_raw_parts(
             &phdr as *const Elf64ProgramHeader as *const u8,
             phdr_size,
-        );
-        binary[ehdr_size..ehdr_size + phdr_size].copy_from_slice(phdr_bytes);
-    }
+        )
+    };
+    binary[ehdr_size..ehdr_size + phdr_size].copy_from_slice(phdr_bytes);
 
     binary
 }

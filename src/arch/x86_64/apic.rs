@@ -221,20 +221,18 @@ pub unsafe fn detect_and_init() -> Result<(), &'static str> {
 
     APIC_BASE_VIRT.store(virt_base, Ordering::Release);
 
-    // SAFETY: APIC MMIO is now mapped and APIC_BASE_VIRT is set. All APIC
-    // register accesses below target valid offsets in the APIC register space.
-    unsafe {
-        // Enable APIC via Spurious Interrupt Vector Register:
-        // Set vector to SPURIOUS_VECTOR (0xFF) and set APIC Software Enable bit
-        let sivr = apic_read(APIC_SIVR);
-        apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE | SPURIOUS_VECTOR as u32);
+    // SAFETY: APIC MMIO is now mapped and APIC_BASE_VIRT is set.
+    // APIC_SIVR is a valid APIC register offset.
+    let sivr = unsafe { apic_read(APIC_SIVR) };
+    // SAFETY: Writing SIVR with the enable bit and spurious vector is valid.
+    unsafe { apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE | SPURIOUS_VECTOR as u32) };
 
-        let apic_id = apic_read(APIC_ID) >> 24;
-        crate::println!(
-            "  APIC enabled: phys={:#x} virt={:#x} id={}",
-            phys_base, virt_base, apic_id
-        );
-    }
+    // SAFETY: APIC_ID is a valid APIC register offset.
+    let apic_id = unsafe { apic_read(APIC_ID) } >> 24;
+    crate::println!(
+        "  APIC enabled: phys={:#x} virt={:#x} id={}",
+        phys_base, virt_base, apic_id
+    );
 
     Ok(())
 }
@@ -289,36 +287,34 @@ pub unsafe fn write_eoi() {
 /// PIC must be disabled first (PIT Channel 0 won't generate an IRQ).
 pub unsafe fn configure_timer(frequency_hz: u32) -> u32 {
     // SAFETY: Called during single-threaded boot with interrupts disabled.
-    // PIT calibration and all APIC register accesses are valid at this point.
-    unsafe {
-        let bus_freq = calibrate_against_pit();
+    // PIT calibration is valid at this point.
+    let bus_freq = unsafe { calibrate_against_pit() };
 
-        if bus_freq == 0 {
-            panic!("APIC timer calibration failed: bus frequency is 0");
-        }
-
-        // Configure timer divide: divide by 16 (DCR value 0x03)
-        apic_write(APIC_TIMER_DCR, 0x03);
-
-        // Compute initial count for the desired frequency
-        let initial_count = bus_freq / frequency_hz;
-
-        // Store for AP reuse (APs skip PIT calibration)
-        TIMER_INITIAL_COUNT.store(initial_count, Ordering::Release);
-
-        // LVT Timer: periodic mode, vector TIMER_VECTOR, not masked
-        apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
-
-        // Set initial count — this starts the timer
-        apic_write(APIC_TIMER_ICR, initial_count);
-
-        crate::println!(
-            "  APIC timer: {}Hz (bus={}MHz, count={}, div=16)",
-            frequency_hz, bus_freq / 1_000_000, initial_count
-        );
-
-        bus_freq
+    if bus_freq == 0 {
+        panic!("APIC timer calibration failed: bus frequency is 0");
     }
+
+    // SAFETY: APIC_TIMER_DCR is a valid APIC register offset.
+    unsafe { apic_write(APIC_TIMER_DCR, 0x03) };
+
+    // Compute initial count for the desired frequency
+    let initial_count = bus_freq / frequency_hz;
+
+    // Store for AP reuse (APs skip PIT calibration)
+    TIMER_INITIAL_COUNT.store(initial_count, Ordering::Release);
+
+    // SAFETY: APIC_LVT_TIMER is a valid APIC register offset.
+    unsafe { apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32) };
+
+    // SAFETY: APIC_TIMER_ICR is a valid APIC register offset. Writing starts the timer.
+    unsafe { apic_write(APIC_TIMER_ICR, initial_count) };
+
+    crate::println!(
+        "  APIC timer: {}Hz (bus={}MHz, count={}, div=16)",
+        frequency_hz, bus_freq / 1_000_000, initial_count
+    );
+
+    bus_freq
 }
 
 /// Calibrate the APIC timer by measuring ticks during a PIT-timed window.
@@ -337,60 +333,59 @@ unsafe fn calibrate_against_pit() -> u32 {
     // SAFETY: PIT_CHANNEL0_DATA (0x40) is a valid x86 I/O port for the 8254 PIT.
     let pit_ch0 = unsafe { super::portio::Port8::new(PIT_CHANNEL0_DATA) };
 
-    // SAFETY: APIC is initialized and MMIO base is valid. PIT ports are valid.
-    // Single-threaded boot with interrupts disabled — no concurrent access.
-    unsafe {
-        // Step 1: Set APIC timer divide to 16
-        apic_write(APIC_TIMER_DCR, 0x03);
+    // Step 1: Set APIC timer divide to 16
+    // SAFETY: APIC is initialized, APIC_TIMER_DCR is a valid register offset.
+    unsafe { apic_write(APIC_TIMER_DCR, 0x03) };
 
-        // Step 2: Mask the APIC timer LVT (prevent interrupts during calibration)
-        apic_write(APIC_LVT_TIMER, LVT_TIMER_MASKED);
+    // Step 2: Mask the APIC timer LVT (prevent interrupts during calibration)
+    // SAFETY: APIC_LVT_TIMER is a valid register offset.
+    unsafe { apic_write(APIC_LVT_TIMER, LVT_TIMER_MASKED) };
 
-        // Step 3: Set APIC timer initial count to max
-        apic_write(APIC_TIMER_ICR, 0xFFFF_FFFF);
+    // Step 3: Set APIC timer initial count to max
+    // SAFETY: APIC_TIMER_ICR is a valid register offset.
+    unsafe { apic_write(APIC_TIMER_ICR, 0xFFFF_FFFF) };
 
-        // Step 4: Program PIT Channel 0 for one-shot mode (mode 0)
-        // Command: channel 0, access lo/hi, mode 0 (interrupt on terminal count)
-        pit_cmd.write(0x30);
-        // Write calibration divisor (lo then hi)
-        pit_ch0.write((PIT_CALIBRATION_DIVISOR & 0xFF) as u8);
-        super::portio::io_wait();
-        pit_ch0.write((PIT_CALIBRATION_DIVISOR >> 8) as u8);
+    // Step 4: Program PIT Channel 0 for one-shot mode (mode 0)
+    // Command: channel 0, access lo/hi, mode 0 (interrupt on terminal count)
+    pit_cmd.write(0x30);
+    // Write calibration divisor (lo then hi)
+    pit_ch0.write((PIT_CALIBRATION_DIVISOR & 0xFF) as u8);
+    super::portio::io_wait();
+    pit_ch0.write((PIT_CALIBRATION_DIVISOR >> 8) as u8);
 
-        // Step 5: Busy-wait until PIT Channel 0 counts down to 0.
-        // Read-back: latch channel 0 count, read lo/hi.
-        loop {
-            // Latch Channel 0 counter
-            pit_cmd.write(0x00); // Latch command for channel 0
-            let lo = pit_ch0.read() as u16;
-            let hi = pit_ch0.read() as u16;
-            let count = (hi << 8) | lo;
+    // Step 5: Busy-wait until PIT Channel 0 counts down to 0.
+    // Read-back: latch channel 0 count, read lo/hi.
+    loop {
+        // Latch Channel 0 counter
+        pit_cmd.write(0x00);
+        let lo = pit_ch0.read() as u16;
+        let hi = pit_ch0.read() as u16;
+        let count = (hi << 8) | lo;
 
-            // PIT mode 0: counter decrements to 0 then output goes high.
-            // When count wraps very low (or we read 0), calibration window is done.
-            // In practice the counter may not hit exact 0 on every read, so we
-            // check if the reload bit is set or if count is small.
-            if count <= 1 {
-                break;
-            }
+        // PIT mode 0: counter decrements to 0 then output goes high.
+        // When count wraps very low (or we read 0), calibration window is done.
+        if count <= 1 {
+            break;
         }
-
-        // Step 6: Read how many APIC ticks elapsed
-        let apic_current = apic_read(APIC_TIMER_CCR);
-        let elapsed = 0xFFFF_FFFFu32.wrapping_sub(apic_current);
-
-        // Step 7: Stop APIC timer
-        apic_write(APIC_TIMER_ICR, 0);
-
-        // Step 8: Convert to bus frequency.
-        // PIT calibration window duration: PIT_CALIBRATION_DIVISOR / PIT_FREQUENCY seconds.
-        // elapsed APIC ticks occurred in that window.
-        // bus_freq = elapsed / (divisor / PIT_FREQUENCY) = elapsed * PIT_FREQUENCY / divisor
-        // This is the rate AFTER the divide-by-16 divisor.
-        let bus_freq = (elapsed as u64 * PIT_FREQUENCY as u64) / PIT_CALIBRATION_DIVISOR as u64;
-
-        bus_freq as u32
     }
+
+    // Step 6: Read how many APIC ticks elapsed
+    // SAFETY: APIC_TIMER_CCR is a valid register offset.
+    let apic_current = unsafe { apic_read(APIC_TIMER_CCR) };
+    let elapsed = 0xFFFF_FFFFu32.wrapping_sub(apic_current);
+
+    // Step 7: Stop APIC timer
+    // SAFETY: APIC_TIMER_ICR is a valid register offset.
+    unsafe { apic_write(APIC_TIMER_ICR, 0) };
+
+    // Step 8: Convert to bus frequency.
+    // PIT calibration window duration: PIT_CALIBRATION_DIVISOR / PIT_FREQUENCY seconds.
+    // elapsed APIC ticks occurred in that window.
+    // bus_freq = elapsed / (divisor / PIT_FREQUENCY) = elapsed * PIT_FREQUENCY / divisor
+    // This is the rate AFTER the divide-by-16 divisor.
+    let bus_freq = (elapsed as u64 * PIT_FREQUENCY as u64) / PIT_CALIBRATION_DIVISOR as u64;
+
+    bus_freq as u32
 }
 
 // ============================================================================
@@ -407,21 +402,21 @@ unsafe fn calibrate_against_pit() -> u32 {
 /// Must be called on the AP itself, with interrupts disabled.
 /// BSP must have already called `detect_and_init()`.
 pub unsafe fn init_ap() {
-    // SAFETY: Called on the AP with interrupts disabled. BSP has already
-    // initialized APIC_BASE_VIRT. MSR and APIC MMIO accesses are valid at ring 0.
-    unsafe {
-        // Ensure the APIC global enable bit is set in this AP's MSR
-        let mut apic_base = super::msr::read(IA32_APIC_BASE_MSR);
-        if apic_base & APIC_BASE_ENABLE == 0 {
-            apic_base |= APIC_BASE_ENABLE;
-            super::msr::write(IA32_APIC_BASE_MSR, apic_base);
-        }
-
-        // Enable APIC via Spurious Interrupt Vector Register
-        // (BSP already set the virtual base, which is the same for all CPUs)
-        let sivr = apic_read(APIC_SIVR);
-        apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE | SPURIOUS_VECTOR as u32);
+    // Ensure the APIC global enable bit is set in this AP's MSR
+    // SAFETY: IA32_APIC_BASE is a valid MSR, called on AP with interrupts disabled.
+    let mut apic_base = unsafe { super::msr::read(IA32_APIC_BASE_MSR) };
+    if apic_base & APIC_BASE_ENABLE == 0 {
+        apic_base |= APIC_BASE_ENABLE;
+        // SAFETY: Writing the enable bit to IA32_APIC_BASE is valid at ring 0.
+        unsafe { super::msr::write(IA32_APIC_BASE_MSR, apic_base) };
     }
+
+    // Enable APIC via Spurious Interrupt Vector Register
+    // (BSP already set the virtual base, which is the same for all CPUs)
+    // SAFETY: BSP has initialized APIC_BASE_VIRT. APIC_SIVR is a valid offset.
+    let sivr = unsafe { apic_read(APIC_SIVR) };
+    // SAFETY: Writing SIVR with enable bit and spurious vector is valid.
+    unsafe { apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE | SPURIOUS_VECTOR as u32) };
 }
 
 /// Configure the APIC timer on an AP using the BSP's calibration values.
@@ -440,14 +435,13 @@ pub unsafe fn configure_timer_ap() {
         return;
     }
 
-    // SAFETY: APIC is initialized on this AP (init_ap completed). APIC MMIO
-    // is mapped and valid. Timer register offsets are correct.
-    unsafe {
-        // Same timer configuration as BSP: divide by 16, periodic mode, TIMER_VECTOR
-        apic_write(APIC_TIMER_DCR, 0x03);
-        apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
-        apic_write(APIC_TIMER_ICR, initial_count);
-    }
+    // Same timer configuration as BSP: divide by 16, periodic mode, TIMER_VECTOR
+    // SAFETY: APIC is initialized on this AP (init_ap completed). APIC_TIMER_DCR is valid.
+    unsafe { apic_write(APIC_TIMER_DCR, 0x03) };
+    // SAFETY: APIC_LVT_TIMER is a valid register offset.
+    unsafe { apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32) };
+    // SAFETY: APIC_TIMER_ICR is a valid register offset. Writing starts the timer.
+    unsafe { apic_write(APIC_TIMER_ICR, initial_count) };
 }
 
 // ============================================================================
@@ -506,22 +500,22 @@ unsafe fn wait_for_ipi_delivery() {
 /// Must be called with interrupts disabled (or from interrupt context) to
 /// prevent reentrant ICR access.
 pub unsafe fn send_ipi(dest_apic_id: u8, vector: u8) {
-    // SAFETY: APIC is initialized, interrupts are disabled (or we are in
-    // interrupt context), and the vector is registered in the target's IDT.
-    // ICR High/Low are valid APIC register offsets.
+    // SAFETY: APIC is initialized. ICR_LOW is a valid register offset.
+    unsafe { wait_for_ipi_delivery() };
+
+    // Write destination APIC ID (bits 31:24 of ICR High)
+    // SAFETY: APIC_ICR_HIGH is a valid register offset.
+    unsafe { apic_write(APIC_ICR_HIGH, (dest_apic_id as u32) << 24) };
+
+    // Write ICR Low: vector + Fixed delivery + level assert + no shorthand
+    // This triggers the IPI.
+    // SAFETY: APIC_ICR_LOW is a valid register offset. Vector is registered in target IDT.
     unsafe {
-        wait_for_ipi_delivery();
-
-        // Write destination APIC ID (bits 31:24 of ICR High)
-        apic_write(APIC_ICR_HIGH, (dest_apic_id as u32) << 24);
-
-        // Write ICR Low: vector + Fixed delivery + level assert + no shorthand
-        // This triggers the IPI.
         apic_write(
             APIC_ICR_LOW,
             vector as u32 | ICR_DELIVERY_FIXED | ICR_LEVEL_ASSERT | ICR_DEST_NO_SHORTHAND,
-        );
-    }
+        )
+    };
 }
 
 /// Send a fixed IPI with the given vector to ALL other CPUs (excluding self).
@@ -532,20 +526,21 @@ pub unsafe fn send_ipi(dest_apic_id: u8, vector: u8) {
 /// # Safety
 /// APIC must be initialized. Vector must be registered in every CPU's IDT.
 pub unsafe fn send_ipi_all_excluding_self(vector: u8) {
-    // SAFETY: APIC is initialized and the vector is registered in every CPU's IDT.
-    // ICR High/Low are valid APIC register offsets.
+    // SAFETY: APIC is initialized. ICR_LOW is a valid register offset.
+    unsafe { wait_for_ipi_delivery() };
+
+    // Shorthand mode ignores the destination field, but we clear it for hygiene
+    // SAFETY: APIC_ICR_HIGH is a valid register offset.
+    unsafe { apic_write(APIC_ICR_HIGH, 0) };
+
+    // Write ICR Low: vector + Fixed + level assert + all-excluding-self shorthand
+    // SAFETY: APIC_ICR_LOW is a valid register offset. Vector is registered in all IDTs.
     unsafe {
-        wait_for_ipi_delivery();
-
-        // Shorthand mode ignores the destination field, but we clear it for hygiene
-        apic_write(APIC_ICR_HIGH, 0);
-
-        // Write ICR Low: vector + Fixed + level assert + all-excluding-self shorthand
         apic_write(
             APIC_ICR_LOW,
             vector as u32 | ICR_DELIVERY_FIXED | ICR_LEVEL_ASSERT | ICR_DEST_ALL_EXCLUDING_SELF,
-        );
-    }
+        )
+    };
 }
 
 /// Send a fixed IPI to self.
@@ -553,15 +548,17 @@ pub unsafe fn send_ipi_all_excluding_self(vector: u8) {
 /// # Safety
 /// APIC must be initialized. Vector must be registered in this CPU's IDT.
 pub unsafe fn send_ipi_self(vector: u8) {
-    // SAFETY: APIC is initialized and the vector is registered in this CPU's IDT.
-    // ICR High/Low are valid APIC register offsets.
-    unsafe {
-        wait_for_ipi_delivery();
+    // SAFETY: APIC is initialized. ICR_LOW is a valid register offset.
+    unsafe { wait_for_ipi_delivery() };
 
-        apic_write(APIC_ICR_HIGH, 0);
+    // SAFETY: APIC_ICR_HIGH is a valid register offset.
+    unsafe { apic_write(APIC_ICR_HIGH, 0) };
+
+    // SAFETY: APIC_ICR_LOW is a valid register offset. Vector is registered in this CPU's IDT.
+    unsafe {
         apic_write(
             APIC_ICR_LOW,
             vector as u32 | ICR_DELIVERY_FIXED | ICR_LEVEL_ASSERT | ICR_DEST_SELF,
-        );
-    }
+        )
+    };
 }

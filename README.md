@@ -44,9 +44,11 @@ Built by one person, in a few months of coding. The full, current picture — wh
 
 The headline:
 
-- ArcOS boots to stable preemptive SMP multitasking on **x86_64** and **AArch64** in QEMU. Both targets build clean in release.
-- The **security model is real and running**: cryptographic identity backed by a hardware YubiKey (no secret key in kernel memory), boot modules signed at build time and verified before execution, user-space services (filesystem, key store, virtio-net, UDP stack) isolated behind capability-checked IPC with every message carrying an unforgeable sender identity, content-addressed object store with Blake3 hashing and Ed25519 signatures.
-- Every `unsafe` block has a `// SAFETY:` comment. Lock ordering is documented and enforced. The code is written to be read.
+- ArcOS boots to stable preemptive SMP multitasking on **x86_64** and **AArch64** in QEMU. Both targets build clean in release. USB boot tooling is ready for bare-metal testing on a Dell Precision 3630.
+- The **security model is real and running**: cryptographic identity backed by a hardware YubiKey (no secret key in kernel memory), boot modules signed at build time and verified before execution, user-space services (filesystem, key store, networking, shell) isolated behind capability-checked IPC with every message carrying an unforgeable sender identity, content-addressed object store with Blake3 hashing and Ed25519 signatures.
+- **Phase 3 architecture is landing**: shared-memory data channels with MMU-enforced producer/consumer roles, capability revocation, boot-time-sized kernel object tables, generation-counter process IDs, full process lifecycle cleanup. The substrate that real workloads need — video, file I/O, AI inference — is being built now.
+- **Static analysis and fuzzing are active.** Clippy enforced on every change. `cargo-fuzz` targets cover the ELF parser, binary verifier, buddy allocator, and capability system — each with shadow-model oracles that catch invariant violations, not just crashes. Unsafe blocks are individually scoped with per-operation `// SAFETY:` comments. Miri and Kani proof harnesses are on the roadmap.
+- 316 unit tests. Lock ordering is documented and enforced. The code is written to be read.
 
 The kernel is real. The security model is real. This is not a prototype.
 
@@ -68,9 +70,9 @@ ELF binary arrives
     → ObjectStore: ownership enforced on every get/put/delete
 ```
 
-Identity is a 32-byte Ed25519 public key bound to every process (quantum resistant keying planned.) The kernel stamps Identity onto every IPC message — unforgeable, no trust required from user-space. The bootstrap Principal derives from a compiled-in YubiKey public key. No private key lives in kernel memory.
+Identity is a 32-byte Ed25519 public key bound to every process (quantum resistance planned.) The kernel stamps Identity onto every IPC message — unforgeable, no trust required from user-space. The bootstrap Principal derives from a compiled-in YubiKey public key. No private key lives in kernel memory.
 
-IPC is capability-based, sharded per-endpoint, with fixed 256-byte messages for predictable verification. Three enforcement points: IpcManager send/recv, syscall pre-dispatch, capability delegation.
+IPC has two paths: a **control path** (capability-based, sharded per-endpoint, fixed 256-byte messages for predictable verification) and a **bulk data path** (shared-memory channels with MMU-enforced producer/consumer/bidirectional roles). Three enforcement points: IpcManager send/recv, syscall pre-dispatch, capability delegation.
 For detailed internals — lock ordering, memory layout, syscall reference, scheduler design — see the Design Documents section below.
 
 ## Boot Sequence
@@ -89,9 +91,10 @@ The boot sequence is where trust is established — before any user-space code r
 6. IPC manager, capability manager, and zero-trust interceptor initialized
 7. Bootstrap Principal created from compiled-in YubiKey public key, bound to kernel processes
 8. PCI bus scan, device table populated
-9. Signed ELF boot modules loaded and verified (hello, key-store, fs-service, virtio-net, udp-stack) with per-process page tables
-10. AP cores started via Limine MP protocol — per-CPU GDT, APIC, scheduler
-11. Preemptive SMP scheduling begins
+9. Kernel object tables sized from detected memory and tier policy, allocated contiguously
+10. Signed ELF boot modules loaded and verified (hello, key-store, fs-service, virtio-net, i219-net, udp-stack, shell) with per-process page tables
+11. AP cores started via Limine MP protocol — per-CPU GDT, APIC, scheduler
+12. Preemptive SMP scheduling begins
 
 ### AArch64
 
@@ -104,22 +107,23 @@ The boot sequence is where trust is established — before any user-space code r
 7. Exception vector table installed, SVC handler configured
 8. IPC manager, capability manager, and zero-trust interceptor initialized
 9. Bootstrap Principal created from compiled-in YubiKey public key, bound to kernel processes
-10. Signed ELF boot modules loaded and verified with per-process page tables
-11. AP cores started via Limine MP protocol — per-CPU GIC, timer, scheduler
-12. Preemptive SMP scheduling begins
+10. Kernel object tables sized from detected memory and tier policy, allocated contiguously
+11. Signed ELF boot modules loaded and verified with per-process page tables
+12. AP cores started via Limine MP protocol — per-CPU GIC, timer, scheduler
+13. Preemptive SMP scheduling begins
 
 ---
 
 ## Building
 
-ArcOS builds on macOS (Apple Silicon) with Rust nightly. Kernel binaries run only in QEMU — never directly on the host.
-Prerequisites
+ArcOS builds on macOS (Apple Silicon) with Rust nightly (pinned — see `rust-toolchain.toml`). Kernel binaries run only in QEMU or on bare-metal target hardware — never directly on the host.
 
-Rust nightly (see rust-toolchain.toml)
-Targets: x86_64-unknown-none, aarch64-unknown-none
-QEMU via Homebrew
-Limine v8.7.0 (auto-cloned to /tmp/limine)
-mtools for AArch64 FAT disk images
+Prerequisites:
+- Rust nightly (pinned date in `rust-toolchain.toml`; required for `abi_x86_interrupt` only)
+- Targets: `x86_64-unknown-none`, `aarch64-unknown-none`
+- QEMU via Homebrew
+- Limine v8.7.0 (auto-cloned to `/tmp/limine`)
+- `mtools` for AArch64 FAT disk images
 ```
 Unit tests (host macOS)
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
@@ -135,6 +139,12 @@ make img-aarch64 && make run-aarch64
 
 # Sign via seed (CI / no hardware key)
 ./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --seed <hex> <elf-file>
+
+# Fuzz a security-critical target (requires cargo-fuzz)
+cargo fuzz run fuzz_elf_parser
+cargo fuzz run fuzz_binary_verifier
+cargo fuzz run fuzz_buddy_allocator
+cargo fuzz run fuzz_capability
 ```
 ---
 
@@ -146,7 +156,7 @@ src/
 ├── arch/aarch64/         # GICv3, ARM Generic Timer, SVC, TLBI, EL0/EL1
 ├── scheduler/            # Priority-band preemptive SMP scheduler (portable)
 ├── ipc/                  # Capability-based IPC, Principal, zero-trust interceptor
-├── syscalls/             # 24 syscalls, all implemented
+├── syscalls/             # 33 syscalls, all implemented
 ├── memory/               # Frame allocator, buddy allocator, per-process page tables
 ├── fs/                   # ArcObject, ObjectStore, Blake3, Ed25519
 ├── loader/               # ELF loader, BinaryVerifier, SignedBinaryVerifier
@@ -158,10 +168,18 @@ user/
 ├── fs-service/           # Filesystem service (endpoint 16)
 ├── key-store-service/    # Ed25519 signing service (endpoint 17)
 ├── virtio-net/           # Virtio-net driver (endpoint 20)
-└── udp-stack/            # UDP/IP network service (endpoint 21)
+├── i219-net/             # Intel I219-LM driver (bare-metal target)
+├── udp-stack/            # UDP/IP network service (endpoint 21)
+└── shell/                # Interactive serial shell
 
 tools/
 └── sign-elf/             # Host-side ELF signing tool (YubiKey or seed)
+
+fuzz/
+├── fuzz_elf_parser.rs        # Adversarial ELF bytes through full parse pipeline
+├── fuzz_binary_verifier.rs   # Synthetic segments vs. verify-before-execute gate
+├── fuzz_buddy_allocator.rs   # Random alloc/free sequences with overlap + double-free detection
+└── fuzz_capability.rs        # Grant/revoke/verify sequences with shadow-model oracle
 ```
 
 ---
@@ -202,6 +220,8 @@ Narrative walkthroughs that explain how ArcOS works by following real things thr
 - [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) — IPC primitives: control path (256-byte messages) and bulk path (channels)
 - [ADR-006](docs/adr/006-policy-service.md) — Policy service: externalized policy decisions
 - [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) — Capability revocation and audit telemetry
+- [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) — Boot-time-sized kernel object tables
+- [ADR-009](docs/adr/009-purpose-tiers-scope.md) — Purpose, tiers, scope, and governance
 
 ---
 
@@ -244,14 +264,21 @@ The bootstrap Principal derives from a compiled-in YubiKey public key. No privat
 
 ### IPC Model
 
-Capability-based message passing with zero-trust enforcement:
+Two-path IPC with zero-trust enforcement:
 
+**Control path** — capability-based message passing:
 - **Fixed-size messages** (256 bytes) for predictable verification
 - **Capability rights**: Send, Receive, Delegate — fine-grained per-endpoint
 - **Priority levels**: Critical, High, Normal, Low
 - **Three-layer enforcement**: IPC interceptor hooks at IpcManager send/recv, syscall pre-dispatch, and capability delegation
 - **Page-table-walk** for user buffer validation in Write/Read syscalls
 - **Identity-aware receive** (`RecvMsg`): returns `[sender_principal:32][from_endpoint:4][payload:N]`
+
+**Bulk data path** — shared-memory channels:
+- **MMU-enforced roles**: Producer (RW), Consumer (RO), Bidirectional (RW/RW)
+- **Principal-bound**: creator specifies peer by public key; kernel verifies on attach
+- **Full lifecycle management**: create, attach, close, revoke; TLB shootdown on teardown
+- **Requires `CreateChannel` system capability** — no uncontrolled channel creation
 
 ### Memory Layout
 
@@ -270,7 +297,8 @@ Strict lock hierarchy prevents deadlock across all kernel subsystems:
 
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
+CHANNEL_MANAGER(5) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7) →
+INTERRUPT_ROUTER(8) → OBJECT_STORE(9)
 ```
 
 `*` = IrqSpinlock (interrupt-disabling). Lower numbers acquired before higher. No exceptions.

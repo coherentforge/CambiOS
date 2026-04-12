@@ -113,12 +113,10 @@ impl LockedHeapAllocator {
 
         let block = heap_start as *mut FreeBlock;
         // SAFETY: heap_start is a valid, writable, heap_size-byte region per caller contract.
-        // We write a FreeBlock header at the base. heap_size >= MIN_BLOCK_SIZE ensures
-        // the region can hold at least one FreeBlock (16 bytes).
-        unsafe {
-            (*block).size = heap_size;
-            (*block).next = ptr::null_mut();
-        }
+        // heap_size >= MIN_BLOCK_SIZE ensures the region can hold at least one FreeBlock.
+        unsafe { (*block).size = heap_size };
+        // SAFETY: Same region — writing the next pointer of the initial free block.
+        unsafe { (*block).next = ptr::null_mut() };
 
         inner.free_list = block;
         inner.heap_base = heap_start;
@@ -180,66 +178,68 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
             return ptr::null_mut();
         }
 
-        // SAFETY: All pointer dereferences below access FreeBlock nodes in the free list.
+        // First-fit search through sorted free list.
+        // All pointer dereferences below access FreeBlock nodes in the free list.
         // Each node was written by init() or dealloc() and is valid while we hold the lock.
-        // The list is sorted by address and nodes don't overlap. We also write FreeBlock
-        // headers for split blocks and allocation headers — all within the heap region
-        // that we own exclusively under the lock.
-        unsafe {
-            // First-fit search through sorted free list
-            let mut prev: *mut FreeBlock = ptr::null_mut();
-            let mut current = inner.free_list;
+        let mut prev: *mut FreeBlock = ptr::null_mut();
+        let mut current = inner.free_list;
 
-            while !current.is_null() {
-                let block_addr = current as usize;
-                let block_size = (*current).size;
+        while !current.is_null() {
+            let block_addr = current as usize;
+            // SAFETY: current is a valid FreeBlock pointer; lock is held.
+            let block_size = unsafe { (*current).size };
 
-                // User data starts after 16-byte header, aligned
-                let data_start = block_addr + header_size;
-                let aligned_start = align_up(data_start, align);
-                let total_needed = (aligned_start - block_addr) + size;
+            // User data starts after 16-byte header, aligned
+            let data_start = block_addr + header_size;
+            let aligned_start = align_up(data_start, align);
+            let total_needed = (aligned_start - block_addr) + size;
 
-                if block_size >= total_needed {
-                    let remainder = block_size - total_needed;
+            if block_size >= total_needed {
+                let remainder = block_size - total_needed;
 
-                    // Remove or split the block from the free list FIRST
-                    // (before we overwrite the FreeBlock header with our alloc header)
-                    let next_block = (*current).next;
+                // Remove or split the block from the free list FIRST
+                // (before we overwrite the FreeBlock header with our alloc header)
+                // SAFETY: current is valid; reading next pointer.
+                let next_block = unsafe { (*current).next };
 
-                    if remainder >= MIN_BLOCK_SIZE + header_size {
-                        // Split: create a new free block after this allocation
-                        let new_block = (block_addr + total_needed) as *mut FreeBlock;
-                        (*new_block).size = remainder;
-                        (*new_block).next = next_block;
+                if remainder >= MIN_BLOCK_SIZE + header_size {
+                    // Split: create a new free block after this allocation
+                    let new_block = (block_addr + total_needed) as *mut FreeBlock;
+                    // SAFETY: new_block is within the heap region (block_addr + total_needed < block_end).
+                    unsafe { (*new_block).size = remainder };
+                    // SAFETY: Same pointer — writing the next field.
+                    unsafe { (*new_block).next = next_block };
 
-                        if prev.is_null() {
-                            inner.free_list = new_block;
-                        } else {
-                            (*prev).next = new_block;
-                        }
+                    if prev.is_null() {
+                        inner.free_list = new_block;
                     } else {
-                        // Use the whole block
-                        if prev.is_null() {
-                            inner.free_list = next_block;
-                        } else {
-                            (*prev).next = next_block;
-                        }
-                        // Adjust total_needed to use the whole block for dealloc consistency
-                        // (not strictly needed, but cleaner)
+                        // SAFETY: prev is a valid FreeBlock pointer in the free list.
+                        unsafe { (*prev).next = new_block };
                     }
-
-                    // Write 2-word header: [block_base, total_block_size]
-                    let hdr = (aligned_start - header_size) as *mut [usize; 2];
-                    (*hdr)[0] = block_addr;
-                    (*hdr)[1] = if remainder >= MIN_BLOCK_SIZE + header_size { total_needed } else { block_size };
-
-                    self.release();
-                    return aligned_start as *mut u8;
+                } else {
+                    // Use the whole block
+                    if prev.is_null() {
+                        inner.free_list = next_block;
+                    } else {
+                        // SAFETY: prev is a valid FreeBlock pointer.
+                        unsafe { (*prev).next = next_block };
+                    }
                 }
 
-                prev = current;
-                current = (*current).next;
+                // Write 2-word header: [block_base, total_block_size]
+                let hdr = (aligned_start - header_size) as *mut [usize; 2];
+                // SAFETY: hdr points to the 16-byte header region within the allocated block.
+                unsafe { (*hdr)[0] = block_addr };
+                // SAFETY: Same header region — writing block size.
+                unsafe { (*hdr)[1] = if remainder >= MIN_BLOCK_SIZE + header_size { total_needed } else { block_size } };
+
+                self.release();
+                return aligned_start as *mut u8;
             }
+
+            prev = current;
+            // SAFETY: current is valid; reading next pointer.
+            current = unsafe { (*current).next };
         }
 
         self.release();
@@ -256,52 +256,70 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
         // SAFETY: ptr was returned by our alloc(), which writes a [block_base, block_size]
         // header at (aligned_start - 16). Reading it back here recovers the original
         // allocation metadata. If ptr was NOT returned by this allocator, this is UB.
-        let (block_addr, block_size) = unsafe { ((*hdr)[0], (*hdr)[1]) };
+        let block_addr = unsafe { (*hdr)[0] };
+        // SAFETY: Same header — reading the block size field.
+        let block_size = unsafe { (*hdr)[1] };
 
         self.acquire();
-        // SAFETY: Lock is held; inner.get() gives exclusive access. All pointer dereferences
-        // below access FreeBlock nodes in the free list (written by init/alloc/dealloc) or
-        // the newly freed block. The list is sorted by address and nodes don't overlap.
-        unsafe {
-            let inner = &mut *self.inner.get();
+        // SAFETY: Lock is held; inner.get() gives exclusive access.
+        let inner = unsafe { &mut *self.inner.get() };
 
-            // Insert freed block into sorted free list and coalesce
-            let freed = block_addr as *mut FreeBlock;
-            (*freed).size = block_size;
+        // Insert freed block into sorted free list and coalesce.
+        // All pointer dereferences below access FreeBlock nodes in the free list
+        // or the newly freed block, sorted by address, non-overlapping.
+        let freed = block_addr as *mut FreeBlock;
+        // SAFETY: freed points to the start of the block being returned.
+        unsafe { (*freed).size = block_size };
 
-            // Find insertion point (list is sorted by address)
-            let mut prev: *mut FreeBlock = ptr::null_mut();
-            let mut current = inner.free_list;
+        // Find insertion point (list is sorted by address)
+        let mut prev: *mut FreeBlock = ptr::null_mut();
+        let mut current = inner.free_list;
 
-            while !current.is_null() && (current as usize) < block_addr {
-                prev = current;
-                current = (*current).next;
+        while !current.is_null() && (current as usize) < block_addr {
+            prev = current;
+            // SAFETY: current is a valid FreeBlock in the free list; lock is held.
+            current = unsafe { (*current).next };
+        }
+
+        // Insert into list
+        // SAFETY: freed is valid — writing next pointer.
+        unsafe { (*freed).next = current };
+        if prev.is_null() {
+            inner.free_list = freed;
+        } else {
+            // SAFETY: prev is a valid FreeBlock pointer.
+            unsafe { (*prev).next = freed };
+        }
+
+        // Coalesce with next block if adjacent
+        if !current.is_null() {
+            // SAFETY: freed is valid — reading size.
+            let freed_end = block_addr + unsafe { (*freed).size };
+            if freed_end == current as usize {
+                // SAFETY: current is valid — reading size for coalesce.
+                let current_size = unsafe { (*current).size };
+                // SAFETY: freed is valid — adding coalesced size.
+                unsafe { (*freed).size += current_size };
+                // SAFETY: current is valid — reading next pointer for splice.
+                let current_next = unsafe { (*current).next };
+                // SAFETY: freed is valid — updating next pointer.
+                unsafe { (*freed).next = current_next };
             }
+        }
 
-            // Insert into list
-            (*freed).next = current;
-            if prev.is_null() {
-                inner.free_list = freed;
-            } else {
-                (*prev).next = freed;
-            }
-
-            // Coalesce with next block if adjacent
-            if !current.is_null() {
-                let freed_end = block_addr + (*freed).size;
-                if freed_end == current as usize {
-                    (*freed).size += (*current).size;
-                    (*freed).next = (*current).next;
-                }
-            }
-
-            // Coalesce with previous block if adjacent
-            if !prev.is_null() {
-                let prev_end = prev as usize + (*prev).size;
-                if prev_end == freed as usize {
-                    (*prev).size += (*freed).size;
-                    (*prev).next = (*freed).next;
-                }
+        // Coalesce with previous block if adjacent
+        if !prev.is_null() {
+            // SAFETY: prev is valid — reading size.
+            let prev_end = prev as usize + unsafe { (*prev).size };
+            if prev_end == freed as usize {
+                // SAFETY: freed is valid — reading size for coalesce.
+                let freed_size = unsafe { (*freed).size };
+                // SAFETY: prev is valid — adding coalesced size.
+                unsafe { (*prev).size += freed_size };
+                // SAFETY: freed is valid — reading next pointer.
+                let freed_next = unsafe { (*freed).next };
+                // SAFETY: prev is valid — updating next pointer.
+                unsafe { (*prev).next = freed_next };
             }
         }
 

@@ -190,17 +190,20 @@ pub fn cpu_count() -> u32 {
 pub unsafe fn init_bsp(apic_id: u32) {
     // SAFETY: Single-threaded boot. PER_CPU_DATA is a mutable static but
     // only the BSP accesses index 0 during init with interrupts disabled.
-    // IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
-    unsafe {
-        let percpu = &raw mut PER_CPU_DATA[0];
-        (*percpu).self_ptr = percpu as *const PerCpu;
-        (*percpu).cpu_id = 0;
-        (*percpu).apic_id = apic_id;
-        (*percpu).current_task_id = 0;
-        (*percpu).interrupt_depth = 0;
+    let percpu = unsafe { &raw mut PER_CPU_DATA[0] };
+    // SAFETY: percpu points to a valid PerCpu in the static array; single-threaded boot.
+    unsafe { (*percpu).self_ptr = percpu as *const PerCpu };
+    // SAFETY: Same — writing cpu_id field.
+    unsafe { (*percpu).cpu_id = 0 };
+    // SAFETY: Same — writing apic_id field.
+    unsafe { (*percpu).apic_id = apic_id };
+    // SAFETY: Same — writing current_task_id field.
+    unsafe { (*percpu).current_task_id = 0 };
+    // SAFETY: Same — writing interrupt_depth field.
+    unsafe { (*percpu).interrupt_depth = 0 };
 
-        super::msr::write(IA32_GS_BASE, percpu as u64);
-    }
+    // SAFETY: IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
+    unsafe { super::msr::write(IA32_GS_BASE, percpu as u64) };
 
     CPU_COUNT.store(1, core::sync::atomic::Ordering::Release);
 }
@@ -213,19 +216,22 @@ pub unsafe fn init_bsp(apic_id: u32) {
 pub unsafe fn init_ap(cpu_index: usize, apic_id: u32) {
     assert!(cpu_index > 0 && cpu_index < MAX_CPUS, "AP cpu_index out of range");
 
-    // SAFETY: Each AP calls this exactly once with a unique cpu_index during
-    // its startup sequence. PER_CPU_DATA[cpu_index] is only accessed by this AP.
-    // IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
-    unsafe {
-        let percpu = &raw mut PER_CPU_DATA[cpu_index];
-        (*percpu).self_ptr = percpu as *const PerCpu;
-        (*percpu).cpu_id = cpu_index as u32;
-        (*percpu).apic_id = apic_id;
-        (*percpu).current_task_id = 0;
-        (*percpu).interrupt_depth = 0;
+    // SAFETY: Each AP calls this exactly once with a unique cpu_index.
+    // PER_CPU_DATA[cpu_index] is only accessed by this AP.
+    let percpu = unsafe { &raw mut PER_CPU_DATA[cpu_index] };
+    // SAFETY: percpu points to a valid PerCpu in the static array; AP-local access.
+    unsafe { (*percpu).self_ptr = percpu as *const PerCpu };
+    // SAFETY: Same — writing cpu_id field.
+    unsafe { (*percpu).cpu_id = cpu_index as u32 };
+    // SAFETY: Same — writing apic_id field.
+    unsafe { (*percpu).apic_id = apic_id };
+    // SAFETY: Same — writing current_task_id field.
+    unsafe { (*percpu).current_task_id = 0 };
+    // SAFETY: Same — writing interrupt_depth field.
+    unsafe { (*percpu).interrupt_depth = 0 };
 
-        super::msr::write(IA32_GS_BASE, percpu as u64);
-    }
+    // SAFETY: IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
+    unsafe { super::msr::write(IA32_GS_BASE, percpu as u64) };
 
     CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 }
@@ -242,16 +248,16 @@ pub unsafe fn init_ap(cpu_index: usize, apic_id: u32) {
 pub unsafe fn current_percpu() -> &'static PerCpu {
     let ptr: *const PerCpu;
     // SAFETY: GS base points to a valid PerCpu struct (initialized by
-    // init_bsp/init_ap). Reading gs:[0] yields self_ptr, which is the
-    // PerCpu address. The pointed-to data has 'static lifetime.
+    // init_bsp/init_ap). Reading gs:[0] yields self_ptr.
     unsafe {
         core::arch::asm!(
             "mov {}, gs:[0]",
             out(reg) ptr,
             options(nostack, readonly, preserves_flags),
         );
-        &*ptr
     }
+    // SAFETY: ptr is self_ptr, which has 'static lifetime.
+    unsafe { &*ptr }
 }
 
 /// Get the current CPU's PerCpu data (mutable).
@@ -263,17 +269,17 @@ pub unsafe fn current_percpu() -> &'static PerCpu {
 #[inline(always)]
 pub unsafe fn current_percpu_mut() -> &'static mut PerCpu {
     let ptr: *mut PerCpu;
-    // SAFETY: Same as current_percpu, but returns &mut. Safe because PerCpu
-    // is only accessed by its owning CPU, and the caller guarantees no
-    // concurrent mutable access.
+    // SAFETY: GS base points to a valid PerCpu struct. Reading gs:[0] yields self_ptr.
     unsafe {
         core::arch::asm!(
             "mov {}, gs:[0]",
             out(reg) ptr,
             options(nostack, readonly, preserves_flags),
         );
-        &mut *ptr
     }
+    // SAFETY: ptr is self_ptr with 'static lifetime. Caller guarantees no
+    // concurrent mutable access (CPU-local data).
+    unsafe { &mut *ptr }
 }
 
 /// Convenience: get the current CPU's logical ID.

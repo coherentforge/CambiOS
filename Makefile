@@ -17,6 +17,8 @@
 KERNEL := target/x86_64-unknown-none/release/arcos_microkernel
 ISO := arcos.iso
 LIMINE_DIR := /tmp/limine
+LIMINE_BRANCH := v8.x-binary
+LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 
 # User-space ELF binaries (x86_64)
 USER_ELF := user/hello.elf
@@ -179,7 +181,14 @@ sign-tool:
 export-pubkey: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) --export-pubkey bootstrap_pubkey.bin
 
-iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell
+# Auto-clone Limine if /tmp/limine was cleaned (reboot, macOS periodic cleanup, etc.)
+$(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
+	@echo "=== Cloning Limine $(LIMINE_BRANCH) ==="
+	git clone $(LIMINE_REPO) --branch=$(LIMINE_BRANCH) --depth=1 $(LIMINE_DIR)
+
+limine: $(LIMINE_DIR)/BOOTX64.EFI
+
+iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -229,7 +238,7 @@ run: iso
 		-cdrom $(ISO) \
 		-serial mon:stdio \
 		-smp 2 \
-		-m 128M \
+		-m 4G \
 		-device virtio-net-pci \
 		-no-reboot
 
@@ -240,14 +249,14 @@ run-uefi: iso
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
 		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
 		-serial mon:stdio \
-		-m 128M \
+		-m 4G \
 		-no-reboot
 
 # x86_64 FAT32 UEFI image — for USB boot on bare metal (Dell 3630 etc.)
 # Usage: make img-x86 && sudo dd if=arcos-x86.img of=/dev/diskN bs=1M
 IMG_X86 := arcos-x86.img
 
-img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell sign-tool
+img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell sign-tool limine
 	@echo "=== Building x86_64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_X86)
 	dd if=/dev/zero of=$(IMG_X86) bs=1M count=64
@@ -300,7 +309,7 @@ run-img-x86: img-x86
 		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
 		-serial mon:stdio \
 		-smp 2 \
-		-m 128M \
+		-m 4G \
 		-device virtio-net-pci \
 		-no-reboot
 
@@ -363,7 +372,7 @@ run-img-usb: img-usb
 		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
 		-serial mon:stdio \
 		-smp 2 \
-		-m 128M \
+		-m 4G \
 		-device virtio-net-pci \
 		-no-reboot
 
@@ -441,7 +450,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool
+img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -484,7 +493,7 @@ run-aarch64: img-aarch64
 		-machine virt,gic-version=3 \
 		-cpu cortex-a72 \
 		-smp 2 \
-		-m 256M \
+		-m 4G \
 		-serial mon:stdio \
 		-display none \
 		-no-reboot \

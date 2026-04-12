@@ -51,24 +51,22 @@ struct Rsdp {
 /// `vaddr` must point to a valid, mapped RSDP structure.
 unsafe fn validate_rsdp(vaddr: usize) -> Result<(u64, u32, u8), &'static str> {
     // SAFETY: Caller guarantees vaddr points to a valid, mapped RSDP structure.
-    // All pointer dereferences below are within that structure.
-    unsafe {
-        let rsdp = &*(vaddr as *const Rsdp);
+    let rsdp = unsafe { &*(vaddr as *const Rsdp) };
 
-        // Verify signature
-        if &rsdp.signature != b"RSD PTR " {
-            return Err("RSDP: bad signature");
-        }
-
-        // Verify v1 checksum (first 20 bytes)
-        let bytes = core::slice::from_raw_parts(vaddr as *const u8, 20);
-        let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-        if sum != 0 {
-            return Err("RSDP: bad checksum");
-        }
-
-        Ok((rsdp.xsdt_address, rsdp.rsdt_address, rsdp.revision))
+    // Verify signature
+    if &rsdp.signature != b"RSD PTR " {
+        return Err("RSDP: bad signature");
     }
+
+    // Verify v1 checksum (first 20 bytes)
+    // SAFETY: vaddr is valid and mapped, 20 bytes is within the RSDP structure.
+    let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, 20) };
+    let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    if sum != 0 {
+        return Err("RSDP: bad checksum");
+    }
+
+    Ok((rsdp.xsdt_address, rsdp.rsdt_address, rsdp.revision))
 }
 
 // ============================================================================
@@ -100,24 +98,22 @@ const SDT_HEADER_SIZE: usize = core::mem::size_of::<SdtHeader>();
 /// # Safety
 /// `vaddr` must point to a valid, mapped SDT with at least `header.length` bytes.
 unsafe fn validate_sdt(vaddr: usize) -> Result<&'static SdtHeader, &'static str> {
-    // SAFETY: Caller guarantees vaddr points to a valid, mapped SDT with at
-    // least header.length bytes accessible.
-    unsafe {
-        let header = &*(vaddr as *const SdtHeader);
-        let length = header.length as usize;
+    // SAFETY: Caller guarantees vaddr points to a valid, mapped SDT.
+    let header = unsafe { &*(vaddr as *const SdtHeader) };
+    let length = header.length as usize;
 
-        if length < SDT_HEADER_SIZE {
-            return Err("SDT: length too small");
-        }
-
-        let bytes = core::slice::from_raw_parts(vaddr as *const u8, length);
-        let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-        if sum != 0 {
-            return Err("SDT: bad checksum");
-        }
-
-        Ok(header)
+    if length < SDT_HEADER_SIZE {
+        return Err("SDT: length too small");
     }
+
+    // SAFETY: vaddr is valid and mapped, length is from the header (at least SDT_HEADER_SIZE).
+    let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, length) };
+    let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    if sum != 0 {
+        return Err("SDT: bad checksum");
+    }
+
+    Ok(header)
 }
 
 // ============================================================================
@@ -302,21 +298,21 @@ pub unsafe fn parse_acpi(rsdp_phys: u64) -> Result<AcpiInterruptInfo, &'static s
     let rsdp_virt = rsdp_phys + hhdm;
 
     // SAFETY: Caller guarantees rsdp_phys is valid and HHDM-mapped.
-    // All sub-calls operate on HHDM-mapped ACPI tables.
-    unsafe {
-        let (xsdt_phys, rsdt_phys, revision) = validate_rsdp(rsdp_virt as usize)?;
+    let (xsdt_phys, rsdt_phys, revision) = unsafe { validate_rsdp(rsdp_virt as usize) }?;
 
-        // Find the MADT by walking XSDT (preferred) or RSDT
-        let madt_virt = if revision >= 2 && xsdt_phys != 0 {
-            find_table_xsdt(xsdt_phys + hhdm, b"APIC", hhdm)?
-        } else if rsdt_phys != 0 {
-            find_table_rsdt(rsdt_phys as u64 + hhdm, b"APIC", hhdm)?
-        } else {
-            return Err("ACPI: no XSDT or RSDT");
-        };
+    // Find the MADT by walking XSDT (preferred) or RSDT
+    let madt_virt = if revision >= 2 && xsdt_phys != 0 {
+        // SAFETY: XSDT is HHDM-mapped at xsdt_phys + hhdm.
+        unsafe { find_table_xsdt(xsdt_phys + hhdm, b"APIC", hhdm) }?
+    } else if rsdt_phys != 0 {
+        // SAFETY: RSDT is HHDM-mapped at rsdt_phys + hhdm.
+        unsafe { find_table_rsdt(rsdt_phys as u64 + hhdm, b"APIC", hhdm) }?
+    } else {
+        return Err("ACPI: no XSDT or RSDT");
+    };
 
-        parse_madt(madt_virt)
-    }
+    // SAFETY: madt_virt points to a valid, checksum-verified MADT.
+    unsafe { parse_madt(madt_virt) }
 }
 
 /// Walk the XSDT (64-bit pointers) to find a table by signature.
@@ -329,29 +325,29 @@ unsafe fn find_table_xsdt(
     hhdm: u64,
 ) -> Result<usize, &'static str> {
     // SAFETY: Caller guarantees xsdt_virt points to a valid, mapped XSDT.
-    // All pointer operations below access HHDM-mapped ACPI table memory.
-    unsafe {
-        let header = validate_sdt(xsdt_virt as usize)?;
-        let total_len = header.length as usize;
-        let entries_offset = SDT_HEADER_SIZE;
-        let entries_len = total_len - entries_offset;
-        let entry_count = entries_len / 8; // 64-bit pointers
+    let header = unsafe { validate_sdt(xsdt_virt as usize) }?;
+    let total_len = header.length as usize;
+    let entries_offset = SDT_HEADER_SIZE;
+    let entries_len = total_len - entries_offset;
+    let entry_count = entries_len / 8; // 64-bit pointers
 
-        let entries_base = xsdt_virt as usize + entries_offset;
+    let entries_base = xsdt_virt as usize + entries_offset;
 
-        for i in 0..entry_count {
-            let phys = core::ptr::read_unaligned((entries_base + i * 8) as *const u64);
-            let virt = (phys + hhdm) as usize;
-            let entry_header = &*(virt as *const SdtHeader);
-            if &entry_header.signature == signature {
-                // Validate the found table
-                let _ = validate_sdt(virt)?;
-                return Ok(virt);
-            }
+    for i in 0..entry_count {
+        // SAFETY: entries_base + i*8 is within the XSDT bounds (validated above).
+        let phys = unsafe { core::ptr::read_unaligned((entries_base + i * 8) as *const u64) };
+        let virt = (phys + hhdm) as usize;
+        // SAFETY: virt points to a HHDM-mapped ACPI table header.
+        let entry_header = unsafe { &*(virt as *const SdtHeader) };
+        if &entry_header.signature == signature {
+            // Validate the found table
+            // SAFETY: virt points to a mapped SDT.
+            let _ = unsafe { validate_sdt(virt) }?;
+            return Ok(virt);
         }
-
-        Err("ACPI: table not found in XSDT")
     }
+
+    Err("ACPI: table not found in XSDT")
 }
 
 /// Walk the RSDT (32-bit pointers) to find a table by signature.
@@ -364,28 +360,30 @@ unsafe fn find_table_rsdt(
     hhdm: u64,
 ) -> Result<usize, &'static str> {
     // SAFETY: Caller guarantees rsdt_virt points to a valid, mapped RSDT.
-    // All pointer operations below access HHDM-mapped ACPI table memory.
-    unsafe {
-        let header = validate_sdt(rsdt_virt as usize)?;
-        let total_len = header.length as usize;
-        let entries_offset = SDT_HEADER_SIZE;
-        let entries_len = total_len - entries_offset;
-        let entry_count = entries_len / 4; // 32-bit pointers
+    let header = unsafe { validate_sdt(rsdt_virt as usize) }?;
+    let total_len = header.length as usize;
+    let entries_offset = SDT_HEADER_SIZE;
+    let entries_len = total_len - entries_offset;
+    let entry_count = entries_len / 4; // 32-bit pointers
 
-        let entries_base = rsdt_virt as usize + entries_offset;
+    let entries_base = rsdt_virt as usize + entries_offset;
 
-        for i in 0..entry_count {
-            let phys = core::ptr::read_unaligned((entries_base + i * 4) as *const u32) as u64;
-            let virt = (phys + hhdm) as usize;
-            let entry_header = &*(virt as *const SdtHeader);
-            if &entry_header.signature == signature {
-                let _ = validate_sdt(virt)?;
-                return Ok(virt);
-            }
+    for i in 0..entry_count {
+        // SAFETY: entries_base + i*4 is within the RSDT bounds (validated above).
+        let phys = unsafe {
+            core::ptr::read_unaligned((entries_base + i * 4) as *const u32)
+        } as u64;
+        let virt = (phys + hhdm) as usize;
+        // SAFETY: virt points to a HHDM-mapped ACPI table header.
+        let entry_header = unsafe { &*(virt as *const SdtHeader) };
+        if &entry_header.signature == signature {
+            // SAFETY: virt points to a mapped SDT.
+            let _ = unsafe { validate_sdt(virt) }?;
+            return Ok(virt);
         }
-
-        Err("ACPI: table not found in RSDT")
     }
+
+    Err("ACPI: table not found in RSDT")
 }
 
 /// Parse the MADT and extract I/O APIC and override entries.
@@ -394,82 +392,81 @@ unsafe fn find_table_rsdt(
 /// `madt_virt` must point to a valid, checksum-verified MADT.
 unsafe fn parse_madt(madt_virt: usize) -> Result<AcpiInterruptInfo, &'static str> {
     // SAFETY: Caller guarantees madt_virt points to a valid, checksum-verified MADT.
-    // All pointer dereferences below access HHDM-mapped ACPI table memory within
-    // the bounds established by the MADT's length field.
-    unsafe {
-        let madt = &*(madt_virt as *const MadtHeader);
-        let total_len = madt.sdt.length as usize;
+    let madt = unsafe { &*(madt_virt as *const MadtHeader) };
+    let total_len = madt.sdt.length as usize;
 
-        let mut info = AcpiInterruptInfo::new();
-        info.local_apic_address = madt.local_apic_address;
+    let mut info = AcpiInterruptInfo::new();
+    info.local_apic_address = madt.local_apic_address;
 
-        // Entries start after the MADT header (44 bytes = 36 SDT + 4 LAPIC addr + 4 flags)
-        let entries_start = madt_virt + core::mem::size_of::<MadtHeader>();
-        let entries_end = madt_virt + total_len;
-        let mut offset = entries_start;
+    // Entries start after the MADT header (44 bytes = 36 SDT + 4 LAPIC addr + 4 flags)
+    let entries_start = madt_virt + core::mem::size_of::<MadtHeader>();
+    let entries_end = madt_virt + total_len;
+    let mut offset = entries_start;
 
-        while offset + 2 <= entries_end {
-            let entry = &*(offset as *const MadtEntryHeader);
-            let entry_len = entry.length as usize;
+    while offset + 2 <= entries_end {
+        // SAFETY: offset is within the MADT bounds (checked above).
+        let entry = unsafe { &*(offset as *const MadtEntryHeader) };
+        let entry_len = entry.length as usize;
 
-            if entry_len < 2 || offset + entry_len > entries_end {
-                break; // Malformed entry
-            }
-
-            match entry.entry_type {
-                MADT_TYPE_IO_APIC => {
-                    if entry_len >= core::mem::size_of::<MadtIoApic>()
-                        && info.io_apic_count < MAX_IO_APICS
-                    {
-                        let io_apic = &*(offset as *const MadtIoApic);
-                        info.io_apics[info.io_apic_count] = Some(IoApicInfo {
-                            id: io_apic.id,
-                            address: io_apic.address as u64,
-                            gsi_base: io_apic.gsi_base,
-                        });
-                        info.io_apic_count += 1;
-                    }
-                }
-                MADT_TYPE_INTERRUPT_SOURCE_OVERRIDE => {
-                    if entry_len >= core::mem::size_of::<MadtInterruptSourceOverride>()
-                        && info.override_count < MAX_OVERRIDES
-                    {
-                        let iso = &*(offset as *const MadtInterruptSourceOverride);
-                        let flags = iso.flags;
-                        let polarity = match flags & 0x03 {
-                            0 => Polarity::BusDefault,
-                            1 => Polarity::ActiveHigh,
-                            3 => Polarity::ActiveLow,
-                            _ => Polarity::BusDefault,
-                        };
-                        let trigger = match (flags >> 2) & 0x03 {
-                            0 => TriggerMode::BusDefault,
-                            1 => TriggerMode::Edge,
-                            3 => TriggerMode::Level,
-                            _ => TriggerMode::BusDefault,
-                        };
-
-                        info.overrides[info.override_count] = Some(InterruptOverride {
-                            source_irq: iso.source,
-                            gsi: iso.gsi,
-                            polarity,
-                            trigger,
-                        });
-                        info.override_count += 1;
-                    }
-                }
-                _ => {} // Skip other entry types (Local APIC NMI, etc.)
-            }
-
-            offset += entry_len;
+        if entry_len < 2 || offset + entry_len > entries_end {
+            break; // Malformed entry
         }
 
-        if info.io_apic_count == 0 {
-            return Err("MADT: no I/O APIC found");
+        match entry.entry_type {
+            MADT_TYPE_IO_APIC => {
+                if entry_len >= core::mem::size_of::<MadtIoApic>()
+                    && info.io_apic_count < MAX_IO_APICS
+                {
+                    // SAFETY: entry_len is checked, offset is within MADT bounds.
+                    let io_apic = unsafe { &*(offset as *const MadtIoApic) };
+                    info.io_apics[info.io_apic_count] = Some(IoApicInfo {
+                        id: io_apic.id,
+                        address: io_apic.address as u64,
+                        gsi_base: io_apic.gsi_base,
+                    });
+                    info.io_apic_count += 1;
+                }
+            }
+            MADT_TYPE_INTERRUPT_SOURCE_OVERRIDE => {
+                if entry_len >= core::mem::size_of::<MadtInterruptSourceOverride>()
+                    && info.override_count < MAX_OVERRIDES
+                {
+                    // SAFETY: entry_len is checked, offset is within MADT bounds.
+                    let iso = unsafe { &*(offset as *const MadtInterruptSourceOverride) };
+                    let flags = iso.flags;
+                    let polarity = match flags & 0x03 {
+                        0 => Polarity::BusDefault,
+                        1 => Polarity::ActiveHigh,
+                        3 => Polarity::ActiveLow,
+                        _ => Polarity::BusDefault,
+                    };
+                    let trigger = match (flags >> 2) & 0x03 {
+                        0 => TriggerMode::BusDefault,
+                        1 => TriggerMode::Edge,
+                        3 => TriggerMode::Level,
+                        _ => TriggerMode::BusDefault,
+                    };
+
+                    info.overrides[info.override_count] = Some(InterruptOverride {
+                        source_irq: iso.source,
+                        gsi: iso.gsi,
+                        polarity,
+                        trigger,
+                    });
+                    info.override_count += 1;
+                }
+            }
+            _ => {} // Skip other entry types (Local APIC NMI, etc.)
         }
 
-        Ok(info)
+        offset += entry_len;
     }
+
+    if info.io_apic_count == 0 {
+        return Err("MADT: no I/O APIC found");
+    }
+
+    Ok(info)
 }
 
 // ============================================================================

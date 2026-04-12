@@ -1,4 +1,12 @@
 # Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
 [toolchain]
-channel = "nightly"
+# Pinned nightly — bump deliberately, not automatically.
+# Nightly is required for: abi_x86_interrupt (x86 interrupt calling convention).
+# When abi_x86_interrupt stabilizes, move to stable Rust.
+channel = "nightly-2026-02-07"
+targets = [
+    "x86_64-unknown-none",
+    "aarch64-unknown-none",
+    "x86_64-apple-darwin",
+]
