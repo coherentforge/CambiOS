@@ -126,9 +126,13 @@ pub unsafe fn disable_pic() {
     // SAFETY: All port handles target the 8259 PIC command/data ports during
     // single-threaded boot with interrupts disabled. Ports are valid x86 I/O
     // addresses and we are at ring 0.
+    // SAFETY: PIC1_CMD (0x20) is a valid x86 I/O port for the 8259 PIC.
     let pic1_cmd = unsafe { super::portio::Port8::new(PIC1_CMD) };
+    // SAFETY: PIC1_DATA (0x21) is a valid x86 I/O port for the 8259 PIC.
     let pic1_data = unsafe { super::portio::Port8::new(PIC1_DATA) };
+    // SAFETY: PIC2_CMD (0xA0) is a valid x86 I/O port for the 8259 PIC.
     let pic2_cmd = unsafe { super::portio::Port8::new(PIC2_CMD) };
+    // SAFETY: PIC2_DATA (0xA1) is a valid x86 I/O port for the 8259 PIC.
     let pic2_data = unsafe { super::portio::Port8::new(PIC2_DATA) };
 
     // ICW1: begin initialization, expect ICW4
@@ -223,7 +227,7 @@ pub unsafe fn detect_and_init() -> Result<(), &'static str> {
         // Enable APIC via Spurious Interrupt Vector Register:
         // Set vector to SPURIOUS_VECTOR (0xFF) and set APIC Software Enable bit
         let sivr = apic_read(APIC_SIVR);
-        apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE as u32 | SPURIOUS_VECTOR as u32);
+        apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE | SPURIOUS_VECTOR as u32);
 
         let apic_id = apic_read(APIC_ID) >> 24;
         crate::println!(
@@ -328,9 +332,13 @@ unsafe fn calibrate_against_pit() -> u32 {
     // SAFETY: Called during single-threaded boot with interrupts disabled.
     // All APIC MMIO and PIT port I/O accesses target valid hardware registers
     // at ring 0. APIC is initialized, PIT ports are standard x86 I/O addresses.
+    // SAFETY: PIT_CMD (0x43) is a valid x86 I/O port for the 8254 PIT.
     let pit_cmd = unsafe { super::portio::Port8::new(PIT_CMD) };
+    // SAFETY: PIT_CHANNEL0_DATA (0x40) is a valid x86 I/O port for the 8254 PIT.
     let pit_ch0 = unsafe { super::portio::Port8::new(PIT_CHANNEL0_DATA) };
 
+    // SAFETY: APIC is initialized and MMIO base is valid. PIT ports are valid.
+    // Single-threaded boot with interrupts disabled — no concurrent access.
     unsafe {
         // Step 1: Set APIC timer divide to 16
         apic_write(APIC_TIMER_DCR, 0x03);
@@ -412,7 +420,7 @@ pub unsafe fn init_ap() {
         // Enable APIC via Spurious Interrupt Vector Register
         // (BSP already set the virtual base, which is the same for all CPUs)
         let sivr = apic_read(APIC_SIVR);
-        apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE as u32 | SPURIOUS_VECTOR as u32);
+        apic_write(APIC_SIVR, sivr | SIVR_APIC_ENABLE | SPURIOUS_VECTOR as u32);
     }
 }
 

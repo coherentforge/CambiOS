@@ -85,6 +85,10 @@ pub struct InterruptRoutingTable {
     entry_count: usize,
 }
 
+impl Default for InterruptRoutingTable {
+    fn default() -> Self { Self::new() }
+}
+
 impl InterruptRoutingTable {
     /// Create an empty routing table
     pub const fn new() -> Self {

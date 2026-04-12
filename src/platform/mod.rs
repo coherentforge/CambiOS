@@ -223,6 +223,10 @@ pub struct PowerManager {
     thermal_limit_reached: bool,
 }
 
+impl Default for PowerManager {
+    fn default() -> Self { Self::new() }
+}
+
 impl PowerManager {
     /// Create a new power manager
     pub const fn new() -> Self {

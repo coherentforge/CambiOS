@@ -3,7 +3,7 @@
 //! Page table management
 //!
 //! Provides kernel page table operations on top of the Limine-provided identity
-//! + HHDM mapping. Uses the x86_64 crate's `OffsetPageTable` for safe
+//! and HHDM mapping. Uses the x86_64 crate's `OffsetPageTable` for safe
 //! traversal via the HHDM offset.
 //!
 //! ## Memory layout (set up by Limine, extended here)
@@ -251,6 +251,107 @@ pub fn free_process_page_table(
     pml4_phys: u64,
 ) {
     let _ = frame_alloc.free(PhysFrame { addr: pml4_phys });
+}
+
+/// Walk the user-half of a PML4 (entries 0..256) and free all
+/// intermediate page table frames (PDP, PD, PT levels). Then free
+/// the PML4 frame itself.
+///
+/// **Precondition:** All user-space *leaf* pages must already be
+/// unmapped by `ProcessDescriptor::reclaim_user_vmas()`. This
+/// function frees the intermediate page table structures that
+/// `map_page` allocated (PDP, PD, PT frames), plus the PML4 root.
+///
+/// Kernel-half entries (256..512) are shared pointers into the
+/// kernel's own PDP/PD/PT hierarchy and **must not** be freed.
+///
+/// Phase 3.2d.ii (Roadmap item 17): closes the page-table-frame
+/// leak documented in STATUS.md § Known Issues.
+///
+/// Returns the total number of frames freed (including the PML4).
+///
+/// # Safety
+///
+/// - `pml4_phys` must be a valid PML4 physical address created by
+///   `create_process_page_table`.
+/// - The page table must not be loaded in any CPU's CR3 (the
+///   process must be terminated).
+/// - HHDM offset must be set.
+pub fn reclaim_process_page_tables(
+    pml4_phys: u64,
+    frame_alloc: &mut FrameAllocator,
+) -> usize {
+    if pml4_phys == 0 {
+        return 0;
+    }
+
+    let hhdm = crate::hhdm_offset();
+    let mut freed = 0usize;
+
+    // SAFETY: pml4_phys is a valid PML4 physical address (precondition).
+    // HHDM maps it to a kernel-accessible virtual address. The process
+    // is terminated so no CPU has this PML4 loaded.
+    let pml4_virt = (pml4_phys + hhdm) as *const PageTable;
+    let pml4 = unsafe { &*pml4_virt };
+
+    // Walk only the user-half (entries 0..256). Each PRESENT entry
+    // points to a PDP frame.
+    for pml4_idx in 0..256 {
+        let pml4_entry = &pml4[pml4_idx];
+        if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let pdp_phys = pml4_entry.addr().as_u64();
+        let pdp_virt = (pdp_phys + hhdm) as *const PageTable;
+        // SAFETY: the PDP frame was allocated by our frame allocator
+        // during map_page. HHDM maps it.
+        let pdp = unsafe { &*pdp_virt };
+
+        for pdp_idx in 0..512 {
+            let pdp_entry = &pdp[pdp_idx];
+            if !pdp_entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            // Skip huge pages (1 GiB) — we don't use them, but
+            // guard against future use.
+            if pdp_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                continue;
+            }
+            let pd_phys = pdp_entry.addr().as_u64();
+            let pd_virt = (pd_phys + hhdm) as *const PageTable;
+            // SAFETY: same reasoning as pdp.
+            let pd = unsafe { &*pd_virt };
+
+            for pd_idx in 0..512 {
+                let pd_entry = &pd[pd_idx];
+                if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                // Skip large pages (2 MiB).
+                if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                let pt_phys = pd_entry.addr().as_u64();
+                // Free the PT frame (leaf page table).
+                let _ = frame_alloc.free(PhysFrame { addr: pt_phys });
+                freed += 1;
+            }
+
+            // Free the PD frame.
+            let _ = frame_alloc.free(PhysFrame { addr: pd_phys });
+            freed += 1;
+        }
+
+        // Free the PDP frame.
+        let _ = frame_alloc.free(PhysFrame { addr: pdp_phys });
+        freed += 1;
+    }
+
+    // Free the PML4 frame itself.
+    let _ = frame_alloc.free(PhysFrame { addr: pml4_phys });
+    freed += 1;
+
+    freed
 }
 
 /// Standard flag combinations for common page types.

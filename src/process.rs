@@ -1,10 +1,10 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-/// Process management, heap allocation, and virtual memory area tracking
-///
-/// Manages per-process state including memory allocators and VMA tracking.
-/// Each process gets a BuddyAllocator (pure bookkeeping) plus a VmaTracker
-/// that records user-space virtual memory allocations for proper free/unmap.
+//! Process management, heap allocation, and virtual memory area tracking
+//!
+//! Manages per-process state including memory allocators and VMA tracking.
+//! Each process gets a BuddyAllocator (pure bookkeeping) plus a VmaTracker
+//! that records user-space virtual memory allocations for proper free/unmap.
 
 use crate::memory::buddy_allocator::BuddyAllocator;
 use crate::memory::frame_allocator::{FrameAllocator, FrameAllocError, PAGE_SIZE};
@@ -61,6 +61,10 @@ pub struct VmaTracker {
     count: usize,
     /// Next virtual address to allocate from (bump, page-aligned)
     next_vaddr: u64,
+}
+
+impl Default for VmaTracker {
+    fn default() -> Self { Self::new() }
 }
 
 impl VmaTracker {
@@ -132,7 +136,7 @@ impl VmaTracker {
 }
 
 // ============================================================================
-// Wave 2a: MAX_PROCESSES is no longer a compile-time constant.
+// Phase 3.2a: MAX_PROCESSES is no longer a compile-time constant.
 //
 // The number of process slots is now computed at boot from the active
 // tier policy and the available-memory figure — see
@@ -171,7 +175,7 @@ pub enum ProcessCreateError {
 /// allocator no longer lives inline — it's constructed in place at
 /// the start of each process's heap by [`ProcessDescriptor::new`] and
 /// accessed via [`ProcessDescriptor::allocator_mut`]. See the module
-/// doc and ADR-008 Wave 2a follow-up for the rationale.
+/// doc and ADR-008 Phase 3.2a follow-up for the rationale.
 ///
 /// # Invariants (for formal verification)
 ///
@@ -196,7 +200,7 @@ pub enum ProcessCreateError {
 pub struct ProcessDescriptor {
     /// Physical base address of this process's heap (for page tables).
     /// The first `size_of::<BuddyAllocator>()` bytes at this address hold
-    /// the process's buddy allocator state (Wave 2a follow-up).
+    /// the process's buddy allocator state (Phase 3.2a follow-up).
     pub phys_base: u64,
     /// HHDM-mapped virtual base (for kernel-side access).
     /// `virt_base as *mut BuddyAllocator` is a valid, initialized pointer
@@ -215,12 +219,12 @@ impl ProcessDescriptor {
     /// heap region from the frame allocator and placing a fresh
     /// `BuddyAllocator` in the first few KB of that heap.
     ///
-    /// Wave 2a: heap is no longer at a deterministic PID-derived
+    /// Phase 3.2a: heap is no longer at a deterministic PID-derived
     /// physical address. Each process gets a fresh contiguous region
     /// from the frame allocator, which means process exit MUST free
     /// it via [`ProcessDescriptor::reclaim_heap`] to avoid a leak.
     ///
-    /// Wave 2a follow-up (Item 1): the per-process `BuddyAllocator`
+    /// Phase 3.2a follow-up (Item 1): the per-process `BuddyAllocator`
     /// lives in the heap itself at `virt_base..virt_base + size_of::<BuddyAllocator>()`,
     /// constructed via `core::ptr::write` with
     /// `new_with_reserved_prefix` so user allocations skip the
@@ -332,6 +336,100 @@ impl ProcessDescriptor {
         frame_alloc.free_contiguous(self.phys_base, HEAP_PAGES)
     }
 
+    /// Reclaim all user-space VMA-tracked regions.
+    ///
+    /// Walks the VMA tracker, unmaps each region's pages from the
+    /// process page table, and frees the underlying physical frames
+    /// back to the frame allocator.
+    ///
+    /// Must be called **before** `reclaim_page_tables()` because
+    /// unmapping requires a valid page table.
+    ///
+    /// Returns the number of VMA regions reclaimed (for diagnostics).
+    ///
+    /// Phase 3.2d.ii (Roadmap item 17): closes the VMA region leak
+    /// that previously occurred on process exit.
+    #[cfg(not(test))]
+    pub fn reclaim_user_vmas(
+        &mut self,
+        frame_alloc: &mut FrameAllocator,
+    ) -> usize {
+        if self.cr3 == 0 {
+            // Kernel tasks have no per-process page table or user VMAs.
+            return 0;
+        }
+
+        let mut reclaimed = 0usize;
+
+        // Drain all VMA entries. We collect bases first to avoid
+        // borrowing conflicts with the VMA tracker.
+        let mut bases = [0u64; MAX_VMAS];
+        let mut base_count = 0usize;
+        for entry in self.vma.entries.iter().flatten() {
+            if base_count < MAX_VMAS {
+                bases[base_count] = entry.base_vaddr;
+                base_count += 1;
+            }
+        }
+
+        for &base in &bases[..base_count] {
+            if let Some(entry) = self.vma.free_region(base) {
+                // Unmap each page and free its physical frame.
+                // SAFETY: self.cr3 is a valid PML4 physical address
+                // (set by create_process_page_table in ProcessTable::
+                // create_process). We hold exclusive access to the
+                // ProcessDescriptor (via &mut self), and the process
+                // is terminated so its page table is not loaded in
+                // any CPU's CR3.
+                let mut pt = unsafe {
+                    paging::page_table_from_cr3(self.cr3)
+                };
+                for page_idx in 0..entry.num_pages as usize {
+                    let vaddr = entry.base_vaddr + (page_idx as u64) * PAGE_SIZE;
+                    if let Ok(phys_frame) = paging::unmap_page(&mut pt, vaddr) {
+                        let _ = frame_alloc.free(phys_frame);
+                    }
+                    // Ignore NotMapped — the page may have been
+                    // allocated in the VMA tracker but never actually
+                    // mapped (e.g., a failed allocation that reserved
+                    // virtual space but couldn't get a frame).
+                }
+                reclaimed += 1;
+            }
+        }
+
+        reclaimed
+    }
+
+    /// Test-only stub: drains the VMA tracker without touching page
+    /// tables (which don't exist in host tests). Returns the number of
+    /// VMA entries that were drained. Mirrors the kernel behavior of
+    /// returning 0 for kernel tasks (cr3 == 0).
+    #[cfg(test)]
+    pub fn reclaim_user_vmas(
+        &mut self,
+        _frame_alloc: &mut FrameAllocator,
+    ) -> usize {
+        if self.cr3 == 0 {
+            return 0;
+        }
+        let mut reclaimed = 0usize;
+        let mut bases = [0u64; MAX_VMAS];
+        let mut base_count = 0usize;
+        for entry in self.vma.entries.iter().flatten() {
+            if base_count < MAX_VMAS {
+                bases[base_count] = entry.base_vaddr;
+                base_count += 1;
+            }
+        }
+        for i in 0..base_count {
+            if self.vma.free_region(bases[i]).is_some() {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
     /// Allocate memory, returning the kernel-accessible virtual address.
     /// Returns 0 on failure.
     pub fn allocate(&mut self, size: usize) -> usize {
@@ -356,14 +454,27 @@ impl ProcessDescriptor {
 /// Process table — slice-backed storage from the kernel object table
 /// region.
 ///
-/// Wave 2a: storage is a `&'static mut [Option<ProcessDescriptor>]`
+/// Phase 3.2a: storage is a `&'static mut [Option<ProcessDescriptor>]`
 /// slice handed in from `memory::object_table::init()`. The slice
 /// length equals `config::num_slots()`, computed at boot from the
 /// active tier policy and available RAM. See ADR-008.
+///
+/// Phase 3.2c: per-slot generation counters prevent stale `ProcessId`
+/// references from targeting a reused slot. The generation for a slot
+/// is incremented in `destroy_process` and stamped into the
+/// `ProcessId` returned by `create_process`. Lookups compare the
+/// caller's `ProcessId.generation()` against the stored generation.
 pub struct ProcessTable {
     processes: &'static mut [Option<ProcessDescriptor>],
     /// Cached HHDM offset for creating new processes
     hhdm_offset: u64,
+    /// Per-slot generation counter (Phase 3.2c, ADR-008 § Open Problem 9).
+    /// Heap-allocated at construction, one `u32` per slot. Incremented
+    /// in `destroy_process` when a slot becomes free. The current
+    /// generation is stamped into the `ProcessId` returned by
+    /// `create_process`, so stale references (whose generation no
+    /// longer matches) are rejected by every lookup.
+    generations: Box<[u32]>,
 }
 
 impl ProcessTable {
@@ -373,18 +484,33 @@ impl ProcessTable {
     /// The slice must have every slot pre-initialized to `None`
     /// (which `object_table::init` guarantees). The returned
     /// `Box<Self>` lives on the kernel heap; only its small header
-    /// (slice pointer, length, hhdm_offset) lands there — the actual
-    /// slot storage lives in the object table region.
+    /// (slice pointer, length, hhdm_offset, generations) lands there —
+    /// the actual slot storage lives in the object table region.
+    ///
+    /// Phase 3.2c: also allocates a heap-backed generation counter array,
+    /// one `u32` per slot, all starting at 0.
     pub fn from_object_slice(
         processes: &'static mut [Option<ProcessDescriptor>],
         hhdm_offset: u64,
     ) -> Option<Box<Self>> {
-        // Small header — trivial allocation, no manual slot init needed.
+        let num_slots = processes.len();
+        let generations = alloc::vec![0u32; num_slots].into_boxed_slice();
         let table = ProcessTable {
             processes,
             hhdm_offset,
+            generations,
         };
         Some(Box::new(table))
+    }
+
+    /// Find a free slot by linear scan. Returns the slot index, or
+    /// `None` if all slots are occupied.
+    ///
+    /// Phase 3.2c: replaces the external `NEXT_PROCESS_ID` atomic.
+    /// Linear scan is O(n) in `num_slots` but bounded and
+    /// verification-friendly (no free-list state to reason about).
+    fn find_free_slot(&self) -> Option<usize> {
+        self.processes.iter().position(|slot| slot.is_none())
     }
 
     /// Number of slots in the table (equal to `config::num_slots()`).
@@ -395,34 +521,26 @@ impl ProcessTable {
 
     /// Create a new process and allocate its heap region.
     ///
-    /// Wave 2a: always requires a frame allocator now, because
-    /// `ProcessDescriptor::new` itself allocates the per-process heap
-    /// via `FrameAllocator::allocate_contiguous(HEAP_PAGES)`. The
-    /// previous `frame_alloc: Option<...>` parameter went away — if
-    /// you don't want a per-process page table, pass
-    /// `create_page_table = false`.
+    /// Phase 3.2c: the process table allocates the slot internally via
+    /// linear scan and stamps the current generation counter into the
+    /// returned `ProcessId`. The caller no longer passes a ProcessId
+    /// — it receives one. This closes the ambient-authority gap where
+    /// any caller could pick an arbitrary slot index.
     ///
     /// Failure modes:
-    /// - `"Process ID out of range"` — `process_id.0 >= capacity()`
-    /// - `"Process already exists"` — slot already `Some`
+    /// - `"No free process slots"` — all slots occupied
     /// - `"Failed to allocate process heap"` — frame allocator
-    ///   exhausted (after Wave 2a, heaps are allocated on demand)
+    ///   exhausted (after Phase 3.2a, heaps are allocated on demand)
     /// - `"Failed to allocate page table"` — per-process PML4
     ///   allocation failed
     pub fn create_process(
         &mut self,
-        process_id: ProcessId,
         frame_alloc: &mut FrameAllocator,
         create_page_table: bool,
-    ) -> Result<(), &'static str> {
-        let idx = process_id.0 as usize;
-        if idx >= self.processes.len() {
-            return Err("Process ID out of range");
-        }
-
-        if self.processes[idx].is_some() {
-            return Err("Process already exists");
-        }
+    ) -> Result<ProcessId, &'static str> {
+        let idx = self.find_free_slot().ok_or("No free process slots")?;
+        let generation = self.generations[idx];
+        let process_id = ProcessId::new(idx as u32, generation);
 
         let mut desc = match ProcessDescriptor::new(process_id, self.hhdm_offset, frame_alloc) {
             Ok(d) => d,
@@ -452,13 +570,13 @@ impl ProcessTable {
         }
 
         self.processes[idx] = Some(desc);
-        Ok(())
+        Ok(process_id)
     }
 
     /// Allocate memory for a process, returning kernel-accessible virtual address.
     /// Returns 0 on failure.
     pub fn allocate_for(&mut self, process_id: ProcessId, size: usize) -> usize {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx >= self.processes.len() {
             return 0;
         }
@@ -470,7 +588,7 @@ impl ProcessTable {
 
     /// Free memory for a process by kernel-accessible virtual address.
     pub fn free_for(&mut self, process_id: ProcessId, virt_addr: usize) -> bool {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx >= self.processes.len() {
             return false;
         }
@@ -482,12 +600,12 @@ impl ProcessTable {
 
     /// Get process physical heap base address from the stored descriptor.
     ///
-    /// Wave 2a: heaps are no longer at a deterministic
+    /// Phase 3.2a: heaps are no longer at a deterministic
     /// `PROCESS_HEAP_BASE + pid * HEAP_SIZE` address — the base is
     /// whatever the frame allocator handed us at creation time. This
     /// getter reads the stored `phys_base` field.
     pub fn get_heap_base(&self, process_id: ProcessId) -> u64 {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| p.phys_base).unwrap_or(0)
         } else {
@@ -497,7 +615,7 @@ impl ProcessTable {
 
     /// Get process heap size
     pub fn get_heap_size(&self, process_id: ProcessId) -> u64 {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| p.heap_size).unwrap_or(0)
         } else {
@@ -505,34 +623,59 @@ impl ProcessTable {
         }
     }
 
-    /// Destroy a process and reclaim its heap back to the frame allocator.
+    /// Destroy a process and reclaim all its kernel-managed resources.
     ///
-    /// Wave 2a / Roadmap item 17 (partial): the per-process heap
-    /// region is freed via `FrameAllocator::free_contiguous` so
-    /// subsequent process creations can reuse those frames. Page
-    /// tables, VMA regions, and endpoint subscriptions are still
-    /// leaked — those are tracked separately under item 17.
+    /// Phase 3.2d.ii (Roadmap item 17): full lifecycle cleanup. The
+    /// reclamation order is important:
+    ///
+    /// 1. **VMA regions** — unmap every VMA-tracked user page and free
+    ///    its physical frame. Must come first because unmapping
+    ///    requires a valid page table.
+    /// 2. **Page table frames** — walk the user-half of the PML4 and
+    ///    free all intermediate page table structures (PDP/PD/PT).
+    ///    Must come after VMA reclaim (leaf pages are gone).
+    /// 3. **Heap** — free the contiguous heap region (existing path).
+    /// 4. **Generation increment** — prevent stale ProcessId from
+    ///    targeting the reused slot (Phase 3.2c).
+    ///
+    /// Kernel stack deallocation is deferred to a separate cleanup
+    /// pass (bounded leak, requires scheduler-level deferred-free
+    /// mechanism). See STATUS.md.
     pub fn destroy_process(
         &mut self,
         process_id: ProcessId,
         frame_alloc: &mut FrameAllocator,
     ) {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx >= self.processes.len() {
             return;
         }
-        if let Some(desc) = self.processes[idx].take() {
-            // Best effort: reclaim the heap. If free_contiguous fails
-            // (frame allocator corruption, which shouldn't happen),
-            // we've already removed the descriptor from the table —
-            // the frames are lost but the slot is free.
+        if let Some(mut desc) = self.processes[idx].take() {
+            // Step 1: Reclaim VMA-tracked user-space regions.
+            // Unmaps pages from the process page table and frees
+            // physical frames. Must precede page table reclaim.
+            let _vma_count = desc.reclaim_user_vmas(frame_alloc);
+
+            // Step 2: Reclaim page table frames (PML4 + intermediates).
+            // Only for processes with a per-process page table (cr3 != 0).
+            #[cfg(not(test))]
+            if desc.cr3 != 0 {
+                paging::reclaim_process_page_tables(desc.cr3, frame_alloc);
+            }
+
+            // Step 3: Reclaim the heap region.
             let _ = desc.reclaim_heap(frame_alloc);
+
+            // Step 4: Increment generation so the next occupant of this
+            // slot gets a distinct ProcessId. Wrapping is intentional —
+            // u32 gives ~4 billion reuses per slot before wrap.
+            self.generations[idx] = self.generations[idx].wrapping_add(1);
         }
     }
 
     /// Get a process's CR3 (PML4 physical address). Returns 0 if no per-process page table.
     pub fn get_cr3(&self, process_id: ProcessId) -> u64 {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| p.cr3).unwrap_or(0)
         } else {
@@ -542,13 +685,13 @@ impl ProcessTable {
 
     /// Check whether a process slot is occupied.
     pub fn slot_occupied(&self, process_id: ProcessId) -> bool {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         idx < self.processes.len() && self.processes[idx].is_some()
     }
 
     /// Get mutable access to a process's VMA tracker.
     pub fn vma_mut(&mut self, process_id: ProcessId) -> Option<&mut VmaTracker> {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx < self.processes.len() {
             self.processes[idx].as_mut().map(|p| &mut p.vma)
         } else {
@@ -558,7 +701,7 @@ impl ProcessTable {
 
     /// Get read-only access to a process's VMA tracker.
     pub fn vma(&self, process_id: ProcessId) -> Option<&VmaTracker> {
-        let idx = process_id.0 as usize;
+        let idx = process_id.slot() as usize;
         if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| &p.vma)
         } else {
@@ -656,5 +799,60 @@ mod tests {
         // 65th allocation fails — no free slots
         assert!(vma.allocate_region(1).is_none());
         assert_eq!(vma.count(), MAX_VMAS);
+    }
+
+    // ========================================================================
+    // Phase 3.2d.ii: reclaim_user_vmas tests
+    //
+    // These use the #[cfg(test)] stub which drains the VMA tracker
+    // without touching real page tables.
+    // ========================================================================
+
+    /// Helper: construct a ProcessDescriptor with a dummy heap
+    /// (no real frame allocation in test mode).
+    fn test_descriptor() -> ProcessDescriptor {
+        ProcessDescriptor {
+            phys_base: 0x1000_0000,
+            virt_base: 0xFFFF_8001_0000_0000,
+            heap_size: HEAP_SIZE,
+            cr3: 0x2000_0000, // non-zero → has per-process PT
+            vma: VmaTracker::new(),
+        }
+    }
+
+    #[test]
+    fn test_reclaim_user_vmas_empty() {
+        let mut desc = test_descriptor();
+        let mut fa = FrameAllocator::new();
+        assert_eq!(desc.reclaim_user_vmas(&mut fa), 0);
+        assert_eq!(desc.vma.count(), 0);
+    }
+
+    #[test]
+    fn test_reclaim_user_vmas_drains_tracker() {
+        let mut desc = test_descriptor();
+        let mut fa = FrameAllocator::new();
+
+        // Allocate 3 VMA regions.
+        desc.vma.allocate_region(1).unwrap();
+        desc.vma.allocate_region(4).unwrap();
+        desc.vma.allocate_region(2).unwrap();
+        assert_eq!(desc.vma.count(), 3);
+
+        let reclaimed = desc.reclaim_user_vmas(&mut fa);
+        assert_eq!(reclaimed, 3);
+        assert_eq!(desc.vma.count(), 0);
+    }
+
+    #[test]
+    fn test_reclaim_user_vmas_kernel_task_is_noop() {
+        let mut desc = test_descriptor();
+        desc.cr3 = 0; // kernel task — no per-process page table
+        let mut fa = FrameAllocator::new();
+
+        // Even with VMA entries, a kernel task's reclaim is a no-op
+        // (in the real kernel; in test mode the stub always drains).
+        // The test verifies the function returns without error.
+        assert_eq!(desc.reclaim_user_vmas(&mut fa), 0);
     }
 }

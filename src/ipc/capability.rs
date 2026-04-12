@@ -10,6 +10,30 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt;
 
+/// Kinds of capabilities in the ArcOS capability model.
+///
+/// Distinguishes between IPC endpoint capabilities (the original model)
+/// and system capabilities that grant kernel-level operational rights.
+/// Endpoint capabilities are stored per-slot in the endpoint capability
+/// array; system capabilities are stored as flags in [`ProcessCapabilities`].
+///
+/// Phase 3.2b introduces `CreateProcess` as the first system capability
+/// (ADR-008 § Migration Path). Phase 3.2d.iii adds `CreateChannel`
+/// (ADR-005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityKind {
+    /// IPC endpoint access with specific rights.
+    /// Stored in the per-process endpoint capability array.
+    Endpoint,
+    /// Right to create new processes (Phase 3.2b, ADR-008 § Migration Path).
+    /// Checked at process-creation call sites (handle_spawn,
+    /// load_boot_modules) before invoking `ProcessTable::create_process`.
+    CreateProcess,
+    /// Right to create shared-memory channels (Phase 3.2d.iii, ADR-005).
+    /// Checked at `SYS_CHANNEL_CREATE` before allocating channel memory.
+    CreateChannel,
+}
+
 /// Errors from capability operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityError {
@@ -47,7 +71,7 @@ pub struct Capability {
 /// Why: bounded set for verification; cache-line-friendly linear scan. Originally
 ///      chosen to match `MAX_PROCESSES` and `MAX_ENDPOINTS` (a process can
 ///      typically hold capabilities for ~half the system's endpoints). As of
-///      Wave 2a, `MAX_PROCESSES` is runtime-computed (`config::num_slots()`),
+///      Phase 3.2a, `MAX_PROCESSES` is runtime-computed (`config::num_slots()`),
 ///      but this per-process cap is still a fixed compile-time 32.
 /// Replace when: Phase 3 work hits this — the policy service holds one capability
 ///      per service it mediates, the audit consumer holds one per producer.
@@ -64,6 +88,13 @@ pub struct ProcessCapabilities {
     /// Set via BindPrincipal syscall. Once bound, cannot be rebound without
     /// explicit unbind (prevents identity theft).
     principal: Option<Principal>,
+    /// System capability: can this process create new processes?
+    /// Phase 3.2b (ADR-008 § Migration Path). Checked at process-creation
+    /// call sites before invoking `ProcessTable::create_process`.
+    create_process: bool,
+    /// System capability: can this process create shared-memory channels?
+    /// Phase 3.2d.iii (ADR-005). Checked at `SYS_CHANNEL_CREATE`.
+    create_channel: bool,
 }
 
 impl ProcessCapabilities {
@@ -74,16 +105,16 @@ impl ProcessCapabilities {
             capabilities: [None; 32],
             count: 0,
             principal: None,
+            create_process: false,
+            create_channel: false,
         }
     }
 
     /// Grant a capability to this process
     pub fn grant(&mut self, endpoint: EndpointId, rights: CapabilityRights) -> Result<(), CapabilityError> {
-        if self.count >= 32 {
-            return Err(CapabilityError::CapabilityFull);
-        }
-
-        // Check if already has this endpoint (invariant: no duplicates in 0..count)
+        // Check if already has this endpoint (invariant: no duplicates in 0..count).
+        // This scan MUST come before the capacity check so that updating an
+        // existing endpoint's rights succeeds even when the table is full.
         for i in 0..self.count as usize {
             if let Some(cap) = self.capabilities[i] {
                 if cap.endpoint == endpoint {
@@ -92,6 +123,10 @@ impl ProcessCapabilities {
                     return Ok(());
                 }
             }
+        }
+
+        if self.count >= 32 {
+            return Err(CapabilityError::CapabilityFull);
         }
 
         // Add new capability (relies on invariant: no Some exists beyond count)
@@ -199,13 +234,44 @@ impl ProcessCapabilities {
     pub fn capability_count(&self) -> u8 {
         self.count
     }
+
+    /// Grant a system capability.
+    ///
+    /// Endpoint capabilities use [`grant()`]; this method handles
+    /// non-endpoint capability kinds (Phase 3.2b: `CreateProcess`,
+    /// Phase 3.2d.iii: `CreateChannel`).
+    pub fn grant_system(&mut self, kind: CapabilityKind) {
+        match kind {
+            CapabilityKind::CreateProcess => self.create_process = true,
+            CapabilityKind::CreateChannel => self.create_channel = true,
+            CapabilityKind::Endpoint => {}
+        }
+    }
+
+    /// Check whether this process holds a system capability.
+    pub fn has_system(&self, kind: CapabilityKind) -> bool {
+        match kind {
+            CapabilityKind::CreateProcess => self.create_process,
+            CapabilityKind::CreateChannel => self.create_channel,
+            CapabilityKind::Endpoint => false,
+        }
+    }
+
+    /// Revoke a system capability.
+    pub fn revoke_system(&mut self, kind: CapabilityKind) {
+        match kind {
+            CapabilityKind::CreateProcess => self.create_process = false,
+            CapabilityKind::CreateChannel => self.create_channel = false,
+            CapabilityKind::Endpoint => {}
+        }
+    }
 }
 
 /// Global capability manager for the system
 ///
 /// Tracks capabilities for all processes. Central policy enforcement point.
 ///
-/// Wave 2a: slot storage is a `&'static mut [Option<ProcessCapabilities>]`
+/// Phase 3.2a: slot storage is a `&'static mut [Option<ProcessCapabilities>]`
 /// slice backed by the kernel object table region (see
 /// `memory::object_table::init`). The slice length equals
 /// `config::num_slots()`, computed at boot from the active tier policy.
@@ -263,34 +329,64 @@ impl CapabilityManager {
         })
     }
 
+    /// Look up a process's capability table by ProcessId, with
+    /// generation validation (Phase 3.2c).
+    ///
+    /// Returns `InvalidOperation` if the slot index is out of range,
+    /// `ProcessNotFound` if the slot is empty or if the caller's
+    /// generation doesn't match (stale reference).
+    fn lookup(&self, process_id: ProcessId) -> Result<&ProcessCapabilities, CapabilityError> {
+        let slot = process_id.slot() as usize;
+        if slot >= self.process_caps.len() {
+            return Err(CapabilityError::InvalidOperation);
+        }
+        let caps = self.process_caps[slot]
+            .as_ref()
+            .ok_or(CapabilityError::ProcessNotFound)?;
+        // Generation check: reject stale ProcessId references
+        if caps.process_id != process_id {
+            return Err(CapabilityError::ProcessNotFound);
+        }
+        Ok(caps)
+    }
+
+    /// Mutable variant of [`lookup`].
+    fn lookup_mut(&mut self, process_id: ProcessId) -> Result<&mut ProcessCapabilities, CapabilityError> {
+        let slot = process_id.slot() as usize;
+        if slot >= self.process_caps.len() {
+            return Err(CapabilityError::InvalidOperation);
+        }
+        let caps = self.process_caps[slot]
+            .as_mut()
+            .ok_or(CapabilityError::ProcessNotFound)?;
+        if caps.process_id != process_id {
+            return Err(CapabilityError::ProcessNotFound);
+        }
+        Ok(caps)
+    }
+
     /// Register a new process in the capability system
     pub fn register_process(&mut self, process_id: ProcessId) -> Result<(), CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
+        if process_id.slot() as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
-        if self.process_caps[process_id.0 as usize].is_some() {
+        if self.process_caps[process_id.slot() as usize].is_some() {
             return Err(CapabilityError::InvalidOperation); // Already registered
         }
 
-        self.process_caps[process_id.0 as usize] = Some(ProcessCapabilities::new(process_id));
+        self.process_caps[process_id.slot() as usize] = Some(ProcessCapabilities::new(process_id));
         self.process_count += 1;
         Ok(())
     }
 
     /// Unregister a process (revoke all its capabilities)
     pub fn unregister_process(&mut self, process_id: ProcessId) -> Result<(), CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        if self.process_caps[process_id.0 as usize].is_some() {
-            self.process_caps[process_id.0 as usize] = None;
-            self.process_count -= 1;
-            Ok(())
-        } else {
-            Err(CapabilityError::ProcessNotFound)
-        }
+        // Verify generation before clearing the slot
+        let _ = self.lookup(process_id)?;
+        self.process_caps[process_id.slot() as usize] = None;
+        self.process_count -= 1;
+        Ok(())
     }
 
     /// Grant a capability to a process
@@ -300,15 +396,7 @@ impl CapabilityManager {
         endpoint: EndpointId,
         rights: CapabilityRights,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        if let Some(caps) = &mut self.process_caps[process_id.0 as usize] {
-            caps.grant(endpoint, rights)
-        } else {
-            Err(CapabilityError::ProcessNotFound)
-        }
+        self.lookup_mut(process_id)?.grant(endpoint, rights)
     }
 
     /// Verify a process has access to an endpoint
@@ -318,15 +406,7 @@ impl CapabilityManager {
         endpoint: EndpointId,
         rights: CapabilityRights,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        if let Some(caps) = &self.process_caps[process_id.0 as usize] {
-            caps.verify_access(endpoint, rights)
-        } else {
-            Err(CapabilityError::ProcessNotFound)
-        }
+        self.lookup(process_id)?.verify_access(endpoint, rights)
     }
 
     /// Revoke a capability
@@ -335,37 +415,17 @@ impl CapabilityManager {
         process_id: ProcessId,
         endpoint: EndpointId,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        if let Some(caps) = &mut self.process_caps[process_id.0 as usize] {
-            caps.revoke(endpoint)
-        } else {
-            Err(CapabilityError::ProcessNotFound)
-        }
+        self.lookup_mut(process_id)?.revoke(endpoint)
     }
 
     /// Get process capability table
     pub fn get_capabilities(&self, process_id: ProcessId) -> Result<&ProcessCapabilities, CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        self.process_caps[process_id.0 as usize]
-            .as_ref()
-            .ok_or(CapabilityError::ProcessNotFound)
+        self.lookup(process_id)
     }
 
     /// Get mutable reference to process capabilities
     pub fn get_capabilities_mut(&mut self, process_id: ProcessId) -> Result<&mut ProcessCapabilities, CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        self.process_caps[process_id.0 as usize]
-            .as_mut()
-            .ok_or(CapabilityError::ProcessNotFound)
+        self.lookup_mut(process_id)
     }
 
     /// Count of registered processes
@@ -382,18 +442,10 @@ impl CapabilityManager {
         process_id: ProcessId,
         principal: Principal,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        let caps = self.process_caps[process_id.0 as usize]
-            .as_mut()
-            .ok_or(CapabilityError::ProcessNotFound)?;
-
+        let caps = self.lookup_mut(process_id)?;
         if caps.principal.is_some() {
             return Err(CapabilityError::InvalidOperation); // Already bound
         }
-
         caps.principal = Some(principal);
         Ok(())
     }
@@ -403,15 +455,44 @@ impl CapabilityManager {
         &self,
         process_id: ProcessId,
     ) -> Result<Principal, CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
+        self.lookup(process_id)?.principal.ok_or(CapabilityError::ProcessNotFound)
+    }
 
-        let caps = self.process_caps[process_id.0 as usize]
-            .as_ref()
-            .ok_or(CapabilityError::ProcessNotFound)?;
+    /// Grant a system capability to a process.
+    ///
+    /// Phase 3.2b (ADR-008 § Migration Path): `CapabilityKind::CreateProcess`
+    /// is the first system capability. Granted to bootstrap-Principal
+    /// processes at boot so they can invoke `ProcessTable::create_process`.
+    pub fn grant_system_capability(
+        &mut self,
+        process_id: ProcessId,
+        kind: CapabilityKind,
+    ) -> Result<(), CapabilityError> {
+        self.lookup_mut(process_id)?.grant_system(kind);
+        Ok(())
+    }
 
-        caps.principal.ok_or(CapabilityError::ProcessNotFound)
+    /// Check whether a process holds a system capability.
+    ///
+    /// Returns `Ok(true)` if the process holds the capability,
+    /// `Ok(false)` if registered but does not hold it, or an error
+    /// if the process is not found / out of range.
+    pub fn has_system_capability(
+        &self,
+        process_id: ProcessId,
+        kind: CapabilityKind,
+    ) -> Result<bool, CapabilityError> {
+        Ok(self.lookup(process_id)?.has_system(kind))
+    }
+
+    /// Revoke a system capability from a process.
+    pub fn revoke_system_capability(
+        &mut self,
+        process_id: ProcessId,
+        kind: CapabilityKind,
+    ) -> Result<(), CapabilityError> {
+        self.lookup_mut(process_id)?.revoke_system(kind);
+        Ok(())
     }
 
     /// Delegate a capability to another process.
@@ -444,8 +525,8 @@ impl CapabilityManager {
         rights: CapabilityRights,
         interceptor: Option<&dyn crate::ipc::interceptor::IpcInterceptor>,
     ) -> Result<(), CapabilityError> {
-        if source_pid.0 as usize >= self.process_caps.len()
-            || target_pid.0 as usize >= self.process_caps.len()
+        if source_pid.slot() as usize >= self.process_caps.len()
+            || target_pid.slot() as usize >= self.process_caps.len()
         {
             return Err(CapabilityError::InvalidOperation);
         }
@@ -464,18 +545,26 @@ impl CapabilityManager {
             }
         }
 
-        // Layer 2: Validate the delegation is allowed (scoped to drop reference)
+        // Layer 2: Validate the delegation is allowed (scoped to drop reference).
+        // Generation-checked inline (can't use lookup/lookup_mut for both
+        // source and target without two &mut borrows).
         {
-            let source_caps = self.process_caps[source_pid.0 as usize]
+            let source_caps = self.process_caps[source_pid.slot() as usize]
                 .as_ref()
                 .ok_or(CapabilityError::ProcessNotFound)?;
+            if source_caps.process_id != source_pid {
+                return Err(CapabilityError::ProcessNotFound);
+            }
             source_caps.can_delegate(endpoint, rights)?;
         }
 
         // Then grant to target (in a separate scope after source reference is dropped)
-        let target_caps = self.process_caps[target_pid.0 as usize]
+        let target_caps = self.process_caps[target_pid.slot() as usize]
             .as_mut()
             .ok_or(CapabilityError::ProcessNotFound)?;
+        if target_caps.process_id != target_pid {
+            return Err(CapabilityError::ProcessNotFound);
+        }
         target_caps.grant(endpoint, rights)?;
 
         Ok(())
@@ -499,39 +588,39 @@ impl CapabilityManager {
     /// - The holder's next attempt to use the capability will fail the
     ///   standard [`verify_access`] check with [`CapabilityError::AccessDenied`],
     ///   which is the current v0 signal. (Active control-IPC notification is
-    ///   deferred — see "Wave 4" stub below.)
+    ///   deferred — see "Phase 3.4" stub below.)
     ///
-    /// # Authority — v0 (Wave 1)
+    /// # Authority — v0 (Phase 3.1)
     ///
     /// Only the bootstrap Principal can revoke. This matches the existing
     /// pattern for `SyscallNumber::BindPrincipal` and
     /// `SyscallNumber::ClaimBootstrapKey`. ADR-007 §"Who can revoke" specifies
     /// three authority paths (original grantor, holder of `revoke` right,
-    /// bootstrap/policy service); the other two land in Wave 4 when the policy
-    /// service exists as the mediator.
+    /// bootstrap/policy service); the other two land in Phase 3.4 when the
+    /// policy service exists as the mediator.
     ///
     /// # Stubbed behavior (documented, not workarounds)
     ///
     /// The following ADR-007 §"How revocation interacts with channels" steps
-    /// are intentionally stubbed in Wave 1 because their prerequisites do not
-    /// exist yet. Each is marked in-code so a future maintainer cannot miss
-    /// them when the prerequisite lands.
+    /// are intentionally stubbed in Phase 3.1 because their prerequisites do
+    /// not exist yet. Each is marked in-code so a future maintainer cannot
+    /// miss them when the prerequisite lands.
     ///
-    /// - **Wave 2 (channels).** If the capability kind is a channel role,
+    /// - **Phase 3.2d (channels).** If the capability kind is a channel role,
     ///   unmap the shared pages from the holder's address space and issue a
     ///   TLB shootdown via `crate::arch::tlb::shootdown_range`. No channel
-    ///   kind exists in Wave 1 — all capabilities are endpoint rights.
-    /// - **Wave 3 (audit telemetry).** Emit an
+    ///   kind exists in Phase 3.1 — all capabilities are endpoint rights.
+    /// - **Phase 3.3 (audit telemetry).** Emit an
     ///   `audit::Event::CapabilityRevoked { revoker, holder, endpoint, … }`
     ///   record to the per-CPU audit staging buffer. No audit subsystem
-    ///   exists in Wave 1.
-    /// - **Wave 4 (policy service).** Invalidate the per-CPU policy decision
+    ///   exists in Phase 3.1.
+    /// - **Phase 3.4 (policy service).** Invalidate the per-CPU policy decision
     ///   cache for the `(holder, endpoint)` key via an IPI broadcast, and
     ///   send a control-IPC `CapabilityRevoked` notification to the holder
     ///   via the kernel-initiated send primitive. Neither the cache nor
-    ///   the kernel-initiated send primitive exist in Wave 1.
+    ///   the kernel-initiated send primitive exist in Phase 3.1.
     ///
-    /// Wave 1 honors the "atomic, immediate, structural" properties of
+    /// Phase 3.1 honors the "atomic, immediate, structural" properties of
     /// ADR-007 §"What revocation means" — the capability is gone the moment
     /// this method returns. The *active notification* property is the part
     /// that is stubbed; the holder learns of the revocation via its next
@@ -543,39 +632,29 @@ impl CapabilityManager {
         revoker_principal: Principal,
         bootstrap: Principal,
     ) -> Result<(), CapabilityError> {
-        // Authority check — v0 (Wave 1): bootstrap Principal only.
-        // TODO Wave 4: also accept the original grantor and any holder of the
+        // Authority check — v0 (Phase 3.1): bootstrap Principal only.
+        // TODO Phase 3.4: also accept the original grantor and any holder of the
         // `revoke` right on `endpoint`, per ADR-007 §"Who can revoke".
         if revoker_principal != bootstrap {
             return Err(CapabilityError::AccessDenied);
         }
 
-        if holder.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
+        // Generation-checked lookup (Phase 3.2c)
+        self.lookup_mut(holder)?.revoke(endpoint)?;
 
-        // Perform the table mutation. The existing per-process revoke() is
-        // the low-level helper — it enforces the table invariants and returns
-        // EndpointNotFound if the capability is already gone (idempotent
-        // failure, not success).
-        let caps = self.process_caps[holder.0 as usize]
-            .as_mut()
-            .ok_or(CapabilityError::ProcessNotFound)?;
-        caps.revoke(endpoint)?;
-
-        // TODO Wave 2: if the capability kind is a channel role, unmap the
+        // TODO Phase 3.2d: if the capability kind is a channel role, unmap the
         // shared pages from the holder's address space and issue a TLB
         // shootdown via crate::arch::tlb::shootdown_range(). Channels do not
-        // exist yet — all capabilities are endpoint rights in Wave 1.
+        // exist yet — all capabilities are endpoint rights in Phase 3.1.
         //
-        // TODO Wave 3: crate::audit::emit(Event::CapabilityRevoked {
+        // TODO Phase 3.3: crate::audit::emit(Event::CapabilityRevoked {
         //     revoker: revoker_principal,
         //     holder,
         //     endpoint,
         //     timestamp: crate::scheduler::Timer::get_ticks(),
         // });
         //
-        // TODO Wave 4: invalidate the per-CPU policy decision cache for
+        // TODO Phase 3.4: invalidate the per-CPU policy decision cache for
         // (holder, endpoint) via an IPI broadcast, then send a kernel-
         // originated control IPC notification to the holder using
         // kernel_send() + Principal::KERNEL. See ADR-006 §"Caching" and
@@ -599,11 +678,11 @@ impl CapabilityManager {
     ///
     /// # Stubbed behavior
     ///
-    /// Same Wave 2/3/4 stubs as [`revoke`], applied per-capability during
-    /// iteration. Wave 3 (audit telemetry) will emit one
+    /// Same Phase 3.2d/3.3/3.4 stubs as [`revoke`], applied per-capability
+    /// during iteration. Phase 3.3 (audit telemetry) will emit one
     /// `CapabilityRevoked` event per removed capability (or a single
     /// batched `ProcessTerminated` event that carries the count — that's a
-    /// telemetry-design choice for Wave 3 to make).
+    /// telemetry-design choice for Phase 3.3 to make).
     ///
     /// Note: this removes capabilities from the process's table but does not
     /// unregister the process itself. The caller should call
@@ -613,13 +692,7 @@ impl CapabilityManager {
         &mut self,
         process_id: ProcessId,
     ) -> Result<usize, CapabilityError> {
-        if process_id.0 as usize >= self.process_caps.len() {
-            return Err(CapabilityError::InvalidOperation);
-        }
-
-        let caps = self.process_caps[process_id.0 as usize]
-            .as_mut()
-            .ok_or(CapabilityError::ProcessNotFound)?;
+        let caps = self.lookup_mut(process_id)?;
 
         let count = caps.capability_count() as usize;
 
@@ -628,12 +701,16 @@ impl CapabilityManager {
         // grant/revoke methods maintain that invariant, but clear-all should
         // be robust against any future layout change.
         //
-        // TODO Wave 3: emit an audit event per removed capability (or a single
+        // TODO Phase 3.3: emit an audit event per removed capability (or a single
         // batched ProcessTerminated event for the count).
         for slot in caps.capabilities.iter_mut() {
             *slot = None;
         }
         caps.count = 0;
+
+        // Clear system capabilities (Phase 3.2b, 3.2d.iii)
+        caps.create_process = false;
+        caps.create_channel = false;
 
         Ok(count)
     }
@@ -645,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_process_capabilities() {
-        let mut caps = ProcessCapabilities::new(ProcessId(1));
+        let mut caps = ProcessCapabilities::new(ProcessId::new(1, 0));
 
         // Grant send/receive on endpoint 0
         let rights = CapabilityRights {
@@ -672,7 +749,7 @@ mod tests {
     fn test_capability_manager() {
         let mut mgr = CapabilityManager::new_for_test();
 
-        let proc_id = ProcessId(1);
+        let proc_id = ProcessId::new(1, 0);
         let endpoint = EndpointId(10);
 
         // Register process
@@ -711,8 +788,8 @@ mod tests {
     fn test_delegation() {
         let mut mgr = CapabilityManager::new_for_test();
 
-        let proc_a = ProcessId(1);
-        let proc_b = ProcessId(2);
+        let proc_a = ProcessId::new(1, 0);
+        let proc_b = ProcessId::new(2, 0);
         let endpoint = EndpointId(10);
 
         // Register both processes
@@ -753,8 +830,8 @@ mod tests {
     fn test_delegation_requires_delegate_right() {
         let mut mgr = CapabilityManager::new_for_test();
 
-        let proc_a = ProcessId(1);
-        let proc_b = ProcessId(2);
+        let proc_a = ProcessId::new(1, 0);
+        let proc_b = ProcessId::new(2, 0);
         let endpoint = EndpointId(10);
 
         mgr.register_process(proc_a).unwrap();
@@ -777,8 +854,8 @@ mod tests {
     fn test_delegation_cannot_escalate_rights() {
         let mut mgr = CapabilityManager::new_for_test();
 
-        let proc_a = ProcessId(1);
-        let proc_b = ProcessId(2);
+        let proc_a = ProcessId::new(1, 0);
+        let proc_b = ProcessId::new(2, 0);
         let endpoint = EndpointId(10);
 
         mgr.register_process(proc_a).unwrap();
@@ -809,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_capability_limit() {
-        let mut caps = ProcessCapabilities::new(ProcessId(1));
+        let mut caps = ProcessCapabilities::new(ProcessId::new(1, 0));
 
         // Grant 32 capabilities (the limit)
         for i in 0..32 {
@@ -841,7 +918,7 @@ mod tests {
     #[test]
     fn test_bind_and_get_principal() {
         let mut mgr = CapabilityManager::new_for_test();
-        let proc_id = ProcessId(1);
+        let proc_id = ProcessId::new(1, 0);
         let principal = Principal::from_public_key([0xAA; 32]);
 
         mgr.register_process(proc_id).unwrap();
@@ -854,7 +931,7 @@ mod tests {
     #[test]
     fn test_bind_principal_rejects_double_bind() {
         let mut mgr = CapabilityManager::new_for_test();
-        let proc_id = ProcessId(1);
+        let proc_id = ProcessId::new(1, 0);
         let p1 = Principal::from_public_key([0xAA; 32]);
         let p2 = Principal::from_public_key([0xBB; 32]);
 
@@ -871,13 +948,13 @@ mod tests {
     #[test]
     fn test_get_principal_unregistered_process() {
         let mgr = CapabilityManager::new_for_test();
-        assert!(mgr.get_principal(ProcessId(99)).is_err());
+        assert!(mgr.get_principal(ProcessId::new(99, 0)).is_err());
     }
 
     #[test]
     fn test_get_principal_no_principal_bound() {
         let mut mgr = CapabilityManager::new_for_test();
-        let proc_id = ProcessId(1);
+        let proc_id = ProcessId::new(1, 0);
         mgr.register_process(proc_id).unwrap();
 
         // Registered but no Principal bound yet
@@ -890,11 +967,11 @@ mod tests {
         let principal = Principal::from_public_key([0xAA; 32]);
 
         // Not registered — should fail
-        assert!(mgr.bind_principal(ProcessId(99), principal).is_err());
+        assert!(mgr.bind_principal(ProcessId::new(99, 0), principal).is_err());
     }
 
     // ========================================================================
-    // Wave 1 revocation tests — CapabilityManager::revoke() and
+    // Phase 3.1 revocation tests — CapabilityManager::revoke() and
     // revoke_all_for_process(). See ADR-007 for the design.
     // ========================================================================
 
@@ -903,7 +980,7 @@ mod tests {
     /// to `revoke()`. Returns (manager, holder_pid, endpoint, bootstrap).
     fn revoke_test_fixture() -> (Box<CapabilityManager>, ProcessId, EndpointId, Principal) {
         let mut mgr = CapabilityManager::new_for_test();
-        let holder = ProcessId(1);
+        let holder = ProcessId::new(1, 0);
         let endpoint = EndpointId(10);
         let bootstrap = Principal::from_public_key([0xAA; 32]);
 
@@ -983,7 +1060,7 @@ mod tests {
     fn test_revoke_unregistered_process_returns_process_not_found() {
         let (mut mgr, _holder, endpoint, bootstrap) = revoke_test_fixture();
         // In-range ProcessId but not registered (fixture only registers PID 1).
-        let ghost = ProcessId(5);
+        let ghost = ProcessId::new(5, 0);
 
         assert_eq!(
             mgr.revoke(ghost, endpoint, bootstrap, bootstrap),
@@ -995,7 +1072,7 @@ mod tests {
     fn test_revoke_out_of_range_pid_returns_invalid_operation() {
         let (mut mgr, _holder, endpoint, bootstrap) = revoke_test_fixture();
         // Beyond the manager's capacity — distinct code path from ProcessNotFound.
-        let out_of_range = ProcessId(mgr.capacity() as u32);
+        let out_of_range = ProcessId::new(mgr.capacity() as u32, 0);
 
         assert_eq!(
             mgr.revoke(out_of_range, endpoint, bootstrap, bootstrap),
@@ -1021,7 +1098,7 @@ mod tests {
     #[test]
     fn test_revoke_all_for_process_returns_count() {
         let mut mgr = CapabilityManager::new_for_test();
-        let proc_id = ProcessId(1);
+        let proc_id = ProcessId::new(1, 0);
         mgr.register_process(proc_id).unwrap();
 
         // Grant 5 capabilities.
@@ -1068,7 +1145,7 @@ mod tests {
     #[test]
     fn test_revoke_all_for_process_empty_table_returns_zero() {
         let mut mgr = CapabilityManager::new_for_test();
-        let proc_id = ProcessId(1);
+        let proc_id = ProcessId::new(1, 0);
         mgr.register_process(proc_id).unwrap();
 
         // Registered but no capabilities granted.
@@ -1080,7 +1157,7 @@ mod tests {
         let mut mgr = CapabilityManager::new_for_test();
         // In-range but not registered.
         assert_eq!(
-            mgr.revoke_all_for_process(ProcessId(5)),
+            mgr.revoke_all_for_process(ProcessId::new(5, 0)),
             Err(CapabilityError::ProcessNotFound)
         );
     }
@@ -1089,7 +1166,7 @@ mod tests {
     fn test_revoke_all_for_process_out_of_range_returns_invalid_operation() {
         let mut mgr = CapabilityManager::new_for_test();
         assert_eq!(
-            mgr.revoke_all_for_process(ProcessId(mgr.capacity() as u32)),
+            mgr.revoke_all_for_process(ProcessId::new(mgr.capacity() as u32, 0)),
             Err(CapabilityError::InvalidOperation)
         );
     }
@@ -1097,8 +1174,8 @@ mod tests {
     #[test]
     fn test_revoke_all_for_process_preserves_other_processes() {
         let mut mgr = CapabilityManager::new_for_test();
-        let victim = ProcessId(1);
-        let bystander = ProcessId(2);
+        let victim = ProcessId::new(1, 0);
+        let bystander = ProcessId::new(2, 0);
         let endpoint = EndpointId(10);
         let rights = CapabilityRights {
             send: true,
@@ -1117,5 +1194,274 @@ mod tests {
 
         // Bystander's capability is untouched.
         mgr.verify_access(bystander, endpoint, rights).unwrap();
+    }
+
+    // ========================================================================
+    // Phase 3.2b system capability tests — CapabilityKind::CreateProcess.
+    // See ADR-008 § Migration Path.
+    // ========================================================================
+
+    #[test]
+    fn test_grant_and_check_create_process() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        // Not granted yet.
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
+
+        // Grant it.
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+
+        // Now present.
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), true);
+    }
+
+    #[test]
+    fn test_revoke_create_process() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), true);
+
+        mgr.revoke_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
+    }
+
+    #[test]
+    fn test_create_process_unregistered_returns_error() {
+        let mgr = CapabilityManager::new_for_test();
+        // In-range but not registered.
+        assert_eq!(
+            mgr.has_system_capability(ProcessId::new(5, 0), CapabilityKind::CreateProcess),
+            Err(CapabilityError::ProcessNotFound)
+        );
+    }
+
+    #[test]
+    fn test_create_process_out_of_range_returns_invalid_operation() {
+        let mgr = CapabilityManager::new_for_test();
+        assert_eq!(
+            mgr.has_system_capability(ProcessId::new(mgr.capacity() as u32, 0), CapabilityKind::CreateProcess),
+            Err(CapabilityError::InvalidOperation)
+        );
+    }
+
+    #[test]
+    fn test_revoke_all_clears_create_process() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        // Grant CreateProcess plus an endpoint capability.
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+        mgr.grant_capability(proc_id, EndpointId(10), CapabilityRights::SEND_ONLY).unwrap();
+
+        // revoke_all_for_process clears everything.
+        let count = mgr.revoke_all_for_process(proc_id).unwrap();
+        assert_eq!(count, 1); // 1 endpoint capability removed
+
+        // CreateProcess is also gone.
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
+    }
+
+    #[test]
+    fn test_create_process_independent_per_process() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_a = ProcessId::new(1, 0);
+        let proc_b = ProcessId::new(2, 0);
+        mgr.register_process(proc_a).unwrap();
+        mgr.register_process(proc_b).unwrap();
+
+        // Grant only to A.
+        mgr.grant_system_capability(proc_a, CapabilityKind::CreateProcess).unwrap();
+
+        // A has it, B does not.
+        assert_eq!(mgr.has_system_capability(proc_a, CapabilityKind::CreateProcess).unwrap(), true);
+        assert_eq!(mgr.has_system_capability(proc_b, CapabilityKind::CreateProcess).unwrap(), false);
+    }
+
+    #[test]
+    fn test_grant_create_process_is_idempotent() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        // Double-grant is fine — idempotent.
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), true);
+    }
+
+    // ========================================================================
+    // Phase 3.2d.iii system capability tests — CapabilityKind::CreateChannel.
+    // See ADR-005.
+    // ========================================================================
+
+    #[test]
+    fn test_grant_and_check_create_channel() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap(), false);
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap();
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap(), true);
+    }
+
+    #[test]
+    fn test_revoke_create_channel() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap();
+        mgr.revoke_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap();
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap(), false);
+    }
+
+    #[test]
+    fn test_revoke_all_clears_create_channel() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap();
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap();
+        mgr.revoke_all_for_process(proc_id).unwrap();
+
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap(), false);
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
+    }
+
+    #[test]
+    fn test_create_channel_independent_of_create_process() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        // Grant CreateChannel but not CreateProcess.
+        mgr.grant_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap();
+
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap(), true);
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
+    }
+
+    // ========================================================================
+    // Phase 3.2c generation counter tests — ProcessId generation validation.
+    // See ADR-008 § Open Problem 9.
+    // ========================================================================
+
+    #[test]
+    fn test_stale_process_id_rejected_by_verify_access() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let gen0 = ProcessId::new(1, 0);
+        let gen1 = ProcessId::new(1, 1); // same slot, different generation
+
+        mgr.register_process(gen0).unwrap();
+        mgr.grant_capability(gen0, EndpointId(10), CapabilityRights::SEND_ONLY).unwrap();
+
+        // Correct generation succeeds.
+        mgr.verify_access(gen0, EndpointId(10), CapabilityRights::SEND_ONLY).unwrap();
+
+        // Stale generation (gen1) targeting the same slot is rejected.
+        assert_eq!(
+            mgr.verify_access(gen1, EndpointId(10), CapabilityRights::SEND_ONLY),
+            Err(CapabilityError::ProcessNotFound)
+        );
+    }
+
+    #[test]
+    fn test_stale_process_id_rejected_by_grant() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let gen0 = ProcessId::new(1, 0);
+        let stale = ProcessId::new(1, 42);
+
+        mgr.register_process(gen0).unwrap();
+
+        // Grant via stale id is rejected.
+        assert_eq!(
+            mgr.grant_capability(stale, EndpointId(10), CapabilityRights::SEND_ONLY),
+            Err(CapabilityError::ProcessNotFound)
+        );
+    }
+
+    #[test]
+    fn test_stale_process_id_rejected_by_bind_principal() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let gen0 = ProcessId::new(1, 0);
+        let stale = ProcessId::new(1, 1);
+        let principal = Principal::from_public_key([0xCC; 32]);
+
+        mgr.register_process(gen0).unwrap();
+
+        assert_eq!(
+            mgr.bind_principal(stale, principal),
+            Err(CapabilityError::ProcessNotFound)
+        );
+    }
+
+    #[test]
+    fn test_stale_process_id_rejected_by_revoke() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let gen0 = ProcessId::new(1, 0);
+        let stale = ProcessId::new(1, 1);
+        let bootstrap = Principal::from_public_key([0xAA; 32]);
+
+        mgr.register_process(gen0).unwrap();
+        mgr.grant_capability(gen0, EndpointId(10), CapabilityRights::SEND_ONLY).unwrap();
+
+        // Revoke via stale id is rejected even with bootstrap authority.
+        assert_eq!(
+            mgr.revoke(stale, EndpointId(10), bootstrap, bootstrap),
+            Err(CapabilityError::ProcessNotFound)
+        );
+
+        // Original capability still intact.
+        mgr.verify_access(gen0, EndpointId(10), CapabilityRights::SEND_ONLY).unwrap();
+    }
+
+    #[test]
+    fn test_stale_process_id_rejected_by_system_capability() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let gen0 = ProcessId::new(1, 0);
+        let stale = ProcessId::new(1, 1);
+
+        mgr.register_process(gen0).unwrap();
+        mgr.grant_system_capability(gen0, CapabilityKind::CreateProcess).unwrap();
+
+        // Stale generation can't query or revoke system caps.
+        assert_eq!(
+            mgr.has_system_capability(stale, CapabilityKind::CreateProcess),
+            Err(CapabilityError::ProcessNotFound)
+        );
+        assert_eq!(
+            mgr.revoke_system_capability(stale, CapabilityKind::CreateProcess),
+            Err(CapabilityError::ProcessNotFound)
+        );
+    }
+
+    #[test]
+    fn test_process_id_slot_and_generation_encoding() {
+        let pid = ProcessId::new(42, 7);
+        assert_eq!(pid.slot(), 42);
+        assert_eq!(pid.generation(), 7);
+
+        // Round-trip through raw u64
+        let raw = pid.as_raw();
+        let restored = ProcessId::from_raw(raw);
+        assert_eq!(restored, pid);
+        assert_eq!(restored.slot(), 42);
+        assert_eq!(restored.generation(), 7);
+    }
+
+    #[test]
+    fn test_process_id_generation_zero_is_default() {
+        let pid = ProcessId::new(5, 0);
+        assert_eq!(pid.slot(), 5);
+        assert_eq!(pid.generation(), 0);
     }
 }

@@ -7,6 +7,7 @@
 //! formal property proof.
 
 pub mod capability;
+pub mod channel;
 pub mod interceptor;
 
 extern crate alloc;
@@ -17,7 +18,7 @@ use core::fmt;
 /// Why: one endpoint per service in the simple case. Sharded IPC has one
 ///      shard per endpoint; the per-shard message queues are sized from this.
 ///      Historically matched `MAX_PROCESSES = 32`; `MAX_PROCESSES` is gone
-///      as of Wave 2a (the process table now scales with tier policy via
+///      as of Phase 3.2a (the process table now scales with tier policy via
 ///      `config::num_slots()`), but `MAX_ENDPOINTS` remains a fixed cap.
 /// Replace when: a Phase 3 service needs more than 32 endpoints, or the IPC
 ///      shard array becomes a contention point at higher process counts.
@@ -29,9 +30,65 @@ pub const MAX_ENDPOINTS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EndpointId(pub u32);
 
-/// Process/task identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ProcessId(pub u32);
+/// Process identifier with generation counter (Phase 3.2c, ADR-008).
+///
+/// Encodes `(slot_index: u32, generation: u32)` in a single `u64`.
+/// The slot index is the array position in the process table and
+/// capability table. The generation counter is incremented each time
+/// a slot is freed and reused, preventing stale references from
+/// silently targeting the wrong process.
+///
+/// # Layout
+///
+/// - Bits  0..31: `slot_index` (low 32 bits)
+/// - Bits 32..63: `generation` (high 32 bits)
+///
+/// # Invariants (for formal verification)
+///
+/// - `slot_index < num_slots()` for every live ProcessId.
+/// - Two ProcessIds are equal iff both slot and generation match.
+/// - A ProcessId whose generation does not match the current slot
+///   generation is *stale* and must be rejected by every lookup.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcessId(u64);
+
+impl ProcessId {
+    /// Create a ProcessId from slot index and generation counter.
+    #[inline]
+    pub const fn new(slot: u32, generation: u32) -> Self {
+        ProcessId((slot as u64) | ((generation as u64) << 32))
+    }
+
+    /// Slot index (array index into process/capability tables).
+    #[inline]
+    pub const fn slot(&self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Generation counter (incremented on slot reuse).
+    #[inline]
+    pub const fn generation(&self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Raw u64 for syscall wire format.
+    #[inline]
+    pub const fn as_raw(&self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct from raw u64 (syscall boundary).
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        ProcessId(raw)
+    }
+}
+
+impl fmt::Debug for ProcessId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ProcessId(slot={}, gen={})", self.slot(), self.generation())
+    }
+}
 
 // ============================================================================
 // Principal — cryptographic identity primitive
@@ -190,8 +247,8 @@ pub trait MessageQueue {
 /// may be permitted to share authority without being permitted to take it
 /// back, which is the right behavior for audit-trail-style delegations.
 ///
-/// In Wave 1 the `revoke` field exists but no policy path consults it yet.
-/// `SYS_REVOKE_CAPABILITY` is bootstrap-Principal-only until Wave 4 lands the
+/// In Phase 3.1 the `revoke` field exists but no policy path consults it yet.
+/// `SYS_REVOKE_CAPABILITY` is bootstrap-Principal-only until Phase 3.4 lands the
 /// policy service that mediates the "holder-of-revoke-right can call revoke"
 /// path described in ADR-007 §"Who can revoke".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +304,10 @@ pub struct EndpointQueue {
     head: usize,
     tail: usize,
     count: usize,
+}
+
+impl Default for EndpointQueue {
+    fn default() -> Self { Self::new() }
 }
 
 impl EndpointQueue {
@@ -387,6 +448,10 @@ pub enum SyncChannelState {
     ReplyPending,
 }
 
+impl Default for SyncChannel {
+    fn default() -> Self { Self::new() }
+}
+
 impl SyncChannel {
     /// Create an empty sync channel
     pub const fn new() -> Self {
@@ -516,6 +581,10 @@ impl SyncChannel {
     pub fn state(&self) -> SyncChannelState {
         self.state
     }
+}
+
+impl Default for IpcManager {
+    fn default() -> Self { Self::new() }
 }
 
 impl IpcManager {
@@ -673,9 +742,9 @@ impl IpcManager {
     ///
     /// Returns:
     /// - `Ok(SyncSendResult::ReceiverWoken(task_id))`: Receiver was already waiting;
-    ///    wake it. Sender does NOT block.
+    ///   wake it. Sender does NOT block.
     /// - `Ok(SyncSendResult::SenderMustBlock)`: No receiver waiting;
-    ///    caller must block sender as `SyncSendWait(endpoint)`.
+    ///   caller must block sender as `SyncSendWait(endpoint)`.
     /// - `Err`: Channel busy or invalid endpoint.
     pub fn sync_send(
         &mut self,
@@ -698,9 +767,9 @@ impl IpcManager {
     ///
     /// Returns:
     /// - `Ok(SyncRecvResult::Message(msg, wake_sender))`: Got message;
-    ///    if `wake_sender` is Some, wake that task (it was blocked on send).
+    ///   if `wake_sender` is Some, wake that task (it was blocked on send).
     /// - `Ok(SyncRecvResult::ReceiverMustBlock)`: No message available;
-    ///    caller must block receiver as `SyncRecvWait(endpoint)`.
+    ///   caller must block receiver as `SyncRecvWait(endpoint)`.
     /// - `Err`: Invalid state or endpoint.
     pub fn sync_recv(
         &mut self,
@@ -725,9 +794,9 @@ impl IpcManager {
     ///
     /// Returns:
     /// - `Ok(SyncCallResult::ReceiverWoken(task_id))`: Receiver was waiting;
-    ///    wake it. Caller blocks as `SyncReplyWait(endpoint)`.
+    ///   wake it. Caller blocks as `SyncReplyWait(endpoint)`.
     /// - `Ok(SyncCallResult::CallerMustBlock)`: No receiver yet;
-    ///    caller blocks as `SyncReplyWait(endpoint)`.
+    ///   caller blocks as `SyncReplyWait(endpoint)`.
     pub fn sync_call(
         &mut self,
         endpoint: EndpointId,
@@ -791,8 +860,14 @@ pub enum SyncSendResult {
     SenderMustBlock,
 }
 
-/// Result of a synchronous receive operation
+/// Result of a synchronous receive operation.
+///
+/// The `Message` variant is large (320 bytes) due to the 256-byte inline
+/// payload. Boxing would add heap allocation on the IPC hot path.
+/// The size asymmetry is intentional — `ReceiverMustBlock` is the fast
+/// path (no data to return), `Message` is the data path.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum SyncRecvResult {
     /// Got a message. Option<u32> = sender task to wake (None if call/reply).
     Message(Message, Option<u32>),
@@ -825,6 +900,12 @@ pub struct EndpointShard {
     pub sync_channel: SyncChannel,
 }
 
+impl Default for EndpointShard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EndpointShard {
     pub const fn new() -> Self {
         EndpointShard {
@@ -848,6 +929,10 @@ pub struct ShardedIpcManager {
     /// Protected by its own lock since it's rarely accessed and never mutated
     /// after boot.
     interceptor: Spinlock<Option<Box<dyn interceptor::IpcInterceptor>>>,
+}
+
+impl Default for ShardedIpcManager {
+    fn default() -> Self { Self::new() }
 }
 
 impl ShardedIpcManager {
@@ -959,9 +1044,10 @@ impl ShardedIpcManager {
     }
 }
 
-// SAFETY: ShardedIpcManager contains Spinlocks (which are Send+Sync) and
-// a trait object behind a Spinlock. All fields are safe to share across threads.
+/// SAFETY: ShardedIpcManager contains Spinlocks (which are Send+Sync) and
+/// a trait object behind a Spinlock. All fields are safe to share across threads.
 unsafe impl Send for ShardedIpcManager {}
+/// SAFETY: Per-shard spinlocks serialize all access; no unsynchronized interior mutability.
 unsafe impl Sync for ShardedIpcManager {}
 
 #[cfg(test)]
@@ -1181,7 +1267,7 @@ mod tests {
         let mut mgr = IpcManager::new();
         let mut cap_mgr = CapabilityManager::new_for_test();
 
-        let proc_id = ProcessId(0);
+        let proc_id = ProcessId::new(0, 0);
         let endpoint = EndpointId(5);
         let principal = Principal::from_public_key([0xAA; 32]);
 
@@ -1206,7 +1292,7 @@ mod tests {
         let mut mgr = IpcManager::new();
         let mut cap_mgr = CapabilityManager::new_for_test();
 
-        let proc_id = ProcessId(0);
+        let proc_id = ProcessId::new(0, 0);
         let endpoint = EndpointId(5);
 
         // Register process with capability but NO Principal bound

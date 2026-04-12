@@ -1,14 +1,14 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-/// Spinlock implementations for synchronizing kernel state
-///
-/// Two variants:
-/// - `Spinlock<T>`: basic spinlock, suitable for locks never acquired from ISR context
-/// - `IrqSpinlock<T>`: saves/disables interrupts before acquiring, prevents same-CPU
-///   deadlock when a timer ISR fires while the lock is held
-///
-/// On SMP, `IrqSpinlock` is required for any lock that might be contended from
-/// both thread context and ISR context (e.g., SCHEDULER, TIMER).
+//! Spinlock implementations for synchronizing kernel state
+//!
+//! Two variants:
+//! - `Spinlock<T>`: basic spinlock, suitable for locks never acquired from ISR context
+//! - `IrqSpinlock<T>`: saves/disables interrupts before acquiring, prevents same-CPU
+//!   deadlock when a timer ISR fires while the lock is held
+//!
+//! On SMP, `IrqSpinlock` is required for any lock that might be contended from
+//! both thread context and ISR context (e.g., SCHEDULER, TIMER).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::cell::UnsafeCell;
@@ -216,8 +216,11 @@ impl<T> IrqSpinlock<T> {
     }
 }
 
-// SAFETY: Same reasoning as Spinlock — mutual exclusion via atomic CAS.
+/// SAFETY: Mutual exclusion via atomic CAS with interrupt disable.
+/// IrqSpinlock additionally saves/restores interrupt state, preventing
+/// same-CPU deadlock when a timer ISR fires while the lock is held.
 unsafe impl<T: Send> Send for IrqSpinlock<T> {}
+/// SAFETY: Same as Send — atomic CAS + interrupt disable guarantees exclusive access.
 unsafe impl<T: Send> Sync for IrqSpinlock<T> {}
 
 /// RAII guard for IrqSpinlock. Restores interrupt state on drop.

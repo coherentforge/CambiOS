@@ -468,6 +468,97 @@ pub mod paging {
         let _ = frame_alloc.free(PhysFrame { addr: phys });
     }
 
+    /// Walk an AArch64 TTBR0 L0 table and free all intermediate page
+    /// table frames (L1, L2, L3 levels), then free the L0 frame itself.
+    ///
+    /// **Precondition:** All user-space *leaf* pages must already be
+    /// unmapped by `ProcessDescriptor::reclaim_user_vmas()`. This
+    /// function frees the intermediate page table structures only.
+    ///
+    /// On AArch64 with TTBR0/TTBR1 split, the entire L0 table is
+    /// user-only (kernel lives in TTBR1), so all 512 L0 entries can
+    /// be walked safely.
+    ///
+    /// Phase 3.2d.ii (Roadmap item 17): closes the page-table-frame
+    /// leak on AArch64.
+    ///
+    /// Returns the total number of frames freed (including the L0).
+    pub fn reclaim_process_page_tables(
+        l0_phys: u64,
+        frame_alloc: &mut FrameAllocator,
+    ) -> usize {
+        if l0_phys == 0 {
+            return 0;
+        }
+
+        let mut freed = 0usize;
+
+        // SAFETY: l0_phys is a valid L0 page table address from
+        // create_process_page_table. phys_to_virt maps it via HHDM.
+        // The process is terminated so no CPU has this table in TTBR0.
+        let l0_virt = phys_to_virt(l0_phys) as *const u64;
+
+        for l0_idx in 0..512usize {
+            // SAFETY: l0_virt points to a 4 KiB page table with 512
+            // 8-byte entries. l0_idx < 512.
+            let l0_entry = unsafe { core::ptr::read(l0_virt.add(l0_idx)) };
+            if l0_entry & DESC_VALID == 0 {
+                continue;
+            }
+            // Must be a table descriptor (not a block) at L0.
+            if l0_entry & DESC_TABLE == 0 {
+                continue;
+            }
+            let l1_phys = l0_entry & ADDR_MASK;
+            let l1_virt = phys_to_virt(l1_phys) as *const u64;
+
+            for l1_idx in 0..512usize {
+                // SAFETY: same reasoning.
+                let l1_entry = unsafe { core::ptr::read(l1_virt.add(l1_idx)) };
+                if l1_entry & DESC_VALID == 0 {
+                    continue;
+                }
+                // Skip 1 GiB block descriptors (we don't use them for
+                // user space, but guard against future use).
+                if l1_entry & DESC_TABLE == 0 {
+                    continue;
+                }
+                let l2_phys = l1_entry & ADDR_MASK;
+                let l2_virt = phys_to_virt(l2_phys) as *const u64;
+
+                for l2_idx in 0..512usize {
+                    // SAFETY: same reasoning.
+                    let l2_entry = unsafe { core::ptr::read(l2_virt.add(l2_idx)) };
+                    if l2_entry & DESC_VALID == 0 {
+                        continue;
+                    }
+                    // Skip 2 MiB block descriptors.
+                    if l2_entry & DESC_TABLE == 0 {
+                        continue;
+                    }
+                    let l3_phys = l2_entry & ADDR_MASK;
+                    // Free the L3 frame.
+                    let _ = frame_alloc.free(PhysFrame { addr: l3_phys });
+                    freed += 1;
+                }
+
+                // Free the L2 frame.
+                let _ = frame_alloc.free(PhysFrame { addr: l2_phys });
+                freed += 1;
+            }
+
+            // Free the L1 frame.
+            let _ = frame_alloc.free(PhysFrame { addr: l1_phys });
+            freed += 1;
+        }
+
+        // Free the L0 frame itself.
+        let _ = frame_alloc.free(PhysFrame { addr: l0_phys });
+        freed += 1;
+
+        freed
+    }
+
     // ========================================================================
     // Early boot MMIO mapping (no allocator needed)
     // ========================================================================
@@ -731,6 +822,12 @@ pub trait MemoryAllocator {
 ///
 /// CR3 holds a physical address — we add the HHDM offset to get a
 /// kernel-accessible virtual pointer.
+///
+/// # Safety
+///
+/// Caller must ensure no other mutable reference to the active PML4
+/// exists. The returned reference aliases the live page table that the
+/// CPU is walking — modifications must be carefully sequenced.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn get_page_table() -> Option<&'static mut PageTable> {
     let (level_4_table_frame, _) = Cr3::read();

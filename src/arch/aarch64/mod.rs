@@ -778,7 +778,8 @@ fn debug_log_context_switch(current_sp: u64, new_sp: u64) {
     /// `uart` must point to a valid, mapped PL011 data register.
     unsafe fn uart_write_bytes(uart: *mut u32, bytes: &[u8]) {
         for &b in bytes {
-            core::ptr::write_volatile(uart, b as u32);
+            // SAFETY: caller guarantees `uart` points to a valid, mapped PL011 data register.
+            unsafe { core::ptr::write_volatile(uart, b as u32) };
         }
     }
 
@@ -790,7 +791,8 @@ fn debug_log_context_switch(current_sp: u64, new_sp: u64) {
         for i in (0..16).rev() {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
             let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            core::ptr::write_volatile(uart, ch as u32);
+            // SAFETY: caller guarantees `uart` points to a valid, mapped PL011 data register.
+            unsafe { core::ptr::write_volatile(uart, ch as u32) };
         }
     }
 
@@ -928,7 +930,7 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
         match sched.as_ref().and_then(|s| {
             let tid = s.current_task()?;
             let task = s.current_task_ref()?;
-            let pid = task.process_id.unwrap_or(ProcessId(tid.0 as u32));
+            let pid = task.process_id.unwrap_or(ProcessId::new(tid.0 as u32, 0));
             Some((tid, pid, task.cr3))
         }) {
             Some(info) => info,

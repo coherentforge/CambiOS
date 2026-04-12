@@ -136,6 +136,12 @@ pub struct DefaultInterceptor {
     pub max_payload: usize,
 }
 
+impl Default for DefaultInterceptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DefaultInterceptor {
     pub fn new() -> Self {
         Self {
@@ -162,7 +168,7 @@ impl IpcInterceptor for DefaultInterceptor {
         }
 
         // 3. No self-send (sender endpoint == target endpoint from same process)
-        if msg.from.0 == endpoint.0 && sender.0 == endpoint.0 {
+        if msg.from.0 == endpoint.0 && sender.slot() == endpoint.0 {
             return InterceptDecision::Deny(DenyReason::SelfSend);
         }
 
@@ -234,7 +240,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         let msg = make_msg(0, 5, 100);
         assert_eq!(
-            interceptor.on_send(ProcessId(0), EndpointId(5), &msg),
+            interceptor.on_send(ProcessId::new(0, 0), EndpointId(5), &msg),
             InterceptDecision::Allow,
         );
     }
@@ -244,7 +250,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         let msg = make_msg(0, 99, 10);
         assert_eq!(
-            interceptor.on_send(ProcessId(0), EndpointId(99), &msg),
+            interceptor.on_send(ProcessId::new(0, 0), EndpointId(99), &msg),
             InterceptDecision::Deny(DenyReason::EndpointOutOfBounds),
         );
     }
@@ -254,7 +260,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         let msg = make_msg(0, 5, 300);
         assert_eq!(
-            interceptor.on_send(ProcessId(0), EndpointId(5), &msg),
+            interceptor.on_send(ProcessId::new(0, 0), EndpointId(5), &msg),
             InterceptDecision::Deny(DenyReason::InvalidPayload),
         );
     }
@@ -265,7 +271,7 @@ mod tests {
         // Process 3 sending from endpoint 3 to endpoint 3
         let msg = make_msg(3, 3, 10);
         assert_eq!(
-            interceptor.on_send(ProcessId(3), EndpointId(3), &msg),
+            interceptor.on_send(ProcessId::new(3, 0), EndpointId(3), &msg),
             InterceptDecision::Deny(DenyReason::SelfSend),
         );
     }
@@ -275,7 +281,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         let msg = make_msg(0, 5, 0);
         assert_eq!(
-            interceptor.on_send(ProcessId(0), EndpointId(5), &msg),
+            interceptor.on_send(ProcessId::new(0, 0), EndpointId(5), &msg),
             InterceptDecision::Allow,
         );
     }
@@ -285,7 +291,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         let msg = make_msg(0, 5, 256);
         assert_eq!(
-            interceptor.on_send(ProcessId(0), EndpointId(5), &msg),
+            interceptor.on_send(ProcessId::new(0, 0), EndpointId(5), &msg),
             InterceptDecision::Allow,
         );
     }
@@ -296,7 +302,7 @@ mod tests {
     fn test_recv_allows_valid_endpoint() {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
-            interceptor.on_recv(ProcessId(1), EndpointId(5)),
+            interceptor.on_recv(ProcessId::new(1, 0), EndpointId(5)),
             InterceptDecision::Allow,
         );
     }
@@ -305,7 +311,7 @@ mod tests {
     fn test_recv_denies_endpoint_out_of_bounds() {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
-            interceptor.on_recv(ProcessId(1), EndpointId(50)),
+            interceptor.on_recv(ProcessId::new(1, 0), EndpointId(50)),
             InterceptDecision::Deny(DenyReason::EndpointOutOfBounds),
         );
     }
@@ -317,7 +323,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
             interceptor.on_delegate(
-                ProcessId(1), ProcessId(2), EndpointId(5),
+                ProcessId::new(1, 0), ProcessId::new(2, 0), EndpointId(5),
                 CapabilityRights::SEND_ONLY,
             ),
             InterceptDecision::Allow,
@@ -329,7 +335,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
             interceptor.on_delegate(
-                ProcessId(1), ProcessId(1), EndpointId(5),
+                ProcessId::new(1, 0), ProcessId::new(1, 0), EndpointId(5),
                 CapabilityRights::SEND_ONLY,
             ),
             InterceptDecision::Deny(DenyReason::SelfDelegation),
@@ -341,7 +347,7 @@ mod tests {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
             interceptor.on_delegate(
-                ProcessId(1), ProcessId(2), EndpointId(100),
+                ProcessId::new(1, 0), ProcessId::new(2, 0), EndpointId(100),
                 CapabilityRights::FULL,
             ),
             InterceptDecision::Deny(DenyReason::EndpointOutOfBounds),
@@ -354,11 +360,11 @@ mod tests {
     fn test_syscall_allows_all_by_default() {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
-            interceptor.on_syscall(ProcessId(1), SyscallNumber::Write),
+            interceptor.on_syscall(ProcessId::new(1, 0), SyscallNumber::Write),
             InterceptDecision::Allow,
         );
         assert_eq!(
-            interceptor.on_syscall(ProcessId(1), SyscallNumber::GetPid),
+            interceptor.on_syscall(ProcessId::new(1, 0), SyscallNumber::GetPid),
             InterceptDecision::Allow,
         );
     }
@@ -386,7 +392,7 @@ mod tests {
         let interceptor = DenyAllSends;
         let msg = make_msg(0, 5, 10);
         assert_eq!(
-            interceptor.on_send(ProcessId(0), EndpointId(5), &msg),
+            interceptor.on_send(ProcessId::new(0, 0), EndpointId(5), &msg),
             InterceptDecision::Deny(DenyReason::PolicyViolation),
         );
     }

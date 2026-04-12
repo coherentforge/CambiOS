@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! Kernel object table region — Wave 2a of [ADR-008].
+//! Kernel object table region — Phase 3.2a of [ADR-008].
 //!
 //! The "kernel object table region" is a single contiguous physical
 //! allocation that backs two disjoint, page-aligned slices:
@@ -197,11 +197,13 @@ pub fn init(
     }
 
     // SAFETY: All slots initialized above; pointers are valid and
-    // properly aligned; region is owned exclusively by this init call
-    // (called exactly once per kernel lifetime per the module contract);
-    // lifetime is 'static because the region is never freed.
+    // SAFETY: process_ptr is non-null, page-aligned, initialized to None via
+    // write_bytes(0) + ptr::write(None), and owned exclusively by this call.
+    // Lifetime is 'static because the region is never freed.
     let process_slots: &'static mut [Option<ProcessDescriptor>] =
         unsafe { core::slice::from_raw_parts_mut(process_ptr, num_slots) };
+    // SAFETY: Same as above — capability_ptr is the next page-aligned sub-region,
+    // properly initialized and exclusively owned.
     let capability_slots: &'static mut [Option<ProcessCapabilities>] =
         unsafe { core::slice::from_raw_parts_mut(capability_ptr, num_slots) };
 

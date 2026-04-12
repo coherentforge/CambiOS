@@ -1,17 +1,17 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-/// Buddy Allocator for Process Heaps
-///
-/// Pure bookkeeping allocator: tracks slot allocation via bitmaps without
-/// touching the managed memory. Returns offsets from base, not addresses.
-/// The caller (ProcessDescriptor) is responsible for translating offsets
-/// to the correct address space (physical for page tables, HHDM-virtual
-/// for kernel access).
-///
-/// This design:
-/// - Eliminates BlockHeader overhead (no 8-byte header per allocation)
-/// - Never performs unsafe memory I/O — fully testable without real memory
-/// - Is address-space agnostic — works with physical, virtual, or test addresses
+//! Buddy Allocator for Process Heaps
+//!
+//! Pure bookkeeping allocator: tracks slot allocation via bitmaps without
+//! touching the managed memory. Returns offsets from base, not addresses.
+//! The caller (ProcessDescriptor) is responsible for translating offsets
+//! to the correct address space (physical for page tables, HHDM-virtual
+//! for kernel access).
+//!
+//! This design:
+//! - Eliminates BlockHeader overhead (no 8-byte header per allocation)
+//! - Never performs unsafe memory I/O — fully testable without real memory
+//! - Is address-space agnostic — works with physical, virtual, or test addresses
 
 use core::fmt;
 
@@ -42,9 +42,9 @@ pub struct Allocation {
 /// bits are set. The allocator stores the order for each allocation in a
 /// separate parallel bitmap so that `free()` only needs the offset.
 ///
-/// ## In-place construction (Wave 2a follow-up)
+/// ## In-place construction (Phase 3.2a follow-up)
 ///
-/// As of the Wave 2a follow-up, the allocator is constructed in place at
+/// As of the Phase 3.2a follow-up, the allocator is constructed in place at
 /// the start of each process heap (not as a field of `ProcessDescriptor`
 /// anymore). The first `reserved_slots * MIN_SIZE` bytes of the heap hold
 /// the allocator's own state and are reserved so user allocations never
@@ -87,7 +87,13 @@ impl BuddyAllocator {
             reserved_slots: 0,
         }
     }
+}
 
+impl Default for BuddyAllocator {
+    fn default() -> Self { Self::new() }
+}
+
+impl BuddyAllocator {
     /// Create a new buddy allocator with the first `reserved_bytes` of the
     /// managed heap marked as allocated and protected from `free()`.
     ///
@@ -116,7 +122,7 @@ impl BuddyAllocator {
         if reserved_bytes == 0 {
             return allocator;
         }
-        let slots = (reserved_bytes + MIN_SIZE - 1) / MIN_SIZE;
+        let slots = reserved_bytes.div_ceil(MIN_SIZE);
         let total_slots = MAX_SIZE / MIN_SIZE;
         // Cap at total_slots so we never mark bits outside the bitmap.
         // Caller-side invariant: reserved_bytes should be << MAX_SIZE, but
@@ -166,7 +172,7 @@ impl BuddyAllocator {
     /// - the slot is not currently allocated (double-free),
     /// - the decoded order is out of range.
     pub fn free(&mut self, offset: usize) -> bool {
-        if offset % MIN_SIZE != 0 {
+        if !offset.is_multiple_of(MIN_SIZE) {
             return false;
         }
 
@@ -191,7 +197,7 @@ impl BuddyAllocator {
         }
 
         let order = self.get_order(start_slot);
-        if order < MIN_ORDER || order > MAX_ORDER {
+        if !(MIN_ORDER..=MAX_ORDER).contains(&order) {
             return false;
         }
 
@@ -382,7 +388,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Reserved-prefix construction (Wave 2a Item 1: in-place allocator state)
+    // Reserved-prefix construction (Phase 3.2a Item 1: in-place allocator state)
     // ========================================================================
 
     #[test]
@@ -435,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_new_with_reserved_prefix_allocator_state_size() {
-        // The practical Wave 2a use case: reserve enough space for the
+        // The practical Phase 3.2a use case: reserve enough space for the
         // allocator's own state. size_of::<BuddyAllocator>() is the
         // actual reservation size in ProcessDescriptor::new.
         let state_size = core::mem::size_of::<BuddyAllocator>();

@@ -29,3 +29,33 @@ pub mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::*;
+
+// ============================================================================
+// Portable TLB shootdown wrapper (Phase 3.2d.iii)
+// ============================================================================
+
+/// Invalidate a range of pages across all CPUs.
+///
+/// Portable wrapper over the arch-specific TLB shootdown. Called by
+/// channel close/revoke and process exit to ensure no CPU caches
+/// stale mappings after unmap.
+///
+/// # Safety
+///
+/// The page table modifications (unmaps) must already be visible in
+/// memory before calling this. Must be called at ring 0 / EL1.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
+    // SAFETY: caller guarantees page table mods are committed.
+    unsafe { x86_64::tlb::shootdown_range(virt_addr, page_count) }
+}
+
+/// AArch64 variant: TLBI broadcast instructions (hardware-mediated, no IPI).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
+    // AArch64 shootdown_range is inherently safe (TLBI + DSB + ISB),
+    // but we wrap it as unsafe to match the portable API contract.
+    aarch64::tlb::shootdown_range(virt_addr, page_count as usize);
+}

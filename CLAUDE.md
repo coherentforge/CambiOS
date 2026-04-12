@@ -57,11 +57,11 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (267 tests, all passing)
+# Run tests (316 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
-# Build for a specific deployment tier (Wave 2a / ADR-008 / ADR-009).
+# Build for a specific deployment tier (Phase 3.2a / ADR-008 / ADR-009).
 # ARCOS_TIER selects which TableSizingPolicy is compiled in. Default
 # is tier3 when unset — always target tier3 unless specifically
 # working on tier1 or tier2. build.rs reads ARCOS_TIER and emits a
@@ -103,6 +103,20 @@ make sign-tool
 
 **Important:** The microkernel binary (`src/microkernel/main.rs`) cannot compile for test on macOS because it uses ELF-specific linker sections. Always use `--lib` when running tests. The `RUST_MIN_STACK` env var is required because some tests (buddy allocator) need >2MB stack. The `user/fs-service/` crate is built separately with `CARGO_ENCODED_RUSTFLAGS` to override the parent `.cargo/config.toml` (which targets kernel code model). The `tools/sign-elf/` crate is a host-side tool with its own `.cargo/config.toml` targeting `aarch64-apple-darwin`.
 
+## Code Navigation — rust-analyzer MCP Tools
+
+An MCP server exposing rust-analyzer is configured in `.mcp.json`. **Prefer these tools over Grep/Glob for code navigation whenever practical:**
+
+- **`mcp__rust-analyzer__symbol_references`** — find a symbol by name and get all references in one call. Use this instead of grepping for a symbol name.
+- **`mcp__rust-analyzer__hover`** — get the resolved type, struct fields, and doc comments at a position. Use this instead of reading surrounding code to understand a type.
+- **`mcp__rust-analyzer__definition`** — jump to where a symbol is defined. Use this instead of grepping for `fn name` or `struct name`.
+- **`mcp__rust-analyzer__references`** — find all references at a position (when you already have file:line:col).
+- **`mcp__rust-analyzer__implementations`** — find all trait implementations. Use this instead of grepping for `impl TraitName`.
+- **`mcp__rust-analyzer__symbols`** — fuzzy search for symbols across the workspace.
+- **`mcp__rust-analyzer__document_symbols`** — structural overview of a file (all functions, types, constants).
+
+These tools return semantically precise results (no false positives from comments or strings) and save significant tokens compared to grep-then-read cycles. Grep is still appropriate for searching within string literals, comments, or non-Rust files.
+
 ## Project Overview
 
 ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
@@ -135,13 +149,13 @@ build.rs                      # Reads ARCOS_TIER env var (default: tier3),
 ```
 src/
 ├── lib.rs                    # Crate root, global statics, init, halt
-├── process.rs                # ProcessTable, ProcessDescriptor, VmaTracker (Wave 2a: slice-backed)
+├── process.rs                # ProcessTable, ProcessDescriptor, VmaTracker (Phase 3.2a: slice-backed; Phase 3.2c: generation counters, slot allocator)
 ├── boot_modules.rs           # Boot module registry (name → physical range)
 ├── acpi/
 │   └── mod.rs                # ACPI table parser (RSDP, XSDT, MADT)
 ├── config/
 │   ├── mod.rs                # Build-time configuration re-exports
-│   └── tier.rs               # TableSizingPolicy, TIER{1,2,3}_POLICY, num_slots_from, binding_constraint_for (Wave 2a)
+│   └── tier.rs               # TableSizingPolicy, TIER{1,2,3}_POLICY, num_slots_from, binding_constraint_for (Phase 3.2a)
 ├── arch/
 │   ├── mod.rs                # cfg-gated architecture shim (re-exports active backend)
 │   ├── spinlock.rs           # Spinlock + IrqSpinlock (interrupt-disabling)
@@ -175,6 +189,7 @@ src/
 ├── ipc/
 │   ├── mod.rs                # IPC: Principal, EndpointQueue, SyncChannel, IpcManager, ShardedIpcManager
 │   ├── capability.rs         # Capability-based security + Principal binding
+│   ├── channel.rs            # Shared-memory data channels (Phase 3.2d, ADR-005)
 │   └── interceptor.rs        # Zero-trust IPC interceptor (policy enforcement)
 ├── loader/
 │   ├── mod.rs                # ELF process loader + verify-before-execute gate + SignedBinaryVerifier
@@ -184,7 +199,7 @@ src/
 │   ├── buddy_allocator.rs    # Pure bookkeeping buddy allocator
 │   ├── frame_allocator.rs    # Bitmap-based physical frame allocator (covers 0–2 GiB) + per-CPU FrameCache + allocate_contiguous / free_contiguous
 │   ├── heap.rs               # Kernel heap allocator (linked-list, GlobalAlloc)
-│   ├── object_table.rs       # Kernel object table region allocator (Wave 2a, ADR-008)
+│   ├── object_table.rs       # Kernel object table region allocator (Phase 3.2a, ADR-008)
 │   └── paging.rs             # x86_64 page table management (OffsetPageTable)
 ├── microkernel/
 │   └── main.rs               # Kernel entry point, all subsystem init
@@ -259,8 +274,8 @@ User data before user code is **required** by SYSRET selector computation.
 ### Memory Layout
 - **Kernel heap:** 4MB at HHDM+physical, initialized from Limine memory map
 - **Boot stack:** 256KB via Limine StackSizeRequest
-- **Kernel object table region (Wave 2a):** contiguous physical region allocated at boot via `FrameAllocator::allocate_contiguous`, HHDM-mapped, holds two page-aligned subregions — `[Option<ProcessDescriptor>; num_slots]` and `[Option<ProcessCapabilities>; num_slots]`. Size is determined by `config::num_slots()` × (`size_of::<Option<ProcessDescriptor>>() + size_of::<Option<ProcessCapabilities>>()`), rounded up per subregion to a page boundary. Allocated in `init_kernel_object_tables()` in `main.rs` between frame allocator init and GDT setup. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and `src/memory/object_table.rs`.
-- **Per-process heaps (Wave 2a):** each process gets a `HEAP_SIZE` (1 MiB) contiguous physical region, allocated on demand in `ProcessDescriptor::new` via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` and freed in `handle_exit` via `free_contiguous`. No more `PROCESS_HEAP_BASE + pid * HEAP_SIZE` arithmetic — the physical base is whatever the frame allocator hands out. Kernel still accesses the heap via HHDM (`virt_base = phys_base + hhdm_offset`).
+- **Kernel object table region (Phase 3.2a):** contiguous physical region allocated at boot via `FrameAllocator::allocate_contiguous`, HHDM-mapped, holds two page-aligned subregions — `[Option<ProcessDescriptor>; num_slots]` and `[Option<ProcessCapabilities>; num_slots]`. Size is determined by `config::num_slots()` × (`size_of::<Option<ProcessDescriptor>>() + size_of::<Option<ProcessCapabilities>>()`), rounded up per subregion to a page boundary. Allocated in `init_kernel_object_tables()` in `main.rs` between frame allocator init and GDT setup. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and `src/memory/object_table.rs`.
+- **Per-process heaps (Phase 3.2a):** each process gets a `HEAP_SIZE` (1 MiB) contiguous physical region, allocated on demand in `ProcessDescriptor::new` via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` and freed in `handle_exit` via `free_contiguous`. No more `PROCESS_HEAP_BASE + pid * HEAP_SIZE` arithmetic — the physical base is whatever the frame allocator hands out. Kernel still accesses the heap via HHDM (`virt_base = phys_base + hhdm_offset`).
 - **User code:** mapped at 0x400000
 - **User stack:** top at 0x800000, 64KB (16 pages), grows down
 - **Per-process PML4:** kernel half cloned (entries 256..511)
@@ -272,7 +287,8 @@ User data before user code is **required** by SYSRET selector computation.
 ### Lock Ordering (MUST be followed to prevent deadlock)
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
+CHANNEL_MANAGER(5) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7) →
+INTERRUPT_ROUTER(8) → OBJECT_STORE(9)
 ```
 `*` = IrqSpinlock (saves/disables interrupts before acquiring, prevents same-CPU deadlock when timer ISR fires while lock is held). Others use plain Spinlock.
 
@@ -309,9 +325,11 @@ ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17,
 ClaimBootstrapKey=18, ObjPutSigned=19,
 MapMmio=20, AllocDma=21, DeviceInfo=22, PortIo=23,
 ConsoleRead=24, Spawn=25, WaitTask=26,
-RevokeCapability=27
+RevokeCapability=27,
+ChannelCreate=28, ChannelAttach=29, ChannelClose=30,
+ChannelRevoke=31, ChannelInfo=32
 ```
-All 28 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+All 33 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **Exit**: Marks task as Terminated in scheduler and calls `CapabilityManager::revoke_all_for_process()` to reclaim endpoint capabilities (see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
@@ -335,9 +353,14 @@ All 28 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **DeviceInfo**: Returns 108-byte PCI device descriptor by index (vendor/device ID, class, BARs with decoded addresses/sizes/types)
 - **PortIo**: Kernel-validated port I/O on PCI device I/O BARs. Rejects ports not within a discovered PCI BAR. Supports byte/word/dword read/write
 - **ConsoleRead**: Non-blocking read of bytes from the serial console into a user buffer
-- **Spawn**: Create a new process from a named boot module; parent is the caller
+- **Spawn**: Create a new process from a named boot module; parent is the caller. Requires `CapabilityKind::CreateProcess` (Phase 3.2b, ADR-008); returns `PermissionDenied` without it
 - **WaitTask**: Block until a named child task exits; returns the child's exit code
-- **RevokeCapability**: Revoke a capability held by another process on an endpoint. Wave 1 authority = bootstrap Principal only; grantor / holder-of-`revoke`-right / policy service paths land in Wave 4. Args will refactor from `(pid, endpoint)` to a single `CapabilityHandle` in Wave 2 once channels force a system-wide capability registry. See [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)
+- **RevokeCapability**: Revoke a capability held by another process on an endpoint. Phase 3.1 authority = bootstrap Principal only; grantor / holder-of-`revoke`-right / policy service paths land in Phase 3.4. `CapabilityHandle` refactor deferred to post-v1 handle table. See [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)
+- **ChannelCreate**: Allocate a shared-memory channel. Creator specifies size (pages), peer Principal, and role (Producer/Consumer/Bidirectional). Requires `CreateChannel` system capability. Returns ChannelId; writes creator's vaddr to output pointer. See [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md)
+- **ChannelAttach**: Attach to an existing channel as the named peer. Kernel verifies caller's Principal matches peer_principal from create. Maps shared pages into peer's address space with role-determined permissions (RO/RW). Returns vaddr
+- **ChannelClose**: Gracefully close a channel. Unmaps from both processes, TLB shootdown, frees physical frames. Only creator or peer may call
+- **ChannelRevoke**: Force-close a channel (bootstrap authority, Phase 3.1 pattern). Same teardown as close but no caller-identity check
+- **ChannelInfo**: Read channel metadata (state, role, sizes, addresses, tick) into user buffer
 
 ## Development Conventions
 
@@ -373,7 +396,7 @@ const MAX_GSI_PINS: usize = 24;
 const CACHE_CAPACITY: usize = 32;
 ```
 
-**SCAFFOLDING bounds must be sized for the v1 endgame, not today's workload.** When picking a SCAFFOLDING value, do not pick "the smallest number that works today" with the plan to resize later. Extrapolate forward across the full v1 sequence: Phase 3 (channels, policy service, audit telemetry), Phase 4 (persistent ObjectStore + virtio-blk), Phase 5 (Yggdrasil mesh networking), the init process spawning services from a boot manifest, and per-service state growth as the kernel matures. A bound that is comfortably above today's usage but gets crossed during v1 development is the worst case — it looks fine at review time and silently becomes a bottleneck during the waves where changing it is most disruptive. The rule:
+**SCAFFOLDING bounds must be sized for the v1 endgame, not today's workload.** When picking a SCAFFOLDING value, do not pick "the smallest number that works today" with the plan to resize later. Extrapolate forward across the full v1 sequence: Phase 3 (channels, policy service, audit telemetry), Phase 4 (persistent ObjectStore + virtio-blk), Phase 5 (Yggdrasil mesh networking), the init process spawning services from a boot manifest, and per-service state growth as the kernel matures. A bound that is comfortably above today's usage but gets crossed during v1 development is the worst case — it looks fine at review time and silently becomes a bottleneck during the subphases where changing it is most disruptive. The rule:
 
 1. Estimate **(a)** current workload, **(b)** v1 workload after all phases land, **(c)** memory cost at candidate multiples of the v1 estimate.
 2. Pick the smallest value where the v1 estimate is approximately **≤ 25% of the bound** AND the memory cost is still comfortable. "≤ 25%" means the bound has ~4× headroom above the v1 estimate — enough that a surprising workload or an unplanned consumer (a new audit channel, a second policy cache) does not push against the wall.
@@ -477,7 +500,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 267 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3 Wave 1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3 Wave 2a), 7 BuddyAllocator reserved-prefix tests (Wave 2a SLOT_OVERHEAD shrink)
+- 316 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c)
 
 ## Post-Change Review Protocol
 
@@ -508,7 +531,7 @@ make run-aarch64    # AArch64
 ```
 All builds and clippy must pass with zero errors. Do not skip any step.
 
-**Flag pre-existing warnings.** Any warning surfaced by `cargo build` / `cargo test` — even pre-existing and unrelated to the current change — must be acknowledged, not silently passed through. Warnings accumulate, and "pre-existing and unrelated" is how technical debt becomes invisible. Two acceptable responses:
+**Flag pre-existing warnings.** Any warning surfaced by `cargo build` / `cargo test` / `cargo clippy` — even pre-existing and unrelated to the current change — must be acknowledged, not silently passed through. Warnings accumulate, and "pre-existing and unrelated" is how technical debt becomes invisible. Two acceptable responses:
 
 - **Tiny and safe → fix it in the same change.** Unused imports, unused variables, dead `let` bindings, trivially redundant casts. These take seconds and clearing them keeps build output clean for the next change.
 - **Otherwise → report and track.** Surface the warning explicitly to the user (file:line, warning text, one-line note) and add it to [STATUS.md](STATUS.md)'s "Known issues" section (or another tracked list) so it is not forgotten. Silent pass-through is not acceptable, because build noise is how formal-verification prep and human review lose signal.
@@ -556,7 +579,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 | Category | Files | Auto-refresh? | Rule |
 |---|---|---|---|
 | **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
-| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-009) | **No** — human only | ADRs are immutable history. If a decision is wrong or superseded, write a new ADR that supersedes it. Never edit an old ADR to reflect new code state. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
+| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-009) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
 | **design / source_of_truth** | [ArcOS.md](ArcOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 
@@ -564,7 +587,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 1. Did this change modify a subsystem listed in [STATUS.md](STATUS.md)'s subsystem table? → Update its row and bump `last_synced_to_code:`.
 2. Did this change move a phase forward (e.g., "Phase 3 in progress" → "Phase 3 done")? → Update the Phase markers table.
 3. Did this change touch the scheduler? → Re-read [SCHEDULER.md](src/scheduler/SCHEDULER.md) and update if anything in it is now wrong.
-4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments.
+4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments. Did this change diverge from an existing ADR's plan? → Append a `## Divergence` entry to that ADR documenting what changed and why.
 5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference / Lock Ordering / Syscall Numbers tables.
 6. Did this change resolve a Platform Gotcha in CLAUDE.md or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
 7. Did this change cite a doc that doesn't exist yet? → Either create the doc or remove the citation.

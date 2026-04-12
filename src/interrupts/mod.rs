@@ -32,11 +32,47 @@ pub use routing::{InterruptRoutingTable, InterruptRoute, IrqNumber, InterruptCon
 /// Interrupt descriptor table.
 ///
 /// # Safety
-/// Mutable static — all writes happen during single-threaded init (`init()`
-/// and `init_hardware_interrupts()`) before interrupts are enabled, so no
-/// concurrent access is possible. After `load()`, only the CPU reads it.
+/// IDT storage wrapper — replaces `static mut` with `UnsafeCell` to comply
+/// with Rust 2024 edition deprecation of `static mut` references.
+///
+/// All writes happen during single-threaded init (`init()` and
+/// `init_hardware_interrupts()`) before interrupts are enabled. After
+/// `load()`, only the CPU reads it (not software).
 #[cfg(target_arch = "x86_64")]
-static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
+struct IdtStorage(core::cell::UnsafeCell<InterruptDescriptorTable>);
+
+#[cfg(target_arch = "x86_64")]
+// SAFETY: IDT is written during single-threaded boot init, then read-only
+// by CPU hardware. No concurrent software access occurs after init.
+unsafe impl Sync for IdtStorage {}
+
+#[cfg(target_arch = "x86_64")]
+static IDT: IdtStorage = IdtStorage(core::cell::UnsafeCell::new(InterruptDescriptorTable::new()));
+
+/// Obtain a mutable reference to the IDT. Init-time only.
+///
+/// # Safety
+///
+/// Must only be called during single-threaded init with interrupts
+/// disabled. No other reference to the IDT may exist.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn idt_mut() -> &'static mut InterruptDescriptorTable {
+    // SAFETY: Caller guarantees single-threaded init context.
+    unsafe { &mut *IDT.0.get() }
+}
+
+/// Obtain a shared reference to the IDT. Used for `load()`.
+///
+/// # Safety
+///
+/// The IDT must be fully initialized before calling.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn idt_ref() -> &'static InterruptDescriptorTable {
+    // SAFETY: Caller guarantees IDT is initialized.
+    unsafe { &*IDT.0.get() }
+}
 
 /// Tracks whether the IDT has been loaded (set once during `init()`).
 #[cfg(target_arch = "x86_64")]
@@ -301,27 +337,28 @@ pub mod device_irqs {
 pub unsafe fn register_device_isrs() {
     use crate::arch::x86_64::ioapic::DEVICE_VECTOR_BASE;
 
-    // SAFETY: Single-threaded init before IDT reload. IDT is a mutable static
-    // but no concurrent access is possible with interrupts disabled.
-    unsafe {
-        let idt = &mut *(&raw mut IDT);
-        for (gsi, handler) in device_irqs::HANDLERS.iter().enumerate() {
-            let vector = DEVICE_VECTOR_BASE as usize + gsi;
-            idt[vector].set_handler_fn(*handler);
-        }
+    // SAFETY: Single-threaded init before IDT reload, interrupts disabled.
+    let idt = unsafe { idt_mut() };
+    for (gsi, handler) in device_irqs::HANDLERS.iter().enumerate() {
+        let vector = DEVICE_VECTOR_BASE as usize + gsi;
+        idt[vector].set_handler_fn(*handler);
     }
 }
 
-/// Initialize interrupt handling (exceptions only, no hardware interrupts yet)
+/// Initialize interrupt handling (exceptions only, no hardware interrupts yet).
 ///
 /// Call `init_hardware_interrupts()` separately after kernel subsystems are ready.
+///
+/// # Safety
+///
+/// Must be called once during single-threaded boot with interrupts disabled.
+/// The IDT static is mutated and loaded into the CPU.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn init() {
-    // SAFETY: Single-threaded init — interrupts are disabled, no concurrent access.
-    unsafe {
-        configure_idt();
-        (*(&raw const IDT)).load();
-    }
+    // SAFETY: configure_idt() writes to IDT via idt_mut(). Single-threaded init.
+    unsafe { configure_idt() };
+    // SAFETY: IDT is fully configured by configure_idt(). Single-threaded init.
+    unsafe { idt_ref().load() };
     IDT_LOADED.store(true, Ordering::Release);
 }
 
@@ -400,19 +437,18 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
     extern "C" {
         fn timer_isr_stub();
     }
-    // SAFETY: Single-threaded init. timer_isr_stub is our global_asm symbol.
-    // IDT is a mutable static but no concurrent access with interrupts disabled.
+    // SAFETY: Single-threaded init, interrupts disabled, IDT not yet reloaded.
+    // set_handler_addr is unsafe because the handler must follow the x86-interrupt ABI.
+    // timer_isr_stub is our global_asm naked entry point that does.
     unsafe {
-        (&mut (*(&raw mut IDT)))[apic::TIMER_VECTOR as usize]
+        idt_mut()[apic::TIMER_VECTOR as usize]
             .set_handler_addr(x86_64::VirtAddr::new(timer_isr_stub as *const () as u64));
     }
 
     // Step 4b: Register spurious interrupt handler at vector 0xFF
-    // SAFETY: Single-threaded init, within IDT bounds.
-    unsafe {
-        (&mut (*(&raw mut IDT)))[0xFF_usize]
-            .set_handler_fn(exceptions::spurious_interrupt);
-    }
+    // SAFETY: Single-threaded init, interrupts disabled.
+    let idt = unsafe { idt_mut() };
+    idt[0xFF_usize].set_handler_fn(exceptions::spurious_interrupt);
 
     // Step 4c: Register device ISR handlers at vectors 33-56 (if I/O APIC available)
     if acpi_info.is_some() {
@@ -422,13 +458,11 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
     }
 
     // Step 4d: Register TLB shootdown IPI handler at vector 0xFE
-    // SAFETY: Single-threaded init, within IDT bounds.
     {
         use crate::arch::x86_64::tlb;
-        unsafe {
-            (&mut (*(&raw mut IDT)))[tlb::TLB_SHOOTDOWN_VECTOR as usize]
-                .set_handler_fn(tlb::tlb_shootdown_isr);
-        }
+        // SAFETY: Single-threaded init, interrupts disabled.
+        idt[tlb::TLB_SHOOTDOWN_VECTOR as usize]
+            .set_handler_fn(tlb::tlb_shootdown_isr);
         crate::println!("  TLB shootdown handler registered (vector {:#x})", tlb::TLB_SHOOTDOWN_VECTOR);
     }
 
@@ -450,8 +484,11 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 
         // Wire double-fault IDT entry to use IST1 (hardware IST index 1 = TSS.ist[0])
         // SAFETY: Single-threaded init, IDT not yet reloaded.
+        // set_stack_index is unsafe because an invalid IST index would corrupt
+        // the stack switch on exception. Index 0 maps to IST1 (allocated above).
         unsafe {
-            (*(&raw mut IDT)).double_fault
+            idt_mut()
+                .double_fault
                 .set_handler_fn(exceptions::double_fault)
                 .set_stack_index(0); // x86_64 crate: 0 maps to IST1
         }
@@ -460,8 +497,8 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
     }
 
     // Step 6a: Reload IDT with all handlers (timer, device ISRs, exceptions)
-    // SAFETY: IDT is fully configured. Reloading makes the CPU pick up all handlers.
-    unsafe { (*(&raw const IDT)).load(); }
+    // SAFETY: IDT is fully configured by all steps above.
+    unsafe { idt_ref().load() };
 
     // Step 6b: Configure I/O APIC device IRQ routing (after IDT loaded)
     if let Some(ref info) = acpi_info {
@@ -488,13 +525,13 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 unsafe fn configure_idt() {
     // SAFETY: Single-threaded init — interrupts disabled, no concurrent IDT access.
     // Each set_handler_fn registers a valid extern "x86-interrupt" handler.
-    unsafe {
-        (*(&raw mut IDT)).divide_error.set_handler_fn(exceptions::divide_by_zero);
-        (*(&raw mut IDT)).general_protection_fault
-            .set_handler_fn(exceptions::general_protection_fault);
-        (*(&raw mut IDT)).page_fault.set_handler_fn(exceptions::page_fault);
-        (*(&raw mut IDT)).double_fault.set_handler_fn(exceptions::double_fault);
-    }
+    // SAFETY: Single-threaded init, interrupts disabled.
+    let idt = unsafe { idt_mut() };
+    idt.divide_error.set_handler_fn(exceptions::divide_by_zero);
+    idt.general_protection_fault
+        .set_handler_fn(exceptions::general_protection_fault);
+    idt.page_fault.set_handler_fn(exceptions::page_fault);
+    idt.double_fault.set_handler_fn(exceptions::double_fault);
 }
 
 /// Request interrupt with verification contract
@@ -531,6 +568,6 @@ pub fn idt_loaded() -> bool {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn load_idt_ap() {
     // SAFETY: IDT is fully configured by BSP (IDT_LOADED is true).
-    // The IDT is a global static — same virtual address on all CPUs.
-    unsafe { (*(&raw const IDT)).load(); }
+    // Same virtual address on all CPUs via the global static.
+    unsafe { idt_ref().load() };
 }

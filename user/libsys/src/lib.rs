@@ -352,3 +352,73 @@ pub fn wait_task(task_id: u32) -> i64 {
 pub fn get_time() -> u64 {
     syscall_raw3(SYS_GET_TIME, 0, 0, 0) as u64
 }
+
+// ============================================================================
+// Phase 3.2d.iv: Shared-memory channel syscalls (ADR-005)
+// ============================================================================
+
+const SYS_CHANNEL_CREATE: u64 = 28;
+const SYS_CHANNEL_ATTACH: u64 = 29;
+const SYS_CHANNEL_CLOSE: u64 = 30;
+const SYS_CHANNEL_REVOKE: u64 = 31;
+const SYS_CHANNEL_INFO: u64 = 32;
+
+/// Create a shared-memory channel.
+///
+/// `size_pages`: number of 4 KiB pages (1..=4096).
+/// `peer_principal`: 32-byte Ed25519 public key of the intended peer.
+/// `role`: 0 = Producer (creator writes), 1 = Consumer (creator reads),
+///         2 = Bidirectional (both sides write).
+/// `out_vaddr`: receives the creator's virtual address of the shared region.
+///
+/// Returns the ChannelId (>= 0) on success, or a negative error code.
+/// Requires the `CreateChannel` system capability.
+pub fn channel_create(
+    size_pages: u32,
+    peer_principal: &[u8; 32],
+    role: u32,
+    out_vaddr: &mut u64,
+) -> i64 {
+    syscall_raw4(
+        SYS_CHANNEL_CREATE,
+        size_pages as u64,
+        peer_principal.as_ptr() as u64,
+        role as u64,
+        out_vaddr as *mut u64 as u64,
+    )
+}
+
+/// Attach to an existing channel as the named peer.
+///
+/// The kernel verifies the caller's Principal matches the peer_principal
+/// specified at create time. Returns the user-space virtual address of
+/// the shared region on success, or a negative error code.
+pub fn channel_attach(channel_id: u64) -> i64 {
+    syscall_raw3(SYS_CHANNEL_ATTACH, channel_id, 0, 0)
+}
+
+/// Close a channel. Both sides' mappings are removed.
+///
+/// Only the creator or peer may call this. Returns 0 on success.
+pub fn channel_close(channel_id: u64) -> i64 {
+    syscall_raw3(SYS_CHANNEL_CLOSE, channel_id, 0, 0)
+}
+
+/// Force-revoke a channel (bootstrap/policy authority required).
+///
+/// Returns 0 on success.
+pub fn channel_revoke(channel_id: u64) -> i64 {
+    syscall_raw3(SYS_CHANNEL_REVOKE, channel_id, 0, 0)
+}
+
+/// Query channel metadata.
+///
+/// Writes a 46-byte descriptor to `out_buf`. Returns 0 on success.
+pub fn channel_info(channel_id: u64, out_buf: &mut [u8]) -> i64 {
+    syscall_raw3(
+        SYS_CHANNEL_INFO,
+        channel_id,
+        out_buf.as_mut_ptr() as u64,
+        out_buf.len() as u64,
+    )
+}

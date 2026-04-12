@@ -40,19 +40,14 @@ pub unsafe fn init(frequency_hz: u32) -> u16 {
     // The command byte 0x34 selects Channel 0, lobyte/hibyte access, rate generator mode.
 
     // Calculate divisor (clamped to u16 range)
-    let divisor = if frequency_hz == 0 {
-        65535u16 // Minimum frequency (~18.2 Hz)
-    } else {
-        let raw = PIT_BASE_FREQUENCY / frequency_hz;
-        if raw > 65535 {
-            65535u16
-        } else if raw < 1 {
-            1u16
-        } else {
-            raw as u16
-        }
+    let divisor = match PIT_BASE_FREQUENCY.checked_div(frequency_hz) {
+        None | Some(0) => 1u16,
+        Some(raw) if raw > 65535 => 65535u16,
+        Some(raw) => raw as u16,
     };
 
+    // SAFETY: PIT_COMMAND (0x43) and PIT_CHANNEL0 (0x40) are standard x86 I/O
+    // ports. Called during single-threaded boot with interrupts disabled.
     unsafe {
         let mut cmd_port = Port::<u8>::new(PIT_COMMAND);
         let mut data_port = Port::<u8>::new(PIT_CHANNEL0);

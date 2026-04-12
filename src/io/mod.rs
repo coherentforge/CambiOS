@@ -149,12 +149,13 @@ pub fn read_byte() -> Option<u8> {
         let mut guard = SERIAL1.lock();
         let _serial = guard.as_mut()?;
 
-        // SAFETY: Reading Line Status Register (base+5) and Data Register
-        // (base+0) are side-effect-free reads. The port was initialized at boot.
         use x86_64::instructions::port::Port;
         let base = 0x3F8u16;
+        // SAFETY: Reading Line Status Register (base+5) is a side-effect-free read
+        // on a valid x86 I/O port. The serial port was initialized at boot.
         let lsr: u8 = unsafe { Port::new(base + 5).read() };
         if lsr & 0x01 != 0 {
+            // SAFETY: Data Register (base+0) read — byte is available per LSR check above.
             let data: u8 = unsafe { Port::new(base).read() };
             Some(data)
         } else {

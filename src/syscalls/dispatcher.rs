@@ -227,6 +227,13 @@ impl SyscallDispatcher {
             SyscallNumber::Spawn => Self::handle_spawn(args, ctx),
             SyscallNumber::WaitTask => Self::handle_wait_task(args, ctx),
             SyscallNumber::RevokeCapability => Self::handle_revoke_capability(args, ctx),
+
+            // Phase 3.2d.iii: shared-memory channels (ADR-005)
+            SyscallNumber::ChannelCreate => Self::handle_channel_create(args, ctx),
+            SyscallNumber::ChannelAttach => Self::handle_channel_attach(args, ctx),
+            SyscallNumber::ChannelClose => Self::handle_channel_close(args, ctx),
+            SyscallNumber::ChannelRevoke => Self::handle_channel_revoke(args, ctx),
+            SyscallNumber::ChannelInfo => Self::handle_channel_info(args, ctx),
         }
     }
 
@@ -270,11 +277,6 @@ impl SyscallDispatcher {
         // Per ADR-007 §"What this gives us", process exit invokes
         // revoke_all_for_process() to prevent stale capabilities from
         // accumulating in the capability table.
-        //
-        // Note: this reclaims endpoint capabilities only. VMA regions,
-        // page table frames, and IPC endpoint subscriptions are not yet
-        // reclaimed — see STATUS.md "Process lifecycle cleanup is partial"
-        // known issue. Those are separate work items.
         let revoked_count = {
             let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
             if let Some(cap_mgr) = cap_guard.as_mut() {
@@ -284,24 +286,44 @@ impl SyscallDispatcher {
             }
         };
 
-        // Reclaim the process heap region back to the frame allocator.
+        // Phase 3.2d.iii: revoke all channels the exiting process is
+        // party to (as creator or peer). For each revoked channel, unmap
+        // pages from the surviving peer, issue TLB shootdown, and free
+        // the physical frames.
         //
-        // Wave 2a (ADR-008): per-process heaps are allocated on demand
-        // via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` in
-        // `ProcessDescriptor::new`. Without this reclaim, the heap
-        // frames would leak and Tier 3 deployments would eventually
-        // exhaust the frame allocator after enough process exits.
+        // Lock ordering: CHANNEL_MANAGER(5) → PROCESS_TABLE(6) →
+        // FRAME_ALLOCATOR(7). CAPABILITY_MANAGER(4) was released above.
+        let channels_revoked = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            if let Some(chan_mgr) = chan_guard.as_mut() {
+                let (revoked, count) = chan_mgr.revoke_all_for_process(ctx.process_id);
+                drop(chan_guard); // release CHANNEL_MANAGER(5) before PROCESS_TABLE(6)
+
+                // Teardown each revoked channel's mappings.
+                for record in revoked.iter().take(count).flatten() {
+                    Self::teardown_channel_mappings(record);
+                }
+                count
+            } else {
+                drop(chan_guard);
+                0
+            }
+        };
+
+        // Reclaim process resources: VMA regions, page table frames, heap.
         //
-        // `ProcessTable::destroy_process` internally calls
-        // `free_contiguous(phys_base, HEAP_PAGES)` on the descriptor
-        // and clears the slot. Lock ordering: PROCESS_TABLE(5) ->
-        // FRAME_ALLOCATOR(6), valid.
+        // Phase 3.2d.ii: `destroy_process` now calls `reclaim_user_vmas`
+        // (unmaps VMA-tracked pages, frees frames), then
+        // `reclaim_process_page_tables` (frees PML4/intermediate PT frames),
+        // then `reclaim_heap` (frees contiguous heap region).
+        //
+        // Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7), valid.
         let heap_reclaimed = {
             let mut pt_guard = crate::PROCESS_TABLE.lock();
             if let Some(pt) = pt_guard.as_mut() {
                 if pt.slot_occupied(ctx.process_id) {
                     let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
-                    pt.destroy_process(ctx.process_id, &mut *fa_guard);
+                    pt.destroy_process(ctx.process_id, &mut fa_guard);
                     true
                 } else {
                     false
@@ -312,18 +334,21 @@ impl SyscallDispatcher {
         };
 
         crate::println!(
-            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s){})",
-            ctx.process_id.0,
+            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s), {} chan(s){})",
+            ctx.process_id.slot(),
             ctx.task_id.0,
             exit_code,
             revoked_count,
-            if heap_reclaimed { ", heap" } else { "" }
+            channels_revoked,
+            if heap_reclaimed { ", heap+vma+pt" } else { "" }
         );
 
         // Yield to next task. Terminated tasks are never re-scheduled,
         // so this loop effectively does not return.
-        // SAFETY: We are on the kernel stack, scheduler lock is not held.
         loop {
+            // SAFETY: We are on the kernel stack, scheduler lock is not held.
+            // Yield switches to the next runnable task; terminated tasks are
+            // never re-enqueued so this loop does not return.
             unsafe { crate::arch::yield_save_and_switch(); }
         }
     }
@@ -357,7 +382,7 @@ impl SyscallDispatcher {
         // Build IPC message
         let endpoint = crate::ipc::EndpointId(endpoint_id);
         let mut msg = crate::ipc::Message::new(
-            crate::ipc::EndpointId(ctx.process_id.0),
+            crate::ipc::EndpointId(ctx.process_id.slot()),
             endpoint,
         );
         if msg.set_payload(&kbuf[..len]).is_err() {
@@ -481,7 +506,7 @@ impl SyscallDispatcher {
     /// allocates physical frames, maps them into the process address space,
     /// and returns the user virtual address.
     ///
-    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
     ///
     /// Performance: data frames are allocated from the per-CPU cache
     /// (no global lock). FRAME_ALLOCATOR is only locked briefly for
@@ -496,9 +521,9 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        let num_pages = ((size + 4095) / 4096) as u32;
+        let num_pages = size.div_ceil(4096) as u32;
 
-        // Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+        // Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
         let mut pt_guard = crate::PROCESS_TABLE.lock();
         let vma = pt_guard
             .as_mut()
@@ -572,7 +597,7 @@ impl SyscallDispatcher {
     /// Looks up the allocation in the process VMA tracker, unmaps all pages,
     /// returns physical frames to the allocator, and removes the VMA entry.
     ///
-    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
     fn handle_free(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let ptr = args.arg1;
 
@@ -586,7 +611,7 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+        // Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
         let mut pt_guard = crate::PROCESS_TABLE.lock();
         let vma_entry = pt_guard
             .as_mut()
@@ -643,7 +668,7 @@ impl SyscallDispatcher {
         }
 
         // Register this task as the IRQ handler and pin to this CPU (one-time setup).
-        // Lock ordering: PER_CPU_SCHEDULER(1) → INTERRUPT_ROUTER(7)
+        // Lock ordering: PER_CPU_SCHEDULER(1) → INTERRUPT_ROUTER(8)
         {
             let mut sched_guard = crate::local_scheduler().lock();
             let mut router_guard = crate::INTERRUPT_ROUTER.lock();
@@ -711,7 +736,7 @@ impl SyscallDispatcher {
 
     /// SYS_GET_PID: Get current process ID
     fn handle_get_pid(_args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        Ok(ctx.process_id.0 as u64)
+        Ok(ctx.process_id.slot() as u64)
     }
 
     /// SYS_GET_TIME: Get system time in ticks
@@ -789,7 +814,7 @@ impl SyscallDispatcher {
         }
 
         // Bind the Principal to the target process
-        let target = ProcessId(target_pid);
+        let target = ProcessId::new(target_pid, 0);
         let principal = crate::ipc::Principal::from_public_key(pubkey);
 
         let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
@@ -943,7 +968,7 @@ impl SyscallDispatcher {
     /// Creates an ArcObject with author/owner = caller's Principal.
     /// Writes 32-byte content hash to out_hash. Returns 0 on success.
     ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(8) — sequential, not nested.
+    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential, not nested.
     fn handle_obj_put(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let content_ptr = args.arg1;
         let content_len = args.arg_usize(2);
@@ -1009,7 +1034,7 @@ impl SyscallDispatcher {
     /// Objects with empty (unsigned) signatures are returned without verification
     /// (graceful degradation for legacy/unsigned objects).
     ///
-    /// Lock ordering: OBJECT_STORE(8) only.
+    /// Lock ordering: OBJECT_STORE(9) only.
     fn handle_obj_get(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let hash_ptr = args.arg1;
         let out_buf = args.arg2;
@@ -1036,12 +1061,11 @@ impl SyscallDispatcher {
         // Verify signature if the object is signed (non-empty signature).
         // Unsigned objects (empty signature) are returned as-is for backward
         // compatibility — the caller can check the signature field if needed.
-        if !obj.signature.is_empty_sig() {
-            if !crate::fs::verify_signature(&obj.owner, &obj.content, &obj.signature) {
+        if !obj.signature.is_empty_sig()
+            && !crate::fs::verify_signature(&obj.owner, &obj.content, &obj.signature) {
                 drop(store_guard);
                 return Err(SyscallError::PermissionDenied);
             }
-        }
 
         let copy_len = core::cmp::min(obj.content.len(), out_buf_len);
         let content_slice = &obj.content[..copy_len];
@@ -1062,7 +1086,7 @@ impl SyscallDispatcher {
     ///
     /// Only the object's owner can delete. Returns 0 on success.
     ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(8) — sequential.
+    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential.
     fn handle_obj_delete(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let hash_ptr = args.arg1;
 
@@ -1108,7 +1132,7 @@ impl SyscallDispatcher {
     ///
     /// Writes packed 32-byte hashes. Returns number of objects listed.
     ///
-    /// Lock ordering: OBJECT_STORE(8) only.
+    /// Lock ordering: OBJECT_STORE(9) only.
     fn handle_obj_list(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let out_buf = args.arg1;
         let out_buf_len = args.arg_usize(2);
@@ -1183,7 +1207,7 @@ impl SyscallDispatcher {
         // Write 64-byte secret key to user buffer
         write_user_buffer(ctx.cr3, out_sk_ptr, &sk)?;
 
-        crate::println!("  [ClaimBootstrapKey] pid={} — key claimed, kernel copy zeroed", ctx.process_id.0);
+        crate::println!("  [ClaimBootstrapKey] pid={} — key claimed, kernel copy zeroed", ctx.process_id.slot());
 
         Ok(64)
     }
@@ -1198,7 +1222,7 @@ impl SyscallDispatcher {
     /// This is the path for signed objects when the key-store service holds
     /// the private key.
     ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(8) — sequential.
+    /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential.
     fn handle_obj_put_signed(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let content_ptr = args.arg1;
         let content_len = args.arg_usize(2);
@@ -1279,7 +1303,7 @@ impl SyscallDispatcher {
     /// page attributes. The kernel validates the physical address is not in
     /// a RAM region (only device MMIO ranges are permitted).
     ///
-    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
     fn handle_map_mmio(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let phys_addr = args.arg1;
         let num_pages = args.arg2_u32();
@@ -1350,7 +1374,7 @@ impl SyscallDispatcher {
     /// on both sides) to contain device overflows. Maps into the calling
     /// process and writes the physical address to *out_paddr_ptr.
     ///
-    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+    /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
     fn handle_alloc_dma(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let num_pages = args.arg1_u32();
         let _flags = args.arg2_u32(); // Reserved for IOMMU hints
@@ -1514,7 +1538,7 @@ impl SyscallDispatcher {
         match width {
             1 if port & 1 != 0 => return Err(SyscallError::InvalidArg), // word: 2-byte aligned
             2 if port & 3 != 0 => return Err(SyscallError::InvalidArg), // dword: 4-byte aligned
-            0 | 1 | 2 => {}
+            0..=2 => {}
             _ => return Err(SyscallError::InvalidArg),
         }
 
@@ -1557,8 +1581,8 @@ impl SyscallDispatcher {
                     p.read() as u64
                 }
                 2 => {
-                    // SAFETY: Port validated, 4-byte aligned. 32-bit IN.
                     let v: u32;
+                    // SAFETY: Port validated against PCI BAR, 4-byte aligned. 32-bit IN instruction.
                     unsafe {
                         core::arch::asm!(
                             "in eax, dx",
@@ -1620,13 +1644,12 @@ impl SyscallDispatcher {
     /// Args: arg1 = name_ptr (user), arg2 = name_len
     /// Returns: new task ID on success, negative error otherwise.
     ///
-    /// Lock ordering: PROCESS_TABLE(5) → FRAME_ALLOCATOR(6), then
+    /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7), then
     /// CAPABILITY_MANAGER(4) separately after dropping the first two.
     fn handle_spawn(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         use crate::loader::{self, SignedBinaryVerifier};
         use crate::scheduler::Priority;
-        use crate::ipc::ProcessId;
-        use core::sync::atomic::Ordering;
+        use crate::ipc::capability::CapabilityKind;
 
         let name_ptr = args.arg1;
         let name_len = args.arg_usize(2);
@@ -1636,6 +1659,21 @@ impl SyscallDispatcher {
         }
         if ctx.cr3 == 0 {
             return Err(SyscallError::InvalidArg);
+        }
+
+        // Phase 3.2b (ADR-008): check CreateProcess authority before any
+        // resource allocation. CAPABILITY_MANAGER lock level = 4, no
+        // other locks held yet.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            if let Some(cap_mgr) = cap_guard.as_ref() {
+                let has_right = cap_mgr
+                    .has_system_capability(ctx.process_id, CapabilityKind::CreateProcess)
+                    .unwrap_or(false);
+                if !has_right {
+                    return Err(SyscallError::PermissionDenied);
+                }
+            }
         }
 
         // Read module name from user memory
@@ -1653,15 +1691,11 @@ impl SyscallDispatcher {
         // which is valid for the kernel's lifetime via HHDM.
         let binary = unsafe { core::slice::from_raw_parts(module_addr, module_size) };
 
-        // Allocate a new process ID
-        let pid = crate::NEXT_PROCESS_ID.fetch_add(1, Ordering::AcqRel);
-        let process_id = ProcessId(pid);
-
         // Use signed verifier with bootstrap key
         let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
         let verifier = SignedBinaryVerifier::with_key(bootstrap.public_key);
 
-        // Lock ordering: SCHEDULER(1) → PROCESS_TABLE(5) → FRAME_ALLOCATOR(6)
+        // Lock ordering: SCHEDULER(1) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
         let mut sched_guard = crate::local_scheduler().lock();
         let mut pt_guard = crate::PROCESS_TABLE.lock();
         let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
@@ -1669,15 +1703,18 @@ impl SyscallDispatcher {
         let sched = sched_guard.as_mut().ok_or(SyscallError::OutOfMemory)?;
         let pt = pt_guard.as_mut().ok_or(SyscallError::OutOfMemory)?;
 
+        // Phase 3.2c: process table allocates the slot internally;
+        // ProcessId returned in the result.
         let result = loader::load_elf_process(
             binary,
-            process_id,
             Priority::NORMAL,
             &verifier,
             pt,
             &mut fa_guard,
             sched,
         ).map_err(|_| SyscallError::OutOfMemory)?;
+
+        let process_id = result.process_id;
 
         let new_task_id = result.task_id;
 
@@ -1687,12 +1724,12 @@ impl SyscallDispatcher {
         }
 
         // Register task in CPU map
-        // SAFETY: GS/TPIDR_EL1 base is valid after percpu_init; reading
-        // cpu_id is a pure read from the per-CPU data structure.
         let cpu_id = {
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: GS base is valid after percpu_init; pure read from per-CPU data.
             { unsafe { crate::arch::x86_64::percpu::current_percpu().cpu_id() } }
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: TPIDR_EL1 base is valid after percpu_init; pure read from per-CPU data.
             { unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } }
         };
         crate::set_task_cpu(new_task_id.0, cpu_id as u16);
@@ -1718,6 +1755,17 @@ impl SyscallDispatcher {
                         crate::ipc::CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
                     );
                 }
+                // Phase 3.2b (ADR-008): spawned processes inherit
+                // CreateProcess (trusted boot modules only for now).
+                let _ = cap_mgr.grant_system_capability(
+                    process_id,
+                    CapabilityKind::CreateProcess,
+                );
+                // Phase 3.2d.iv (ADR-005): spawned processes may create channels.
+                let _ = cap_mgr.grant_system_capability(
+                    process_id,
+                    CapabilityKind::CreateChannel,
+                );
                 // Bind bootstrap Principal
                 if !bootstrap.is_zero() {
                     let _ = cap_mgr.bind_principal(process_id, bootstrap);
@@ -1728,7 +1776,7 @@ impl SyscallDispatcher {
         crate::println!(
             "  [Spawn] '{}' → task {} process {} (parent=task {})",
             core::str::from_utf8(name).unwrap_or("?"),
-            new_task_id.0, process_id.0, ctx.task_id.0
+            new_task_id.0, process_id.slot(), ctx.task_id.0
         );
 
         Ok(new_task_id.0 as u64)
@@ -1790,21 +1838,21 @@ impl SyscallDispatcher {
     ///
     /// Args: arg1 = target_process_id (u32), arg2 = endpoint_id (u32)
     ///
-    /// Authority — Wave 1 (per ADR-007 §"Who can revoke"):
+    /// Authority — Phase 3.1 (per ADR-007 §"Who can revoke"):
     ///   Only the bootstrap Principal can call this. Matches the restriction
     ///   pattern of `handle_bind_principal` and `handle_claim_bootstrap_key`.
     ///
-    /// Wave 4 will relax this to also accept: the original grantor of the
+    /// Phase 3.4 will relax this to also accept: the original grantor of the
     /// capability, and any process holding the `revoke` right on the endpoint
     /// (once the policy service exists as the mediator for those paths).
     ///
-    /// Wave 2 will refactor the argument shape from `(pid, endpoint)` to a
+    /// Phase 3.2d will refactor the argument shape from `(pid, endpoint)` to a
     /// single `CapabilityHandle`, once channels force a system-wide capability
     /// registry into existence.
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) — no higher locks held.
     fn handle_revoke_capability(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        let target_pid = crate::ipc::ProcessId(args.arg1_u32());
+        let target_pid = crate::ipc::ProcessId::new(args.arg1_u32(), 0);
         let endpoint_id = crate::ipc::EndpointId(args.arg2_u32());
 
         // Read the bootstrap Principal once at the syscall boundary.
@@ -1835,9 +1883,477 @@ impl SyscallDispatcher {
 
         crate::println!(
             "  [RevokeCapability] caller_pid={} target_pid={} endpoint={} — revoked",
-            ctx.process_id.0, target_pid.0, endpoint_id.0
+            ctx.process_id.slot(), target_pid.slot(), endpoint_id.0
         );
 
         Ok(0)
+    }
+
+    // ========================================================================
+    // Phase 3.2d.iii: Shared-memory channels (ADR-005)
+    // ========================================================================
+
+    /// SYS_CHANNEL_CREATE: Create a shared-memory channel.
+    ///
+    /// Args: arg1 = size_pages, arg2 = peer_principal_ptr (*const u8, 32 bytes),
+    ///       arg3 = role (0=Producer, 1=Consumer, 2=Bidirectional),
+    ///       arg4 = out_vaddr_ptr (*mut u64, creator's mapping address)
+    ///
+    /// Returns: ChannelId (u64) on success, negative error on failure.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) →
+    /// PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
+    fn handle_channel_create(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::channel::{ChannelRole, MAX_CHANNEL_PAGES, MIN_CHANNEL_PAGES};
+
+        let size_pages = args.arg1_u32();
+        let peer_principal_ptr = args.arg2;
+        let role_raw = args.arg3 as u32;
+        let out_vaddr_ptr = args.arg4;
+
+        // --- Validate args ---
+        if !(MIN_CHANNEL_PAGES..=MAX_CHANNEL_PAGES).contains(&size_pages) {
+            return Err(SyscallError::InvalidArg);
+        }
+        let role = ChannelRole::from_u32(role_raw).ok_or(SyscallError::InvalidArg)?;
+        if peer_principal_ptr == 0 || peer_principal_ptr >= USER_SPACE_END {
+            return Err(SyscallError::InvalidArg);
+        }
+        if out_vaddr_ptr == 0 || out_vaddr_ptr >= USER_SPACE_END {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // --- Read peer Principal from user buffer ---
+        let mut peer_key = [0u8; 32];
+        read_user_buffer(ctx.cr3, peer_principal_ptr, 32, &mut peer_key)?;
+        let peer_principal = crate::ipc::Principal::from_public_key(peer_key);
+
+        // --- Check CreateChannel capability + get creator's Principal ---
+        let creator_principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+            let has_cap = cap_mgr
+                .has_system_capability(ctx.process_id, crate::ipc::capability::CapabilityKind::CreateChannel)
+                .map_err(|_| SyscallError::PermissionDenied)?;
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
+
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        }; // drop CAPABILITY_MANAGER(4)
+
+        // --- Allocate contiguous physical frames ---
+        let base_phys = {
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+            fa_guard
+                .allocate_contiguous(size_pages as usize)
+                .map_err(|_| SyscallError::OutOfMemory)?
+                .addr
+        }; // drop FRAME_ALLOCATOR(7)
+
+        // Zero the channel memory.
+        let hhdm = crate::hhdm_offset();
+        // SAFETY: Freshly allocated contiguous frames, HHDM-mapped, exclusive.
+        unsafe {
+            core::ptr::write_bytes(
+                (base_phys + hhdm) as *mut u8,
+                0,
+                size_pages as usize * 4096,
+            );
+        }
+
+        // --- Allocate VMA region + map into creator's page table ---
+        let creator_vaddr = {
+            let mut pt_guard = crate::PROCESS_TABLE.lock();
+            let vma = pt_guard
+                .as_mut()
+                .and_then(|pt| pt.vma_mut(ctx.process_id))
+                .ok_or(SyscallError::InvalidArg)?;
+
+            let vaddr = vma
+                .allocate_region(size_pages)
+                .ok_or(SyscallError::OutOfMemory)?;
+
+            // Map pages into creator's address space.
+            let creator_flags = if role.creator_writable() {
+                crate::memory::paging::flags::user_rw()
+            } else {
+                crate::memory::paging::flags::user_ro()
+            };
+
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+            // SAFETY: ctx.cr3 is a valid PML4/L0 for this process.
+            unsafe {
+                let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
+                crate::memory::paging::map_range(
+                    &mut pt,
+                    vaddr,
+                    base_phys,
+                    size_pages as usize,
+                    creator_flags,
+                    &mut fa_guard,
+                )
+                .map_err(|_| SyscallError::OutOfMemory)?;
+            }
+            drop(fa_guard);
+            drop(pt_guard);
+            vaddr
+        };
+
+        // --- Register in ChannelManager ---
+        let tick = crate::scheduler::Timer::get_ticks();
+
+        let channel_id = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            chan_mgr
+                .create(crate::ipc::channel::ChannelCreateParams {
+                    creator_principal,
+                    peer_principal,
+                    creator_pid: ctx.process_id,
+                    role,
+                    num_pages: size_pages,
+                    physical_base: base_phys,
+                    creator_vaddr,
+                    created_at_tick: tick,
+                })
+                .map_err(|_| SyscallError::OutOfMemory)?
+        }; // drop CHANNEL_MANAGER(5)
+
+        // --- Write creator_vaddr to output pointer ---
+        let vaddr_bytes = creator_vaddr.to_le_bytes();
+        write_user_buffer(ctx.cr3, out_vaddr_ptr, &vaddr_bytes)?;
+
+        crate::println!(
+            "  [ChannelCreate] pid={} id={} pages={} role={:?} → vaddr={:#x}",
+            ctx.process_id.slot(),
+            channel_id.as_raw(),
+            size_pages,
+            role,
+            creator_vaddr,
+        );
+
+        Ok(channel_id.as_raw())
+    }
+
+    /// SYS_CHANNEL_ATTACH: Attach to an existing channel as the named peer.
+    ///
+    /// Args: arg1 = channel_id (u64)
+    ///
+    /// Returns: user-space virtual address of the shared region, or negative error.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) →
+    /// PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
+    fn handle_channel_attach(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::channel::ChannelId;
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // --- Get caller's Principal ---
+        let caller_principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        }; // drop CAPABILITY_MANAGER(4)
+
+        // --- Read channel record to get physical_base, num_pages, role ---
+        let (physical_base, num_pages, peer_writable) = {
+            let chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            let record = chan_mgr.get(channel_id).map_err(|_| SyscallError::InvalidArg)?;
+
+            // Verify state and principal before allocating anything.
+            if record.state != crate::ipc::channel::ChannelState::AwaitingAttach {
+                return Err(SyscallError::InvalidArg);
+            }
+            if record.peer_principal != caller_principal {
+                return Err(SyscallError::PermissionDenied);
+            }
+
+            (record.physical_base, record.num_pages, record.role.peer_writable())
+        }; // drop CHANNEL_MANAGER(5) — will re-acquire below for the attach mutation
+
+        // --- Allocate VMA region + map into peer's page table ---
+        let peer_vaddr = {
+            let mut pt_guard = crate::PROCESS_TABLE.lock();
+            let vma = pt_guard
+                .as_mut()
+                .and_then(|pt| pt.vma_mut(ctx.process_id))
+                .ok_or(SyscallError::InvalidArg)?;
+
+            let vaddr = vma
+                .allocate_region(num_pages)
+                .ok_or(SyscallError::OutOfMemory)?;
+
+            let flags = if peer_writable {
+                crate::memory::paging::flags::user_rw()
+            } else {
+                crate::memory::paging::flags::user_ro()
+            };
+
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+            // SAFETY: ctx.cr3 is a valid PML4/L0 for the peer process.
+            unsafe {
+                let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
+                crate::memory::paging::map_range(
+                    &mut pt,
+                    vaddr,
+                    physical_base,
+                    num_pages as usize,
+                    flags,
+                    &mut fa_guard,
+                )
+                .map_err(|_| SyscallError::OutOfMemory)?;
+            }
+            drop(fa_guard);
+            drop(pt_guard);
+            vaddr
+        };
+
+        // --- Finalize attach in ChannelManager ---
+        {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            chan_mgr
+                .attach(channel_id, caller_principal, ctx.process_id, peer_vaddr)
+                .map_err(|_| SyscallError::InvalidArg)?;
+        }
+
+        crate::println!(
+            "  [ChannelAttach] pid={} channel={} → vaddr={:#x}",
+            ctx.process_id.slot(),
+            channel_id.as_raw(),
+            peer_vaddr,
+        );
+
+        Ok(peer_vaddr)
+    }
+
+    /// SYS_CHANNEL_CLOSE: Close a channel gracefully.
+    ///
+    /// Args: arg1 = channel_id (u64)
+    ///
+    /// Lock ordering: CHANNEL_MANAGER(5) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7),
+    /// then TLB shootdown (lock-free).
+    fn handle_channel_close(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::channel::ChannelId;
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+
+        // --- Close in ChannelManager (returns the record) ---
+        let record = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            chan_mgr
+                .close(channel_id, ctx.process_id)
+                .map_err(|e| match e {
+                    crate::ipc::channel::ChannelError::PermissionDenied => SyscallError::PermissionDenied,
+                    crate::ipc::channel::ChannelError::NotFound => SyscallError::InvalidArg,
+                    _ => SyscallError::InvalidArg,
+                })?
+        }; // drop CHANNEL_MANAGER(5)
+
+        // --- Unmap from both processes + free VMA slots ---
+        Self::teardown_channel_mappings(&record);
+
+        crate::println!(
+            "  [ChannelClose] pid={} channel={} pages={}",
+            ctx.process_id.slot(),
+            channel_id.as_raw(),
+            record.num_pages,
+        );
+
+        Ok(0)
+    }
+
+    /// SYS_CHANNEL_REVOKE: Force-close a channel (bootstrap authority).
+    ///
+    /// Args: arg1 = channel_id (u64)
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) →
+    /// PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
+    fn handle_channel_revoke(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::channel::ChannelId;
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+
+        // --- Authority check: bootstrap Principal only (Phase 3.1 pattern) ---
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            let caller_principal = cap_mgr
+                .get_principal(ctx.process_id)
+                .map_err(|_| SyscallError::PermissionDenied)?;
+            if caller_principal != bootstrap {
+                return Err(SyscallError::PermissionDenied);
+            }
+        } // drop CAPABILITY_MANAGER(4)
+
+        // --- Revoke in ChannelManager ---
+        let record = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            chan_mgr
+                .revoke(channel_id)
+                .map_err(|_| SyscallError::InvalidArg)?
+        }; // drop CHANNEL_MANAGER(5)
+
+        // --- Teardown ---
+        Self::teardown_channel_mappings(&record);
+
+        crate::println!(
+            "  [ChannelRevoke] pid={} channel={} pages={}",
+            ctx.process_id.slot(),
+            channel_id.as_raw(),
+            record.num_pages,
+        );
+
+        Ok(0)
+    }
+
+    /// SYS_CHANNEL_INFO: Read channel metadata.
+    ///
+    /// Args: arg1 = channel_id (u64), arg2 = out_buf, arg3 = buf_len
+    ///
+    /// Writes a fixed-format descriptor to the user buffer:
+    ///   [state:1][role:1][num_pages:4][creator_pid_slot:4][peer_pid_slot:4]
+    ///   [creator_vaddr:8][peer_vaddr:8][physical_base:8][created_at_tick:8]
+    /// Total: 46 bytes
+    ///
+    /// Lock ordering: CHANNEL_MANAGER(5) only.
+    fn handle_channel_info(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::channel::ChannelId;
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+        let out_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        if buf_len < 46 || out_buf == 0 || out_buf >= USER_SPACE_END {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let mut info = [0u8; 46];
+
+        {
+            let chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            let record = chan_mgr.get(channel_id).map_err(|_| SyscallError::InvalidArg)?;
+
+            info[0] = record.state as u8;
+            info[1] = record.role as u8;
+            info[2..6].copy_from_slice(&record.num_pages.to_le_bytes());
+            info[6..10].copy_from_slice(&record.creator_pid.slot().to_le_bytes());
+            let peer_slot = record.peer_pid.map(|p| p.slot()).unwrap_or(u32::MAX);
+            info[10..14].copy_from_slice(&peer_slot.to_le_bytes());
+            info[14..22].copy_from_slice(&record.creator_vaddr.to_le_bytes());
+            info[22..30].copy_from_slice(&record.peer_vaddr.to_le_bytes());
+            info[30..38].copy_from_slice(&record.physical_base.to_le_bytes());
+            info[38..46].copy_from_slice(&record.created_at_tick.to_le_bytes());
+        } // drop CHANNEL_MANAGER(5)
+
+        write_user_buffer(ctx.cr3, out_buf, &info)?;
+
+        Ok(0)
+    }
+
+    // ========================================================================
+    // Channel teardown helper (shared by close, revoke, process exit)
+    // ========================================================================
+
+    /// Unmap a closed/revoked channel's pages from both processes,
+    /// issue TLB shootdown, free VMA slots, and free the physical frames.
+    ///
+    /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7), then
+    /// TLB shootdown (lock-free).
+    ///
+    /// Called after the ChannelManager lock has been released (the record
+    /// is already taken out of the table).
+    fn teardown_channel_mappings(record: &crate::ipc::channel::ChannelRecord) {
+        // Collect vaddrs for TLB shootdown after locks are released.
+        let mut shootdown_creator = false;
+        let mut shootdown_peer = false;
+
+        {
+            let mut pt_guard = crate::PROCESS_TABLE.lock();
+            if let Some(pt) = pt_guard.as_mut() {
+                // Unmap from creator.
+                if record.creator_vaddr != 0 {
+                    if let Some(vma) = pt.vma_mut(record.creator_pid) {
+                        vma.free_region(record.creator_vaddr);
+                    }
+                    let creator_cr3 = pt.get_cr3(record.creator_pid);
+                    if creator_cr3 != 0 {
+                        // SAFETY: creator_cr3 is a valid page table. The
+                        // channel is closed so no user-space writes are
+                        // racing (the record is already Closed/Revoked).
+                        unsafe {
+                            let mut page_table = crate::memory::paging::page_table_from_cr3(creator_cr3);
+                            for i in 0..record.num_pages as u64 {
+                                let vaddr = record.creator_vaddr + i * 4096;
+                                let _ = crate::memory::paging::unmap_page(&mut page_table, vaddr);
+                            }
+                        }
+                        shootdown_creator = true;
+                    }
+                }
+
+                // Unmap from peer (if attached).
+                if record.peer_vaddr != 0 {
+                    if let Some(peer_pid) = record.peer_pid {
+                        if let Some(vma) = pt.vma_mut(peer_pid) {
+                            vma.free_region(record.peer_vaddr);
+                        }
+                        let peer_cr3 = pt.get_cr3(peer_pid);
+                        if peer_cr3 != 0 {
+                            // SAFETY: same reasoning as creator.
+                            unsafe {
+                                let mut page_table = crate::memory::paging::page_table_from_cr3(peer_cr3);
+                                for i in 0..record.num_pages as u64 {
+                                    let vaddr = record.peer_vaddr + i * 4096;
+                                    let _ = crate::memory::paging::unmap_page(&mut page_table, vaddr);
+                                }
+                            }
+                            shootdown_peer = true;
+                        }
+                    }
+                }
+            }
+        } // drop PROCESS_TABLE(6)
+
+        // TLB shootdown for unmapped ranges (lock-free).
+        // SAFETY: shootdown_range requires ring 0 and that the page table
+        // modifications (above) are already visible in memory.
+        if shootdown_creator {
+            unsafe {
+                crate::arch::tlb_shootdown_range(record.creator_vaddr, record.num_pages);
+            }
+        }
+        if shootdown_peer {
+            unsafe {
+                crate::arch::tlb_shootdown_range(record.peer_vaddr, record.num_pages);
+            }
+        }
+
+        // Free the contiguous physical frames.
+        {
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+            let _ = fa_guard.free_contiguous(record.physical_base, record.num_pages as usize);
+        }
     }
 }

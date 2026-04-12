@@ -530,7 +530,7 @@ mod tests {
 
     /// 1 TB — sanity test that pathological RAM doesn't break the math.
     ///
-    /// After Wave 2a Item 1 (BuddyAllocator moved to per-heap storage),
+    /// After Phase 3.2a Item 1 (BuddyAllocator moved to per-heap storage),
     /// `SLOT_OVERHEAD` shrunk from ~22 KB to ~2 KB. Tier3's 512 MiB
     /// budget ceiling now buys far more slots than `max_slots = 65536`,
     /// so tier3 at large RAM is **slot-bound** (max_slots is the binding

@@ -26,8 +26,8 @@ extern crate alloc;
 // ============================================================================
 //
 // PER_CPU_SCHEDULER[*](1) → PER_CPU_TIMER[*](2) → IPC_MANAGER(3) →
-// CAPABILITY_MANAGER(4) → PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) →
-// INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
+// CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) → PROCESS_TABLE(6) →
+// FRAME_ALLOCATOR(7) → INTERRUPT_ROUTER(8) → OBJECT_STORE(9)
 //
 // Lower-numbered locks must be acquired before higher-numbered ones.
 // Sequential (non-nested) acquisitions are always safe — release the first
@@ -77,7 +77,7 @@ use limine::request::{
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::hlt;
 use arcos_core::println;
-use arcos_core::{BOOT_MODULE_REGISTRY, NEXT_PROCESS_ID};
+use arcos_core::BOOT_MODULE_REGISTRY;
 use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, BlockReason, TaskId};
 use arcos_core::ipc::{EndpointId, IpcManager, Message, ProcessId, CapabilityRights};
 use arcos_core::interrupts::{IrqNumber, InterruptContext};
@@ -288,7 +288,7 @@ unsafe extern "C" fn kmain() -> ! {
     // Initialize physical frame allocator from Limine memory map
     init_frame_allocator();
 
-    // Wave 2a (ADR-008): compute num_slots from the active tier policy
+    // Phase 3.2a (ADR-008): compute num_slots from the active tier policy
     // and allocate the kernel object table region BEFORE the process
     // table and capability manager are constructed — they both borrow
     // slice storage from this region.
@@ -540,7 +540,7 @@ fn init_kernel_heap() {
     let (phys_base, region_len) = best.expect("No usable memory region large enough for kernel heap");
 
     // Skip first 1MB of region to avoid any low-memory conflicts
-    let safe_offset: u64 = if phys_base < 0x200000 { 0x200000 - phys_base } else { 0 };
+    let safe_offset: u64 = 0x200000_u64.saturating_sub(phys_base);
     let phys_base = phys_base + safe_offset;
     let region_len = region_len - safe_offset;
 
@@ -604,7 +604,7 @@ fn init_frame_allocator() {
     let heap_phys = KERNEL_HEAP_PHYS_BASE.load(core::sync::atomic::Ordering::Acquire);
     fa.reserve_region(heap_phys, KERNEL_HEAP_SIZE);
     //
-    // Wave 2a (ADR-008): per-process heaps are no longer pre-reserved
+    // Phase 3.2a (ADR-008): per-process heaps are no longer pre-reserved
     // as a fixed slab at PROCESS_HEAP_BASE. Instead, each process
     // allocates its heap on demand via `FrameAllocator::allocate_contiguous`
     // in `ProcessDescriptor::new`, and reclaims it via `free_contiguous`
@@ -621,7 +621,7 @@ fn init_frame_allocator() {
     );
 }
 
-/// Wave 2a (ADR-008): compute `num_slots` from the active tier policy
+/// Phase 3.2a (ADR-008): compute `num_slots` from the active tier policy
 /// and the available memory figure, allocate the kernel object table
 /// region from the frame allocator, and install the slice-backed
 /// `ProcessTable` and `CapabilityManager` into their globals.
@@ -635,7 +635,7 @@ fn init_kernel_object_tables() {
     use arcos_core::memory::frame_allocator::PAGE_SIZE;
     use arcos_core::memory::object_table;
     use arcos_core::process::ProcessTable;
-    use arcos_core::{CAPABILITY_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
+    use arcos_core::{CAPABILITY_MANAGER, CHANNEL_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
 
     // Available memory figure: the *free* frame count at this point
     // in boot, times the page size. This is what's actually allocatable
@@ -724,6 +724,11 @@ fn init_kernel_object_tables() {
 
     *PROCESS_TABLE.lock() = Some(process_table);
     *CAPABILITY_MANAGER.lock() = Some(capability_manager);
+
+    // Phase 3.2d.iii: initialize the channel manager (lock position 5).
+    *CHANNEL_MANAGER.lock() = Some(Box::new(
+        arcos_core::ipc::channel::ChannelManager::new(),
+    ));
 }
 
 /// Map ACPI-related physical memory into the HHDM (x86_64 only).
@@ -751,7 +756,7 @@ fn map_acpi_regions(rsdp_phys: u64) {
     // Map the page containing the RSDP (often in BIOS RESERVED area, not in HHDM)
     if rsdp_phys != 0 {
         let page_phys = rsdp_phys & !0xFFF;
-        let _ = paging::map_page(&mut pt, page_phys + hhdm, page_phys, flags, &mut *fa_guard);
+        let _ = paging::map_page(&mut pt, page_phys + hhdm, page_phys, flags, &mut fa_guard);
     }
 
     // Map all ACPI-related and small RESERVED regions.
@@ -776,7 +781,7 @@ fn map_acpi_regions(rsdp_phys: u64) {
                 for i in 0..page_count {
                     let phys = base + (i as u64) * 4096;
                     // Ignore AlreadyMapped — page may overlap with an existing mapping
-                    let _ = paging::map_page(&mut pt, phys + hhdm, phys, flags, &mut *fa_guard);
+                    let _ = paging::map_page(&mut pt, phys + hhdm, phys, flags, &mut fa_guard);
                 }
                 mapped_pages += page_count;
             }
@@ -844,13 +849,15 @@ fn scheduler_init() {
 /// Grants send/receive on endpoints 0-31 (full range) and binds the
 /// bootstrap Principal to the process (boot modules are trusted).
 fn register_process_capabilities(process_id: ProcessId) {
+    use arcos_core::ipc::capability::CapabilityKind;
+
     let mut guard = CAPABILITY_MANAGER.lock();
     let cap_mgr = match guard.as_mut() {
         Some(m) => m,
         None => return,
     };
     if let Err(e) = cap_mgr.register_process(process_id) {
-        println!("  ✗ Failed to register caps for process {}: {}", process_id.0, e);
+        println!("  ✗ Failed to register caps for process {}: {}", process_id.slot(), e);
         return;
     }
     // Grant send/receive on all endpoints (boot modules are trusted)
@@ -861,6 +868,11 @@ fn register_process_capabilities(process_id: ProcessId) {
             CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
         );
     }
+    // Phase 3.2b (ADR-008): boot modules are trusted and may spawn
+    // child processes (e.g., the shell uses SYS_SPAWN).
+    let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
+    // Phase 3.2d.iv (ADR-005): boot modules may create shared-memory channels.
+    let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
     // Bind bootstrap Principal to boot module processes (they're trusted)
     let bootstrap = BOOTSTRAP_PRINCIPAL.load();
     if !bootstrap.is_zero() {
@@ -929,9 +941,6 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
             continue;
         }
 
-        // Assign process IDs starting at 5
-        let process_id = ProcessId(5 + loaded_count);
-
         let mut pt_guard = PROCESS_TABLE.lock();
         let mut fa_guard = FRAME_ALLOCATOR.lock();
         let pt = match pt_guard.as_mut() {
@@ -942,9 +951,9 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
             }
         };
 
+        // Phase 3.2c: process table allocates slot + generation internally.
         match loader::load_elf_process(
             binary,
-            process_id,
             Priority::NORMAL,
             &verifier,
             pt,
@@ -952,6 +961,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
             scheduler,
         ) {
             Ok(result) => {
+                let process_id = result.process_id;
                 // Drop locks before acquiring CAPABILITY_MANAGER
                 drop(fa_guard);
                 drop(pt_guard);
@@ -963,7 +973,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
-                    result.task_id.0, result.process_id.0, result.entry_point
+                    result.task_id.0, result.process_id.slot(), result.entry_point
                 );
                 loaded_count += 1;
             }
@@ -977,8 +987,8 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         println!("✓ Loaded {} signed module(s) as user processes", loaded_count);
     }
 
-    // Set the next process ID for runtime Spawn syscall
-    NEXT_PROCESS_ID.store(5 + loaded_count, core::sync::atomic::Ordering::Release);
+    // Phase 3.2c: NEXT_PROCESS_ID removed — process table allocates
+    // slots internally via linear scan with generation stamping.
 }
 
 /// Initialize IPC subsystem
@@ -1005,7 +1015,7 @@ fn ipc_init() {
 
 /// Initialize capability manager — register the first 3 kernel processes.
 ///
-/// Wave 2a: the `CapabilityManager` itself was constructed in
+/// Phase 3.2a: the `CapabilityManager` itself was constructed in
 /// `init_kernel_object_tables` with slice-backed storage. This step
 /// only registers processes 0-2 (kernel tasks created in
 /// process_table_init) and grants their initial capabilities.
@@ -1013,6 +1023,8 @@ fn ipc_init() {
 /// calls register_process_capabilities after their process table
 /// entries exist.
 fn capability_manager_init() {
+    use arcos_core::ipc::capability::CapabilityKind;
+
     let mut guard = CAPABILITY_MANAGER.lock();
     let cap_mgr = guard
         .as_mut()
@@ -1021,7 +1033,7 @@ fn capability_manager_init() {
     // Only register processes that already exist in the process table (0-2).
     // Processes 3+ are registered on-demand when user tasks are created.
     for task_id in 0..3u32 {
-        let process_id = ProcessId(task_id);
+        let process_id = ProcessId::new(task_id, 0);
         if let Err(e) = cap_mgr.register_process(process_id) {
             println!("  ✗ Failed to register process {}: {}", task_id, e);
             continue;
@@ -1055,6 +1067,13 @@ fn capability_manager_init() {
                 );
             }
         }
+
+        // Phase 3.2b (ADR-008): grant CreateProcess to all kernel
+        // processes. These run with the bootstrap Principal and
+        // orchestrate boot module loading + runtime Spawn.
+        let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
+        // Phase 3.2d.iv (ADR-005): grant CreateChannel to kernel processes.
+        let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
     }
 
     println!("  ✓ Capability manager initialized with {} processes", cap_mgr.process_count());
@@ -1087,7 +1106,7 @@ fn bootstrap_identity_init() {
     let mut cap_guard = CAPABILITY_MANAGER.lock();
     if let Some(cap_mgr) = cap_guard.as_mut() {
         for pid in 0..3u32 {
-            if let Err(e) = cap_mgr.bind_principal(ProcessId(pid), bootstrap) {
+            if let Err(e) = cap_mgr.bind_principal(ProcessId::new(pid, 0), bootstrap) {
                 println!("  ✗ Failed to bind bootstrap Principal to process {}: {}", pid, e);
             }
         }
@@ -1118,7 +1137,7 @@ fn object_store_init() {
 
 /// Initialize process table — populate the first 3 kernel processes.
 ///
-/// Wave 2a: the `ProcessTable` itself was constructed in
+/// Phase 3.2a: the `ProcessTable` itself was constructed in
 /// `init_kernel_object_tables` with slice-backed storage. This step
 /// only creates the first three `ProcessDescriptor`s, allocating each
 /// one's heap via the frame allocator.
@@ -1136,12 +1155,12 @@ fn process_table_init() {
     // Create process descriptors for the first 3 processes (matching
     // task count). Each one gets a freshly allocated heap region via
     // FrameAllocator::allocate_contiguous (256 frames / 1 MiB each).
+    // Phase 3.2c: slot + generation assigned by process table.
     for i in 0..3 {
-        let process_id = ProcessId(i as u32);
-        match pt.create_process(process_id, &mut *fa_guard, /* create_page_table = */ false) {
-            Ok(()) => {
+        match pt.create_process(&mut fa_guard, /* create_page_table = */ false) {
+            Ok(process_id) => {
                 let heap_base = pt.get_heap_base(process_id);
-                println!("  ✓ Process {} heap at {:#x}", i, heap_base);
+                println!("  ✓ Process {} (gen {}) heap at {:#x}", process_id.slot(), process_id.generation(), heap_base);
             }
             Err(e) => {
                 println!("  ✗ Failed to create process {}: {}", i, e);
@@ -1172,8 +1191,8 @@ fn ipc_send_and_notify(endpoint: EndpointId, msg: Message) -> bool {
         let mut best_priority = arcos_core::scheduler::Priority::IDLE;
         let cpu_count = arcos_core::ONLINE_CPU_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize;
 
-        for cpu in 0..cpu_count {
-            let guard = PER_CPU_SCHEDULER[cpu].lock();
+        for sched_lock in PER_CPU_SCHEDULER.iter().take(cpu_count) {
+            let guard = sched_lock.lock();
             if let Some(sched) = guard.as_ref() {
                 if let Some(tid) = sched.find_highest_priority_receiver(endpoint.0) {
                     if let Some(task) = sched.get_task_pub(tid) {
@@ -1599,11 +1618,11 @@ fn distribute_tasks_to_aps() {
     let mut migrated = 0;
     let mut ap_target = 1usize; // Start with CPU 1
 
-    for i in 0..count {
+    for &slot in migratable.iter().take(count) {
         if migrated >= to_migrate {
             break;
         }
-        if let Some(tid) = migratable[i] {
+        if let Some(tid) = slot {
             match migrate_task(tid, 0, ap_target) {
                 Ok(()) => {
                     println!("  ✓ Migrated {} → CPU {}", tid, ap_target);

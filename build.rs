@@ -30,6 +30,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(tier1)");
     println!("cargo:rustc-check-cfg=cfg(tier2)");
     println!("cargo:rustc-check-cfg=cfg(tier3)");
+    // cargo-fuzz passes --cfg fuzzing via RUSTFLAGS; register it so the
+    // compiler doesn't warn about an unknown cfg on nightly.
+    println!("cargo:rustc-check-cfg=cfg(fuzzing)");
 
     // Re-run if the user changes the tier selection.
     println!("cargo:rerun-if-env-changed=ARCOS_TIER");

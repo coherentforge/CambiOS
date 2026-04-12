@@ -74,12 +74,7 @@ impl RamObjectStore {
 
     /// Find the first free slot.
     fn find_free_slot(&self) -> Option<usize> {
-        for i in 0..MAX_OBJECTS {
-            if self.objects[i].is_none() {
-                return Some(i);
-            }
-        }
-        None
+        self.objects.iter().position(|slot| slot.is_none())
     }
 
     /// Current capacity remaining.

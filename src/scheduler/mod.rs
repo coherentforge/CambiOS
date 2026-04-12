@@ -203,7 +203,13 @@ impl Scheduler {
             state: SchedulerState::Uninitialized,
         }
     }
+}
 
+impl Default for Scheduler {
+    fn default() -> Self { Self::new() }
+}
+
+impl Scheduler {
     /// Heap-allocate a Scheduler directly.
     ///
     /// Equivalent to `Box::new(Scheduler::new())` but makes the intent
@@ -396,7 +402,7 @@ impl Scheduler {
         }
 
         // Fallback: idle task (always ready as last resort)
-        if let Some(Some(task)) = self.tasks.get(0) {
+        if let Some(Some(task)) = self.tasks.first() {
             if task.state == TaskState::Ready {
                 return Ok(TaskId(0));
             }
@@ -625,30 +631,27 @@ impl Scheduler {
         let mut to_enqueue: [(TaskId, usize); 32] = [(TaskId(0), 0); 32];
         let mut woken = 0;
 
-        for slot in self.tasks.iter_mut() {
-            if let Some(task) = slot {
-                if task.state == TaskState::Blocked {
-                    if let Some(BlockReason::IoWait(waiting_irq)) = task.block_reason {
-                        if waiting_irq == irq {
-                            task.state = TaskState::Ready;
-                            task.block_reason = None;
-                            task.reset_time_slice();
-                            if !task.in_ready_queue {
-                                task.in_ready_queue = true;
-                                if woken < to_enqueue.len() {
-                                    to_enqueue[woken] = (task.id, priority_to_band(task.priority));
-                                }
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state == TaskState::Blocked {
+                if let Some(BlockReason::IoWait(waiting_irq)) = task.block_reason {
+                    if waiting_irq == irq {
+                        task.state = TaskState::Ready;
+                        task.block_reason = None;
+                        task.reset_time_slice();
+                        if !task.in_ready_queue {
+                            task.in_ready_queue = true;
+                            if woken < to_enqueue.len() {
+                                to_enqueue[woken] = (task.id, priority_to_band(task.priority));
                             }
-                            woken += 1;
                         }
+                        woken += 1;
                     }
                 }
             }
         }
 
         // Enqueue woken tasks into ready queues
-        for i in 0..woken.min(to_enqueue.len()) {
-            let (tid, band) = to_enqueue[i];
+        for &(tid, band) in &to_enqueue[..woken.min(to_enqueue.len())] {
             self.ready_queues[band].push_back(tid);
         }
         self.runnable_count += woken;
@@ -666,29 +669,26 @@ impl Scheduler {
         let mut to_enqueue: [(TaskId, usize); 32] = [(TaskId(0), 0); 32];
         let mut woken = 0;
 
-        for slot in self.tasks.iter_mut() {
-            if let Some(task) = slot {
-                if task.state == TaskState::Blocked {
-                    if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
-                        if ep == endpoint {
-                            task.state = TaskState::Ready;
-                            task.block_reason = None;
-                            task.reset_time_slice();
-                            if !task.in_ready_queue {
-                                task.in_ready_queue = true;
-                                if woken < to_enqueue.len() {
-                                    to_enqueue[woken] = (task.id, priority_to_band(task.priority));
-                                }
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state == TaskState::Blocked {
+                if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
+                    if ep == endpoint {
+                        task.state = TaskState::Ready;
+                        task.block_reason = None;
+                        task.reset_time_slice();
+                        if !task.in_ready_queue {
+                            task.in_ready_queue = true;
+                            if woken < to_enqueue.len() {
+                                to_enqueue[woken] = (task.id, priority_to_band(task.priority));
                             }
-                            woken += 1;
                         }
+                        woken += 1;
                     }
                 }
             }
         }
 
-        for i in 0..woken.min(to_enqueue.len()) {
-            let (tid, band) = to_enqueue[i];
+        for &(tid, band) in &to_enqueue[..woken.min(to_enqueue.len())] {
             self.ready_queues[band].push_back(tid);
         }
         self.runnable_count += woken;
@@ -702,18 +702,16 @@ impl Scheduler {
     pub fn find_highest_priority_receiver(&self, endpoint: u32) -> Option<TaskId> {
         let mut highest_priority_task: Option<(TaskId, Priority)> = None;
 
-        for task_opt in self.tasks.iter() {
-            if let Some(task) = task_opt {
-                if task.state == TaskState::Blocked {
-                    if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
-                        if ep == endpoint {
-                            if let Some((_, current_priority)) = highest_priority_task {
-                                if task.priority > current_priority {
-                                    highest_priority_task = Some((task.id, task.priority));
-                                }
-                            } else {
+        for task in self.tasks.iter().flatten() {
+            if task.state == TaskState::Blocked {
+                if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
+                    if ep == endpoint {
+                        if let Some((_, current_priority)) = highest_priority_task {
+                            if task.priority > current_priority {
                                 highest_priority_task = Some((task.id, task.priority));
                             }
+                        } else {
+                            highest_priority_task = Some((task.id, task.priority));
                         }
                     }
                 }

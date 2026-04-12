@@ -91,6 +91,10 @@ pub struct Tss {
     pub iomap_base: u16,
 }
 
+impl Default for Tss {
+    fn default() -> Self { Self::new() }
+}
+
 impl Tss {
     /// Create a zeroed TSS.
     pub const fn new() -> Self {
@@ -195,7 +199,7 @@ pub unsafe fn init_for_cpu(cpu_index: usize) {
     // ---- Load this CPU's GDT ----
     // SAFETY: descriptor.base points to this CPU's static GDT array, limit is
     // computed from its actual size. GDT entries are correctly formed above.
-    let gdt_ref = unsafe { &*(&raw const CPU_GDT[cpu_index]) };
+    let gdt_ref = unsafe { &CPU_GDT[cpu_index] };
     let descriptor = GdtDescriptor {
         limit: (core::mem::size_of_val(gdt_ref) - 1) as u16,
         base: gdt_ref.as_ptr() as u64,
@@ -285,6 +289,7 @@ extern "C" {
 //
 // Called via `call` from Rust, returns via `ret`. The far return in the
 // middle switches CS to KERNEL_CS without disturbing the outer call/ret.
+#[cfg(not(fuzzing))]
 core::arch::global_asm!(
     ".global gdt_reload_segments",
     "gdt_reload_segments:",

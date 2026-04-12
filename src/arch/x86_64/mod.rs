@@ -69,6 +69,7 @@ extern "C" {
     pub fn context_switch(current_ctx: *mut CpuContext, next_ctx: *const CpuContext) -> !;
 }
 
+#[cfg(not(fuzzing))]
 core::arch::global_asm!(
     // =================================================================
     // context_save(ctx: *mut CpuContext)
@@ -304,6 +305,7 @@ pub fn cpu_to_saved_context(cpu: &CpuContext, saved: &mut SavedContext) {
 // calls the Rust handler which may decide to switch tasks, then restores registers
 // from the (potentially different) SavedContext and returns via iretq.
 
+#[cfg(not(fuzzing))]
 core::arch::global_asm!(
     ".global timer_isr_stub",
     "timer_isr_stub:",
@@ -477,6 +479,7 @@ extern "C" {
     pub fn yield_save_and_switch();
 }
 
+#[cfg(not(fuzzing))]
 core::arch::global_asm!(
     ".global yield_save_and_switch",
     "yield_save_and_switch:",
@@ -551,6 +554,48 @@ core::arch::global_asm!(
     "sti",
     "ret",                      // Return to caller of yield_save_and_switch
 );
+
+// ============================================================================
+// Fuzz stubs — satisfy linker when cargo-fuzz sets --cfg fuzzing
+// ============================================================================
+//
+// These replace global_asm! symbols during fuzzing. The fuzz targets exercise
+// pure-logic modules (ELF parser, capability, allocator) and never call these
+// kernel runtime primitives, but the linker requires them to exist because
+// non-fuzzing code (SyscallDispatcher, Scheduler) references them.
+
+#[cfg(fuzzing)]
+mod fuzz_asm_stubs {
+    use crate::scheduler::CpuContext;
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn context_save(_ctx: *mut CpuContext) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn context_restore(_ctx: *const CpuContext) -> ! {
+        unreachable!("context_restore called during fuzzing")
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn context_switch(
+        _current_ctx: *mut CpuContext,
+        _next_ctx: *const CpuContext,
+    ) -> ! {
+        unreachable!("context_switch called during fuzzing")
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn timer_isr_stub() {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn yield_save_and_switch() {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn gdt_reload_segments() {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn syscall_entry() {}
+}
 
 /// Rust handler for voluntary context switch.
 ///

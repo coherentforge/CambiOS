@@ -399,9 +399,10 @@ pub fn get_device(index: usize) -> Option<&'static PciDevice> {
 pub fn is_port_in_pci_bar(port: u16) -> bool {
     let count = device_count();
     let port_u64 = port as u64;
-    for i in 0..count {
-        // SAFETY: i < count, same reasoning as get_device.
-        let dev = unsafe { &DEVICES[i] };
+    // SAFETY: count <= MAX_PCI_DEVICES, elements 0..count are initialized
+    // by scan_bus. Shared reference only — no mutation.
+    let devices = unsafe { &DEVICES[..count] };
+    for dev in devices {
         for bar_idx in 0..6 {
             if dev.bar_is_io[bar_idx] && dev.bars[bar_idx] != 0 && dev.bar_sizes[bar_idx] != 0 {
                 let base = dev.bars[bar_idx];
@@ -420,12 +421,8 @@ pub fn is_port_in_pci_bar(port: u16) -> bool {
 /// Returns the first match, or `None` if no matching device was found.
 pub fn find_by_vendor_device(vendor: u16, device: u16) -> Option<&'static PciDevice> {
     let count = device_count();
-    for i in 0..count {
-        // SAFETY: i < count, same reasoning as get_device.
-        let dev = unsafe { &DEVICES[i] };
-        if dev.vendor_id == vendor && dev.device_id == device {
-            return Some(dev);
-        }
-    }
-    None
+    // SAFETY: count <= MAX_PCI_DEVICES, elements 0..count are initialized
+    // by scan_bus. Shared reference only.
+    let devices = unsafe { &DEVICES[..count] };
+    devices.iter().find(|dev| dev.vendor_id == vendor && dev.device_id == device)
 }

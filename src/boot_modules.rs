@@ -24,10 +24,11 @@ struct ModuleEntry {
     size: usize,
 }
 
-// SAFETY: Module addresses point to Limine EXECUTABLE_AND_MODULES memory
-// which is valid for the kernel's lifetime and only read (never mutated)
-// after boot. The registry is protected by a Spinlock.
+/// SAFETY: Module addresses point to Limine EXECUTABLE_AND_MODULES memory
+/// which is valid for the kernel's lifetime and only read (never mutated)
+/// after boot. The registry is protected by a Spinlock.
 unsafe impl Send for ModuleEntry {}
+/// SAFETY: Read-only after boot; spinlock-protected registry ensures no data races.
 unsafe impl Sync for ModuleEntry {}
 
 impl ModuleEntry {
@@ -45,6 +46,12 @@ impl ModuleEntry {
 pub struct BootModuleRegistry {
     entries: [ModuleEntry; MAX_MODULES],
     count: usize,
+}
+
+impl Default for BootModuleRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BootModuleRegistry {

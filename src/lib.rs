@@ -39,7 +39,7 @@ pub mod boot_modules;
 pub mod pci;
 
 // Kernel heap allocator — initialized from Limine memory map in kmain
-#[cfg(not(test))]
+#[cfg(not(any(test, fuzzing)))]
 #[global_allocator]
 pub static KERNEL_HEAP: memory::heap::LockedHeapAllocator = memory::heap::LockedHeapAllocator::new();
 
@@ -57,32 +57,33 @@ use process::ProcessTable;
 
 use memory::frame_allocator::FrameAllocator;
 
-/// Global state protected by spinlocks (multicore-safe)
-///
-/// CRITICAL: Global lock ordering to prevent deadlocks
-/// ====================================================
-/// Acquire locks in this order ONLY. Never acquire in reverse or nested order:
-/// 1. PER_CPU_SCHEDULER[*] (highest priority - preemption, task state)
-/// 2. PER_CPU_TIMER[*] (tick counting)
-/// 3. IPC_MANAGER (message queues)
-/// 4. CAPABILITY_MANAGER (access control)
-/// 5. PROCESS_TABLE (process metadata)
-/// 6. FRAME_ALLOCATOR (physical page allocation)
-/// 7. INTERRUPT_ROUTER (interrupt routing)
-/// 8. OBJECT_STORE (filesystem — highest-level subsystem, lowest priority)
-///
-/// Per-CPU lock rule: NEVER hold two different CPUs' scheduler (or timer) locks
-/// simultaneously. If cross-CPU access is required (e.g., task migration), acquire
-/// in ascending CPU index order to prevent A-B / B-A deadlocks.
-///
-/// Additional lock domains (independent of hierarchy above):
-/// - PER_CPU_FRAME_CACHE[cpu] — per-CPU, never held with FRAME_ALLOCATOR
-/// - SHARDED_IPC.shards[endpoint] — per-endpoint, never held cross-endpoint
-/// - BOOTSTRAP_PRINCIPAL — written once at boot, read-only thereafter
-///
-/// Large structs (IpcManager ~1.3MB, CapabilityManager ~100KB, ProcessTable ~132KB,
-/// RamObjectStore ~TBD) are heap-allocated via Box after the kernel heap is
-/// initialized from the Limine memory map.
+// Global state protected by spinlocks (multicore-safe)
+//
+// CRITICAL: Global lock ordering to prevent deadlocks
+// ====================================================
+// Acquire locks in this order ONLY. Never acquire in reverse or nested order:
+// 1. PER_CPU_SCHEDULER[*] (highest priority - preemption, task state)
+// 2. PER_CPU_TIMER[*] (tick counting)
+// 3. IPC_MANAGER (message queues)
+// 4. CAPABILITY_MANAGER (access control)
+// 5. CHANNEL_MANAGER (shared-memory channel table)      [Phase 3.2d.iii]
+// 6. PROCESS_TABLE (process metadata)                   [was 5]
+// 7. FRAME_ALLOCATOR (physical page allocation)         [was 6]
+// 8. INTERRUPT_ROUTER (interrupt routing)               [was 7]
+// 9. OBJECT_STORE (filesystem — highest-level subsystem) [was 8]
+//
+// Per-CPU lock rule: NEVER hold two different CPUs' scheduler (or timer) locks
+// simultaneously. If cross-CPU access is required (e.g., task migration), acquire
+// in ascending CPU index order to prevent A-B / B-A deadlocks.
+//
+// Additional lock domains (independent of hierarchy above):
+// - PER_CPU_FRAME_CACHE[cpu] — per-CPU, never held with FRAME_ALLOCATOR
+// - SHARDED_IPC.shards[endpoint] — per-endpoint, never held cross-endpoint
+// - BOOTSTRAP_PRINCIPAL — written once at boot, read-only thereafter
+//
+// Large structs (IpcManager ~1.3MB, CapabilityManager ~100KB, ProcessTable ~132KB,
+// RamObjectStore ~TBD) are heap-allocated via Box after the kernel heap is
+// initialized from the Limine memory map.
 
 /// SCAFFOLDING: maximum number of CPUs supported.
 /// Why: matches xAPIC 8-bit APIC ID space; statically-sized per-CPU arrays for
@@ -262,9 +263,9 @@ pub fn wake_task_on_cpu(_task_id: scheduler::TaskId) -> bool {
 /// Number of online CPUs (BSP = 1, incremented by each AP that completes init).
 pub static ONLINE_CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
-/// Next process ID to assign (atomically incremented by Spawn syscall).
-/// Boot sets this after load_boot_modules to the next free slot.
-pub static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(5);
+// Phase 3.2c: NEXT_PROCESS_ID removed. ProcessTable::create_process
+// now allocates slots internally via linear scan with generation
+// stamping. See ADR-008 § Open Problem 9.
 
 /// Minimum tick interval between balance attempts (1 second at 100Hz).
 const BALANCE_INTERVAL_TICKS: u64 = 100;
@@ -383,6 +384,12 @@ pub struct BootstrapPrincipal {
     inner: Spinlock<ipc::Principal>,
 }
 
+impl Default for BootstrapPrincipal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BootstrapPrincipal {
     pub const fn new() -> Self {
         BootstrapPrincipal {
@@ -406,6 +413,12 @@ impl BootstrapPrincipal {
 /// Written once at boot via `store()`, read via `load()`.
 pub struct BootstrapSecretKey {
     inner: Spinlock<[u8; 64]>,
+}
+
+impl Default for BootstrapSecretKey {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BootstrapSecretKey {
@@ -461,11 +474,16 @@ pub static IPC_MANAGER: Spinlock<Option<Box<IpcManager>>> = Spinlock::new(None);
 /// capability-enforced IPC paths and interceptor setup.
 pub static SHARDED_IPC: ipc::ShardedIpcManager = ipc::ShardedIpcManager::new();
 pub static CAPABILITY_MANAGER: Spinlock<Option<Box<CapabilityManager>>> = Spinlock::new(None);
+
+/// Channel manager — shared-memory channel table (lock position 5).
+/// Initialized at boot after CAPABILITY_MANAGER (Phase 3.2d.iii).
+pub static CHANNEL_MANAGER: Spinlock<Option<Box<ipc::channel::ChannelManager>>> = Spinlock::new(None);
+
 pub static PROCESS_TABLE: Spinlock<Option<Box<ProcessTable>>> = Spinlock::new(None);
 pub static FRAME_ALLOCATOR: Spinlock<FrameAllocator> = Spinlock::new(FrameAllocator::new());
 pub static INTERRUPT_ROUTER: Spinlock<InterruptRoutingTable> = Spinlock::new(InterruptRoutingTable::new());
 
-/// Object store — content-addressed signed object storage (lock position 8).
+/// Object store — content-addressed signed object storage (lock position 9).
 ///
 /// Initialized at boot after all other subsystems. Phase 0 uses RamObjectStore
 /// (fixed-capacity, RAM-backed). Phase 1+ adds disk-backed implementations.

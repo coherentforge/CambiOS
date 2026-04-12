@@ -144,16 +144,50 @@ pub enum SyscallNumber {
 
     /// revoke_capability(target_process_id: u32, endpoint_id: u32) -> i32
     /// Revoke a capability held by another process on a given endpoint.
-    /// Per ADR-007 §"Who can revoke", Wave 1 restricts this to the bootstrap
+    /// Per ADR-007 §"Who can revoke", Phase 3.1 restricts this to the bootstrap
     /// Principal; other authority paths (original grantor, holder of `revoke`
-    /// right, policy service) land in Wave 4.
+    /// right, policy service) land in Phase 3.4.
     ///
-    /// Args are `(target_process_id, endpoint_id)` in Wave 1 for simplicity.
-    /// Wave 2 refactors this to a single `CapabilityHandle` once channels
+    /// Args are `(target_process_id, endpoint_id)` in Phase 3.1 for simplicity.
+    /// Phase 3.2d refactors this to a single `CapabilityHandle` once channels
     /// force a system-wide capability registry into existence.
     ///
     /// Returns 0 on success, negative error code on failure.
     RevokeCapability = 27,
+
+    /// channel_create(size_pages: u32, peer_principal_ptr: *const u8, role: u32,
+    ///                out_vaddr_ptr: *mut u64) -> i64
+    /// Create a shared-memory channel with `size_pages` pages. The peer's
+    /// 32-byte Principal is read from `peer_principal_ptr`. `role` selects
+    /// Producer(0)/Consumer(1)/Bidirectional(2). The creator's mapping
+    /// virtual address is written to `out_vaddr_ptr`. Returns the ChannelId
+    /// (>= 0) on success, or a negative error code.
+    /// Requires `CreateChannel` system capability.
+    ChannelCreate = 28,
+
+    /// channel_attach(channel_id: u64) -> i64
+    /// Attach to an existing channel as the named peer. Kernel verifies
+    /// the caller's Principal matches the peer_principal specified at
+    /// create time. Returns the user-space virtual address of the shared
+    /// region on success, or a negative error code.
+    ChannelAttach = 29,
+
+    /// channel_close(channel_id: u64) -> i32
+    /// Close a channel. Unmaps the shared region from both processes,
+    /// issues TLB shootdown, and frees the physical pages. Only the
+    /// creator or peer may call this. Returns 0 on success.
+    ChannelClose = 30,
+
+    /// channel_revoke(channel_id: u64) -> i32
+    /// Force-close a channel from a third party (bootstrap/policy
+    /// authority). Same teardown as close but no caller-identity check.
+    /// Returns 0 on success.
+    ChannelRevoke = 31,
+
+    /// channel_info(channel_id: u64, out_buf: *mut u8, buf_len: u32) -> i32
+    /// Read channel metadata (size, state, principals, byte counters)
+    /// into a user buffer. Returns 0 on success.
+    ChannelInfo = 32,
 }
 
 impl SyscallNumber {
@@ -188,6 +222,11 @@ impl SyscallNumber {
             25 => Some(Self::Spawn),
             26 => Some(Self::WaitTask),
             27 => Some(Self::RevokeCapability),
+            28 => Some(Self::ChannelCreate),
+            29 => Some(Self::ChannelAttach),
+            30 => Some(Self::ChannelClose),
+            31 => Some(Self::ChannelRevoke),
+            32 => Some(Self::ChannelInfo),
             _ => None,
         }
     }

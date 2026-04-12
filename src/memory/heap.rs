@@ -63,8 +63,15 @@ pub struct LockedHeapAllocator {
 // SAFETY: All access to the inner KernelHeapAllocator is gated by the atomic
 // spinlock (acquire/release). No caller can obtain a reference without holding
 // the lock, so there are no data races.
+
+/// SAFETY: Locked access via atomic spinlock prevents concurrent mutation.
 unsafe impl Send for LockedHeapAllocator {}
+/// SAFETY: Locked access via atomic spinlock prevents concurrent mutation.
 unsafe impl Sync for LockedHeapAllocator {}
+
+impl Default for LockedHeapAllocator {
+    fn default() -> Self { Self::new() }
+}
 
 impl LockedHeapAllocator {
     /// Create an uninitialized allocator (call `init` before use)
@@ -102,12 +109,12 @@ impl LockedHeapAllocator {
 
         assert!(!inner.initialized, "Kernel heap already initialized");
         assert!(heap_size >= MIN_BLOCK_SIZE, "Heap too small");
-        assert!(heap_start % HEAP_ALIGN == 0, "Heap base not aligned");
+        assert!(heap_start.is_multiple_of(HEAP_ALIGN), "Heap base not aligned");
 
+        let block = heap_start as *mut FreeBlock;
         // SAFETY: heap_start is a valid, writable, heap_size-byte region per caller contract.
         // We write a FreeBlock header at the base. heap_size >= MIN_BLOCK_SIZE ensures
         // the region can hold at least one FreeBlock (16 bytes).
-        let block = heap_start as *mut FreeBlock;
         unsafe {
             (*block).size = heap_size;
             (*block).next = ptr::null_mut();
@@ -141,7 +148,10 @@ impl LockedHeapAllocator {
             // SAFETY: Each node in the free list was written by init() or dealloc().
             // The list is sorted by address and nodes don't overlap, so each
             // FreeBlock pointer is valid while we hold the lock.
+            // SAFETY: current is a valid FreeBlock pointer within the heap region;
+            // we hold the spinlock so no concurrent mutation.
             free += unsafe { (*current).size };
+            // SAFETY: Same invariant as above — current is valid, lock is held.
             current = unsafe { (*current).next };
         }
         self.release();
@@ -149,6 +159,10 @@ impl LockedHeapAllocator {
     }
 }
 
+/// SAFETY: The atomic spinlock serializes all alloc/dealloc calls.
+/// The free-list is maintained such that all FreeBlock pointers remain
+/// valid while the lock is held, and allocated regions are never
+/// returned to the list until dealloc is called with the matching pointer.
 unsafe impl GlobalAlloc for LockedHeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size().max(MIN_BLOCK_SIZE);
@@ -237,11 +251,11 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
             return;
         }
 
+        let header_size: usize = 16;
+        let hdr = (ptr as usize - header_size) as *mut [usize; 2];
         // SAFETY: ptr was returned by our alloc(), which writes a [block_base, block_size]
         // header at (aligned_start - 16). Reading it back here recovers the original
         // allocation metadata. If ptr was NOT returned by this allocator, this is UB.
-        let header_size: usize = 16;
-        let hdr = (ptr as usize - header_size) as *mut [usize; 2];
         let (block_addr, block_size) = unsafe { ((*hdr)[0], (*hdr)[1]) };
 
         self.acquire();

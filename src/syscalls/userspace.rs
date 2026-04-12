@@ -246,5 +246,5 @@ pub fn sys_exit(exit_code: u32) -> ! {
     let _args = SyscallArgs::new(exit_code as u64, 0, 0, 0, 0, 0);
     
     // TODO: Call kernel syscall handler
-    loop { }  // Should not reach here
+    loop { core::hint::spin_loop() }  // Should not reach here
 }

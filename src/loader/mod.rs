@@ -153,6 +153,12 @@ pub struct DefaultVerifier {
     pub max_memory: u64,
 }
 
+impl Default for DefaultVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DefaultVerifier {
     pub fn new() -> Self {
         Self {
@@ -171,7 +177,8 @@ impl BinaryVerifier for DefaultVerifier {
         // 1. Entry point must be within a LOAD segment
         let entry = metadata.entry_point;
         let entry_in_segment = segments.iter().any(|seg| {
-            entry >= seg.vaddr && entry < seg.vaddr + seg.memsz
+            let seg_end = seg.vaddr.saturating_add(seg.memsz);
+            entry >= seg.vaddr && entry < seg_end
         });
         if !entry_in_segment {
             return VerifyResult::Deny(DenyReason::EntryPointOutOfRange);
@@ -199,8 +206,8 @@ impl BinaryVerifier for DefaultVerifier {
             for j in (i + 1)..segments.len() {
                 let a = &segments[i];
                 let b = &segments[j];
-                let a_end = a.vaddr + a.memsz;
-                let b_end = b.vaddr + b.memsz;
+                let a_end = a.vaddr.saturating_add(a.memsz);
+                let b_end = b.vaddr.saturating_add(b.memsz);
                 if a.vaddr < b_end && b.vaddr < a_end {
                     return VerifyResult::Deny(DenyReason::OverlappingSegments);
                 }
@@ -352,7 +359,6 @@ pub struct LoadedProcess {
 /// pass the raw references directly.
 pub fn load_elf_process(
     binary: &[u8],
-    process_id: ProcessId,
     priority: Priority,
     verifier: &dyn BinaryVerifier,
     process_table: &mut ProcessTable,
@@ -374,8 +380,10 @@ pub fn load_elf_process(
     }
 
     // --- Step 4: Create process with per-process page table ---
-    process_table
-        .create_process(process_id, frame_alloc, /* create_page_table = */ true)
+    // Phase 3.2c: process table allocates the slot and stamps the
+    // generation counter into the returned ProcessId.
+    let process_id = process_table
+        .create_process(frame_alloc, /* create_page_table = */ true)
         .map_err(|_| LoaderError::ProcessCreationFailed)?;
 
     let cr3 = process_table.get_cr3(process_id);
@@ -390,7 +398,7 @@ pub fn load_elf_process(
         let page_aligned_vaddr = seg.vaddr & !(PAGE_SIZE - 1);
         let offset_in_first_page = seg.vaddr - page_aligned_vaddr;
         let total_bytes = offset_in_first_page + seg.memsz;
-        let num_pages = ((total_bytes + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+        let num_pages = total_bytes.div_ceil(PAGE_SIZE) as usize;
 
         let flags = if seg.writable {
             paging::flags::user_rw()

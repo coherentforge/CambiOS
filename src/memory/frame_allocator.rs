@@ -113,13 +113,19 @@ impl FrameAllocator {
             initialized: false,
         }
     }
+}
 
+impl Default for FrameAllocator {
+    fn default() -> Self { Self::new() }
+}
+
+impl FrameAllocator {
     /// Mark a physical region as available (free) for allocation.
     ///
     /// Called once per USABLE entry in the Limine memory map.
     /// `base` and `length` are physical addresses/sizes.
     pub fn add_region(&mut self, base: u64, length: u64) {
-        let start_frame = (base + PAGE_SIZE - 1) / PAGE_SIZE; // Round up
+        let start_frame = base.div_ceil(PAGE_SIZE); // Round up
         let end_frame = (base + length) / PAGE_SIZE; // Round down
 
         for frame_idx in start_frame..end_frame {
@@ -140,7 +146,7 @@ impl FrameAllocator {
     /// Use this to exclude the kernel image, kernel heap, page tables, etc.
     pub fn reserve_region(&mut self, base: u64, length: u64) {
         let start_frame = base / PAGE_SIZE; // Round down (conservative)
-        let end_frame = (base + length + PAGE_SIZE - 1) / PAGE_SIZE; // Round up
+        let end_frame = (base + length).div_ceil(PAGE_SIZE); // Round up
 
         for frame_idx in start_frame..end_frame {
             let idx = frame_idx as usize;
@@ -168,7 +174,7 @@ impl FrameAllocator {
             return Err(FrameAllocError::NotInitialized);
         }
 
-        let words = (self.total_frames + 63) / 64;
+        let words = self.total_frames.div_ceil(64);
 
         // Search from hint, wrapping around
         for offset in 0..words {
@@ -208,7 +214,7 @@ impl FrameAllocator {
     /// Two use cases today:
     /// - DMA buffers (virtio-net, etc.) where the device needs a small
     ///   (≤ 64-frame / 256 KiB) physically contiguous buffer.
-    /// - Per-process heaps (Wave 2a) where each process needs a
+    /// - Per-process heaps (Phase 3.2a) where each process needs a
     ///   `HEAP_SIZE / PAGE_SIZE` contiguous physical run (256 frames /
     ///   1 MiB by default). Previously capped at 64 frames; cap lifted
     ///   because heaps are larger and the bitmap scan is `O(total_frames)`
@@ -261,7 +267,7 @@ impl FrameAllocator {
     /// Free `count` physically contiguous 4 KiB frames starting at `base`.
     ///
     /// Inverse of `allocate_contiguous`. Used by the process heap reclaim
-    /// path in `handle_exit` (Wave 2a).
+    /// path in `handle_exit` (Phase 3.2a).
     ///
     /// All `count` frames must currently be allocated; partially-freed
     /// regions return `DoubleFree` and leave the bitmap unchanged (the
@@ -279,7 +285,7 @@ impl FrameAllocator {
             return Ok(());
         }
 
-        if base % PAGE_SIZE != 0 {
+        if !base.is_multiple_of(PAGE_SIZE) {
             return Err(FrameAllocError::InvalidFrame);
         }
 
@@ -410,6 +416,10 @@ pub struct FrameCache {
     stack: [u64; CACHE_CAPACITY],
     /// Number of valid frames in the cache (top-of-stack index).
     count: usize,
+}
+
+impl Default for FrameCache {
+    fn default() -> Self { Self::new() }
 }
 
 impl FrameCache {
@@ -768,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_allocate_contiguous_large_run() {
-        // Wave 2a: the 64-frame cap on allocate_contiguous was lifted so
+        // Phase 3.2a: the 64-frame cap on allocate_contiguous was lifted so
         // process heaps (256 frames / 1 MiB by default) can be allocated
         // through this API. Verify that a 256-frame run works end-to-end.
         let mut fa = FrameAllocator::new();

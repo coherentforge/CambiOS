@@ -79,7 +79,11 @@ pub struct PerCpu {
 // is no cross-thread sharing of a single instance. The static array requires
 // Sync for compilation, but each element is only mutated by its owning CPU
 // during single-threaded init (init_bsp/init_ap).
+
+/// SAFETY: Each PerCpu instance is CPU-local — no cross-CPU sharing.
 unsafe impl Send for PerCpu {}
+/// SAFETY: Static array requires Sync; each element is mutated only by its
+/// owning CPU during single-threaded init.
 unsafe impl Sync for PerCpu {}
 
 impl PerCpu {

@@ -45,8 +45,7 @@ pub const TIMER_VECTOR: u8 = PIC1_OFFSET; // Vector 32
 /// # Safety
 /// Must be called exactly once during boot, before enabling interrupts.
 pub unsafe fn init() {
-    // SAFETY for all Port I/O in this function:
-    // Called once during single-threaded boot with interrupts disabled.
+    // SAFETY: Called once during single-threaded boot with interrupts disabled.
     // Ports 0x20/0x21 (master PIC) and 0xA0/0xA1 (slave PIC) are standard
     // x86 I/O addresses. The ICW sequence (ICW1-ICW4) follows the Intel 8259
     // specification with io_wait() delays between writes.

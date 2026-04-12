@@ -141,6 +141,12 @@ pub struct ObjectCapSet {
     count: u8,
 }
 
+impl Default for ObjectCapSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ObjectCapSet {
     pub const fn new() -> Self {
         ObjectCapSet {
