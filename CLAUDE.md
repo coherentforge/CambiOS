@@ -57,7 +57,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (260 tests, all passing)
+# Run tests (267 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -474,7 +474,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 260 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3 Wave 1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3 Wave 2a)
+- 267 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3 Wave 1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3 Wave 2a), 7 BuddyAllocator reserved-prefix tests (Wave 2a SLOT_OVERHEAD shrink)
 
 ## Post-Change Review Protocol
 

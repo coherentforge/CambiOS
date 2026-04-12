@@ -390,6 +390,14 @@ pub fn init_num_slots(available_memory_bytes: u64) -> usize {
     n
 }
 
+/// Override the runtime slot count after a post-computation cap has
+/// been applied (e.g. the contiguous-run-fitting heuristic in
+/// `init_kernel_object_tables`). Must be called after `init_num_slots`
+/// and before anything reads `num_slots()`.
+pub fn init_num_slots_override(n: usize) {
+    NUM_SLOTS.store(n, Ordering::Release);
+}
+
 /// Read the runtime slot count. Returns 0 before `init_num_slots` has
 /// been called (bug indicator: callers should never read this before
 /// kernel boot is complete).
@@ -522,33 +530,19 @@ mod tests {
 
     /// 1 TB — sanity test that pathological RAM doesn't break the math.
     ///
-    /// With current `SLOT_OVERHEAD` (~22.5 KB due to per-process
-    /// `BuddyAllocator` bitmap), tier3's 512 MiB budget ceiling binds
-    /// before its 65536 slot ceiling. The expected result is
-    /// `ram_budget_ceiling / SLOT_OVERHEAD`, clamped to
-    /// `[min_slots, max_slots]`. If `SLOT_OVERHEAD` shrinks enough in
-    /// a future refactor (e.g. moving the buddy allocator to per-heap
-    /// storage), the slot ceiling will start to bind and this test
-    /// will catch the transition.
+    /// After Wave 2a Item 1 (BuddyAllocator moved to per-heap storage),
+    /// `SLOT_OVERHEAD` shrunk from ~22 KB to ~2 KB. Tier3's 512 MiB
+    /// budget ceiling now buys far more slots than `max_slots = 65536`,
+    /// so tier3 at large RAM is **slot-bound** (max_slots is the binding
+    /// constraint). This is the binding flip the ADR-008 Post-Change
+    /// Review note predicted.
     #[test]
-    fn tier3_at_1_tb_is_budget_bound() {
+    fn tier3_at_1_tb_is_slot_bound() {
         let n = num_slots_from(&TIER3_POLICY, 1024u64 * 1024 * 1024 * 1024);
-        let expected = clamp_u32(
-            (TIER3_POLICY.ram_budget_ceiling / SLOT_OVERHEAD as u64) as u32,
-            TIER3_POLICY.min_slots,
-            TIER3_POLICY.max_slots,
-        );
-        assert_eq!(n, expected);
-        // The whole point of this test: on current kernel state the
-        // result must be well below max_slots — if it ever equals
-        // max_slots, SLOT_OVERHEAD has shrunk enough that the ADR's
-        // "binding constraint shifts to slot count" condition has
-        // triggered, and the tier defaults should be reviewed.
-        // This assertion documents the current binding as budget.
-        assert!(
-            n < TIER3_POLICY.max_slots,
-            "SLOT_OVERHEAD has shrunk enough that tier3 is now slot-bound; \
-             revisit ADR-008 tier defaults per its Post-Change Review note."
+        assert_eq!(
+            n, TIER3_POLICY.max_slots,
+            "tier3 at 1 TiB should hit the max_slots ceiling ({}), got {}",
+            TIER3_POLICY.max_slots, n
         );
     }
 
@@ -599,13 +593,13 @@ mod tests {
     }
 
     #[test]
-    fn binding_huge_memory_hits_budget_ceiling_at_tier3() {
+    fn binding_huge_memory_hits_slot_ceiling_at_tier3() {
         // 1 TiB on tier3: fractional budget is 30 GiB, clamped down
-        // to 512 MiB ceiling. With current SLOT_OVERHEAD the result
-        // is within [min_slots, max_slots], so the binding is the
-        // budget ceiling (not the slot ceiling).
+        // to 512 MiB ceiling. After Item 1 (SLOT_OVERHEAD shrink), the
+        // 512 MiB budget buys ~262K slots, well above max_slots (65536).
+        // The slot clamp fires: binding is MaxSlots.
         let b = binding_constraint_for(&TIER3_POLICY, 1024u64 * 1024 * 1024 * 1024);
-        assert_eq!(b, BindingConstraint::BudgetCeiling);
+        assert_eq!(b, BindingConstraint::MaxSlots);
     }
 
     #[test]

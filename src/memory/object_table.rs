@@ -375,11 +375,12 @@ mod tests {
     /// larger than the pool.
     #[test]
     fn init_propagates_frame_alloc_failure() {
-        // Small frame allocator: 16 frames = 64 KiB, nowhere near
-        // enough for a 32-slot object table (~22 KiB × 32 = 704 KiB
-        // plus page-rounding).
+        // Tiny frame allocator: 4 frames = 16 KiB. Even with the
+        // smaller ProcessDescriptor (BuddyAllocator moved to per-heap
+        // storage), a 32-slot object table needs ~12 pages, so this
+        // must fail with OutOfMemory.
         let mut fa = FrameAllocator::new();
-        fa.add_region(0x100000, 16 * 4096);
+        fa.add_region(0x100000, 4 * 4096);
         fa.finalize();
 
         let result = init(&mut fa, 32, 0, BindingConstraint::Unconstrained);

@@ -637,21 +637,45 @@ fn init_kernel_object_tables() {
     use arcos_core::process::ProcessTable;
     use arcos_core::{CAPABILITY_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
 
-    // Available memory figure: bytes tracked by the frame allocator.
-    // This is what's actually available for kernel allocations after
-    // USABLE regions have been added and reserved regions subtracted.
-    let available_memory_bytes = {
+    // Available memory figure: the *free* frame count at this point
+    // in boot, times the page size. This is what's actually allocatable
+    // (after USABLE regions added, reserved regions subtracted, kernel
+    // heap carved out).
+    //
+    // We use free_count, NOT total_count, because the object table
+    // region must be allocated from the pool that remains — and
+    // allocate_contiguous needs a physically contiguous run that
+    // fits within the free pool.
+    let (available_memory_bytes, free_frames) = {
         let fa = FRAME_ALLOCATOR.lock();
-        fa.total_count() as u64 * PAGE_SIZE
+        (fa.free_count() as u64 * PAGE_SIZE, fa.free_count())
     };
 
     // Compute num_slots and the binding constraint from the active
     // tier policy. Purely functional — no side effects.
-    let num_slots = config::init_num_slots(available_memory_bytes);
+    let mut num_slots = config::init_num_slots(available_memory_bytes);
     let binding = config::binding_constraint_for(
         &config::ACTIVE_POLICY,
         available_memory_bytes,
     );
+
+    // Safety cap: the region must be allocatable as a contiguous
+    // physical run from the frame allocator. If the policy-derived
+    // num_slots would produce a region larger than half the free
+    // frames (heuristic: we need room for process heaps + other
+    // allocations too), reduce num_slots until it fits. This is
+    // the "contiguous run" constraint that the tier policy's budget
+    // ceiling doesn't know about.
+    let max_region_frames = free_frames / 2; // leave at least half for process heaps
+    loop {
+        let needed_frames = (object_table::region_bytes_for(num_slots) / PAGE_SIZE) as usize;
+        if needed_frames <= max_region_frames || num_slots <= config::ACTIVE_POLICY.min_slots as usize {
+            break;
+        }
+        num_slots /= 2;
+    }
+    // Re-store the capped num_slots so downstream reads see the final value.
+    config::init_num_slots_override(num_slots);
 
     // Allocate the contiguous region from the frame allocator and
     // carve out the two page-aligned subregions.

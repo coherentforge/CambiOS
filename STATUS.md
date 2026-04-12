@@ -14,7 +14,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 
 ## At a glance
 
-- **260 unit tests passing** on host (`x86_64-apple-darwin`)
+- **267 unit tests passing** on host (`x86_64-apple-darwin`)
 - **x86_64**: clean release build, boots in QEMU with 2 CPUs, 7 boot modules running (hello, fs-service, key-store, virtio-net, i219-net, udp-stack, shell)
 - **AArch64**: clean release build, boots in QEMU `virt`, all 7 modules running, full SMP (single-CPU mode tested; SMP timer-on-AP issue tracked)
 - **Bare metal**: USB boot tooling complete (`make img-usb` builds GPT image; `make usb DEVICE=/dev/diskN` writes safely); not yet tested on target hardware (Dell Precision 3630)
@@ -123,7 +123,7 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | Kernel object table region (Wave 2a) | 5 | `region_bytes_for` page-aligned and monotonic, `init` produces disjoint valid slices with `None` initialization, rejects zero slots, propagates frame-alloc failure |
 | AArch64 portable logic | 12 | PerCpu offsets, GIC register math, page table descriptor flags |
 | Other | ~70 | Timer, IPC sync channel, ProcessTable, VMA tracker, syscall args, etc. |
-| **Total** | **260** | All passing on `x86_64-apple-darwin` |
+| **Total** | **267** | All passing on `x86_64-apple-darwin` |
 
 Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 

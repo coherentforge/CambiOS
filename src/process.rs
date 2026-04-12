@@ -167,7 +167,11 @@ pub enum ProcessCreateError {
     HeapAllocFailure(FrameAllocError),
 }
 
-/// Process descriptor with heap allocator and VMA tracking.
+/// Process descriptor with VMA tracking. The per-process buddy
+/// allocator no longer lives inline — it's constructed in place at
+/// the start of each process's heap by [`ProcessDescriptor::new`] and
+/// accessed via [`ProcessDescriptor::allocator_mut`]. See the module
+/// doc and ADR-008 Wave 2a follow-up for the rationale.
 ///
 /// # Invariants (for formal verification)
 ///
@@ -182,15 +186,21 @@ pub enum ProcessCreateError {
 ///   via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` and must be freed
 ///   via `FrameAllocator::free_contiguous(phys_base, HEAP_PAGES)` exactly
 ///   once when the process exits.
+/// - **The first `size_of::<BuddyAllocator>()` bytes of the managed heap
+///   contain a valid `BuddyAllocator` struct**, constructed in place by
+///   `ProcessDescriptor::new` via `core::ptr::write` and initialized with
+///   `new_with_reserved_prefix` so user allocations never overlap.
 /// - All VMA entries in `vma` reference user-space addresses in the lower
 ///   canonical half (< `USER_SPACE_END`).
-/// - `allocator` offsets are relative to `phys_base`/`virt_base`, not absolute.
+/// - BuddyAllocator offsets are relative to `virt_base`, not absolute.
 pub struct ProcessDescriptor {
-    /// Pure bookkeeping allocator (returns offsets, no memory I/O)
-    pub allocator: BuddyAllocator,
-    /// Physical base address of this process's heap (for page tables)
+    /// Physical base address of this process's heap (for page tables).
+    /// The first `size_of::<BuddyAllocator>()` bytes at this address hold
+    /// the process's buddy allocator state (Wave 2a follow-up).
     pub phys_base: u64,
-    /// HHDM-mapped virtual base (for kernel-side access)
+    /// HHDM-mapped virtual base (for kernel-side access).
+    /// `virt_base as *mut BuddyAllocator` is a valid, initialized pointer
+    /// for the lifetime of the descriptor.
     pub virt_base: u64,
     /// Heap size in bytes
     pub heap_size: u64,
@@ -202,12 +212,22 @@ pub struct ProcessDescriptor {
 
 impl ProcessDescriptor {
     /// Create a new process descriptor, dynamically allocating its
-    /// heap region from the frame allocator.
+    /// heap region from the frame allocator and placing a fresh
+    /// `BuddyAllocator` in the first few KB of that heap.
     ///
     /// Wave 2a: heap is no longer at a deterministic PID-derived
     /// physical address. Each process gets a fresh contiguous region
     /// from the frame allocator, which means process exit MUST free
     /// it via [`ProcessDescriptor::reclaim_heap`] to avoid a leak.
+    ///
+    /// Wave 2a follow-up (Item 1): the per-process `BuddyAllocator`
+    /// lives in the heap itself at `virt_base..virt_base + size_of::<BuddyAllocator>()`,
+    /// constructed via `core::ptr::write` with
+    /// `new_with_reserved_prefix` so user allocations skip the
+    /// allocator's own state. This shrinks `SLOT_OVERHEAD` (the per-
+    /// process object-table cost) from ~22 KB to ~a few hundred bytes
+    /// — see ADR-008 § "Current binding observation" for the effect
+    /// on tier policies.
     ///
     /// `hhdm_offset`: the higher-half direct map offset from Limine,
     /// so the kernel can access process heap memory via
@@ -226,14 +246,66 @@ impl ProcessDescriptor {
             .allocate_contiguous(HEAP_PAGES)
             .map_err(ProcessCreateError::HeapAllocFailure)?;
         let phys_base = frame.addr;
+        let virt_base = phys_base + hhdm_offset;
+
+        // Placement-new the buddy allocator at the start of the heap.
+        // The reserved prefix equals the allocator's own struct size
+        // so the allocator can never hand out a range that overlaps
+        // its own bitmap storage.
+        //
+        // SAFETY:
+        // - `virt_base` points at freshly-allocated HHDM-mapped frames
+        //   (just returned from `allocate_contiguous`). We are the
+        //   exclusive owner of these frames — nothing else holds a
+        //   reference.
+        // - The frames form a single contiguous region of
+        //   `HEAP_SIZE = 1 MiB`, which is much larger than
+        //   `size_of::<BuddyAllocator>()` (~20 KB). No risk of writing
+        //   past the end.
+        // - `virt_base` is page-aligned (frame allocator returns
+        //   page-aligned bases) which satisfies any alignment
+        //   requirement `BuddyAllocator` has (its max alignment is
+        //   that of `u64`, which is 8 bytes, well below 4096).
+        // - `BuddyAllocator` is `#[repr(C)]` with only plain-array
+        //   fields, so the layout is deterministic and safe to
+        //   construct via `core::ptr::write`.
+        unsafe {
+            core::ptr::write(
+                virt_base as *mut BuddyAllocator,
+                BuddyAllocator::new_with_reserved_prefix(
+                    core::mem::size_of::<BuddyAllocator>(),
+                ),
+            );
+        }
+
         Ok(ProcessDescriptor {
-            allocator: BuddyAllocator::new(),
             phys_base,
-            virt_base: phys_base + hhdm_offset,
+            virt_base,
             heap_size: HEAP_SIZE,
             cr3: 0, // 0 = uses kernel page table (no per-process table yet)
             vma: VmaTracker::new(),
         })
+    }
+
+    /// Return a mutable reference to the in-place `BuddyAllocator` at
+    /// the start of this process's heap.
+    ///
+    /// # Safety / invariant
+    ///
+    /// This helper only produces a valid reference as long as
+    /// `ProcessDescriptor::new` successfully constructed the
+    /// descriptor — that's where the allocator is placement-new'd.
+    /// All constructors go through `new`, so the invariant holds
+    /// for every live descriptor. The returned reference is tied to
+    /// `self`'s borrow, so the borrow checker enforces unique access
+    /// despite the raw pointer cast inside.
+    #[inline]
+    fn allocator_mut(&mut self) -> &mut BuddyAllocator {
+        // SAFETY: `self.virt_base` holds a valid, initialized
+        // `BuddyAllocator` by the struct invariant documented above.
+        // The `&mut self` borrow guarantees no aliased access. The
+        // lifetime of the returned reference is tied to `self`.
+        unsafe { &mut *(self.virt_base as *mut BuddyAllocator) }
     }
 
     /// Return the heap region back to the frame allocator.
@@ -243,6 +315,11 @@ impl ProcessDescriptor {
     /// this call, the descriptor's `phys_base` and `virt_base` point
     /// at frames that no longer belong to this process — the caller
     /// must drop the descriptor immediately and never touch it again.
+    ///
+    /// The in-place `BuddyAllocator` is NOT explicitly dropped: it's
+    /// a plain-array struct with no `Drop` impl, so releasing the
+    /// frames is the complete cleanup. The bits of storage that used
+    /// to hold its bitmap are simply returned to the pool.
     ///
     /// Returns the frame allocator error on failure, but in normal
     /// operation this should never fail: we allocated `HEAP_PAGES`
@@ -258,19 +335,21 @@ impl ProcessDescriptor {
     /// Allocate memory, returning the kernel-accessible virtual address.
     /// Returns 0 on failure.
     pub fn allocate(&mut self, size: usize) -> usize {
-        match self.allocator.allocate(size) {
-            Some(alloc) => self.virt_base as usize + alloc.offset,
+        let virt_base = self.virt_base as usize;
+        match self.allocator_mut().allocate(size) {
+            Some(alloc) => virt_base + alloc.offset,
             None => 0,
         }
     }
 
     /// Free memory by its kernel-accessible virtual address.
     pub fn free(&mut self, virt_addr: usize) -> bool {
-        if virt_addr < self.virt_base as usize {
+        let virt_base = self.virt_base as usize;
+        if virt_addr < virt_base {
             return false;
         }
-        let offset = virt_addr - self.virt_base as usize;
-        self.allocator.free(offset)
+        let offset = virt_addr - virt_base;
+        self.allocator_mut().free(offset)
     }
 }
 

@@ -16,7 +16,7 @@
 pub mod tier;
 
 pub use tier::{
-    binding_constraint_for, init_num_slots, num_slots, num_slots_from, BindingConstraint,
-    TableSizingPolicy, ACTIVE_POLICY, ACTIVE_TIER_NAME, SLOT_OVERHEAD, TIER1_POLICY,
-    TIER2_POLICY, TIER3_POLICY,
+    binding_constraint_for, init_num_slots, init_num_slots_override, num_slots,
+    num_slots_from, BindingConstraint, TableSizingPolicy, ACTIVE_POLICY,
+    ACTIVE_TIER_NAME, SLOT_OVERHEAD, TIER1_POLICY, TIER2_POLICY, TIER3_POLICY,
 };

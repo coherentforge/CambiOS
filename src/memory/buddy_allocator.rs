@@ -41,6 +41,21 @@ pub struct Allocation {
 /// minimum-sized (16-byte) slot. For larger orders, multiple consecutive
 /// bits are set. The allocator stores the order for each allocation in a
 /// separate parallel bitmap so that `free()` only needs the offset.
+///
+/// ## In-place construction (Wave 2a follow-up)
+///
+/// As of the Wave 2a follow-up, the allocator is constructed in place at
+/// the start of each process heap (not as a field of `ProcessDescriptor`
+/// anymore). The first `reserved_slots * MIN_SIZE` bytes of the heap hold
+/// the allocator's own state and are reserved so user allocations never
+/// overlap. Use [`BuddyAllocator::new_with_reserved_prefix`] to construct
+/// an allocator with a pre-reserved prefix; [`BuddyAllocator::new`] is
+/// still valid for standalone use (unit tests, future allocator contexts).
+///
+/// `#[repr(C)]` fixes the field layout so placement-new via raw pointer
+/// is layout-stable across compiler versions. The struct has no lifetimes,
+/// no references, and no interior unsafety — just plain array storage.
+#[repr(C)]
 pub struct BuddyAllocator {
     /// Allocation status: bit set = slot occupied
     /// 512 × 64 = 32768 slots × 16 bytes = 512KB addressable (= MAX_SIZE)
@@ -50,15 +65,66 @@ pub struct BuddyAllocator {
     /// 32768 slots / 2 per byte = 16384 bytes = 16KB
     /// Only the first slot of each allocation has a meaningful order value.
     orders: [u8; 16384],
+
+    /// Number of slots reserved at offset 0 (for in-place construction).
+    /// When non-zero, `find_free_slots` starts its search at `reserved_slots`
+    /// and `free` rejects offsets below `reserved_slots * MIN_SIZE`. Always
+    /// zero for `new()`; set by `new_with_reserved_prefix`.
+    reserved_slots: u32,
 }
 
 impl BuddyAllocator {
-    /// Create a new buddy allocator for a process heap
+    /// Create a new buddy allocator for a process heap with no reserved prefix.
+    ///
+    /// Suitable for unit tests and standalone contexts where the allocator
+    /// does not share memory with the heap it manages. For the in-place
+    /// case (where the allocator lives at the start of the heap), use
+    /// [`BuddyAllocator::new_with_reserved_prefix`] instead.
     pub fn new() -> Self {
         BuddyAllocator {
             allocations: [0; 512],
             orders: [0; 16384],
+            reserved_slots: 0,
         }
+    }
+
+    /// Create a new buddy allocator with the first `reserved_bytes` of the
+    /// managed heap marked as allocated and protected from `free()`.
+    ///
+    /// Used for in-place construction at the start of a process heap: the
+    /// allocator's own state (this struct) lives at offset 0..`reserved_bytes`,
+    /// and user allocations must never overlap that region. This constructor:
+    ///
+    /// 1. Initializes a fresh allocator with all slots free and `reserved_slots == 0`.
+    /// 2. Computes `slots = ceil(reserved_bytes / MIN_SIZE)` — the number of
+    ///    `MIN_SIZE`-aligned slots that cover the reserved prefix.
+    /// 3. Marks those slots as allocated in the `allocations` bitmap so
+    ///    `find_free_slots` skips them.
+    /// 4. Records `reserved_slots = slots` so `free()` rejects any offset
+    ///    below the prefix — without this field, a stray `free(0)` call
+    ///    would read the (zero-initialized) orders bitmap, decode
+    ///    `MIN_ORDER = 4`, mark the first 16 bytes as free, and leave the
+    ///    rest of the reserved prefix in an inconsistent "used but
+    ///    unreachable from the free list" state. The explicit field
+    ///    closes that footgun.
+    ///
+    /// The order bitmap is left untouched for reserved slots — nothing
+    /// reads it, because the `reserved_slots` check in `free` bails out
+    /// before the order lookup.
+    pub fn new_with_reserved_prefix(reserved_bytes: usize) -> Self {
+        let mut allocator = Self::new();
+        if reserved_bytes == 0 {
+            return allocator;
+        }
+        let slots = (reserved_bytes + MIN_SIZE - 1) / MIN_SIZE;
+        let total_slots = MAX_SIZE / MIN_SIZE;
+        // Cap at total_slots so we never mark bits outside the bitmap.
+        // Caller-side invariant: reserved_bytes should be << MAX_SIZE, but
+        // defensive clamp costs nothing and prevents a silent wrap.
+        let slots = slots.min(total_slots);
+        allocator.mark_range(0, slots, true);
+        allocator.reserved_slots = slots as u32;
+        allocator
     }
 
     /// Allocate a block of the requested size
@@ -92,6 +158,13 @@ impl BuddyAllocator {
     ///
     /// The order is recovered from the internal order map — callers don't
     /// need to remember it.
+    ///
+    /// Returns `false` (without mutating state) if:
+    /// - the offset is not `MIN_SIZE`-aligned,
+    /// - the offset is beyond the managed region,
+    /// - the offset falls inside the reserved prefix (if any),
+    /// - the slot is not currently allocated (double-free),
+    /// - the decoded order is out of range.
     pub fn free(&mut self, offset: usize) -> bool {
         if offset % MIN_SIZE != 0 {
             return false;
@@ -100,6 +173,15 @@ impl BuddyAllocator {
         let start_slot = offset / MIN_SIZE;
         let total_slots = MAX_SIZE / MIN_SIZE;
         if start_slot >= total_slots {
+            return false;
+        }
+
+        // Reject any free that targets the reserved prefix (in-place
+        // allocator state). Without this check, a stray `free(0)` would
+        // read the zero-initialized orders bitmap, decode `MIN_ORDER`,
+        // and partially unmark the reserved range — leaving the
+        // allocator in an inconsistent state.
+        if start_slot < self.reserved_slots as usize {
             return false;
         }
 
@@ -129,13 +211,22 @@ impl BuddyAllocator {
         order
     }
 
-    /// Find a contiguous run of `count` free slots
+    /// Find a contiguous run of `count` free slots, skipping the
+    /// reserved prefix (if any).
+    ///
+    /// Starting the scan at `reserved_slots` instead of 0 skips the
+    /// in-place-allocator-state bits that are already marked
+    /// allocated. Without this, every `allocate` call would waste
+    /// `reserved_slots` iterations resetting the run on every marked
+    /// bit before reaching free territory — with a 20 KB allocator
+    /// prefix that's 1280 wasted iterations per allocate.
     fn find_free_slots(&self, count: usize) -> Option<usize> {
         let total_slots = MAX_SIZE / MIN_SIZE;
-        let mut run_start = 0;
+        let start = self.reserved_slots as usize;
+        let mut run_start = start;
         let mut run_len = 0;
 
-        for slot in 0..total_slots {
+        for slot in start..total_slots {
             if self.is_allocated(slot) {
                 run_start = slot + 1;
                 run_len = 0;
@@ -288,5 +379,102 @@ mod tests {
         // Free and reallocate
         assert!(allocator.free(big.unwrap().offset));
         assert!(allocator.allocate(16).is_some());
+    }
+
+    // ========================================================================
+    // Reserved-prefix construction (Wave 2a Item 1: in-place allocator state)
+    // ========================================================================
+
+    #[test]
+    fn test_new_with_reserved_prefix_zero_is_same_as_new() {
+        let mut a = BuddyAllocator::new_with_reserved_prefix(0);
+        let b = a.allocate(16).unwrap();
+        assert_eq!(b.offset, 0, "zero reservation should behave like new()");
+    }
+
+    #[test]
+    fn test_new_with_reserved_prefix_first_alloc_skips_prefix() {
+        // Reserve 1024 bytes (64 slots).
+        let mut allocator = BuddyAllocator::new_with_reserved_prefix(1024);
+
+        // First allocation must land past the reserved prefix.
+        let alloc = allocator.allocate(16).unwrap();
+        assert!(
+            alloc.offset >= 1024,
+            "first allocation at offset {} overlaps the 1024-byte reserved prefix",
+            alloc.offset
+        );
+    }
+
+    #[test]
+    fn test_new_with_reserved_prefix_rounds_up_to_min_size() {
+        // 17 bytes rounds up to 32 bytes (2 slots × 16).
+        let mut allocator = BuddyAllocator::new_with_reserved_prefix(17);
+
+        let alloc = allocator.allocate(16).unwrap();
+        // The reserved prefix is 2 slots (32 bytes), so the first
+        // free alloc lands at offset 32.
+        assert_eq!(alloc.offset, 32);
+    }
+
+    #[test]
+    fn test_free_rejects_offset_in_reserved_prefix() {
+        let mut allocator = BuddyAllocator::new_with_reserved_prefix(1024);
+
+        // Attempting to free any offset inside the reserved prefix
+        // must return false without mutating state.
+        assert!(!allocator.free(0));
+        assert!(!allocator.free(16));
+        assert!(!allocator.free(1008)); // last slot in the prefix
+
+        // The prefix is still "allocated" and the next allocate still
+        // lands past it, confirming no partial-unmark happened.
+        let alloc = allocator.allocate(16).unwrap();
+        assert!(alloc.offset >= 1024);
+    }
+
+    #[test]
+    fn test_new_with_reserved_prefix_allocator_state_size() {
+        // The practical Wave 2a use case: reserve enough space for the
+        // allocator's own state. size_of::<BuddyAllocator>() is the
+        // actual reservation size in ProcessDescriptor::new.
+        let state_size = core::mem::size_of::<BuddyAllocator>();
+        let mut allocator = BuddyAllocator::new_with_reserved_prefix(state_size);
+
+        let alloc = allocator.allocate(16).unwrap();
+        assert!(
+            alloc.offset >= state_size,
+            "allocation at offset {} overlaps allocator state of size {}",
+            alloc.offset,
+            state_size
+        );
+    }
+
+    #[test]
+    fn test_new_with_reserved_prefix_allocate_free_cycle_works() {
+        // User allocations past the reserved prefix must still round-trip
+        // through allocate/free correctly.
+        let mut allocator =
+            BuddyAllocator::new_with_reserved_prefix(core::mem::size_of::<BuddyAllocator>());
+
+        let a1 = allocator.allocate(64).unwrap();
+        let a2 = allocator.allocate(128).unwrap();
+        assert_ne!(a1.offset, a2.offset);
+
+        assert!(allocator.free(a1.offset));
+        assert!(allocator.free(a2.offset));
+
+        // After freeing, we can re-allocate and get valid offsets.
+        let a3 = allocator.allocate(64).unwrap();
+        assert!(a3.offset >= core::mem::size_of::<BuddyAllocator>());
+    }
+
+    #[test]
+    fn test_new_with_reserved_prefix_oversized_clamps() {
+        // Pathological: reserve more than the entire managed region.
+        // Should not panic or wrap; the allocator ends up with every
+        // slot marked allocated, and allocate() returns None.
+        let mut allocator = BuddyAllocator::new_with_reserved_prefix(MAX_SIZE * 2);
+        assert!(allocator.allocate(16).is_none());
     }
 }
