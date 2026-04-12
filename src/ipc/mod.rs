@@ -14,10 +14,14 @@ use alloc::boxed::Box;
 use core::fmt;
 
 /// SCAFFOLDING: maximum number of IPC endpoints in the system.
-/// Why: paired with `MAX_PROCESSES` (typically one endpoint per service).
-///      Sharded IPC has one shard per endpoint; the per-shard message queues
-///      and the global capability tables are sized from this.
-/// Replace when: `MAX_PROCESSES` grows. They are a pair and must move together.
+/// Why: one endpoint per service in the simple case. Sharded IPC has one
+///      shard per endpoint; the per-shard message queues are sized from this.
+///      Historically matched `MAX_PROCESSES = 32`; `MAX_PROCESSES` is gone
+///      as of Wave 2a (the process table now scales with tier policy via
+///      `config::num_slots()`), but `MAX_ENDPOINTS` remains a fixed cap.
+/// Replace when: a Phase 3 service needs more than 32 endpoints, or the IPC
+///      shard array becomes a contention point at higher process counts.
+///      Eventually this should track `config::num_slots()` the same way.
 ///      See ASSUMPTIONS.md.
 pub const MAX_ENDPOINTS: usize = 32;
 
@@ -1175,7 +1179,7 @@ mod tests {
         use crate::ipc::capability::CapabilityManager;
 
         let mut mgr = IpcManager::new();
-        let mut cap_mgr = CapabilityManager::new();
+        let mut cap_mgr = CapabilityManager::new_for_test();
 
         let proc_id = ProcessId(0);
         let endpoint = EndpointId(5);
@@ -1200,7 +1204,7 @@ mod tests {
         use crate::ipc::capability::CapabilityManager;
 
         let mut mgr = IpcManager::new();
-        let mut cap_mgr = CapabilityManager::new();
+        let mut cap_mgr = CapabilityManager::new_for_test();
 
         let proc_id = ProcessId(0);
         let endpoint = EndpointId(5);

@@ -6,7 +6,6 @@
 //! Each process holds capabilities that grant rights to communicate with endpoints.
 
 use crate::ipc::{ProcessId, EndpointId, CapabilityRights, Principal};
-use crate::process::MAX_PROCESSES;
 extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt;
@@ -45,9 +44,11 @@ pub struct Capability {
 /// Capability table for a single process.
 ///
 /// SCAFFOLDING: 32 capabilities per process.
-/// Why: bounded set for verification; cache-line-friendly linear scan; matches
-///      `MAX_PROCESSES` and `MAX_ENDPOINTS` (a process can typically hold
-///      capabilities for ~half the system's endpoints).
+/// Why: bounded set for verification; cache-line-friendly linear scan. Originally
+///      chosen to match `MAX_PROCESSES` and `MAX_ENDPOINTS` (a process can
+///      typically hold capabilities for ~half the system's endpoints). As of
+///      Wave 2a, `MAX_PROCESSES` is runtime-computed (`config::num_slots()`),
+///      but this per-process cap is still a fixed compile-time 32.
 /// Replace when: Phase 3 work hits this — the policy service holds one capability
 ///      per service it mediates, the audit consumer holds one per producer.
 ///      32 will get tight fast. See ASSUMPTIONS.md.
@@ -204,50 +205,67 @@ impl ProcessCapabilities {
 ///
 /// Tracks capabilities for all processes. Central policy enforcement point.
 ///
-/// Memory footprint: 32 processes × 32 capabilities × ~16 bytes per Capability ≈ 16KB
-/// Heap-allocated at boot via CapabilityManager::new_boxed().
+/// Wave 2a: slot storage is a `&'static mut [Option<ProcessCapabilities>]`
+/// slice backed by the kernel object table region (see
+/// `memory::object_table::init`). The slice length equals
+/// `config::num_slots()`, computed at boot from the active tier policy.
 pub struct CapabilityManager {
     /// Capability tables for processes (process ID maps to index)
-    process_caps: [Option<ProcessCapabilities>; MAX_PROCESSES],
+    process_caps: &'static mut [Option<ProcessCapabilities>],
     /// Number of active processes with capabilities
     process_count: u16,
 }
 
 impl CapabilityManager {
-    /// Create new capability manager
-    pub const fn new() -> Self {
-        CapabilityManager {
-            process_caps: [None; MAX_PROCESSES],
+    /// Construct a capability manager backed by an already-initialized
+    /// slice from the kernel object table region.
+    ///
+    /// The slice must have every slot pre-initialized to `None`
+    /// (which `object_table::init` guarantees). The returned
+    /// `Box<Self>` header lives on the kernel heap; the slot storage
+    /// lives in the object table region.
+    pub fn from_object_slice(
+        process_caps: &'static mut [Option<ProcessCapabilities>],
+    ) -> Option<Box<Self>> {
+        Some(Box::new(CapabilityManager {
+            process_caps,
             process_count: 0,
-        }
+        }))
     }
 
-    /// Create a new capability manager directly on the heap.
-    ///
-    /// Returns `None` if heap allocation fails.
-    pub fn new_boxed() -> Option<Box<Self>> {
-        use alloc::alloc::{alloc, Layout};
-        let layout = Layout::new::<Self>();
-        // SAFETY: layout is non-zero-sized (CapabilityManager contains arrays).
-        let ptr = unsafe { alloc(layout) as *mut Self };
-        if ptr.is_null() {
-            return None;
+    /// Number of slots in the capability table (equal to `config::num_slots()`).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.process_caps.len()
+    }
+
+    /// Test-only constructor that allocates a host-side `Vec` of the
+    /// given size and leaks it into a `'static` slice. Only usable in
+    /// host unit tests; the kernel path always goes through
+    /// [`from_object_slice`].
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Box<Self> {
+        Self::new_for_test_with_capacity(32)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_capacity(num_slots: usize) -> Box<Self> {
+        let mut v: alloc::vec::Vec<Option<ProcessCapabilities>> =
+            alloc::vec::Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            v.push(None);
         }
-        // SAFETY: Cannot use alloc_zeroed because Option<ProcessCapabilities> may
-        // use niche optimization (bool fields), so all-zeros might not be None.
-        // Instead we write each field explicitly. ptr is valid and aligned per
-        // alloc's contract. We write all fields before constructing the Box.
-        unsafe {
-            core::ptr::addr_of_mut!((*ptr).process_caps)
-                .write([None; MAX_PROCESSES]);
-            core::ptr::addr_of_mut!((*ptr).process_count).write(0u16);
-            Some(Box::from_raw(ptr))
-        }
+        let boxed: Box<[Option<ProcessCapabilities>]> = v.into_boxed_slice();
+        let slice: &'static mut [Option<ProcessCapabilities>] = Box::leak(boxed);
+        Box::new(CapabilityManager {
+            process_caps: slice,
+            process_count: 0,
+        })
     }
 
     /// Register a new process in the capability system
     pub fn register_process(&mut self, process_id: ProcessId) -> Result<(), CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -262,7 +280,7 @@ impl CapabilityManager {
 
     /// Unregister a process (revoke all its capabilities)
     pub fn unregister_process(&mut self, process_id: ProcessId) -> Result<(), CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -282,7 +300,7 @@ impl CapabilityManager {
         endpoint: EndpointId,
         rights: CapabilityRights,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -300,7 +318,7 @@ impl CapabilityManager {
         endpoint: EndpointId,
         rights: CapabilityRights,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -317,7 +335,7 @@ impl CapabilityManager {
         process_id: ProcessId,
         endpoint: EndpointId,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -330,7 +348,7 @@ impl CapabilityManager {
 
     /// Get process capability table
     pub fn get_capabilities(&self, process_id: ProcessId) -> Result<&ProcessCapabilities, CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -341,7 +359,7 @@ impl CapabilityManager {
 
     /// Get mutable reference to process capabilities
     pub fn get_capabilities_mut(&mut self, process_id: ProcessId) -> Result<&mut ProcessCapabilities, CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -364,7 +382,7 @@ impl CapabilityManager {
         process_id: ProcessId,
         principal: Principal,
     ) -> Result<(), CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -385,7 +403,7 @@ impl CapabilityManager {
         &self,
         process_id: ProcessId,
     ) -> Result<Principal, CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -426,7 +444,9 @@ impl CapabilityManager {
         rights: CapabilityRights,
         interceptor: Option<&dyn crate::ipc::interceptor::IpcInterceptor>,
     ) -> Result<(), CapabilityError> {
-        if source_pid.0 >= MAX_PROCESSES as u32 || target_pid.0 >= MAX_PROCESSES as u32 {
+        if source_pid.0 as usize >= self.process_caps.len()
+            || target_pid.0 as usize >= self.process_caps.len()
+        {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -530,7 +550,7 @@ impl CapabilityManager {
             return Err(CapabilityError::AccessDenied);
         }
 
-        if holder.0 >= MAX_PROCESSES as u32 {
+        if holder.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -593,7 +613,7 @@ impl CapabilityManager {
         &mut self,
         process_id: ProcessId,
     ) -> Result<usize, CapabilityError> {
-        if process_id.0 >= MAX_PROCESSES as u32 {
+        if process_id.0 as usize >= self.process_caps.len() {
             return Err(CapabilityError::InvalidOperation);
         }
 
@@ -650,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_capability_manager() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
 
         let proc_id = ProcessId(1);
         let endpoint = EndpointId(10);
@@ -689,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_delegation() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
 
         let proc_a = ProcessId(1);
         let proc_b = ProcessId(2);
@@ -731,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_delegation_requires_delegate_right() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
 
         let proc_a = ProcessId(1);
         let proc_b = ProcessId(2);
@@ -755,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_delegation_cannot_escalate_rights() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
 
         let proc_a = ProcessId(1);
         let proc_b = ProcessId(2);
@@ -820,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_bind_and_get_principal() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let proc_id = ProcessId(1);
         let principal = Principal::from_public_key([0xAA; 32]);
 
@@ -833,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_bind_principal_rejects_double_bind() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let proc_id = ProcessId(1);
         let p1 = Principal::from_public_key([0xAA; 32]);
         let p2 = Principal::from_public_key([0xBB; 32]);
@@ -850,13 +870,13 @@ mod tests {
 
     #[test]
     fn test_get_principal_unregistered_process() {
-        let mgr = CapabilityManager::new();
+        let mgr = CapabilityManager::new_for_test();
         assert!(mgr.get_principal(ProcessId(99)).is_err());
     }
 
     #[test]
     fn test_get_principal_no_principal_bound() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let proc_id = ProcessId(1);
         mgr.register_process(proc_id).unwrap();
 
@@ -866,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_bind_principal_unregistered_process() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let principal = Principal::from_public_key([0xAA; 32]);
 
         // Not registered — should fail
@@ -881,8 +901,8 @@ mod tests {
     /// Helper: a holder process with one granted endpoint capability and a
     /// distinct "attacker" principal, plus a known bootstrap Principal to pass
     /// to `revoke()`. Returns (manager, holder_pid, endpoint, bootstrap).
-    fn revoke_test_fixture() -> (CapabilityManager, ProcessId, EndpointId, Principal) {
-        let mut mgr = CapabilityManager::new();
+    fn revoke_test_fixture() -> (Box<CapabilityManager>, ProcessId, EndpointId, Principal) {
+        let mut mgr = CapabilityManager::new_for_test();
         let holder = ProcessId(1);
         let endpoint = EndpointId(10);
         let bootstrap = Principal::from_public_key([0xAA; 32]);
@@ -974,8 +994,8 @@ mod tests {
     #[test]
     fn test_revoke_out_of_range_pid_returns_invalid_operation() {
         let (mut mgr, _holder, endpoint, bootstrap) = revoke_test_fixture();
-        // Beyond MAX_PROCESSES (32) — distinct code path from ProcessNotFound.
-        let out_of_range = ProcessId(MAX_PROCESSES as u32);
+        // Beyond the manager's capacity — distinct code path from ProcessNotFound.
+        let out_of_range = ProcessId(mgr.capacity() as u32);
 
         assert_eq!(
             mgr.revoke(out_of_range, endpoint, bootstrap, bootstrap),
@@ -1000,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_revoke_all_for_process_returns_count() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let proc_id = ProcessId(1);
         mgr.register_process(proc_id).unwrap();
 
@@ -1047,7 +1067,7 @@ mod tests {
 
     #[test]
     fn test_revoke_all_for_process_empty_table_returns_zero() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let proc_id = ProcessId(1);
         mgr.register_process(proc_id).unwrap();
 
@@ -1057,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_revoke_all_for_process_unregistered_returns_error() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         // In-range but not registered.
         assert_eq!(
             mgr.revoke_all_for_process(ProcessId(5)),
@@ -1067,16 +1087,16 @@ mod tests {
 
     #[test]
     fn test_revoke_all_for_process_out_of_range_returns_invalid_operation() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         assert_eq!(
-            mgr.revoke_all_for_process(ProcessId(MAX_PROCESSES as u32)),
+            mgr.revoke_all_for_process(ProcessId(mgr.capacity() as u32)),
             Err(CapabilityError::InvalidOperation)
         );
     }
 
     #[test]
     fn test_revoke_all_for_process_preserves_other_processes() {
-        let mut mgr = CapabilityManager::new();
+        let mut mgr = CapabilityManager::new_for_test();
         let victim = ProcessId(1);
         let bystander = ProcessId(2);
         let endpoint = EndpointId(10);

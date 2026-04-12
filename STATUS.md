@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-11
+last_synced_to_code: 2026-04-11 (Wave 2a landed)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
@@ -14,7 +14,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 
 ## At a glance
 
-- **229 unit tests passing** on host (`x86_64-apple-darwin`)
+- **260 unit tests passing** on host (`x86_64-apple-darwin`)
 - **x86_64**: clean release build, boots in QEMU with 2 CPUs, 7 boot modules running (hello, fs-service, key-store, virtio-net, i219-net, udp-stack, shell)
 - **AArch64**: clean release build, boots in QEMU `virt`, all 7 modules running, full SMP (single-CPU mode tested; SMP timer-on-AP issue tracked)
 - **Bare metal**: USB boot tooling complete (`make img-usb` builds GPT image; `make usb DEVICE=/dev/diskN` writes safely); not yet tested on target hardware (Dell Precision 3630)
@@ -30,7 +30,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **Capability-based IPC (control path)** | Done | 256-byte fixed messages, three-layer enforcement, sender_principal stamping, sharded per-endpoint | `src/ipc/` | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
 | **Capability bulk path (channels)** | Designed, not implemented | Shared memory channels for data plane | — | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
 | **Capability revocation** | Done (Wave 1, bootstrap-only) | `SYS_REVOKE_CAPABILITY` (#27), `CapabilityManager::revoke()`, `revoke_all_for_process()` wired into `handle_exit`. Authority = bootstrap Principal only; grantor/revoke-right paths defer to Wave 4. Audit emit, channel mapping cleanup, policy cache invalidation, and active holder notification are in-code stubs citing Wave 2/3/4. | `src/ipc/capability.rs`, `src/syscalls/dispatcher.rs` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
-| **Boot-time-sized kernel object tables** | Designed, Wave 2a pending | `MAX_PROCESSES` → runtime `num_slots` computed from per-tier `TableSizingPolicy`, dedicated kernel object table region outside the kernel heap. Wave 2a (tables + region), Wave 2b (`CreateProcess` capability), Wave 2c (`CapabilityHandle` refactor + `ProcessId` generation counter), Wave 2d (channels on the new foundation). | — | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) |
+| **Boot-time-sized kernel object tables** | Done (Wave 2a) | `MAX_PROCESSES` removed as compile-time constant. `num_slots` computed at boot from `config::ACTIVE_POLICY` and frame allocator's tracked memory. Kernel object table region allocated via `FrameAllocator::allocate_contiguous`, HHDM-mapped, carries `ProcessTable` and `CapabilityManager` slot storage as `&'static mut` slices. Per-process heap region allocated on demand (no more PID-derived slab) and reclaimed on process exit via `FrameAllocator::free_contiguous` in `handle_exit`. Wave 2b (`CreateProcess` capability), Wave 2c (`CapabilityHandle` refactor + `ProcessId` generation counter), Wave 2d (channels on the new foundation + full process lifecycle cleanup — PML4/VMA/endpoint-subscription reclaim from Roadmap item 17, folded into 2d because channels force the endpoint-teardown path anyway) pending. | `src/config/tier.rs`, `src/memory/object_table.rs`, `src/process.rs`, `src/ipc/capability.rs`, `src/microkernel/main.rs`, `build.rs` | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) |
 | **Deployment tiers / scope** | Designed, policy-only | Three tiers (Tier 1 ArcOS-Embedded, Tier 2 ArcOS-Standard, Tier 3 ArcOS-Full). Single kernel binary across tiers; tier selection is an install-time choice that decides which `TableSizingPolicy` and which user-space services are loaded. No code gate yet. | — | [ADR-009](docs/adr/009-purpose-tiers-scope.md), [GOVERNANCE.md](GOVERNANCE.md) |
 | **Audit telemetry** | Designed, not implemented | Kernel→userspace event channel for AI observability | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Policy service** | Designed, not implemented | User-space externalization of `on_syscall` decisions | — | [ADR-006](docs/adr/006-policy-service.md) |
@@ -82,7 +82,7 @@ ArcOS uses informal phases to mark identity/storage milestones. These phases are
 | **Phase 1C** | Key-store service degraded mode + signed ObjectStore puts. fs-service requests signing from key-store before ObjPut; falls back to unsigned when key-store is in degraded mode (no runtime YubiKey). | **Done** |
 | **Phase 2A** | First user-space hardware driver. Virtio-net with PCI discovery, virtqueues, DMA bounce buffers, hostile-device validation. | **Done** |
 | **Phase 2B** | First user-space network service. Stateless UDP/IP over virtio-net, with NTP demo. | **Done** |
-| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: Wave 1 (revocation primitive) landed; Wave 2 in progress — see [ADR-008 § Migration Path](docs/adr/008-boot-time-sized-object-tables.md) for the 2a.0→2a→2b→2c→2d decomposition; Wave 3 (telemetry), Wave 4 (policy service) pending** |
+| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: Wave 1 (revocation primitive) landed; Wave 2a.0 (prep docs) landed; Wave 2a (boot-time-sized object tables + runtime `num_slots` + per-process heap reclaim) landed — see [ADR-008 § Migration Path](docs/adr/008-boot-time-sized-object-tables.md). Wave 2b (`CreateProcess` capability), Wave 2c (`CapabilityHandle` refactor + `ProcessId` generation counter), Wave 2d (channels) pending; Wave 3 (telemetry), Wave 4 (policy service) pending** |
 | **Phase 4** | Persistent storage. Virtio-blk driver, disk-backed ObjectStore, ArcObject CLI in shell. | **Planned** |
 | **Phase 5** | Identity-routed networking. Yggdrasil peer service, Ed25519→IPv6 mapping, mesh routing without DNS. | **Planned** |
 | **Phase 6** | Biometric commitment + key recovery. Retinal/facial ZKP enrollment, social attestation, key rotation protocol. | **Planned (post-v1)** |
@@ -118,10 +118,12 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | IPC sender_principal | 4 | Default None, kernel stamping, no-principal path, direct send bypass |
 | ObjectStore types + crypto | 21 | Principal equality, Blake3 hashing, Ed25519 sign/verify, ArcObject creation/author immutability/owner/lineage, ObjectCapSet |
 | RamObjectStore | 12 | Put/get, idempotency, invalid hash rejection, delete, list, capacity, slot reuse, author/owner preservation |
-| Memory subsystem | ~30 | Buddy allocator, frame allocator, heap, paging primitives |
+| Memory subsystem | ~36 | Buddy allocator, frame allocator (including Wave 2a `free_contiguous` round-trip + atomicity tests), heap, paging primitives |
+| Tier configuration (Wave 2a) | 16 | `TableSizingPolicy` field bounds, `num_slots_from` clamp behavior, realistic memory sizes (256 MB / 4 GB / 8 GB / 32 GB / 1 TB) per tier, monotonicity, `binding_constraint_for` per clamp, slot-clamp-shadows-budget-clamp invariant |
+| Kernel object table region (Wave 2a) | 5 | `region_bytes_for` page-aligned and monotonic, `init` produces disjoint valid slices with `None` initialization, rejects zero slots, propagates frame-alloc failure |
 | AArch64 portable logic | 12 | PerCpu offsets, GIC register math, page table descriptor flags |
 | Other | ~70 | Timer, IPC sync channel, ProcessTable, VMA tracker, syscall args, etc. |
-| **Total** | **229** | All passing on `x86_64-apple-darwin` |
+| **Total** | **260** | All passing on `x86_64-apple-darwin` |
 
 Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 
@@ -130,7 +132,8 @@ Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 - **AArch64 SMP timer on AP**: PPI 30 (ARM Generic Timer) does not fire on the second CPU in QEMU `virt`. Single-CPU mode works fully. Investigation pending; may be a QEMU configuration issue or a missing GIC redistributor configuration step on the AP path.
 - **AArch64 device IRQ routing**: GIC `enable_spi()` / `set_spi_trigger()` exist as functions but are not called from the boot path or `handle_wait_irq()`. Device IRQs (virtio, PL011 RX) are not yet functional on AArch64.
 - **ELF loader doesn't merge overlapping segment permissions**: If two PT_LOAD segments share a page with different permissions, the first segment's permissions win. Worked around in user-space linker scripts via `ALIGN(4096)` before `.data`. Loader fix is roadmap item 20.
-- **Process lifecycle cleanup is partial**: `handle_exit` marks the task Terminated and (as of Phase 3 Wave 1) reclaims endpoint capabilities via `revoke_all_for_process()`, but still doesn't reclaim page tables, frames, IPC endpoint subscriptions, or VMA regions. Roadmap item 17.
+- **Process lifecycle cleanup is partial**: `handle_exit` marks the task Terminated, reclaims endpoint capabilities via `revoke_all_for_process()` (Phase 3 Wave 1), and reclaims the per-process heap region via `ProcessTable::destroy_process` → `FrameAllocator::free_contiguous` (Phase 3 Wave 2a). Still not reclaimed: per-process PML4/page table frames, IPC endpoint subscriptions, and VMA regions. Roadmap item 17 — remaining cleanup planned for Phase 3 Wave 2d alongside channel landing, because the channel teardown path (unmap shared pages, issue TLB shootdown per ADR-007 § "How revocation interacts with channels") naturally exercises the same page-table-walk machinery required to reclaim PML4 frames.
+- **Pre-existing user-space driver warnings**: `cargo build` on the `user/virtio-net/` and `user/i219-net/` crates emits `dead_code` / `unused_imports` warnings for scaffolded driver state (PCI field metadata, unused transport constants, `phy_read`/`phy_write` stubs, `DmaBuf::zero`, etc.). These are excluded from the main kernel workspace (`Cargo.toml` exclude list) so they do not affect kernel builds, but surface when `make run` invokes them. Not a correctness issue — the fields/methods are staged for future use. Tracking here so they get cleaned up when the respective drivers get their next real-hardware bring-up pass.
 - **Virtio-net TX completion may require yield to idle on QEMU TCG**: QEMU TCG defers virtio TX processing to its event loop, which runs during guest `hlt`. The driver yields and the idle task hlts, which works for small bursts but the UDP stack's ARP retry/timeout logic doesn't yet exploit this fully.
 
 ## Cross-references

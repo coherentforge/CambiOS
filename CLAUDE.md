@@ -57,9 +57,18 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (229 tests, all passing)
+# Run tests (260 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+
+# Build for a specific deployment tier (Wave 2a / ADR-008 / ADR-009).
+# ARCOS_TIER selects which TableSizingPolicy is compiled in. Default
+# is tier3 when unset — always target tier3 unless specifically
+# working on tier1 or tier2. build.rs reads ARCOS_TIER and emits a
+# single --cfg tierN flag; any other value is a build error.
+ARCOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
+ARCOS_TIER=tier2 cargo build --target x86_64-unknown-none --release
+ARCOS_TIER=tier3 cargo build --target x86_64-unknown-none --release   # same as leaving it unset
 
 # Build ISO + run in QEMU (x86_64) — includes kernel, hello.elf, fs-service
 make iso && make run
@@ -109,15 +118,27 @@ ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targetin
 
 ## Architecture
 
+### Build-time configuration (`build.rs`)
+
+```
+build.rs                      # Reads ARCOS_TIER env var (default: tier3),
+                              # emits --cfg tierN for src/config/tier.rs to
+                              # select the compiled-in TableSizingPolicy.
+                              # See ADR-008 and ADR-009.
+```
+
 ### Kernel (`src/`)
 
 ```
 src/
 ├── lib.rs                    # Crate root, global statics, init, halt
-├── process.rs                # ProcessTable, ProcessDescriptor, VmaTracker
+├── process.rs                # ProcessTable, ProcessDescriptor, VmaTracker (Wave 2a: slice-backed)
 ├── boot_modules.rs           # Boot module registry (name → physical range)
 ├── acpi/
 │   └── mod.rs                # ACPI table parser (RSDP, XSDT, MADT)
+├── config/
+│   ├── mod.rs                # Build-time configuration re-exports
+│   └── tier.rs               # TableSizingPolicy, TIER{1,2,3}_POLICY, num_slots_from, binding_constraint_for (Wave 2a)
 ├── arch/
 │   ├── mod.rs                # cfg-gated architecture shim (re-exports active backend)
 │   ├── spinlock.rs           # Spinlock + IrqSpinlock (interrupt-disabling)
@@ -158,8 +179,9 @@ src/
 ├── memory/
 │   ├── mod.rs                # Memory subsystem init + AArch64 paging (L0-L3, early_map_mmio)
 │   ├── buddy_allocator.rs    # Pure bookkeeping buddy allocator
-│   ├── frame_allocator.rs    # Bitmap-based physical frame allocator (covers 0–2 GiB) + per-CPU FrameCache
+│   ├── frame_allocator.rs    # Bitmap-based physical frame allocator (covers 0–2 GiB) + per-CPU FrameCache + allocate_contiguous / free_contiguous
 │   ├── heap.rs               # Kernel heap allocator (linked-list, GlobalAlloc)
+│   ├── object_table.rs       # Kernel object table region allocator (Wave 2a, ADR-008)
 │   └── paging.rs             # x86_64 page table management (OffsetPageTable)
 ├── microkernel/
 │   └── main.rs               # Kernel entry point, all subsystem init
@@ -234,12 +256,14 @@ User data before user code is **required** by SYSRET selector computation.
 ### Memory Layout
 - **Kernel heap:** 4MB at HHDM+physical, initialized from Limine memory map
 - **Boot stack:** 256KB via Limine StackSizeRequest
+- **Kernel object table region (Wave 2a):** contiguous physical region allocated at boot via `FrameAllocator::allocate_contiguous`, HHDM-mapped, holds two page-aligned subregions — `[Option<ProcessDescriptor>; num_slots]` and `[Option<ProcessCapabilities>; num_slots]`. Size is determined by `config::num_slots()` × (`size_of::<Option<ProcessDescriptor>>() + size_of::<Option<ProcessCapabilities>>()`), rounded up per subregion to a page boundary. Allocated in `init_kernel_object_tables()` in `main.rs` between frame allocator init and GDT setup. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and `src/memory/object_table.rs`.
+- **Per-process heaps (Wave 2a):** each process gets a `HEAP_SIZE` (1 MiB) contiguous physical region, allocated on demand in `ProcessDescriptor::new` via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` and freed in `handle_exit` via `free_contiguous`. No more `PROCESS_HEAP_BASE + pid * HEAP_SIZE` arithmetic — the physical base is whatever the frame allocator hands out. Kernel still accesses the heap via HHDM (`virt_base = phys_base + hhdm_offset`).
 - **User code:** mapped at 0x400000
 - **User stack:** top at 0x800000, 64KB (16 pages), grows down
 - **Per-process PML4:** kernel half cloned (entries 256..511)
 - **HHDM:** Higher Half Direct Map provided by Limine for physical memory access
-- **x86_64 HHDM:** `0xFFFF800000000000`, process heap base `0x800000`
-- **AArch64 HHDM:** `0xFFFF000000000000`, process heap base `0x40800000` (QEMU virt RAM starts at 1 GiB)
+- **x86_64 HHDM:** `0xFFFF800000000000`
+- **AArch64 HHDM:** `0xFFFF000000000000` (QEMU virt RAM starts at 1 GiB)
 - **Frame allocator:** bitmap covers 0-2 GiB physical (524288 frames, 64 KB bitmap in .bss)
 
 ### Lock Ordering (MUST be followed to prevent deadlock)
@@ -450,7 +474,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 229 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3 Wave 1)
+- 260 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3 Wave 1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3 Wave 2a)
 
 ## Post-Change Review Protocol
 

@@ -80,9 +80,7 @@ use arcos_core::println;
 use arcos_core::{BOOT_MODULE_REGISTRY, NEXT_PROCESS_ID};
 use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, BlockReason, TaskId};
 use arcos_core::ipc::{EndpointId, IpcManager, Message, ProcessId, CapabilityRights};
-use arcos_core::ipc::capability::CapabilityManager;
 use arcos_core::interrupts::{IrqNumber, InterruptContext};
-use arcos_core::process::ProcessTable;
 
 // Use the global statics from the library crate
 use arcos_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, INTERRUPT_ROUTER, BOOTSTRAP_PRINCIPAL, OBJECT_STORE};
@@ -289,6 +287,12 @@ unsafe extern "C" fn kmain() -> ! {
 
     // Initialize physical frame allocator from Limine memory map
     init_frame_allocator();
+
+    // Wave 2a (ADR-008): compute num_slots from the active tier policy
+    // and allocate the kernel object table region BEFORE the process
+    // table and capability manager are constructed — they both borrow
+    // slice storage from this region.
+    init_kernel_object_tables();
 
     // Load our GDT (replaces Limine's) — must be before IDT and syscall init
     // On AArch64: no-op (EL1/EL0 managed via exception levels).
@@ -599,11 +603,13 @@ fn init_frame_allocator() {
     // - Kernel heap (base was chosen dynamically by init_kernel_heap)
     let heap_phys = KERNEL_HEAP_PHYS_BASE.load(core::sync::atomic::Ordering::Acquire);
     fa.reserve_region(heap_phys, KERNEL_HEAP_SIZE);
-    // - Process heaps: 32 × 1 MB starting at 0x800000
-    fa.reserve_region(
-        arcos_core::process::PROCESS_HEAP_BASE,
-        arcos_core::process::MAX_PROCESSES as u64 * arcos_core::process::HEAP_SIZE,
-    );
+    //
+    // Wave 2a (ADR-008): per-process heaps are no longer pre-reserved
+    // as a fixed slab at PROCESS_HEAP_BASE. Instead, each process
+    // allocates its heap on demand via `FrameAllocator::allocate_contiguous`
+    // in `ProcessDescriptor::new`, and reclaims it via `free_contiguous`
+    // in `ProcessTable::destroy_process` during `handle_exit`. No
+    // pre-reservation call is needed here.
 
     fa.finalize();
 
@@ -613,6 +619,87 @@ fn init_frame_allocator() {
         fa.free_count() * PAGE_SIZE as usize / (1024 * 1024),
         fa.total_count() * PAGE_SIZE as usize / (1024 * 1024),
     );
+}
+
+/// Wave 2a (ADR-008): compute `num_slots` from the active tier policy
+/// and the available memory figure, allocate the kernel object table
+/// region from the frame allocator, and install the slice-backed
+/// `ProcessTable` and `CapabilityManager` into their globals.
+///
+/// After this runs, `PROCESS_TABLE` and `CAPABILITY_MANAGER` are set
+/// but empty — the first three kernel tasks are populated later in
+/// `process_table_init` and `capability_manager_init`, respectively.
+fn init_kernel_object_tables() {
+    use arcos_core::config;
+    use arcos_core::ipc::capability::CapabilityManager;
+    use arcos_core::memory::frame_allocator::PAGE_SIZE;
+    use arcos_core::memory::object_table;
+    use arcos_core::process::ProcessTable;
+    use arcos_core::{CAPABILITY_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
+
+    // Available memory figure: bytes tracked by the frame allocator.
+    // This is what's actually available for kernel allocations after
+    // USABLE regions have been added and reserved regions subtracted.
+    let available_memory_bytes = {
+        let fa = FRAME_ALLOCATOR.lock();
+        fa.total_count() as u64 * PAGE_SIZE
+    };
+
+    // Compute num_slots and the binding constraint from the active
+    // tier policy. Purely functional — no side effects.
+    let num_slots = config::init_num_slots(available_memory_bytes);
+    let binding = config::binding_constraint_for(
+        &config::ACTIVE_POLICY,
+        available_memory_bytes,
+    );
+
+    // Allocate the contiguous region from the frame allocator and
+    // carve out the two page-aligned subregions.
+    let hhdm = arcos_core::hhdm_offset();
+    let table = {
+        let mut fa = FRAME_ALLOCATOR.lock();
+        match object_table::init(&mut fa, num_slots, hhdm, binding) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("✗ Kernel object table allocation failed: {:?}", e);
+                println!("  tier = {}, num_slots = {}, binding = {}",
+                    config::ACTIVE_TIER_NAME,
+                    num_slots,
+                    binding.as_str(),
+                );
+                arcos_core::halt();
+            }
+        }
+    };
+
+    // Operator-visible boot log line — per ADR-008 § Migration Path
+    // step 2a, this line documents the tier, slot count, region size,
+    // and which constraint bound the computation. When `SLOT_OVERHEAD`
+    // grows or workload pressure shifts, this line is the first place
+    // to look.
+    println!(
+        "✓ Kernel object tables: {} slots × ({} + {}) bytes = {} KiB, \
+         tier={}, binding={}, phys={:#x}",
+        table.num_slots,
+        core::mem::size_of::<Option<arcos_core::process::ProcessDescriptor>>(),
+        core::mem::size_of::<Option<arcos_core::ipc::capability::ProcessCapabilities>>(),
+        table.region_bytes / 1024,
+        config::ACTIVE_TIER_NAME,
+        table.binding.as_str(),
+        table.region_base_phys,
+    );
+
+    // Move the two slices into their respective globals. Both are
+    // `Box<T>` wrappers around `&'static mut [...]` slices — the slot
+    // storage lives in the object table region, only the small
+    // header lands on the kernel heap.
+    let process_table = ProcessTable::from_object_slice(table.process_slots, hhdm)
+        .expect("failed to wrap ProcessTable around object table slice");
+    let capability_manager = CapabilityManager::from_object_slice(table.capability_slots)
+        .expect("failed to wrap CapabilityManager around object table slice");
+
+    *PROCESS_TABLE.lock() = Some(process_table);
+    *CAPABILITY_MANAGER.lock() = Some(capability_manager);
 }
 
 /// Map ACPI-related physical memory into the HHDM (x86_64 only).
@@ -892,20 +979,20 @@ fn ipc_init() {
     println!("✓ IPC manager ready [interceptor active, per-endpoint sharding enabled]");
 }
 
-/// Initialize capability manager.
+/// Initialize capability manager — register the first 3 kernel processes.
 ///
-/// Only registers processes 0-2 (kernel tasks created in process_table_init).
-/// Boot module processes are registered later when load_boot_modules calls
-/// register_process_capabilities after their process table entries exist.
+/// Wave 2a: the `CapabilityManager` itself was constructed in
+/// `init_kernel_object_tables` with slice-backed storage. This step
+/// only registers processes 0-2 (kernel tasks created in
+/// process_table_init) and grants their initial capabilities.
+/// Boot module processes are registered later when load_boot_modules
+/// calls register_process_capabilities after their process table
+/// entries exist.
 fn capability_manager_init() {
     let mut guard = CAPABILITY_MANAGER.lock();
-    let cap_mgr = match CapabilityManager::new_boxed() {
-        Some(cm) => guard.insert(cm),
-        None => {
-            println!("✗ Failed to allocate CapabilityManager — halting");
-            arcos_core::halt();
-        }
-    };
+    let cap_mgr = guard
+        .as_mut()
+        .expect("CAPABILITY_MANAGER must be initialized by init_kernel_object_tables");
 
     // Only register processes that already exist in the process table (0-2).
     // Processes 3+ are registered on-demand when user tasks are created.
@@ -1005,28 +1092,39 @@ fn object_store_init() {
     println!("✓ Object store initialized (RAM, capacity: {} objects)", arcos_core::fs::ram::MAX_OBJECTS);
 }
 
-/// Initialize process table
+/// Initialize process table — populate the first 3 kernel processes.
+///
+/// Wave 2a: the `ProcessTable` itself was constructed in
+/// `init_kernel_object_tables` with slice-backed storage. This step
+/// only creates the first three `ProcessDescriptor`s, allocating each
+/// one's heap via the frame allocator.
 fn process_table_init() {
-    let mut pt = match ProcessTable::new_boxed(arcos_core::hhdm_offset()) {
-        Some(pt) => pt,
-        None => {
-            println!("✗ Failed to allocate ProcessTable — halting");
-            arcos_core::halt();
-        }
-    };
-    
-    // Create process descriptors for the first 3 processes (matching task count)
+    use arcos_core::FRAME_ALLOCATOR;
+
+    // Lock order: PROCESS_TABLE (5) -> FRAME_ALLOCATOR (6). Valid.
+    let mut pt_guard = PROCESS_TABLE.lock();
+    let pt = pt_guard
+        .as_mut()
+        .expect("PROCESS_TABLE must be initialized by init_kernel_object_tables");
+
+    let mut fa_guard = FRAME_ALLOCATOR.lock();
+
+    // Create process descriptors for the first 3 processes (matching
+    // task count). Each one gets a freshly allocated heap region via
+    // FrameAllocator::allocate_contiguous (256 frames / 1 MiB each).
     for i in 0..3 {
         let process_id = ProcessId(i as u32);
-        if let Err(e) = pt.create_process(process_id, None) {
-            println!("  ✗ Failed to create process {}: {}", i, e);
-        } else {
-            let heap_base = pt.get_heap_base(process_id);
-            println!("  ✓ Process {} heap at {:#x}", i, heap_base);
+        match pt.create_process(process_id, &mut *fa_guard, /* create_page_table = */ false) {
+            Ok(()) => {
+                let heap_base = pt.get_heap_base(process_id);
+                println!("  ✓ Process {} heap at {:#x}", i, heap_base);
+            }
+            Err(e) => {
+                println!("  ✗ Failed to create process {}: {}", i, e);
+            }
         }
     }
-    
-    *PROCESS_TABLE.lock() = Some(pt);
+
     println!("✓ Process table initialized");
 }
 

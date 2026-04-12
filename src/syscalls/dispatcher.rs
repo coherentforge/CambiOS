@@ -284,9 +284,40 @@ impl SyscallDispatcher {
             }
         };
 
+        // Reclaim the process heap region back to the frame allocator.
+        //
+        // Wave 2a (ADR-008): per-process heaps are allocated on demand
+        // via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` in
+        // `ProcessDescriptor::new`. Without this reclaim, the heap
+        // frames would leak and Tier 3 deployments would eventually
+        // exhaust the frame allocator after enough process exits.
+        //
+        // `ProcessTable::destroy_process` internally calls
+        // `free_contiguous(phys_base, HEAP_PAGES)` on the descriptor
+        // and clears the slot. Lock ordering: PROCESS_TABLE(5) ->
+        // FRAME_ALLOCATOR(6), valid.
+        let heap_reclaimed = {
+            let mut pt_guard = crate::PROCESS_TABLE.lock();
+            if let Some(pt) = pt_guard.as_mut() {
+                if pt.slot_occupied(ctx.process_id) {
+                    let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+                    pt.destroy_process(ctx.process_id, &mut *fa_guard);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
         crate::println!(
-            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s))",
-            ctx.process_id.0, ctx.task_id.0, exit_code, revoked_count
+            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s){})",
+            ctx.process_id.0,
+            ctx.task_id.0,
+            exit_code,
+            revoked_count,
+            if heap_reclaimed { ", heap" } else { "" }
         );
 
         // Yield to next task. Terminated tasks are never re-scheduled,

@@ -375,7 +375,7 @@ pub fn load_elf_process(
 
     // --- Step 4: Create process with per-process page table ---
     process_table
-        .create_process(process_id, Some(frame_alloc))
+        .create_process(process_id, frame_alloc, /* create_page_table = */ true)
         .map_err(|_| LoaderError::ProcessCreationFailed)?;
 
     let cr3 = process_table.get_cr3(process_id);

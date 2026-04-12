@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 pub mod buddy_allocator;
 pub mod frame_allocator;
 pub mod heap;
+pub mod object_table;
 
 #[cfg(target_arch = "x86_64")]
 pub mod paging;

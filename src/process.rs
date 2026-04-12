@@ -7,7 +7,7 @@
 /// that records user-space virtual memory allocations for proper free/unmap.
 
 use crate::memory::buddy_allocator::BuddyAllocator;
-use crate::memory::frame_allocator::FrameAllocator;
+use crate::memory::frame_allocator::{FrameAllocator, FrameAllocError, PAGE_SIZE};
 use crate::memory::paging;
 use crate::ipc::ProcessId;
 extern crate alloc;
@@ -131,35 +131,41 @@ impl VmaTracker {
     }
 }
 
-/// SCAFFOLDING: maximum number of concurrent processes in the entire system.
-/// Why: each ProcessDescriptor contains a ~20 KB allocator (bitmap + order map),
-///      and the verification model wants a small bounded process set.
-/// Replace when: a real shell session + a couple of pipes brushes 32 (i.e. as soon
-///      as the v1 shell + spawn lands and a user runs anything non-trivial). Likely
-///      target 256+. Note: `MAX_ENDPOINTS` is paired with this and grows with it.
-///      See ASSUMPTIONS.md.
-pub const MAX_PROCESSES: usize = 32;
+// ============================================================================
+// Wave 2a: MAX_PROCESSES is no longer a compile-time constant.
+//
+// The number of process slots is now computed at boot from the active
+// tier policy and the available-memory figure — see
+// `crate::config::num_slots()`. Use that function (or `ProcessTable::
+// capacity()`) instead of any old reference to `MAX_PROCESSES`.
+//
+// Per ADR-008, the tables that MAX_PROCESSES used to size now live in
+// the kernel object table region, allocated once at boot in
+// `crate::memory::object_table::init()`.
+// ============================================================================
 
-/// Base physical address for process heaps.
-/// Each process gets its own heap at: PROCESS_HEAP_BASE + (pid * HEAP_SIZE).
-///
-/// x86_64: 8MB — above the kernel heap (4MB at 0x200000), within low RAM.
-/// AArch64 (QEMU virt): RAM starts at 0x4000_0000 (1 GiB). Physical addresses
-/// below that are MMIO (GIC, UART, etc). We use 0x4080_0000 (1 GiB + 8 MiB).
-#[cfg(target_arch = "x86_64")]
-pub const PROCESS_HEAP_BASE: u64 = 0x800000;
-#[cfg(target_arch = "aarch64")]
-pub const PROCESS_HEAP_BASE: u64 = 0x4080_0000;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub const PROCESS_HEAP_BASE: u64 = 0x800000;
 /// SCAFFOLDING: per-process heap size (1 MiB).
-/// Why: fixed budget hardcoded into the per-PID address arithmetic
-///      (`PROCESS_HEAP_BASE + pid * HEAP_SIZE`). Conservative default that lets
-///      every PID get its heap at a deterministic offset.
-/// Replace when: udp-stack is already feeling this. The growth path is non-trivial
-///      because the value is baked into the address layout — needs a layout change,
-///      not a constant bump. See ASSUMPTIONS.md.
+/// Why: default budget per process. Today every process gets a
+///      contiguous physical heap of this size, allocated from the
+///      frame allocator in `ProcessDescriptor::new` and freed in
+///      `handle_exit` via `FrameAllocator::free_contiguous`. No
+///      longer tied to a pre-reserved slab.
+/// Replace when: udp-stack is already feeling this. Future: per-service
+///      heap sizing, lazy heap mapping, or growable heap via extra
+///      allocations. See ASSUMPTIONS.md.
 pub const HEAP_SIZE: u64 = 0x100000;
+
+/// Number of 4 KiB frames in a process heap (1 MiB / 4 KiB = 256).
+pub const HEAP_PAGES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
+
+/// Errors from `ProcessDescriptor::new` — today, only heap allocation
+/// can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessCreateError {
+    /// The frame allocator could not provide a contiguous heap region.
+    /// Wraps the underlying frame allocator error for diagnostics.
+    HeapAllocFailure(FrameAllocError),
+}
 
 /// Process descriptor with heap allocator and VMA tracking.
 ///
@@ -171,6 +177,11 @@ pub const HEAP_SIZE: u64 = 0x100000;
 /// - `phys_base` is page-aligned and within the physical address range
 ///   covered by the frame allocator.
 /// - `virt_base == phys_base + hhdm_offset` (HHDM mapping for kernel access).
+/// - `heap_size == HEAP_PAGES * PAGE_SIZE` for every currently-live descriptor.
+/// - The physical range `[phys_base, phys_base + heap_size)` was allocated
+///   via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` and must be freed
+///   via `FrameAllocator::free_contiguous(phys_base, HEAP_PAGES)` exactly
+///   once when the process exits.
 /// - All VMA entries in `vma` reference user-space addresses in the lower
 ///   canonical half (< `USER_SPACE_END`).
 /// - `allocator` offsets are relative to `phys_base`/`virt_base`, not absolute.
@@ -190,20 +201,58 @@ pub struct ProcessDescriptor {
 }
 
 impl ProcessDescriptor {
-    /// Create a new process descriptor
+    /// Create a new process descriptor, dynamically allocating its
+    /// heap region from the frame allocator.
+    ///
+    /// Wave 2a: heap is no longer at a deterministic PID-derived
+    /// physical address. Each process gets a fresh contiguous region
+    /// from the frame allocator, which means process exit MUST free
+    /// it via [`ProcessDescriptor::reclaim_heap`] to avoid a leak.
     ///
     /// `hhdm_offset`: the higher-half direct map offset from Limine,
-    /// so the kernel can access process heap memory.
-    pub fn new(process_id: ProcessId, hhdm_offset: u64) -> Self {
-        let phys_base = PROCESS_HEAP_BASE + (process_id.0 as u64 * HEAP_SIZE);
-        ProcessDescriptor {
+    /// so the kernel can access process heap memory via
+    /// `virt_base = phys_base + hhdm_offset`.
+    ///
+    /// Returns `Err(ProcessCreateError::HeapAllocFailure(_))` if the
+    /// frame allocator cannot provide `HEAP_PAGES` contiguous frames.
+    /// The caller's responsibility is to propagate the error to its
+    /// own caller (usually `ProcessTable::create_process`).
+    pub fn new(
+        _process_id: ProcessId,
+        hhdm_offset: u64,
+        frame_alloc: &mut FrameAllocator,
+    ) -> Result<Self, ProcessCreateError> {
+        let frame = frame_alloc
+            .allocate_contiguous(HEAP_PAGES)
+            .map_err(ProcessCreateError::HeapAllocFailure)?;
+        let phys_base = frame.addr;
+        Ok(ProcessDescriptor {
             allocator: BuddyAllocator::new(),
             phys_base,
             virt_base: phys_base + hhdm_offset,
             heap_size: HEAP_SIZE,
             cr3: 0, // 0 = uses kernel page table (no per-process table yet)
             vma: VmaTracker::new(),
-        }
+        })
+    }
+
+    /// Return the heap region back to the frame allocator.
+    ///
+    /// Called by `handle_exit` / `ProcessTable::destroy_process` as
+    /// part of process lifecycle cleanup (Roadmap item 17). After
+    /// this call, the descriptor's `phys_base` and `virt_base` point
+    /// at frames that no longer belong to this process — the caller
+    /// must drop the descriptor immediately and never touch it again.
+    ///
+    /// Returns the frame allocator error on failure, but in normal
+    /// operation this should never fail: we allocated `HEAP_PAGES`
+    /// contiguous frames in `new`, and the bitmap invariant
+    /// guarantees `free_contiguous` succeeds on any base we allocated.
+    pub fn reclaim_heap(
+        &self,
+        frame_alloc: &mut FrameAllocator,
+    ) -> Result<(), FrameAllocError> {
+        frame_alloc.free_contiguous(self.phys_base, HEAP_PAGES)
     }
 
     /// Allocate memory, returning the kernel-accessible virtual address.
@@ -225,60 +274,70 @@ impl ProcessDescriptor {
     }
 }
 
-/// Process table
+/// Process table — slice-backed storage from the kernel object table
+/// region.
+///
+/// Wave 2a: storage is a `&'static mut [Option<ProcessDescriptor>]`
+/// slice handed in from `memory::object_table::init()`. The slice
+/// length equals `config::num_slots()`, computed at boot from the
+/// active tier policy and available RAM. See ADR-008.
 pub struct ProcessTable {
-    processes: [Option<ProcessDescriptor>; MAX_PROCESSES],
+    processes: &'static mut [Option<ProcessDescriptor>],
     /// Cached HHDM offset for creating new processes
     hhdm_offset: u64,
 }
 
 impl ProcessTable {
-    /// Create an empty process table
-    pub fn new(hhdm_offset: u64) -> Self {
-        ProcessTable {
-            processes: [const { None }; MAX_PROCESSES],
+    /// Construct a process table backed by an already-initialized
+    /// slice from the kernel object table region.
+    ///
+    /// The slice must have every slot pre-initialized to `None`
+    /// (which `object_table::init` guarantees). The returned
+    /// `Box<Self>` lives on the kernel heap; only its small header
+    /// (slice pointer, length, hhdm_offset) lands there — the actual
+    /// slot storage lives in the object table region.
+    pub fn from_object_slice(
+        processes: &'static mut [Option<ProcessDescriptor>],
+        hhdm_offset: u64,
+    ) -> Option<Box<Self>> {
+        // Small header — trivial allocation, no manual slot init needed.
+        let table = ProcessTable {
+            processes,
             hhdm_offset,
-        }
+        };
+        Some(Box::new(table))
     }
 
-    /// Create an empty process table directly on the heap.
-    ///
-    /// Allocates raw memory (MAX_PROCESSES × size_of::<ProcessDescriptor>() bytes)
-    /// and initializes each slot explicitly to `None`.
-    /// We cannot rely on zeroed memory == `None` because the compiler may
-    /// assign discriminant 0 to `Some` for `Option<ProcessDescriptor>` on
-    /// bare-metal targets (observed on `x86_64-unknown-none` release builds).
-    pub fn new_boxed(hhdm_offset: u64) -> Option<Box<Self>> {
-        use alloc::alloc::{alloc, Layout};
-        let layout = Layout::new::<Self>();
-        // SAFETY: layout is non-zero-sized (ProcessTable contains arrays).
-        let ptr = unsafe { alloc(layout) as *mut Self };
-        if ptr.is_null() {
-            return None;
-        }
-        // SAFETY: ptr is valid, properly aligned, and large enough for ProcessTable.
-        // We initialize every field before constructing the Box.
-        unsafe {
-            for i in 0..MAX_PROCESSES {
-                core::ptr::addr_of_mut!((*ptr).processes[i]).write(None);
-            }
-            core::ptr::addr_of_mut!((*ptr).hhdm_offset).write(hhdm_offset);
-            Some(Box::from_raw(ptr))
-        }
+    /// Number of slots in the table (equal to `config::num_slots()`).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.processes.len()
     }
 
-    /// Create a new process with its own page table.
+    /// Create a new process and allocate its heap region.
     ///
-    /// Allocates a fresh PML4 with kernel mappings cloned, then maps the
-    /// process heap region as user-accessible. Pass `None` for frame_alloc
-    /// to skip page table creation (process uses kernel page table).
+    /// Wave 2a: always requires a frame allocator now, because
+    /// `ProcessDescriptor::new` itself allocates the per-process heap
+    /// via `FrameAllocator::allocate_contiguous(HEAP_PAGES)`. The
+    /// previous `frame_alloc: Option<...>` parameter went away — if
+    /// you don't want a per-process page table, pass
+    /// `create_page_table = false`.
+    ///
+    /// Failure modes:
+    /// - `"Process ID out of range"` — `process_id.0 >= capacity()`
+    /// - `"Process already exists"` — slot already `Some`
+    /// - `"Failed to allocate process heap"` — frame allocator
+    ///   exhausted (after Wave 2a, heaps are allocated on demand)
+    /// - `"Failed to allocate page table"` — per-process PML4
+    ///   allocation failed
     pub fn create_process(
         &mut self,
         process_id: ProcessId,
-        frame_alloc: Option<&mut FrameAllocator>,
+        frame_alloc: &mut FrameAllocator,
+        create_page_table: bool,
     ) -> Result<(), &'static str> {
         let idx = process_id.0 as usize;
-        if idx >= MAX_PROCESSES {
+        if idx >= self.processes.len() {
             return Err("Process ID out of range");
         }
 
@@ -286,18 +345,30 @@ impl ProcessTable {
             return Err("Process already exists");
         }
 
-        let mut desc = ProcessDescriptor::new(process_id, self.hhdm_offset);
+        let mut desc = match ProcessDescriptor::new(process_id, self.hhdm_offset, frame_alloc) {
+            Ok(d) => d,
+            Err(ProcessCreateError::HeapAllocFailure(_)) => {
+                return Err("Failed to allocate process heap");
+            }
+        };
 
         // Optionally create a per-process page table
-        if let Some(fa) = frame_alloc {
-            match paging::create_process_page_table(fa) {
+        if create_page_table {
+            match paging::create_process_page_table(frame_alloc) {
                 Ok(cr3) => {
                     desc.cr3 = cr3;
                     // Kernel access to the process heap is already available
                     // via the cloned HHDM mappings in the kernel half (entries 256..512).
                     // User-space mappings at low addresses are set up separately.
                 }
-                Err(_) => return Err("Failed to allocate page table"),
+                Err(_) => {
+                    // Unwind the heap allocation so we don't leak frames.
+                    // If free_contiguous itself fails we still bubble up the
+                    // original error to the caller — at that point the frame
+                    // allocator is inconsistent regardless.
+                    let _ = desc.reclaim_heap(frame_alloc);
+                    return Err("Failed to allocate page table");
+                }
             }
         }
 
@@ -309,7 +380,7 @@ impl ProcessTable {
     /// Returns 0 on failure.
     pub fn allocate_for(&mut self, process_id: ProcessId, size: usize) -> usize {
         let idx = process_id.0 as usize;
-        if idx >= MAX_PROCESSES {
+        if idx >= self.processes.len() {
             return 0;
         }
         match self.processes[idx].as_mut() {
@@ -321,7 +392,7 @@ impl ProcessTable {
     /// Free memory for a process by kernel-accessible virtual address.
     pub fn free_for(&mut self, process_id: ProcessId, virt_addr: usize) -> bool {
         let idx = process_id.0 as usize;
-        if idx >= MAX_PROCESSES {
+        if idx >= self.processes.len() {
             return false;
         }
         match self.processes[idx].as_mut() {
@@ -330,33 +401,60 @@ impl ProcessTable {
         }
     }
 
-    /// Get process physical heap base address
+    /// Get process physical heap base address from the stored descriptor.
+    ///
+    /// Wave 2a: heaps are no longer at a deterministic
+    /// `PROCESS_HEAP_BASE + pid * HEAP_SIZE` address — the base is
+    /// whatever the frame allocator handed us at creation time. This
+    /// getter reads the stored `phys_base` field.
     pub fn get_heap_base(&self, process_id: ProcessId) -> u64 {
-        PROCESS_HEAP_BASE + (process_id.0 as u64 * HEAP_SIZE)
+        let idx = process_id.0 as usize;
+        if idx < self.processes.len() {
+            self.processes[idx].as_ref().map(|p| p.phys_base).unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     /// Get process heap size
     pub fn get_heap_size(&self, process_id: ProcessId) -> u64 {
         let idx = process_id.0 as usize;
-        if idx < MAX_PROCESSES {
+        if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| p.heap_size).unwrap_or(0)
         } else {
             0
         }
     }
 
-    /// Destroy a process
-    pub fn destroy_process(&mut self, process_id: ProcessId) {
+    /// Destroy a process and reclaim its heap back to the frame allocator.
+    ///
+    /// Wave 2a / Roadmap item 17 (partial): the per-process heap
+    /// region is freed via `FrameAllocator::free_contiguous` so
+    /// subsequent process creations can reuse those frames. Page
+    /// tables, VMA regions, and endpoint subscriptions are still
+    /// leaked — those are tracked separately under item 17.
+    pub fn destroy_process(
+        &mut self,
+        process_id: ProcessId,
+        frame_alloc: &mut FrameAllocator,
+    ) {
         let idx = process_id.0 as usize;
-        if idx < MAX_PROCESSES {
-            self.processes[idx] = None;
+        if idx >= self.processes.len() {
+            return;
+        }
+        if let Some(desc) = self.processes[idx].take() {
+            // Best effort: reclaim the heap. If free_contiguous fails
+            // (frame allocator corruption, which shouldn't happen),
+            // we've already removed the descriptor from the table —
+            // the frames are lost but the slot is free.
+            let _ = desc.reclaim_heap(frame_alloc);
         }
     }
 
     /// Get a process's CR3 (PML4 physical address). Returns 0 if no per-process page table.
     pub fn get_cr3(&self, process_id: ProcessId) -> u64 {
         let idx = process_id.0 as usize;
-        if idx < MAX_PROCESSES {
+        if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| p.cr3).unwrap_or(0)
         } else {
             0
@@ -366,13 +464,13 @@ impl ProcessTable {
     /// Check whether a process slot is occupied.
     pub fn slot_occupied(&self, process_id: ProcessId) -> bool {
         let idx = process_id.0 as usize;
-        idx < MAX_PROCESSES && self.processes[idx].is_some()
+        idx < self.processes.len() && self.processes[idx].is_some()
     }
 
     /// Get mutable access to a process's VMA tracker.
     pub fn vma_mut(&mut self, process_id: ProcessId) -> Option<&mut VmaTracker> {
         let idx = process_id.0 as usize;
-        if idx < MAX_PROCESSES {
+        if idx < self.processes.len() {
             self.processes[idx].as_mut().map(|p| &mut p.vma)
         } else {
             None
@@ -382,7 +480,7 @@ impl ProcessTable {
     /// Get read-only access to a process's VMA tracker.
     pub fn vma(&self, process_id: ProcessId) -> Option<&VmaTracker> {
         let idx = process_id.0 as usize;
-        if idx < MAX_PROCESSES {
+        if idx < self.processes.len() {
             self.processes[idx].as_ref().map(|p| &p.vma)
         } else {
             None

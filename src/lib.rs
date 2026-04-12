@@ -21,6 +21,7 @@ extern crate alloc;
 use x86_64::instructions::hlt;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+pub mod config;
 pub mod io;
 pub mod memory;
 pub mod interrupts;

@@ -205,13 +205,20 @@ impl FrameAllocator {
     /// Returns the physical address of the first frame, or an error.
     /// All frames in the run are marked as allocated.
     ///
-    /// For DMA buffers where the device needs contiguous physical memory.
+    /// Two use cases today:
+    /// - DMA buffers (virtio-net, etc.) where the device needs a small
+    ///   (≤ 64-frame / 256 KiB) physically contiguous buffer.
+    /// - Per-process heaps (Wave 2a) where each process needs a
+    ///   `HEAP_SIZE / PAGE_SIZE` contiguous physical run (256 frames /
+    ///   1 MiB by default). Previously capped at 64 frames; cap lifted
+    ///   because heaps are larger and the bitmap scan is `O(total_frames)`
+    ///   regardless of `count`, so there's no runtime concern.
     pub fn allocate_contiguous(&mut self, count: usize) -> Result<PhysFrame, FrameAllocError> {
         if !self.initialized {
             return Err(FrameAllocError::NotInitialized);
         }
 
-        if count == 0 || count > 64 {
+        if count == 0 {
             return Err(FrameAllocError::OutOfMemory);
         }
 
@@ -249,6 +256,61 @@ impl FrameAllocator {
         }
 
         Err(FrameAllocError::OutOfMemory)
+    }
+
+    /// Free `count` physically contiguous 4 KiB frames starting at `base`.
+    ///
+    /// Inverse of `allocate_contiguous`. Used by the process heap reclaim
+    /// path in `handle_exit` (Wave 2a).
+    ///
+    /// All `count` frames must currently be allocated; partially-freed
+    /// regions return `DoubleFree` and leave the bitmap unchanged (the
+    /// check is performed as a pre-pass so partial success is impossible).
+    pub fn free_contiguous(
+        &mut self,
+        base: u64,
+        count: usize,
+    ) -> Result<(), FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::NotInitialized);
+        }
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        if base % PAGE_SIZE != 0 {
+            return Err(FrameAllocError::InvalidFrame);
+        }
+
+        let start_idx = (base / PAGE_SIZE) as usize;
+        let end_idx = start_idx.saturating_add(count);
+
+        if end_idx > self.total_frames {
+            return Err(FrameAllocError::InvalidFrame);
+        }
+
+        // Pre-pass: every frame in [start_idx, end_idx) must be allocated,
+        // otherwise fail without touching the bitmap.
+        for idx in start_idx..end_idx {
+            if !self.is_set(idx) {
+                return Err(FrameAllocError::DoubleFree);
+            }
+        }
+
+        // Clear all bits and update the free-frame counter.
+        for idx in start_idx..end_idx {
+            self.clear_bit(idx);
+        }
+        self.free_frames += count;
+
+        // Move hint back so future allocations can re-use this range.
+        let word_idx = start_idx / 64;
+        if word_idx < self.search_hint {
+            self.search_hint = word_idx;
+        }
+
+        Ok(())
     }
 
     /// Free a previously allocated frame.
@@ -705,13 +767,37 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_contiguous_over_max() {
+    fn test_allocate_contiguous_large_run() {
+        // Wave 2a: the 64-frame cap on allocate_contiguous was lifted so
+        // process heaps (256 frames / 1 MiB by default) can be allocated
+        // through this API. Verify that a 256-frame run works end-to-end.
         let mut fa = FrameAllocator::new();
-        fa.add_region(0x100000, 100 * 4096);
+        fa.add_region(0x100000, 300 * 4096); // 300 frames
         fa.finalize();
 
-        // 65 exceeds the 64-page max
-        assert_eq!(fa.allocate_contiguous(65), Err(FrameAllocError::OutOfMemory));
+        let base = fa.allocate_contiguous(256).unwrap();
+        assert_eq!(base.addr, 0x100000);
+        assert_eq!(fa.free_count(), 44);
+
+        // Request a second 256-frame run — fails, only 44 frames left.
+        assert_eq!(
+            fa.allocate_contiguous(256),
+            Err(FrameAllocError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn test_allocate_contiguous_larger_than_region() {
+        // Requesting more frames than exist should fail with OutOfMemory,
+        // not succeed by accident. (Replaces the old 64-frame cap test.)
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 100 * 4096); // 100 frames
+        fa.finalize();
+
+        assert_eq!(
+            fa.allocate_contiguous(101),
+            Err(FrameAllocError::OutOfMemory)
+        );
     }
 
     #[test]
@@ -734,5 +820,94 @@ mod tests {
 
         fa.allocate_contiguous(16).unwrap();
         assert_eq!(fa.free_count(), 18);
+    }
+
+    #[test]
+    fn test_free_contiguous_round_trip() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 300 * 4096); // 300 frames
+        fa.finalize();
+        assert_eq!(fa.free_count(), 300);
+
+        // Allocate a 256-frame heap-sized run and free it.
+        let base = fa.allocate_contiguous(256).unwrap();
+        assert_eq!(fa.free_count(), 44);
+
+        fa.free_contiguous(base.addr, 256).unwrap();
+        assert_eq!(fa.free_count(), 300);
+
+        // The freed range should be allocatable again at the same base
+        // (search hint was rolled back).
+        let base2 = fa.allocate_contiguous(256).unwrap();
+        assert_eq!(base2.addr, base.addr);
+    }
+
+    #[test]
+    fn test_free_contiguous_double_free_atomic() {
+        // Partially-overlapping free should fail without touching the bitmap.
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 20 * 4096);
+        fa.finalize();
+
+        let base = fa.allocate_contiguous(8).unwrap();
+        fa.free_contiguous(base.addr, 4).unwrap(); // Free first 4
+        assert_eq!(fa.free_count(), 16);
+
+        // Try to free the whole 8-frame range — frames 4..8 are still
+        // allocated, but frames 0..4 are already free. The pre-pass
+        // detects this and returns DoubleFree before touching the bitmap.
+        assert_eq!(
+            fa.free_contiguous(base.addr, 8),
+            Err(FrameAllocError::DoubleFree)
+        );
+
+        // Bitmap was not mutated — the remaining 4 allocated frames are
+        // still accounted for.
+        assert_eq!(fa.free_count(), 16);
+
+        // We can still free the trailing 4 correctly.
+        fa.free_contiguous(base.addr + 4 * PAGE_SIZE, 4).unwrap();
+        assert_eq!(fa.free_count(), 20);
+    }
+
+    #[test]
+    fn test_free_contiguous_unaligned_base() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096);
+        fa.finalize();
+
+        let base = fa.allocate_contiguous(4).unwrap();
+
+        // Unaligned base rejected.
+        assert_eq!(
+            fa.free_contiguous(base.addr + 1, 4),
+            Err(FrameAllocError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn test_free_contiguous_out_of_range() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096);
+        fa.finalize();
+
+        // start_idx + count > total_frames -> InvalidFrame.
+        // 0x100000 = frame 256, + 8 = frame 264, but we only have frames
+        // 256..266 (10 frames). Requesting 20 from 256 -> frame 276 > 266.
+        assert_eq!(
+            fa.free_contiguous(0x100000, 20),
+            Err(FrameAllocError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn test_free_contiguous_zero_count_is_noop() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 10 * 4096);
+        fa.finalize();
+
+        let free_before = fa.free_count();
+        assert!(fa.free_contiguous(0x100000, 0).is_ok());
+        assert_eq!(fa.free_count(), free_before);
     }
 }
