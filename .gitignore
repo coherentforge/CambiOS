@@ -8,3 +8,4 @@ tools/*/target/
 iso_root/
 .DS_Store
 *.log
+.symbols

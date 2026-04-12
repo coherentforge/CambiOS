@@ -63,7 +63,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean img-x86 run-img-x86 img-usb run-img-usb usb verify-usb kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net i219-net udp-stack shell user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net i219-net udp-stack shell user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -426,6 +426,12 @@ verify-usb:
 
 test:
 	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+
+# Generate machine-readable symbol index for AI-assisted development.
+# Output: .symbols (gitignored). Read by Claude Code at session start
+# to avoid repeated grep calls for symbol locations and line numbers.
+symbols:
+	python3 tools/gen-symbols.py
 
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/arcos_microkernel

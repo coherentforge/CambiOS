@@ -70,6 +70,9 @@ ARCOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
 ARCOS_TIER=tier2 cargo build --target x86_64-unknown-none --release
 ARCOS_TIER=tier3 cargo build --target x86_64-unknown-none --release   # same as leaving it unset
 
+# Generate symbol index for AI-assisted navigation (read .symbols at session start)
+make symbols
+
 # Build ISO + run in QEMU (x86_64) — includes kernel, hello.elf, fs-service
 make iso && make run
 
@@ -485,6 +488,13 @@ After any code change, run through this checklist systematically before consider
 # Unit tests (host)
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
+# Clippy lint pass (catches correctness + style issues beyond warnings)
+# Note: not yet -D warnings — 164 pre-existing style lints need a
+# dedicated cleanup pass first. Run without -D to check for NEW lints
+# introduced by the current change. Once the baseline is clean,
+# promote to -D warnings.
+cargo clippy --target x86_64-unknown-none 2>&1 | grep "^error\|^warning" | head -20
+
 # Kernel build — x86_64 (debug + release)
 cargo build --target x86_64-unknown-none
 cargo build --target x86_64-unknown-none --release
@@ -496,7 +506,7 @@ cargo build --target aarch64-unknown-none --release
 make run            # x86_64
 make run-aarch64    # AArch64
 ```
-All builds must pass with zero errors. Do not skip any step.
+All builds and clippy must pass with zero errors. Do not skip any step.
 
 **Flag pre-existing warnings.** Any warning surfaced by `cargo build` / `cargo test` — even pre-existing and unrelated to the current change — must be acknowledged, not silently passed through. Warnings accumulate, and "pre-existing and unrelated" is how technical debt becomes invisible. Two acceptable responses:
 
