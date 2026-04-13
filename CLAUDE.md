@@ -57,7 +57,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (316 tests, all passing)
+# Run tests (362 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -176,6 +176,10 @@ src/
 │       ├── syscall.rs        # SVC entry stub + VBAR_EL1 init
 │       ├── timer.rs          # ARM Generic Timer (CNTP_TVAL_EL0, 100 Hz)
 │       └── tlb.rs            # TLB shootdown via TLBI broadcast instructions
+├── audit/
+│   ├── mod.rs                # AuditEventKind (16 variants), RawAuditEvent (64-byte wire format), emit(), builder constructors, sampling config (Phase 3.3)
+│   ├── buffer.rs             # StagingBuffer: lock-free SPSC ring buffer (per-CPU, formally verifiable)
+│   └── drain.rs              # AuditRing (global ring buffer, HHDM-backed), drain_tick() (BSP timer ISR piggyback)
 ├── fs/
 │   ├── mod.rs                # ArcObject, ObjectStore trait, Blake3 hashing, Ed25519 sign/verify
 │   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects)
@@ -298,6 +302,8 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 - `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR. Cache lock released before acquiring global allocator on refill/drain.
 - `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint. Released before acquiring scheduler for task wake.
 - `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter. Not part of the lock hierarchy.
+- `AUDIT_RING` — acquired by `drain_tick()` (try_lock from BSP ISR, holds no other lock) and by `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO` handlers (two-phase protocol: never held while PROCESS_TABLE or FRAME_ALLOCATOR is held). `audit::emit()` never touches it.
+- `PER_CPU_AUDIT_BUFFER[cpu]` — lock-free SPSC; no lock at all. Written by local CPU, drained by BSP.
 
 ### Timer / Preemptive Scheduling
 - **APIC timer** at 100Hz (periodic mode, PIT-calibrated), fires on vector 32
@@ -327,9 +333,10 @@ MapMmio=20, AllocDma=21, DeviceInfo=22, PortIo=23,
 ConsoleRead=24, Spawn=25, WaitTask=26,
 RevokeCapability=27,
 ChannelCreate=28, ChannelAttach=29, ChannelClose=30,
-ChannelRevoke=31, ChannelInfo=32
+ChannelRevoke=31, ChannelInfo=32,
+AuditAttach=33, AuditInfo=34
 ```
-All 33 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+All 35 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **Exit**: Marks task as Terminated in scheduler and calls `CapabilityManager::revoke_all_for_process()` to reclaim endpoint capabilities (see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
@@ -361,6 +368,8 @@ All 33 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **ChannelClose**: Gracefully close a channel. Unmaps from both processes, TLB shootdown, frees physical frames. Only creator or peer may call
 - **ChannelRevoke**: Force-close a channel (bootstrap authority, Phase 3.1 pattern). Same teardown as close but no caller-identity check
 - **ChannelInfo**: Read channel metadata (state, role, sizes, addresses, tick) into user buffer
+- **AuditAttach**: Attach as the audit ring consumer. Maps kernel audit ring pages RO into caller's address space. Restricted to bootstrap Principal (Phase 3.3). Returns user vaddr
+- **AuditInfo**: Read audit ring statistics (total produced, total dropped, capacity, consumer attached, per-CPU staging occupancy) into a 48-byte user buffer. Any process may call
 
 ## Development Conventions
 
@@ -469,7 +478,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Capabilities, grant/revoke, delegation** | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) | `src/ipc/capability.rs` |
 | **Process tables / tier configuration / boot-time object sizing** | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md), [ADR-009](docs/adr/009-purpose-tiers-scope.md) | `src/process.rs`, `src/ipc/capability.rs`, [ASSUMPTIONS.md § Tier policies](ASSUMPTIONS.md) |
 | **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/interceptor.rs` |
-| **Audit telemetry / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | — |
+| **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
 | **Identity / Principal / sender_principal** | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) (intent only) |
 | **ObjectStore / ArcObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
@@ -500,7 +509,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 316 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c)
+- 362 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c), 44 audit infrastructure tests (Phase 3.3: 14 staging buffer + 18 event types + 12 ring/drain)
 
 ## Post-Change Review Protocol
 

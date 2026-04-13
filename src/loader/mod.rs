@@ -375,8 +375,34 @@ pub fn load_elf_process(
 
     // --- Step 3: Verify before execute ---
     match verifier.verify(binary, &metadata, segments) {
-        VerifyResult::Allow => {}
-        VerifyResult::Deny(reason) => return Err(LoaderError::Denied(reason)),
+        VerifyResult::Allow => {
+            // Phase 3.3: emit BinaryLoaded audit event.
+            let hash_prefix = {
+                let mut buf = [0u8; 24];
+                let len = binary.len().min(24);
+                buf[..len].copy_from_slice(&binary[..len]);
+                buf
+            };
+            crate::audit::emit(crate::audit::RawAuditEvent::binary_loaded(
+                binary.len(), hash_prefix, crate::audit::now(), 0,
+            ));
+        }
+        VerifyResult::Deny(reason) => {
+            let reason_code = match reason {
+                DenyReason::EntryPointOutOfRange => 0,
+                DenyReason::SegmentInKernelSpace => 1,
+                DenyReason::WritableAndExecutable => 2,
+                DenyReason::OverlappingSegments => 3,
+                DenyReason::ExcessiveMemory => 4,
+                DenyReason::PolicyViolation => 5,
+                DenyReason::MissingSignature => 6,
+                DenyReason::InvalidSignature => 7,
+            };
+            crate::audit::emit(crate::audit::RawAuditEvent::binary_rejected(
+                reason_code, crate::audit::now(), 0,
+            ));
+            return Err(LoaderError::Denied(reason));
+        }
     }
 
     // --- Step 4: Create process with per-process page table ---

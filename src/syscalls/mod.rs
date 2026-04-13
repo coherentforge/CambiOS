@@ -188,6 +188,19 @@ pub enum SyscallNumber {
     /// Read channel metadata (size, state, principals, byte counters)
     /// into a user buffer. Returns 0 on success.
     ChannelInfo = 32,
+
+    /// audit_attach() -> i64
+    /// Attach as the audit ring consumer. Maps the kernel's audit ring
+    /// pages read-only into the caller's address space. Returns the
+    /// user-space virtual address on success.
+    /// Restricted to bootstrap Principal (Phase 3.3).
+    AuditAttach = 33,
+
+    /// audit_info(out_buf: *mut u8, buf_len: u32) -> i32
+    /// Read audit ring statistics (total produced, total dropped,
+    /// capacity, consumer attached, per-CPU staging occupancy) into
+    /// a user buffer. Any process may call.
+    AuditInfo = 34,
 }
 
 impl SyscallNumber {
@@ -227,6 +240,8 @@ impl SyscallNumber {
             30 => Some(Self::ChannelClose),
             31 => Some(Self::ChannelRevoke),
             32 => Some(Self::ChannelInfo),
+            33 => Some(Self::AuditAttach),
+            34 => Some(Self::AuditInfo),
             _ => None,
         }
     }

@@ -294,6 +294,11 @@ unsafe extern "C" fn kmain() -> ! {
     // slice storage from this region.
     init_kernel_object_tables();
 
+    // Phase 3.3 (ADR-007): allocate global audit ring buffer from frame
+    // allocator BEFORE any process is created, so early boot events
+    // (process creation, capability grants) are captured.
+    audit_init();
+
     // Load our GDT (replaces Limine's) — must be before IDT and syscall init
     // On AArch64: no-op (EL1/EL0 managed via exception levels).
     // SAFETY: Single-threaded boot, interrupts disabled.
@@ -729,6 +734,36 @@ fn init_kernel_object_tables() {
     *CHANNEL_MANAGER.lock() = Some(Box::new(
         arcos_core::ipc::channel::ChannelManager::new(),
     ));
+}
+
+/// Phase 3.3 (ADR-007): allocate global audit ring buffer from the frame
+/// allocator and initialize the per-CPU staging buffers.
+///
+/// Must be called after `init_frame_allocator()` and before any process
+/// is created so early boot events are captured.
+fn audit_init() {
+    use arcos_core::audit::drain::AuditRing;
+    use arcos_core::FRAME_ALLOCATOR;
+
+    let hhdm = arcos_core::hhdm_offset();
+    let ring = {
+        let mut fa = FRAME_ALLOCATOR.lock();
+        match AuditRing::init(&mut fa, hhdm) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("✗ Audit ring allocation failed: {:?}", e);
+                println!("  Audit infrastructure disabled — events will be dropped");
+                return;
+            }
+        }
+    };
+
+    let capacity = ring.capacity();
+    let pages = ring.page_count();
+    *arcos_core::AUDIT_RING.lock() = Some(ring);
+
+    println!("✓ Audit: initialized ({} pages, {} event slots)",
+        pages, capacity);
 }
 
 /// Map ACPI-related physical memory into the HHDM (x86_64 only).

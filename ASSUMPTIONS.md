@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide numeric bound catalog
 auto_refresh: required
-last_synced_to_code: 2026-04-12 (Phase 3.2d landed)
+last_synced_to_code: 2026-04-12 (Phase 3.3 landed)
 authoritative_for: every fixed numeric bound, fixed-size array, hard limit in kernel code — what kind of bound it is, why this number, and what triggers re-evaluation
 -->
 
@@ -93,6 +93,8 @@ These are the ones that will need to grow as the system matures. They are correc
 | `MAX_CHANNELS` | 64 | [src/ipc/channel.rs:34](src/ipc/channel.rs#L34) | Bounded channel table for verification. 64 channels supports 32 services × 2 data paths each, with 4× headroom above the v1 estimate of ~16 active channels (7 boot modules × ~2 data paths + growth). Memory cost: 64 × ~160 bytes ≈ 10 KiB. | First service that legitimately needs more than ~4 simultaneous channels and the table fills up. |
 | `MAX_CHANNEL_PAGES` | 4096 (16 MiB) | [src/ipc/channel.rs:44](src/ipc/channel.rs#L44) | Soft cap on channel size in pages. Bounds the physical memory a single channel can consume. 16 MiB covers 1080p framebuffers (~8 MiB double-buffered) and virtio-blk request queues. | A workload legitimately needing > 16 MiB of shared memory (4K video, LLM KV cache). The policy service (Phase 3.4) should gate larger allocations. |
 | `MIN_CHANNEL_PAGES` | 1 (4 KiB) | [src/ipc/channel.rs:52](src/ipc/channel.rs#L52) | Minimum channel size. Channels smaller than a page would defeat the purpose — the 256-byte control IPC already covers small messages. |
+| `STAGING_BUFFER_CAPACITY` | 128 | [src/audit/buffer.rs:31](src/audit/buffer.rs#L31) | Per-CPU audit staging ring. At ~64 bytes/event, 128 entries = 8 KiB per CPU. At 1000 events/sec across 4 CPUs, each CPU sees ~250 events/sec. With drain at 100 Hz, ~2.5 events/drain cycle typical. 128 entries gives 50× headroom for typical, handles 10× burst without drops. Memory: 256 CPUs × 8 KiB = 2 MiB worst case, ~16 KiB typical (2 CPUs). | Observed drop rates exceed 0.1% under sustained load. |
+| `AUDIT_RING_PAGES` | 16 (64 KiB) | [src/audit/drain.rs:51](src/audit/drain.rs#L51) | Global audit ring buffer. Minus 64-byte header, holds 1023 events. At 1000 events/sec typical rate, ~1 second of buffering. ADR-007 specifies 64 KiB. Memory cost: 64 KiB, negligible. | Consumer consistently drops events due to ring overflow (visible via SYS_AUDIT_INFO stats). |
 | `KERNEL_HEAP_SIZE` | 4 MiB | [src/microkernel/main.rs:501](src/microkernel/main.rs#L501) | Sufficient for current Box/Vec allocations; conscious upper bound to make memory accounting easy. | Phase 3 channels + audit ring buffers + larger capability tables will pressure this. First OOM in `Box::new()` is the signal. |
 | `HEAP_SIZE` (per process) | 1 MiB | [src/process.rs:156](src/process.rs#L156) | Default per-process heap size. As of Phase 3.2a, each process's heap is dynamically allocated from the frame allocator via `allocate_contiguous(HEAP_PAGES)` at creation and reclaimed via `free_contiguous` at exit — no more PID-derived slab. udp-stack is already feeling this at 1 MiB. | When udp-stack or any Phase 3 service needs more than 1 MiB of heap. The growth path is now straightforward (no pre-reserved slab to resize), but might want per-service sizing rather than a global constant. |
 | `HEAP_PAGES` (per process) | 256 (1 MiB / 4 KiB) | [src/process.rs:159](src/process.rs#L159) | Derived from `HEAP_SIZE / PAGE_SIZE`. Drives the `allocate_contiguous` request in `ProcessDescriptor::new`. Paired with `HEAP_SIZE` and grows with it. | N/A — derived, tracks `HEAP_SIZE`. |
@@ -115,7 +117,8 @@ These are *not* arbitrary. Each one encodes a design decision. They should not c
 | `MIN_ORDER` / `MAX_ORDER` (buddy) | 4 / 19 | [src/memory/buddy_allocator.rs](src/memory/buddy_allocator.rs) | 16 B minimum, 512 KiB maximum allocation. Encodes the buddy allocator's range. |
 | `ENTRIES_PER_TABLE` (page table) | 512 | [src/memory/mod.rs:111](src/memory/mod.rs#L111) | x86_64 / AArch64 4-level page tables have exactly 512 entries per level. Hardware-defined but expressed as a structural constant. |
 | `Principal::public_key` length | 32 bytes | [src/ipc/mod.rs:45](src/ipc/mod.rs#L45) | Ed25519 public key length. The crypto algorithm is the design decision; 32 is its consequence. Changes only if [identity.md](identity.md) chooses a different crypto primitive (e.g., ML-DSA-65 post-quantum). |
-| Lock hierarchy depth | 8 | n/a | The seven-lock hierarchy in [CLAUDE.md § Lock Ordering](CLAUDE.md#lock-ordering). Adding a lock is a deliberate architectural decision, not a number bump. |
+| Lock hierarchy depth | 9 | n/a | The nine-lock hierarchy in [CLAUDE.md § Lock Ordering](CLAUDE.md#lock-ordering). Adding a lock is a deliberate architectural decision, not a number bump. |
+| `RAW_AUDIT_EVENT_SIZE` | 64 bytes | [src/audit/mod.rs:91](src/audit/mod.rs#L91) | One x86_64 cache line. Matches ADR-007's "~64 bytes average" target. The flat wire format avoids serialization overhead and is memcpy-safe. |
 
 ### HARDWARE — fixed by external ABI/spec
 
@@ -141,6 +144,8 @@ These are performance knobs. Picking a number without measurements is guessing. 
 | `REFILL_COUNT` / `DRAIN_COUNT` | 16 / 16 | [src/memory/frame_allocator.rs:332](src/memory/frame_allocator.rs#L332) | Batch size for cache refill/drain — amortizes the global lock cost. |
 | `MAX_INDIVIDUAL_PAGES` (TLB shootdown) | 32 | [src/arch/x86_64/tlb.rs:31](src/arch/x86_64/tlb.rs#L31) | Threshold for `invlpg` per-page vs. full CR3 reload. Above 32, full reload is cheaper. Verified empirically by other kernels; not measured for ArcOS. |
 | `MAX_OVERRIDES` (ACPI MADT) | 16 | [src/acpi/mod.rs:187](src/acpi/mod.rs#L187) | Realistic firmware override count. |
+| `DRAIN_BATCH_SIZE` (audit) | 64 | [src/audit/drain.rs:59](src/audit/drain.rs#L59) | Max events drained from all per-CPU staging buffers per timer tick. Bounds ISR time: 64 events × 64 bytes = 4 KiB of copies. |
+| `AUDIT_IPC_SAMPLE_RATE` | 100 | [src/audit/mod.rs:393](src/audit/mod.rs) | IPC send/recv sampling: emit 1 audit event per 100 operations. At ~1000 IPC/sec, produces ~10 events/sec — informative for pattern detection without flooding. |
 
 #### Tier policies
 

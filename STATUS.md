@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-12 (Phase 3.2d landed)
+last_synced_to_code: 2026-04-12 (Phase 3.3 landed)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
@@ -33,7 +33,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **CreateProcess capability** | Done (Phase 3.2b) | `CapabilityKind::CreateProcess` system capability. `handle_spawn` checks authority before allocation. Granted to kernel processes (0-2) and all boot modules at boot. `revoke_all_for_process` clears system caps on exit. | `src/ipc/capability.rs`, `src/syscalls/dispatcher.rs`, `src/microkernel/main.rs` | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) § Migration Path |
 | **Boot-time-sized kernel object tables** | Done (Phase 3.2a+3.2b+3.2c+3.2d) | `MAX_PROCESSES` removed as compile-time constant. `num_slots` computed at boot from `config::ACTIVE_POLICY` and frame allocator's tracked memory. Kernel object table region allocated via `FrameAllocator::allocate_contiguous`, HHDM-mapped, carries `ProcessTable` and `CapabilityManager` slot storage as `&'static mut` slices. Per-process heap region allocated on demand and reclaimed on exit. Phase 3.2b: `CapabilityKind::CreateProcess` system capability. Phase 3.2c: `ProcessId` generation counters. Phase 3.2d: shared-memory channels (`ChannelManager`, 5 syscalls, `CreateChannel` cap), full process lifecycle cleanup (VMA reclaim, page table frame reclaim on exit), lock hierarchy renumbered (CHANNEL_MANAGER at position 5). `CapabilityHandle` refactor deferred to post-v1 handle table. | `src/config/tier.rs`, `src/memory/object_table.rs`, `src/process.rs`, `src/ipc/capability.rs`, `src/ipc/mod.rs`, `src/syscalls/dispatcher.rs`, `src/loader/mod.rs`, `src/microkernel/main.rs`, `build.rs` | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) |
 | **Deployment tiers / scope** | Designed, policy-only | Three tiers (Tier 1 ArcOS-Embedded, Tier 2 ArcOS-Standard, Tier 3 ArcOS-Full). Single kernel binary across tiers; tier selection is an install-time choice that decides which `TableSizingPolicy` and which user-space services are loaded. No code gate yet. | — | [ADR-009](docs/adr/009-purpose-tiers-scope.md), [GOVERNANCE.md](GOVERNANCE.md) |
-| **Audit telemetry** | Designed, not implemented | Kernel→userspace event channel for AI observability | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
+| **Audit infrastructure** | Done (Phase 3.3) | Kernel→userspace event streaming for security observability. Per-CPU lock-free staging buffers → global audit ring (64 KiB, 1023 event slots). 16 event types, `audit::emit()` at 14 instrumentation points. IPC send/recv sampled 1-in-100. Drain via BSP timer ISR piggyback (100 Hz). `SYS_AUDIT_ATTACH` (33) maps ring RO into consumer. `SYS_AUDIT_INFO` (34) returns stats. | `src/audit/`, `src/syscalls/dispatcher.rs`, `user/libsys/` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Policy service** | Designed, not implemented | User-space externalization of `on_syscall` decisions | — | [ADR-006](docs/adr/006-policy-service.md) |
 | **Cryptographic identity** | Done (Phase 1C, hardware-backed) | Bootstrap Principal from compiled-in YubiKey pubkey, IPC sender stamping, BindPrincipal/GetPrincipal syscalls | `src/ipc/`, `bootstrap_pubkey.bin` | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
 | **Signed ELF loading** | Done | ARCSIG trailer, Ed25519 signature verification, `SignedBinaryVerifier` | `src/loader/` | [ADR-004](docs/adr/004-cryptographic-integrity.md) |
@@ -83,7 +83,7 @@ ArcOS uses informal phases to mark identity/storage milestones. These phases are
 | **Phase 1C** | Key-store service degraded mode + signed ObjectStore puts. fs-service requests signing from key-store before ObjPut; falls back to unsigned when key-store is in degraded mode (no runtime YubiKey). | **Done** |
 | **Phase 2A** | First user-space hardware driver. Virtio-net with PCI discovery, virtqueues, DMA bounce buffers, hostile-device validation. | **Done** |
 | **Phase 2B** | First user-space network service. Stateless UDP/IP over virtio-net, with NTP demo. | **Done** |
-| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit telemetry. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: 3.1 (revocation primitive) landed; 3.2a (boot-time-sized object tables) landed; 3.2b (`CreateProcess` capability) landed; 3.2c (`ProcessId` generation counter) landed; 3.2d (shared-memory channels + process lifecycle cleanup) landed — see [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md). 3.3 (telemetry), 3.4 (policy service) pending** |
+| **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit infrastructure. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: 3.1 (revocation primitive) landed; 3.2a (boot-time-sized object tables) landed; 3.2b (`CreateProcess` capability) landed; 3.2c (`ProcessId` generation counter) landed; 3.2d (shared-memory channels + process lifecycle cleanup) landed; 3.3 (audit infrastructure) landed — see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md). 3.4 (policy service) pending** |
 | **Phase 4** | Persistent storage. Virtio-blk driver, disk-backed ObjectStore, ArcObject CLI in shell. | **Planned** |
 | **Phase 5** | Identity-routed networking. Yggdrasil peer service, Ed25519→IPv6 mapping, mesh routing without DNS. | **Planned** |
 | **Phase 6** | Biometric commitment + key recovery. Retinal/facial ZKP enrollment, social attestation, key rotation protocol. | **Planned (post-v1)** |
@@ -106,7 +106,7 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | 9 | ArcObject CLI | **Planned** |
 | 10 | Yggdrasil peer service | **Planned** |
 
-**Currently blocking the v1 sequence:** Phase 3 (architecture work — channels, policy service, revocation, telemetry). Once the architectural substrate exists, items 4-10 sit on top of it and proceed in order.
+**Currently blocking the v1 sequence:** Phase 3.4 (policy service). Revocation (Phase 3.1), channels (Phase 3.2d), and audit infrastructure (Phase 3.3) are done. Once the policy service exists, items 4-10 sit on top of it and proceed in order.
 
 ## Test coverage
 
@@ -124,9 +124,12 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | Kernel object table region (Phase 3.2a) | 5 | `region_bytes_for` page-aligned and monotonic, `init` produces disjoint valid slices with `None` initialization, rejects zero slots, propagates frame-alloc failure |
 | Channel manager (Phase 3.2d) | 28 | ChannelId encoding, ChannelRole permissions, create/attach/close/revoke state machine, table full, principal mismatch, stale generation, slot reuse, revoke_all_for_process, preserve-bystander |
 | Process lifecycle cleanup (Phase 3.2d.ii) | 3 | VMA reclaim (empty, drains tracker, kernel task noop) |
+| Audit staging buffer (Phase 3.3) | 14 | SPSC ring: push, drain, wrap-around, overflow, interleaved, capacity cycles, take_dropped |
+| Audit event types (Phase 3.3) | 18 | Event kind discriminants, wire format size, builder round-trips for all 16 event types, timestamp/sequence encoding |
+| Audit ring + drain (Phase 3.3) | 12 | Ring header magic/capacity, write/wrap, drain from staging, staging drop reporting, batch bound, consumer attach/detach, capacity math |
 | AArch64 portable logic | 12 | PerCpu offsets, GIC register math, page table descriptor flags |
 | Other | ~70 | Timer, IPC sync channel, ProcessTable, VMA tracker, syscall args, etc. |
-| **Total** | **316** | All passing on `x86_64-apple-darwin` |
+| **Total** | **362** | All passing on `x86_64-apple-darwin` |
 
 Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 

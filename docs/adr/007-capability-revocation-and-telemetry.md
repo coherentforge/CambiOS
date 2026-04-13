@@ -423,3 +423,13 @@ When implementing the changes specified by this ADR, the following CLAUDE.md sec
 - **§ "Syscall Numbers"** — add `SYS_REVOKE_CAPABILITY` and `SYS_AUDIT_INFO` when assigned
 - **§ "Required Reading by Subsystem"** (when added) — under "If you are touching capability/policy code"
 - **§ "Post-Change Review Protocol" Step 8** (when added) — adding new audit event types requires updating SECURITY.md and any docs that reference the audit format
+
+## Divergence
+
+Phase 3.3 implementation (2026-04-12) diverges from this ADR in three ways:
+
+1. **Phase renamed from "Telemetry" to "Audit."** The word "telemetry" is culturally loaded (Windows telemetry, etc.) and invites misunderstanding for a project that is explicitly telemetry-free to the outside world. The module is `crate::audit`, events are "audit events", the channel is the "audit ring". The word "telemetry" still appears in this ADR's original text (immutable history) but all new code and docs use "audit".
+
+2. **Global ring is kernel-internal, not a ChannelManager record.** The ADR specifies using "the channel mechanism from ADR-005." Implementation revealed that the kernel has no ProcessId, no Principal, and no VMA tracker — the channel state machine would require extensive special-casing. Instead, the ring is a dedicated `AuditRing` struct backed by contiguous physical pages allocated at boot. When the policy service attaches via `SYS_AUDIT_ATTACH`, those same physical pages are mapped RO into its address space — reusing the same `map_range` logic but bypassing `ChannelManager`. This preserves the ADR's intent (kernel produces, consumer reads RO) without architectural contortion.
+
+3. **Drain via BSP timer ISR piggyback, not a dedicated background task.** The ADR mentions a "background task" for draining per-CPU staging buffers to the global ring. Implementation uses the BSP timer ISR (100 Hz) with `try_lock()` and a bounded batch size (`DRAIN_BATCH_SIZE = 64`). This avoids consuming a scheduler slot for what is essentially "copy 640 bytes every 10ms". If profiling shows the drain is too expensive for ISR context, it can be moved to a dedicated task without changing the `emit()` API or buffer layout.

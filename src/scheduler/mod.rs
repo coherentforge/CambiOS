@@ -45,6 +45,26 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
         }
     }
 
+    // Drain per-CPU audit staging buffers into the global ring (BSP only).
+    // Must run after timer tick (uses Timer::get_ticks for timestamps)
+    // and before scheduler tick (no locks held at this point).
+    #[cfg(all(not(test), target_arch = "x86_64"))]
+    {
+        // SAFETY: GS base initialized after boot; cpu_id is a pure read.
+        let cpu_id = unsafe { crate::arch::x86_64::percpu::current_cpu_id() };
+        if cpu_id == 0 {
+            crate::audit::drain::drain_tick();
+        }
+    }
+    #[cfg(all(not(test), target_arch = "aarch64"))]
+    {
+        // SAFETY: TPIDR_EL1 initialized after boot; cpu_id is a pure read.
+        let cpu_id = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() };
+        if cpu_id == 0 {
+            crate::audit::drain::drain_tick();
+        }
+    }
+
     // Tick scheduler and potentially switch tasks
     if let Some(mut sched_guard) = crate::local_scheduler().try_lock() {
         if let Some(sched) = sched_guard.as_mut() {

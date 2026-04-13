@@ -422,3 +422,33 @@ pub fn channel_info(channel_id: u64, out_buf: &mut [u8]) -> i64 {
         out_buf.len() as u64,
     )
 }
+
+// ============================================================================
+// Audit infrastructure (Phase 3.3, ADR-007)
+// ============================================================================
+
+const SYS_AUDIT_ATTACH: u64 = 33;
+const SYS_AUDIT_INFO: u64 = 34;
+
+/// Attach as the audit ring consumer.
+///
+/// Maps the kernel's audit ring pages read-only into this process's
+/// address space. Returns the user-space virtual address on success,
+/// or a negative error code.
+///
+/// Restricted to the bootstrap Principal.
+pub fn audit_attach() -> i64 {
+    syscall_raw3(SYS_AUDIT_ATTACH, 0, 0, 0)
+}
+
+/// Read audit ring statistics into `out_buf`.
+///
+/// `out_buf` must be at least 48 bytes. Returns 0 on success.
+pub fn audit_info(out_buf: &mut [u8]) -> i64 {
+    syscall_raw3(
+        SYS_AUDIT_INFO,
+        out_buf.as_mut_ptr() as u64,
+        out_buf.len() as u64,
+        0,
+    )
+}

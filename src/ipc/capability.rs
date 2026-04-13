@@ -646,14 +646,16 @@ impl CapabilityManager {
         // shared pages from the holder's address space and issue a TLB
         // shootdown via crate::arch::tlb::shootdown_range(). Channels do not
         // exist yet — all capabilities are endpoint rights in Phase 3.1.
-        //
-        // TODO Phase 3.3: crate::audit::emit(Event::CapabilityRevoked {
-        //     revoker: revoker_principal,
-        //     holder,
-        //     endpoint,
-        //     timestamp: crate::scheduler::Timer::get_ticks(),
-        // });
-        //
+
+        // Phase 3.3: emit audit event for revocation.
+        #[cfg(not(any(test, fuzzing)))]
+        crate::audit::emit(crate::audit::RawAuditEvent::capability_revoked(
+            // revoker_principal is the caller's identity; for now pass the
+            // holder as a proxy since we don't track the revoker PID here.
+            holder, holder, endpoint,
+            crate::scheduler::Timer::get_ticks(), 0,
+        ));
+
         // TODO Phase 3.4: invalidate the per-CPU policy decision cache for
         // (holder, endpoint) via an IPI broadcast, then send a kernel-
         // originated control IPC notification to the holder using
@@ -701,8 +703,9 @@ impl CapabilityManager {
         // grant/revoke methods maintain that invariant, but clear-all should
         // be robust against any future layout change.
         //
-        // TODO Phase 3.3: emit an audit event per removed capability (or a single
-        // batched ProcessTerminated event for the count).
+        // Phase 3.3: emit a single batched event for the count rather than
+        // per-capability (process is exiting — individual revoke events would
+        // be noise). The ProcessTerminated event in handle_exit covers this.
         for slot in caps.capabilities.iter_mut() {
             *slot = None;
         }

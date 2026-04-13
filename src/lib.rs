@@ -35,6 +35,7 @@ pub mod process;
 pub mod acpi;
 pub mod fs;
 pub mod boot_modules;
+pub mod audit;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
 
@@ -100,6 +101,12 @@ pub static PER_CPU_SCHEDULER: [IrqSpinlock<Option<Box<Scheduler>>>; MAX_CPUS] =
 /// Per-CPU timer instances. Each CPU owns PER_CPU_TIMER[cpu_id].
 pub static PER_CPU_TIMER: [IrqSpinlock<Option<Timer>>; MAX_CPUS] =
     [const { IrqSpinlock::new(None) }; MAX_CPUS];
+
+/// Per-CPU audit staging buffers. Each CPU writes to PER_CPU_AUDIT_BUFFER[cpu_id]
+/// via `audit::emit()`. The BSP drain task reads from all buffers.
+/// Lock-free SPSC: no lock needed, no entry in the lock hierarchy.
+pub static PER_CPU_AUDIT_BUFFER: [audit::buffer::StagingBuffer; MAX_CPUS] =
+    [const { audit::buffer::StagingBuffer::new() }; MAX_CPUS];
 
 /// Get the current CPU's scheduler lock.
 ///
@@ -262,6 +269,11 @@ pub fn wake_task_on_cpu(_task_id: scheduler::TaskId) -> bool {
 
 /// Number of online CPUs (BSP = 1, incremented by each AP that completes init).
 pub static ONLINE_CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Get the current number of online CPUs.
+pub fn online_cpu_count() -> usize {
+    ONLINE_CPU_COUNT.load(Ordering::Acquire) as usize
+}
 
 // Phase 3.2c: NEXT_PROCESS_ID removed. ProcessTable::create_process
 // now allocates slots internally via linear scan with generation
@@ -482,6 +494,12 @@ pub static CHANNEL_MANAGER: Spinlock<Option<Box<ipc::channel::ChannelManager>>> 
 pub static PROCESS_TABLE: Spinlock<Option<Box<ProcessTable>>> = Spinlock::new(None);
 pub static FRAME_ALLOCATOR: Spinlock<FrameAllocator> = Spinlock::new(FrameAllocator::new());
 pub static INTERRUPT_ROUTER: Spinlock<InterruptRoutingTable> = Spinlock::new(InterruptRoutingTable::new());
+
+/// Global audit ring buffer — kernel-internal, not in the lock hierarchy.
+/// Only acquired by `drain_tick()` (try_lock from BSP ISR) and by
+/// `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO` syscall handlers (two-phase protocol).
+/// `audit::emit()` never touches this — it writes to PER_CPU_AUDIT_BUFFER only.
+pub static AUDIT_RING: Spinlock<Option<audit::drain::AuditRing>> = Spinlock::new(None);
 
 /// Object store — content-addressed signed object storage (lock position 9).
 ///
