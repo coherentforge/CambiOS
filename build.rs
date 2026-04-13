@@ -1,15 +1,15 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! Build-time tier selection for ArcOS.
+//! Build-time tier selection for CambiOS.
 //!
-//! ArcOS ships as a single kernel binary that is tuned for one of three
+//! CambiOS ships as a single kernel binary that is tuned for one of three
 //! deployment tiers at build time (see [ADR-009] and [ADR-008]):
 //!
-//! - `tier1` — ArcOS-Embedded (small, fixed-function deployments)
-//! - `tier2` — ArcOS-Standard (typical single-user desktop / workstation)
-//! - `tier3` — ArcOS-Full (heavy general-purpose, bare metal, AI workloads)
+//! - `tier1` — CambiOS-Embedded (small, fixed-function deployments)
+//! - `tier2` — CambiOS-Standard (typical single-user desktop / workstation)
+//! - `tier3` — CambiOS-Full (heavy general-purpose, bare metal, AI workloads)
 //!
-//! The choice is made via the `ARCOS_TIER` environment variable. When
+//! The choice is made via the `CAMBIOS_TIER` environment variable. When
 //! unset, the build defaults to `tier3` — every build is a Tier 3 build
 //! unless the developer is specifically working on Tier 1 or Tier 2.
 //!
@@ -35,9 +35,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(fuzzing)");
 
     // Re-run if the user changes the tier selection.
-    println!("cargo:rerun-if-env-changed=ARCOS_TIER");
+    println!("cargo:rerun-if-env-changed=CAMBIOS_TIER");
 
-    let tier = std::env::var("ARCOS_TIER").unwrap_or_else(|_| "tier3".to_string());
+    let tier = std::env::var("CAMBIOS_TIER").unwrap_or_else(|_| "tier3".to_string());
 
     match tier.as_str() {
         "tier1" | "tier2" | "tier3" => {
@@ -48,7 +48,7 @@ fn main() {
         }
         other => {
             panic!(
-                "ARCOS_TIER must be one of: tier1, tier2, tier3 (got: {:?}). \
+                "CAMBIOS_TIER must be one of: tier1, tier2, tier3 (got: {:?}). \
                  Leave unset to default to tier3.",
                 other
             );

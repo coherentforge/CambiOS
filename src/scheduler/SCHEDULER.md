@@ -6,13 +6,13 @@ last_synced_to_code: 2026-04-10
 authoritative_for: scheduler internals, task lifecycle, time slicing, priority bands, blocking primitives, IPC integration with the scheduler
 -->
 
-# ArcOS Preemptive SMP Scheduler
+# CambiOS Preemptive SMP Scheduler
 
 > **Implementation reference.** This document describes what is currently in `src/scheduler/`. It is auto-refreshed when scheduler code changes (see `CLAUDE.md` § "Post-Change Review Protocol", Step 8). For the *decisions* behind the SMP architecture, see [ADR-001](../../docs/adr/001-smp-scheduling-and-lock-hierarchy.md).
 
 ## Overview
 
-The ArcOS scheduler is a **per-CPU, preemptive, priority-band scheduler** with SMP task migration and load balancing. Each CPU runs its own independent scheduler instance — no global lock on the hot path. Tasks are assigned to a "home CPU" and can be migrated between CPUs by the load balancer or by IRQ affinity. Scheduling is O(1) within each CPU via per-priority-band ready queues.
+The CambiOS scheduler is a **per-CPU, preemptive, priority-band scheduler** with SMP task migration and load balancing. Each CPU runs its own independent scheduler instance — no global lock on the hot path. Tasks are assigned to a "home CPU" and can be migrated between CPUs by the load balancer or by IRQ affinity. Scheduling is O(1) within each CPU via per-priority-band ready queues.
 
 The scheduler is wired to two context-switch paths:
 1. **ISR-driven preemption** — the timer ISR saves the current task's full register state and restores the next task's, every 10ms

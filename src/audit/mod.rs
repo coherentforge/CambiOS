@@ -14,7 +14,7 @@
 //!                                   (lock-free SPSC)              (BSP ISR)      (consumer reads)
 //! ```
 //!
-//! This is **not** external telemetry. ArcOS is telemetry-free to the outside
+//! This is **not** external telemetry. CambiOS is telemetry-free to the outside
 //! world. This is kernel→userspace event streaming for security observability.
 
 pub mod buffer;

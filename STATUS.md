@@ -6,9 +6,9 @@ last_synced_to_code: 2026-04-12 (Phase 3.3 landed)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
-# ArcOS Implementation Status
+# CambiOS Implementation Status
 
-> **Living status doc.** This file is the single source of truth for "what is currently built." It is auto-refreshed when feature work lands (see [CLAUDE.md § Post-Change Review Protocol Step 8](CLAUDE.md#post-change-review-protocol)). Pure intent and plans live in [ArcOS.md](ArcOS.md) and the design docs; this file is for *current state*.
+> **Living status doc.** This file is the single source of truth for "what is currently built." It is auto-refreshed when feature work lands (see [CLAUDE.md § Post-Change Review Protocol Step 8](CLAUDE.md#post-change-review-protocol)). Pure intent and plans live in [CambiOS.md](CambiOS.md) and the design docs; this file is for *current state*.
 >
 > If you're trying to figure out "is X done yet?" — this is the doc to read. If you're trying to figure out "should X be done a certain way?" — read the linked design doc instead.
 
@@ -23,7 +23,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 
 | Subsystem | Status | Notes | Code | Design |
 |---|---|---|---|---|
-| **Microkernel core** | Done | Heap, frame allocator, page tables, GDT/IDT (x86), VBAR_EL1 (AArch64) | `src/microkernel/`, `src/memory/` | [ArcOS.md § The Microkernel](ArcOS.md) |
+| **Microkernel core** | Done | Heap, frame allocator, page tables, GDT/IDT (x86), VBAR_EL1 (AArch64) | `src/microkernel/`, `src/memory/` | [CambiOS.md § The Microkernel](CambiOS.md) |
 | **Per-CPU SMP scheduler** | Done | Per-CPU schedulers, 4 priority bands, O(1) scheduling, task migration, push-based load balancing | `src/scheduler/` | [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) |
 | **Voluntary context switch** | Done | `yield_save_and_switch` (x86_64 + AArch64), synthetic exception frame | `src/arch/x86_64/mod.rs`, `src/arch/aarch64/mod.rs` | — |
 | **Preemptive context switch** | Done | Timer ISR with full register save, context switch hint, TLB shootdown | `src/arch/*/mod.rs` | [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) |
@@ -32,12 +32,12 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **Capability revocation** | Done (Phase 3.1, bootstrap-only) | `SYS_REVOKE_CAPABILITY` (#27), `CapabilityManager::revoke()`, `revoke_all_for_process()` wired into `handle_exit`. Authority = bootstrap Principal only; grantor/revoke-right paths defer to Phase 3.4. Audit emit, channel mapping cleanup, policy cache invalidation, and active holder notification are in-code stubs citing Phase 3.2/3.3/3.4. | `src/ipc/capability.rs`, `src/syscalls/dispatcher.rs` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **CreateProcess capability** | Done (Phase 3.2b) | `CapabilityKind::CreateProcess` system capability. `handle_spawn` checks authority before allocation. Granted to kernel processes (0-2) and all boot modules at boot. `revoke_all_for_process` clears system caps on exit. | `src/ipc/capability.rs`, `src/syscalls/dispatcher.rs`, `src/microkernel/main.rs` | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) § Migration Path |
 | **Boot-time-sized kernel object tables** | Done (Phase 3.2a+3.2b+3.2c+3.2d) | `MAX_PROCESSES` removed as compile-time constant. `num_slots` computed at boot from `config::ACTIVE_POLICY` and frame allocator's tracked memory. Kernel object table region allocated via `FrameAllocator::allocate_contiguous`, HHDM-mapped, carries `ProcessTable` and `CapabilityManager` slot storage as `&'static mut` slices. Per-process heap region allocated on demand and reclaimed on exit. Phase 3.2b: `CapabilityKind::CreateProcess` system capability. Phase 3.2c: `ProcessId` generation counters. Phase 3.2d: shared-memory channels (`ChannelManager`, 5 syscalls, `CreateChannel` cap), full process lifecycle cleanup (VMA reclaim, page table frame reclaim on exit), lock hierarchy renumbered (CHANNEL_MANAGER at position 5). `CapabilityHandle` refactor deferred to post-v1 handle table. | `src/config/tier.rs`, `src/memory/object_table.rs`, `src/process.rs`, `src/ipc/capability.rs`, `src/ipc/mod.rs`, `src/syscalls/dispatcher.rs`, `src/loader/mod.rs`, `src/microkernel/main.rs`, `build.rs` | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) |
-| **Deployment tiers / scope** | Designed, policy-only | Three tiers (Tier 1 ArcOS-Embedded, Tier 2 ArcOS-Standard, Tier 3 ArcOS-Full). Single kernel binary across tiers; tier selection is an install-time choice that decides which `TableSizingPolicy` and which user-space services are loaded. No code gate yet. | — | [ADR-009](docs/adr/009-purpose-tiers-scope.md), [GOVERNANCE.md](GOVERNANCE.md) |
+| **Deployment tiers / scope** | Designed, policy-only | Three tiers (Tier 1 CambiOS-Embedded, Tier 2 CambiOS-Standard, Tier 3 CambiOS-Full). Single kernel binary across tiers; tier selection is an install-time choice that decides which `TableSizingPolicy` and which user-space services are loaded. No code gate yet. | — | [ADR-009](docs/adr/009-purpose-tiers-scope.md), [GOVERNANCE.md](GOVERNANCE.md) |
 | **Audit infrastructure** | Done (Phase 3.3) | Kernel→userspace event streaming for security observability. Per-CPU lock-free staging buffers → global audit ring (64 KiB, 1023 event slots). 16 event types, `audit::emit()` at 14 instrumentation points. IPC send/recv sampled 1-in-100. Drain via BSP timer ISR piggyback (100 Hz). `SYS_AUDIT_ATTACH` (33) maps ring RO into consumer. `SYS_AUDIT_INFO` (34) returns stats. | `src/audit/`, `src/syscalls/dispatcher.rs`, `user/libsys/` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Policy service** | Designed, not implemented | User-space externalization of `on_syscall` decisions | — | [ADR-006](docs/adr/006-policy-service.md) |
 | **Cryptographic identity** | Done (Phase 1C, hardware-backed) | Bootstrap Principal from compiled-in YubiKey pubkey, IPC sender stamping, BindPrincipal/GetPrincipal syscalls | `src/ipc/`, `bootstrap_pubkey.bin` | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
 | **Signed ELF loading** | Done | ARCSIG trailer, Ed25519 signature verification, `SignedBinaryVerifier` | `src/loader/` | [ADR-004](docs/adr/004-cryptographic-integrity.md) |
-| **Content-addressed ObjectStore** | Done (Phase 1C, RAM-backed) | ArcObject with Blake3, Ed25519, ACL; RamObjectStore (256 objects) | `src/fs/` | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) |
+| **Content-addressed ObjectStore** | Done (Phase 1C, RAM-backed) | CambiObject with Blake3, Ed25519, ACL; RamObjectStore (256 objects) | `src/fs/` | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) |
 | **Persistent ObjectStore** | Planned | Disk-backed implementation of the ObjectStore trait | — | [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) |
 | **Key-store service** | Done | User-space, IPC endpoint 17, runs in degraded mode (no runtime YubiKey access yet) | `user/key-store-service/` | — |
 | **FS service** | Done | User-space, IPC endpoint 16, ObjectStore gateway with sender_principal enforcement | `user/fs-service/` | — |
@@ -67,13 +67,13 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **Process lifecycle cleanup** | Done (Phase 3.2d.ii) | `handle_exit` performs full cleanup: capability revocation, channel revocation (unmap + TLB shootdown + frame free), VMA region reclaim, page table frame reclaim (PML4 + intermediates), heap reclaim. Kernel stack dealloc deferred (bounded 8 KiB/process leak, requires scheduler-level deferred-free). | `src/syscalls/dispatcher.rs`, `src/process.rs`, `src/memory/paging.rs`, `src/memory/mod.rs` | — |
 | **AArch64 user-space services** | Done | All boot modules build for both targets via `libsys` shared syscall wrappers (x86_64 syscall + AArch64 svc) | `user/libsys/` | — |
 | **RISC-V port** | Planned (post-v1) | Third arch backend matching x86_64/AArch64 public API | — | — |
-| **AI pre-execution code analysis** | Planned (post-v1) | JIT analysis of ELF binaries before execution | — | [ArcOS.md § AI Integration](ArcOS.md) |
+| **AI pre-execution code analysis** | Planned (post-v1) | JIT analysis of ELF binaries before execution | — | [CambiOS.md § AI Integration](CambiOS.md) |
 | **Behavioral anomaly detection (AI)** | Planned (post-v1) | Runtime monitoring service consuming audit telemetry | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) |
-| **AI compatibility layer (Win32)** | Planned (post-v1) | Long-term vision item from ArcOS.md | — | [ArcOS.md § Application Compatibility](ArcOS.md) |
+| **AI compatibility layer (Win32)** | Planned (post-v1) | Long-term vision item from CambiOS.md | — | [CambiOS.md § Application Compatibility](CambiOS.md) |
 
 ## Phase markers
 
-ArcOS uses informal phases to mark identity/storage milestones. These phases are referenced from [identity.md](identity.md) and [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md).
+CambiOS uses informal phases to mark identity/storage milestones. These phases are referenced from [identity.md](identity.md) and [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md).
 
 | Phase | Goal | Status |
 |---|---|---|
@@ -84,7 +84,7 @@ ArcOS uses informal phases to mark identity/storage milestones. These phases are
 | **Phase 2A** | First user-space hardware driver. Virtio-net with PCI discovery, virtqueues, DMA bounce buffers, hostile-device validation. | **Done** |
 | **Phase 2B** | First user-space network service. Stateless UDP/IP over virtio-net, with NTP demo. | **Done** |
 | **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit infrastructure. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: 3.1 (revocation primitive) landed; 3.2a (boot-time-sized object tables) landed; 3.2b (`CreateProcess` capability) landed; 3.2c (`ProcessId` generation counter) landed; 3.2d (shared-memory channels + process lifecycle cleanup) landed; 3.3 (audit infrastructure) landed — see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md). 3.4 (policy service) pending** |
-| **Phase 4** | Persistent storage. Virtio-blk driver, disk-backed ObjectStore, ArcObject CLI in shell. | **Planned** |
+| **Phase 4** | Persistent storage. Virtio-blk driver, disk-backed ObjectStore, CambiObject CLI in shell. | **Planned** |
 | **Phase 5** | Identity-routed networking. Yggdrasil peer service, Ed25519→IPv6 mapping, mesh routing without DNS. | **Planned** |
 | **Phase 6** | Biometric commitment + key recovery. Retinal/facial ZKP enrollment, social attestation, key rotation protocol. | **Planned (post-v1)** |
 | **Phase 7** | SSB bridge. Cross-instance capability grants and identity attestations over append-only logs. | **Planned (post-v1)** |
@@ -103,7 +103,7 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | 6 | TCP stack | **Planned** |
 | 7 | Virtio-blk driver | **Planned** |
 | 8 | Persistent ObjectStore | **Planned** |
-| 9 | ArcObject CLI | **Planned** |
+| 9 | CambiObject CLI | **Planned** |
 | 10 | Yggdrasil peer service | **Planned** |
 
 **Currently blocking the v1 sequence:** Phase 3.4 (policy service). Revocation (Phase 3.1), channels (Phase 3.2d), and audit infrastructure (Phase 3.3) are done. Once the policy service exists, items 4-10 sit on top of it and proceed in order.
@@ -117,7 +117,7 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | IPC interceptor | 13 | Payload validation, bounds, self-send, delegation policy, syscall filtering, custom interceptors |
 | ELF verifier | 14 | W^X, kernel space rejection, overlapping segments, memory limits, entry point boundary cases, signed binary verifier |
 | IPC sender_principal | 4 | Default None, kernel stamping, no-principal path, direct send bypass |
-| ObjectStore types + crypto | 21 | Principal equality, Blake3 hashing, Ed25519 sign/verify, ArcObject creation/author immutability/owner/lineage, ObjectCapSet |
+| ObjectStore types + crypto | 21 | Principal equality, Blake3 hashing, Ed25519 sign/verify, CambiObject creation/author immutability/owner/lineage, ObjectCapSet |
 | RamObjectStore | 12 | Put/get, idempotency, invalid hash rejection, delete, list, capacity, slot reuse, author/owner preservation |
 | Memory subsystem | ~36 | Buddy allocator, frame allocator (including Phase 3.2a `free_contiguous` round-trip + atomicity tests), heap, paging primitives |
 | Tier configuration (Phase 3.2a) | 16 | `TableSizingPolicy` field bounds, `num_slots_from` clamp behavior, realistic memory sizes (256 MB / 4 GB / 8 GB / 32 GB / 1 TB) per tier, monotonicity, `binding_constraint_for` per clamp, slot-clamp-shadows-budget-clamp invariant |
@@ -145,7 +145,7 @@ Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 
 ## Cross-references
 
-- [ArcOS.md](ArcOS.md) — source-of-truth architecture document
+- [CambiOS.md](CambiOS.md) — source-of-truth architecture document
 - [identity.md](identity.md) — identity architecture (Phases 0-7 are defined here)
 - [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — settled decisions for the identity + storage layer
 - [SECURITY.md](SECURITY.md) — enforcement status table (security-specific subset of this document)

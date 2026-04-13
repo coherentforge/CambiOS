@@ -1,6 +1,6 @@
 # From NTP Query to UTC Clock
 
-*How ArcOS asks Google what time it is, and why the answer requires every layer of the system to work.*
+*How CambiOS asks Google what time it is, and why the answer requires every layer of the system to work.*
 
 ---
 

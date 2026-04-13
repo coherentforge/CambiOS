@@ -1,8 +1,8 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS ELF Signing Tool
+//! CambiOS ELF Signing Tool
 //!
-//! Signs ELF binaries with an Ed25519 signature for the ArcOS kernel's
+//! Signs ELF binaries with an Ed25519 signature for the CambiOS kernel's
 //! SignedBinaryVerifier. Appends a signature trailer to the binary.
 //!
 //! Two signing modes:
@@ -18,7 +18,7 @@
 //!   sign-elf --seed <hex> <elf-file> [--output <path>]     # sign via seed
 //!   sign-elf --print-pubkey                                # print public key (hex)
 //!   sign-elf --export-pubkey <path>                        # write raw 32-byte pubkey
-//!   sign-elf --pin <pin>                                   # YubiKey PIN (or env ARCOS_SIGN_PIN)
+//!   sign-elf --pin <pin>                                   # YubiKey PIN (or env CAMBIO_SIGN_PIN)
 
 use ed25519_compact::{KeyPair, Seed};
 use std::env;
@@ -114,7 +114,7 @@ fn parse_args() -> Args {
         });
         SigningMode::Seed(parse_hex_seed(content.trim()))
     } else {
-        let pin = pin.or_else(|| env::var("ARCOS_SIGN_PIN").ok());
+        let pin = pin.or_else(|| env::var("CAMBIO_SIGN_PIN").ok());
         SigningMode::YubiKey { pin }
     };
 
@@ -136,7 +136,7 @@ fn parse_args() -> Args {
 }
 
 fn print_usage(prog: &str) {
-    eprintln!("ArcOS ELF Signing Tool v0.3.0");
+    eprintln!("CambiOS ELF Signing Tool v0.3.0");
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  {} <elf-file> [options]               Sign via YubiKey (default)", prog);
@@ -146,7 +146,7 @@ fn print_usage(prog: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --output, -o <path>   Write signed binary to <path> (default: in-place)");
-    eprintln!("  --pin <pin>           YubiKey OpenPGP PIN (or set ARCOS_SIGN_PIN env var)");
+    eprintln!("  --pin <pin>           YubiKey OpenPGP PIN (or set CAMBIO_SIGN_PIN env var)");
     eprintln!("  --seed <hex>          Use seed-derived key (64 hex chars = 32 bytes)");
 }
 

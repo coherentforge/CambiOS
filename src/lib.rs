@@ -7,7 +7,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-//! ArcOS Microkernel - Verification-Ready Core
+//! CambiOS Microkernel - Verification-Ready Core
 //!
 //! A minimal microkernel for x86-64 supporting:
 //! - Process/task management
@@ -383,7 +383,7 @@ pub static BOOTSTRAP_PRINCIPAL: BootstrapPrincipal = BootstrapPrincipal::new();
 
 /// Bootstrap Secret Key — the Ed25519 secret key for the bootstrap identity.
 ///
-/// Used by the kernel to sign ArcObjects on behalf of processes bound to the
+/// Used by the kernel to sign CambiObjects on behalf of processes bound to the
 /// bootstrap Principal. Written once during boot, read-only after.
 /// 64 bytes: seed (32) || public_key (32), per Ed25519 convention.
 pub static BOOTSTRAP_SECRET_KEY: BootstrapSecretKey = BootstrapSecretKey::new();

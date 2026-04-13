@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS Virtio-Net Driver — user-space network device driver
+//! CambiOS Virtio-Net Driver — user-space network device driver
 //!
 //! Runs as a ring-3 process. Discovers the virtio-net PCI device via the
 //! DeviceInfo syscall, initializes the legacy virtio transport, sets up

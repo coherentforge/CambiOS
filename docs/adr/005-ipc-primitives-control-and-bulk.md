@@ -4,13 +4,13 @@
 - **Date:** 2026-04-10
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-002](002-three-layer-enforcement-pipeline.md) (Three-Layer Enforcement Pipeline)
 - **Supersedes:** N/A
-- **Context:** Defining the IPC architecture as ArcOS moves from proof-of-concept workloads to real applications (networking, video, file I/O, future AI inference)
+- **Context:** Defining the IPC architecture as CambiOS moves from proof-of-concept workloads to real applications (networking, video, file I/O, future AI inference)
 
 ## Problem
 
-ArcOS today has one IPC primitive: a kernel-mediated, fixed-size, 256-byte message-passing path. Every byte that travels between two processes is copied through the kernel, capability-checked, interceptor-checked, and identity-stamped. The hot path has been good enough for the workloads it has carried so far — control RPCs between user-space services, syscall return values, signed-binary verification messages, key-store signing requests.
+CambiOS today has one IPC primitive: a kernel-mediated, fixed-size, 256-byte message-passing path. Every byte that travels between two processes is copied through the kernel, capability-checked, interceptor-checked, and identity-stamped. The hot path has been good enough for the workloads it has carried so far — control RPCs between user-space services, syscall return values, signed-binary verification messages, key-store signing requests.
 
-It is not good enough for the workloads ArcOS exists to support.
+It is not good enough for the workloads CambiOS exists to support.
 
 A 60 fps display server moving 8 MB frames at 1080p needs ~500 MB/s of guest-to-guest bandwidth. An LLM inference service producing tokens needs multi-GB/s for KV cache and embedding traffic. A virtio-blk driver moving disk blocks at NVMe rates needs sustained hundreds of MB/s. A video decoder writing to a framebuffer needs to do it without copying through ring 0 on every macroblock. None of these can be implemented on a 256-byte-at-a-time path with kernel-mediated copies.
 
@@ -22,7 +22,7 @@ This ADR fixes both problems at once. It writes down the reasoning behind the ex
 
 ## The Reframe
 
-The framing that resolves this is taken directly from [ArcOS.md](../../ArcOS.md) and [PHILOSOPHY.md](../../PHILOSOPHY.md), which both already authorize what we're about to do. The relevant principle is:
+The framing that resolves this is taken directly from [CambiOS.md](../../CambiOS.md) and [PHILOSOPHY.md](../../PHILOSOPHY.md), which both already authorize what we're about to do. The relevant principle is:
 
 > **The kernel mediates *policy*, not *bytes*.**
 
@@ -32,11 +32,11 @@ A capability check at IPC send time is *policy*: "is process A allowed to send a
 
 A 4 MB framebuffer copy is *not policy*. It's *bytes*. The decision about whether the display server is allowed to share memory with its client is the same kind of decision as the IPC capability check — made once, structurally enforced, requires no per-byte mediation. Once the decision is made, the bytes flow through the page tables (which the MMU enforces on every access, in hardware, at full memory bandwidth) without any additional kernel involvement.
 
-This reframe does not weaken security. It moves enforcement from a per-byte check (which is theatre, because by the time bytes are flowing the security decision has already been made) to a per-channel check at setup time (which is the actual moment authority is granted). [ArcOS.md line 134](../../ArcOS.md) already encodes this: "There is no shared memory between services unless explicitly granted through a capability."
+This reframe does not weaken security. It moves enforcement from a per-byte check (which is theatre, because by the time bytes are flowing the security decision has already been made) to a per-channel check at setup time (which is the actual moment authority is granted). [CambiOS.md line 134](../../CambiOS.md) already encodes this: "There is no shared memory between services unless explicitly granted through a capability."
 
 ## Decision
 
-ArcOS has **two distinct IPC primitives**, with non-overlapping responsibilities:
+CambiOS has **two distinct IPC primitives**, with non-overlapping responsibilities:
 
 ### 1. Control IPC — small, fixed-size, kernel-mediated, verification-friendly
 
@@ -179,7 +179,7 @@ The kernel signature on the record is what makes channel telemetry trustworthy a
 | (TBD) | `SYS_CHANNEL_REVOKE` | Force-close from a third party with revoke authority |
 | (TBD) | `SYS_CHANNEL_INFO` | Read channel metadata (size, peers, purpose, byte counts) |
 
-Numbers will be assigned when implementation lands. They are deliberately not specified here because the syscall numbering for ArcOS is contiguous and assigning them now would create gaps if implementation order shifts.
+Numbers will be assigned when implementation lands. They are deliberately not specified here because the syscall numbering for CambiOS is contiguous and assigning them now would create gaps if implementation order shifts.
 
 ### Notification
 
@@ -232,7 +232,7 @@ The key invariant: **a revoked channel cannot leak data after revocation.** Once
 | A malicious producer floods the consumer with garbage data | The consumer chose to attach. If A is sending garbage, B can `CLOSE` the channel and stop receiving. The capability is opt-in — the consumer is never forced to accept a channel from a process they don't trust. |
 | Two cooperating malicious processes coordinate via shared memory the kernel can't see | This is true and intentional. The kernel never reads payload bytes. If process A and B both have legitimate capabilities to a shared channel, what they say to each other through that channel is between them. The kernel guarantees only what it always guaranteed: A and B were authorized to communicate, B's identity is what A thinks it is, the topology of communication is auditable. |
 | The producer keeps writing data the consumer never reads, and the channel fills up | Producer-side problem. The ring buffer is producer-managed; the producer is responsible for backpressure. If the producer doesn't implement backpressure, that's a producer bug, not a kernel bug. |
-| Side-channel timing attacks via shared memory access patterns | Same as any shared-memory system. ArcOS does not currently mitigate Spectre/Meltdown-class side channels and channels do not change this story. |
+| Side-channel timing attacks via shared memory access patterns | Same as any shared-memory system. CambiOS does not currently mitigate Spectre/Meltdown-class side channels and channels do not change this story. |
 | The AI security service wants to inspect channel contents in real time | The AI doesn't get per-byte inspection by default. It gets per-channel telemetry (creation, capability holders, byte counts, lifecycle events) via the policy service, which is sufficient for behavioral anomaly detection. If a specific channel needs payload inspection, the policy service can request a snapshot — see [ADR-007 § Audit Telemetry](007-capability-revocation-and-telemetry.md#audit-telemetry). Inline payload inspection for every byte is *out of scope* — it's the wrong layer for AI. |
 
 ### Impact on the threat model from ADR-000
@@ -280,7 +280,7 @@ Several alternatives were considered before settling on two distinct primitives.
 
 ### Option D: External shared memory primitive (the chosen option, written here for completeness)
 
-**Why chosen.** Solves the throughput problem structurally — the kernel is not on the data path, so its throughput limit does not apply. Composes with the existing capability and identity systems. Authorized by [ArcOS.md line 134](../../ArcOS.md). Verifiable as a separate, simpler invariant set than the control IPC. Enables real workloads (video, file I/O, LLM inference, audio) without compromising the control path's security properties.
+**Why chosen.** Solves the throughput problem structurally — the kernel is not on the data path, so its throughput limit does not apply. Composes with the existing capability and identity systems. Authorized by [CambiOS.md line 134](../../CambiOS.md). Verifiable as a separate, simpler invariant set than the control IPC. Enables real workloads (video, file I/O, LLM inference, audio) without compromising the control path's security properties.
 
 The tradeoff: more kernel code (channel manager), more user-space discipline (ring buffer protocols), and a different threat model conversation (the channel data is between the two peers, not inspectable by the kernel — but the *topology* is). All three of these are acceptable in exchange for an architecture that scales to general-purpose workloads.
 
@@ -316,7 +316,7 @@ These are out of scope for the ADR but worth recording so they're not rediscover
 - **[ADR-003](003-content-addressed-storage-and-identity.md)** — Identity primitives (channels carry creator + peer Principals)
 - **[ADR-006](006-policy-service.md)** — Policy externalization (channel creation may be policy-gated)
 - **[ADR-007](007-capability-revocation-and-telemetry.md)** — Revocation mechanics + telemetry consumers (channel close paths and AI observability)
-- **[ArcOS.md § The Microkernel](../../ArcOS.md)** — Source-of-truth: "no shared memory between services unless explicitly granted through a capability"
+- **[CambiOS.md § The Microkernel](../../CambiOS.md)** — Source-of-truth: "no shared memory between services unless explicitly granted through a capability"
 - **[CLAUDE.md § Lock Ordering](../../CLAUDE.md#lock-ordering)** — Channel manager will sit at a new position in the hierarchy (TBD during implementation)
 - **[SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis)** — Capability revocation gap (closes via ADR-007 + channels)
 - **[SCHEDULER.md § Blocking and Wake Primitives](../../src/scheduler/SCHEDULER.md#blocking-and-wake-primitives)** — Notification path (channels reuse existing IPC wake)

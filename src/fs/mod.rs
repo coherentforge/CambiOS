@@ -1,8 +1,8 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS Object Store — content-addressed signed object storage
+//! CambiOS Object Store — content-addressed signed object storage
 //!
-//! The native ArcOS storage model. Files are not bytes-at-a-path; they are
+//! The native CambiOS storage model. Files are not bytes-at-a-path; they are
 //! content-addressed signed objects with an immutable author, a transferable
 //! owner, and a cryptographic signature tying content to controller.
 //!
@@ -24,7 +24,7 @@ use crate::ipc::Principal;
 /// Blake3 content hash producing a 32-byte (256-bit) output.
 ///
 /// Blake3 is a cryptographic hash function: collision-resistant, preimage-
-/// resistant, and extremely fast. Used as the content address for ArcObjects.
+/// resistant, and extremely fast. Used as the content address for CambiObjects.
 pub fn content_hash(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
@@ -201,17 +201,17 @@ impl ObjectCapSet {
 }
 
 // ============================================================================
-// ArcObject — the fundamental storage unit
+// CambiObject — the fundamental storage unit
 // ============================================================================
 
-/// An ArcObject is the native ArcOS storage unit: a content-addressed,
+/// An CambiObject is the native CambiOS storage unit: a content-addressed,
 /// signed, ownership-tracked object.
 ///
 /// - `author` is immutable: set at creation, records who made this.
 /// - `owner` is transferable: the current controller who signs the object.
 /// - `content_hash` is the object's address (content-derived).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArcObject {
+pub struct CambiObject {
     /// Content hash — the object's unique address (Blake3).
     pub content_hash: [u8; 32],
     /// Creator's public key — IMMUTABLE after creation. Historical fact.
@@ -232,14 +232,14 @@ pub struct ArcObject {
     pub content: Vec<u8>,
 }
 
-impl ArcObject {
-    /// Create a new ArcObject. The author is set here and cannot be changed.
+impl CambiObject {
+    /// Create a new CambiObject. The author is set here and cannot be changed.
     ///
     /// `content_hash` is computed from `content`. `owner` defaults to `author`
     /// (creator is controller unless ownership is explicitly transferred).
     pub fn new(author: Principal, content: Vec<u8>, created_at: u64) -> Self {
         let hash = content_hash(&content);
-        ArcObject {
+        CambiObject {
             content_hash: hash,
             author: author.public_key,
             owner: author.public_key, // Creator is initial owner
@@ -260,7 +260,7 @@ impl ArcObject {
         created_at: u64,
     ) -> Self {
         let hash = content_hash(&content);
-        ArcObject {
+        CambiObject {
             content_hash: hash,
             author: author.public_key,
             owner: owner.public_key,
@@ -334,7 +334,7 @@ impl core::fmt::Display for StoreError {
     }
 }
 
-/// The ObjectStore trait — the VFS abstraction for ArcOS.
+/// The ObjectStore trait — the VFS abstraction for CambiOS.
 ///
 /// Not a traditional block-device filesystem. Every backing store
 /// (RAM, disk, sovereign cloud, P2P) implements this trait.
@@ -342,11 +342,11 @@ impl core::fmt::Display for StoreError {
 /// Phase 1B: RamObjectStore with Blake3 hashing + Ed25519 signatures.
 pub trait ObjectStore {
     /// Retrieve an object by content hash.
-    fn get(&self, hash: &[u8; 32]) -> Result<&ArcObject, StoreError>;
+    fn get(&self, hash: &[u8; 32]) -> Result<&CambiObject, StoreError>;
 
     /// Store an object. Returns the content hash (the object's address).
     /// The store verifies `content_hash` matches the content on put.
-    fn put(&mut self, object: ArcObject) -> Result<[u8; 32], StoreError>;
+    fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError>;
 
     /// Delete an object by content hash.
     fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError>;
@@ -441,7 +441,7 @@ mod tests {
     fn test_sign_and_verify() {
         let seed = [1u8; 32];
         let (pk, sk) = keypair_from_seed(&seed);
-        let content = b"ArcOS signed object content";
+        let content = b"CambiOS signed object content";
 
         let sig = sign_content(&sk, content);
         assert!(!sig.is_empty_sig());
@@ -487,7 +487,7 @@ mod tests {
     fn test_arc_object_creation() {
         let author = Principal::from_public_key([1u8; 32]);
         let content = alloc::vec![10, 20, 30];
-        let obj = ArcObject::new(author, content.clone(), 1000);
+        let obj = CambiObject::new(author, content.clone(), 1000);
 
         assert_eq!(obj.author, [1u8; 32]);
         assert_eq!(obj.owner, [1u8; 32]); // Owner defaults to author
@@ -499,12 +499,12 @@ mod tests {
 
     #[test]
     fn test_arc_object_author_immutability() {
-        // ArcObject.author is pub but the constructor sets it.
+        // CambiObject.author is pub but the constructor sets it.
         // The design invariant: author is set at creation and should never
         // be modified. This test documents the expectation. Enforcement
         // is at the ObjectStore level (put() preserves author).
         let author = Principal::from_public_key([1u8; 32]);
-        let obj = ArcObject::new(author, alloc::vec![42], 0);
+        let obj = CambiObject::new(author, alloc::vec![42], 0);
         assert_eq!(obj.author, [1u8; 32]);
         assert_eq!(obj.author_principal(), author);
     }
@@ -513,7 +513,7 @@ mod tests {
     fn test_arc_object_with_different_owner() {
         let author = Principal::from_public_key([1u8; 32]);
         let owner = Principal::from_public_key([2u8; 32]);
-        let obj = ArcObject::new_with_owner(author, owner, alloc::vec![99], 500);
+        let obj = CambiObject::new_with_owner(author, owner, alloc::vec![99], 500);
 
         assert_eq!(obj.author, [1u8; 32]);
         assert_eq!(obj.owner, [2u8; 32]);
@@ -524,7 +524,7 @@ mod tests {
     fn test_arc_object_lineage() {
         let author = Principal::from_public_key([1u8; 32]);
         let parent_hash = [0xFFu8; 32];
-        let obj = ArcObject::new(author, alloc::vec![1, 2, 3], 0)
+        let obj = CambiObject::new(author, alloc::vec![1, 2, 3], 0)
             .with_lineage(parent_hash);
 
         assert_eq!(obj.lineage, Some(parent_hash));

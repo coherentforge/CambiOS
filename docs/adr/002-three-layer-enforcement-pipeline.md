@@ -10,7 +10,7 @@
 
 ## Problem
 
-ADR-000 establishes that ArcOS uses capability-based access control and zero-trust principles. But a security *model* is not enforcement — it needs to be wired into the code paths where operations actually happen.
+ADR-000 establishes that CambiOS uses capability-based access control and zero-trust principles. But a security *model* is not enforcement — it needs to be wired into the code paths where operations actually happen.
 
 The question: where in the syscall and IPC dispatch pipeline do we enforce access control, and how do we structure the checks so that:
 

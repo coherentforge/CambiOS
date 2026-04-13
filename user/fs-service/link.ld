@@ -1,6 +1,6 @@
 /* Copyright (C) 2024-2026 Jason Ricca. All rights reserved. */
 
-/* ArcOS user-space ELF linker script (fs-service)
+/* CambiOS user-space ELF linker script (fs-service)
  *
  * Places code at 0x400000 (USER_CODE_VADDR).
  * Produces a minimal static ELF64 binary.

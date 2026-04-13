@@ -14,11 +14,11 @@ Access control lists (ACLs) mitigate this by attaching permission lists to resou
 2. **Ambient.** Authority comes from identity (who you are), not possession (what you hold). A compromised PDF reader can read SSH keys because it runs as you and you can read SSH keys.
 3. **Unverifiable at scale.** Policy is distributed across files, tables, and configuration. Auditing who can do what requires reconstructing the full authority graph — an NP-hard problem in practice.
 
-ArcOS needs a security model where compromising any single component — a driver, a service, even a kernel subsystem — gains the attacker exactly nothing beyond the explicitly granted rights of that component.
+CambiOS needs a security model where compromising any single component — a driver, a service, even a kernel subsystem — gains the attacker exactly nothing beyond the explicitly granted rights of that component.
 
 ## Decision
 
-ArcOS adopts two complementary security principles as its foundational architecture:
+CambiOS adopts two complementary security principles as its foundational architecture:
 
 1. **Zero-Trust Architecture (ZTA):** No process, driver, or kernel component is trusted by default, regardless of whether it is already running inside the system. Every operation is verified at the time of use.
 
@@ -38,7 +38,7 @@ This is the analogy: traditional OS security is a building where you badge in at
 
 ### Trust boundaries
 
-ArcOS has three trust levels, each with a strict enforcement boundary:
+CambiOS has three trust levels, each with a strict enforcement boundary:
 
 | Level | Runs in | Trust | Enforcement |
 |---|---|---|---|
@@ -50,7 +50,7 @@ Drivers, filesystems, and networking run as Ring 3 services — not in the kerne
 
 ### Capability model
 
-A capability in ArcOS is a kernel-managed `(endpoint, rights)` pair:
+A capability in CambiOS is a kernel-managed `(endpoint, rights)` pair:
 
 ```rust
 pub struct Capability {
@@ -122,7 +122,7 @@ The verifier runs before the loader allocates frames or maps pages. A binary tha
 
 ## Threat Model
 
-### What ArcOS protects against
+### What CambiOS protects against
 
 | Threat | Mitigation |
 |---|---|
@@ -197,7 +197,7 @@ PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7)
 
 6. **Verify before execute.** No binary runs without passing the verification gate. No memory is allocated for unverified binaries.
 
-7. **No telemetry.** ArcOS does not phone home, report analytics, or exfiltrate any data. Security monitoring is local and under the operator's control.
+7. **No telemetry.** CambiOS does not phone home, report analytics, or exfiltrate any data. Security monitoring is local and under the operator's control.
 
 ## Future Work
 
@@ -209,7 +209,7 @@ The architectural extensions to the capability model have been moved into their 
 
 The remaining open item not yet captured in its own ADR:
 
-**Cryptographic capabilities.** Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked ArcOS nodes without a central authority. Only relevant once mesh networking lands.
+**Cryptographic capabilities.** Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked CambiOS nodes without a central authority. Only relevant once mesh networking lands.
 
 ## References
 

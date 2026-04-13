@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS Filesystem Service — user-space ObjectStore gateway
+//! CambiOS Filesystem Service — user-space ObjectStore gateway
 //!
 //! Runs as a ring-3 process. Registers IPC endpoint 16, receives
 //! get/put/delete/list commands over IPC, enforces ownership via

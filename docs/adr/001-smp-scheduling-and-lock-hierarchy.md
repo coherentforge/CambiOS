@@ -7,7 +7,7 @@
 
 ## Problem
 
-ArcOS had a single global `SCHEDULER: IrqSpinlock<Option<Box<Scheduler>>>` and `TIMER: IrqSpinlock<Option<Timer>>` protecting all task state behind one lock per resource. With SMP (multiple CPUs online since Phase 2), this created a serialization bottleneck: every timer ISR on every CPU contended on the same lock. Only one CPU could advance its scheduler tick or perform a context switch at a time.
+CambiOS had a single global `SCHEDULER: IrqSpinlock<Option<Box<Scheduler>>>` and `TIMER: IrqSpinlock<Option<Timer>>` protecting all task state behind one lock per resource. With SMP (multiple CPUs online since Phase 2), this created a serialization bottleneck: every timer ISR on every CPU contended on the same lock. Only one CPU could advance its scheduler tick or perform a context switch at a time.
 
 The existing ISR hot path already used `try_lock()` to avoid deadlock, meaning a CPU that lost the race simply skipped its tick entirely — acceptable for a single CPU, but a scaling wall for multicore.
 
@@ -295,7 +295,7 @@ The timer ISR fires asynchronously — it can interrupt code that already holds 
 
 ## The Seven-Lock Hierarchy
 
-ArcOS has seven system-wide lock groups, ordered to prevent deadlock. This is the single most important architectural invariant for contributors to understand.
+CambiOS has seven system-wide lock groups, ordered to prevent deadlock. This is the single most important architectural invariant for contributors to understand.
 
 ```
 PER_CPU_SCHEDULER[*](1)* → PER_CPU_TIMER[*](2)* → IPC_MANAGER(3) →

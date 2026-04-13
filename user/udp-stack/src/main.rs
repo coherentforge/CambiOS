@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS UDP Stack — user-space network service
+//! CambiOS UDP Stack — user-space network service
 //!
 //! Minimal stateless UDP/IP implementation running as a ring-3 process.
 //! Communicates with the virtio-net driver (endpoint 20) for raw Ethernet

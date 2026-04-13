@@ -6,7 +6,7 @@
 //! table slots at boot from three inputs:
 //!
 //! 1. The **tier policy** (a [`TableSizingPolicy`]), selected at build
-//!    time by the `ARCOS_TIER` environment variable (see `build.rs`).
+//!    time by the `CAMBIOS_TIER` environment variable (see `build.rs`).
 //! 2. The **available RAM** at boot, measured from the Limine memory
 //!    map and passed into [`init_num_slots`].
 //! 3. The compile-time constant [`SLOT_OVERHEAD`], computed from
@@ -35,13 +35,13 @@ use crate::process::ProcessDescriptor;
 // ============================================================================
 //
 // `build.rs` emits exactly one of `--cfg tier1`, `--cfg tier2`, or
-// `--cfg tier3`, defaulting to `tier3` when `ARCOS_TIER` is unset. The
+// `--cfg tier3`, defaulting to `tier3` when `CAMBIOS_TIER` is unset. The
 // checks below catch the impossible cases: zero tiers or multiple
 // tiers. If either fires at compile time, `build.rs` is broken.
 
 #[cfg(not(any(tier1, tier2, tier3)))]
 compile_error!(
-    "no tier selected — build.rs should default to tier3 when ARCOS_TIER is unset. \
+    "no tier selected — build.rs should default to tier3 when CAMBIOS_TIER is unset. \
      Check that build.rs is being picked up and that cargo is re-running it."
 );
 
@@ -124,7 +124,7 @@ pub const SLOT_OVERHEAD: usize = core::mem::size_of::<ProcessDescriptor>()
 // Defaults from ADR-008 § Decision. Documented in ASSUMPTIONS.md § Tier
 // policies with replacement criteria.
 
-/// TUNING: Tier 1 (ArcOS-Embedded) default policy.
+/// TUNING: Tier 1 (CambiOS-Embedded) default policy.
 /// 1.5% of RAM, clamped 2–8 MiB, for 32–256 slots.
 pub const TIER1_POLICY: TableSizingPolicy = TableSizingPolicy {
     min_slots: 32,
@@ -134,7 +134,7 @@ pub const TIER1_POLICY: TableSizingPolicy = TableSizingPolicy {
     ram_budget_ceiling: 8 * 1024 * 1024,
 };
 
-/// TUNING: Tier 2 (ArcOS-Standard, no AI) default policy.
+/// TUNING: Tier 2 (CambiOS-Standard, no AI) default policy.
 /// 2% of RAM, clamped 16–64 MiB, for 128–4096 slots.
 pub const TIER2_POLICY: TableSizingPolicy = TableSizingPolicy {
     min_slots: 128,
@@ -144,7 +144,7 @@ pub const TIER2_POLICY: TableSizingPolicy = TableSizingPolicy {
     ram_budget_ceiling: 64 * 1024 * 1024,
 };
 
-/// TUNING: Tier 3 (ArcOS-Full) default policy.
+/// TUNING: Tier 3 (CambiOS-Full) default policy.
 /// 3% of RAM, clamped 64–512 MiB, for 256–65536 slots.
 pub const TIER3_POLICY: TableSizingPolicy = TableSizingPolicy {
     min_slots: 256,

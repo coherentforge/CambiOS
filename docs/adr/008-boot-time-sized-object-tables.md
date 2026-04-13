@@ -8,19 +8,19 @@
 
 ## Context
 
-ArcOS's kernel today stores per-process state — the process descriptor table and the capability table — in fixed-size dense arrays sized by a compile-time constant. The constant was `MAX_PROCESSES = 32` until Wave 1 of Phase 3 (capability revocation) landed, at which point the conversation about raising it surfaced that "pick a bigger constant" does not address the real problem. The real problem is that *any* compile-time constant has structural failure modes at the two ends of the project's target hardware range (embedded at one end, future high-memory workstations at the other) and in the sawtooth between phases. This ADR documents the allocation model ArcOS adopts to resolve that.
+CambiOS's kernel today stores per-process state — the process descriptor table and the capability table — in fixed-size dense arrays sized by a compile-time constant. The constant was `MAX_PROCESSES = 32` until Wave 1 of Phase 3 (capability revocation) landed, at which point the conversation about raising it surfaced that "pick a bigger constant" does not address the real problem. The real problem is that *any* compile-time constant has structural failure modes at the two ends of the project's target hardware range (embedded at one end, future high-memory workstations at the other) and in the sawtooth between phases. This ADR documents the allocation model CambiOS adopts to resolve that.
 
 This ADR is written after [ADR-009](009-purpose-tiers-scope.md), which commits the project to three deployment tiers and a broad but bounded hardware range. ADR-009 establishes the hardware precondition; this ADR designs the mechanism that serves it.
 
 ## Problem
 
-ArcOS's kernel currently stores per-process state in fixed-size dense arrays sized by the compile-time constant `MAX_PROCESSES = 32`. This includes the process descriptor table in [src/process.rs](../../src/process.rs) and the capability table in [src/ipc/capability.rs](../../src/ipc/capability.rs). Every slot is preallocated at boot, regardless of whether it is used. Lookups are O(1) array indexing. Verification invariants reason about the array as a statically-bounded structure.
+CambiOS's kernel currently stores per-process state in fixed-size dense arrays sized by the compile-time constant `MAX_PROCESSES = 32`. This includes the process descriptor table in [src/process.rs](../../src/process.rs) and the capability table in [src/ipc/capability.rs](../../src/ipc/capability.rs). Every slot is preallocated at boot, regardless of whether it is used. Lookups are O(1) array indexing. Verification invariants reason about the array as a statically-bounded structure.
 
 This was the right design when the kernel ran three processes in total. It is the wrong design for a general-purpose operating system that targets modern hardware and expects to run user workloads beyond a handful of core services. Four problems have accumulated, and together they motivate this ADR.
 
 **Problem 1 — the bound is too small for general-purpose workloads.**
 
-The value of 32 is a scaffolding artifact from the kernel's earliest days. Today the project runs 7 boot modules plus idle, and the v1 roadmap adds at least another dozen core-service processes (policy service, audit watcher, init, DHCP client, DNS resolver, TCP stack, virtio-blk driver, persistent ObjectStore, ArcObject CLI, Yggdrasil peer service, and the tier-dependent AI services described in [ADR-009](009-purpose-tiers-scope.md)). Beyond core services, general-purpose use involves spawned user programs — shells, editors, build systems, browser helper processes, PE-compatibility sandboxes. Any realistic Tier 3 session hits 32 before the user has opened their second application.
+The value of 32 is a scaffolding artifact from the kernel's earliest days. Today the project runs 7 boot modules plus idle, and the v1 roadmap adds at least another dozen core-service processes (policy service, audit watcher, init, DHCP client, DNS resolver, TCP stack, virtio-blk driver, persistent ObjectStore, CambiObject CLI, Yggdrasil peer service, and the tier-dependent AI services described in [ADR-009](009-purpose-tiers-scope.md)). Beyond core services, general-purpose use involves spawned user programs — shells, editors, build systems, browser helper processes, PE-compatibility sandboxes. Any realistic Tier 3 session hits 32 before the user has opened their second application.
 
 [ADR-009](009-purpose-tiers-scope.md) commits the project to being a first-class general-purpose operating system across three deployment tiers. A cap of 32 is incompatible with that commitment at every tier.
 
@@ -40,7 +40,7 @@ A fix for this problem does not strictly require changing the allocation model �
 
 **Problem 4 — compile-time sizing does not survive a wide hardware range.**
 
-[ADR-009](009-purpose-tiers-scope.md) commits ArcOS to three deployment tiers spanning approximately three orders of magnitude of hardware: from a 256 MB embedded board at the Tier 1 minimum through 8 GB desktops and laptops at the Tier 3 floor to future workstations with hundreds of gigabytes or terabytes of RAM. A single compile-time `MAX_PROCESSES` constant cannot serve this range. A number that is comfortable on a 16 GB desktop is absurdly small on a future 1 TB workstation. A number sized for the future is catastrophic on a 512 MB embedded board.
+[ADR-009](009-purpose-tiers-scope.md) commits CambiOS to three deployment tiers spanning approximately three orders of magnitude of hardware: from a 256 MB embedded board at the Tier 1 minimum through 8 GB desktops and laptops at the Tier 3 floor to future workstations with hundreds of gigabytes or terabytes of RAM. A single compile-time `MAX_PROCESSES` constant cannot serve this range. A number that is comfortable on a 16 GB desktop is absurdly small on a future 1 TB workstation. A number sized for the future is catastrophic on a 512 MB embedded board.
 
 [ADR-009](009-purpose-tiers-scope.md) also commits the project to "Platform Is an Implementation Detail" and to a single kernel binary running across each tier's hardware range. A compile-time constant breaks that commitment as soon as the hardware range is wide. The project can either accept multiple kernel builds for different hardware classes (rejected by the single-binary principle), pick a single number and accept that it is wrong for both extremes (rejected by the general-purpose commitment), or find an allocation model that adapts to hardware at boot time.
 
@@ -68,7 +68,7 @@ Paired with structural capability-gated process creation — where creating a pr
 
 ## Decision
 
-ArcOS adopts a **boot-time-sized dense array** allocation model for per-process kernel object tables, paired with **structural capability-gated process creation**. The tables live in a dedicated memory region carved from the frame allocator at boot init, separate from the kernel heap. The sizing policy is expressed as a RAM budget rather than a slot count. Specifically:
+CambiOS adopts a **boot-time-sized dense array** allocation model for per-process kernel object tables, paired with **structural capability-gated process creation**. The tables live in a dedicated memory region carved from the frame allocator at boot init, separate from the kernel heap. The sizing policy is expressed as a RAM budget rather than a slot count. Specifically:
 
 **1. The kernel takes its table sizing policy as an explicit input, not as a hidden formula.** A `TableSizingPolicy` struct declares the sizing decision in configuration that can be read, verified, and adjusted independently of kernel source. The kernel's role is to *apply* the policy to the actual hardware at boot; it does not decide the policy.
 
@@ -134,11 +134,11 @@ let num_slots = slots_from_budget.clamp(policy.min_slots, policy.max_slots);
 
 Five fields, two clamps, one arithmetic derivation using a compile-time constant for slot overhead. The verifier treats the five policy fields as axioms from the tier configuration, treats `SLOT_OVERHEAD` as a compile-time constant, and reasons about each clamp as a simple inequality. The `u128` intermediate prevents overflow on unusual memory sizes; on realistic hardware the optimizer lowers it to ordinary integer operations.
 
-**4. The policy is declared at the tier boundary, not in the kernel's core logic.** Per [ADR-009](009-purpose-tiers-scope.md), the tier is an install-time choice — it determines which build of ArcOS is shipped and which user-space services are loaded. The tier also carries the table sizing policy as part of its build-time configuration. Each tier ships with a default policy:
+**4. The policy is declared at the tier boundary, not in the kernel's core logic.** Per [ADR-009](009-purpose-tiers-scope.md), the tier is an install-time choice — it determines which build of CambiOS is shipped and which user-space services are loaded. The tier also carries the table sizing policy as part of its build-time configuration. Each tier ships with a default policy:
 
-- **Tier 1 — ArcOS-Embedded.** `{ min_slots: 32, max_slots: 256, ram_budget_ppm: 15_000, ram_budget_floor: 2 MiB, ram_budget_ceiling: 8 MiB }`. Reads as: "1.5% of RAM, clamped 2 MiB to 8 MiB, for between 32 and 256 slots." Embedded deployments typically run small, stable sets of fixed-function processes; the 256-slot ceiling reflects that a deployment needing more is probably the wrong fit for Tier 1.
-- **Tier 2 — ArcOS-Standard (no AI).** `{ min_slots: 128, max_slots: 4096, ram_budget_ppm: 20_000, ram_budget_floor: 16 MiB, ram_budget_ceiling: 64 MiB }`. Reads as: "2% of RAM, clamped 16 MiB to 64 MiB, for between 128 and 4096 slots." Sized for a typical single-user desktop or workstation; operators on shared multi-user machines or heavy build farms can raise the ceiling in a custom tier configuration.
-- **Tier 3 — ArcOS-Full.** `{ min_slots: 256, max_slots: 65536, ram_budget_ppm: 30_000, ram_budget_floor: 64 MiB, ram_budget_ceiling: 512 MiB }`. Reads as: "3% of RAM, clamped 64 MiB to 512 MiB, for between 256 and 65536 slots." Sized to accommodate heavy general-purpose workloads (large builds, many user applications, AI services with per-request workers). Operators with workloads exceeding 65536 processes can raise the ceiling in a custom tier configuration — the cap is a default, not a physical limit.
+- **Tier 1 — CambiOS-Embedded.** `{ min_slots: 32, max_slots: 256, ram_budget_ppm: 15_000, ram_budget_floor: 2 MiB, ram_budget_ceiling: 8 MiB }`. Reads as: "1.5% of RAM, clamped 2 MiB to 8 MiB, for between 32 and 256 slots." Embedded deployments typically run small, stable sets of fixed-function processes; the 256-slot ceiling reflects that a deployment needing more is probably the wrong fit for Tier 1.
+- **Tier 2 — CambiOS-Standard (no AI).** `{ min_slots: 128, max_slots: 4096, ram_budget_ppm: 20_000, ram_budget_floor: 16 MiB, ram_budget_ceiling: 64 MiB }`. Reads as: "2% of RAM, clamped 16 MiB to 64 MiB, for between 128 and 4096 slots." Sized for a typical single-user desktop or workstation; operators on shared multi-user machines or heavy build farms can raise the ceiling in a custom tier configuration.
+- **Tier 3 — CambiOS-Full.** `{ min_slots: 256, max_slots: 65536, ram_budget_ppm: 30_000, ram_budget_floor: 64 MiB, ram_budget_ceiling: 512 MiB }`. Reads as: "3% of RAM, clamped 64 MiB to 512 MiB, for between 256 and 65536 slots." Sized to accommodate heavy general-purpose workloads (large builds, many user applications, AI services with per-request workers). Operators with workloads exceeding 65536 processes can raise the ceiling in a custom tier configuration — the cap is a default, not a physical limit.
 
 These values are starting points, not final commitments. They are documented in [ASSUMPTIONS.md](../../ASSUMPTIONS.md) and can be tuned when real workload data exists. The kernel binary is identical across tiers per ADR-009's "same kernel binary across tiers" commitment; what differs is the `TableSizingPolicy` value compiled in from the tier's configuration.
 
@@ -151,9 +151,9 @@ On current kernel state, `max_slots` is typically the binding constraint at the 
 
 **6. The tables live in a dedicated "kernel object table region," not in the kernel heap.** The process and capability tables are allocated as a single contiguous region directly from the frame allocator during boot init, mapped into the kernel's address space via the HHDM, and never freed for the lifetime of the kernel. This is a deliberate architectural commitment that this ADR makes, rather than leaving to implementation time. The rationale and mechanism are detailed in the Architecture section below. The kernel heap remains at its current size for Wave 2a; growing the heap to absorb other Phase 3 subsystem pressure (audit ring buffers, channel bookkeeping, policy cache) is a separate decision from this ADR.
 
-**7. The policy is visible and adjustable at build time today, with a documented migration to boot-time configuration when a manifest mechanism exists.** Because the policy is five explicit numbers rather than a hidden formula, an operator deploying ArcOS to unusual hardware can adjust the policy at build time without touching kernel source beyond the tier configuration file. The policy for each tier lives in a dedicated kernel configuration module (`src/config/tier.rs` in Wave 2a's implementation). Three Cargo features — `tier1`, `tier2`, `tier3` — select which tier's policy is compiled in; exactly one is set per kernel build. A build-script check rejects a configuration with zero or multiple tier features set. An operator who wants a custom policy adds a `tier_custom` feature with their own policy values and rebuilds.
+**7. The policy is visible and adjustable at build time today, with a documented migration to boot-time configuration when a manifest mechanism exists.** Because the policy is five explicit numbers rather than a hidden formula, an operator deploying CambiOS to unusual hardware can adjust the policy at build time without touching kernel source beyond the tier configuration file. The policy for each tier lives in a dedicated kernel configuration module (`src/config/tier.rs` in Wave 2a's implementation). Three Cargo features — `tier1`, `tier2`, `tier3` — select which tier's policy is compiled in; exactly one is set per kernel build. A build-script check rejects a configuration with zero or multiple tier features set. An operator who wants a custom policy adds a `tier_custom` feature with their own policy values and rebuilds.
 
-Build-time configuration is the right mechanism for Wave 2 because ArcOS does not yet have a boot-manifest infrastructure — the kernel does not read any runtime-loaded configuration today. Introducing boot-manifest support just for table sizing would be a larger scope change than this ADR needs. The long-term direction, however, is clear: **when ArcOS grows a boot-manifest mechanism (anticipated post-v1, alongside the init process and service configuration work), the table sizing policy moves from compile-time configuration to the manifest.** The compile-time const becomes a fallback default for the case where no manifest is present, and an operator who wants a different policy adjusts the manifest rather than rebuilding the kernel. This ADR does not design the manifest itself, but it commits that the table sizing policy will be among the first things to move into it, because the policy is already structured to make that migration clean: the struct, the fields, and the computation are the same on either side of the move — only the *source* of the policy values changes.
+Build-time configuration is the right mechanism for Wave 2 because CambiOS does not yet have a boot-manifest infrastructure — the kernel does not read any runtime-loaded configuration today. Introducing boot-manifest support just for table sizing would be a larger scope change than this ADR needs. The long-term direction, however, is clear: **when CambiOS grows a boot-manifest mechanism (anticipated post-v1, alongside the init process and service configuration work), the table sizing policy moves from compile-time configuration to the manifest.** The compile-time const becomes a fallback default for the case where no manifest is present, and an operator who wants a different policy adjusts the manifest rather than rebuilding the kernel. This ADR does not design the manifest itself, but it commits that the table sizing policy will be among the first things to move into it, because the policy is already structured to make that migration clean: the struct, the fields, and the computation are the same on either side of the move — only the *source* of the policy values changes.
 
 **8. At the kernel level, the policy is an axiom.** The kernel does not decide the policy; it receives the policy from the tier configuration and applies it. From the verifier's perspective, `num_slots` is an input parameter constrained by the policy fields and the compile-time `SLOT_OVERHEAD`, not a value derived from a formula with magic constants. This is a stronger verification target than a hidden formula: the verifier proves properties of the table given `num_slots`, and the policy's constraints on `num_slots` (derived from the two clamps) are checked at init time and then treated as invariants.
 
@@ -185,16 +185,16 @@ After step 11, `num_slots` is effectively a compile-time constant from the persp
 
 ### What the RAM budget means for a running program
 
-A running program on ArcOS sees "available memory" = physical RAM minus kernel commitments. The kernel object table region is one of those commitments: memory the kernel reserves at boot, never frees, and never makes visible to user space.
+A running program on CambiOS sees "available memory" = physical RAM minus kernel commitments. The kernel object table region is one of those commitments: memory the kernel reserves at boot, never frees, and never makes visible to user space.
 
 On 8 GB Tier 3 with the default policy, the region reserves roughly 200 MiB (the `ram_budget_ceiling` at 3% of 8 GB is 246 MiB, clamped down to 512 MiB ceiling — the ceiling is not the binding constraint at this RAM size, but `max_slots × SLOT_OVERHEAD` typically is). Combined with other kernel commitments (heap, frame bitmap, per-CPU state, kernel code and page tables), total kernel memory footprint at boot is a few hundred MiB. User programs on an 8 GB machine see approximately 7.5 GB available — about 95% of physical memory.
 
 For comparison on the same hardware:
 - Windows 11: kernel + services + background tasks typically commit 4-8 GB at boot. Users see 8-12 GB.
 - Linux (full desktop distro): ~1-2 GB committed at boot. Users see 14-15 GB.
-- ArcOS Tier 3: ~200-400 MiB committed at boot. Users see ~7.5 GB.
+- CambiOS Tier 3: ~200-400 MiB committed at boot. Users see ~7.5 GB.
 
-The kernel object table region is the largest single commitment this ADR introduces, and it is still a small fraction of what commercial OSes reserve. The commitment is pre-allocated at boot and stays committed regardless of workload — a lightly-loaded Tier 3 machine has the same table footprint as a heavily-loaded one. This is the "set once, never changes" property that makes the allocation verification-clean. The tradeoff is that memory capacity reserved for slots that may go unused cannot be reclaimed by user programs. For ArcOS's goals (verification, predictability, no allocation failures in the hot path), this tradeoff is deliberate, and the memory cost remains modest — a few percent of RAM at every tier.
+The kernel object table region is the largest single commitment this ADR introduces, and it is still a small fraction of what commercial OSes reserve. The commitment is pre-allocated at boot and stays committed regardless of workload — a lightly-loaded Tier 3 machine has the same table footprint as a heavily-loaded one. This is the "set once, never changes" property that makes the allocation verification-clean. The tradeoff is that memory capacity reserved for slots that may go unused cannot be reclaimed by user programs. For CambiOS's goals (verification, predictability, no allocation failures in the hot path), this tradeoff is deliberate, and the memory cost remains modest — a few percent of RAM at every tier.
 
 ### Kernel Object Table Region
 
@@ -208,7 +208,7 @@ The process and capability tables are allocated from a dedicated physical memory
 
 3. **Verification.** A dedicated region has a single, declared memory range that is easier to reason about than a heap allocation of similar size. Verification properties of the tables (bounded iteration, valid index range, disjoint-from-other-allocations) are parameterized by `num_slots` and the region base address, neither of which interacts with the heap allocator's state.
 
-4. **Separation of concerns.** "Kernel object storage" and "kernel working memory" are architecturally different things. Linux's slab allocator, seL4's untyped memory, and other production kernels all distinguish between them. ArcOS's current conflation into a single heap is a scaffolding choice from the early kernel days; this ADR introduces the separation for the specific objects it covers.
+4. **Separation of concerns.** "Kernel object storage" and "kernel working memory" are architecturally different things. Linux's slab allocator, seL4's untyped memory, and other production kernels all distinguish between them. CambiOS's current conflation into a single heap is a scaffolding choice from the early kernel days; this ADR introduces the separation for the specific objects it covers.
 
 5. **Reusable pattern for future kernel objects.** When Wave 2d implements channels, they use the same pattern: a dedicated region for the channel table, sized by a channel-specific `TableSizingPolicy` declared in the tier configuration alongside the process-table policy. The architectural template this ADR establishes is reusable for every future kernel-object allocation that needs the same properties (long-lived, large, dense-array, known-at-boot). Future regions for additional kernel object kinds (capability registry entries, audit records, policy cache rows) can use the same allocation path.
 
@@ -288,7 +288,7 @@ The boot-time sizing and region allocation changes happen during kernel initiali
 
 This section addresses the question that shaped the choice between the options considered in the Why Not Other Options section: *does this approach survive general-purpose workloads across the full tier range, or does it have hidden failure modes?*
 
-The short answer is yes, because the chosen approach is structurally conservative. It does not introduce any mechanism that is new to operating systems at scale (dense arrays with runtime-sized capacity are standard; dedicated regions for long-lived kernel objects are standard), does not depend on solving any open research problems (defragmentation, Retype budget management), and does not require hardware support beyond what ArcOS already assumes.
+The short answer is yes, because the chosen approach is structurally conservative. It does not introduce any mechanism that is new to operating systems at scale (dense arrays with runtime-sized capacity are standard; dedicated regions for long-lived kernel objects are standard), does not depend on solving any open research problems (defragmentation, Retype budget management), and does not require hardware support beyond what CambiOS already assumes.
 
 ### Scaling properties
 
@@ -300,7 +300,7 @@ The short answer is yes, because the chosen approach is structurally conservativ
 
 Three workload patterns matter for general-purpose viability. Each is handled cleanly by the chosen approach:
 
-**A desktop session with many running programs.** A user running ArcOS as their daily driver might have shell, editor, browser, messaging client, file manager, and several helper processes — perhaps 30-50 processes total. On Tier 3 at 8 GB, `num_slots` is in the tens of thousands. The session consumes well under 1% of the slots. Comfortable.
+**A desktop session with many running programs.** A user running CambiOS as their daily driver might have shell, editor, browser, messaging client, file manager, and several helper processes — perhaps 30-50 processes total. On Tier 3 at 8 GB, `num_slots` is in the tens of thousands. The session consumes well under 1% of the slots. Comfortable.
 
 **A build system spawning many short-lived processes.** A compilation invoking a build tool that spawns parallel worker processes might have 200-500 concurrent processes at peak. On Tier 3 at 8 GB this is a small fraction of the slots. Well within capacity.
 
@@ -340,7 +340,7 @@ The chosen approach does not solve the "what if a workload wants more than the c
 
 ## Verification Stance
 
-ArcOS's verification posture, documented in [CLAUDE.md](../../CLAUDE.md) under "Formal Verification (Non-Negotiable Constraint)," has several requirements that any kernel change must respect:
+CambiOS's verification posture, documented in [CLAUDE.md](../../CLAUDE.md) under "Formal Verification (Non-Negotiable Constraint)," has several requirements that any kernel change must respect:
 
 - Bounded iteration (no unbounded loops in kernel paths)
 - Invariants encoded in types where possible
@@ -362,7 +362,7 @@ The boot-time-sized dense array with dedicated region preserves all of these:
 
 **The verification target that actually changes** is the one invariant that used to read "the process table has exactly `MAX_PROCESSES` slots" and now reads "the process table has exactly `num_slots` slots, where `num_slots` is derived from a `TableSizingPolicy` and `SLOT_OVERHEAD` via a deterministic clamp computation at init, and has not changed since, and where the table occupies a known range of physical memory that does not overlap any other kernel allocation." This is *more specific* than a compile-time constant, not less. A verifier reasoning about post-init kernel state treats the five `TableSizingPolicy` fields as axioms (inputs to the kernel from the tier configuration), treats `SLOT_OVERHEAD` as a compile-time constant, treats the clamp computation as a simple arithmetic fact, and proves properties of the table parameterized by `num_slots` and its base address. This is a well-understood verification pattern.
 
-**What about adversarial inputs?** A natural question is whether an attacker could influence `num_slots` by manipulating the bootloader memory map. The answer: the bootloader memory map is trusted input (at ArcOS's trust boundary for the hardware), and if it is compromised, every other kernel invariant that depends on it is also compromised. This is not a new attack surface introduced by this ADR — the frame allocator already trusts the memory map, and the scheduler's per-CPU state already trusts the CPU count derived from ACPI. The `num_slots` computation is one more place that trusts the memory map, using the same trust model the rest of the boot sequence already uses. Additionally, the `ram_budget_ceiling` and `max_slots` clamps provide hard upper bounds that do not depend on memory map input at all — an attacker who reported absurdly large memory would still see `num_slots` capped at the policy bounds.
+**What about adversarial inputs?** A natural question is whether an attacker could influence `num_slots` by manipulating the bootloader memory map. The answer: the bootloader memory map is trusted input (at CambiOS's trust boundary for the hardware), and if it is compromised, every other kernel invariant that depends on it is also compromised. This is not a new attack surface introduced by this ADR — the frame allocator already trusts the memory map, and the scheduler's per-CPU state already trusts the CPU count derived from ACPI. The `num_slots` computation is one more place that trusts the memory map, using the same trust model the rest of the boot sequence already uses. Additionally, the `ram_budget_ceiling` and `max_slots` clamps provide hard upper bounds that do not depend on memory map input at all — an attacker who reported absurdly large memory would still see `num_slots` capped at the policy bounds.
 
 ## Threat Model Impact
 
@@ -463,7 +463,7 @@ Several alternatives were considered before settling on the chosen approach. Eac
 
 *Why considered.* Strongly aligned with verification-first goals. Eliminates ambient authority structurally via capability-gated Retype. Counting-invariant verification target. Proven in embedded systems.
 
-*Why rejected.* Fragmentation under long-running general-purpose workloads is an unsolved problem with no satisfying solution in existing systems. Memory defragmentation in a live kernel is either latency-spiking stop-the-world compaction or permanent background-worker overhead — neither acceptable for a general-purpose OS. seL4 avoids the problem by targeting workloads that reboot frequently and have predictable object counts; ArcOS's general-purpose aspirations per [ADR-009](009-purpose-tiers-scope.md) do not get that dodge. Not proven as a general-purpose OS substrate in any public deployment. The chosen approach preserves most of object memory's benefits (bounded memory, verification-friendly, capability-gated creation, dedicated region for kernel objects) without introducing the fragmentation risk. Remains a candidate for a superseding ADR if future work reveals a satisfying fragmentation solution.
+*Why rejected.* Fragmentation under long-running general-purpose workloads is an unsolved problem with no satisfying solution in existing systems. Memory defragmentation in a live kernel is either latency-spiking stop-the-world compaction or permanent background-worker overhead — neither acceptable for a general-purpose OS. seL4 avoids the problem by targeting workloads that reboot frequently and have predictable object counts; CambiOS's general-purpose aspirations per [ADR-009](009-purpose-tiers-scope.md) do not get that dodge. Not proven as a general-purpose OS substrate in any public deployment. The chosen approach preserves most of object memory's benefits (bounded memory, verification-friendly, capability-gated creation, dedicated region for kernel objects) without introducing the fragmentation risk. Remains a candidate for a superseding ADR if future work reveals a satisfying fragmentation solution.
 
 **Alternative 6: Capability-gated process creation (structural), independent of allocation mechanism.**
 
@@ -475,25 +475,25 @@ Several alternatives were considered before settling on the chosen approach. Eac
 
 *Why considered.* Scales to general-purpose workloads without a fixed cap.
 
-*Why rejected.* The kernel heap allocator is itself in the verification target. Variable-length heap-allocated collections are harder to verify than fixed arrays. ArcOS's verification-first posture makes this an unacceptable trade.
+*Why rejected.* The kernel heap allocator is itself in the verification target. Variable-length heap-allocated collections are harder to verify than fixed arrays. CambiOS's verification-first posture makes this an unacceptable trade.
 
 **Alternative 8: Linux-style PID bitmap plus slab allocator.**
 
 *Why considered.* Industry-proven, scales to millions of processes, mature tooling.
 
-*Why rejected.* Same verification objection as Redox-style, plus additional complexity. Linux's scale is a distraction — ArcOS's v1 targets do not need tens of thousands of processes per CPU.
+*Why rejected.* Same verification objection as Redox-style, plus additional complexity. Linux's scale is a distraction — CambiOS's v1 targets do not need tens of thousands of processes per CPU.
 
 **Alternative 9: Fuchsia-style handle table with slab-allocated kernel objects.**
 
 *Why considered.* Fuchsia is the closest prior art — a microkernel OS with a handle-to-object model and general-purpose ambitions.
 
-*Why rejected.* Fuchsia's verification story is not as strong as ArcOS aims to be. Its handle table design is capability-ish but not as structurally enforced as ArcOS's capability system intends to be.
+*Why rejected.* Fuchsia's verification story is not as strong as CambiOS aims to be. Its handle table design is capability-ish but not as structurally enforced as CambiOS's capability system intends to be.
 
 **Alternative 10: Hidden formula with a single kernel-internal fraction.**
 
 *Why considered.* An earlier draft of this ADR proposed `num_slots = (available_memory × 0.5%) / bytes_per_slot` as a kernel-internal computation.
 
-*Why rejected.* A hidden formula conflates mechanism and policy. This is harder to verify, harder to adjust, and does not match ArcOS's pattern of "kernel provides mechanism, configuration above it provides policy." Subsequent drafts introduced explicit policy fields, eventually arriving at the memory-budget formulation in the chosen approach.
+*Why rejected.* A hidden formula conflates mechanism and policy. This is harder to verify, harder to adjust, and does not match CambiOS's pattern of "kernel provides mechanism, configuration above it provides policy." Subsequent drafts introduced explicit policy fields, eventually arriving at the memory-budget formulation in the chosen approach.
 
 **Alternative 11: Tables allocated from the kernel heap.**
 
@@ -509,7 +509,7 @@ Several alternatives were considered before settling on the chosen approach. Eac
 
 ## Open Problems
 
-The chosen approach resolves the four problems in this ADR's Problem section. It does not resolve every problem ArcOS will face at scale. This section enumerates the known-unsolved parts so future contributors do not have to discover them under pressure.
+The chosen approach resolves the four problems in this ADR's Problem section. It does not resolve every problem CambiOS will face at scale. This section enumerates the known-unsolved parts so future contributors do not have to discover them under pressure.
 
 **Problem 1: Default tier policies are initial values, not final.**
 
@@ -521,7 +521,7 @@ As the kernel evolves and per-process state grows, `SLOT_OVERHEAD` grows, and th
 
 **Problem 3: Verification tooling confirmation.**
 
-The claim that "boot-time constant is as verification-friendly as a compile-time constant" is plausible but unconfirmed. Most formal verification tools handle "runtime value set once at init, never changed" cleanly. The chosen approach's axiom-style policy (five fields, two clamps, arithmetic over policy axioms and a compile-time constant) is additionally simpler to prove than a formula-based approach. However, ArcOS has not yet committed to a specific verifier, and different tools have different support for this pattern.
+The claim that "boot-time constant is as verification-friendly as a compile-time constant" is plausible but unconfirmed. Most formal verification tools handle "runtime value set once at init, never changed" cleanly. The chosen approach's axiom-style policy (five fields, two clamps, arithmetic over policy axioms and a compile-time constant) is additionally simpler to prove than a formula-based approach. However, CambiOS has not yet committed to a specific verifier, and different tools have different support for this pattern.
 
 Before committing this approach to code, a proof sketch should confirm that the chosen verifier treats boot-time axioms cleanly and can reason about a slice-backed table whose base address is determined at init. If it cannot, we re-evaluate — either switch to a compile-time constant (reintroducing the hardware-range problem) or pick a different verification tool.
 
@@ -549,7 +549,7 @@ Channels are kernel objects. Under the chosen approach, channel allocation shoul
 
 **Problem 9: ProcessId stability under slot reuse.**
 
-A `ProcessId` in ArcOS is currently the slot index of a process in the process table. When a process exits and its slot becomes free, a future process allocated to the same slot reuses the same `ProcessId`. This has a subtle failure mode: stale references to the old `ProcessId` — stored in parent/child relationships, capability grants, audit log entries, debug dumps — now point at the new process, and operations that follow them silently target the wrong target. At the current kernel's low process counts and slow churn the risk is small; as `num_slots` scales up under this ADR and process churn increases (build systems, PE-compat sandboxes, helper processes), the risk grows.
+A `ProcessId` in CambiOS is currently the slot index of a process in the process table. When a process exits and its slot becomes free, a future process allocated to the same slot reuses the same `ProcessId`. This has a subtle failure mode: stale references to the old `ProcessId` — stored in parent/child relationships, capability grants, audit log entries, debug dumps — now point at the new process, and operations that follow them silently target the wrong target. At the current kernel's low process counts and slow churn the risk is small; as `num_slots` scales up under this ADR and process churn increases (build systems, PE-compat sandboxes, helper processes), the risk grows.
 
 The standard fix is to separate slot index from stable process identity by adding a generation counter to each slot, incremented on reuse. `ProcessId` becomes a `(slot_index, generation)` pair; every dereference compares both fields; a stale reference whose generation no longer matches the current slot occupant fails the lookup and returns an error rather than targeting the wrong process.
 

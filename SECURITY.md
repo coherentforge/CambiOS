@@ -1,6 +1,6 @@
-# ArcOS Security Architecture
+# CambiOS Security Architecture
 
-This document maps the zero-trust enforcement points in the ArcOS microkernel — *what* is enforced, *where* in the code, and *why*. It is the security-specific reference; project-wide implementation status (what's built vs. designed vs. planned, test counts, phase markers) lives in **[STATUS.md](STATUS.md)**.
+This document maps the zero-trust enforcement points in the CambiOS microkernel — *what* is enforced, *where* in the code, and *why*. It is the security-specific reference; project-wide implementation status (what's built vs. designed vs. planned, test counts, phase markers) lives in **[STATUS.md](STATUS.md)**.
 
 **Required reading by topic:**
 - Foundational security *decision* (why capabilities, why zero-trust): [ADR-000](docs/adr/000-zta-and-cap.md)
@@ -248,11 +248,11 @@ The receiving process (via `SYS_RECV_MSG`, syscall 13) gets the 32-byte `sender_
 
 ## ObjectStore Enforcement (Phase 0)
 
-ArcOS storage is content-addressed signed objects, not files-at-paths. The `ObjectStore` is the kernel's storage primitive; the FS service is a user-space gateway to it.
+CambiOS storage is content-addressed signed objects, not files-at-paths. The `ObjectStore` is the kernel's storage primitive; the FS service is a user-space gateway to it.
 
 ### Ownership Model
 
-Every `ArcObject` has an immutable **author** (who created it) and a transferable **owner** (who controls it). The kernel enforces ownership on destructive operations:
+Every `CambiObject` has an immutable **author** (who created it) and a transferable **owner** (who controls it). The kernel enforces ownership on destructive operations:
 
 - **ObjPut** (syscall 14): The caller's Principal becomes the author and owner. Content is hashed (Blake3) and stored. Returns the 32-byte content hash.
 - **ObjGet** (syscall 15): Any process can read by hash. No ownership check on read (content-addressed data is inherently shareable).
@@ -372,7 +372,7 @@ The gaps below are organized by whether they have a design (ADR drafted) or are 
 | **ObjGet access control** | Any process can read any object by hash | Hashes are not secrets, so this is not strictly a defect — but per-object ACLs may be wanted for sensitive content. ObjectStore already has the `ObjectCapSet` field; needs an enforcement story. |
 | **Capability expiry / TTL** | Granted capabilities last forever unless revoked | Add TTL field to `Capability`, check in `verify_access()`. Useful for short-lived delegations (e.g., "let this one binary read this one file"). |
 | **IPC rate limiting** | No defense against IPC flooding DoS | `on_send` hook — track send count per process per interval. Becomes more important once channels exist (ADR-005), since channels open a path the kernel *doesn't* per-byte inspect. |
-| **Cryptographic capabilities** | Capabilities don't work across networked ArcOS nodes | Replace kernel tables with signed tokens. Only matters once Yggdrasil mesh networking lands; not a v1 concern. |
+| **Cryptographic capabilities** | Capabilities don't work across networked CambiOS nodes | Replace kernel tables with signed tokens. Only matters once Yggdrasil mesh networking lands; not a v1 concern. |
 
 ### Done (Historical)
 

@@ -1,4 +1,4 @@
-# ArcOS
+# CambiOS
 
 > *Your computer... is not your own.*
 
@@ -8,13 +8,13 @@ This is not a conspiracy theory. It is documented hardware design. Even Apple's 
 
 Almost everything running on top of this foundation — whether Windows, macOS, Linux — layers additional extraction: telemetry baked into the kernel, analytics in the bootloader, identifiers that follow you across reinstalls. The software stack most people trust with their most sensitive data was designed, at a fundamental level, around interests that are not theirs.
 
-Ready to take it back? ArcOS is your response.
+Ready to take it back? CambiOS is your response.
 
 ---
 
-## What ArcOS Is
+## What CambiOS Is
 
-ArcOS (in development) is a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer system for interaction that is verifiably yours. Closing it requires sovereign silicon - and that's part of where this is going. Until then, ArcOS is a complete software foundation with no extraction above the hardware line: a formally-verified microkernel, memory-safe, cryptographic identity, zero-trust networking, and AI-powered security that works for the owner rather than the vendor.
+CambiOS (in development) is a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer system for interaction that is verifiably yours. Closing it requires sovereign silicon - and that's part of where this is going. Until then, CambiOS is a complete software foundation with no extraction above the hardware line: a formally-verified microkernel, memory-safe, cryptographic identity, zero-trust networking, and AI-powered security that works for the owner rather than the vendor.
 
 At its foundation is a microkernel written for formal verification from first principles in Rust:
 
@@ -28,11 +28,11 @@ At its foundation is a microkernel written for formal verification from first pr
 
 ## Honesty About the "Hardware Problem"
 
-ArcOS runs on x86_64 and AArch64. On those platforms it dramatically reduces the software attack surface — capability-based IPC, zero-trust enforcement, cryptographic identity, verified execution protect against a vast category of threats that affect everyone running conventional systems.
+CambiOS runs on x86_64 and AArch64. On those platforms it dramatically reduces the software attack surface — capability-based IPC, zero-trust enforcement, cryptographic identity, verified execution protect against a vast category of threats that affect everyone running conventional systems.
 
-But it cannot remove Intel ME or AMD PSP. Those coprocessors sit below the kernel — ME and PSP on x86, TrustZone on ARM. No software can fully neutralize them. ArcOS is explicit about this rather than pretending otherwise.
+But it cannot remove Intel ME or AMD PSP. Those coprocessors sit below the kernel — ME and PSP on x86, TrustZone on ARM. No software can fully neutralize them. CambiOS is explicit about this rather than pretending otherwise.
 
-**True security and true sovereignty are undercut until the hardware beneath the kernel is open and auditable.** Everything ArcOS builds — verified boot, signed binaries, unforgeable identity — sits on a foundation it cannot yet inspect. That is not an acceptable permanent state.
+**True security and true sovereignty are undercut until the hardware beneath the kernel is open and auditable.** Everything CambiOS builds — verified boot, signed binaries, unforgeable identity — sits on a foundation it cannot yet inspect. That is not an acceptable permanent state.
 
 The long-term answer is open hardware all the way down. We're building toward that. In the meantime most people are on x86, and they deserve better security now, and clear eyes about what the silicon underneath still does.
 
@@ -44,7 +44,7 @@ Built by one person, in a few months of coding. The full, current picture — wh
 
 The headline:
 
-- ArcOS boots to stable preemptive SMP multitasking on **x86_64** and **AArch64** in QEMU. Both targets build clean in release. USB boot tooling is ready for bare-metal testing on a Dell Precision 3630.
+- CambiOS boots to stable preemptive SMP multitasking on **x86_64** and **AArch64** in QEMU. Both targets build clean in release. USB boot tooling is ready for bare-metal testing on a Dell Precision 3630.
 - The **security model is real and running**: cryptographic identity backed by a hardware YubiKey (no secret key in kernel memory), boot modules signed at build time and verified before execution, user-space services (filesystem, key store, networking, shell) isolated behind capability-checked IPC with every message carrying an unforgeable sender identity, content-addressed object store with Blake3 hashing and Ed25519 signatures.
 - **Phase 3 architecture is landing**: shared-memory data channels with MMU-enforced producer/consumer roles, capability revocation, boot-time-sized kernel object tables, generation-counter process IDs, full process lifecycle cleanup. The substrate that real workloads need — video, file I/O, AI inference — is being built now.
 - **Static analysis and fuzzing are active.** Clippy enforced on every change. `cargo-fuzz` targets cover the ELF parser, binary verifier, buddy allocator, and capability system — each with shadow-model oracles that catch invariant violations, not just crashes. Unsafe blocks are individually scoped with per-operation `// SAFETY:` comments. Miri and Kani proof harnesses are on the roadmap.
@@ -56,7 +56,7 @@ The kernel is real. The security model is real. This is not a prototype.
 
 ## Architecture
 
-ArcOS is a full operating system. Its kernel is a microkernel and does five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Everything else - filesystems, networking, device drivers - all run as isolated user-space services communicating over capability-checked IPC.
+CambiOS is a full operating system. Its kernel is a microkernel and does five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Everything else - filesystems, networking, device drivers - all run as isolated user-space services communicating over capability-checked IPC.
 
 The attack surface is small by design. A buggy filesystem service can't take down the kernel. A compromised network driver can't read another process's memory. Isolation is structural, not policy.
 
@@ -77,7 +77,7 @@ For detailed internals — lock ordering, memory layout, syscall reference, sche
 
 ## Boot Sequence
 
-ArcOS boots via the **Limine v8.7.0** boot protocol on both architectures.
+CambiOS boots via the **Limine v8.7.0** boot protocol on both architectures.
 
 The boot sequence is where trust is established — before any user-space code runs.
 
@@ -116,7 +116,7 @@ The boot sequence is where trust is established — before any user-space code r
 
 ## Building
 
-ArcOS builds on macOS (Apple Silicon) with Rust nightly (pinned — see `rust-toolchain.toml`). Kernel binaries run only in QEMU or on bare-metal target hardware — never directly on the host.
+CambiOS builds on macOS (Apple Silicon) with Rust nightly (pinned — see `rust-toolchain.toml`). Kernel binaries run only in QEMU or on bare-metal target hardware — never directly on the host.
 
 Prerequisites:
 - Rust nightly (pinned date in `rust-toolchain.toml`; required for `abi_x86_interrupt` only)
@@ -158,7 +158,7 @@ src/
 ├── ipc/                  # Capability-based IPC, Principal, zero-trust interceptor
 ├── syscalls/             # 33 syscalls, all implemented
 ├── memory/               # Frame allocator, buddy allocator, per-process page tables
-├── fs/                   # ArcObject, ObjectStore, Blake3, Ed25519
+├── fs/                   # CambiObject, ObjectStore, Blake3, Ed25519
 ├── loader/               # ELF loader, BinaryVerifier, SignedBinaryVerifier
 ├── pci/                  # PCI bus scan, device table, BAR decoding
 └── microkernel/main.rs   # Kernel entry point
@@ -186,7 +186,7 @@ fuzz/
 
 ## Manuals
 
-Narrative walkthroughs that explain how ArcOS works by following real things through the system:
+Narrative walkthroughs that explain how CambiOS works by following real things through the system:
 
 - [Waking Up](docs/manuals/01-waking-up.md) — The boot sequence as a story: bootstrap paradoxes, dependency chains, and bringing a microkernel to life
 - [The Life of a Message](docs/manuals/02-life-of-a-message.md) — An IPC message from syscall to delivery, through capability checks and identity stamping
@@ -199,8 +199,8 @@ Narrative walkthroughs that explain how ArcOS works by following real things thr
 ## Design Documents
 
 - [STATUS.md](STATUS.md) — Canonical "what is built" doc: subsystem status, phase markers, v1 roadmap, test counts, known issues
-- [ArcOS.md](ArcOS.md) — Source-of-truth architecture document
-- [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind ArcOS
+- [CambiOS.md](CambiOS.md) — Source-of-truth architecture document
+- [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind CambiOS
 - [identity.md](identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
 - [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Phase intent for identity + storage
 - [win-compat.md](win-compat.md) — Windows compatibility layer design (PE loader, AI-translated shims, sandboxed Principal)
@@ -227,7 +227,7 @@ Narrative walkthroughs that explain how ArcOS works by following real things thr
 
 ## Contributing
 
-ArcOS is looking for people who understand what's at stake.
+CambiOS is looking for people who understand what's at stake.
 
 If you work on OS internals, compiler infrastructure, hardware security, or ML systems — and you've read this far and feel something — reach out. The foundation is real. The roadmap is clear. The work ahead is large enough that no single person should do it alone.
 

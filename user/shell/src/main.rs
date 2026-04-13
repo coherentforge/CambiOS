@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS interactive shell
+//! CambiOS interactive shell
 //!
 //! A minimal command-line shell over the serial console. Supports built-in
 //! commands and spawning boot module ELFs by name.
@@ -25,7 +25,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     sys::print(b"\r\n");
-    sys::print(b"ArcOS Shell v0.1\r\n");
+    sys::print(b"CambiOS Shell v0.1\r\n");
     sys::print(b"Type 'help' for available commands.\r\n");
 
     loop {

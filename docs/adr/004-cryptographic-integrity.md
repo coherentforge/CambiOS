@@ -13,7 +13,7 @@ ADR-003 established the content-addressed storage model and cryptographic identi
 
 1. **FNV-1a for content hashing.** FNV-1a is a non-cryptographic hash — fast but trivially collidable. An attacker can craft two different objects with the same FNV-1a hash, making content-addressing meaningless as an integrity guarantee. The ObjectStore cannot distinguish a legitimate object from a tampered one.
 
-2. **Signatures are not verified.** ArcObject has a `signature` field and `author`/`owner` fields, but nothing verifies that the signature is valid. Any process can claim any Principal as its author or owner. The ownership model is structurally correct but not enforced.
+2. **Signatures are not verified.** CambiObject has a `signature` field and `author`/`owner` fields, but nothing verifies that the signature is valid. Any process can claim any Principal as its author or owner. The ownership model is structurally correct but not enforced.
 
 3. **ELF modules are unsigned.** The BinaryVerifier gate checks structural properties (W^X, entry point, overlap) but not provenance. A valid-looking ELF with correct structure but malicious behavior passes all current checks. There is no way to distinguish a legitimate boot module from a crafted one.
 
@@ -35,7 +35,7 @@ Integrate `blake3` for content hashing and `ed25519-compact` for digital signatu
 
 **Ed25519** (`ed25519-compact`) for signatures:
 
-- **32-byte keys, 64-byte signatures** — Matches the existing field sizes in ArcObject and Principal. No structural changes needed.
+- **32-byte keys, 64-byte signatures** — Matches the existing field sizes in CambiObject and Principal. No structural changes needed.
 - **Fast verification** — ~70µs per verification on modern hardware. Acceptable for per-object verification.
 - **Deterministic** — Same key + same message always produces the same signature. Important for reproducible builds and testing.
 - **`no_std` compatible** — `ed25519-compact` is pure Rust, `no_std`, no allocator required for core operations.

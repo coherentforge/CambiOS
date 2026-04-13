@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS Intel I219-LM Network Driver — user-space, MMIO-based.
+//! CambiOS Intel I219-LM Network Driver — user-space, MMIO-based.
 //!
 //! Targets the Intel I219-LM Ethernet controller integrated into 100/200/300
 //! /400-series PCH chipsets (e.g., the Dell Precision 3630). Discovers the

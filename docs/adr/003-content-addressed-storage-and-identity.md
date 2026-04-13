@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-04-05
 - **Depends on:** ADR-000 (Zero-Trust Architecture and Capability-Based Access Control)
-- **Context:** Establishing the native storage and identity model — what a "file" is in ArcOS and how authorship, ownership, and provenance work
+- **Context:** Establishing the native storage and identity model — what a "file" is in CambiOS and how authorship, ownership, and provenance work
 
 ## Problem
 
@@ -17,11 +17,11 @@ Traditional filesystems store bytes at paths. A file has no inherent notion of w
 
 4. **Copying strips identity.** Copying a file to another system, email, or storage medium severs it from its ownership and permission metadata. The copy is indistinguishable from any other sequence of bytes.
 
-ArcOS needs a storage model where every object is self-describing: it carries its own identity, authorship, ownership proof, and integrity guarantee regardless of where it lives.
+CambiOS needs a storage model where every object is self-describing: it carries its own identity, authorship, ownership proof, and integrity guarantee regardless of where it lives.
 
 ## Decision
 
-ArcOS adopts a **content-addressed object store** as its native storage model and **cryptographic Principals** (Ed25519 public keys) as its identity primitive. Every stored object (an ArcObject) is identified by the hash of its content, carries immutable authorship and transferable ownership, and is signed by its owner. Identity is established by key generation, not by registration with an authority.
+CambiOS adopts a **content-addressed object store** as its native storage model and **cryptographic Principals** (Ed25519 public keys) as its identity primitive. Every stored object (an CambiObject) is identified by the hash of its content, carries immutable authorship and transferable ownership, and is signed by its owner. Identity is established by key generation, not by registration with an authority.
 
 These two decisions — content-addressing and cryptographic identity — are co-dependent. Content-addressing without identity produces anonymous blobs. Identity without content-addressing produces signed bytes that can be silently swapped. Together they produce **signed artifacts with unforgeable provenance**.
 
@@ -49,12 +49,12 @@ Every IPC message carries a `sender_principal` field stamped by the kernel in `s
 
 This provides **zero-cost unforgeable identity for local IPC**. Receiving processes know who sent every message without cryptographic verification overhead. Signatures are reserved for network boundaries (future phases).
 
-### ArcObject: The Storage Unit
+### CambiObject: The Storage Unit
 
-Every stored object in ArcOS is an ArcObject:
+Every stored object in CambiOS is an CambiObject:
 
 ```rust
-pub struct ArcObject {
+pub struct CambiObject {
     pub content_hash:  [u8; 32],         // content address (FNV-1a Phase 0, Blake3 Phase 1)
     pub author:        [u8; 32],         // creator's public key — IMMUTABLE
     pub owner:         [u8; 32],         // current controller's public key — transferable
@@ -81,8 +81,8 @@ The storage abstraction is a trait, not a filesystem:
 
 ```rust
 pub trait ObjectStore {
-    fn get(&self, hash: &[u8; 32]) -> Result<&ArcObject, StoreError>;
-    fn put(&mut self, object: ArcObject) -> Result<[u8; 32], StoreError>;
+    fn get(&self, hash: &[u8; 32]) -> Result<&CambiObject, StoreError>;
+    fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError>;
     fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError>;
     fn list(&self) -> Result<Vec<[u8; 32]>, StoreError>;
     fn count(&self) -> usize;
@@ -93,7 +93,7 @@ pub trait ObjectStore {
 
 ### FS Service: User-Space ObjectStore Gateway
 
-The filesystem service (`user/fs-service/`) is the first real user-space service in ArcOS. It runs as a Rust `no_std` ELF, registers IPC endpoint 16, and enters a service loop:
+The filesystem service (`user/fs-service/`) is the first real user-space service in CambiOS. It runs as a Rust `no_std` ELF, registers IPC endpoint 16, and enters a service loop:
 
 1. `RecvMsg` — receives IPC with `sender_principal` + command payload
 2. Parse command (PUT/GET/DELETE/LIST)
@@ -112,7 +112,7 @@ Seven new syscalls support identity and storage:
 | 11 | BindPrincipal | Bind a 32-byte Principal to a process (restricted to bootstrap Principal) |
 | 12 | GetPrincipal | Read the calling process's bound Principal |
 | 13 | RecvMsg | Identity-aware receive: returns `[sender_principal:32][from_endpoint:4][payload:N]` |
-| 14 | ObjPut | Store an ArcObject, returns 32-byte content hash |
+| 14 | ObjPut | Store an CambiObject, returns 32-byte content hash |
 | 15 | ObjGet | Retrieve object content by hash |
 | 16 | ObjDelete | Delete object (ownership enforced — only owner can delete) |
 | 17 | ObjList | List all object hashes (packed 32-byte hashes) |
@@ -158,7 +158,7 @@ Position 8 reflects that the ObjectStore is the highest-level kernel subsystem �
 
 ## Phase Progression
 
-The interfaces (`Principal`, `ArcObject`, `bind_principal`/`get_principal`, `sender_principal` stamping, `ObjectStore` trait) are stable. The backing implementations evolve through phases:
+The interfaces (`Principal`, `CambiObject`, `bind_principal`/`get_principal`, `sender_principal` stamping, `ObjectStore` trait) are stable. The backing implementations evolve through phases:
 
 | Aspect | Initial design (Phase 0) | Production target |
 |------------|---------|-------------------|
@@ -172,7 +172,7 @@ For which phase is currently realized in the code, see [STATUS.md § Phase marke
 
 ## Verification
 
-Test counts and what each test covers (Principal construction, IPC sender stamping, ArcObject hashing, RamObjectStore put/get/delete/list/capacity, etc.) live in [STATUS.md § Test coverage](../../STATUS.md#test-coverage).
+Test counts and what each test covers (Principal construction, IPC sender stamping, CambiObject hashing, RamObjectStore put/get/delete/list/capacity, etc.) live in [STATUS.md § Test coverage](../../STATUS.md#test-coverage).
 
 ## References
 
@@ -180,7 +180,7 @@ Test counts and what each test covers (Principal construction, IPC sender stampi
 - [ADR-004](004-cryptographic-integrity.md): Cryptographic integrity (Blake3 + Ed25519)
 - [identity.md](../../identity.md): Identity architecture (authoritative design document)
 - [FS-and-ID-design-plan.md](../../FS-and-ID-design-plan.md): Phase intent for identity + storage
-- `src/fs/mod.rs`, `src/fs/ram.rs`: ArcObject and RamObjectStore
+- `src/fs/mod.rs`, `src/fs/ram.rs`: CambiObject and RamObjectStore
 - `src/ipc/mod.rs`: Principal type, sender_principal stamping
 - `src/ipc/capability.rs`: Principal binding on ProcessCapabilities
 - `user/fs-service/src/main.rs`: User-space FS service

@@ -1,9 +1,9 @@
 /* Copyright (C) 2024-2026 Jason Ricca. All rights reserved. */
 
-// ArcOS user-space test program — "hello" module (AArch64)
+// CambiOS user-space test program — "hello" module (AArch64)
 //
 // Loaded by Limine as a boot module, executed at EL0.
-// Uses ArcOS syscalls via the SVC instruction.
+// Uses CambiOS syscalls via the SVC instruction.
 //
 // Syscall convention (AArch64):
 //   x8 = syscall number

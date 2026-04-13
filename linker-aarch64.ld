@@ -1,6 +1,6 @@
 /* Copyright (C) 2024-2026 Jason Ricca. All rights reserved. */
 
-/* ArcOS Microkernel linker script for Limine bootloader (AArch64) */
+/* CambiOS Microkernel linker script for Limine bootloader (AArch64) */
 
 OUTPUT_FORMAT(elf64-littleaarch64)
 ENTRY(kmain)

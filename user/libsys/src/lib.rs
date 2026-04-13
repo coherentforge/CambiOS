@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS user-space syscall library
+//! CambiOS user-space syscall library
 //!
 //! Safe wrappers around architecture-specific syscall instructions. This is
 //! the ONLY crate in user-space that contains `unsafe` code. All other

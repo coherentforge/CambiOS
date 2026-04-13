@@ -1,6 +1,6 @@
-# ArcOS Identity Architecture
+# CambiOS Identity Architecture
 
-This document captures the design thinking behind ArcOS identity — what identity means in ArcOS, how it relates to files, keys, biology, and social context, and what gets built in what order. It is a living design document, not a specification. When implementation decisions are made, this document gets updated to reflect them.
+This document captures the design thinking behind CambiOS identity — what identity means in CambiOS, how it relates to files, keys, biology, and social context, and what gets built in what order. It is a living design document, not a specification. When implementation decisions are made, this document gets updated to reflect them.
 
 For the foundational security architecture this plugs into, see [security.md](security.md).
 For the filesystem object model that depends on identity, see [filesystem.md](filesystem.md) (forthcoming).
@@ -9,7 +9,7 @@ For the filesystem object model that depends on identity, see [filesystem.md](fi
 
 ## The Core Claim
 
-In ArcOS, everything is an object with an attributable source. Files are signed artifacts with a creator and an owner. Messages are assertions made by an identity. Processes run under an identity with tokenized capabilities. 
+In CambiOS, everything is an object with an attributable source. Files are signed artifacts with a creator and an owner. Messages are assertions made by an identity. Processes run under an identity with tokenized capabilities. 
 
 Identity is primitive and the system is built on that.
 
@@ -19,13 +19,13 @@ Identity is primitive and the system is built on that.
 
 Briefly:
 
-**It is not a username.** A human-readable label assigned by a central authority can be reassigned, revoked, or duplicated across systems. ArcOS has no username system.
+**It is not a username.** A human-readable label assigned by a central authority can be reassigned, revoked, or duplicated across systems. CambiOS has no username system.
 
-**It is not password based.** Passwords are shared secrets too easily stolen, leaked, or forgotten. ArcOS has no password authentication.
+**It is not password based.** Passwords are shared secrets too easily stolen, leaked, or forgotten. CambiOS has no password authentication.
 
 **It is not an account.** Accounts exist in someone else's database, are granted by an authority, can be suspended, and cease to exist when the service does. 
 
-**It is not a certificate from a CA.** Certificate authorities can be compromised, coerced, or simply disappear. ArcOS does not delegate trust to any claimed authority.
+**It is not a certificate from a CA.** Certificate authorities can be compromised, coerced, or simply disappear. CambiOS does not delegate trust to any claimed authority.
 
 ---
 
@@ -39,7 +39,7 @@ Daily use should be frictionless. Password or otherwise traditionally secured wo
 
 ## What Identity Is
 
-An ArcOS identity is irrevocable. A **cryptographic key pair** is generated locally, controlled exclusively by its holder, verifiable by anyone, and dependent on no external authority for its existence. The identity layer is **algorithm-agnostic** — all key material, signatures, and verification are mediated through dynamic-sized fields so the system can transition between classical and post-quantum schemes without structural changes.
+An CambiOS identity is irrevocable. A **cryptographic key pair** is generated locally, controlled exclusively by its holder, verifiable by anyone, and dependent on no external authority for its existence. The identity layer is **algorithm-agnostic** — all key material, signatures, and verification are mediated through dynamic-sized fields so the system can transition between classical and post-quantum schemes without structural changes.
 
 ```
 Identity {
@@ -61,7 +61,7 @@ In **dual mode**, a signature is the concatenation of a classical Ed25519 signat
 
 ### Quantum-Resistant Dual-Mode Design
 
-ArcOS does not bet on a single cryptographic assumption surviving the next several decades. The identity layer operates in three modes, selectable per identity and upgradeable over time:
+CambiOS does not bet on a single cryptographic assumption surviving the next several decades. The identity layer operates in three modes, selectable per identity and upgradeable over time:
 
 | Mode | Algorithm | Public Key | Signature | Use Case |
 |------|-----------|------------|-----------|----------|
@@ -79,7 +79,7 @@ Hybrid mode is the **default for new identities**. Classical mode remains availa
 - **Small signatures** — 64 bytes. Minimal overhead for ownership proof.
 - **Fast** — Verification is cheap enough to do on every file access without measurable overhead.
 - **Constant-time** — Resistant to timing side-channel attacks.
-- **Foundation of `did:key`** — The DID method most aligned with ArcOS's no-central-authority principle encodes Ed25519 keys directly.
+- **Foundation of `did:key`** — The DID method most aligned with CambiOS's no-central-authority principle encodes Ed25519 keys directly.
 - **Mature and audited** — Decades of deployment, well-understood security properties.
 
 **ML-DSA-65** (NIST FIPS 204, formerly Dilithium3) is the post-quantum layer:
@@ -115,7 +115,7 @@ This means:
 
 The decision that files have owners is the decision that shapes everything above it.
 
-A file in ArcOS's native format is not bytes with a path. It is:
+A file in CambiOS's native format is not bytes with a path. It is:
 
 ```
 File {
@@ -138,7 +138,7 @@ The owner signs the object. The signature ties content to controller cryptograph
 
 ### Ownership Transfer
 
-Ownership is transferred via a signed `OwnershipTransfer` object — itself an ArcObject stored in the ObjectStore:
+Ownership is transferred via a signed `OwnershipTransfer` object — itself an CambiObject stored in the ObjectStore:
 
 ```
 OwnershipTransfer {
@@ -159,7 +159,7 @@ Provenance is structural. Because the creator field is immutable and ownership v
 
 Sharing is replication of the same signed artifact, it's not a copy with back-referencing. A file you push to a peer is verifiable as yours regardless of where it lives. A sovereign cloud host stores objects as ciphertext they cannot read, forge, or credibly deny origins of.
 
-The append-only social log is not a separate concept. Each post is an ArcObject. Linking by lineage creates the social log. Commerce is not a separate layer either. The identity primitive provides for the exchange primitive; a userspace finex module builds negotiation, terms, and settlement on top. 
+The append-only social log is not a separate concept. Each post is an CambiObject. Linking by lineage creates the social log. Commerce is not a separate layer either. The identity primitive provides for the exchange primitive; a userspace finex module builds negotiation, terms, and settlement on top. 
 
 ---
 
@@ -169,7 +169,7 @@ The append-only social log is not a separate concept. Each post is an ArcObject.
 
 A key pair solves the cryptographic problem of identity. It does not solve the human problem of identity: what happens when you lose the key?
 
-In a pure key-pair model, losing the private key means losing the identity. Every file you signed becomes unextendable (you can no longer produce new signatures). Recovery requires either a trusted third party (central authority, violates ArcOS principles) or a pre-established recovery mechanism (another secret to lose).
+In a pure key-pair model, losing the private key means losing the identity. Every file you signed becomes unextendable (you can no longer produce new signatures). Recovery requires either a trusted third party (central authority, violates CambiOS principles) or a pre-established recovery mechanism (another secret to lose).
 
 ### Biometrics as Entropy, Not as Key
 
@@ -228,7 +228,7 @@ ZKP: "I possess a biometric sample consistent with the committed profile,
 
 The commitment (a hash of the biometric profile) is public and stored with the identity. The raw biometric data never leaves the device. Verification is proof of biological consistency, not disclosure of biological data.
 
-This is an active research area (biometric ZKPs). ArcOS does not implement it now. But the interface is designed to accommodate it when it matures.
+This is an active research area (biometric ZKPs). CambiOS does not implement it now. But the interface is designed to accommodate it when it matures.
 
 ### Key Recovery via Biometric Context
 
@@ -253,7 +253,7 @@ The private key is never stored. It is derived. The derivation inputs are things
 
 ### The Social Graph as Identity Infrastructure
 
-ArcOS's SSB-inspired social layer is core identity infrastructure. The append-only signed logs of your peers are a verifiable record of their interaction with you over time. A quorum of peers attesting to your identity is more than a social nicety. It is a cryptographic recovery mechanism.
+CambiOS's SSB-inspired social layer is core identity infrastructure. The append-only signed logs of your peers are a verifiable record of their interaction with you over time. A quorum of peers attesting to your identity is more than a social nicety. It is a cryptographic recovery mechanism.
 
 This maps directly onto DAO (Decentralized Autonomous Organization) governance models: quorum decisions, on-log attestation, authority without central control. A recovery quorum functions like a DAO vote — a threshold of known parties must attest before a key rotation is authorized.
 
@@ -271,7 +271,7 @@ The proposed resolution is that enrollment is a **witnessed social act**, not a 
 
 A new identity's trust weight reflects the depth and history of its attestation graph — not a binary trusted/untrusted distinction, but a continuous signal that grows with genuine interaction.
 
-This mirrors how human identity has always worked at its most fundamental level: community recognition, not institutional registration. You exist as an identity because people who know you attest to your existence. ArcOS makes this explicit and cryptographic.
+This mirrors how human identity has always worked at its most fundamental level: community recognition, not institutional registration. You exist as an identity because people who know you attest to your existence. CambiOS makes this explicit and cryptographic.
 
 Bootstrapping the system requires real human group interaction. 
 
@@ -314,7 +314,7 @@ Signatures from processes are verifiable as deriving from your identity without 
 
 ### Revocation Model: Social Blocking + Eventual Consistency
 
-ArcOS does not have a central authority that can revoke identities. There is no certificate revocation list, no global kill switch, no admin who can delete you. Instead, revocation is **local** and **social** — the same way trust works between humans.
+CambiOS does not have a central authority that can revoke identities. There is no certificate revocation list, no global kill switch, no admin who can delete you. Instead, revocation is **local** and **social** — the same way trust works between humans.
 
 There are two distinct mechanisms, serving different purposes:
 
@@ -344,7 +344,7 @@ Bootstrap Principal revocation is a **system-level event**: firmware update, new
 
 #### Properties
 
-| Property | Traditional CA | ArcOS Social Revocation |
+| Property | Traditional CA | CambiOS Social Revocation |
 |----------|---------------|------------------------|
 | **Latency** | Seconds (CRL/OCSP) | Seconds to minutes (social graph replication) |
 | **Scope** | Global (everyone trusts the CA) | Local neighborhood (your peers, then their peers) |
@@ -361,7 +361,7 @@ This model trades **instant global revocation** for **local social revocation wi
 
 2. **The attacker's window is narrow.** An attacker with a stolen key cannot immediately impersonate you to your actual contacts — you notify them through a trusted side channel (in person, phone call, pre-shared signal) and they block instantly. The attacker can only fool strangers who haven't received the revocation yet, and strangers have low trust weight by default.
 
-3. **Central revocation is a central vulnerability.** Any system that can revoke you globally can be coerced, compromised, or corrupted into revoking you unjustly. ArcOS eliminates this attack surface entirely. No single entity — not even the OS itself — can erase your identity from the network.
+3. **Central revocation is a central vulnerability.** Any system that can revoke you globally can be coerced, compromised, or corrupted into revoking you unjustly. CambiOS eliminates this attack surface entirely. No single entity — not even the OS itself — can erase your identity from the network.
 
 ---
 
@@ -409,7 +409,7 @@ Social graph quorum recovery. The `social_attestation` field in IdentityContext 
 
 ### Phase 4: Full DID Integration
 
-`did:key` encoding of identity public keys. Ed25519 keys use the existing `did:key` multicodec. ML-DSA-65 and Hybrid keys use extended multicodec prefixes (pending W3C/IETF standardization of post-quantum DID methods). Identity becomes expressible as a DID, interoperable with the broader decentralized identity ecosystem. Cryptographic capabilities across networked ArcOS nodes become possible.
+`did:key` encoding of identity public keys. Ed25519 keys use the existing `did:key` multicodec. ML-DSA-65 and Hybrid keys use extended multicodec prefixes (pending W3C/IETF standardization of post-quantum DID methods). Identity becomes expressible as a DID, interoperable with the broader decentralized identity ecosystem. Cryptographic capabilities across networked CambiOS nodes become possible.
 
 ---
 
@@ -419,7 +419,7 @@ These must hold after every change to identity-related code:
 
 1. **Private keys never leave the key store.** No user-space process receives a raw private key. Signing is always a request to the key store service.
 
-2. **Every file has a creator and an owner.** The native ArcOS filesystem format has no concept of a creatorless or ownerless file. The creator field is immutable — no API path may modify it after creation. The owner field is transferable only via signed `OwnershipTransfer` objects. Files created by system processes during bootstrap have the bootstrap identity as both creator and owner.
+2. **Every file has a creator and an owner.** The native CambiOS filesystem format has no concept of a creatorless or ownerless file. The creator field is immutable — no API path may modify it after creation. The owner field is transferable only via signed `OwnershipTransfer` objects. Files created by system processes during bootstrap have the bootstrap identity as both creator and owner.
 
 3. **Signatures are verified before trust.** A file's owner field is meaningless without verifying the signature. Code that reads owner without verifying signature is a bug.
 
@@ -449,5 +449,5 @@ Further future unresolved:
 - **DNA as future modality** — Under what conditions (social consensus, privacy infrastructure maturity, regulatory clarity) would DNA/epigenetic profiling be activated? What governance mechanism decides this — per-user opt-in, community vote, or protocol-level upgrade?
 - **Process key scoping** — How is the process_capability_hash computed? What prevents a process from claiming a broader scope than it was granted?
 - **Rotation during social graph unavailability** — If a key is lost and the social graph is offline (no network), how is recovery handled? Is there a time-limited local recovery path?
-- **Post-quantum DID encoding** — `did:key` multicodec for ML-DSA-65 is not yet standardized. ArcOS may need to define a provisional encoding and migrate when the standard lands. What is the compatibility strategy?
-- **Portable identity sessions** — If identity is a Principal and not a machine, any ArcOS terminal becomes your terminal when you authenticate. What does a guest session on foreign hardware look like? What capabilities does it get? What happens to locally-cached objects on logout? This is a UX and security design question that sits at the intersection of the key store service and the consent model.
+- **Post-quantum DID encoding** — `did:key` multicodec for ML-DSA-65 is not yet standardized. CambiOS may need to define a provisional encoding and migrate when the standard lands. What is the compatibility strategy?
+- **Portable identity sessions** — If identity is a Principal and not a machine, any CambiOS terminal becomes your terminal when you authenticate. What does a guest session on foreign hardware look like? What capabilities does it get? What happens to locally-cached objects on logout? This is a UX and security design question that sits at the intersection of the key store service and the consent model.

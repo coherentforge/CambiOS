@@ -1,14 +1,14 @@
 # The Signature Chain
 
-*How ArcOS knows the code it runs is the code that was built.*
+*How CambiOS knows the code it runs is the code that was built.*
 
 ---
 
 ## The Problem
 
-Before a single instruction of user code runs on ArcOS, the kernel must answer a question: is this binary authentic? Not "is it valid" — the ELF headers could be perfect. Not "is it safe" — the code could pass every structural check. The question is more fundamental: did the person who built this system actually produce this binary, or did something change it along the way?
+Before a single instruction of user code runs on CambiOS, the kernel must answer a question: is this binary authentic? Not "is it valid" — the ELF headers could be perfect. Not "is it safe" — the code could pass every structural check. The question is more fundamental: did the person who built this system actually produce this binary, or did something change it along the way?
 
-This is the code authenticity problem, and most operating systems don't solve it at the kernel level. They rely on package managers, signature checks in user-space tools, or the hope that the boot media wasn't tampered with. ArcOS solves it with a chain of trust that starts in hardware and ends in the kernel's refusal to allocate memory for anything it can't verify.
+This is the code authenticity problem, and most operating systems don't solve it at the kernel level. They rely on package managers, signature checks in user-space tools, or the hope that the boot media wasn't tampered with. CambiOS solves it with a chain of trust that starts in hardware and ends in the kernel's refusal to allocate memory for anything it can't verify.
 
 ## The Hardware Root
 
@@ -20,7 +20,7 @@ The corresponding public key — 32 bytes — is extracted once:
 ./tools/sign-elf/target/release/sign-elf --export-pubkey bootstrap_pubkey.bin
 ```
 
-This file, `bootstrap_pubkey.bin`, is the root of trust for the entire system. It gets compiled into the kernel binary via `include_bytes!()`. Every ArcOS kernel binary contains a copy of this public key, burned into its `.rodata` section at build time.
+This file, `bootstrap_pubkey.bin`, is the root of trust for the entire system. It gets compiled into the kernel binary via `include_bytes!()`. Every CambiOS kernel binary contains a copy of this public key, burned into its `.rodata` section at build time.
 
 The private key stays on the YubiKey. The public key travels with the kernel. That asymmetry is the whole point.
 
@@ -121,7 +121,7 @@ There are no shortcuts in this chain. There is no "debug mode" that skips verifi
 
 ## What This Means
 
-If you're running ArcOS, and the kernel booted, and a user-space service is running, you know:
+If you're running CambiOS, and the kernel booted, and a user-space service is running, you know:
 
 1. The service binary was signed by someone who possesses the YubiKey (or knows the development seed).
 2. The binary has not been modified since it was signed — not one byte.

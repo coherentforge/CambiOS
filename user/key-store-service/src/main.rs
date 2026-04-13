@@ -1,6 +1,6 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! ArcOS Key Store Service — user-space Ed25519 signing service
+//! CambiOS Key Store Service — user-space Ed25519 signing service
 //!
 //! When a bootstrap secret key is available in the kernel (legacy seed mode),
 //! claims it at boot and signs on behalf of callers. When no secret key is

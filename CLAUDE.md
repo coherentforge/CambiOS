@@ -1,4 +1,4 @@
-# ArcOS Microkernel — Claude Code Context
+# CambiOS Microkernel — Claude Code Context
 
 ## Formal Verification (Non-Negotiable Constraint)
 The microkernel must be written for future formal verification. Every design decision in kernel code should keep this achievable. Concretely:
@@ -17,7 +17,7 @@ The BuddyAllocator (pure bookkeeping, no hardware access, fully testable on host
 
 ## Project Vision
 
-ArcOS is a next-gen AI-integrated operating system built on these principles:
+CambiOS is a next-gen AI-integrated operating system built on these principles:
 
 - **Security First:** Zero-trust architecture with real-time AI monitoring. No backdoors, no telemetry/telematics. Every process is verified at runtime.
 - **Microkernel Isolation:** Device drivers, networking, and file systems run in isolated user-space environments — aligned for future formal verification.
@@ -62,13 +62,13 @@ cargo build --target aarch64-unknown-none --release
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
 # Build for a specific deployment tier (Phase 3.2a / ADR-008 / ADR-009).
-# ARCOS_TIER selects which TableSizingPolicy is compiled in. Default
+# CAMBIOS_TIER selects which TableSizingPolicy is compiled in. Default
 # is tier3 when unset — always target tier3 unless specifically
-# working on tier1 or tier2. build.rs reads ARCOS_TIER and emits a
+# working on tier1 or tier2. build.rs reads CAMBIOS_TIER and emits a
 # single --cfg tierN flag; any other value is a build error.
-ARCOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
-ARCOS_TIER=tier2 cargo build --target x86_64-unknown-none --release
-ARCOS_TIER=tier3 cargo build --target x86_64-unknown-none --release   # same as leaving it unset
+CAMBIOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
+CAMBIOS_TIER=tier2 cargo build --target x86_64-unknown-none --release
+CAMBIOS_TIER=tier3 cargo build --target x86_64-unknown-none --release   # same as leaving it unset
 
 # Generate symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols
@@ -119,7 +119,7 @@ These tools return semantically precise results (no false positives from comment
 
 ## Project Overview
 
-ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
+CambiOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
 
 **Current state:** see [STATUS.md](STATUS.md). That file is the canonical source for what is built, what is in progress, and what is planned, including test counts, subsystem status, phase markers, v1 roadmap progress, and known issues. **This file (CLAUDE.md) is the technical reference for the kernel** — conventions, rules, lock ordering, build commands, required-reading map. Status info is intentionally not duplicated here so the two files cannot drift.
 
@@ -138,7 +138,7 @@ ArcOS is a verification-ready microkernel OS written in Rust (`no_std`) targetin
 ### Build-time configuration (`build.rs`)
 
 ```
-build.rs                      # Reads ARCOS_TIER env var (default: tier3),
+build.rs                      # Reads CAMBIOS_TIER env var (default: tier3),
                               # emits --cfg tierN for src/config/tier.rs to
                               # select the compiled-in TableSizingPolicy.
                               # See ADR-008 and ADR-009.
@@ -181,7 +181,7 @@ src/
 │   ├── buffer.rs             # StagingBuffer: lock-free SPSC ring buffer (per-CPU, formally verifiable)
 │   └── drain.rs              # AuditRing (global ring buffer, HHDM-backed), drain_tick() (BSP timer ISR piggyback)
 ├── fs/
-│   ├── mod.rs                # ArcObject, ObjectStore trait, Blake3 hashing, Ed25519 sign/verify
+│   ├── mod.rs                # CambiObject, ObjectStore trait, Blake3 hashing, Ed25519 sign/verify
 │   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects)
 ├── interrupts/
 │   ├── mod.rs                # IDT setup, exception/device ISR handlers
@@ -349,7 +349,7 @@ All 35 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **BindPrincipal**: Binds a 32-byte Principal (public key) to a process. Restricted: only the bootstrap Principal can call this
 - **GetPrincipal**: Returns the calling process's bound Principal (32 bytes)
 - **RecvMsg**: Like Read but returns `[sender_principal:32][from_endpoint:4][payload:N]` — identity-aware receive
-- **ObjPut**: Store ArcObject with caller as author/owner, returns 32-byte content hash
+- **ObjPut**: Store CambiObject with caller as author/owner, returns 32-byte content hash
 - **ObjGet**: Retrieve object content by hash
 - **ObjDelete**: Delete object (ownership enforced — only owner can delete)
 - **ObjList**: List all object hashes (packed 32-byte hashes)
@@ -415,7 +415,7 @@ When you add a new bound or change one, update the matching table in [ASSUMPTION
 
 ## Multi-Platform Strategy (x86_64, AArch64, RISC-V planned)
 
-ArcOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The architecture abstraction is in place:
+CambiOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The architecture abstraction is in place:
 
 ### Current Portability Boundary
 - `src/arch/mod.rs` — cfg-gated shim that re-exports the active backend
@@ -480,7 +480,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/interceptor.rs` |
 | **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
 | **Identity / Principal / sender_principal** | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) (intent only) |
-| **ObjectStore / ArcObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
+| **ObjectStore / CambiObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
 | **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
 | **Architecture port (RISC-V, etc.)** | This file's "Multi-Platform Strategy" section | `src/arch/x86_64/mod.rs` and `src/arch/aarch64/mod.rs` as the public API to match |
@@ -491,11 +491,11 @@ When working on a subsystem, read its design and implementation docs *before* wr
 
 These documents capture architectural decisions that implementation must align with. Pure intent goes in the design docs and ADRs; current implementation status goes in [STATUS.md](STATUS.md).
 
-- **[ArcOS.md](ArcOS.md)** — Source-of-truth architecture document (vision, principles, what ArcOS *is*).
-- **[identity.md](identity.md)** — Identity architecture: what identity means in ArcOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model.
-- **[FS-and-ID-design-plan.md](FS-and-ID-design-plan.md)** — Phase intent for identity + storage. Content-addressed ObjectStore, ArcObject model, bootstrap identity, IPC sender_principal stamping. Flows from identity.md.
+- **[CambiOS.md](CambiOS.md)** — Source-of-truth architecture document (vision, principles, what CambiOS *is*).
+- **[identity.md](identity.md)** — Identity architecture: what identity means in CambiOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model.
+- **[FS-and-ID-design-plan.md](FS-and-ID-design-plan.md)** — Phase intent for identity + storage. Content-addressed ObjectStore, CambiObject model, bootstrap identity, IPC sender_principal stamping. Flows from identity.md.
 - **[win-compat.md](win-compat.md)** — Windows compatibility layer design: sandboxed PE loader, AI-translated Win32 shim tiers, virtual registry/filesystem, sandboxed Principal model, target application phases (business → CAD → instrumentation).
-- **[PHILOSOPHY.md](PHILOSOPHY.md)** — Why ArcOS exists, the AI-watches-not-decides stance, the verification-first commitment.
+- **[PHILOSOPHY.md](PHILOSOPHY.md)** — Why CambiOS exists, the AI-watches-not-decides stance, the verification-first commitment.
 - **[SECURITY.md](SECURITY.md)** — Security posture, enforcement table, threat model.
 - **[ASSUMPTIONS.md](ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
 - **[GOVERNANCE.md](GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
@@ -589,7 +589,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 |---|---|---|---|
 | **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
 | **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-009) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
-| **design / source_of_truth** | [ArcOS.md](ArcOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
+| **design / source_of_truth** | [CambiOS.md](CambiOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 
 **Concrete checklist for the change you just made:**

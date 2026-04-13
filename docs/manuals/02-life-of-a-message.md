@@ -8,7 +8,7 @@
 
 A user-space process — say, the UDP stack — wants to send a message to the virtio-net driver. It has a buffer of bytes (an Ethernet frame to transmit) and knows the driver is listening on endpoint 20. It calls `sys::write(20, &buffer)`.
 
-In a monolithic kernel, this would be a function call into shared address space. The sender and receiver would share memory. A bug in either could corrupt the other. In ArcOS, these are isolated processes with separate page tables. They cannot see each other's memory. The only way to communicate is to convince the kernel to carry a message between them.
+In a monolithic kernel, this would be a function call into shared address space. The sender and receiver would share memory. A bug in either could corrupt the other. In CambiOS, these are isolated processes with separate page tables. They cannot see each other's memory. The only way to communicate is to convince the kernel to carry a message between them.
 
 That convincing is not automatic. The kernel doesn't trust the sender. It doesn't trust the message. It doesn't even trust that the sender is who it claims to be. Every step of delivery is a checkpoint where something can be denied.
 
@@ -46,7 +46,7 @@ The sender didn't set `sender_principal`. The sender *can't* set it. Even if the
 
 ## The Second Question: "Do You Have Permission?"
 
-The kernel acquires two locks — IPC_MANAGER and CAPABILITY_MANAGER — in the correct order (lock positions 3 and 4 in the global hierarchy). Lock ordering is strict in ArcOS: acquiring a lower-numbered lock while holding a higher-numbered one is a deadlock waiting to happen, and the design prevents it structurally.
+The kernel acquires two locks — IPC_MANAGER and CAPABILITY_MANAGER — in the correct order (lock positions 3 and 4 in the global hierarchy). Lock ordering is strict in CambiOS: acquiring a lower-numbered lock while holding a higher-numbered one is a deadlock waiting to happen, and the design prevents it structurally.
 
 The capability manager checks whether this process holds a capability with `send` rights on endpoint 20. Capabilities are kernel-managed `(endpoint, rights)` pairs. User-space can't see them, can't fabricate them, can't guess them. They're stored in a per-process table inside the kernel.
 
@@ -106,6 +106,6 @@ Seven steps. Three independent enforcement layers. Two page-table walks. One ide
 
 In a monolithic kernel, this would be a function call — fast, no enforcement, no isolation, no identity. One shared address space where any bug is everyone's problem.
 
-In ArcOS, the overhead of those seven steps is the price of a system where a compromised process can send messages stamped with its own (real) identity to endpoints it has (real) permission to use, containing payloads that are (really) validated. It cannot pretend to be someone else. It cannot talk to endpoints it hasn't been granted access to. It cannot send malformed data that corrupts kernel state.
+In CambiOS, the overhead of those seven steps is the price of a system where a compromised process can send messages stamped with its own (real) identity to endpoints it has (real) permission to use, containing payloads that are (really) validated. It cannot pretend to be someone else. It cannot talk to endpoints it hasn't been granted access to. It cannot send malformed data that corrupts kernel state.
 
 The message arrived. The receiver knows who sent it. That's not a feature. That's the architecture.

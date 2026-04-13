@@ -4,7 +4,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! ArcOS Microkernel Main
+//! CambiOS Microkernel Main
 //!
 //! Microkernel core with:
 //! - Task/process scheduler (round-robin, preemptive)
@@ -233,7 +233,7 @@ unsafe extern "C" fn kmain() -> ! {
     // Verify Limine protocol is supported (panics with a message if not)
     assert!(BASE_REVISION.is_supported(), "Limine base revision not supported!");
 
-    println!("=== ArcOS Microkernel [v0.2.0] ===");
+    println!("=== CambiOS Microkernel [v0.2.0] ===");
     println!("Booted via Limine\n");
 
     let hhdm_offset = arcos_core::hhdm_offset();

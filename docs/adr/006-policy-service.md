@@ -8,7 +8,7 @@
 
 ## Problem
 
-ArcOS already separates **enforcement** from **decision** in spirit, but not yet in implementation. The kernel enforces capability checks on every IPC operation ([ADR-002](002-three-layer-enforcement-pipeline.md)'s three-layer pipeline). The check itself — "does the calling process hold the right capability for this operation?" — is mechanical: a table lookup against the per-process `ProcessCapabilities` struct, with the capability table treated as the single source of truth.
+CambiOS already separates **enforcement** from **decision** in spirit, but not yet in implementation. The kernel enforces capability checks on every IPC operation ([ADR-002](002-three-layer-enforcement-pipeline.md)'s three-layer pipeline). The check itself — "does the calling process hold the right capability for this operation?" — is mechanical: a table lookup against the per-process `ProcessCapabilities` struct, with the capability table treated as the single source of truth.
 
 What's missing is the upstream question: **how does a capability get into that table in the first place, and under what conditions can it be added, modified, or revoked?**
 
@@ -18,9 +18,9 @@ Right now the answer is hardcoded in the kernel:
 - Delegation is allowed if the source holds the `delegate` right and is not escalating beyond what they already have
 - The `IpcInterceptor::on_syscall` hook exists at [src/syscalls/dispatcher.rs](../../src/syscalls/dispatcher.rs) but its default policy is permissive — it always returns `Allow`. [SECURITY.md](../../SECURITY.md) lists per-process syscall allowlists as "Not implemented" (gap #1, highest priority)
 
-Each of these decisions is *policy*. Each one is currently expressed as Rust code inside the kernel. Each one is therefore impossible to update without recompiling the kernel, impossible to observe without instrumenting the kernel, and impossible to drive from a separate process — including the AI security service that [PHILOSOPHY.md](../../PHILOSOPHY.md) and [ArcOS.md](../../ArcOS.md) both describe as a userspace observer.
+Each of these decisions is *policy*. Each one is currently expressed as Rust code inside the kernel. Each one is therefore impossible to update without recompiling the kernel, impossible to observe without instrumenting the kernel, and impossible to drive from a separate process — including the AI security service that [PHILOSOPHY.md](../../PHILOSOPHY.md) and [CambiOS.md](../../CambiOS.md) both describe as a userspace observer.
 
-The architectural intent is already documented. [ArcOS.md line 88](../../ArcOS.md) lists "Policy" as one of the **Core Services** in the layer diagram, sitting *above* the microkernel. [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) explicitly says the AI security layer "observes without controlling the microkernel" and "enforces through capabilities already present in the system." [SECURITY.md gap #1](../../SECURITY.md#gap-analysis) names per-process syscall allowlists as the highest-impact missing piece, with the explicit note that "the hook exists. Just needs policy tables."
+The architectural intent is already documented. [CambiOS.md line 88](../../CambiOS.md) lists "Policy" as one of the **Core Services** in the layer diagram, sitting *above* the microkernel. [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) explicitly says the AI security layer "observes without controlling the microkernel" and "enforces through capabilities already present in the system." [SECURITY.md gap #1](../../SECURITY.md#gap-analysis) names per-process syscall allowlists as the highest-impact missing piece, with the explicit note that "the hook exists. Just needs policy tables."
 
 So the gap is not "we need to invent a policy mechanism." The gap is "we need to give the existing policy slot a real implementation, *and* we need to put that implementation outside the kernel so it can evolve independently and be observed by the AI security layer."
 
@@ -53,7 +53,7 @@ Extract authorization policy decisions into a **user-space policy service**, acc
 | **Policy logic** | Inside `policy-service`, replaceable | The default implementation is hardcoded "allow if signed by bootstrap key + on the syscall allowlist for this binary's stated profile." Replaceable with rule-based, ML-informed, or human-attended logic without kernel changes. |
 | **AI observation** | Separate user-space `ai-watcher` (future) | Subscribes to telemetry from the policy service. Recommends policy changes via IPC. **Never makes decisions directly.** Cannot bypass the policy service. The policy service decides whether to act on AI recommendations. |
 
-This is the layering [ArcOS.md line 88](../../ArcOS.md) already specifies. The kernel does five things ("Scheduling | Memory | IPC | Capabilities | Interrupts"); Policy is one of the Core Services *above* the kernel. The capability manager stays in the kernel because that's where mechanical enforcement happens. The decision-making layer moves up.
+This is the layering [CambiOS.md line 88](../../CambiOS.md) already specifies. The kernel does five things ("Scheduling | Memory | IPC | Capabilities | Interrupts"); Policy is one of the Core Services *above* the kernel. The capability manager stays in the kernel because that's where mechanical enforcement happens. The decision-making layer moves up.
 
 ### How a policy decision happens
 
@@ -231,7 +231,7 @@ What happens if the policy service crashes?
 | Policy service is compromised (returns Allow when it should return Deny) | Cannot be detected from kernel side | This is the same threat as any compromised user-space service. Mitigated by the policy service being signed at build time, holding minimal capabilities (only the policy endpoint and the audit channel), and being one of the smallest user-space services. The policy service is itself in the TCB-of-policy, even though it's not in the kernel TCB. |
 | Kernel cache poisoning | Cache is per-CPU, written only by `IpcInterceptor`, no IPC path can write directly | Not exploitable from user-space without compromising the kernel itself. |
 
-The fallback to permissive policy is intentional. **The kernel does not become unusable when the policy service is unavailable.** A policy service crash should not crash the kernel, and a policy service compromise should not be worse than a non-existent policy service. The system degrades to the v0 ArcOS posture (capability checks still enforced, syscall allowlists not enforced) rather than refusing to operate.
+The fallback to permissive policy is intentional. **The kernel does not become unusable when the policy service is unavailable.** A policy service crash should not crash the kernel, and a policy service compromise should not be worse than a non-existent policy service. The system degrades to the v0 CambiOS posture (capability checks still enforced, syscall allowlists not enforced) rather than refusing to operate.
 
 This is a deliberate tradeoff. The alternative — fail-closed, where every syscall is denied if the policy service is down — would mean the policy service is a single point of failure for the entire OS. Fail-open is the safer choice for a kernel whose other security properties (capabilities, identity stamping, ELF verification) remain in force regardless of policy service state.
 
@@ -239,7 +239,7 @@ This is a deliberate tradeoff. The alternative — fail-closed, where every sysc
 
 **Without caching:** an upcall per syscall would be a disaster. Every syscall would block, schedule the policy service, schedule the policy response back, and resume — easily 10 microseconds added per syscall, dominating the scheduler. Untenable.
 
-**With caching:** the steady state is one hash lookup per syscall plus the existing capability check. The upcall happens only on the first instance of each (process, decision) pair, plus cache misses on TTL expiry. Measured against current ArcOS workloads (~24 syscalls, simple control patterns), the steady-state overhead is sub-microsecond. The first call from a new process pays the upcall cost once.
+**With caching:** the steady state is one hash lookup per syscall plus the existing capability check. The upcall happens only on the first instance of each (process, decision) pair, plus cache misses on TTL expiry. Measured against current CambiOS workloads (~24 syscalls, simple control patterns), the steady-state overhead is sub-microsecond. The first call from a new process pays the upcall cost once.
 
 **For high-frequency syscalls** (`SYS_YIELD`, `SYS_GET_PID`), the cache should never miss in the steady state — these are the most-repeated patterns. The TTL of 1 second means the upcall happens at most once per second per (process, syscall) pair, which is negligible.
 
@@ -254,7 +254,7 @@ This is a deliberate tradeoff. The alternative — fail-closed, where every sysc
 | AI security service is compromised | N/A (no AI today) | AI is sandboxed: it can only send recommendations to the policy service. The policy service decides whether to act. Worst case: AI sends bad recommendations, policy service ignores them or applies them, behavior reverts to manual policy update |
 | Policy service is compromised | N/A | Subset of "compromised user-space service" — affects policy decisions but not capability storage. Capability table remains kernel-managed and unforgeable |
 | Cache poisoning (kernel-side cache) | N/A | Not exploitable: cache is per-CPU, written only by `IpcInterceptor`, no IPC path writes it directly |
-| Policy service doesn't respond | Operation blocks | Falls back to permissive default after timeout — operation continues with v0 ArcOS behavior |
+| Policy service doesn't respond | Operation blocks | Falls back to permissive default after timeout — operation continues with v0 CambiOS behavior |
 | Adversary races policy responses (sends fake response before real one) | N/A | Responses are matched on `query_id` (kernel-generated nonce); the policy service is the only process holding the policy endpoint capability, so no other process can send responses |
 
 The key property: **the kernel TCB does not grow.** The policy service is in the policy-decision TCB but not the kernel TCB. A policy service compromise does not give an attacker kernel privileges — only the ability to influence which capabilities get granted, which is a strictly smaller authority than kernel access.
@@ -281,7 +281,7 @@ This matches CLAUDE.md's verification posture: kernel code is verification-targe
 
 **Why considered.** The interceptor already exists. Adding more rules to `DefaultInterceptor` is mechanically easy. No new IPC, no new service, no new failure modes.
 
-**Why rejected.** It violates the architectural intent in [ArcOS.md line 88](../../ArcOS.md) ("Policy" as a Core Service above the kernel) and [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) ("AI watches without controlling the kernel"). It also makes AI integration impossible without putting the AI in the kernel, which everyone agrees is a non-starter. The default interceptor is fine as a fallback; it is not where the actual policy logic should live long-term.
+**Why rejected.** It violates the architectural intent in [CambiOS.md line 88](../../CambiOS.md) ("Policy" as a Core Service above the kernel) and [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) ("AI watches without controlling the kernel"). It also makes AI integration impossible without putting the AI in the kernel, which everyone agrees is a non-starter. The default interceptor is fine as a fallback; it is not where the actual policy logic should live long-term.
 
 ### Option B: Load policy as a kernel module (Linux LSM-style)
 
@@ -293,11 +293,11 @@ This matches CLAUDE.md's verification posture: kernel code is verification-targe
 
 **Why considered.** Linux uses this for some BPF-based LSMs. The policy is bytecode, the kernel runs an interpreter, updates require no recompilation.
 
-**Why rejected.** Introduces a JIT compiler or interpreter in the kernel — orders of magnitude more complexity than the entire current ArcOS kernel. The verification story for an in-kernel bytecode interpreter is unsolved (eBPF has had multiple kernel CVEs from verifier bugs). And the latency story isn't actually better than an IPC upcall with caching, because the steady state for both is "no kernel-side work."
+**Why rejected.** Introduces a JIT compiler or interpreter in the kernel — orders of magnitude more complexity than the entire current CambiOS kernel. The verification story for an in-kernel bytecode interpreter is unsolved (eBPF has had multiple kernel CVEs from verifier bugs). And the latency story isn't actually better than an IPC upcall with caching, because the steady state for both is "no kernel-side work."
 
 ### Option D: Run the policy service in user-space, accessed via IPC upcall (chosen)
 
-**Why chosen.** Aligns with the existing layered architecture. Composes with capability isolation. Replaceable without kernel changes. AI-compatible without making AI a kernel component. Verification surface stays small. Failure mode is graceful (fall back to permissive default). Performance is acceptable with caching. Matches the documented intent in ArcOS.md and PHILOSOPHY.md.
+**Why chosen.** Aligns with the existing layered architecture. Composes with capability isolation. Replaceable without kernel changes. AI-compatible without making AI a kernel component. Verification surface stays small. Failure mode is graceful (fall back to permissive default). Performance is acceptable with caching. Matches the documented intent in CambiOS.md and PHILOSOPHY.md.
 
 The cost is: more user-space code, a new IPC upcall path, a new `BlockReason` variant, and the discipline of keeping the policy service's startup before any other user-space service. All of these are local, contained changes.
 
@@ -335,7 +335,7 @@ Steps 1–7 establish the architectural slot without changing observable behavio
 - **[ADR-002](002-three-layer-enforcement-pipeline.md)** — The interceptor pattern this ADR makes real (the `on_syscall` hook is the slot that's getting filled)
 - **[ADR-005](005-ipc-primitives-control-and-bulk.md)** — Channel creation goes through policy too (`should_allow_channel_create`)
 - **[ADR-007](007-capability-revocation-and-telemetry.md)** — Revocation primitive used by the policy service; audit telemetry consumed by the AI watcher
-- **[ArcOS.md § Architecture](../../ArcOS.md)** — Layer diagram showing "Policy" as a Core Service above the microkernel
+- **[CambiOS.md § Architecture](../../CambiOS.md)** — Layer diagram showing "Policy" as a Core Service above the microkernel
 - **[PHILOSOPHY.md](../../PHILOSOPHY.md) lines 73-99** — "AI observes without controlling the kernel"
 - **[SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis)** — Items 1, 5, "Runtime behavioral AI" all addressed by this ADR + ADR-007
 - **[SCHEDULER.md § Blocking and Wake Primitives](../../src/scheduler/SCHEDULER.md#blocking-and-wake-primitives)** — `BlockReason::PolicyWait` joins the existing block reasons

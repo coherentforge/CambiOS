@@ -1,9 +1,9 @@
 /* Copyright (C) 2024-2026 Jason Ricca. All rights reserved. */
 
-// ArcOS user-space test program — "hello" module
+// CambiOS user-space test program — "hello" module
 //
 // Loaded by Limine as a boot module, executed in ring 3.
-// Uses ArcOS syscalls via the SYSCALL instruction.
+// Uses CambiOS syscalls via the SYSCALL instruction.
 //
 // Syscall convention (x86_64):
 //   rax = syscall number

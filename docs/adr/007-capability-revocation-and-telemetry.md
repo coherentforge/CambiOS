@@ -8,7 +8,7 @@
 
 ## Problem
 
-ArcOS has working capability *grants*: every IPC endpoint has rights, every process has a capability table, every operation checks its right against the table. What's missing is the ability to **take capabilities back**.
+CambiOS has working capability *grants*: every IPC endpoint has rights, every process has a capability table, every operation checks its right against the table. What's missing is the ability to **take capabilities back**.
 
 [SECURITY.md gap #5](../../SECURITY.md#gap-analysis) flags this directly: "Required before any real multi-service deployment. A driver update needs to revoke the old driver's capabilities." The use cases are concrete and not hypothetical:
 
@@ -410,7 +410,7 @@ The order is deliberate: revocation comes first because it has no dependencies o
 - **[ADR-002](002-three-layer-enforcement-pipeline.md)** — Enforcement pipeline (capability check still happens; revocation makes the check fail post-revoke)
 - **[ADR-005](005-ipc-primitives-control-and-bulk.md)** — Channels (audit telemetry uses the channel primitive; channel revocation uses the primitive defined here)
 - **[ADR-006](006-policy-service.md)** — Policy service (the primary consumer of audit telemetry and the primary caller of `SYS_REVOKE_CAPABILITY`)
-- **[ArcOS.md § AI Integration](../../ArcOS.md)** — Three pillars: security, compatibility, operations. The audit telemetry substrate enables Pillar 1 (Security AI)
+- **[CambiOS.md § AI Integration](../../CambiOS.md)** — Three pillars: security, compatibility, operations. The audit telemetry substrate enables Pillar 1 (Security AI)
 - **[PHILOSOPHY.md](../../PHILOSOPHY.md) lines 73-99** — "AI watches without controlling" — this ADR provides the *something to watch*
 - **[SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis)** — Closes gap #5 (capability revocation) and provides the substrate for items "Audit logging" and "Runtime behavioral AI"
 

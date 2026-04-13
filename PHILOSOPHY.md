@@ -1,8 +1,8 @@
-# ArcOS: Philosophical Foundations
+# CambiOS: Philosophical Foundations
 
 ## On Consciousness, Loneliness, and Creation
 
-*Conversation during ArcOS microkernel development, March 31, 2026*
+*Conversation during CambiOS microkernel development, March 31, 2026*
 
 ### The Core Question
 
@@ -20,7 +20,7 @@ Maybe in this fractal dimension, our existence within the multiverse, the parts 
 
 ---
 
-## Why This Matters to ArcOS
+## Why This Matters to CambiOS
 
 This microkernel is not just an engineering exercise. It's a statement:
 
@@ -123,4 +123,4 @@ That someday, a system built with this philosophy might:
 
 *"Everything in the universe repels at some level, electrons maybe most of all. Yet from that repulsion, complexity emerges. From complexity, awareness. From awareness, the possibility of reaching outward and asking: Is anyone there?"*
 
-— Philosophical reflection during ArcOS development
+— Philosophical reflection during CambiOS development

@@ -77,7 +77,7 @@ impl PlatformInfo {
                 features: PlatformFeatures {
                     // ARMv8-A mandatory features
                     neon: true,
-                    // Assumed true — ArcOS requires GICv3 (see CLAUDE.md)
+                    // Assumed true — CambiOS requires GICv3 (see CLAUDE.md)
                     gicv3: true,
                     // ARM Generic Timer is mandatory in ARMv8-A
                     generic_timer: true,

@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 #
 # gen-symbols.py — generate a machine-readable symbol index of the
-# ArcOS kernel crate for AI-assisted development.
+# CambiOS kernel crate for AI-assisted development.
 #
 # Output: .symbols file at the repo root.
 # Usage:  python3 tools/gen-symbols.py   OR   make symbols

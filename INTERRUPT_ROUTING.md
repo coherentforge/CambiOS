@@ -2,7 +2,7 @@
 
 ## Overview
 
-ArcOS implements **interrupt-driven task wakeup** through a routing system that maps hardware IRQs to driver tasks. When hardware asserts an interrupt, the kernel wakes any task blocked on that IRQ via the scheduler's `wake_irq_waiters()` mechanism. Drivers sleep until their interrupt fires — no polling, no spin-waiting.
+CambiOS implements **interrupt-driven task wakeup** through a routing system that maps hardware IRQs to driver tasks. When hardware asserts an interrupt, the kernel wakes any task blocked on that IRQ via the scheduler's `wake_irq_waiters()` mechanism. Drivers sleep until their interrupt fires — no polling, no spin-waiting.
 
 This solves a critical problem in microkernel design:
 - **Before**: Drivers poll or spin-wait for events (wastes CPU, kills thermal efficiency)
@@ -10,7 +10,7 @@ This solves a critical problem in microkernel design:
 
 ## Interrupt Controller Architecture
 
-ArcOS uses the **Local APIC** and **I/O APIC** exclusively. The legacy 8259 PIC is disabled at boot (remapped to vectors 0xF0-0xFF and fully masked).
+CambiOS uses the **Local APIC** and **I/O APIC** exclusively. The legacy 8259 PIC is disabled at boot (remapped to vectors 0xF0-0xFF and fully masked).
 
 | Controller | Role | Configured in |
 |---|---|---|

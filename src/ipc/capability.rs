@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt;
 
-/// Kinds of capabilities in the ArcOS capability model.
+/// Kinds of capabilities in the CambiOS capability model.
 ///
 /// Distinguishes between IPC endpoint capabilities (the original model)
 /// and system capabilities that grant kernel-level operational rights.

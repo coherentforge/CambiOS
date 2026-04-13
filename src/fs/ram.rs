@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use alloc::alloc::{alloc, Layout};
 
-use super::{ArcObject, ObjectStore, ObjectMeta, StoreError, content_hash};
+use super::{CambiObject, ObjectStore, ObjectMeta, StoreError, content_hash};
 
 /// SCAFFOLDING: maximum number of objects in the RAM store.
 /// Why: Phase 0 RAM-backed store with a fixed-capacity array. Linear scan for
@@ -23,14 +23,14 @@ pub const MAX_OBJECTS: usize = 256;
 
 /// RAM-backed ObjectStore.
 ///
-/// Stores up to `MAX_OBJECTS` ArcObjects in a heap-allocated array.
+/// Stores up to `MAX_OBJECTS` CambiObjects in a heap-allocated array.
 /// Linear scan for get/delete/list — fine for Phase 0 testing.
 ///
 /// Heap-allocated via `new_boxed()` to avoid stack overflow (matches
 /// existing kernel conventions for large structs).
 pub struct RamObjectStore {
     /// Object slots. `Some(obj)` = occupied, `None` = free.
-    objects: [Option<ArcObject>; MAX_OBJECTS],
+    objects: [Option<CambiObject>; MAX_OBJECTS],
     /// Number of stored objects.
     count: usize,
 }
@@ -42,13 +42,13 @@ impl RamObjectStore {
     /// 256KB boot stack. Returns `None` if the heap is exhausted.
     pub fn new_boxed() -> Option<Box<Self>> {
         let layout = Layout::new::<Self>();
-        // SAFETY: Layout is non-zero-sized (contains array of 256 Option<ArcObject>).
+        // SAFETY: Layout is non-zero-sized (contains array of 256 Option<CambiObject>).
         let ptr = unsafe { alloc(layout) as *mut Self };
         if ptr.is_null() {
             return None;
         }
         // SAFETY: We write every field before constructing the Box.
-        // Cannot use alloc_zeroed because Option<ArcObject> contains Vec<u8>
+        // Cannot use alloc_zeroed because Option<CambiObject> contains Vec<u8>
         // (a fat pointer) — zeroed memory is not valid for Option<Vec>.
         // Instead, write None to each slot explicitly.
         for i in 0..MAX_OBJECTS {
@@ -89,12 +89,12 @@ impl RamObjectStore {
 }
 
 impl ObjectStore for RamObjectStore {
-    fn get(&self, hash: &[u8; 32]) -> Result<&ArcObject, StoreError> {
+    fn get(&self, hash: &[u8; 32]) -> Result<&CambiObject, StoreError> {
         let idx = self.find_index(hash).ok_or(StoreError::NotFound)?;
         self.objects[idx].as_ref().ok_or(StoreError::NotFound)
     }
 
-    fn put(&mut self, object: ArcObject) -> Result<[u8; 32], StoreError> {
+    fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError> {
         // Verify content_hash matches actual content
         let computed = content_hash(&object.content);
         if computed != object.content_hash {
@@ -152,9 +152,9 @@ mod tests {
         RamObjectStore::new_boxed().expect("test: failed to allocate RamObjectStore")
     }
 
-    fn make_object(data: &[u8]) -> ArcObject {
+    fn make_object(data: &[u8]) -> CambiObject {
         let author = Principal::from_public_key([1u8; 32]);
-        ArcObject::new(author, data.to_vec(), 100)
+        CambiObject::new(author, data.to_vec(), 100)
     }
 
     #[test]
@@ -289,7 +289,7 @@ mod tests {
         let mut store = make_store();
         let author = Principal::from_public_key([0xAA; 32]);
         let owner = Principal::from_public_key([0xBB; 32]);
-        let obj = ArcObject::new_with_owner(author, owner, alloc::vec![1, 2, 3], 42);
+        let obj = CambiObject::new_with_owner(author, owner, alloc::vec![1, 2, 3], 42);
         let hash = store.put(obj).unwrap();
 
         let retrieved = store.get(&hash).unwrap();

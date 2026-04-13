@@ -6,11 +6,11 @@ last_synced_to_code: 2026-04-12 (Phase 3.3 landed)
 authoritative_for: every fixed numeric bound, fixed-size array, hard limit in kernel code — what kind of bound it is, why this number, and what triggers re-evaluation
 -->
 
-# ArcOS Numeric Assumptions
+# CambiOS Numeric Assumptions
 
 > **The rule:** every arbitrary numeric bound in kernel code must be a *conscious* bound. Not "this is what fit when I wrote it." Not "this looked big enough." Conscious means: I picked this number, I know why I picked it, I know what category it belongs to, and I know what would make me change it.
 >
-> Unconscious bounds are how production-ready software accrues weakness. ArcOS catches them while it's still early enough to fix them painlessly.
+> Unconscious bounds are how production-ready software accrues weakness. CambiOS catches them while it's still early enough to fix them painlessly.
 
 ## Why this document exists
 
@@ -25,7 +25,7 @@ This document catalogs every such bound and forces a category on each: which one
 | Category | Meaning | Will it change? |
 |---|---|---|
 | **SCAFFOLDING** | Picked for verification ergonomics or early-development simplicity. The constraint exists because of how the code was built, not because of what the system *is*. | Yes — when the trigger condition fires. |
-| **ARCHITECTURAL** | A real invariant of the system. Encodes a structural decision. Changing it means changing what ArcOS is. | No. |
+| **ARCHITECTURAL** | A real invariant of the system. Encodes a structural decision. Changing it means changing what CambiOS is. | No. |
 | **HARDWARE** | Imposed by an external ABI, spec, or chip. Bounded by reality outside the codebase. | Only if the underlying spec changes. |
 | **TUNING** | Performance knob that depends on workload. Picking a number is meaningless without measurements. | When benchmarks say so, not before. |
 | **LEGACY** | Picked early, never revisited, no recorded rationale. **No bound should stay in this category** — every legacy bound is a bug waiting for somebody to discover that the constraint doesn't make sense. Audit them on sight; promote to one of the four real categories or remove the limit. |
@@ -98,7 +98,7 @@ These are the ones that will need to grow as the system matures. They are correc
 | `KERNEL_HEAP_SIZE` | 4 MiB | [src/microkernel/main.rs:501](src/microkernel/main.rs#L501) | Sufficient for current Box/Vec allocations; conscious upper bound to make memory accounting easy. | Phase 3 channels + audit ring buffers + larger capability tables will pressure this. First OOM in `Box::new()` is the signal. |
 | `HEAP_SIZE` (per process) | 1 MiB | [src/process.rs:156](src/process.rs#L156) | Default per-process heap size. As of Phase 3.2a, each process's heap is dynamically allocated from the frame allocator via `allocate_contiguous(HEAP_PAGES)` at creation and reclaimed via `free_contiguous` at exit — no more PID-derived slab. udp-stack is already feeling this at 1 MiB. | When udp-stack or any Phase 3 service needs more than 1 MiB of heap. The growth path is now straightforward (no pre-reserved slab to resize), but might want per-service sizing rather than a global constant. |
 | `HEAP_PAGES` (per process) | 256 (1 MiB / 4 KiB) | [src/process.rs:159](src/process.rs#L159) | Derived from `HEAP_SIZE / PAGE_SIZE`. Drives the `allocate_contiguous` request in `ProcessDescriptor::new`. Paired with `HEAP_SIZE` and grows with it. | N/A — derived, tracks `HEAP_SIZE`. |
-| `KERNEL_STACK_SIZE` (per task) | 8 KiB | [src/loader/mod.rs:33](src/loader/mod.rs#L33) | Linux uses 16 KiB; ArcOS uses 8 because syscall handlers are currently shallow. | First deep call chain — recursive ELF verifier, signed-object validator with stack-allocated context, channel teardown that walks process tables. Watch for stack-overflow double-faults landing on IST1. |
+| `KERNEL_STACK_SIZE` (per task) | 8 KiB | [src/loader/mod.rs:33](src/loader/mod.rs#L33) | Linux uses 16 KiB; CambiOS uses 8 because syscall handlers are currently shallow. | First deep call chain — recursive ELF verifier, signed-object validator with stack-allocated context, channel teardown that walks process tables. Watch for stack-overflow double-faults landing on IST1. |
 | `MAX_FRAMES` (frame allocator) | 524288 | [src/memory/frame_allocator.rs:32](src/memory/frame_allocator.rs#L32) | Bitmap covers 0-2 GiB physical. Bitmap is 64 KiB in `.bss`. | The Dell 3630 target has 16 GiB. The bare-metal bring-up will hit this immediately. The bitmap just needs to grow — a real production blocker, not verification scaffolding. |
 | `MAX_PROCESS_MEMORY` (per binary) | 256 MiB | [src/loader/mod.rs:49](src/loader/mod.rs#L49) | ELF verifier hard cap; prevents OOM via crafted binaries. | A legitimate user-space service that needs > 256 MiB. Fine for now. |
 | `DEFAULT_STACK_PAGES` (per process) | 16 (64 KiB) | [src/loader/mod.rs:40](src/loader/mod.rs#L40) | Conservative default; existing services fit. | Per-service decision; should become a process descriptor field rather than a constant once different services have different needs. |
@@ -122,7 +122,7 @@ These are *not* arbitrary. Each one encodes a design decision. They should not c
 
 ### HARDWARE — fixed by external ABI/spec
 
-These are facts about the world. ArcOS has no leverage to change them.
+These are facts about the world. CambiOS has no leverage to change them.
 
 | Constant | Value | Where | Source |
 |---|---|---|---|
@@ -142,20 +142,20 @@ These are performance knobs. Picking a number without measurements is guessing. 
 |---|---|---|---|
 | `CACHE_CAPACITY` (per-CPU frame cache) | 32 | [src/memory/frame_allocator.rs:329](src/memory/frame_allocator.rs#L329) | Allocator lock contention vs. per-CPU memory parked unused. Larger = less lock contention, more wasted frames. |
 | `REFILL_COUNT` / `DRAIN_COUNT` | 16 / 16 | [src/memory/frame_allocator.rs:332](src/memory/frame_allocator.rs#L332) | Batch size for cache refill/drain — amortizes the global lock cost. |
-| `MAX_INDIVIDUAL_PAGES` (TLB shootdown) | 32 | [src/arch/x86_64/tlb.rs:31](src/arch/x86_64/tlb.rs#L31) | Threshold for `invlpg` per-page vs. full CR3 reload. Above 32, full reload is cheaper. Verified empirically by other kernels; not measured for ArcOS. |
+| `MAX_INDIVIDUAL_PAGES` (TLB shootdown) | 32 | [src/arch/x86_64/tlb.rs:31](src/arch/x86_64/tlb.rs#L31) | Threshold for `invlpg` per-page vs. full CR3 reload. Above 32, full reload is cheaper. Verified empirically by other kernels; not measured for CambiOS. |
 | `MAX_OVERRIDES` (ACPI MADT) | 16 | [src/acpi/mod.rs:187](src/acpi/mod.rs#L187) | Realistic firmware override count. |
 | `DRAIN_BATCH_SIZE` (audit) | 64 | [src/audit/drain.rs:59](src/audit/drain.rs#L59) | Max events drained from all per-CPU staging buffers per timer tick. Bounds ISR time: 64 events × 64 bytes = 4 KiB of copies. |
 | `AUDIT_IPC_SAMPLE_RATE` | 100 | [src/audit/mod.rs:393](src/audit/mod.rs) | IPC send/recv sampling: emit 1 audit event per 100 operations. At ~1000 IPC/sec, produces ~10 events/sec — informative for pattern detection without flooding. |
 
 #### Tier policies
 
-These three rows capture the default `TableSizingPolicy` per deployment tier introduced by [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and [ADR-009](docs/adr/009-purpose-tiers-scope.md). Each policy is a 5-field struct — `min_slots`, `max_slots`, `ram_budget_ppm`, `ram_budget_floor`, `ram_budget_ceiling` — that drives the boot-time `num_slots` computation in [`config::num_slots_from`](src/config/tier.rs). They are TUNING because the defaults are starting points chosen from estimated workload density; the right values depend on what each tier's deployments actually run, and will shift as real workload data arrives. The kernel binary is identical across tiers per ADR-009; what differs is which policy is selected by the `ARCOS_TIER` build environment variable (default: `tier3`), wired in via [`build.rs`](build.rs).
+These three rows capture the default `TableSizingPolicy` per deployment tier introduced by [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and [ADR-009](docs/adr/009-purpose-tiers-scope.md). Each policy is a 5-field struct — `min_slots`, `max_slots`, `ram_budget_ppm`, `ram_budget_floor`, `ram_budget_ceiling` — that drives the boot-time `num_slots` computation in [`config::num_slots_from`](src/config/tier.rs). They are TUNING because the defaults are starting points chosen from estimated workload density; the right values depend on what each tier's deployments actually run, and will shift as real workload data arrives. The kernel binary is identical across tiers per ADR-009; what differs is which policy is selected by the `CAMBIOS_TIER` build environment variable (default: `tier3`), wired in via [`build.rs`](build.rs).
 
 | Policy | Value | Where | What it trades off |
 |---|---|---|---|
-| `TIER1_POLICY` (ArcOS-Embedded) | `{ min_slots: 32, max_slots: 256, ram_budget_ppm: 15_000, ram_budget_floor: 2 MiB, ram_budget_ceiling: 8 MiB }` | [src/config/tier.rs:129](src/config/tier.rs#L129) | 1.5% of RAM, clamped 2-8 MiB, for 32-256 slots. Embedded deployments run small, stable sets of fixed-function processes; 256-slot ceiling reflects "more than this is probably the wrong tier." Tunable per deployment via custom tier config. |
-| `TIER2_POLICY` (ArcOS-Standard, no AI) | `{ min_slots: 128, max_slots: 4096, ram_budget_ppm: 20_000, ram_budget_floor: 16 MiB, ram_budget_ceiling: 64 MiB }` | [src/config/tier.rs:139](src/config/tier.rs#L139) | 2% of RAM, clamped 16-64 MiB, for 128-4096 slots. Sized for a typical single-user desktop or workstation. Shared multi-user machines or heavy build farms raise the ceiling in a custom tier config. |
-| `TIER3_POLICY` (ArcOS-Full) | `{ min_slots: 256, max_slots: 65536, ram_budget_ppm: 30_000, ram_budget_floor: 64 MiB, ram_budget_ceiling: 512 MiB }` | [src/config/tier.rs:149](src/config/tier.rs#L149) | 3% of RAM, clamped 64-512 MiB, for 256-65536 slots. Sized for heavy general-purpose workloads (large builds, many user applications, AI services with per-request workers). 65536 is a default, not a physical limit. |
+| `TIER1_POLICY` (CambiOS-Embedded) | `{ min_slots: 32, max_slots: 256, ram_budget_ppm: 15_000, ram_budget_floor: 2 MiB, ram_budget_ceiling: 8 MiB }` | [src/config/tier.rs:129](src/config/tier.rs#L129) | 1.5% of RAM, clamped 2-8 MiB, for 32-256 slots. Embedded deployments run small, stable sets of fixed-function processes; 256-slot ceiling reflects "more than this is probably the wrong tier." Tunable per deployment via custom tier config. |
+| `TIER2_POLICY` (CambiOS-Standard, no AI) | `{ min_slots: 128, max_slots: 4096, ram_budget_ppm: 20_000, ram_budget_floor: 16 MiB, ram_budget_ceiling: 64 MiB }` | [src/config/tier.rs:139](src/config/tier.rs#L139) | 2% of RAM, clamped 16-64 MiB, for 128-4096 slots. Sized for a typical single-user desktop or workstation. Shared multi-user machines or heavy build farms raise the ceiling in a custom tier config. |
+| `TIER3_POLICY` (CambiOS-Full) | `{ min_slots: 256, max_slots: 65536, ram_budget_ppm: 30_000, ram_budget_floor: 64 MiB, ram_budget_ceiling: 512 MiB }` | [src/config/tier.rs:149](src/config/tier.rs#L149) | 3% of RAM, clamped 64-512 MiB, for 256-65536 slots. Sized for heavy general-purpose workloads (large builds, many user applications, AI services with per-request workers). 65536 is a default, not a physical limit. |
 
 **Current binding observation (tier3, QEMU 128 MiB):** after the BuddyAllocator-to-per-heap move, `SLOT_OVERHEAD` dropped from ~22 KB to ~2 KB. On QEMU 128 MiB, `num_slots` is capped by the contiguous-region fitting heuristic (half of free frames). At 1 TiB, Tier 3 hits `max_slots = 65536` (slot-bound) — the binding flip the ADR originally predicted. Tier 1 is also slot-bound; Tier 2 transitions from budget-bound to slot-bound at ~8 GiB of RAM.
 

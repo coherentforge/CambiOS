@@ -1,6 +1,6 @@
 # Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-# ArcOS Makefile - Build kernel and Limine bootable ISO
+# CambiOS Makefile - Build kernel and Limine bootable ISO
 #
 # Usage:
 #   make all     - Build kernel + ISO
@@ -10,12 +10,12 @@
 #   make test    - Run unit tests
 #
 # Signing modes:
-#   make run                        # YubiKey signing (default, requires ARCOS_SIGN_PIN)
+#   make run                        # YubiKey signing (default, requires CAMBIO_SIGN_PIN)
 #   make run SIGN_MODE=seed         # Seed-based signing (CI/testing)
-#   ARCOS_SIGN_PIN=123456 make run  # YubiKey with PIN via env var
+#   CAMBIO_SIGN_PIN=123456 make run # YubiKey with PIN via env var
 
-KERNEL := target/x86_64-unknown-none/release/arcos_microkernel
-ISO := arcos.iso
+KERNEL := target/x86_64-unknown-none/release/cambios_microkernel
+ISO := cambios.iso
 LIMINE_DIR := /tmp/limine
 LIMINE_BRANCH := v8.x-binary
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
@@ -195,7 +195,7 @@ iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack 
 	mkdir -p iso_root/boot/limine
 	mkdir -p iso_root/EFI/BOOT
 	# Copy kernel binary
-	cp $(KERNEL) iso_root/boot/arcos_microkernel
+	cp $(KERNEL) iso_root/boot/cambios_microkernel
 	# Copy user-space ELF modules
 	cp $(USER_ELF) iso_root/boot/hello.elf
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
@@ -243,18 +243,18 @@ run: iso
 		-no-reboot
 
 run-uefi: iso
-	@cp $(EFI_VARS_X86) /tmp/arcos-efivars.fd
+	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
 		-cdrom $(ISO) \
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
-		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
+		-drive if=pflash,format=raw,file=/tmp/cambios-efivars.fd \
 		-serial mon:stdio \
 		-m 4G \
 		-no-reboot
 
 # x86_64 FAT32 UEFI image — for USB boot on bare metal (Dell 3630 etc.)
-# Usage: make img-x86 && sudo dd if=arcos-x86.img of=/dev/diskN bs=1M
-IMG_X86 := arcos-x86.img
+# Usage: make img-x86 && sudo dd if=cambios-x86.img of=/dev/diskN bs=1M
+IMG_X86 := cambios-x86.img
 
 img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell sign-tool limine
 	@echo "=== Building x86_64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
@@ -266,7 +266,7 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	mmd -i $(IMG_X86) ::/boot
 	mmd -i $(IMG_X86) ::/boot/limine
 	mcopy -i $(IMG_X86) $(LIMINE_DIR)/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy -i $(IMG_X86) $(KERNEL) ::/boot/arcos_microkernel
+	mcopy -i $(IMG_X86) $(KERNEL) ::/boot/cambios_microkernel
 	# Copy + sign all x86_64 user-space modules
 	cp $(USER_ELF) /tmp/hello-signed.elf
 	cp $(KS_SERVICE_ELF) /tmp/key-store-service-signed.elf
@@ -302,11 +302,11 @@ EFI_VARS_X86 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-i386-vars.fd'
 
 # Test x86_64 FAT image in QEMU UEFI (validates the image before writing to USB)
 run-img-x86: img-x86
-	@cp $(EFI_VARS_X86) /tmp/arcos-efivars.fd
+	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
 		-drive file=$(IMG_X86),format=raw \
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
-		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
+		-drive if=pflash,format=raw,file=/tmp/cambios-efivars.fd \
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
@@ -337,7 +337,7 @@ run-img-x86: img-x86
 #   make usb DEVICE=/dev/diskN # Write to USB (with confirmation)
 #   make verify-usb DEVICE=/dev/diskN # Read back and compare
 
-IMG_USB := arcos-usb.img
+IMG_USB := cambios-usb.img
 IMG_USB_SIZE_MB := 96
 ESP_SIZE_MB := 64
 
@@ -355,7 +355,7 @@ img-usb: img-x86
 	sgdisk --clear \
 		--new=1:2048:+$(ESP_SIZE_MB)M \
 		--typecode=1:EF00 \
-		--change-name=1:"ArcOS ESP" \
+		--change-name=1:"CambiOS ESP" \
 		$(IMG_USB) >/dev/null
 	# Embed the FAT32 ESP image at LBA 2048 (offset = 2048 * 512 = 1 MiB).
 	dd if=$(IMG_X86) of=$(IMG_USB) bs=1M seek=1 conv=notrunc status=none
@@ -365,11 +365,11 @@ img-usb: img-x86
 
 # Test the GPT image in QEMU UEFI (validates before writing to USB)
 run-img-usb: img-usb
-	@cp $(EFI_VARS_X86) /tmp/arcos-efivars.fd
+	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
 		-drive file=$(IMG_USB),format=raw \
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
-		-drive if=pflash,format=raw,file=/tmp/arcos-efivars.fd \
+		-drive if=pflash,format=raw,file=/tmp/cambios-efivars.fd \
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
@@ -422,14 +422,14 @@ verify-usb:
 	fi
 	@echo "Reading $(IMG_USB_SIZE_MB) MiB from $(DEVICE)..."
 	@diskutil unmountDisk $(DEVICE) 2>/dev/null || true
-	sudo dd if=$(DEVICE) of=/tmp/arcos-usb-readback.img bs=1M count=$(IMG_USB_SIZE_MB) status=progress
+	sudo dd if=$(DEVICE) of=/tmp/cambios-usb-readback.img bs=1M count=$(IMG_USB_SIZE_MB) status=progress
 	@echo "Comparing to $(IMG_USB)..."
-	@if cmp -s /tmp/arcos-usb-readback.img $(IMG_USB); then \
+	@if cmp -s /tmp/cambios-usb-readback.img $(IMG_USB); then \
 		echo "✓ USB matches source image (verified $(IMG_USB_SIZE_MB) MiB)"; \
-		rm -f /tmp/arcos-usb-readback.img; \
+		rm -f /tmp/cambios-usb-readback.img; \
 	else \
 		echo "✗ MISMATCH: USB does not match $(IMG_USB)"; \
-		echo "  Readback saved to /tmp/arcos-usb-readback.img for inspection"; \
+		echo "  Readback saved to /tmp/cambios-usb-readback.img for inspection"; \
 		exit 1; \
 	fi
 
@@ -443,8 +443,8 @@ symbols:
 	python3 tools/gen-symbols.py
 
 # AArch64 targets
-KERNEL_AARCH64 := target/aarch64-unknown-none/release/arcos_microkernel
-IMG_AARCH64 := arcos-aarch64.img
+KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
+IMG_AARCH64 := cambios-aarch64.img
 EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-code.fd' 2>/dev/null | head -1)
 
 kernel-aarch64:
@@ -460,7 +460,7 @@ img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-servic
 	mmd -i $(IMG_AARCH64) ::/boot
 	mmd -i $(IMG_AARCH64) ::/boot/limine
 	mcopy -i $(IMG_AARCH64) $(LIMINE_DIR)/BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
-	mcopy -i $(IMG_AARCH64) $(KERNEL_AARCH64) ::/boot/arcos_microkernel
+	mcopy -i $(IMG_AARCH64) $(KERNEL_AARCH64) ::/boot/cambios_microkernel
 	# Copy + sign all AArch64 user-space modules
 	cp $(USER_ELF_AARCH64) /tmp/hello-signed.elf
 	cp $(KS_SERVICE_ELF_AARCH64) /tmp/key-store-service-signed.elf

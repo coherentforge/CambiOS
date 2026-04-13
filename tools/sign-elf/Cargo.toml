@@ -4,7 +4,7 @@
 name = "sign-elf"
 version = "0.3.0"
 edition = "2021"
-description = "ArcOS ELF signing tool — Ed25519 via YubiKey or seed"
+description = "CambiOS ELF signing tool — Ed25519 via YubiKey or seed"
 
 [dependencies]
 blake3 = "1.8"

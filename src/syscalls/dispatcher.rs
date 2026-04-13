@@ -1009,11 +1009,11 @@ impl SyscallDispatcher {
     // ObjectStore syscalls
     // ========================================================================
 
-    /// SYS_OBJ_PUT: Store an ArcObject in the object store.
+    /// SYS_OBJ_PUT: Store an CambiObject in the object store.
     ///
     /// Args: arg1 = content_ptr (user vaddr), arg2 = content_len, arg3 = out_hash (user vaddr)
     ///
-    /// Creates an ArcObject with author/owner = caller's Principal.
+    /// Creates an CambiObject with author/owner = caller's Principal.
     /// Writes 32-byte content hash to out_hash. Returns 0 on success.
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential, not nested.
@@ -1045,14 +1045,14 @@ impl SyscallDispatcher {
         // Get current time for created_at
         let ticks = crate::scheduler::Timer::get_ticks();
 
-        // Create ArcObject with caller as author and owner
+        // Create CambiObject with caller as author and owner
         let content_vec = {
             extern crate alloc;
             let mut v = alloc::vec::Vec::with_capacity(copied);
             v.extend_from_slice(&kbuf[..copied]);
             v
         };
-        let obj = crate::fs::ArcObject::new(principal, content_vec, ticks);
+        let obj = crate::fs::CambiObject::new(principal, content_vec, ticks);
         let hash = obj.content_hash;
 
         // Store in OBJECT_STORE (lock position 8)
@@ -1260,7 +1260,7 @@ impl SyscallDispatcher {
         Ok(64)
     }
 
-    /// SYS_OBJ_PUT_SIGNED: Store a pre-signed ArcObject.
+    /// SYS_OBJ_PUT_SIGNED: Store a pre-signed CambiObject.
     ///
     /// Args: arg1 = content_ptr, arg2 = content_len, arg3 = sig_ptr (64 bytes),
     ///        arg4 = out_hash_ptr (32 bytes)
@@ -1310,14 +1310,14 @@ impl SyscallDispatcher {
         // Get current time for created_at
         let ticks = crate::scheduler::Timer::get_ticks();
 
-        // Create ArcObject with the verified signature
+        // Create CambiObject with the verified signature
         let content_vec = {
             extern crate alloc;
             let mut v = alloc::vec::Vec::with_capacity(copied);
             v.extend_from_slice(&kbuf[..copied]);
             v
         };
-        let mut obj = crate::fs::ArcObject::new(principal, content_vec, ticks);
+        let mut obj = crate::fs::CambiObject::new(principal, content_vec, ticks);
         obj.signature = signature;
         let hash = obj.content_hash;
 

@@ -75,7 +75,7 @@ pub enum SyscallNumber {
     RecvMsg = 13,
 
     /// obj_put(content_ptr: *const u8, content_len: usize, out_hash: *mut u8) -> isize
-    /// Store an ArcObject. Author/owner = caller's Principal.
+    /// Store an CambiObject. Author/owner = caller's Principal.
     /// Writes 32-byte content hash to out_hash. Returns 0 or negative error.
     ObjPut = 14,
 
@@ -98,7 +98,7 @@ pub enum SyscallNumber {
     ClaimBootstrapKey = 18,
 
     /// obj_put_signed(content_ptr: *const u8, content_len: usize, sig_ptr: *const u8, out_hash: *mut u8) -> isize
-    /// Store a pre-signed ArcObject. Kernel verifies the Ed25519 signature
+    /// Store a pre-signed CambiObject. Kernel verifies the Ed25519 signature
     /// against the caller's Principal before storing. Returns 0 or negative error.
     ObjPutSigned = 19,
 

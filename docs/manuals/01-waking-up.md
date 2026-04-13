@@ -1,6 +1,6 @@
 # Waking Up
 
-*What happens when ArcOS boots, from the first instruction to the first scheduled task.*
+*What happens when CambiOS boots, from the first instruction to the first scheduled task.*
 
 ---
 
@@ -44,7 +44,7 @@ After this point, exceptions are handled instead of being fatal. A page fault pr
 
 ## Bringing Up the Subsystems
 
-Now the kernel initializes its core subsystems, one at a time, in a specific order dictated by the lock hierarchy. ArcOS has a strict rule: locks must be acquired in a fixed global order to prevent deadlock. The subsystems initialize in that same order, because each one builds on what came before.
+Now the kernel initializes its core subsystems, one at a time, in a specific order dictated by the lock hierarchy. CambiOS has a strict rule: locks must be acquired in a fixed global order to prevent deadlock. The subsystems initialize in that same order, because each one builds on what came before.
 
 **Process table** comes first. It creates descriptors for the three kernel processes (PIDs 0, 1, 2), each with its own page table. These aren't real processes yet — they're just bookkeeping entries. But the scheduler and IPC system need them to exist.
 
@@ -64,7 +64,7 @@ With all subsystems ready, the scheduler initializes. This is the most complex s
 
 The scheduler creates the idle task (Task 0) on the boot stack — this is the task that runs when there's nothing else to do. It creates two kernel-mode tasks with their own stacks. Then it loads the boot modules.
 
-Boot modules are ELF binaries that Limine loaded into memory alongside the kernel. Before ArcOS will run any of them, every binary must pass through the `SignedBinaryVerifier`. The verifier strips a 72-byte ARCSIG trailer from the end of the binary, extracts a 64-byte Ed25519 signature, computes the Blake3 hash of the remaining ELF bytes, and checks the signature against the bootstrap public key. If the signature doesn't match — if even a single byte has been changed — the binary is rejected. No memory is allocated for it. No pages are mapped. It simply doesn't load.
+Boot modules are ELF binaries that Limine loaded into memory alongside the kernel. Before CambiOS will run any of them, every binary must pass through the `SignedBinaryVerifier`. The verifier strips a 72-byte ARCSIG trailer from the end of the binary, extracts a 64-byte Ed25519 signature, computes the Blake3 hash of the remaining ELF bytes, and checks the signature against the bootstrap public key. If the signature doesn't match — if even a single byte has been changed — the binary is rejected. No memory is allocated for it. No pages are mapped. It simply doesn't load.
 
 For each verified module, the kernel creates a full user-space process: a new set of page tables (with the kernel half cloned for the upper address space), user code mapped at `0x400000`, a 64 KB user stack below `0x800000`, and a `SavedContext` on a kernel stack that will be used for context switching. The ELF loader enforces W^X — no memory page is both writable and executable — and rejects binaries with segments that overlap or extend into kernel space.
 

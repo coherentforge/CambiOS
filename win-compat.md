@@ -5,9 +5,9 @@ auto_refresh: forbidden
 authoritative_for: PE loader sandbox, sandboxed Principal model, AI shim translation tiers, Win32 application support phases
 -->
 
-# ArcOS Windows Compatibility Layer — Design Document
+# CambiOS Windows Compatibility Layer — Design Document
 
-This document captures the design for ArcOS's Windows application compatibility layer — a sandboxed execution environment that runs unmodified Windows PE binaries on ArcOS, using AI-assisted API translation at JIT and runtime. It is a living design document, not a specification. Implementation status of any phase or feature lives in [STATUS.md](STATUS.md).
+This document captures the design for CambiOS's Windows application compatibility layer — a sandboxed execution environment that runs unmodified Windows PE binaries on CambiOS, using AI-assisted API translation at JIT and runtime. It is a living design document, not a specification. Implementation status of any phase or feature lives in [STATUS.md](STATUS.md).
 
 For the identity model that governs how sandboxed processes interact with the system, see [identity.md](identity.md).
 For the object store that mediates file access, see [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md).
@@ -16,7 +16,7 @@ For the object store that mediates file access, see [FS-and-ID-design-plan.md](F
 
 ## The Core Claim
 
-ArcOS can run Windows applications without Windows. Not by reimplementing Win32 line-by-line (the Wine approach, 30 years and counting), but by understanding what the application is trying to do and translating that intent to ArcOS primitives — at load time where possible, at runtime where necessary, with AI bridging the gaps that static translation cannot.
+CambiOS can run Windows applications without Windows. Not by reimplementing Win32 line-by-line (the Wine approach, 30 years and counting), but by understanding what the application is trying to do and translating that intent to CambiOS primitives — at load time where possible, at runtime where necessary, with AI bridging the gaps that static translation cannot.
 
 The compatibility layer is not an emulator. It is a translator with a learning curve.
 
@@ -24,9 +24,9 @@ The compatibility layer is not an emulator. It is a translator with a learning c
 
 ## What This Is Not
 
-**It is not a virtual machine.** The application runs natively on ArcOS hardware. No Windows kernel, no hypervisor, no license.
+**It is not a virtual machine.** The application runs natively on CambiOS hardware. No Windows kernel, no hypervisor, no license.
 
-**It is not Wine.** Wine reimplements the Win32 API surface function-by-function. ArcOS's compatibility layer starts with static shims for known APIs but falls back to AI-assisted intent translation for unknown or complex call patterns. The goal is behavioral equivalence, not API-level fidelity.
+**It is not Wine.** Wine reimplements the Win32 API surface function-by-function. CambiOS's compatibility layer starts with static shims for known APIs but falls back to AI-assisted intent translation for unknown or complex call patterns. The goal is behavioral equivalence, not API-level fidelity.
 
 **It is not unrestricted.** A Windows binary is untrusted foreign code. It runs in a sandbox with a constrained Principal, mediated IPC access, and no direct hardware interaction. The zero-trust model applies fully.
 
@@ -36,12 +36,12 @@ The compatibility layer is not an emulator. It is a translator with a learning c
 
 ### Sandboxed Principal
 
-A Windows PE binary cannot carry an ArcOS Ed25519 identity. It receives a **sandboxed Principal** — a synthetic identity generated per-application-instance, scoped to the compatibility sandbox.
+A Windows PE binary cannot carry an CambiOS Ed25519 identity. It receives a **sandboxed Principal** — a synthetic identity generated per-application-instance, scoped to the compatibility sandbox.
 
 ```
 SandboxedPrincipal {
     inner:       Principal,          // Ed25519 keypair, ephemeral or user-bound
-    parent:      Principal,          // the ArcOS user who launched the app
+    parent:      Principal,          // the CambiOS user who launched the app
     permissions: SandboxPolicy,      // what this process may access
     label:       String,             // human-readable: "QuickBooks 2024"
 }
@@ -50,7 +50,7 @@ SandboxedPrincipal {
 The sandboxed Principal:
 - **Cannot impersonate** the parent user's Principal
 - **Cannot access** IPC endpoints unless the sandbox policy explicitly grants it
-- **Cannot touch hardware** — all device access is mediated through ArcOS services
+- **Cannot touch hardware** — all device access is mediated through CambiOS services
 - **Can store objects** in the ObjectStore, but they are tagged with the sandbox Principal as author (the parent user is owner)
 - **Can be revoked** by the parent user at any time — killing the process and invalidating stored capabilities
 
@@ -62,11 +62,11 @@ Windows apps expect a filesystem with drive letters, paths, and ACLs. The compat
 C:\Users\<user>\Documents\  →  ObjectStore query (owner = parent Principal, tag = "documents")
 C:\Program Files\<app>\     →  read-only view of the app's installation objects
 C:\Windows\System32\        →  compatibility layer's DLL shim library
-HKEY_LOCAL_MACHINE\...      →  virtual registry (ArcObject-backed key-value store)
-HKEY_CURRENT_USER\...       →  per-sandbox registry (ArcObject-backed)
+HKEY_LOCAL_MACHINE\...      →  virtual registry (CambiObject-backed key-value store)
+HKEY_CURRENT_USER\...       →  per-sandbox registry (CambiObject-backed)
 ```
 
-File writes from the sandboxed app create ArcObjects with:
+File writes from the sandboxed app create CambiObjects with:
 - **author** = sandboxed Principal (the app created it)
 - **owner** = parent Principal (the user controls it)
 
@@ -85,12 +85,12 @@ Sandboxed processes have no network access by default. The sandbox policy can gr
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    ArcOS Kernel                           │
+│                    CambiOS Kernel                           │
 │  (IPC, scheduler, memory, identity — unchanged)          │
 └──────────┬──────────────────────────────┬────────────────┘
            │ IPC                          │ IPC
 ┌──────────▼──────────┐      ┌────────────▼───────────────┐
-│  win-compat          │      │  ArcOS Native Services     │
+│  win-compat          │      │  CambiOS Native Services     │
 │  (endpoint 20)       │──────│  fs-service (16)           │
 │                      │ IPC  │  key-store (17)            │
 │  Single user-space   │──────│  AI translator (21)        │
@@ -131,7 +131,7 @@ user/
         │   ├── shell32.rs  # file dialogs, shell integration
         │   └── comctl32.rs # common controls (list view, tree view, etc.)
         ├── vfs.rs          # virtual filesystem (drive letters → ObjectStore)
-        ├── registry.rs     # virtual registry (HKLM/HKCU/HKCR → ArcObject KV)
+        ├── registry.rs     # virtual registry (HKLM/HKCU/HKCR → CambiObject KV)
         ├── sandbox.rs      # sandbox policy + SandboxedPrincipal management
         └── thunk32.rs      # 32-bit compat-mode support (heaven's gate stub)
 ```
@@ -145,9 +145,9 @@ The AI translator is the one component that lives outside `win-compat` — it ru
 **API Shim Layer** (`shims/`) — Static implementations of known Win32 API calls. These are pre-built translations:
 - `CreateFileW` → ObjectStore put/get via FS service IPC
 - `ReadFile` / `WriteFile` → IPC read/write to FS service
-- `VirtualAlloc` / `VirtualFree` → ArcOS Allocate/Free syscalls
-- `GetSystemTime` → ArcOS GetTime syscall
-- `MessageBoxW` → ArcOS UI service notification (future)
+- `VirtualAlloc` / `VirtualFree` → CambiOS Allocate/Free syscalls
+- `GetSystemTime` → CambiOS GetTime syscall
+- `MessageBoxW` → CambiOS UI service notification (future)
 - `RegOpenKeyEx` / `RegQueryValueEx` → virtual registry lookup
 
 This is the fast path. Known APIs, known translations, no AI involved.
@@ -156,20 +156,20 @@ This is the fast path. Known APIs, known translations, no AI involved.
 
 1. **JIT translation**: On first encounter of an unknown API call, the translator analyzes the call signature, parameters, and surrounding call context. It generates a translation shim and caches it for future calls. The shim is validated (sandboxed, no privilege escalation) before installation.
 
-2. **Runtime behavioral translation**: For complex patterns — COM object instantiation chains, OLE automation sequences, multi-step dialog flows — the translator observes the pattern and maps it to ArcOS-native behavior. Example: a COM `QueryInterface` → `QueryInterface` → method call chain that implements "save file with format options" gets recognized and translated to a single FS service interaction.
+2. **Runtime behavioral translation**: For complex patterns — COM object instantiation chains, OLE automation sequences, multi-step dialog flows — the translator observes the pattern and maps it to CambiOS-native behavior. Example: a COM `QueryInterface` → `QueryInterface` → method call chain that implements "save file with format options" gets recognized and translated to a single FS service interaction.
 
-3. **Learning**: Translation shims that work correctly are persisted to the ObjectStore (signed by the compatibility service's Principal). Over time, the shim library grows. Shims can be shared across ArcOS instances via the SSB bridge — a translation that works for QuickBooks on one machine works on all machines.
+3. **Learning**: Translation shims that work correctly are persisted to the ObjectStore (signed by the compatibility service's Principal). Over time, the shim library grows. Shims can be shared across CambiOS instances via the SSB bridge — a translation that works for QuickBooks on one machine works on all machines.
 
-**Virtual Filesystem** — Maps Windows path conventions to ObjectStore queries. Maintains a path-to-hash index per sandbox. Handles drive letters, UNC paths, and Windows path separators. Translates Windows file attributes and timestamps to ArcObject metadata.
+**Virtual Filesystem** — Maps Windows path conventions to ObjectStore queries. Maintains a path-to-hash index per sandbox. Handles drive letters, UNC paths, and Windows path separators. Translates Windows file attributes and timestamps to CambiObject metadata.
 
-**Virtual Registry** — Windows applications depend heavily on the registry for configuration, COM class registration, file associations, and license state. The virtual registry is an ArcObject-backed key-value store, scoped per-sandbox. Registry writes from one sandboxed app are invisible to others (isolation).
+**Virtual Registry** — Windows applications depend heavily on the registry for configuration, COM class registration, file associations, and license state. The virtual registry is an CambiObject-backed key-value store, scoped per-sandbox. Registry writes from one sandboxed app are invisible to others (isolation).
 
 **Sandbox Policy** — Declarative policy attached to each sandboxed Principal:
 ```
 SandboxPolicy {
     fs_access:     Vec<FsGrant>,        // which ObjectStore paths/tags are visible
     net_access:    Vec<NetGrant>,        // which endpoints are reachable
-    ipc_endpoints: Vec<EndpointGrant>,   // which ArcOS IPC endpoints are callable
+    ipc_endpoints: Vec<EndpointGrant>,   // which CambiOS IPC endpoints are callable
     resource_limits: ResourceLimits,     // memory, CPU time, object count
     clipboard:     bool,                 // can read/write host clipboard
     ui:            bool,                 // can create windows/dialogs
@@ -182,7 +182,7 @@ SandboxPolicy {
 
 Windows binaries don't carry ARCSIG signatures and cannot pass through the SignedBinaryVerifier. Instead, the compatibility layer uses a separate trust chain:
 
-1. **Authenticode verification** — if the PE binary has a valid Microsoft Authenticode signature, verify it. This provides provenance (the binary came from a known publisher) but not ArcOS-level trust.
+1. **Authenticode verification** — if the PE binary has a valid Microsoft Authenticode signature, verify it. This provides provenance (the binary came from a known publisher) but not CambiOS-level trust.
 
 2. **User consent** — the parent Principal must explicitly authorize execution. The first launch of a new PE binary presents a consent dialog showing the publisher (if Authenticode-signed) or "unknown publisher."
 
@@ -206,7 +206,7 @@ This is where the AI has a structural advantage over static reimplementation: it
 
 ### Translation Tiers
 
-**Tier 0 — Static shims (no AI):** Known Win32 APIs with direct ArcOS equivalents. Deterministic, fast, no model inference. This covers the bulk of simple applications.
+**Tier 0 — Static shims (no AI):** Known Win32 APIs with direct CambiOS equivalents. Deterministic, fast, no model inference. This covers the bulk of simple applications.
 
 **Tier 1 — JIT shims (AI at first call):** Unknown or rare APIs. The AI analyzes the call once, generates a shim, caches it. Subsequent calls use the cached shim with no inference overhead.
 
@@ -220,11 +220,11 @@ Every AI-generated shim must pass validation before installation:
 - **No privilege escalation** — the shim cannot grant capabilities the sandbox policy doesn't allow
 - **No sandbox escape** — the shim cannot access memory, IPC endpoints, or objects outside the sandbox
 - **Deterministic after caching** — once validated and cached, the shim behaves identically on every invocation
-- **Auditable** — shims are ArcObjects with the AI translator as author, signed and content-hashed
+- **Auditable** — shims are CambiObjects with the AI translator as author, signed and content-hashed
 
 ### Model Placement
 
-The AI model powering the translator does NOT run inside the sandboxed process. It runs as a separate ArcOS service with its own Principal, communicating with the compatibility service over IPC. This means:
+The AI model powering the translator does NOT run inside the sandboxed process. It runs as a separate CambiOS service with its own Principal, communicating with the compatibility service over IPC. This means:
 - The model's weights and state are protected from the sandboxed app
 - The sandboxed app cannot influence the model's behavior (no prompt injection via API call parameters)
 - Model updates don't require restarting sandboxed apps
@@ -268,11 +268,11 @@ The AI model powering the translator does NOT run inside the sandboxed process. 
 
 **Target apps:** LabVIEW, instrument control software
 
-**Additional requirements:** USB device passthrough, VISA/GPIB protocol translation. This tier depends on ArcOS having a mature USB stack and device driver model.
+**Additional requirements:** USB device passthrough, VISA/GPIB protocol translation. This tier depends on CambiOS having a mature USB stack and device driver model.
 
 ---
 
-## Interaction with Existing ArcOS Architecture
+## Interaction with Existing CambiOS Architecture
 
 ### Kernel Changes Required
 
@@ -291,17 +291,17 @@ All file I/O from sandboxed apps flows through the compatibility service → FS 
 
 ### Identity Integration
 
-The sandboxed Principal is created by the compatibility service (which holds the parent user's delegation). The `BindPrincipal` syscall is used to assign the sandboxed identity. The existing `GetPrincipal` / `RecvMsg` identity-aware IPC works unchanged — ArcOS services receiving requests from a sandboxed app see the sandboxed Principal and can enforce policy accordingly.
+The sandboxed Principal is created by the compatibility service (which holds the parent user's delegation). The `BindPrincipal` syscall is used to assign the sandboxed identity. The existing `GetPrincipal` / `RecvMsg` identity-aware IPC works unchanged — CambiOS services receiving requests from a sandboxed app see the sandboxed Principal and can enforce policy accordingly.
 
 ---
 
 ## Settled Decisions (Compatibility Layer)
 
-**32-bit PE support on x86_64 — yes, via CPU compatibility mode.** The microkernel's IPC architecture makes this dramatically simpler than Windows WoW64. In a monolithic kernel, WoW64 must thunk ~2000 syscalls between 32-bit and 64-bit struct layouts. In ArcOS, the 32-bit PE process communicates with the 64-bit compatibility service via IPC messages (raw bytes — no pointer-width dependency). The IPC boundary does the thunking for free. Kernel changes: two new GDT entries (32-bit compat-mode code/data segments, L=0 D=1), ~4 lines in `gdt.rs`. User-space: a "heaven's gate" thunk (~20 instructions) in the shim DLLs does far-jump to 64-bit mode for ArcOS syscalls. Process address space already fits in the lower 4GB (user code at 0x400000, stack at 0x800000). **AArch64 32-bit x86 PE requires full binary translation — that is part of the larger "x86-on-ARM" problem, not addressed here.**
+**32-bit PE support on x86_64 — yes, via CPU compatibility mode.** The microkernel's IPC architecture makes this dramatically simpler than Windows WoW64. In a monolithic kernel, WoW64 must thunk ~2000 syscalls between 32-bit and 64-bit struct layouts. In CambiOS, the 32-bit PE process communicates with the 64-bit compatibility service via IPC messages (raw bytes — no pointer-width dependency). The IPC boundary does the thunking for free. Kernel changes: two new GDT entries (32-bit compat-mode code/data segments, L=0 D=1), ~4 lines in `gdt.rs`. User-space: a "heaven's gate" thunk (~20 instructions) in the shim DLLs does far-jump to 64-bit mode for CambiOS syscalls. Process address space already fits in the lower 4GB (user code at 0x400000, stack at 0x800000). **AArch64 32-bit x86 PE requires full binary translation — that is part of the larger "x86-on-ARM" problem, not addressed here.**
 
 **Installer UX — "download .exe, it works."** The user experience is: download a Windows installer (.exe or .msi), double-click it, it installs and runs. The installer executes inside the sandbox like any other PE binary. All side effects are captured:
 - File creation → ObjectStore objects (virtual filesystem)
-- Registry writes → virtual registry (ArcObject-backed KV store)
+- Registry writes → virtual registry (CambiObject-backed KV store)
 - COM registration → virtual registry entries under HKCR
 - Service registration → sandboxed background tasks
 - Shortcut creation → sandbox manifest metadata
@@ -326,7 +326,7 @@ MSI support requires a minimal Windows Installer engine (MSI is a transactional 
 
 3. **AI model requirements** — what size/capability of model is needed for effective JIT translation? Can a small, specialized model handle Tier 1 (single API calls) while a larger model handles Tier 2 (behavioral patterns)? What are the latency requirements — a 100ms JIT shim generation is fine for a first call, but runtime behavioral translation needs to be faster.
 
-4. **Shared shim distribution** — how do ArcOS instances share validated translation shims? The SSB bridge is the natural transport, but we need a discovery mechanism (how does an instance find shims for QuickBooks?) and a trust model (whose shims do you trust?).
+4. **Shared shim distribution** — how do CambiOS instances share validated translation shims? The SSB bridge is the natural transport, but we need a discovery mechanism (how does an instance find shims for QuickBooks?) and a trust model (whose shims do you trust?).
 
 5. **x86-on-AArch64** — running x86 PE binaries on AArch64 hardware requires binary translation (Apple Rosetta-style). This is a separate, large effort. Initial compatibility layer targets x86_64 native only.
 
@@ -334,7 +334,7 @@ MSI support requires a minimal Windows Installer engine (MSI is a transactional 
 
 ## Non-Goals
 
-- **Running Windows drivers.** Drivers require kernel-level access that the sandbox cannot provide. Hardware support comes from native ArcOS drivers.
+- **Running Windows drivers.** Drivers require kernel-level access that the sandbox cannot provide. Hardware support comes from native CambiOS drivers.
 - **Running Windows services.** Background services that expect SCM (Service Control Manager) integration are out of scope for Phase 1.
 - **DRM/anti-cheat compatibility.** Kernel-level DRM and anti-cheat systems (Denuvo kernel mode, Vanguard, EAC) require ring 0 access. These will not work and we will not try to make them work.
 - **Pixel-perfect UI rendering.** The goal is functional equivalence, not visual identity with Windows. A "Save As" dialog should work correctly; it doesn't need to look exactly like the Windows 11 version.
@@ -352,7 +352,7 @@ This is preliminary. The actual implementation plan will be developed as the pre
 - Import table resolution against curated shim set
 - Shim DLLs: `ntdll` (heap, TLS, structured exception handling), `kernel32` (file I/O, memory, threading basics, version queries)
 - Sandboxed Principal creation and binding
-- Virtual registry (HKCU/HKLM/HKCR, ArcObject-backed KV store)
+- Virtual registry (HKCU/HKLM/HKCR, CambiObject-backed KV store)
 - Virtual filesystem (drive letter mapping, path translation, `C:\Windows\System32\` → shim library)
 - MSI engine (minimal: component/feature tables, file extraction, registry actions, custom action execution)
 - NSIS/Inno Setup support (these are PE executables — they run naturally once the shim layer works)
@@ -362,7 +362,7 @@ This is preliminary. The actual implementation plan will be developed as the pre
 
 ### Phase 1 — Business Application Support
 - Expand shim coverage: `user32` (windowing, messages), `gdi32` (2D rendering), `advapi32` (registry, security tokens), `ole32` (basic COM), `shell32` (file dialogs, shell integration), `comctl32`/`comdlg32` (common controls/dialogs)
-- Printing pipeline (translate Win32 GDI printing to ArcOS print service)
+- Printing pipeline (translate Win32 GDI printing to CambiOS print service)
 - .NET Framework hosting (CoreCLR or Mono, in-sandbox) — many business apps are .NET WinForms
 - AI translator service (Tier 0 + Tier 1 — static + JIT shims)
 - **Validation target:** QuickBooks Desktop installs from its .exe installer, opens a company file, generates a report, prints it

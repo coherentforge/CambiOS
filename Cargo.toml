@@ -9,7 +9,7 @@ exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user
 name = "arcos"
 version = "0.1.0"
 edition = "2021"
-authors = ["ArcOS Development Team"]
+authors = ["CambiOS Development Team"]
 
 [dependencies]
 bitflags = "2.3"
@@ -31,7 +31,7 @@ strip = false
 opt-level = 0
 
 [[bin]]
-name = "arcos_microkernel"
+name = "cambios_microkernel"
 path = "src/microkernel/main.rs"
 
 [lib]

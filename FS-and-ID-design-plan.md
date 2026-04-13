@@ -6,7 +6,7 @@ last_synced_to_code: N/A (intent doc, not status)
 authoritative_for: phase intent, settled architectural decisions for identity + storage
 -->
 
-# ArcOS Identity + Storage Architecture — Design Plan
+# CambiOS Identity + Storage Architecture — Design Plan
 
 > **Intent doc.** This file captures *what we are building and why*, in dependency order. It does **not** track current status — that lives in [STATUS.md § Phase markers](STATUS.md#phase-markers). It does **not** carry implementation details for how each phase looks in code — that lives in the code itself, in the per-subsystem reference docs (e.g. [SECURITY.md](SECURITY.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md)), and in the relevant ADRs.
 >
@@ -14,12 +14,12 @@ authoritative_for: phase intent, settled architectural decisions for identity + 
 
 ## Context
 
-ArcOS has a working microkernel (preemptive multitasking, SMP, ring-3 user tasks, IPC + capabilities, zero-trust interceptor, Limine module loading). The decisions on identity and storage are philosophically and practically the most consequential architectural decisions in the project so far. Because it defines what a "file" means, and respects sovereignty at the user and data object level, this decision propagates into every object the system touches.
+CambiOS has a working microkernel (preemptive multitasking, SMP, ring-3 user tasks, IPC + capabilities, zero-trust interceptor, Limine module loading). The decisions on identity and storage are philosophically and practically the most consequential architectural decisions in the project so far. Because it defines what a "file" means, and respects sovereignty at the user and data object level, this decision propagates into every object the system touches.
 
 This plan reflects design decisions made through extended discussion. It is a working document and subject to change. The authoritative design documents are:
 
-- **[identity.md](identity.md)** — what identity *is* in ArcOS (Ed25519 Principals, biometric commitment, recovery model, did:key)
-- **[ArcOS.md](ArcOS.md)** — source-of-truth architecture document that constrains every plan including this one
+- **[identity.md](identity.md)** — what identity *is* in CambiOS (Ed25519 Principals, biometric commitment, recovery model, did:key)
+- **[CambiOS.md](CambiOS.md)** — source-of-truth architecture document that constrains every plan including this one
 
 This plan is the implementation sequencing that flows from those two documents.
 
@@ -29,9 +29,9 @@ See something off? Share, please.
 
 **Is it robust and secure? Does it keep the protocol open, or does it tie behavior to a specific implementation?** Every architectural decision should be evaluated against this.
 
-**ArcOS is a protocol as much as an OS.** The ArcOS microkernel enables secure hardware access to a system of open protocols. The identity and storage layers define a protocol specification *as* the implementation. Any system that implements the `ObjectStore` trait (content-addressed signed objects with author/owner), uses Ed25519 Principals for identity, and speaks SSB for inter-instance communication is a compatible peer — regardless of what kernel, language, or hardware it runs on.
+**CambiOS is a protocol as much as an OS.** The CambiOS microkernel enables secure hardware access to a system of open protocols. The identity and storage layers define a protocol specification *as* the implementation. Any system that implements the `ObjectStore` trait (content-addressed signed objects with author/owner), uses Ed25519 Principals for identity, and speaks SSB for inter-instance communication is a compatible peer — regardless of what kernel, language, or hardware it runs on.
 
-The microkernel is the reference implementation: by design the most security-hardened, sovereignty-respecting version of the protocol, but not the only valid one. Forks are extensions of the network, not threats to it. This is a direct consequence of "no attestation, no gatekeeper" ([identity.md](identity.md)): by not requiring instance attestation, ArcOS is defined by its protocol, not its binary.
+The microkernel is the reference implementation: by design the most security-hardened, sovereignty-respecting version of the protocol, but not the only valid one. Forks are extensions of the network, not threats to it. This is a direct consequence of "no attestation, no gatekeeper" ([identity.md](identity.md)): by not requiring instance attestation, CambiOS is defined by its protocol, not its binary.
 
 ## Settled Decisions
 
@@ -39,7 +39,7 @@ These are the load-bearing decisions for the identity and storage layers. They c
 
 **Every file has an owner AND an author** — two distinct roles at the object level. Author is the Ed25519 public key of whoever created the object — immutable, set at creation, never changes. Owner is the Ed25519 public key of whoever currently controls the object — transferable via signed ownership transfer objects. The owner signs the object (tying content to controller). Example: an employee creates a document at work — they are the author, but the employer is the owner. An independent contractor creates a document — they are both author and owner unless a contract transfers ownership. Files are signed artifacts, not bytes at a path.
 
-**Content-addressed object store** — files are ArcObjects identified by Blake3 content hash. Names/paths are a separate layer (a "directory" is itself an ArcObject mapping names to hashes). This is the native storage model.
+**Content-addressed object store** — files are CambiObjects identified by Blake3 content hash. Names/paths are a separate layer (a "directory" is itself an CambiObject mapping names to hashes). This is the native storage model.
 
 **ObjectStore trait as the VFS abstraction** — not a traditional block-device VFS. Local storage, sovereign cloud, P2P logs, and RAM are all backing store implementations behind the same trait. The seams are in the right place from day one.
 
@@ -59,11 +59,11 @@ These are the load-bearing decisions for the identity and storage layers. They c
 
 **Signed modules** — every user-space module (ELF binary) must be signed by a trusted Principal before the kernel will execute it. Without this, a malicious actor could craft a module that operates within the architecture's constraints (valid ELF, passes W^X checks, uses correct syscall ABI) but performs harmful actions. The existing `BinaryVerifier` gate in the loader is the enforcement point — it has been extended to require a valid signature over the ELF content. The signing key's Principal must be in a trusted set (initially just the bootstrap Principal; later, a configurable trust anchor list). Per [ADR-004](docs/adr/004-cryptographic-integrity.md).
 
-**Ownership transfer model** — ownership of an `ArcObject` is transferred via a signed `OwnershipTransfer` object: the current owner signs a statement delegating ownership to a new Principal. The transfer object itself is an `ArcObject` (content-addressed, signed, stored in the ObjectStore). This creates an auditable chain of custody. The original author field remains immutable — authorship is historical fact, ownership is current control.
+**Ownership transfer model** — ownership of an `CambiObject` is transferred via a signed `OwnershipTransfer` object: the current owner signs a statement delegating ownership to a new Principal. The transfer object itself is an `CambiObject` (content-addressed, signed, stored in the ObjectStore). This creates an auditable chain of custody. The original author field remains immutable — authorship is historical fact, ownership is current control.
 
-**Connected by consent, no attestation required** — each ArcOS instance generates its own bootstrap keypair independently. No shared root key, no instance attestation, no gatekeeper. The system is not isolated or monopolized — anyone can build a compatible instance that speaks the same protocol (`ObjectStore` trait + SSB bridge + Ed25519 signatures). Connection is bilateral consent: when you consent to connect with another Principal, they can send objects directly to your `ObjectStore` — not via email or intermediary, but Principal-to-Principal transfer over the SSB bridge, landing in sovereign storage you control. Consent has concrete mechanics: their Principal is added to your trust list with specific `ObjectRights` (send, but maybe not delete or modify). The social UI surfaces incoming objects. You choose whether to accept ownership transfer or hold a copy they still own. The virtual world mirrors the real one — there are people you don't want to connect with, and the architecture respects that by making connection opt-in with no default trust.
+**Connected by consent, no attestation required** — each CambiOS instance generates its own bootstrap keypair independently. No shared root key, no instance attestation, no gatekeeper. The system is not isolated or monopolized — anyone can build a compatible instance that speaks the same protocol (`ObjectStore` trait + SSB bridge + Ed25519 signatures). Connection is bilateral consent: when you consent to connect with another Principal, they can send objects directly to your `ObjectStore` — not via email or intermediary, but Principal-to-Principal transfer over the SSB bridge, landing in sovereign storage you control. Consent has concrete mechanics: their Principal is added to your trust list with specific `ObjectRights` (send, but maybe not delete or modify). The social UI surfaces incoming objects. You choose whether to accept ownership transfer or hold a copy they still own. The virtual world mirrors the real one — there are people you don't want to connect with, and the architecture respects that by making connection opt-in with no default trust.
 
-**Copy resistance** — ArcOS objects are persistent and unique. Because every object is content-addressed and signed by its owner, creating a "copy" means creating a new object with a new owner signature — the copy is a distinct object with its own identity, not a duplicate. This makes unauthorized copying detectable (the original's lineage doesn't include the copy) and the copy cannot claim to be the original.
+**Copy resistance** — CambiOS objects are persistent and unique. Because every object is content-addressed and signed by its owner, creating a "copy" means creating a new object with a new owner signature — the copy is a distinct object with its own identity, not a duplicate. This makes unauthorized copying detectable (the original's lineage doesn't include the copy) and the copy cannot claim to be the original.
 
 ## Phase Intent (in dependency order)
 
@@ -77,9 +77,9 @@ For *implementation details* of each phase (which structs, which files, which sy
 
 **Goal:** Make the storage object model coherent. Every IPC message carries an unforgeable sender identity. Every stored object has an author and an owner. A filesystem service can exist in user-space and enforce ownership without trusting its callers' self-claimed identities.
 
-**Why this is the foundation:** Without `sender_principal` stamping in the kernel, ownership enforcement has to rely on user-space trust — which means it has no foundation at all. Without the `ObjectStore` trait, every storage backend reinvents the same access model. Phase 0 establishes both at minimal scope: identity primitives in the IPC layer, ArcObject as the storage unit, RAM-backed implementation that proves the trait works.
+**Why this is the foundation:** Without `sender_principal` stamping in the kernel, ownership enforcement has to rely on user-space trust — which means it has no foundation at all. Without the `ObjectStore` trait, every storage backend reinvents the same access model. Phase 0 establishes both at minimal scope: identity primitives in the IPC layer, CambiObject as the storage unit, RAM-backed implementation that proves the trait works.
 
-**Scope:** kernel `Principal` type, `sender_principal` on IPC `Message`, `BindPrincipal`/`GetPrincipal` syscalls, `ArcObject` data structure, `ObjectStore` trait, RAM-backed implementation, FS service as user-space ELF on a dedicated IPC endpoint.
+**Scope:** kernel `Principal` type, `sender_principal` on IPC `Message`, `BindPrincipal`/`GetPrincipal` syscalls, `CambiObject` data structure, `ObjectStore` trait, RAM-backed implementation, FS service as user-space ELF on a dedicated IPC endpoint.
 
 **Out of scope:** real cryptography (Phase 0 uses placeholder hashing and unsigned objects), persistent storage (RAM only), key management (private key in a kernel static), signed ELF loading (loader still passes any structurally valid binary).
 
@@ -131,7 +131,7 @@ For *implementation details* of each phase (which structs, which files, which sy
 
 **Goal:** Demonstrate that a complete network stack can run in user-space on top of the driver from Phase 2A, with no kernel networking code. Proves the architectural claim that "networking is a user-space service, not a kernel subsystem."
 
-**Why this matters:** Every conventional OS has its network stack in the kernel, and every conventional OS has been bitten by network-stack vulnerabilities that escalated to root. ArcOS puts the entire stack in ring 3 from day one. A bug in UDP parsing crashes a user-space service; it cannot become a kernel exploit.
+**Why this matters:** Every conventional OS has its network stack in the kernel, and every conventional OS has been bitten by network-stack vulnerabilities that escalated to root. CambiOS puts the entire stack in ring 3 from day one. A bug in UDP parsing crashes a user-space service; it cannot become a kernel exploit.
 
 **Scope:** `user/udp-stack/` as an ARP + IPv4 + UDP service over the virtio-net IPC interface, NTP demo as a working end-to-end vertical slice, hardcoded SLIRP configuration as the initial network state (DHCP comes later, in the v1 roadmap).
 
@@ -159,17 +159,17 @@ For *implementation details* of each phase (which structs, which files, which sy
 
 **Goal:** Replace the RAM-backed `ObjectStore` with a disk-backed implementation. Once Phase 4 is in, content-addressed objects survive reboot, and the v1 milestone of "interactive, network-capable, identity-rooted OS running on real hardware with persistent storage" is achievable.
 
-**Scope:** Virtio-blk driver in user-space (same pattern as virtio-net, on Phase 3's channel substrate for bulk data), disk-backed `ObjectStore` implementation behind the same trait Phase 0 defined, ArcObject CLI in the shell that exercises the storage path end-to-end (`arcobj put`, `arcobj get`, `arcobj list`, `arcobj delete`).
+**Scope:** Virtio-blk driver in user-space (same pattern as virtio-net, on Phase 3's channel substrate for bulk data), disk-backed `ObjectStore` implementation behind the same trait Phase 0 defined, CambiObject CLI in the shell that exercises the storage path end-to-end (`arcobj put`, `arcobj get`, `arcobj list`, `arcobj delete`).
 
 **Out of scope:** VFS / mount infrastructure (post-v1; the FS service stays a flat object gateway in Phase 4), filesystem snapshots, garbage collection of unreferenced objects (deferred until objects accumulate enough to make GC matter), encryption at rest (the ObjectStore stores already-signed objects; encryption is a higher-layer concern).
 
 ### Phase 5 — Identity-routed networking
 
-**Goal:** Bridge from IP/DNS-based addressing to Principal-based addressing. Once Phase 5 is in, two ArcOS instances can find and authenticate each other without DNS, without IP assignment, and without trusting any infrastructure beyond the cryptographic primitives ArcOS already has.
+**Goal:** Bridge from IP/DNS-based addressing to Principal-based addressing. Once Phase 5 is in, two CambiOS instances can find and authenticate each other without DNS, without IP assignment, and without trusting any infrastructure beyond the cryptographic primitives CambiOS already has.
 
 **Scope:** Yggdrasil-style mesh networking, Ed25519 Principal → IPv6 mapping (Yggdrasil's `200::/7` address space derives directly from a 32-byte public key), X25519 key exchange derived from Ed25519 keys, Noise protocol handshake, spanning-tree routing, peer-to-peer discovery without bootstrap servers (or with minimal user-controlled bootstrap nodes).
 
-**Why this comes after persistent storage:** Identity-routed networking is the interface to the social layer ([identity.md](identity.md) § "Social Attestation"). The social layer wants to write attestations as `ArcObject`s in the local store. Without persistent storage, the social layer is amnesiac across reboots, which defeats the point of an attestation log.
+**Why this comes after persistent storage:** Identity-routed networking is the interface to the social layer ([identity.md](identity.md) § "Social Attestation"). The social layer wants to write attestations as `CambiObject`s in the local store. Without persistent storage, the social layer is amnesiac across reboots, which defeats the point of an attestation log.
 
 ### Phase 6 — Biometric commitment + key recovery
 
@@ -181,7 +181,7 @@ For *implementation details* of each phase (which structs, which files, which sy
 
 ### Phase 7 — SSB bridge
 
-**Goal:** Cross-instance identity attestation and capability grants over append-only logs. Once Phase 7 is in, ArcOS instances form a federated network where identities and trust relationships propagate through signed log replication, not through any central directory.
+**Goal:** Cross-instance identity attestation and capability grants over append-only logs. Once Phase 7 is in, CambiOS instances form a federated network where identities and trust relationships propagate through signed log replication, not through any central directory.
 
 **Scope per [identity.md](identity.md):** SSB protocol implementation (or tinySSB for constrained links), bridge service that translates between IPC capabilities and SSB log entries, eventually-consistent revocation via signed revocation objects in social feeds, progressive ML-DSA signature sync (Ed25519 first, ML-DSA when bandwidth allows).
 
@@ -194,8 +194,8 @@ Each phase has its own verification gate. The gates are listed in [STATUS.md § 
 - `sender_principal` is set by the kernel only, never by sender code
 - `BindPrincipal` syscall is restricted to the bootstrap Principal
 - All new identity/storage code is arch-portable (no `#[cfg(target_arch)]` in `src/fs/` or identity-related IPC changes)
-- `ArcObject.author` is immutable after creation — no API path allows modification
-- `ArcObject.owner` defaults to author at creation — creator is controller unless explicitly transferred
+- `CambiObject.author` is immutable after creation — no API path allows modification
+- `CambiObject.owner` defaults to author at creation — creator is controller unless explicitly transferred
 - Ownership transfer requires the current owner's signature (enforced at the ObjectStore level once cryptography is in)
 - Lock ordering is maintained: `OBJECT_STORE` is at position 8 (highest-numbered system lock), see [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md)
 
@@ -203,7 +203,7 @@ These invariants survive across phases. New phases may add new invariants but ca
 
 ## Cross-references
 
-- **[ArcOS.md](ArcOS.md)** — source-of-truth architecture document
+- **[CambiOS.md](CambiOS.md)** — source-of-truth architecture document
 - **[identity.md](identity.md)** — identity architecture, key lifecycle, biological model
 - **[STATUS.md](STATUS.md)** — current implementation status of every phase and subsystem
 - **[ADR-003](docs/adr/003-content-addressed-storage-and-identity.md)** — Phase 0 design rationale

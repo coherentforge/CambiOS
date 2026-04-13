@@ -1,18 +1,18 @@
-# ArcOS Developer Experience
+# CambiOS Developer Experience
 
 ## Thesis
 
-ArcOS's strength is architectural: services communicate via IPC, capabilities express permissions, everything is content-addressed and signed. But architecture alone doesn't attract developers. *Experience* does.
+CambiOS's strength is architectural: services communicate via IPC, capabilities express permissions, everything is content-addressed and signed. But architecture alone doesn't attract developers. *Experience* does.
 
-**Decentralization should feel like the natural, easy way to build.** The complexity disappears into libraries, and building on ArcOS feels like idiomatic Rust — not a foreign platform.
+**Decentralization should feel like the natural, easy way to build.** The complexity disappears into libraries, and building on CambiOS feels like idiomatic Rust — not a foreign platform.
 
-The values (privacy, sovereignty, auditability) come for free. Developers choose ArcOS because building here is productive. That's how you win.
+The values (privacy, sovereignty, auditability) come for free. Developers choose CambiOS because building here is productive. That's how you win.
 
 ---
 
 ## Principles
 
-1. **Idiomatic Rust.** No custom toolchains, no exotic build systems. `cargo build`, `cargo test`, standard crate ecosystem. ArcOS services are Rust crates that happen to target ArcOS.
+1. **Idiomatic Rust.** No custom toolchains, no exotic build systems. `cargo build`, `cargo test`, standard crate ecosystem. CambiOS services are Rust crates that happen to target CambiOS.
 
 2. **Progressive disclosure.** A hello-world service is 15 lines. Capabilities, signing, and ACLs appear when you need them — not before.
 
@@ -233,9 +233,9 @@ impl core::fmt::Display for ArcosError {
 
 Not reference material. Guidance.
 
-- **"Your First ArcOS Service"** — tutorial that builds a working service in 15 minutes
+- **"Your First CambiOS Service"** — tutorial that builds a working service in 15 minutes
 - **"Capabilities Explained"** — what they are, why they matter, how to use them
-- **"Content-Addressed Storage Patterns"** — design patterns with ArcObjects
+- **"Content-Addressed Storage Patterns"** — design patterns with CambiObjects
 - **"IPC Cookbook"** — request/response, pub/sub, streaming, error handling
 - **Rustdoc on everything** — every public type and function documented with examples
 
@@ -274,7 +274,7 @@ mod tests {
 
 ## Layer 4: Async Runtime (Future Work)
 
-Modern Rust developers expect async. But async on ArcOS requires a custom executor — there is no epoll, no threads in the traditional sense, no `std::thread::spawn`.
+Modern Rust developers expect async. But async on CambiOS requires a custom executor — there is no epoll, no threads in the traditional sense, no `std::thread::spawn`.
 
 **The path:**
 1. Build a minimal single-threaded executor around IPC recv (the natural "await point")
@@ -290,7 +290,7 @@ async fn handle_request(hash: [u8; 32]) -> Result<Vec<u8>> {
 }
 ```
 
-This is real work — a custom `no_std` async runtime built on ArcOS primitives. It is explicitly **not** tokio (which requires `std`, OS threads, and epoll/kqueue). It would be a purpose-built executor, similar in spirit to `embassy` (embedded async Rust).
+This is real work — a custom `no_std` async runtime built on CambiOS primitives. It is explicitly **not** tokio (which requires `std`, OS threads, and epoll/kqueue). It would be a purpose-built executor, similar in spirit to `embassy` (embedded async Rust).
 
 **Prerequisites:** Layers 1-3 stable. Understanding of which syscalls should be async-friendly. Possibly kernel-side changes to support non-blocking recv.
 
@@ -319,7 +319,7 @@ Capability declarations are auditable — users see what a service needs before 
 
 ### Signed Distribution
 
-ArcOS already has signed ELF loading (Ed25519 ARCSIG trailer). Extend this to distribution:
+CambiOS already has signed ELF loading (Ed25519 ARCSIG trailer). Extend this to distribution:
 
 - Services are published as signed ELF binaries
 - Author's Principal is verifiable
@@ -327,10 +327,10 @@ ArcOS already has signed ELF loading (Ed25519 ARCSIG trailer). Extend this to di
 
 ### Registry (Long-Term)
 
-A crate registry for ArcOS services. Leverages the existing Rust/Cargo ecosystem:
+A crate registry for CambiOS services. Leverages the existing Rust/Cargo ecosystem:
 
 - Services are published as standard Rust crates
-- `cargo install` with an ArcOS target
+- `cargo install` with an CambiOS target
 - Registry tracks capability requirements, author identity, audit status
 
 **Prerequisites:** Stable service API. Real-world services beyond fs-service and key-store.
