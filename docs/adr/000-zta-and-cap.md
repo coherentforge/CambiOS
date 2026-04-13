@@ -211,6 +211,12 @@ The remaining open item not yet captured in its own ADR:
 
 **Cryptographic capabilities.** Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked CambiOS nodes without a central authority. Only relevant once mesh networking lands.
 
+## Divergence
+
+**Identity gate (2026-04-13).** The original ADR described capabilities as the enforcement mechanism but did not mandate that a process *have an identity* before participating in the capability system. Implementation adds a stronger requirement: the syscall dispatcher now gates all capability-bearing, IPC, memory, and device syscalls behind a non-zero Principal check. Unidentified processes can only Exit, Yield, GetPid, GetTime, Print, and GetPrincipal. This ensures that identity is load-bearing — a kernel fork that strips Principal stamping renders every userspace service inert (via `recv_verified` in libsys), not merely "less secure." The design motivation is licensing protection: the security model must be structural, not a peelable layer.
+
+**Unsigned object storage removed (2026-04-13).** fs-service no longer falls back to unsigned `ObjPut` when the key-store is unavailable. All object storage now requires a valid Ed25519 signature via `ObjPutSigned`. If the key-store is degraded, storage operations are denied rather than permitted without cryptographic integrity.
+
 ## References
 
 - Dennis, J.B. & Van Horn, E.C. "Programming Semantics for Multiprogrammed Computations" (1966) — origin of capability-based security

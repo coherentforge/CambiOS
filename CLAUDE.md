@@ -57,7 +57,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (362 tests, all passing)
+# Run tests (384 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -229,7 +229,7 @@ user/
 ├── user-aarch64.ld           # AArch64 user-space linker script
 ├── hello.S                   # Test module (prints 3x, exits) — boot module
 ├── libsys/                   # Shared syscall wrapper library — only unsafe user-space crate
-│   └── src/lib.rs            # Safe wrappers over x86_64 SYSCALL and AArch64 SVC
+│   └── src/lib.rs            # Safe wrappers over x86_64 SYSCALL and AArch64 SVC; Principal, VerifiedMessage, recv_verified (load-bearing identity types)
 ├── fs-service/               # Filesystem service — boot module, IPC endpoint 16
 │   └── src/main.rs           # ObjectStore gateway (sender_principal enforcement)
 ├── key-store-service/        # Key store service (Ed25519 signing) — boot module, IPC endpoint 17
@@ -509,7 +509,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 362 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c), 44 audit infrastructure tests (Phase 3.3: 14 staging buffer + 18 event types + 12 ring/drain)
+- 384 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c), 44 audit infrastructure tests (Phase 3.3: 14 staging buffer + 18 event types + 12 ring/drain), 4 identity gate tests (exempt set validation, coverage, minimality)
 
 ## Post-Change Review Protocol
 

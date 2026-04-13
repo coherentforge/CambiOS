@@ -204,6 +204,33 @@ pub enum SyscallNumber {
 }
 
 impl SyscallNumber {
+    /// Returns `true` for syscalls that require the caller to have a bound,
+    /// non-zero Principal. Unidentified processes may only use the exempt
+    /// set: Exit, Yield, GetPid, GetTime, Print, GetPrincipal.
+    ///
+    /// This is the kernel-side half of the "identity is load-bearing" invariant.
+    /// The userspace half is `recv_verified()` in libsys, which rejects
+    /// anonymous IPC senders. Together they ensure a stripped-security kernel
+    /// fork cannot run the standard userspace ecosystem.
+    pub const fn requires_identity(&self) -> bool {
+        matches!(self,
+            Self::Write | Self::Read | Self::RecvMsg |
+            Self::Allocate | Self::Free |
+            Self::RegisterEndpoint |
+            Self::WaitIrq | Self::MapMmio | Self::AllocDma |
+            Self::DeviceInfo | Self::PortIo |
+            Self::ObjPut | Self::ObjGet | Self::ObjDelete |
+            Self::ObjList | Self::ObjPutSigned |
+            Self::BindPrincipal | Self::ClaimBootstrapKey |
+            Self::Spawn | Self::WaitTask |
+            Self::ConsoleRead |
+            Self::RevokeCapability |
+            Self::ChannelCreate | Self::ChannelAttach |
+            Self::ChannelClose | Self::ChannelRevoke | Self::ChannelInfo |
+            Self::AuditAttach | Self::AuditInfo
+        )
+    }
+
     /// Convert u64 to syscall number
     pub fn from_u64(val: u64) -> Option<Self> {
         match val {
@@ -358,3 +385,88 @@ impl SyscallError {
 
 /// Result type for syscall implementations
 pub type SyscallResult = Result<u64, SyscallError>;
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::SyscallNumber;
+
+    /// The exempt set: syscalls that do NOT require identity.
+    /// These are the only operations an unidentified process can perform.
+    const EXEMPT: &[SyscallNumber] = &[
+        SyscallNumber::Exit,
+        SyscallNumber::Yield,
+        SyscallNumber::GetPid,
+        SyscallNumber::GetTime,
+        SyscallNumber::Print,
+        SyscallNumber::GetPrincipal,
+    ];
+
+    #[test]
+    fn exempt_syscalls_do_not_require_identity() {
+        for &num in EXEMPT {
+            assert!(
+                !num.requires_identity(),
+                "{:?} should be exempt from identity requirement",
+                num,
+            );
+        }
+    }
+
+    #[test]
+    fn identity_required_syscalls_are_gated() {
+        // Every syscall NOT in the exempt set must require identity.
+        let all = [
+            SyscallNumber::Exit, SyscallNumber::Write, SyscallNumber::Read,
+            SyscallNumber::Allocate, SyscallNumber::Free, SyscallNumber::WaitIrq,
+            SyscallNumber::RegisterEndpoint, SyscallNumber::Yield,
+            SyscallNumber::GetPid, SyscallNumber::GetTime, SyscallNumber::Print,
+            SyscallNumber::BindPrincipal, SyscallNumber::GetPrincipal,
+            SyscallNumber::RecvMsg, SyscallNumber::ObjPut, SyscallNumber::ObjGet,
+            SyscallNumber::ObjDelete, SyscallNumber::ObjList,
+            SyscallNumber::ClaimBootstrapKey, SyscallNumber::ObjPutSigned,
+            SyscallNumber::MapMmio, SyscallNumber::AllocDma,
+            SyscallNumber::DeviceInfo, SyscallNumber::PortIo,
+            SyscallNumber::ConsoleRead, SyscallNumber::Spawn,
+            SyscallNumber::WaitTask, SyscallNumber::RevokeCapability,
+            SyscallNumber::ChannelCreate, SyscallNumber::ChannelAttach,
+            SyscallNumber::ChannelClose, SyscallNumber::ChannelRevoke,
+            SyscallNumber::ChannelInfo, SyscallNumber::AuditAttach,
+            SyscallNumber::AuditInfo,
+        ];
+
+        for &num in &all {
+            let is_exempt = EXEMPT.contains(&num);
+            assert_eq!(
+                num.requires_identity(),
+                !is_exempt,
+                "{:?}: requires_identity()={} but exempt={}",
+                num,
+                num.requires_identity(),
+                is_exempt,
+            );
+        }
+    }
+
+    #[test]
+    fn exempt_set_is_minimal() {
+        // The exempt set must be exactly 6 syscalls. If this test fails,
+        // someone added a new exempt syscall — that requires justification.
+        assert_eq!(EXEMPT.len(), 6, "exempt set size changed — review required");
+    }
+
+    #[test]
+    fn all_syscall_numbers_covered() {
+        // Verify from_u64 round-trips for all defined values (0..=34),
+        // ensuring no gap in the requires_identity() match.
+        for i in 0..=34u64 {
+            let num = SyscallNumber::from_u64(i);
+            assert!(num.is_some(), "from_u64({}) returned None", i);
+            // Just exercise requires_identity to confirm no panic
+            let _ = num.unwrap().requires_identity();
+        }
+    }
+}

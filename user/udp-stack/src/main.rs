@@ -726,22 +726,18 @@ fn service_loop(cache: &mut ArpCache, our_mac: &[u8; 6]) -> ! {
     let mut resp_buf = [0u8; 256];
 
     loop {
-        let n = sys::recv_msg(UDP_ENDPOINT, &mut recv_buf);
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-        let total = n as usize;
-        if total < IPC_HEADER_LEN + 1 {
-            continue;
-        }
+        let msg = match sys::recv_verified(UDP_ENDPOINT, &mut recv_buf) {
+            Some(msg) => msg,
+            None => {
+                sys::yield_now();
+                continue;
+            }
+        };
 
-        let from_endpoint = u32::from_le_bytes([
-            recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-        ]);
-        let payload = &recv_buf[IPC_HEADER_LEN..total];
-        let cmd = payload[0];
-        let cmd_data = &payload[1..];
+        let (cmd, cmd_data) = match msg.command() {
+            Some(pair) => pair,
+            None => continue,
+        };
 
         let resp_len = match cmd {
             CMD_UDP_SEND => handle_udp_send(cache, our_mac, cmd_data, &mut resp_buf),
@@ -755,7 +751,7 @@ fn service_loop(cache: &mut ArpCache, our_mac: &[u8; 6]) -> ! {
             }
         };
 
-        sys::write(from_endpoint, &resp_buf[..resp_len]);
+        sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
     }
 }
 
@@ -987,17 +983,13 @@ fn error_loop() -> ! {
     let resp = [STATUS_ERROR];
 
     loop {
-        let n = sys::recv_msg(UDP_ENDPOINT, &mut recv_buf);
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-        let total = n as usize;
-        if total >= IPC_HEADER_LEN + 1 {
-            let from_endpoint = u32::from_le_bytes([
-                recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-            ]);
-            sys::write(from_endpoint, &resp);
-        }
+        let msg = match sys::recv_verified(UDP_ENDPOINT, &mut recv_buf) {
+            Some(msg) => msg,
+            None => {
+                sys::yield_now();
+                continue;
+            }
+        };
+        sys::write(msg.from_endpoint(), &resp);
     }
 }

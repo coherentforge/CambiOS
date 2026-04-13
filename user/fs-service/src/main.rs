@@ -108,24 +108,26 @@ const STATUS_INVALID: u8 = 4;
 /// Request payload: [content:N]
 /// Response: [status:1][hash:32]
 ///
-/// Attempts to create a signed object by requesting a signature from the
-/// key-store service (endpoint 17). Falls back to unsigned ObjPut if the
-/// key-store is unavailable (e.g., during early boot).
-fn handle_put(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8]) -> usize {
+/// Requires a signature from the key-store service (endpoint 17).
+/// No unsigned fallback — identity is load-bearing.
+fn handle_put(payload: &[u8], response: &mut [u8]) -> usize {
     if payload.is_empty() {
         response[0] = STATUS_INVALID;
         return 1;
     }
 
-    let mut hash = [0u8; 32];
-
-    // Try signed path: request signature from key-store, then ObjPutSigned
-    let ret = if let Some(sig) = request_sign(payload) {
-        sys::obj_put_signed(payload, &sig, &mut hash)
-    } else {
-        // Fallback: unsigned ObjPut (key-store not yet available)
-        sys::obj_put(payload, &mut hash)
+    // Require signature from key-store. No fallback — unsigned puts are
+    // not permitted. If key-store is unavailable, the object cannot be stored.
+    let sig = match request_sign(payload) {
+        Some(sig) => sig,
+        None => {
+            response[0] = STATUS_DENIED;
+            return 1;
+        }
     };
+
+    let mut hash = [0u8; 32];
+    let ret = sys::obj_put_signed(payload, &sig, &mut hash);
 
     if ret < 0 {
         response[0] = STATUS_FULL;
@@ -140,7 +142,7 @@ fn handle_put(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8])
 /// Handle GET request.
 /// Request payload: [hash:32]
 /// Response: [status:1][content:N]
-fn handle_get(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8]) -> usize {
+fn handle_get(payload: &[u8], response: &mut [u8]) -> usize {
     if payload.len() < 32 {
         response[0] = STATUS_INVALID;
         return 1;
@@ -170,15 +172,13 @@ fn handle_get(payload: &[u8], _sender_principal: &[u8; 32], response: &mut [u8])
 /// Handle DELETE request.
 /// Request payload: [hash:32]
 /// Response: [status:1]
-fn handle_delete(payload: &[u8], sender_principal: &[u8; 32], response: &mut [u8]) -> usize {
+///
+/// Anonymous check removed: recv_verified guarantees the sender has a
+/// non-zero Principal. If the kernel doesn't stamp principals, the
+/// message is never delivered to this handler.
+fn handle_delete(payload: &[u8], response: &mut [u8]) -> usize {
     if payload.len() < 32 {
         response[0] = STATUS_INVALID;
-        return 1;
-    }
-
-    // Reject anonymous deletes
-    if *sender_principal == [0u8; 32] {
-        response[0] = STATUS_DENIED;
         return 1;
     }
 
@@ -239,41 +239,30 @@ pub extern "C" fn _start() -> ! {
 
     sys::print(b"[FS] Endpoint 16 registered, entering service loop\n");
 
-    // Service loop: receive message, dispatch command, send response
-    let mut recv_buf = [0u8; 256]; // [principal:32][from:4][payload:N]
+    // Service loop: receive verified message, dispatch command, send response.
+    // recv_verified rejects anonymous senders — if the kernel doesn't stamp
+    // principals, this loop processes nothing. Identity is load-bearing.
+    let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];
 
     loop {
-        let n = sys::recv_msg(FS_ENDPOINT, &mut recv_buf);
+        let msg = match sys::recv_verified(FS_ENDPOINT, &mut recv_buf) {
+            Some(msg) => msg,
+            None => {
+                sys::yield_now();
+                continue;
+            }
+        };
 
-        if n <= 0 {
-            // No message — yield and retry. Silence means healthy.
-            sys::yield_now();
-            continue;
-        }
-        let total = n as usize;
+        let (cmd, cmd_data) = match msg.command() {
+            Some(pair) => pair,
+            None => continue,
+        };
 
-        if total < 37 {
-            // Too short: need at least 36-byte header + 1 byte command
-            continue;
-        }
-
-        // Parse header
-        let sender_principal: &[u8; 32] = recv_buf[0..32].try_into().unwrap_or(&[0u8; 32]);
-        let from_endpoint = u32::from_le_bytes([
-            recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-        ]);
-        let payload = &recv_buf[36..total];
-
-        // First byte of payload is the command
-        let cmd = payload[0];
-        let cmd_data = &payload[1..];
-
-        // Dispatch
         let resp_len = match cmd {
-            CMD_PUT => handle_put(cmd_data, sender_principal, &mut resp_buf),
-            CMD_GET => handle_get(cmd_data, sender_principal, &mut resp_buf),
-            CMD_DELETE => handle_delete(cmd_data, sender_principal, &mut resp_buf),
+            CMD_PUT => handle_put(cmd_data, &mut resp_buf),
+            CMD_GET => handle_get(cmd_data, &mut resp_buf),
+            CMD_DELETE => handle_delete(cmd_data, &mut resp_buf),
             CMD_LIST => handle_list(&mut resp_buf),
             _ => {
                 resp_buf[0] = STATUS_INVALID;
@@ -281,7 +270,6 @@ pub extern "C" fn _start() -> ! {
             }
         };
 
-        // Send response back to sender's endpoint
-        sys::write(from_endpoint, &resp_buf[..resp_len]);
+        sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
     }
 }

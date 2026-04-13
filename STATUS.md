@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-12 (Phase 3.3 landed)
+last_synced_to_code: 2026-04-13 (identity gate + load-bearing security)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
@@ -14,7 +14,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 
 ## At a glance
 
-- **316 unit tests passing** on host (`x86_64-apple-darwin`)
+- **384 unit tests passing** on host (`x86_64-apple-darwin`)
 - **x86_64**: clean release build, boots in QEMU with 2 CPUs, 7 boot modules running (hello, fs-service, key-store, virtio-net, i219-net, udp-stack, shell)
 - **AArch64**: clean release build, boots in QEMU `virt`, all 7 modules running, full SMP (single-CPU mode tested; SMP timer-on-AP issue tracked)
 - **Bare metal**: USB boot tooling complete (`make img-usb` builds GPT image; `make usb DEVICE=/dev/diskN` writes safely); not yet tested on target hardware (Dell Precision 3630)
@@ -35,7 +35,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **Deployment tiers / scope** | Designed, policy-only | Three tiers (Tier 1 CambiOS-Embedded, Tier 2 CambiOS-Standard, Tier 3 CambiOS-Full). Single kernel binary across tiers; tier selection is an install-time choice that decides which `TableSizingPolicy` and which user-space services are loaded. No code gate yet. | — | [ADR-009](docs/adr/009-purpose-tiers-scope.md), [GOVERNANCE.md](GOVERNANCE.md) |
 | **Audit infrastructure** | Done (Phase 3.3) | Kernel→userspace event streaming for security observability. Per-CPU lock-free staging buffers → global audit ring (64 KiB, 1023 event slots). 16 event types, `audit::emit()` at 14 instrumentation points. IPC send/recv sampled 1-in-100. Drain via BSP timer ISR piggyback (100 Hz). `SYS_AUDIT_ATTACH` (33) maps ring RO into consumer. `SYS_AUDIT_INFO` (34) returns stats. | `src/audit/`, `src/syscalls/dispatcher.rs`, `user/libsys/` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | **Policy service** | Designed, not implemented | User-space externalization of `on_syscall` decisions | — | [ADR-006](docs/adr/006-policy-service.md) |
-| **Cryptographic identity** | Done (Phase 1C, hardware-backed) | Bootstrap Principal from compiled-in YubiKey pubkey, IPC sender stamping, BindPrincipal/GetPrincipal syscalls | `src/ipc/`, `bootstrap_pubkey.bin` | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
+| **Cryptographic identity** | Done (Phase 1C, hardware-backed + load-bearing) | Bootstrap Principal from compiled-in YubiKey pubkey, IPC sender stamping, BindPrincipal/GetPrincipal syscalls, **identity gate in syscall dispatcher** (unidentified processes can only Exit/Yield/GetPid/GetTime/Print/GetPrincipal), **`recv_verified` in libsys** (userspace services structurally reject anonymous IPC senders) | `src/ipc/`, `src/syscalls/`, `user/libsys/`, `bootstrap_pubkey.bin` | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
 | **Signed ELF loading** | Done | ARCSIG trailer, Ed25519 signature verification, `SignedBinaryVerifier` | `src/loader/` | [ADR-004](docs/adr/004-cryptographic-integrity.md) |
 | **Content-addressed ObjectStore** | Done (Phase 1C, RAM-backed) | CambiObject with Blake3, Ed25519, ACL; RamObjectStore (256 objects) | `src/fs/` | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) |
 | **Persistent ObjectStore** | Planned | Disk-backed implementation of the ObjectStore trait | — | [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) |
@@ -80,7 +80,7 @@ CambiOS uses informal phases to mark identity/storage milestones. These phases a
 | **Phase 0** | Identity primitives in kernel + RAM-backed ObjectStore. Stamps unforgeable identity on every IPC message; gives every stored object an author and owner. | **Done** |
 | **Phase 1** | Real cryptography. Blake3 hashing, Ed25519 signature verification on objects, signed ELF modules, key store as user-space service. | **Done** |
 | **Phase 1B** | Hardware-backed bootstrap identity. YubiKey-derived public key compiled into kernel; private key never enters kernel memory. | **Done** |
-| **Phase 1C** | Key-store service degraded mode + signed ObjectStore puts. fs-service requests signing from key-store before ObjPut; falls back to unsigned when key-store is in degraded mode (no runtime YubiKey). | **Done** |
+| **Phase 1C** | Key-store service degraded mode + signed ObjectStore puts. fs-service requests signing from key-store before ObjPutSigned; **no unsigned fallback** — objects cannot be stored without a valid signature. Identity is load-bearing: kernel identity gate + userspace `recv_verified` create structural dependency on the security model. | **Done** |
 | **Phase 2A** | First user-space hardware driver. Virtio-net with PCI discovery, virtqueues, DMA bounce buffers, hostile-device validation. | **Done** |
 | **Phase 2B** | First user-space network service. Stateless UDP/IP over virtio-net, with NTP demo. | **Done** |
 | **Phase 3** | Architecture: bulk data path (channels) + externalized policy + capability revocation + audit infrastructure. The substrate that real workloads (video, file I/O, AI inference) need. | **In progress: 3.1 (revocation primitive) landed; 3.2a (boot-time-sized object tables) landed; 3.2b (`CreateProcess` capability) landed; 3.2c (`ProcessId` generation counter) landed; 3.2d (shared-memory channels + process lifecycle cleanup) landed; 3.3 (audit infrastructure) landed — see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md). 3.4 (policy service) pending** |

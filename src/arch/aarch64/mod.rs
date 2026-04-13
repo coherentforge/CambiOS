@@ -950,6 +950,7 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
         process_id,
         task_id,
         cr3,
+        caller_principal: None, // resolved in dispatch()
     };
 
     let args = SyscallArgs::new(arg1, arg2, arg3, arg4, arg5, arg6);
@@ -957,7 +958,7 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
     // SYS_EXIT is handled by handle_exit(), which loops on
     // yield_save_and_switch() and never returns. Other blocking syscalls
     // (recv_msg, wait_irq) yield internally and return when woken.
-    let result = match SyscallDispatcher::dispatch(syscall_num, args, &ctx) {
+    let result = match SyscallDispatcher::dispatch(syscall_num, args, ctx) {
         Ok(val) => val as i64,
         Err(e) => e.as_i64(),
     };

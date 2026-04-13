@@ -435,23 +435,18 @@ pub extern "C" fn _start() -> ! {
     let mut resp_buf = [0u8; 256];
 
     loop {
-        let n = sys::recv_msg(NET_ENDPOINT, &mut recv_buf);
+        let msg = match sys::recv_verified(NET_ENDPOINT, &mut recv_buf) {
+            Some(msg) => msg,
+            None => {
+                sys::yield_now();
+                continue;
+            }
+        };
 
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-        let total = n as usize;
-        if total < 37 {
-            continue;
-        }
-
-        let from_endpoint = u32::from_le_bytes([
-            recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-        ]);
-        let payload = &recv_buf[36..total];
-        let cmd = payload[0];
-        let cmd_data = &payload[1..];
+        let (cmd, cmd_data) = match msg.command() {
+            Some(pair) => pair,
+            None => continue,
+        };
 
         let resp_len = match cmd {
             CMD_SEND_PACKET => handle_send_packet(&mut driver, cmd_data, &mut resp_buf),
@@ -464,7 +459,7 @@ pub extern "C" fn _start() -> ! {
             }
         };
 
-        sys::write(from_endpoint, &resp_buf[..resp_len]);
+        sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
     }
 }
 

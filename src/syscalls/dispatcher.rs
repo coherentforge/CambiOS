@@ -13,6 +13,8 @@ use crate::ipc::ProcessId;
 /// Syscall handler context
 ///
 /// Passed to each syscall handler to give it access to kernel state.
+/// `caller_principal` is resolved once in `dispatch()` and carried through
+/// to all handlers — eliminates redundant CAPABILITY_MANAGER lock acquisitions.
 pub struct SyscallContext {
     /// Calling process ID
     pub process_id: ProcessId,
@@ -20,6 +22,9 @@ pub struct SyscallContext {
     pub task_id: TaskId,
     /// Process page table (CR3). 0 = kernel task (no user address space).
     pub cr3: u64,
+    /// The caller's bound Principal, resolved once at dispatch entry.
+    /// `None` means the process has no bound Principal (anonymous).
+    pub caller_principal: Option<crate::ipc::Principal>,
 }
 
 // ============================================================================
@@ -174,73 +179,105 @@ pub struct SyscallDispatcher;
 impl SyscallDispatcher {
     /// Dispatch a syscall to its handler
     ///
-    /// Pipeline: parse number → interceptor check → handler dispatch.
+    /// Pipeline: parse number → resolve principal → policy check →
+    /// identity gate → handler dispatch.
     pub fn dispatch(
         syscall_num: u64,
         args: SyscallArgs,
-        ctx: &SyscallContext,
+        mut ctx: SyscallContext,
     ) -> SyscallResult {
         let num = match SyscallNumber::from_u64(syscall_num) {
             Some(n) => n,
             None => return Err(SyscallError::Enosys),
         };
 
-        // Zero-trust interceptor: pre-dispatch syscall filter
-        {
-            let ipc_guard = crate::IPC_MANAGER.lock();
-            if let Some(ref ipc_mgr) = *ipc_guard {
-                if let Some(interceptor) = ipc_mgr.interceptor() {
-                    use crate::ipc::interceptor::InterceptDecision;
-                    if let InterceptDecision::Deny(_) = interceptor.on_syscall(ctx.process_id, num) {
-                        crate::audit::emit(crate::audit::RawAuditEvent::syscall_denied(
-                            ctx.process_id, syscall_num, crate::audit::now(), 0,
-                        ));
-                        return Err(SyscallError::PermissionDenied);
-                    }
+        // Resolve the caller's Principal once. Every handler reads
+        // ctx.caller_principal instead of re-acquiring CAPABILITY_MANAGER.
+        ctx.caller_principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            cap_guard.as_ref().and_then(|cm| cm.get_principal(ctx.process_id).ok())
+        };
+
+        // Identity gate: syscalls that require a bound, non-zero Principal
+        // are rejected for anonymous processes. Unidentified processes can
+        // only Exit, Yield, GetPid, GetTime, Print, and GetPrincipal.
+        //
+        // This is the kernel-side enforcement of "no ID, no participation."
+        // A stripped kernel fork that removes this gate still faces the
+        // userspace half (recv_verified in libsys rejects anonymous senders).
+        if num.requires_identity() {
+            match &ctx.caller_principal {
+                Some(p) if !p.is_zero() => {} // identified — proceed
+                _ => {
+                    crate::audit::emit(crate::audit::RawAuditEvent::syscall_denied(
+                        ctx.process_id, syscall_num, crate::audit::now(), 0,
+                    ));
+                    return Err(SyscallError::PermissionDenied);
                 }
             }
         }
 
+        // Phase 3.4: Policy service pre-dispatch check (ADR-006).
+        // Replaces the old IPC_MANAGER → interceptor → on_syscall path.
+        // May block the calling task on a cache miss (upcall to user-space
+        // policy service). Falls back to Allow if the policy service is
+        // unavailable.
+        {
+            use crate::ipc::interceptor::InterceptDecision;
+            let decision = crate::policy::policy_check(
+                ctx.process_id,
+                ctx.task_id,
+                ctx.cr3,
+                syscall_num as u32,
+            );
+            if let InterceptDecision::Deny(_) = decision {
+                crate::audit::emit(crate::audit::RawAuditEvent::syscall_denied(
+                    ctx.process_id, syscall_num, crate::audit::now(), 0,
+                ));
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
         match num {
-            SyscallNumber::Exit => Self::handle_exit(args, ctx),
-            SyscallNumber::Write => Self::handle_write(args, ctx),
-            SyscallNumber::Read => Self::handle_read(args, ctx),
-            SyscallNumber::Allocate => Self::handle_allocate(args, ctx),
-            SyscallNumber::Free => Self::handle_free(args, ctx),
-            SyscallNumber::WaitIrq => Self::handle_wait_irq(args, ctx),
-            SyscallNumber::RegisterEndpoint => Self::handle_register_endpoint(args, ctx),
-            SyscallNumber::Yield => Self::handle_yield(args, ctx),
-            SyscallNumber::GetPid => Self::handle_get_pid(args, ctx),
-            SyscallNumber::GetTime => Self::handle_get_time(args, ctx),
-            SyscallNumber::Print => Self::handle_print(args, ctx),
-            SyscallNumber::BindPrincipal => Self::handle_bind_principal(args, ctx),
-            SyscallNumber::GetPrincipal => Self::handle_get_principal(args, ctx),
-            SyscallNumber::RecvMsg => Self::handle_recv_msg(args, ctx),
-            SyscallNumber::ObjPut => Self::handle_obj_put(args, ctx),
-            SyscallNumber::ObjGet => Self::handle_obj_get(args, ctx),
-            SyscallNumber::ObjDelete => Self::handle_obj_delete(args, ctx),
-            SyscallNumber::ObjList => Self::handle_obj_list(args, ctx),
-            SyscallNumber::ClaimBootstrapKey => Self::handle_claim_bootstrap_key(args, ctx),
-            SyscallNumber::ObjPutSigned => Self::handle_obj_put_signed(args, ctx),
-            SyscallNumber::MapMmio => Self::handle_map_mmio(args, ctx),
-            SyscallNumber::AllocDma => Self::handle_alloc_dma(args, ctx),
-            SyscallNumber::DeviceInfo => Self::handle_device_info(args, ctx),
-            SyscallNumber::PortIo => Self::handle_port_io(args, ctx),
-            SyscallNumber::ConsoleRead => Self::handle_console_read(args, ctx),
-            SyscallNumber::Spawn => Self::handle_spawn(args, ctx),
-            SyscallNumber::WaitTask => Self::handle_wait_task(args, ctx),
-            SyscallNumber::RevokeCapability => Self::handle_revoke_capability(args, ctx),
+            SyscallNumber::Exit => Self::handle_exit(args, &ctx),
+            SyscallNumber::Write => Self::handle_write(args, &ctx),
+            SyscallNumber::Read => Self::handle_read(args, &ctx),
+            SyscallNumber::Allocate => Self::handle_allocate(args, &ctx),
+            SyscallNumber::Free => Self::handle_free(args, &ctx),
+            SyscallNumber::WaitIrq => Self::handle_wait_irq(args, &ctx),
+            SyscallNumber::RegisterEndpoint => Self::handle_register_endpoint(args, &ctx),
+            SyscallNumber::Yield => Self::handle_yield(args, &ctx),
+            SyscallNumber::GetPid => Self::handle_get_pid(args, &ctx),
+            SyscallNumber::GetTime => Self::handle_get_time(args, &ctx),
+            SyscallNumber::Print => Self::handle_print(args, &ctx),
+            SyscallNumber::BindPrincipal => Self::handle_bind_principal(args, &ctx),
+            SyscallNumber::GetPrincipal => Self::handle_get_principal(args, &ctx),
+            SyscallNumber::RecvMsg => Self::handle_recv_msg(args, &ctx),
+            SyscallNumber::ObjPut => Self::handle_obj_put(args, &ctx),
+            SyscallNumber::ObjGet => Self::handle_obj_get(args, &ctx),
+            SyscallNumber::ObjDelete => Self::handle_obj_delete(args, &ctx),
+            SyscallNumber::ObjList => Self::handle_obj_list(args, &ctx),
+            SyscallNumber::ClaimBootstrapKey => Self::handle_claim_bootstrap_key(args, &ctx),
+            SyscallNumber::ObjPutSigned => Self::handle_obj_put_signed(args, &ctx),
+            SyscallNumber::MapMmio => Self::handle_map_mmio(args, &ctx),
+            SyscallNumber::AllocDma => Self::handle_alloc_dma(args, &ctx),
+            SyscallNumber::DeviceInfo => Self::handle_device_info(args, &ctx),
+            SyscallNumber::PortIo => Self::handle_port_io(args, &ctx),
+            SyscallNumber::ConsoleRead => Self::handle_console_read(args, &ctx),
+            SyscallNumber::Spawn => Self::handle_spawn(args, &ctx),
+            SyscallNumber::WaitTask => Self::handle_wait_task(args, &ctx),
+            SyscallNumber::RevokeCapability => Self::handle_revoke_capability(args, &ctx),
 
             // Phase 3.2d.iii: shared-memory channels (ADR-005)
-            SyscallNumber::ChannelCreate => Self::handle_channel_create(args, ctx),
-            SyscallNumber::ChannelAttach => Self::handle_channel_attach(args, ctx),
-            SyscallNumber::ChannelClose => Self::handle_channel_close(args, ctx),
-            SyscallNumber::ChannelRevoke => Self::handle_channel_revoke(args, ctx),
-            SyscallNumber::ChannelInfo => Self::handle_channel_info(args, ctx),
+            SyscallNumber::ChannelCreate => Self::handle_channel_create(args, &ctx),
+            SyscallNumber::ChannelAttach => Self::handle_channel_attach(args, &ctx),
+            SyscallNumber::ChannelClose => Self::handle_channel_close(args, &ctx),
+            SyscallNumber::ChannelRevoke => Self::handle_channel_revoke(args, &ctx),
+            SyscallNumber::ChannelInfo => Self::handle_channel_info(args, &ctx),
 
             // Phase 3.3: audit infrastructure (ADR-007)
-            SyscallNumber::AuditAttach => Self::handle_audit_attach(args, ctx),
-            SyscallNumber::AuditInfo => Self::handle_audit_info(args, ctx),
+            SyscallNumber::AuditAttach => Self::handle_audit_attach(args, &ctx),
+            SyscallNumber::AuditInfo => Self::handle_audit_info(args, &ctx),
         }
     }
 
@@ -389,6 +426,35 @@ impl SyscallDispatcher {
         // Read user buffer into kernel
         let mut kbuf = [0u8; 256];
         read_user_buffer(ctx.cr3, user_buf, len, &mut kbuf)?;
+
+        // Policy response interception — before any lock acquisition.
+        // Writes to POLICY_RESP_ENDPOINT are consumed by the kernel (never
+        // enter the IPC queue). Only the policy service may write here.
+        if endpoint_id == crate::policy::POLICY_RESP_ENDPOINT {
+            let expected_pid = crate::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire);
+            if ctx.process_id.as_raw() != expected_pid {
+                return Err(SyscallError::PermissionDenied);
+            }
+            if let Some((query_id, allowed)) = crate::policy::parse_response(&kbuf[..len]) {
+                let task_id = {
+                    let mut router = crate::POLICY_ROUTER.lock();
+                    router.complete_query(query_id)
+                };
+                // POLICY_ROUTER lock dropped before scheduler wake
+                if let Some(tid) = task_id {
+                    let val = if allowed {
+                        crate::policy::DECISION_ALLOW
+                    } else {
+                        crate::policy::DECISION_DENY
+                    };
+                    crate::policy::POLICY_DECISIONS[tid.0 as usize]
+                        .store(val, core::sync::atomic::Ordering::Release);
+                    crate::wake_task_on_cpu(tid);
+                }
+                return Ok(len as u64);
+            }
+            return Err(SyscallError::InvalidArg);
+        }
 
         // Build IPC message
         let endpoint = crate::ipc::EndpointId(endpoint_id);
@@ -846,19 +912,11 @@ impl SyscallDispatcher {
         read_user_buffer(ctx.cr3, pubkey_ptr, 32, &mut pubkey)?;
 
         // Restriction: only the bootstrap Principal can bind Principals.
-        // Check caller's own Principal against the global bootstrap Principal.
-        {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-
-            let caller_principal = cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?;
-
-            let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-            if caller_principal != bootstrap {
-                return Err(SyscallError::PermissionDenied);
-            }
+        // caller_principal is already resolved by dispatch().
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        let caller = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
+        if *caller != bootstrap {
+            return Err(SyscallError::PermissionDenied);
         }
 
         // Bind the Principal to the target process
@@ -882,7 +940,7 @@ impl SyscallDispatcher {
     /// Writes 32 bytes of public key to the user buffer. Returns 32 on
     /// success, or error if no Principal is bound to this process.
     ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) only.
+    /// No lock needed — caller_principal resolved by dispatch().
     fn handle_get_principal(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let out_buf = args.arg1;
         let buf_len = args.arg_usize(2);
@@ -891,17 +949,9 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Look up caller's Principal
-        let principal = {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+        // caller_principal already resolved by dispatch()
+        let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::InvalidArg)?;
 
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::InvalidArg)?
-        };
-
-        // Write the 32-byte public key to user buffer
         write_user_buffer(ctx.cr3, out_buf, &principal.public_key)?;
 
         Ok(32)
@@ -1033,14 +1083,9 @@ impl SyscallDispatcher {
         let mut kbuf = [0u8; 4096];
         let copied = read_user_buffer(ctx.cr3, content_ptr, content_len, &mut kbuf)?;
 
-        // Get caller's Principal (required — anonymous puts are not allowed)
-        let principal = {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?
-        };
+        // caller_principal already resolved by dispatch(); identity gate
+        // guarantees it's non-zero for this syscall.
+        let principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // Get current time for created_at
         let ticks = crate::scheduler::Timer::get_ticks();
@@ -1146,14 +1191,8 @@ impl SyscallDispatcher {
         let mut hash = [0u8; 32];
         read_user_buffer(ctx.cr3, hash_ptr, 32, &mut hash)?;
 
-        // Get caller's Principal
-        let principal = {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?
-        };
+        // caller_principal already resolved by dispatch()
+        let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // Check ownership then delete
         let mut store_guard = crate::OBJECT_STORE.lock();
@@ -1233,17 +1272,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Verify caller holds the bootstrap Principal
-        let principal = {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?
-        };
-
+        // Verify caller holds the bootstrap Principal (resolved by dispatch())
+        let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
         let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        if principal != bootstrap {
+        if *principal != bootstrap {
             return Err(SyscallError::PermissionDenied);
         }
 
@@ -1293,14 +1325,8 @@ impl SyscallDispatcher {
         read_user_buffer(ctx.cr3, sig_ptr, 64, &mut sig_bytes)?;
         let signature = crate::fs::SignatureBytes { data: sig_bytes };
 
-        // Get caller's Principal
-        let principal = {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?
-        };
+        // caller_principal already resolved by dispatch()
+        let principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // Verify the signature against the caller's Principal and content
         if !crate::fs::verify_signature(&principal.public_key, &kbuf[..copied], &signature) {
@@ -1916,10 +1942,8 @@ impl SyscallDispatcher {
         let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
         let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        // Look up the caller's bound Principal.
-        let revoker_principal = cap_mgr
-            .get_principal(ctx.process_id)
-            .map_err(|_| SyscallError::PermissionDenied)?;
+        // caller_principal already resolved by dispatch()
+        let revoker_principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // Delegate to the primitive. revoke() performs the authority check
         // (revoker_principal == bootstrap) and the table mutation atomically
@@ -1983,8 +2007,8 @@ impl SyscallDispatcher {
         read_user_buffer(ctx.cr3, peer_principal_ptr, 32, &mut peer_key)?;
         let peer_principal = crate::ipc::Principal::from_public_key(peer_key);
 
-        // --- Check CreateChannel capability + get creator's Principal ---
-        let creator_principal = {
+        // --- Check CreateChannel capability; principal from dispatch() ---
+        {
             let cap_guard = crate::CAPABILITY_MANAGER.lock();
             let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
 
@@ -1994,11 +2018,8 @@ impl SyscallDispatcher {
             if !has_cap {
                 return Err(SyscallError::PermissionDenied);
             }
-
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?
-        }; // drop CAPABILITY_MANAGER(4)
+        } // drop CAPABILITY_MANAGER(4)
+        let creator_principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // --- Allocate contiguous physical frames ---
         let base_phys = {
@@ -2115,14 +2136,8 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // --- Get caller's Principal ---
-        let caller_principal = {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?
-        }; // drop CAPABILITY_MANAGER(4)
+        // caller_principal already resolved by dispatch()
+        let caller_principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // --- Read channel record to get physical_base, num_pages, role ---
         let (physical_base, num_pages, peer_writable) = {
@@ -2255,16 +2270,10 @@ impl SyscallDispatcher {
 
         // --- Authority check: bootstrap Principal only (Phase 3.1 pattern) ---
         let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            let caller_principal = cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?;
-            if caller_principal != bootstrap {
-                return Err(SyscallError::PermissionDenied);
-            }
-        } // drop CAPABILITY_MANAGER(4)
+        let caller_principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
+        if *caller_principal != bootstrap {
+            return Err(SyscallError::PermissionDenied);
+        }
 
         // --- Revoke in ChannelManager ---
         let record = {
@@ -2444,19 +2453,12 @@ impl SyscallDispatcher {
         }
 
         // --- Phase 1: verify bootstrap Principal authority ---
-        {
-            let cap_guard = crate::CAPABILITY_MANAGER.lock();
-            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-
-            let caller_principal = cap_mgr
-                .get_principal(ctx.process_id)
-                .map_err(|_| SyscallError::PermissionDenied)?;
-
-            let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-            if caller_principal != bootstrap {
-                return Err(SyscallError::PermissionDenied);
-            }
-        } // drop CAPABILITY_MANAGER(4)
+        // caller_principal already resolved by dispatch()
+        let caller_principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        if *caller_principal != bootstrap {
+            return Err(SyscallError::PermissionDenied);
+        }
 
         // --- Phase 2: read ring metadata ---
         let (physical_base, page_count) = {

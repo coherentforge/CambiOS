@@ -155,32 +155,23 @@ pub extern "C" fn _start() -> ! {
     sys::register_endpoint(KS_ENDPOINT);
     sys::print(b"[KS] Endpoint 17 registered, entering service loop\n");
 
-    // Step 3: Service loop
+    // Step 3: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];
 
     loop {
-        let n = sys::recv_msg(KS_ENDPOINT, &mut recv_buf);
+        let msg = match sys::recv_verified(KS_ENDPOINT, &mut recv_buf) {
+            Some(msg) => msg,
+            None => {
+                sys::yield_now();
+                continue;
+            }
+        };
 
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-        let total = n as usize;
-
-        if total < 37 {
-            // Too short: need at least 36-byte header + 1 byte command
-            continue;
-        }
-
-        // Parse header: [sender_principal:32][from_endpoint:4][payload:N]
-        let from_endpoint = u32::from_le_bytes([
-            recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-        ]);
-        let payload = &recv_buf[36..total];
-
-        let cmd = payload[0];
-        let cmd_data = &payload[1..];
+        let (cmd, cmd_data) = match msg.command() {
+            Some(pair) => pair,
+            None => continue,
+        };
 
         let resp_len = match cmd {
             CMD_SIGN => handle_sign(&keys, cmd_data, &mut resp_buf),
@@ -191,6 +182,6 @@ pub extern "C" fn _start() -> ! {
             }
         };
 
-        sys::write(from_endpoint, &resp_buf[..resp_len]);
+        sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
     }
 }

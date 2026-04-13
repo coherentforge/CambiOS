@@ -251,6 +251,109 @@ pub fn claim_bootstrap_key(out_sk: &mut [u8; 64]) -> i64 {
 }
 
 // ============================================================================
+// Identity types — the userspace half of "no ID, no participation"
+// ============================================================================
+
+/// A 32-byte Ed25519 public key representing a process identity.
+/// The zero value is invalid (anonymous / unidentified).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Principal([u8; 32]);
+
+impl Principal {
+    /// The zero Principal — sentinel for "no identity."
+    pub const ANONYMOUS: Self = Self([0u8; 32]);
+
+    /// Returns `true` if this is the zero (anonymous) Principal.
+    pub fn is_anonymous(&self) -> bool {
+        self.0 == [0u8; 32]
+    }
+
+    /// The raw 32-byte public key.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// An IPC message whose sender identity has been verified as non-anonymous.
+///
+/// This type **cannot** be constructed without a valid (non-zero) Principal.
+/// If the kernel does not stamp principals on IPC messages (e.g., a stripped
+/// fork), `recv_verified()` always returns `None` and the service is inert.
+///
+/// This is the userspace half of the "identity is load-bearing" invariant.
+/// The kernel half is the identity gate in the syscall dispatcher.
+pub struct VerifiedMessage<'a> {
+    sender: Principal,
+    from_endpoint: u32,
+    payload: &'a [u8],
+}
+
+impl<'a> VerifiedMessage<'a> {
+    /// The sender's verified Principal (guaranteed non-anonymous).
+    pub fn sender(&self) -> &Principal {
+        &self.sender
+    }
+
+    /// The endpoint the message was sent from.
+    pub fn from_endpoint(&self) -> u32 {
+        self.from_endpoint
+    }
+
+    /// The payload bytes (after the 36-byte header).
+    pub fn payload(&self) -> &[u8] {
+        self.payload
+    }
+
+    /// Split the payload into (command_byte, data) if non-empty.
+    pub fn command(&self) -> Option<(u8, &[u8])> {
+        self.payload.split_first().map(|(&cmd, rest)| (cmd, rest))
+    }
+}
+
+/// Receive and verify an IPC message on `endpoint`.
+///
+/// `buf` should be at least 292 bytes for full 256-byte payloads
+/// (36-byte header + 256 payload). Smaller buffers work but truncate.
+///
+/// Returns `Some(VerifiedMessage)` only if a message is available AND the
+/// sender has a non-anonymous (non-zero) Principal. Returns `None` if:
+/// - No message available (queue empty)
+/// - Message too short (< 37 bytes: 32 principal + 4 endpoint + 1 payload)
+/// - Sender principal is anonymous (all zeros)
+///
+/// This is the **only** way to obtain a `VerifiedMessage`. Services that
+/// use this function structurally cannot operate on a kernel that does not
+/// stamp sender identity on IPC messages.
+pub fn recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMessage<'a>> {
+    let n = recv_msg(endpoint, buf);
+    if n <= 0 {
+        return None;
+    }
+    let total = n as usize;
+    // 32 principal + 4 endpoint + 1 minimum payload byte
+    if total < 37 || total > buf.len() {
+        return None;
+    }
+
+    let mut principal_bytes = [0u8; 32];
+    principal_bytes.copy_from_slice(&buf[0..32]);
+    let principal = Principal(principal_bytes);
+
+    // THE STRUCTURAL CHECK: no principal, no message, no service.
+    if principal.is_anonymous() {
+        return None;
+    }
+
+    let from_endpoint = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+
+    Some(VerifiedMessage {
+        sender: principal,
+        from_endpoint,
+        payload: &buf[36..total],
+    })
+}
+
+// ============================================================================
 // Device / DMA syscalls
 // ============================================================================
 

@@ -262,6 +262,7 @@ extern "C" fn syscall_handler_inner(frame: *const SyscallFrame) -> i64 {
         process_id,
         task_id,
         cr3,
+        caller_principal: None, // resolved in dispatch()
     };
 
     let args = SyscallArgs::new(
@@ -269,7 +270,7 @@ extern "C" fn syscall_handler_inner(frame: *const SyscallFrame) -> i64 {
         frame.arg4, frame.arg5, frame.arg6,
     );
 
-    match SyscallDispatcher::dispatch(frame.number, args, &ctx) {
+    match SyscallDispatcher::dispatch(frame.number, args, ctx) {
         Ok(val) => val as i64,
         Err(e) => e.as_i64(),
     }
