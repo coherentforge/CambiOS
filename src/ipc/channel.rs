@@ -26,26 +26,34 @@ use crate::ipc::{ProcessId, Principal};
 // ============================================================================
 
 /// SCAFFOLDING: maximum number of concurrent channels.
-/// Why: bounded table for verification. 64 channels supports 32 services
-///      each with 2 channels (typical: one inbound, one outbound data
-///      path), with 4× headroom above the v1 estimate of ~16 active
-///      channels (7 boot modules × ~2 data paths each, plus growth).
-///      Memory cost: 64 × size_of::<Option<ChannelRecord>>() ≈ 64 × ~160 B
-///      ≈ 10 KiB. Comfortable.
+/// Why: bounded table for verification. Sized for the v1 endgame target of a
+///      multi-monitor 4K@120Hz compositor (see ADR-011): ~6 scanout channels
+///      (3 displays × front/back) + ~30 window surface channels + ~10 GPU
+///      command/memory channels + non-GUI services (current 7 boot modules
+///      × ~2 data paths each) = ~60 active channels at v1 endgame. 4×
+///      headroom over that estimate puts the ceiling at 256.
+///      Memory cost: 256 × size_of::<Option<ChannelRecord>>() ≈ 256 × ~160 B
+///      ≈ 40 KiB. Negligible.
 /// Replace when: the first service needs more than ~4 simultaneous
-///      channels and the table fills up. See ASSUMPTIONS.md.
-pub const MAX_CHANNELS: usize = 64;
+///      channels and the table fills up, OR when multi-monitor + many-client
+///      graphics workloads exceed 60 active channels. See ASSUMPTIONS.md.
+pub const MAX_CHANNELS: usize = 256;
 
-/// SCAFFOLDING: soft cap on channel size in pages (16 MiB = 4096 pages).
-/// Why: bounds the physical memory a single channel can consume. Prevents
-///      a misbehaving user-space service from exhausting the frame
-///      allocator with one syscall. 16 MiB is sufficient for 1080p
-///      framebuffers (~8 MiB per frame, double-buffered) and virtio-blk
-///      request queues.
-/// Replace when: a workload legitimately needs > 16 MiB of shared memory
-///      (e.g., 4K video, LLM KV cache). The policy service (Phase 3.4)
-///      should gate larger allocations. See ASSUMPTIONS.md.
-pub const MAX_CHANNEL_PAGES: u32 = 4096;
+/// SCAFFOLDING: soft cap on channel size in pages (256 MiB = 65536 pages).
+/// Why: bounds the physical memory a single channel can consume. Sized for
+///      the v1 endgame graphics target (ADR-011): a full-screen window
+///      surface on a 4K display at 2× Retina backing scale is an 8K backing
+///      store = 128 MiB at 32bpp, 256 MiB at 64bpp HDR. 256 MiB per channel
+///      accommodates this with no further headroom — multi-monitor workloads
+///      use multiple channels (one per display scanout, one per window
+///      surface). This is a soft cap (ceiling), not always-allocated;
+///      typical channel sizes remain in the single-digit MiB range.
+/// Replace when: HDR + supersampling beyond 2× backing scale on 5K/8K
+///      displays pushes single-surface size past 256 MiB. The tier-aware
+///      policy service (Phase 3.4) and a future `LargeChannel` capability
+///      should gate these allocations before the ceiling rises further.
+///      See ASSUMPTIONS.md.
+pub const MAX_CHANNEL_PAGES: u32 = 65536;
 
 /// ARCHITECTURAL: minimum channel size is one page (4 KiB).
 /// Channels smaller than a page would defeat the purpose — the kernel
@@ -788,6 +796,29 @@ mod tests {
             .err(),
             Some(ChannelError::InvalidSize)
         );
+    }
+
+    /// Exercises the new 256 MiB (65536-page) ceiling raised for the v1
+    /// endgame graphics target (ADR-011). A create at exactly
+    /// `MAX_CHANNEL_PAGES` must be accepted — anything less means the
+    /// ceiling isn't actually reachable.
+    #[test]
+    fn test_create_at_max_pages_succeeds() {
+        let mut mgr = ChannelManager::new();
+        let id = mgr
+            .create(ChannelCreateParams {
+                creator_principal: test_principal(0xAA),
+                peer_principal: test_principal(0xBB),
+                creator_pid: test_pid(1),
+                role: ChannelRole::Producer,
+                num_pages: MAX_CHANNEL_PAGES,
+                physical_base: 0x100_0000,
+                creator_vaddr: 0x1000_0000,
+                created_at_tick: 0,
+            })
+            .unwrap();
+        let record = mgr.get(id).unwrap();
+        assert_eq!(record.num_pages, MAX_CHANNEL_PAGES);
     }
 
     // -- ChannelManager: attach --

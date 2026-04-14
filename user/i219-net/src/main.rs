@@ -122,7 +122,7 @@ impl I219Driver {
         // If the MAC reads as all zeros or all-ones, the EEPROM probably
         // hasn't loaded — bail out.
         if mac.iter().all(|&b| b == 0) || mac.iter().all(|&b| b == 0xFF) {
-            sys::print(b"[I219] MAC read from EEPROM looks invalid\n");
+            sys::print(b"[I219] ERROR: MAC read from EEPROM looks invalid\n");
             return None;
         }
 
@@ -158,10 +158,6 @@ impl I219Driver {
 
         // Step 9: Initialize RX ring (post all bounce buffers as available).
         driver.init_rx();
-
-        sys::print(b"[I219] Device initialized, MAC=");
-        print_mac(&driver.mac);
-        sys::print(b"\n");
 
         Some(driver)
     }
@@ -328,6 +324,7 @@ impl I219Driver {
     }
 }
 
+#[allow(dead_code)] // Kept for future diagnostic use
 fn print_mac(mac: &[u8; 6]) {
     let mut buf = [0u8; 17];
     for i in 0..6 {
@@ -388,25 +385,20 @@ fn handle_recv_packet(driver: &mut I219Driver, response: &mut [u8]) -> usize {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[I219] Intel I219-LM driver starting\n");
-
-    // Step 1: Find the I219 PCI device.
+    // Step 1: Find the I219 PCI device (silent if not present — expected on QEMU).
     let dev = match pci::PciDeviceInfo::find_i219() {
         Some(d) => d,
         None => {
-            sys::print(b"[I219] No I219-LM device found (expected on QEMU)\n");
             // Don't register the endpoint — virtio-net may take it.
             no_device_loop();
         }
     };
 
-    sys::print(b"[I219] Found Intel Ethernet device\n");
-
     // Step 2: Locate BAR0 (MMIO).
     let bar0 = match dev.first_mmio_bar() {
         Some(b) => b,
         None => {
-            sys::print(b"[I219] No MMIO BAR found\n");
+            sys::print(b"[I219] ERROR: no MMIO BAR found\n");
             no_device_loop();
         }
     };
@@ -415,21 +407,21 @@ pub extern "C" fn _start() -> ! {
     let mut driver = match I219Driver::init(bar0.addr, bar0.size) {
         Some(d) => d,
         None => {
-            sys::print(b"[I219] Device initialization failed\n");
+            sys::print(b"[I219] ERROR: device initialization failed\n");
             no_device_loop();
         }
     };
 
     // Step 4: Wait for link (best-effort, doesn't block init).
-    if phy::wait_for_link(&driver.mmio, 200) {
-        sys::print(b"[I219] Link is up\n");
-    } else {
-        sys::print(b"[I219] Link is down (no cable?)\n");
-    }
+    let link_up = phy::wait_for_link(&driver.mmio, 200);
 
     // Step 5: Register IPC endpoint and enter service loop.
     sys::register_endpoint(NET_ENDPOINT);
-    sys::print(b"[I219] Endpoint 20 registered, entering service loop\n");
+    if link_up {
+        sys::print(b"[I219] ready on endpoint 20 (link up)\n");
+    } else {
+        sys::print(b"[I219] ready on endpoint 20 (link down)\n");
+    }
 
     let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];

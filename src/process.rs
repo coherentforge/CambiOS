@@ -18,12 +18,19 @@ use alloc::boxed::Box;
 // ============================================================================
 
 /// SCAFFOLDING: maximum number of tracked memory regions per process.
-/// Why: bounded slot table for the bump-allocated VMA tracker, sized for current
-///      services which use only a handful of regions.
-/// Replace when: channels (ADR-005) attach shared-memory mappings as VMAs — the
-///      first service that holds 5+ channels is on the edge. Also pressure from
-///      any future mmap-style API. See ASSUMPTIONS.md.
-const MAX_VMAS: usize = 64;
+/// Why: bounded slot table for the bump-allocated VMA tracker, sized for the
+///      v1 endgame target of a multi-monitor graphics compositor (ADR-011).
+///      That process is estimated to hold ~50 VMA entries: 3 framebuffer
+///      mappings + ~6 scanout channel mappings + ~30 window surface channels
+///      + GPU MMIO mappings + GPU command/memory channels + heap + stack.
+///      256 slots gives 4× headroom over that estimate per CLAUDE.md
+///      Convention 8.
+///      Memory cost: VmaTracker grows from 64 × ~24 B ≈ 1.5 KiB to 256 × ~24 B
+///      ≈ 6 KiB per process. Trivial across boot modules.
+/// Replace when: channels (ADR-005) attach shared-memory mappings as VMAs —
+///      the first service that holds 50+ channels is on the edge. Or any
+///      future mmap-style API. See ASSUMPTIONS.md.
+const MAX_VMAS: usize = 256;
 
 /// Base virtual address for dynamic user-space allocations.
 /// Placed above code (0x400000) and stack (0x800000) regions.
@@ -50,7 +57,7 @@ pub struct VmaEntry {
 ///
 /// # Invariants (for formal verification)
 ///
-/// - `count <= MAX_VMAS` (64).
+/// - `count <= MAX_VMAS` (256).
 /// - `next_vaddr >= VMA_ALLOC_BASE` and is always page-aligned.
 /// - `next_vaddr < USER_SPACE_END` (0x0000_8000_0000_0000).
 /// - All `Some` entries have `base_vaddr` page-aligned and within user space.
@@ -148,18 +155,26 @@ impl VmaTracker {
 // `crate::memory::object_table::init()`.
 // ============================================================================
 
-/// SCAFFOLDING: per-process heap size (1 MiB).
+/// SCAFFOLDING: per-process heap size (4 MiB).
 /// Why: default budget per process. Today every process gets a
 ///      contiguous physical heap of this size, allocated from the
 ///      frame allocator in `ProcessDescriptor::new` and freed in
-///      `handle_exit` via `FrameAllocator::free_contiguous`. No
-///      longer tied to a pre-reserved slab.
-/// Replace when: udp-stack is already feeling this. Future: per-service
-///      heap sizing, lazy heap mapping, or growable heap via extra
-///      allocations. See ASSUMPTIONS.md.
-pub const HEAP_SIZE: u64 = 0x100000;
+///      `handle_exit` via `FrameAllocator::free_contiguous`. Bumped
+///      from 1 MiB to 4 MiB because udp-stack was already documented
+///      as feeling the 1 MiB ceiling, and the v1 endgame graphics
+///      workload (ADR-011) will push harder: GUI clients need space
+///      for widget trees, font atlases, and software-rendered
+///      backing stores. 4 MiB is the modest bump that buys today's
+///      services breathing room without overcommitting per-process
+///      memory across all boot modules (7 × 4 MiB = 28 MiB baseline,
+///      comfortable on 128 MiB+ QEMU targets).
+/// Replace when: a process needs more than 4 MiB of heap — the right
+///      fix at that point is per-process heap sizing (spawn
+///      argument), not bumping the global constant again. See
+///      ASSUMPTIONS.md.
+pub const HEAP_SIZE: u64 = 0x400000;
 
-/// Number of 4 KiB frames in a process heap (1 MiB / 4 KiB = 256).
+/// Number of 4 KiB frames in a process heap (4 MiB / 4 KiB = 1024).
 pub const HEAP_PAGES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
 
 /// Errors from `ProcessDescriptor::new` — today, only heap allocation
@@ -263,7 +278,7 @@ impl ProcessDescriptor {
         //   exclusive owner of these frames — nothing else holds a
         //   reference.
         // - The frames form a single contiguous region of
-        //   `HEAP_SIZE = 1 MiB`, which is much larger than
+        //   `HEAP_SIZE = 4 MiB`, which is much larger than
         //   `size_of::<BuddyAllocator>()` (~20 KB). No risk of writing
         //   past the end.
         // - `virt_base` is page-aligned (frame allocator returns
@@ -796,7 +811,7 @@ mod tests {
         for _ in 0..MAX_VMAS {
             assert!(vma.allocate_region(1).is_some());
         }
-        // 65th allocation fails — no free slots
+        // Next allocation after MAX_VMAS fills the tracker → no free slots
         assert!(vma.allocate_region(1).is_none());
         assert_eq!(vma.count(), MAX_VMAS);
     }

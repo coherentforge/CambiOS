@@ -189,6 +189,33 @@ pub fn print(msg: &[u8]) {
     syscall_raw3(SYS_PRINT, msg.as_ptr() as u64, msg.len() as u64, 0);
 }
 
+/// Log an error message. Currently prints to the kernel console.
+///
+/// Future: will also emit an audit event (kernel audit ring) so a log
+/// viewer can surface errors without them stepping on the user's display.
+/// Services should prefer this over `print` for error conditions — it
+/// gives us a single hook to evolve into "silent success, visible failure".
+pub fn log_error(tag: &[u8], msg: &[u8]) {
+    // Assemble a single [TAG] ERROR: msg line to keep output contiguous.
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    let push = |buf: &mut [u8], n: &mut usize, bytes: &[u8]| {
+        let space = buf.len().saturating_sub(*n);
+        let take = core::cmp::min(space, bytes.len());
+        buf[*n..*n + take].copy_from_slice(&bytes[..take]);
+        *n += take;
+    };
+    push(&mut buf, &mut n, b"[");
+    push(&mut buf, &mut n, tag);
+    push(&mut buf, &mut n, b"] ERROR: ");
+    push(&mut buf, &mut n, msg);
+    if n < buf.len() {
+        buf[n] = b'\n';
+        n += 1;
+    }
+    print(&buf[..n]);
+}
+
 pub fn register_endpoint(endpoint_id: u32) -> i64 {
     syscall_raw3(SYS_REGISTER_ENDPOINT, endpoint_id as u64, 0, 0)
 }

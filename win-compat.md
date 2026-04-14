@@ -11,6 +11,7 @@ This document captures the design for CambiOS's Windows application compatibilit
 
 For the identity model that governs how sandboxed processes interact with the system, see [identity.md](identity.md).
 For the object store that mediates file access, see [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md).
+For the authoritative rules defining which Win32 functions are served by static shims vs. the AI translator (the API/AI boundary, plan grammar, validation pipeline, caching, audit schema), see [ADR-010](docs/adr/010-win-compat-api-ai-boundary.md) and the companion [Phase 1 catalog](docs/adr/010-win-compat-phase1-catalog.md). Sections below that describe these topics are kept brief; ADR-010 is the source of truth.
 
 ---
 
@@ -91,19 +92,23 @@ Sandboxed processes have no network access by default. The sandbox policy can gr
            │ IPC                          │ IPC
 ┌──────────▼──────────┐      ┌────────────▼───────────────┐
 │  win-compat          │      │  CambiOS Native Services     │
-│  (endpoint 20)       │──────│  fs-service (16)           │
+│  (endpoint 24)       │──────│  fs-service (16)           │
 │                      │ IPC  │  key-store (17)            │
-│  Single user-space   │──────│  AI translator (21)        │
+│  Single user-space   │──────│  AI translator (25)        │
 │  service crate       │      │  net, print, UI (future)   │
 └──────────┬───────────┘      └───────────────────────────┘
-           │ IPC
+           │ IPC (private
+           │  endpoint per
+           │  sandboxed PE)
 ┌──────────▼──────────┐
-│  Sandboxed PE        │   PE processes ONLY talk to win-compat.
-│  Process             │   One funnel, one trust boundary,
-│  (ring 3, restricted │   one place to audit.
-│   Principal)         │
+│  Sandboxed PE        │   Each PE process gets a private
+│  Process             │   endpoint from the tier-policy pool.
+│  (ring 3, restricted │   Enables per-sandbox capability
+│   Principal)         │   isolation at the IPC layer.
 └─────────────────────┘
 ```
+
+**Endpoint allocation note.** Earlier drafts of this document named endpoint 20 for win-compat and endpoint 21 for the AI translator, but those endpoints are now in use by the virtio-net driver (20) and UDP stack (21). The revised allocation is: win-compat control endpoint = 24, AI translator = 25, with per-sandbox private endpoints drawn from the tier-policy pool (see the endpoint-sizing ADR landing alongside ADR-010).
 
 ### Crate Structure
 
@@ -113,7 +118,7 @@ The entire compatibility layer is a single user-space service crate, following t
 user/
 ├── fs-service/             # existing — endpoint 16
 ├── key-store-service/      # existing — endpoint 17
-└── win-compat/             # endpoint 20
+└── win-compat/             # control endpoint 24; per-sandbox endpoints from tier pool
     ├── Cargo.toml
     ├── link.ld             # linker script (same pattern as fs-service)
     └── src/
@@ -136,7 +141,7 @@ user/
         └── thunk32.rs      # 32-bit compat-mode support (heaven's gate stub)
 ```
 
-The AI translator is the one component that lives outside `win-compat` — it runs as a separate service (endpoint 21) with its own Principal, because it has a fundamentally different resource profile (model weights, inference compute) and its own trust boundary. But from the PE process's perspective, the AI translator doesn't exist. The PE process only ever talks to `win-compat` on endpoint 20.
+The AI translator is the one component that lives outside `win-compat` — it runs as a separate service (endpoint 25) with its own Principal, because it has a fundamentally different resource profile (model weights, inference compute) and its own trust boundary. But from the PE process's perspective, the AI translator doesn't exist. The PE process only ever talks to `win-compat` on its sandbox's private endpoint.
 
 ### Components
 
@@ -152,13 +157,7 @@ The AI translator is the one component that lives outside `win-compat` — it ru
 
 This is the fast path. Known APIs, known translations, no AI involved.
 
-**AI Translator** (endpoint 21, separate service) — The novel component. When the shim layer encounters an API call it doesn't have a static translation for, or when a sequence of calls forms a pattern that needs higher-level understanding, `win-compat` forwards the request to the AI translator over IPC:
-
-1. **JIT translation**: On first encounter of an unknown API call, the translator analyzes the call signature, parameters, and surrounding call context. It generates a translation shim and caches it for future calls. The shim is validated (sandboxed, no privilege escalation) before installation.
-
-2. **Runtime behavioral translation**: For complex patterns — COM object instantiation chains, OLE automation sequences, multi-step dialog flows — the translator observes the pattern and maps it to CambiOS-native behavior. Example: a COM `QueryInterface` → `QueryInterface` → method call chain that implements "save file with format options" gets recognized and translated to a single FS service interaction.
-
-3. **Learning**: Translation shims that work correctly are persisted to the ObjectStore (signed by the compatibility service's Principal). Over time, the shim library grows. Shims can be shared across CambiOS instances via the SSB bridge — a translation that works for QuickBooks on one machine works on all machines.
+**AI Translator** (endpoint 25, separate service) — The novel component. When the shim layer encounters an API call it doesn't have a static translation for, or when a sequence of calls forms a pattern that needs higher-level understanding, `win-compat` forwards the request to the AI translator over IPC. The translator's output is a validated *interpretation plan* (not emitted code) that the dispatcher executes under the sandbox's capabilities. The full plan grammar, validation pipeline, caching model, and signature requirements are in [ADR-010](docs/adr/010-win-compat-api-ai-boundary.md).
 
 **Virtual Filesystem** — Maps Windows path conventions to ObjectStore queries. Maintains a path-to-hash index per sandbox. Handles drive letters, UNC paths, and Windows path separators. Translates Windows file attributes and timestamps to CambiObject metadata.
 
@@ -204,23 +203,11 @@ The AI translator does not aim to produce a pixel-perfect reimplementation of ev
 
 This is where the AI has a structural advantage over static reimplementation: it can recognize patterns at a higher level of abstraction.
 
-### Translation Tiers
+### Translation Tiers and Boundary Rules
 
-**Tier 0 — Static shims (no AI):** Known Win32 APIs with direct CambiOS equivalents. Deterministic, fast, no model inference. This covers the bulk of simple applications.
+The four-tier model (Tier 0 static / Tier 1 JIT / Tier 2 behavioral / Tier 3 interactive) is specified in [ADR-010](docs/adr/010-win-compat-api-ai-boundary.md). The ADR defines the decision procedure (determinism, statefulness, frequency, risk surface, argument complexity), the plan grammar the AI translator emits, the validation pipeline every plan passes before execution, the cache and promotion rules, and the audit schema.
 
-**Tier 1 — JIT shims (AI at first call):** Unknown or rare APIs. The AI analyzes the call once, generates a shim, caches it. Subsequent calls use the cached shim with no inference overhead.
-
-**Tier 2 — Runtime behavioral (AI observes patterns):** Complex multi-call patterns (COM, OLE, dialog management). The AI monitors call sequences and intervenes when it recognizes a higher-level intent. This is the most powerful tier but also the most resource-intensive.
-
-**Tier 3 — Fallback (AI mediates interactively):** When the translator cannot determine intent, it can pause the sandboxed process and ask the user: "QuickBooks is trying to access a printer. Allow?" This is the safety net — the system fails safe by asking rather than guessing.
-
-### Shim Validation
-
-Every AI-generated shim must pass validation before installation:
-- **No privilege escalation** — the shim cannot grant capabilities the sandbox policy doesn't allow
-- **No sandbox escape** — the shim cannot access memory, IPC endpoints, or objects outside the sandbox
-- **Deterministic after caching** — once validated and cached, the shim behaves identically on every invocation
-- **Auditable** — shims are CambiObjects with the AI translator as author, signed and content-hashed
+The companion [Phase 1 catalog](docs/adr/010-win-compat-phase1-catalog.md) applies those rules to the ~100 Win32 functions the Phase 1 target apps (QuickBooks, Sage 50, Lacerte, Drake) call. Summary: ~71 Tier 0 static shims, ~19 Tier 1 JIT plans, 6 Tier 2 behavioral patterns, 4 argument-sensitive routers. New Win32 functions are classified using the ADR's procedure and added to the catalog; the ADR itself changes only if the rules change.
 
 ### Model Placement
 

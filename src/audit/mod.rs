@@ -592,18 +592,50 @@ pub const AUDIT_IPC_SAMPLE_RATE: u32 = 100;
 pub fn emit(event: RawAuditEvent) {
     #[cfg(all(not(any(test, fuzzing)), target_arch = "x86_64"))]
     {
-        // SAFETY: GS base is initialized after boot completes. emit() is only
-        // called from syscall handlers and ISR context, both after boot.
-        let cpu_id = unsafe { crate::arch::x86_64::percpu::current_cpu_id() } as usize;
-        crate::PER_CPU_AUDIT_BUFFER[cpu_id].push(event);
+        // SAFETY: Read GS base raw — if null, per-CPU data is not yet
+        // initialized (early boot, before init_bsp). Drop the event silently.
+        // This can happen when audit::emit() is inlined into load_elf_process(),
+        // which runs during scheduler_init() — before init_hardware_interrupts()
+        // calls init_bsp() to set GS base.
+        let gs_base: u64;
+        // SAFETY: rdmsr of IA32_GS_BASE (0xC0000101) is always safe at ring 0.
+        // rdmsr returns result in EDX:EAX.
+        unsafe {
+            let lo: u32;
+            let hi: u32;
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") 0xC000_0101u32,
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack),
+            );
+            gs_base = ((hi as u64) << 32) | (lo as u64);
+        }
+        if gs_base != 0 {
+            // SAFETY: GS base is valid (non-null), per-CPU data initialized.
+            let cpu_id = unsafe { crate::arch::x86_64::percpu::current_cpu_id() } as usize;
+            crate::PER_CPU_AUDIT_BUFFER[cpu_id].push(event);
+        }
+        // else: early boot, silently drop
     }
 
     #[cfg(all(not(any(test, fuzzing)), target_arch = "aarch64"))]
     {
-        // SAFETY: TPIDR_EL1 is initialized after boot completes. emit() is only
-        // called from syscall handlers and ISR context, both after boot.
-        let cpu_id = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
-        crate::PER_CPU_AUDIT_BUFFER[cpu_id].push(event);
+        // SAFETY: Read TPIDR_EL1 raw — if null, per-CPU data is not yet
+        // initialized (early boot, before init_bsp). Drop the event silently.
+        // This can happen when audit::emit() is inlined into load_elf_process(),
+        // which runs during scheduler_init() — before the AArch64 hardware
+        // init block that calls init_bsp() to set TPIDR_EL1.
+        let tpidr: u64;
+        // SAFETY: mrs is a read-only register access, always safe at EL1.
+        unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) tpidr, options(nostack, nomem)) };
+        if tpidr != 0 {
+            // SAFETY: TPIDR_EL1 is valid (non-null), per-CPU data initialized.
+            let cpu_id = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+            crate::PER_CPU_AUDIT_BUFFER[cpu_id].push(event);
+        }
+        // else: early boot, silently drop
     }
 
     // Under test/fuzzing, emit is a no-op — there is no per-CPU hardware.

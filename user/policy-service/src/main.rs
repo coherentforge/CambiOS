@@ -6,13 +6,16 @@
 //! evaluates against per-process syscall profiles, and sends Allow/Deny
 //! decisions back on endpoint 23.
 //!
-//! v0: returns Allow for all queries (establishes architectural slot
-//! without changing behavior). Phase 3.4b adds real per-process
-//! syscall allowlists.
+//! Phase 3.4b: per-process syscall allowlists keyed on ProcessId slot.
+//! Boot modules are loaded in deterministic order from limine.conf; the
+//! slot assignments below must match that order. When the init-process
+//! boot manifest lands, this hardcoded table is replaced by a signed
+//! per-service profile config.
 //!
 //! IPC protocol (256-byte payload):
 //!   Query (kernel → policy-service):
-//!     [sender_principal:32][from_endpoint:4][query_id:8][caller_pid:4][syscall_num:4][caller_principal:32]
+//!     IPC header: [sender_principal:32][from_endpoint:4]
+//!     Payload:    [query_id:8][caller_pid:4][syscall_num:4][caller_principal:32]
 //!   Response (policy-service → kernel):
 //!     [query_id:8][decision:1]   (0 = Allow, 1 = Deny)
 
@@ -47,18 +50,190 @@ const POLICY_RESP_ENDPOINT: u32 = 23;
 const MIN_QUERY_SIZE: usize = 36 + 48;
 
 // ============================================================================
+// Syscall numbers (must match src/syscalls/mod.rs)
+// ============================================================================
+
+const SYS_EXIT: u32 = 0;
+const SYS_WRITE: u32 = 1;
+const SYS_READ: u32 = 2;
+const SYS_ALLOCATE: u32 = 3;
+const SYS_FREE: u32 = 4;
+const SYS_WAIT_IRQ: u32 = 5;
+const SYS_REGISTER_ENDPOINT: u32 = 6;
+const SYS_YIELD: u32 = 7;
+const SYS_GET_PID: u32 = 8;
+const SYS_GET_TIME: u32 = 9;
+const SYS_PRINT: u32 = 10;
+const SYS_BIND_PRINCIPAL: u32 = 11;
+const SYS_GET_PRINCIPAL: u32 = 12;
+const SYS_RECV_MSG: u32 = 13;
+const SYS_OBJ_PUT: u32 = 14;
+const SYS_OBJ_GET: u32 = 15;
+const SYS_OBJ_DELETE: u32 = 16;
+const SYS_OBJ_LIST: u32 = 17;
+const SYS_CLAIM_BOOTSTRAP_KEY: u32 = 18;
+const SYS_OBJ_PUT_SIGNED: u32 = 19;
+const SYS_MAP_MMIO: u32 = 20;
+const SYS_ALLOC_DMA: u32 = 21;
+const SYS_DEVICE_INFO: u32 = 22;
+const SYS_PORT_IO: u32 = 23;
+const SYS_CONSOLE_READ: u32 = 24;
+const SYS_SPAWN: u32 = 25;
+const SYS_WAIT_TASK: u32 = 26;
+const SYS_REVOKE_CAPABILITY: u32 = 27;
+const SYS_CHANNEL_CREATE: u32 = 28;
+const SYS_CHANNEL_ATTACH: u32 = 29;
+const SYS_CHANNEL_CLOSE: u32 = 30;
+const SYS_CHANNEL_REVOKE: u32 = 31;
+const SYS_CHANNEL_INFO: u32 = 32;
+const SYS_AUDIT_ATTACH: u32 = 33;
+const SYS_AUDIT_INFO: u32 = 34;
+
+// ============================================================================
+// Syscall profiles (bitmap of allowed syscall numbers)
+// ============================================================================
+
+/// A syscall profile is a u64 bitmap — bit N is set if syscall number N
+/// is allowed. Fits all 35 current syscalls in a single word. O(1) check.
+type Profile = u64;
+
+/// Build a profile by OR-ing together syscall bits.
+const fn profile(syscalls: &[u32]) -> Profile {
+    let mut bits: u64 = 0;
+    let mut i = 0;
+    while i < syscalls.len() {
+        bits |= 1u64 << syscalls[i];
+        i += 1;
+    }
+    bits
+}
+
+/// Default profile — common syscalls every identified process may use.
+/// Covers panic (Exit), cooperation (Yield), identity (GetPid, GetPrincipal,
+/// GetTime), and diagnostic output (Print). Nothing that touches shared
+/// state or hardware.
+const DEFAULT_PROFILE: Profile = profile(&[
+    SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_GET_TIME, SYS_PRINT, SYS_GET_PRINCIPAL,
+]);
+
+/// Hello test module — minimal profile, just enough to print and exit.
+const HELLO_PROFILE: Profile = DEFAULT_PROFILE;
+
+/// Key-store service — claims bootstrap key, signs object puts over IPC.
+const KEY_STORE_PROFILE: Profile = DEFAULT_PROFILE
+    | profile(&[
+        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
+        SYS_CLAIM_BOOTSTRAP_KEY, SYS_BIND_PRINCIPAL,
+    ]);
+
+/// FS service — ObjectStore gateway.
+const FS_SERVICE_PROFILE: Profile = DEFAULT_PROFILE
+    | profile(&[
+        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
+        SYS_OBJ_PUT, SYS_OBJ_GET, SYS_OBJ_DELETE, SYS_OBJ_LIST, SYS_OBJ_PUT_SIGNED,
+    ]);
+
+/// Network driver (virtio-net / i219-net) — hardware I/O, DMA, IRQs.
+const NET_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
+    | profile(&[
+        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
+        SYS_WAIT_IRQ, SYS_MAP_MMIO, SYS_ALLOC_DMA, SYS_DEVICE_INFO, SYS_PORT_IO,
+    ]);
+
+/// UDP stack — network protocol service over IPC.
+const UDP_STACK_PROFILE: Profile = DEFAULT_PROFILE
+    | profile(&[SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG]);
+
+/// Shell — user interface, can spawn children and drain audit ring.
+const SHELL_PROFILE: Profile = DEFAULT_PROFILE
+    | profile(&[
+        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
+        SYS_CONSOLE_READ, SYS_SPAWN, SYS_WAIT_TASK,
+        SYS_AUDIT_ATTACH, SYS_AUDIT_INFO,
+    ]);
+
+// ============================================================================
+// ProcessId slot → profile mapping
+// ============================================================================
+//
+// SCAFFOLDING: hardcoded by boot-order slot. The assignments below must match
+// limine.conf's module_path order. Slots 0-2 are kernel processes (never
+// queried). Slot 4 (policy-service) is bypassed by the kernel, so its entry
+// here is defensive-only.
+//
+// Replace when: the init-process boot manifest lands (planned post-v1).
+// At that point this table becomes a signed config file loaded at boot,
+// keyed on Principal + module name rather than fragile slot numbers.
+
+const SLOT_UNUSED: Profile = 0;
+
+/// Profile lookup table, indexed by ProcessId slot.
+/// Out-of-range slots get DEFAULT_PROFILE (conservative: only safe syscalls).
+///
+/// Slot order matches limine.conf module ordering. Network drivers
+/// (virtio-net, i219-net, udp-stack) are currently disabled — their
+/// profiles are kept here for when they return.
+const SLOT_PROFILES: [Profile; 16] = [
+    SLOT_UNUSED,          //  0: kernel idle
+    SLOT_UNUSED,          //  1: kernel process 1
+    SLOT_UNUSED,          //  2: kernel process 2
+    HELLO_PROFILE,        //  3: hello.elf
+    SLOT_UNUSED,          //  4: policy-service (bypassed in kernel)
+    KEY_STORE_PROFILE,    //  5: key-store-service
+    FS_SERVICE_PROFILE,   //  6: fs-service
+    SHELL_PROFILE,        //  7: shell
+    DEFAULT_PROFILE,      //  8+: spawned/unknown — conservative default
+    DEFAULT_PROFILE,      //  9
+    DEFAULT_PROFILE,      // 10
+    DEFAULT_PROFILE,      // 11
+    DEFAULT_PROFILE,      // 12
+    DEFAULT_PROFILE,      // 13
+    DEFAULT_PROFILE,      // 14
+    DEFAULT_PROFILE,      // 15
+];
+
+// Silence "unused" warnings for profiles defined for re-enabling drivers later.
+#[allow(dead_code)]
+const _NET_DRIVER_PROFILE_KEPT: Profile = NET_DRIVER_PROFILE;
+#[allow(dead_code)]
+const _UDP_STACK_PROFILE_KEPT: Profile = UDP_STACK_PROFILE;
+
+/// Return the syscall profile for a given process slot.
+fn profile_for(caller_pid: u32) -> Profile {
+    let slot = caller_pid as usize;
+    if slot < SLOT_PROFILES.len() {
+        let p = SLOT_PROFILES[slot];
+        if p == SLOT_UNUSED {
+            // Slot reserved for kernel or bypassed — be conservative.
+            DEFAULT_PROFILE
+        } else {
+            p
+        }
+    } else {
+        // Out-of-range (unknown spawned process) — conservative default.
+        DEFAULT_PROFILE
+    }
+}
+
+/// Check if `syscall_num` is allowed under `profile`.
+fn is_allowed(profile: Profile, syscall_num: u32) -> bool {
+    if syscall_num >= 64 {
+        return false; // out of bitmap range
+    }
+    (profile & (1u64 << syscall_num)) != 0
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[POLICY] Policy service starting\n");
-
     // Register our query endpoint
     sys::register_endpoint(POLICY_QUERY_ENDPOINT);
 
-    sys::print(b"[POLICY] Endpoint 22 registered, entering query loop\n");
+    sys::print(b"[POLICY] ready on endpoint 22\n");
 
     // Service loop: recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
@@ -78,23 +253,36 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
-        // Extract query_id (first 8 bytes of query payload)
+        // Extract query fields
         let query_id_bytes: [u8; 8] = match payload[0..8].try_into() {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let _query_id = u64::from_le_bytes(query_id_bytes);
+        let caller_pid_bytes: [u8; 4] = match payload[8..12].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let syscall_bytes: [u8; 4] = match payload[12..16].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let caller_pid = u32::from_le_bytes(caller_pid_bytes);
+        let syscall_num = u32::from_le_bytes(syscall_bytes);
 
-        // v0: always Allow. Phase 3.4b will add per-process profile lookup here.
-        // The query also contains caller_pid (bytes 8..12), syscall_num (12..16),
-        // and caller_principal (16..48), which Phase 3.4b will use.
+        // Profile lookup + check
+        let profile = profile_for(caller_pid);
+        let allowed = is_allowed(profile, syscall_num);
 
         // Build response: [query_id:8][decision:1]
         let mut resp = [0u8; 9];
         resp[0..8].copy_from_slice(&query_id_bytes);
-        resp[8] = 0; // 0 = Allow
+        resp[8] = if allowed { 0 } else { 1 };
 
         // Send response to the policy response endpoint (kernel intercepts this)
         sys::write(POLICY_RESP_ENDPOINT, &resp);
     }
 }
+
+// Suppress unused warning for MIN_QUERY_SIZE (kept as documentation of the protocol).
+#[allow(dead_code)]
+const _MIN_QUERY_SIZE: usize = MIN_QUERY_SIZE;

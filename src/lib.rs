@@ -36,6 +36,7 @@ pub mod acpi;
 pub mod fs;
 pub mod boot_modules;
 pub mod audit;
+pub mod policy;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
 
@@ -511,6 +512,33 @@ pub static OBJECT_STORE: Spinlock<Option<Box<fs::ram::RamObjectStore>>> = Spinlo
 /// Read-only after boot. Used by the Spawn syscall to find modules by name.
 pub static BOOT_MODULE_REGISTRY: Spinlock<boot_modules::BootModuleRegistry> =
     Spinlock::new(boot_modules::BootModuleRegistry::new());
+
+// ============================================================================
+// Policy service infrastructure (Phase 3.4, ADR-006)
+// ============================================================================
+
+/// Whether the policy service has been identified and the upcall path is active.
+/// Before this is set, `policy_check()` falls back to Allow (current behavior).
+pub static POLICY_SERVICE_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Raw ProcessId of the policy service process. `u64::MAX` = not yet identified.
+/// Used to bypass policy checks for the policy service's own syscalls
+/// (reentrancy prevention) and to verify response senders.
+pub static POLICY_SERVICE_PID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Pending policy query table. Independent lock domain — never held while
+/// acquiring PER_CPU_SCHEDULER. Two-phase pattern: `complete_query` returns
+/// TaskId, caller drops lock, then wakes.
+pub static POLICY_ROUTER: Spinlock<policy::PolicyRouter> =
+    Spinlock::new(policy::PolicyRouter::new());
+
+/// Per-CPU policy decision cache. Each CPU accesses only its own cache with
+/// interrupts disabled — no lock needed. Same access pattern as
+/// `PER_CPU_AUDIT_BUFFER`. Uses `PolicyCacheCell` (UnsafeCell) for interior
+/// mutability since the static requires Sync but access is strictly per-CPU.
+pub static PER_CPU_POLICY_CACHE: [policy::PolicyCacheCell; MAX_CPUS] =
+    [const { policy::PolicyCacheCell::new() }; MAX_CPUS];
 
 // ============================================================================
 // Per-CPU frame cache — reduces global FRAME_ALLOCATOR lock contention

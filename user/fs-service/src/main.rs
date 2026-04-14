@@ -232,12 +232,10 @@ fn handle_list(response: &mut [u8]) -> usize {
 pub extern "C" fn _start() -> ! {
     let _pid = sys::get_pid();
 
-    sys::print(b"[FS] Filesystem service starting\n");
-
     // Register our IPC endpoint
     sys::register_endpoint(FS_ENDPOINT);
 
-    sys::print(b"[FS] Endpoint 16 registered, entering service loop\n");
+    sys::print(b"[FS] ready on endpoint 16\n");
 
     // Service loop: receive verified message, dispatch command, send response.
     // recv_verified rejects anonymous senders — if the kernel doesn't stamp

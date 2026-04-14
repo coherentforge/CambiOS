@@ -122,8 +122,6 @@ fn handle_get_pubkey(keys: &KeyState, response: &mut [u8]) -> usize {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[KS] Key store service starting\n");
-
     // Step 1: Try to claim the bootstrap secret key from the kernel.
     // In hardware-backed mode (YubiKey), no secret key exists in the kernel
     // and this call returns an error. The service enters degraded mode:
@@ -133,11 +131,8 @@ pub extern "C" fn _start() -> ! {
     let mut keys = KeyState::new();
     let mut sk = [0u8; 64];
     let ret = sys::claim_bootstrap_key(&mut sk);
-    if ret < 0 {
-        sys::print(b"[KS] No kernel secret key available (hardware-backed mode)\n");
-        sys::print(b"[KS] Entering degraded mode - signing unavailable\n");
-        // keys.initialized stays false — sign requests will return ERROR
-    } else {
+    let degraded = ret < 0;
+    if !degraded {
         // Legacy seed mode: store the key in process memory
         keys.secret_key.copy_from_slice(&sk);
         keys.public_key.copy_from_slice(&sk[32..64]);
@@ -147,13 +142,16 @@ pub extern "C" fn _start() -> ! {
         for b in sk.iter_mut() {
             *b = 0;
         }
-
-        sys::print(b"[KS] Bootstrap key claimed, kernel copy zeroed\n");
     }
 
     // Step 2: Register our IPC endpoint
     sys::register_endpoint(KS_ENDPOINT);
-    sys::print(b"[KS] Endpoint 17 registered, entering service loop\n");
+
+    if degraded {
+        sys::print(b"[KS] ready on endpoint 17 (degraded mode, no secret key)\n");
+    } else {
+        sys::print(b"[KS] ready on endpoint 17\n");
+    }
 
     // Step 3: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];

@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-13 (identity gate + load-bearing security)
+last_synced_to_code: 2026-04-13 (Phase GUI-0 bounds bump for ADR-011)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
@@ -14,7 +14,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 
 ## At a glance
 
-- **384 unit tests passing** on host (`x86_64-apple-darwin`)
+- **386 unit tests passing** on host (`x86_64-apple-darwin`)
 - **x86_64**: clean release build, boots in QEMU with 2 CPUs, 7 boot modules running (hello, fs-service, key-store, virtio-net, i219-net, udp-stack, shell)
 - **AArch64**: clean release build, boots in QEMU `virt`, all 7 modules running, full SMP (single-CPU mode tested; SMP timer-on-AP issue tracked)
 - **Bare metal**: USB boot tooling complete (`make img-usb` builds GPT image; `make usb DEVICE=/dev/diskN` writes safely); not yet tested on target hardware (Dell Precision 3630)
@@ -119,17 +119,17 @@ The v1 milestone is "interactive, network-capable, identity-rooted OS running on
 | IPC sender_principal | 4 | Default None, kernel stamping, no-principal path, direct send bypass |
 | ObjectStore types + crypto | 21 | Principal equality, Blake3 hashing, Ed25519 sign/verify, CambiObject creation/author immutability/owner/lineage, ObjectCapSet |
 | RamObjectStore | 12 | Put/get, idempotency, invalid hash rejection, delete, list, capacity, slot reuse, author/owner preservation |
-| Memory subsystem | ~36 | Buddy allocator, frame allocator (including Phase 3.2a `free_contiguous` round-trip + atomicity tests), heap, paging primitives |
+| Memory subsystem | ~37 | Buddy allocator, frame allocator (including Phase 3.2a `free_contiguous` round-trip + atomicity tests), heap, paging primitives; `allocate_contiguous` at `HEAP_PAGES` (Phase GUI-0 bounds bump, ADR-011) |
 | Tier configuration (Phase 3.2a) | 16 | `TableSizingPolicy` field bounds, `num_slots_from` clamp behavior, realistic memory sizes (256 MB / 4 GB / 8 GB / 32 GB / 1 TB) per tier, monotonicity, `binding_constraint_for` per clamp, slot-clamp-shadows-budget-clamp invariant |
 | Kernel object table region (Phase 3.2a) | 5 | `region_bytes_for` page-aligned and monotonic, `init` produces disjoint valid slices with `None` initialization, rejects zero slots, propagates frame-alloc failure |
-| Channel manager (Phase 3.2d) | 28 | ChannelId encoding, ChannelRole permissions, create/attach/close/revoke state machine, table full, principal mismatch, stale generation, slot reuse, revoke_all_for_process, preserve-bystander |
+| Channel manager (Phase 3.2d) | 29 | ChannelId encoding, ChannelRole permissions, create/attach/close/revoke state machine, table full, principal mismatch, stale generation, slot reuse, revoke_all_for_process, preserve-bystander; create-at-MAX_CHANNEL_PAGES ceiling test (Phase GUI-0 bounds bump, ADR-011) |
 | Process lifecycle cleanup (Phase 3.2d.ii) | 3 | VMA reclaim (empty, drains tracker, kernel task noop) |
 | Audit staging buffer (Phase 3.3) | 14 | SPSC ring: push, drain, wrap-around, overflow, interleaved, capacity cycles, take_dropped |
 | Audit event types (Phase 3.3) | 18 | Event kind discriminants, wire format size, builder round-trips for all 16 event types, timestamp/sequence encoding |
 | Audit ring + drain (Phase 3.3) | 12 | Ring header magic/capacity, write/wrap, drain from staging, staging drop reporting, batch bound, consumer attach/detach, capacity math |
 | AArch64 portable logic | 12 | PerCpu offsets, GIC register math, page table descriptor flags |
 | Other | ~70 | Timer, IPC sync channel, ProcessTable, VMA tracker, syscall args, etc. |
-| **Total** | **362** | All passing on `x86_64-apple-darwin` |
+| **Total** | **364** | All passing on `x86_64-apple-darwin` |
 
 Run with: `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`
 

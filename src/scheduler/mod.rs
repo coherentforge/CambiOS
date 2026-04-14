@@ -54,6 +54,7 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
         let cpu_id = unsafe { crate::arch::x86_64::percpu::current_cpu_id() };
         if cpu_id == 0 {
             crate::audit::drain::drain_tick();
+            crate::policy::expire_pending_queries();
         }
     }
     #[cfg(all(not(test), target_arch = "aarch64"))]
@@ -62,6 +63,7 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
         let cpu_id = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() };
         if cpu_id == 0 {
             crate::audit::drain::drain_tick();
+            crate::policy::expire_pending_queries();
         }
     }
 

@@ -121,7 +121,7 @@ impl NetDriver {
         transport.select_queue(RX_QUEUE);
         let rx_qsize = transport.queue_size();
         if rx_qsize == 0 {
-            sys::print(b"[NET] RX queue size is 0\n");
+            sys::print(b"[NET] ERROR: RX queue size is 0\n");
             return None;
         }
         // Use smaller of device's max and our max
@@ -129,35 +129,29 @@ impl NetDriver {
 
         let rx_queue = VirtQueue::new(rx_qsize)?;
         transport.set_queue_pfn(rx_queue.pfn());
-        sys::print(b"[NET] RX queue configured\n");
 
         // Step 5: Set up TX queue (queue 1)
         transport.select_queue(TX_QUEUE_IDX);
         let tx_qsize = transport.queue_size();
         if tx_qsize == 0 {
-            sys::print(b"[NET] TX queue size is 0\n");
+            sys::print(b"[NET] ERROR: TX queue size is 0\n");
             return None;
         }
         let tx_qsize = core::cmp::min(tx_qsize, 32); // Limit to avoid stack overflow
 
         let tx_queue = VirtQueue::new(tx_qsize)?;
         transport.set_queue_pfn(tx_queue.pfn());
-        sys::print(b"[NET] TX queue configured\n");
 
         // Step 6: Mark DRIVER_OK
         transport.set_status(transport::STATUS_DRIVER_OK);
 
         if transport.status() & transport::STATUS_FAILED != 0 {
-            sys::print(b"[NET] Device set FAILED status during init\n");
+            sys::print(b"[NET] ERROR: device set FAILED status during init\n");
             return None;
         }
 
         // Read MAC address
         let mac = transport.read_mac();
-
-        sys::print(b"[NET] Device initialized, MAC=");
-        print_mac(&mac);
-        sys::print(b"\n");
 
         // Step 7: Allocate TX bounce buffer
         let tx_buf = BounceBuffer::new()?;
@@ -324,6 +318,7 @@ impl NetDriver {
     }
 }
 
+#[allow(dead_code)] // Kept for future diagnostic use
 fn print_mac(mac: &[u8; 6]) {
     let mut buf = [0u8; 17];
     for i in 0..6 {
@@ -387,19 +382,15 @@ fn handle_recv_packet(driver: &mut NetDriver, response: &mut [u8]) -> usize {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[NET] Virtio-net driver starting\n");
-
-    // Step 1: Find the virtio-net PCI device
+    // Step 1: Find the virtio-net PCI device (silent on success)
     let dev = match pci::PciDeviceInfo::find_virtio_net() {
         Some(d) => d,
         None => {
-            sys::print(b"[NET] No virtio-net device found\n");
+            // Not an error — expected when running with a non-virtio NIC (e.g., i219)
             sys::register_endpoint(NET_ENDPOINT);
             no_device_loop();
         }
     };
-
-    sys::print(b"[NET] Found virtio-net PCI device\n");
 
     // Step 2: Find the I/O BAR for legacy virtio transport.
     // The BAR address for I/O ports is always < 64K on x86.
@@ -412,7 +403,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
     if io_base == 0 {
-        sys::print(b"[NET] No I/O BAR found\n");
+        sys::print(b"[NET] ERROR: no I/O BAR found on virtio-net device\n");
         sys::register_endpoint(NET_ENDPOINT);
         no_device_loop();
     }
@@ -421,7 +412,7 @@ pub extern "C" fn _start() -> ! {
     let mut driver = match NetDriver::init(io_base) {
         Some(d) => d,
         None => {
-            sys::print(b"[NET] Device initialization failed\n");
+            sys::print(b"[NET] ERROR: device initialization failed\n");
             sys::register_endpoint(NET_ENDPOINT);
             no_device_loop();
         }
@@ -429,7 +420,7 @@ pub extern "C" fn _start() -> ! {
 
     // Step 4: Register IPC endpoint
     sys::register_endpoint(NET_ENDPOINT);
-    sys::print(b"[NET] Endpoint 20 registered, entering service loop\n");
+    sys::print(b"[NET] ready on endpoint 20 (virtio-net)\n");
 
     // Step 5: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];

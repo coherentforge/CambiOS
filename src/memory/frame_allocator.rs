@@ -7,7 +7,7 @@
 //!
 //! Design:
 //! - Bitmap tracks allocation state (1 bit per 4 KiB frame)
-//! - Supports up to 4 GiB physical memory (131072 frames × 4 KiB)
+//! - Supports up to 16 GiB physical memory (4194304 frames × 4 KiB)
 //! - Thread-safe: intended to be wrapped in a Spinlock at the call site
 //! - Excludes reserved regions, kernel heap, and kernel image automatically
 
@@ -16,22 +16,30 @@ use core::fmt;
 /// Page / frame size: 4 KiB
 pub const PAGE_SIZE: u64 = 4096;
 
-/// SCAFFOLDING: physical frame allocator covers the first 2 GiB only.
-/// (524288 frames × 4 KiB = 2 GiB; bitmap is 64 KiB in `.bss`.)
+/// SCAFFOLDING: physical frame allocator covers the first 16 GiB.
+/// (4194304 frames × 4 KiB = 16 GiB; bitmap is 512 KiB in `.bss`.)
 ///
-/// Currently fits both QEMU targets:
+/// Fits both QEMU targets and the Dell 3630 bare-metal target:
 /// - x86_64 QEMU: RAM at 0x0, typically ≤ 512 MiB
 /// - AArch64 QEMU virt: RAM at 0x40000000 (1 GiB), needs frames up to ~1.25 GiB
+/// - Dell 3630 bare metal: 16 GiB RAM — this is why the ceiling was raised
 ///
 /// Why: bitmap-based allocator with .bss-sized bitmap is the simplest correct
-///      implementation; 2 GiB was generous for early development.
-/// Replace when: bare-metal Dell 3630 bring-up — that target has 16 GiB and will
-///      hit this immediately. The bitmap just needs to grow (or move to a tiered
-///      structure). This is a real production blocker, not verification scaffolding.
-///      See ASSUMPTIONS.md.
-const MAX_FRAMES: usize = 524288;
+///      implementation. The old 2 GiB ceiling was a documented bare-metal
+///      blocker (Dell 3630 has 16 GiB); bumping to 16 GiB resolves that and
+///      gives headroom for the v1 endgame graphics workload (ADR-011) which
+///      can hold multi-GiB GPU textures, backing stores, and framebuffers.
+///      Bitmap grows from 64 KiB to 512 KiB in .bss — a 448 KiB increase
+///      in the kernel's runtime memory footprint, no impact on binary size.
+/// Replace when: bare-metal targets with > 16 GiB of RAM need the full
+///      physical range tracked. At that point, consider a tiered structure
+///      (multi-level bitmap or sparse tree) rather than growing the flat
+///      bitmap further — at 32 GiB the bitmap would be 1 MiB, at 64 GiB it
+///      would be 2 MiB, and the linear-scan allocator becomes prohibitively
+///      slow for allocate_contiguous of large regions. See ASSUMPTIONS.md.
+const MAX_FRAMES: usize = 4194304;
 
-/// Bitmap words needed: 131072 / 64 = 2048
+/// Bitmap words needed: 4194304 / 64 = 65536
 const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 
 /// Physical frame allocator using a bitmap.
@@ -42,7 +50,7 @@ const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 ///
 /// # Invariants (for formal verification)
 ///
-/// - `total_frames <= MAX_FRAMES` (524288, covering 0–2 GiB physical).
+/// - `total_frames <= MAX_FRAMES` (4194304, covering 0–16 GiB physical).
 /// - `free_frames <= total_frames` always.
 /// - `free_frames` equals the number of 0-bits in `bitmap[0..total_frames]`.
 /// - `search_hint < BITMAP_WORDS` (wraps around on overflow).
@@ -212,13 +220,16 @@ impl FrameAllocator {
     /// All frames in the run are marked as allocated.
     ///
     /// Two use cases today:
-    /// - DMA buffers (virtio-net, etc.) where the device needs a small
-    ///   (≤ 64-frame / 256 KiB) physically contiguous buffer.
+    /// - DMA buffers (virtio-net, etc.) where the device needs a physically
+    ///   contiguous buffer. Per-call cap is now 32768 frames (128 MiB) —
+    ///   raised for the v1 endgame graphics workload (ADR-011) which needs
+    ///   GPU command buffers and GPU-visible memory regions well above the
+    ///   virtio-net envelope.
     /// - Per-process heaps (Phase 3.2a) where each process needs a
-    ///   `HEAP_SIZE / PAGE_SIZE` contiguous physical run (256 frames /
-    ///   1 MiB by default). Previously capped at 64 frames; cap lifted
-    ///   because heaps are larger and the bitmap scan is `O(total_frames)`
-    ///   regardless of `count`, so there's no runtime concern.
+    ///   `HEAP_SIZE / PAGE_SIZE` contiguous physical run (1024 frames /
+    ///   4 MiB by default). The bitmap scan is `O(total_frames)`
+    ///   regardless of `count`, so there's no per-call runtime concern for
+    ///   reasonably-sized requests.
     pub fn allocate_contiguous(&mut self, count: usize) -> Result<PhysFrame, FrameAllocError> {
         if !self.initialized {
             return Err(FrameAllocError::NotInitialized);
@@ -779,8 +790,9 @@ mod tests {
     #[test]
     fn test_allocate_contiguous_large_run() {
         // Phase 3.2a: the 64-frame cap on allocate_contiguous was lifted so
-        // process heaps (256 frames / 1 MiB by default) can be allocated
-        // through this API. Verify that a 256-frame run works end-to-end.
+        // process heaps (now 1024 frames / 4 MiB by default) can be
+        // allocated through this API. Verify that a 256-frame run works
+        // end-to-end (a still-reasonable stand-in for heap allocation).
         let mut fa = FrameAllocator::new();
         fa.add_region(0x100000, 300 * 4096); // 300 frames
         fa.finalize();
@@ -794,6 +806,22 @@ mod tests {
             fa.allocate_contiguous(256),
             Err(FrameAllocError::OutOfMemory)
         );
+    }
+
+    /// Exercises allocate_contiguous at the new process-heap size
+    /// (HEAP_PAGES = 1024, HEAP_SIZE = 4 MiB) after the v1-endgame bump
+    /// (ADR-011). If this ever regresses, process spawn will fail with
+    /// OOM even though there's enough total RAM — catch it here, not in
+    /// QEMU boot logs.
+    #[test]
+    fn test_allocate_contiguous_heap_sized_run() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 1100 * 4096); // 1100 frames (> HEAP_PAGES=1024)
+        fa.finalize();
+
+        let base = fa.allocate_contiguous(1024).unwrap();
+        assert_eq!(base.addr, 0x100000);
+        assert_eq!(fa.free_count(), 76);
     }
 
     #[test]

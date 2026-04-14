@@ -628,7 +628,13 @@ impl SyscallDispatcher {
     fn handle_allocate(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let size = args.arg_usize(1);
 
-        if size == 0 || size > 1024 * 1024 {
+        // SCAFFOLDING: per-call size cap is 64 MiB.
+        // Why: enables large general-purpose allocations (texture staging,
+        //      software-renderer back buffers, font atlases) without forcing
+        //      channel use. Sized for the v1 endgame graphics target (ADR-011).
+        // Replace when: a legitimate workload needs > 64 MiB in a single
+        //      allocate call. See ASSUMPTIONS.md.
+        if size == 0 || size > 64 * 1024 * 1024 {
             return Err(SyscallError::InvalidArg);
         }
         if ctx.cr3 == 0 {
@@ -1382,7 +1388,17 @@ impl SyscallDispatcher {
         let phys_addr = args.arg1;
         let num_pages = args.arg2_u32();
 
-        if num_pages == 0 || num_pages > 256 {
+        // SCAFFOLDING: per-call MMIO mapping cap is 16384 pages (64 MiB).
+        // Why: a 4K framebuffer at 32bpp is 8192 pages (32 MiB); HDR (64bpp)
+        //      doubles that. Sized for the v1 endgame graphics target
+        //      (ADR-011) — a single display's framebuffer fits in one call,
+        //      with room for 5K headroom. Multi-monitor compositors use
+        //      multiple MapMmio calls (one per display), so per-call ceiling
+        //      at 64 MiB is sufficient.
+        // Replace when: single-display HDR surfaces exceed 64 MiB, or a
+        //      workload needs a single large MMIO region larger than that.
+        //      See ASSUMPTIONS.md.
+        if num_pages == 0 || num_pages > 16384 {
             return Err(SyscallError::InvalidArg);
         }
         if phys_addr & 0xFFF != 0 {
@@ -1454,7 +1470,17 @@ impl SyscallDispatcher {
         let _flags = args.arg2_u32(); // Reserved for IOMMU hints
         let out_paddr_ptr = args.arg3;
 
-        if num_pages == 0 || num_pages > 64 {
+        // SCAFFOLDING: per-call DMA allocation cap is 32768 pages (128 MiB).
+        // Why: GPU command buffers and GPU-visible memory regions need
+        //      physically-contiguous DMA backing well above virtio-net's
+        //      64-page envelope. Sized for the v1 endgame graphics target
+        //      (ADR-011). GiB-class GPU texture regions remain a future
+        //      bump — higher limits interact with allocate_contiguous's
+        //      linear-scan cost on the frame allocator bitmap.
+        // Replace when: GPU driver work needs GiB-class single DMA
+        //      allocations, at which point also revisit the
+        //      allocate_contiguous algorithm. See ASSUMPTIONS.md.
+        if num_pages == 0 || num_pages > 32768 {
             return Err(SyscallError::InvalidArg);
         }
         if out_paddr_ptr == 0 || out_paddr_ptr >= USER_SPACE_END {

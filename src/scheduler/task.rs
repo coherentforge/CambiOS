@@ -282,6 +282,8 @@ pub enum BlockReason {
     DebuggerWait,
     /// Waiting for child process
     ChildWait,
+    /// Waiting for policy service to respond to a syscall query (Phase 3.4)
+    PolicyWait(u64),
 }
 
 impl fmt::Display for BlockReason {
@@ -296,6 +298,7 @@ impl fmt::Display for BlockReason {
             BlockReason::TimerWait(ms) => write!(f, "TimerWait({}ms)", ms),
             BlockReason::DebuggerWait => write!(f, "DebuggerWait"),
             BlockReason::ChildWait => write!(f, "ChildWait"),
+            BlockReason::PolicyWait(qid) => write!(f, "PolicyWait({})", qid),
         }
     }
 }

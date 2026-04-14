@@ -1006,6 +1006,15 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 let short_name = strip_module_name(path);
                 BOOT_MODULE_REGISTRY.lock().register(short_name, addr, size as usize);
 
+                // Phase 3.4: identify the policy service by module name
+                if short_name == b"policy-service" {
+                    arcos_core::POLICY_SERVICE_PID.store(
+                        process_id.as_raw(),
+                        core::sync::atomic::Ordering::Release,
+                    );
+                    println!("    ✓ Policy service identified as process {}", process_id.slot());
+                }
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.0, result.process_id.slot(), result.entry_point
@@ -1020,6 +1029,13 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
     if loaded_count > 0 {
         println!("✓ Loaded {} signed module(s) as user processes", loaded_count);
+        // Phase 3.4: Enable policy enforcement if the policy service was loaded.
+        // The fail-open timeout handles the startup window before the policy
+        // service processes its first query.
+        if arcos_core::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire) != u64::MAX {
+            arcos_core::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
+            println!("✓ Policy enforcement enabled (fail-open until service starts)");
+        }
     }
 
     // Phase 3.2c: NEXT_PROCESS_ID removed — process table allocates
@@ -1189,7 +1205,7 @@ fn process_table_init() {
 
     // Create process descriptors for the first 3 processes (matching
     // task count). Each one gets a freshly allocated heap region via
-    // FrameAllocator::allocate_contiguous (256 frames / 1 MiB each).
+    // FrameAllocator::allocate_contiguous (1024 frames / 4 MiB each).
     // Phase 3.2c: slot + generation assigned by process table.
     for i in 0..3 {
         match pt.create_process(&mut fa_guard, /* create_page_table = */ false) {

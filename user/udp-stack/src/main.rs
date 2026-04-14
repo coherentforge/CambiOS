@@ -625,55 +625,29 @@ fn udp_recv(out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
 // ============================================================================
 
 fn run_ntp_demo(cache: &mut ArpCache, our_mac: &[u8; 6]) {
-    sys::print(b"[UDP] NTP demo: querying time.google.com (216.239.35.0)\n");
-
-    // Build and send NTP request
+    // Silent-on-success: NTP demo validates the UDP path, but only errors
+    // are printed. The demo is verification-only; results are discarded.
     let ntp_req = build_ntp_request();
     if !udp_send(cache, our_mac, &NTP_SERVER_IP, NTP_CLIENT_PORT, NTP_PORT, &ntp_req) {
         sys::print(b"[UDP] NTP send failed\n");
         return;
     }
-    sys::print(b"[UDP] NTP request sent, waiting for response...\n");
 
-    // Poll for NTP response
+    // Poll for NTP response. Silent on success, silent on timeout (demo only).
     let mut payload = [0u8; 128];
     for _ in 0..500 {
         if let Some((_src_ip, src_port, len)) = udp_recv(&mut payload) {
             if src_port == NTP_PORT && len >= NTP_PACKET_LEN {
-                if let Some(unix_ts) = parse_ntp_response(&payload[..len]) {
-                    print_ntp_result(unix_ts);
+                if parse_ntp_response(&payload[..len]).is_some() {
                     return;
                 }
             }
         }
     }
-    sys::print(b"[UDP] NTP response timeout\n");
-}
-
-fn print_ntp_result(unix_ts: u64) {
-    sys::print(b"[UDP] NTP response received!\n");
-    sys::print(b"[UDP] Unix timestamp: ");
-    print_u64(unix_ts);
-    sys::print(b"\n");
-
-    // Convert to UTC date/time
-    let (year, month, day, hour, minute, second) = unix_to_datetime(unix_ts);
-    sys::print(b"[UDP] UTC time: ");
-    print_u64(year as u64);
-    sys::print(b"-");
-    print_padded_u8(month);
-    sys::print(b"-");
-    print_padded_u8(day);
-    sys::print(b" ");
-    print_padded_u8(hour);
-    sys::print(b":");
-    print_padded_u8(minute);
-    sys::print(b":");
-    print_padded_u8(second);
-    sys::print(b" UTC\n");
 }
 
 /// Convert Unix timestamp to (year, month, day, hour, minute, second).
+#[allow(dead_code)]
 fn unix_to_datetime(ts: u64) -> (u32, u8, u8, u8, u8, u8) {
     let second = (ts % 60) as u8;
     let ts = ts / 60;
@@ -713,6 +687,7 @@ fn unix_to_datetime(ts: u64) -> (u32, u8, u8, u8, u8, u8) {
     (year, month, day, hour, minute, second)
 }
 
+#[allow(dead_code)]
 fn is_leap_year(y: u32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
@@ -830,11 +805,6 @@ fn handle_set_config(data: &[u8], resp: &mut [u8]) -> usize {
     gw.copy_from_slice(&data[4..8]);
     mask.copy_from_slice(&data[8..12]);
     set_network_config(ip, gw, mask);
-    sys::print(b"[UDP] Network config updated: IP=");
-    print_ip(&ip);
-    sys::print(b" GW=");
-    print_ip(&gw);
-    sys::print(b"\n");
     resp[0] = STATUS_OK;
     1
 }
@@ -881,9 +851,11 @@ fn handle_dhcp_send(our_mac: &[u8; 6], data: &[u8], resp: &mut [u8]) -> usize {
 }
 
 // ============================================================================
-// Printing helpers
+// Printing helpers (kept for future diagnostic use; currently silenced per
+// the "chat on fail only" policy — see services cleanup, Phase 3.4b).
 // ============================================================================
 
+#[allow(dead_code)]
 fn print_u64(mut val: u64) {
     if val == 0 {
         sys::print(b"0");
@@ -899,11 +871,13 @@ fn print_u64(mut val: u64) {
     sys::print(&buf[i..]);
 }
 
+#[allow(dead_code)]
 fn print_padded_u8(val: u8) {
     let buf = [b'0' + val / 10, b'0' + val % 10];
     sys::print(&buf);
 }
 
+#[allow(dead_code)]
 fn print_ip(ip: &[u8; 4]) {
     for i in 0..4 {
         print_u64(ip[i] as u64);
@@ -913,6 +887,7 @@ fn print_ip(ip: &[u8; 4]) {
     }
 }
 
+#[allow(dead_code)]
 fn print_mac(mac: &[u8; 6]) {
     let mut buf = [0u8; 17];
     for i in 0..6 {
@@ -934,47 +909,29 @@ fn print_mac(mac: &[u8; 6]) {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[UDP] UDP stack starting\n");
-
     // Step 1: Get our MAC from virtio-net
     let our_mac = match net_get_mac() {
-        Some(mac) => {
-            sys::print(b"[UDP] Our MAC: ");
-            print_mac(&mac);
-            sys::print(b"\n");
-            mac
-        }
+        Some(mac) => mac,
         None => {
-            sys::print(b"[UDP] Failed to get MAC from virtio-net\n");
+            sys::print(b"[UDP] ERROR: failed to get MAC from virtio-net\n");
             sys::register_endpoint(UDP_ENDPOINT);
             error_loop();
         }
     };
 
-    // Step 2: ARP resolve gateway
+    // Step 2: ARP resolve gateway (silent on success)
     let mut cache = ArpCache::new();
     let gw = gateway_ip();
-    sys::print(b"[UDP] ARP: resolving gateway ");
-    print_ip(&gw);
-    sys::print(b"\n");
-
-    match arp_resolve(&mut cache, &our_mac, &gw) {
-        Some(gw_mac) => {
-            sys::print(b"[UDP] Gateway MAC: ");
-            print_mac(&gw_mac);
-            sys::print(b"\n");
-        }
-        None => {
-            sys::print(b"[UDP] ARP resolution failed for gateway\n");
-        }
+    if arp_resolve(&mut cache, &our_mac, &gw).is_none() {
+        sys::print(b"[UDP] ERROR: ARP resolution failed for gateway\n");
     }
 
-    // Step 3: NTP demo
+    // Step 3: NTP demo (silent on success)
     run_ntp_demo(&mut cache, &our_mac);
 
     // Step 4: Register service endpoint and enter service loop
     sys::register_endpoint(UDP_ENDPOINT);
-    sys::print(b"[UDP] Endpoint 21 registered, entering service loop\n");
+    sys::print(b"[UDP] ready on endpoint 21\n");
     service_loop(&mut cache, &our_mac)
 }
 

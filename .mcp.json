@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rust-analyzer": {
+      "command": "/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/Tooling/mcp-rust-analyzer/.venv/bin/python3",
+      "args": ["-m", "mcp_rust_analyzer"],
+      "env": {
+        "WORKSPACE_ROOT": "/Users/jasonricca/Library/CloudStorage/OneDrive-Personal/Synthesis/coding/ArcOS/Dev"
+      }
+    }
+  }
+}
