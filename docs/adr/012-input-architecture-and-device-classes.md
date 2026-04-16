@@ -35,7 +35,7 @@ What is *not* on this path:
 
 - **Audio input (microphones)** — different transport pattern (USB audio class, bounded-latency ring buffer), tied to audio services. Future ADR.
 - **Video input (cameras)** — document/media flow, tied to media services. Future ADR.
-- **Printers / scanners** — document flow, not event flow. Future *ADR-014: Peripheral and document-flow services*.
+- **Printers / scanners** — document flow, not event flow. Future *ADR-TBD: Peripheral and document-flow services*.
 
 The span of classes and the unevenness of identity / stateful / rate requirements rules out a single one-size endpoint. But most of them share enough shape that an aggregator service with per-class routing is the right answer.
 
