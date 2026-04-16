@@ -42,6 +42,8 @@ POLICY_SERVICE_DIR := user/policy-service
 POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-policy-service
 FB_DEMO_DIR := user/fb-demo
 FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/arcos-fb-demo
+COMPOSITOR_DIR := user/compositor
+COMPOSITOR_ELF := $(COMPOSITOR_DIR)/target/x86_64-unknown-none/release/arcos-compositor
 
 # User-space ELF binaries (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
@@ -56,6 +58,7 @@ UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/ar
 SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/arcos-shell
 POLICY_SERVICE_ELF_AARCH64 := $(POLICY_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-policy-service
 FB_DEMO_ELF_AARCH64 := $(FB_DEMO_DIR)/target/aarch64-unknown-none/release/arcos-fb-demo
+COMPOSITOR_ELF_AARCH64 := $(COMPOSITOR_DIR)/target/aarch64-unknown-none/release/arcos-compositor
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -74,7 +77,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo compositor user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -150,6 +153,13 @@ fb-demo:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== fb-demo ready ==="
 
+compositor:
+	@echo "=== Building compositor (Phase Scanout-1, ADR-014) ==="
+	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== compositor ready ==="
+
 # AArch64 user-space build targets
 user-elf-aarch64:
 	@echo "=== Building user-space ELF (AArch64) ==="
@@ -220,6 +230,13 @@ fb-demo-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== fb-demo (AArch64) ready ==="
 
+compositor-aarch64:
+	@echo "=== Building compositor (AArch64) ==="
+	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== compositor (AArch64) ready ==="
+
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release
@@ -239,7 +256,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo compositor sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -254,12 +271,14 @@ iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo
 	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
 	cp $(FB_DEMO_ELF) iso_root/boot/fb-demo.elf
+	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fb-demo.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -555,7 +574,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 shell-aarch64 policy-service-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 shell-aarch64 policy-service-aarch64 compositor-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -572,17 +591,20 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(FS_SERVICE_ELF_AARCH64) /tmp/fs-service-signed.elf
 	cp $(BLK_DRIVER_ELF_AARCH64) /tmp/virtio-blk-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
+	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/shell-signed.elf
+	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/shell-signed.elf /tmp/compositor-signed.elf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
