@@ -1,6 +1,7 @@
 /target
 user/*/target/
 tools/*/target/
+verification/*/target/
 *.iso
 *.img
 *.elf

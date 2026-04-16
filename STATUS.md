@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-16 (Phase 4b + RISC-V Phase R-2: Sv48 higher-half + DTB parser + frame allocator + kernel heap + Box::new end-to-end on QEMU virt; overlay-aware init_kernel_heap handles full-RAM-plus-reservations boot maps; Phase 4b boot cleanup + arcobj end-to-end carry forward from earlier 2026-04-16)
+last_synced_to_code: 2026-04-16 (Phase 4b + RISC-V Phase R-2: Sv48 higher-half + DTB parser + frame allocator + kernel heap + Box::new end-to-end on QEMU virt; overlay-aware init_kernel_heap handles full-RAM-plus-reservations boot maps; Phase 4b boot cleanup + arcobj end-to-end carry forward from earlier 2026-04-16; first Kani proof live — `BuddyAllocator::free` reserved-prefix safety verified for all offsets in [16, 256] byte prefixes via `make verify`)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 -->
 
@@ -73,6 +73,7 @@ authoritative_for: what is built vs designed vs planned, current test counts, cu
 | **AI pre-execution code analysis** | Planned (post-v1) | JIT analysis of ELF binaries before execution | — | [CambiOS.md § AI Integration](CambiOS.md) |
 | **Behavioral anomaly detection (AI)** | Planned (post-v1) | Runtime monitoring service consuming audit telemetry | — | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) |
 | **AI compatibility layer (Win32)** | Planned (post-v1) | Long-term vision item from CambiOS.md | — | [CambiOS.md § Application Compatibility](CambiOS.md) |
+| **Formal verification (Kani)** | Started 2026-04-16 | First proof live: `BuddyAllocator::free` rejects every offset inside the reserved prefix, for all prefix sizes in [16, 256] bytes (Kani 0.67.0, 150 checks pass in ~18s). Proof crate path-includes the kernel's `buddy_allocator.rs` so the proven source is the same source the kernel compiles — no fork. Run via `make verify`. Next candidates: allocate-then-free roundtrip, non-overlapping allocations, double-free rejection; widen prefix bound from 256 to allocator-state size (~20 KiB) once `mark_range` unwind cost is measured. | `verification/buddy-proofs/` | — |
 
 ## Phase markers
 

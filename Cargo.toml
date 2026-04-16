@@ -3,7 +3,7 @@
 [workspace]
 # User-space crates and tools are built separately (different targets, linker scripts).
 # Exclude them from the kernel workspace to prevent accidental cross-compilation.
-exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user/virtio-blk", "user/i219-net", "user/udp-stack", "user/shell", "user/policy-service", "user/libsys", "user/fb-demo", "tools/sign-elf"]
+exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user/virtio-blk", "user/i219-net", "user/udp-stack", "user/shell", "user/policy-service", "user/libsys", "user/fb-demo", "tools/sign-elf", "verification/buddy-proofs"]
 
 [package]
 name = "arcos"
