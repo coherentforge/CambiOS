@@ -32,6 +32,7 @@
 //! melodic-tumbling-muffin.md`.
 
 pub mod entry;
+pub mod paging;
 pub mod percpu;
 pub mod plic;
 pub mod syscall;

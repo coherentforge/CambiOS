@@ -33,6 +33,7 @@
 //! | TLB shootdown IPI  | TLBI broadcast         | Hardware-assisted on v8.4+  |
 
 pub mod gic;
+pub mod paging;
 pub mod percpu;
 pub mod syscall;
 pub mod timer;
