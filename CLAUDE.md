@@ -89,8 +89,8 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Build RISC-V kernel (release) — Phase R-0 done; full kernel currently
-# fails to compile pending Phase R-1 arch backend. ADR-013.
+# Build RISC-V kernel (release). See ADR-013 / STATUS.md for backend phase state;
+# some phases intentionally don't build while the backend is under construction.
 cargo build --target riscv64gc-unknown-none-elf --release
 
 # Tri-arch regression gate (MANDATORY before commits). During Phases
@@ -177,7 +177,7 @@ These tools return semantically precise results (no false positives from comment
 
 CambiOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting **x86_64**, **AArch64**, and **riscv64gc** (Phase R-0 done; full backend in progress per [ADR-013](docs/adr/013-riscv64-architecture-support.md)). It boots via the Limine v8.x protocol on x86_64 and AArch64; via OpenSBI + custom S-mode stub on RISC-V. Preemptive multitasking with ring 3 (x86), EL0 (AArch64), or U-mode (RISC-V) user tasks.
 
-**Current state:** see [STATUS.md](STATUS.md). That file is the canonical source for what is built, what is in progress, and what is planned, including test counts, subsystem status, phase markers, v1 roadmap progress, and known issues. **This file (CLAUDE.md) is the technical reference for the kernel** — conventions, rules, lock ordering, build commands, required-reading map. Status info is intentionally not duplicated here so the two files cannot drift.
+**Current state:** see [STATUS.md](STATUS.md) — the canonical source for what is built, in progress, and planned, including test counts, subsystem status, phase markers, v1 roadmap progress, and known issues. **This file (CLAUDE.md) is the technical reference for the kernel** — conventions, rules, lock ordering, build commands, required-reading map. Do not duplicate status info here, to avoid drift.
 
 ## Toolchain
 
@@ -432,7 +432,7 @@ Handlers live in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs). Behav
 
 ## Development Conventions
 
-1. **Every `unsafe` block MUST have a `// SAFETY:` comment** explaining why the operation is safe. This was comprehensively audited — maintain it.
+1. **Every `unsafe` block MUST have a `// SAFETY:` comment** explaining why the operation is safe. Citing alignment, bounds, aliasing, or lifetime invariants is the point — "trust me" is not a SAFETY comment.
 
 2. **Lock ordering** (see above) must always be followed. Never acquire a lower-numbered lock while holding a higher-numbered one.
 
@@ -464,7 +464,7 @@ const MAX_GSI_PINS: usize = 24;
 const CACHE_CAPACITY: usize = 32;
 ```
 
-**SCAFFOLDING bounds must be sized for the v1 endgame, not today's workload.** When picking a SCAFFOLDING value, do not pick "the smallest number that works today" with the plan to resize later. Extrapolate forward across the full v1 sequence: Phase 3 (channels, policy service, audit telemetry), Phase 4 (persistent ObjectStore + virtio-blk), Phase 5 (Yggdrasil mesh networking), the init process spawning services from a boot manifest, and per-service state growth as the kernel matures. A bound that is comfortably above today's usage but gets crossed during v1 development is the worst case — it looks fine at review time and silently becomes a bottleneck during the subphases where changing it is most disruptive. The rule:
+**SCAFFOLDING bounds must be sized for the v1 endgame, not today's workload.** Do not pick "the smallest number that works today" and plan to resize later. Extrapolate forward across the full v1 sequence ([STATUS.md](STATUS.md) has the phase list and per-service growth). A bound that's comfortable today but gets crossed during v1 is the worst case — it looks fine at review and silently becomes a bottleneck in the subphase where changing it is most disruptive. The rule:
 
 1. Estimate **(a)** current workload, **(b)** v1 workload after all phases land, **(c)** memory cost at candidate multiples of the v1 estimate.
 2. Pick the smallest value where the v1 estimate is approximately **≤ 25% of the bound** AND the memory cost is still comfortable. "≤ 25%" means the bound has ~4× headroom above the v1 estimate — enough that a surprising workload or an unplanned consumer (a new audit channel, a second policy cache) does not push against the wall.
@@ -593,21 +593,91 @@ These documents capture architectural decisions that implementation must align w
 
 Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
 
+## Worked Examples
+
+Concrete before/after examples for recurring multi-place changes. A diff beats a paragraph of rules: it names every file touched and proves the steps are complete by construction.
+
+### Adding a new syscall
+
+Seven places must change atomically. Skipping any one produces a specific failure mode named below. The canonical reference is the `TryRecvMsg = 37` landing — every step below is taken verbatim from that change.
+
+**(1) Declare the variant** — [src/syscalls/mod.rs](src/syscalls/mod.rs), in the `SyscallNumber` enum.
+```rust
+/// SYS_TRY_RECV_MSG (37): non-blocking variant of RecvMsg. Returns 0
+/// immediately if no message is queued, instead of parking the task
+/// on `MessageWait(endpoint)`. …
+TryRecvMsg = 37,
+```
+*Skipping:* userspace hits `SyscallError::Enosys` because `from_u64` doesn't know the number.
+
+**(2) Classify identity requirement** — same file, `requires_identity()` match.
+```rust
+Self::Write | Self::Read | Self::RecvMsg | Self::TryRecvMsg |
+```
+*Skipping:* if the new syscall touches identity-bearing state and you forget this arm, unidentified processes can call it. The `identity_required_syscalls_are_gated` test below fails — that is the safety net. **Do not silence the test by adding the syscall to the `EXEMPT` set unless the syscall genuinely needs no identity** (check the small exempt list for precedent).
+
+**(3) Wire `from_u64`** — same file.
+```rust
+37 => Some(Self::TryRecvMsg),
+```
+*Skipping:* runtime dispatch returns `None`, the kernel returns `Enosys`, the syscall appears un-implemented.
+
+**(4) Update test coverage** — same file, `#[cfg(test)] mod tests`.
+```rust
+// Add to the `all` array in identity_required_syscalls_are_gated:
+SyscallNumber::TryRecvMsg,
+
+// Extend the range in all_syscall_numbers_covered:
+for i in 0..=37u64 { … }
+```
+*Skipping:* the new variant isn't exercised by `all_syscall_numbers_covered` (test passes vacuously) and isn't checked against the exempt set (test passes because the check iterates `all`, not the enum). Both tests are *cooperative* — they only catch omissions when you also maintain the arrays. This is by design; treat it as a prompt to think about coverage.
+
+**(5) Dispatch the call** — [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs), in `handle_syscall`'s dispatch match.
+```rust
+SyscallNumber::TryRecvMsg => Self::handle_try_recv_msg(args, &ctx),
+```
+*Skipping:* compile error (match non-exhaustive). This is the one step the compiler catches for free.
+
+**(6) Implement the handler** — same file.
+```rust
+fn handle_try_recv_msg(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+    let endpoint_id = args.arg1_u32();
+    let user_buf = args.arg2;
+    let buf_len = args.arg_usize(3);
+    // … capability check → IPC recv → page-walk to user buffer …
+}
+```
+*Skipping:* compile error at step (5). Paired with it.
+
+**(7) Expose the userspace wrapper** — [user/libsys/src/lib.rs](user/libsys/src/lib.rs). Add the `SYS_*` constant alongside the others, then the safe wrapper.
+```rust
+const SYS_TRY_RECV_MSG: u64 = 37;
+
+pub fn try_recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
+    syscall_raw3(SYS_TRY_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+```
+*Skipping:* userspace services can't call the syscall without raw `asm!`. The kernel side works; every consumer is broken until libsys catches up.
+
+**Verification:** after all seven, `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin` must pass (identity-gate tests exercise the new variant), and `make check-stable` must build clean on x86_64 + aarch64.
+
+**Stop-and-Ask triggers in this flow:** does the new syscall belong in the exempt set? (Almost always no — default to identity-required.) Does it introduce a new kind of capability check? (If yes, trip the unread-subsystem gate on `src/ipc/capability.rs` first.) Does it need a new arch backend helper? (If yes, add to all three arch modules.)
+
 ## Verification Strategy
 
 - Trait-based abstractions for property-based verification
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- Unit tests run on host macOS target (`x86_64-apple-darwin`). Current count is derived — run `make stats` or `make test`. Test categories span: portable AArch64 logic, identity/ObjectStore/crypto, signed ELF verifier, capability revocation, tier configuration + kernel object tables, BuddyAllocator reserved-prefix, system capabilities, ProcessId generation counters, audit infrastructure (staging + event types + ring/drain), identity gate (exempt set validation + coverage + minimality), ceiling bounds, BootInfo abstraction, DiskObjectStore + block device. [STATUS.md](STATUS.md) tracks per-subsystem coverage notes.
+- Unit tests run on host macOS target (`x86_64-apple-darwin`); run `make stats` or `make test` for the current count. [STATUS.md](STATUS.md) tracks per-subsystem coverage — do not enumerate categories here (they drift).
 
 ## Post-Change Review Protocol
 
-After any code change, run through this checklist systematically before considering the change complete.
+Run this checklist after any code change, before considering it complete.
 
 ### Scope triage (do this first)
 
-Running the full 8-step protocol on a typo fix produces fatigue that gets paid in skipped steps later. Decide which tier applies before you start:
+Running the full 8-step protocol on a typo fix produces fatigue paid for later in skipped steps. Decide which tier applies first:
 
 - **Small change** — typo, comment prose, whitespace, unused-import removal, local variable rename, STATUS.md note, or documentation-only edit that doesn't touch invariants. Run only **§1 (Build Verification)** and **§8 (Documentation Sync)**. Skip §2–§7.
 - **Subsystem change** — anything that touches a module's public API, an `unsafe` block, the lock hierarchy, the syscall ABI, the boot path, a kernel invariant, a cross-cutting concern, or an ADR-worthy decision. Run the **full protocol §1–§8, in order**. This tier is where drift becomes load-bearing.
@@ -639,10 +709,10 @@ make run-aarch64    # AArch64
 ```
 All builds and clippy must pass with zero errors. Do not skip any step.
 
-**Flag pre-existing warnings.** Any warning surfaced by `cargo build` / `cargo test` / `cargo clippy` — even pre-existing and unrelated to the current change — must be acknowledged, not silently passed through. Warnings accumulate, and "pre-existing and unrelated" is how technical debt becomes invisible. Two acceptable responses:
+**Flag pre-existing warnings.** Any build/test/clippy warning — even pre-existing — must be acknowledged, not silently passed through. "Pre-existing and unrelated" is how technical debt becomes invisible. Two responses:
 
-- **Tiny and safe → fix it in the same change.** Unused imports, unused variables, dead `let` bindings, trivially redundant casts. These take seconds and clearing them keeps build output clean for the next change.
-- **Otherwise → report and track.** Surface the warning explicitly to the user (file:line, warning text, one-line note) and add it to [STATUS.md](STATUS.md)'s "Known issues" section (or another tracked list) so it is not forgotten. Silent pass-through is not acceptable, because build noise is how formal-verification prep and human review lose signal.
+- **Tiny and safe → fix it in the same change.** Unused imports/variables, dead bindings, trivially redundant casts. Seconds to clear, keeps build output clean.
+- **Otherwise → report and track.** Surface it to the user (file:line + warning text) and add to [STATUS.md](STATUS.md)'s Known Issues. Silent pass-through loses signal for formal-verification prep and human review.
 
 ### 2. Safety Audit
 - Every `unsafe` block has a `// SAFETY:` comment explaining the invariants

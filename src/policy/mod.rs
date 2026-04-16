@@ -439,6 +439,9 @@ pub fn policy_check(
     #[cfg(target_arch = "aarch64")]
     // SAFETY: TPIDR_EL1 initialized after boot; cpu_id is a pure read.
     let cpu_id = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: `tp` initialized after boot; cpu_id is a pure read.
+    let cpu_id = unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
 
     // Check cache (entries are per-CPU, accessed only from current CPU)
     // SAFETY: per-CPU access — we are running on this CPU. No concurrent
@@ -544,6 +547,8 @@ pub fn policy_check(
     let wake_cpu = unsafe { crate::arch::x86_64::percpu::current_cpu_id() } as usize;
     #[cfg(target_arch = "aarch64")]
     let wake_cpu = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    #[cfg(target_arch = "riscv64")]
+    let wake_cpu = unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
 
     // SAFETY: per-CPU access — we are running on this CPU after wake.
     // No concurrent reader or writer can access this CPU's cache slot.

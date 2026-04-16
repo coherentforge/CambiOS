@@ -18,6 +18,19 @@ rustflags = [
     "-C", "relocation-model=static",
 ]
 
+# code-model=medium is required for higher-half kernels on RISC-V.
+# The default (medlow) assumes all symbols fit in a ±2 GiB window around 0,
+# which cannot reach 0xffff_ffff_8000_0000. medium uses a 2-instruction
+# auipc+addi sequence for 32-bit PC-relative addressing, which covers
+# our higher-half layout.
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=--script=linker-riscv64.ld",
+    "-C", "link-arg=-z", "-C", "link-arg=noexecstack",
+    "-C", "relocation-model=static",
+    "-C", "code-model=medium",
+]
+
 [alias]
 kbuild = "build --target x86_64-unknown-none"
 ktest = "test --lib"

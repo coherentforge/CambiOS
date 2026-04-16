@@ -580,6 +580,15 @@ impl Scheduler {
     /// Blocking the idle task is a fatal error—it cuts off the fallback
     /// task that schedule() relies on to avoid NoReadyTasks.
     pub fn block_task(&mut self, task_id: TaskId, reason: BlockReason) -> Result<(), ScheduleError> {
+        // Blocking pattern invariant (CLAUDE.md § Timer / Preemptive
+        // Scheduling): interrupts must be disabled before block_task, or
+        // the timer ISR can see Blocked state before yield saves the
+        // correct context. Host stub returns false so this passes under
+        // `cargo test --lib`.
+        debug_assert!(
+            !crate::arch::interrupts_enabled(),
+            "block_task called with interrupts enabled — see CLAUDE.md blocking pattern",
+        );
         // Safety check: never block idle task
         if task_id == TaskId(0) {
             return Err(ScheduleError::InvalidTaskState);

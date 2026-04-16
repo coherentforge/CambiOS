@@ -32,6 +32,9 @@
 
 pub mod limine;
 
+#[cfg(target_arch = "riscv64")]
+pub mod riscv;
+
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};

@@ -173,6 +173,16 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
         // SAFETY: Lock is held; inner.get() gives exclusive access.
         let inner = unsafe { &mut *self.inner.get() };
 
+        // Pre-init allocation is a callsite bug: something ran before
+        // memory::init() and tried to allocate on the kernel heap. The
+        // silent null-return below is the correct release-build fallback
+        // but hides the callsite; this assert names it directly in debug
+        // builds so the failure lands at the bad call, not downstream.
+        debug_assert!(
+            inner.initialized,
+            "kernel heap alloc before memory::init()",
+        );
+
         if !inner.initialized {
             self.release();
             return ptr::null_mut();

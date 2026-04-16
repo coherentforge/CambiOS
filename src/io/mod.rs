@@ -7,8 +7,12 @@
 //!
 //! - **x86_64**: Uses uart_16550 crate (port-mapped I/O at 0x3F8 / COM1)
 //! - **AArch64**: Uses PL011 UART (MMIO at 0x0900_0000 on QEMU `virt`)
+//! - **riscv64**: Uses NS16550-compatible UART (MMIO at 0x1000_0000 on
+//!   QEMU `virt`). See [ADR-013](../../docs/adr/013-riscv64-architecture-support.md)
+//!   § Decision 6 (generic-first: address from DTB at runtime, default
+//!   only applies if DTB parse is unavailable).
 //!
-//! In both cases, SERIAL1 is protected by a spinlock for multicore safety.
+//! In all cases, SERIAL1 is protected by a spinlock for multicore safety.
 
 use core::fmt;
 #[cfg(target_arch = "x86_64")]
@@ -87,6 +91,72 @@ const PL011_PHYS_BASE: u64 = 0x0900_0000;
 #[cfg(target_arch = "aarch64")]
 static SERIAL1: Spinlock<Option<Pl011>> = Spinlock::new(None);
 
+// ============================================================================
+// RISC-V: NS16550-compatible UART (MMIO, 8-bit registers)
+// ============================================================================
+
+/// NS16550 UART driver for RISC-V.
+///
+/// Simpler than PL011: 8-bit register access (vs PL011's 32-bit), no
+/// DMA, no hardware flow control. Register layout per the UART 16550
+/// datasheet. On QEMU `virt` the chip is strapped to 115200 baud and
+/// we don't need to configure divisors.
+#[cfg(target_arch = "riscv64")]
+pub struct Ns16550 {
+    base: usize,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Ns16550 {
+    /// THR: Transmit Holding Register (write) / RHR: Receive (read)
+    const THR: usize = 0;
+    /// LSR: Line Status Register
+    const LSR: usize = 5;
+    /// LSR.THRE (Transmit Holding Register Empty) — bit 5
+    const LSR_THRE: u8 = 1 << 5;
+    /// LSR.DR (Data Ready) — bit 0
+    const LSR_DR: u8 = 1 << 0;
+
+    /// Create a new NS16550 driver at the given MMIO base address.
+    pub const fn new(base: usize) -> Self {
+        Self { base }
+    }
+
+    /// Write a single byte, blocking until THR is empty.
+    pub fn send(&mut self, byte: u8) {
+        // SAFETY: base points to the NS16550 MMIO region. LSR and THR
+        // are 8-bit volatile MMIO accesses.
+        unsafe {
+            let lsr = (self.base + Self::LSR) as *const u8;
+            // Spin until TX holding register empty
+            while core::ptr::read_volatile(lsr) & Self::LSR_THRE == 0 {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile((self.base + Self::THR) as *mut u8, byte);
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl fmt::Write for Ns16550 {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            self.send(byte);
+        }
+        Ok(())
+    }
+}
+
+/// QEMU `virt` machine NS16550 physical base address. Translated
+/// through HHDM at init time. In production the address is discovered
+/// from the DTB (Phase R-1 boot stub) — this constant is the default.
+#[cfg(target_arch = "riscv64")]
+const NS16550_PHYS_BASE: u64 = 0x1000_0000;
+
+/// Global NS16550 serial port, spinlock-protected for multicore safety.
+#[cfg(target_arch = "riscv64")]
+static SERIAL1: Spinlock<Option<Ns16550>> = Spinlock::new(None);
+
 /// Initialize the I/O subsystem
 ///
 /// # Safety
@@ -110,6 +180,16 @@ pub unsafe fn init() {
         let hhdm = crate::hhdm_offset();
         let virt_base = (PL011_PHYS_BASE + hhdm) as usize;
         *guard = Some(Pl011::new(virt_base));
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut guard = SERIAL1.lock();
+        // SAFETY: NS16550_PHYS_BASE is the standard UART0 physical MMIO address
+        // on QEMU virt. HHDM offset set by the S-mode boot stub before io::init.
+        // Called once during single-hart boot.
+        let hhdm = crate::hhdm_offset();
+        let virt_base = (NS16550_PHYS_BASE + hhdm) as usize;
+        *guard = Some(Ns16550::new(virt_base));
     }
 }
 
@@ -181,6 +261,24 @@ pub fn read_byte() -> Option<u8> {
             }
         }
     }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut guard = SERIAL1.lock();
+        let serial = guard.as_mut()?;
+
+        // NS16550: check LSR.DR (bit 0). If set, a byte is waiting in RHR.
+        // SAFETY: base points to the NS16550 MMIO region, initialized at boot.
+        unsafe {
+            let lsr = core::ptr::read_volatile((serial.base + Ns16550::LSR) as *const u8);
+            if lsr & Ns16550::LSR_DR != 0 {
+                let data = core::ptr::read_volatile((serial.base + Ns16550::THR) as *const u8);
+                Some(data)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Interface trait for verification and integration testing
@@ -204,6 +302,19 @@ impl OutputWriter for SerialPort {
 
 #[cfg(target_arch = "aarch64")]
 impl OutputWriter for Pl011 {
+    fn write_byte(&mut self, byte: u8) {
+        self.send(byte);
+    }
+
+    fn write_str(&mut self, s: &str) {
+        for byte in s.bytes() {
+            self.send(byte);
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl OutputWriter for Ns16550 {
     fn write_byte(&mut self, byte: u8) {
         self.send(byte);
     }

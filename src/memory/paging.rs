@@ -119,6 +119,11 @@ pub fn map_page(
     flags: PageTableFlags,
     frame_alloc: &mut FrameAllocator,
 ) -> Result<(), PagingError> {
+    // `containing_address` silently truncates misaligned inputs; that hides
+    // off-by-one / byte-offset-mistaken-for-frame bugs at callers. Assert
+    // the contract at the API boundary in debug builds.
+    debug_assert_eq!(virt_addr & 0xFFF, 0, "map_page virt_addr not page-aligned");
+    debug_assert_eq!(phys_addr & 0xFFF, 0, "map_page phys_addr not page-aligned");
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_addr));
     let frame = X86PhysFrame::containing_address(PhysAddr::new(phys_addr));
 

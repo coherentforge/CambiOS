@@ -35,6 +35,15 @@ pub struct PlatformFeatures {
     pub gicv3: bool,       // GICv3 interrupt controller
     #[cfg(target_arch = "aarch64")]
     pub generic_timer: bool, // ARM Generic Timer
+    // RISC-V feature detection is refined in Phase R-4 (reading misa CSR +
+    // probing SBI extensions). Phase R-1 ships a minimal stub so the struct
+    // is inhabitable on riscv64.
+    #[cfg(target_arch = "riscv64")]
+    pub rv64gc: bool,      // Base ISA (RV64G + C compressed) — required
+    #[cfg(target_arch = "riscv64")]
+    pub supervisor: bool,  // S-mode supported (always true — we run in it)
+    #[cfg(target_arch = "riscv64")]
+    pub sbi: bool,         // Supervisor Binary Interface (OpenSBI provides)
 }
 
 impl PlatformInfo {
@@ -81,6 +90,23 @@ impl PlatformInfo {
                     gicv3: true,
                     // ARM Generic Timer is mandatory in ARMv8-A
                     generic_timer: true,
+                },
+            }
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            // Phase R-1 stub: feature probing (misa CSR read, SBI
+            // extension probes) lands in Phase R-4. Per ADR-013 we
+            // report generic RV64GC + SBI; vendor-identifying CSRs
+            // (mvendorid/marchid/mimpid) are M-mode-only on most
+            // boards and exposed only via DTB — wire that in R-4.
+            PlatformInfo {
+                vendor: "RISC-V",
+                architecture: "riscv64gc",
+                features: PlatformFeatures {
+                    rv64gc: true,
+                    supervisor: true,
+                    sbi: true,
                 },
             }
         }
@@ -142,6 +168,8 @@ pub fn cpu_vendor() -> &'static str {
     { "x86-64" }
     #[cfg(target_arch = "aarch64")]
     { PlatformInfo::detect().vendor }
+    #[cfg(target_arch = "riscv64")]
+    { "RISC-V" }
 }
 
 /// Get CPU model string
@@ -150,6 +178,8 @@ pub fn cpu_model() -> &'static str {
     { "Generic x86-64" }
     #[cfg(target_arch = "aarch64")]
     { "ARMv8-A" }
+    #[cfg(target_arch = "riscv64")]
+    { "Generic RV64GC" }
 }
 
 /// Interface for platform verification

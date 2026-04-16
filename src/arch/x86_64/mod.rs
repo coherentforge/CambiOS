@@ -29,6 +29,38 @@ pub mod tlb;
 use crate::scheduler::CpuContext;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Read the current CPU's interrupt-enable state.
+///
+/// Returns `true` if maskable interrupts are enabled (RFLAGS.IF set).
+/// Used by portable `debug_assert!` at call sites that require interrupts
+/// masked — see CLAUDE.md § Timer / Preemptive Scheduling for the
+/// blocking pattern.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    let rflags: u64;
+    // SAFETY: pushfq/pop is a pure read of RFLAGS; nomem + preserves_flags
+    // tell the compiler no memory or flags side-effects occur.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {0}",
+            out(reg) rflags,
+            options(nomem, preserves_flags),
+        );
+    }
+    (rflags & (1 << 9)) != 0 // RFLAGS.IF
+}
+
+/// Host-test stub. On `x86_64-apple-darwin` the kernel interrupt model
+/// doesn't apply; return `false` so `debug_assert!(!interrupts_enabled())`
+/// passes silently under `cargo test --lib`.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    false
+}
+
 // ============================================================================
 // Explicit context switch primitives (global_asm — no compiler interference)
 // ============================================================================

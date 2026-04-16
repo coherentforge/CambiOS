@@ -300,6 +300,11 @@ pub mod paging {
         page_flags: flags::PageFlags,
         frame_alloc: &mut FrameAllocator,
     ) -> Result<(), PagingError> {
+        // Masking below is tolerant in release builds (preserves existing
+        // behavior) but hides callsite bugs where a byte-offset was mistaken
+        // for a frame-aligned address. Assert the contract at the boundary.
+        debug_assert_eq!(virt_addr & 0xFFF, 0, "map_page virt_addr not page-aligned");
+        debug_assert_eq!(phys_addr & 0xFFF, 0, "map_page phys_addr not page-aligned");
         let va = virt_addr & !0xFFF; // Page-align
         let pa = phys_addr & !0xFFF;
 

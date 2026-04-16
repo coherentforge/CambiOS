@@ -561,6 +561,8 @@ pub fn load_elf_process(
     const ISR_FRAME_SIZE: u64 = 288;
     #[cfg(target_arch = "x86_64")]
     const ISR_FRAME_SIZE: u64 = size_of::<crate::arch::SavedContext>() as u64;
+    #[cfg(target_arch = "riscv64")]
+    const ISR_FRAME_SIZE: u64 = crate::arch::riscv64::ISR_FRAME_SIZE;
     let saved_ctx_addr = kstack_top - ISR_FRAME_SIZE;
     let saved_ctx = saved_ctx_addr as *mut crate::arch::SavedContext;
 
@@ -593,6 +595,25 @@ pub fn load_elf_process(
                 sp_el0: DEFAULT_STACK_TOP,
             };
             // x29 (FP) and x30 (LR) are zero — first entry has no caller
+            core::ptr::write(saved_ctx, ctx);
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            // RISC-V U-mode task entry. On sret, the hart restores:
+            //   PC ← sepc (entry_point)
+            //   privilege ← SPP (must be 0 for U-mode)
+            //   SIE ← SPIE (1 so interrupts are enabled after sret)
+            // sp lives in gpr[2] (x2 = sp per RISC-V ABI).
+            let mut gpr = [0u64; 32];
+            gpr[2] = DEFAULT_STACK_TOP; // x2 = sp
+            let ctx = crate::arch::SavedContext {
+                gpr,
+                sepc: metadata.entry_point,
+                // sstatus: SPP=0 (previous mode was U), SPIE=1 (SIE restored
+                // to 1 after sret), SIE stays 0 in S-mode until sret.
+                // Bit 5 (SPIE) = 0x20.
+                sstatus: 0x20,
+            };
             core::ptr::write(saved_ctx, ctx);
         }
     }

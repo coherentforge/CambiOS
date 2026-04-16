@@ -613,8 +613,8 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     }
 
     println!();
-    println!("Phase R-2.c milestone: heap + frame allocator + Box::new OK.");
-    println!("Next: shared paging module RISC-V arm (R-2.d).");
+    println!("Phase R-2 milestone: Sv48 + higher-half + DTB + heap + Box::new OK.");
+    println!("Next: trap vector + SBI timer + scheduler (Phase R-3).");
     println!("Halting.");
 
     // Phase R-3 will continue with trap vector + scheduler from here.

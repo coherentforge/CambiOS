@@ -30,6 +30,12 @@ pub mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::*;
 
+#[cfg(target_arch = "riscv64")]
+pub mod riscv64;
+
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::*;
+
 // ============================================================================
 // Portable TLB shootdown wrapper (Phase 3.2d.iii)
 // ============================================================================
@@ -58,4 +64,14 @@ pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
     // AArch64 shootdown_range is inherently safe (TLBI + DSB + ISB),
     // but we wrap it as unsafe to match the portable API contract.
     aarch64::tlb::shootdown_range(virt_addr, page_count as usize);
+}
+
+/// RISC-V variant: local `sfence.vma` only in Phase R-1/R-3.
+/// Phase R-5 will extend this to broadcast via SBI IPI across harts.
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
+    // SAFETY: Local sfence.vma is safe from S-mode. Cross-hart coherence
+    // lands in Phase R-5 (ADR-013 Decision 5) via SBI IPI.
+    riscv64::tlb::shootdown_range(virt_addr, page_count as usize);
 }

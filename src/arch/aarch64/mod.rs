@@ -38,6 +38,33 @@ pub mod syscall;
 pub mod timer;
 pub mod tlb;
 
+/// Read the current CPU's IRQ-enable state.
+///
+/// Returns `true` if IRQs are unmasked (DAIF.I *clear*). Used by portable
+/// `debug_assert!` at call sites that require interrupts masked — see
+/// CLAUDE.md § Timer / Preemptive Scheduling.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    let daif: u64;
+    // SAFETY: mrs is a pure read of DAIF; nomem + preserves_flags hold.
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, daif",
+            out(reg) daif,
+            options(nomem, preserves_flags),
+        );
+    }
+    (daif & (1 << 7)) == 0 // DAIF.I; clear = IRQs enabled
+}
+
+/// Host-test stub (same rationale as the x86_64 version).
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    false
+}
+
 /// GDT compatibility shim.
 ///
 /// AArch64 has no segment selectors — privilege is managed via exception
