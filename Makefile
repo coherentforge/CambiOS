@@ -340,7 +340,7 @@ run-uefi: iso
 # Usage: make img-x86 && sudo dd if=cambios-x86.img of=/dev/diskN bs=1M
 IMG_X86 := cambios-x86.img
 
-img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service sign-tool limine
+img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service virtio-blk compositor sign-tool limine
 	@echo "=== Building x86_64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_X86)
 	dd if=/dev/zero of=$(IMG_X86) bs=1M count=64
@@ -360,6 +360,8 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	cp $(UDP_STACK_ELF) /tmp/udp-stack-signed.elf
 	cp $(SHELL_ELF) /tmp/shell-signed.elf
 	cp $(POLICY_SERVICE_ELF) /tmp/policy-service-signed.elf
+	cp $(BLK_DRIVER_ELF) /tmp/virtio-blk-signed.elf
+	cp $(COMPOSITOR_ELF) /tmp/compositor-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
@@ -368,6 +370,8 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
 	mcopy -i $(IMG_X86) /tmp/hello-signed.elf ::/boot/hello.elf
 	mcopy -i $(IMG_X86) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_X86) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
@@ -376,7 +380,9 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	mcopy -i $(IMG_X86) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
 	mcopy -i $(IMG_X86) /tmp/shell-signed.elf ::/boot/shell.elf
 	mcopy -i $(IMG_X86) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
-	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/policy-service-signed.elf
+	mcopy -i $(IMG_X86) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
+	mcopy -i $(IMG_X86) /tmp/compositor-signed.elf ::/boot/compositor.elf
+	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/policy-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/compositor-signed.elf
 	mcopy -i $(IMG_X86) limine.conf ::/limine.conf
 	mcopy -i $(IMG_X86) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_X86) ready ==="
