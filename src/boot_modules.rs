@@ -8,7 +8,7 @@
 //! kernel's lifetime.
 
 /// Maximum number of boot modules the registry can track.
-const MAX_MODULES: usize = 16;
+pub(crate) const MAX_MODULES: usize = 16;
 
 /// Maximum length of a module name (bytes).
 const MAX_NAME_LEN: usize = 64;
@@ -121,6 +121,97 @@ pub fn strip_module_name(path: &[u8]) -> &[u8] {
     }
 }
 
+// ============================================================================
+// Sequential boot-release chain
+//
+// The kernel parks modules 1..N in `BlockReason::BootGate` at load time
+// and releases them one-at-a-time as each predecessor calls the
+// `SYS_MODULE_READY` syscall. This replaces the old "all modules Ready
+// immediately, race to init" model with a deterministic chain whose
+// ordering is fixed by `limine.conf`.
+//
+// Invariants:
+// - Only module 0 (the first in limine.conf) starts `Ready` at boot. All
+//   other loaded modules start `Blocked` on `BootGate` via
+//   `Scheduler::block_task`.
+// - `BOOT_MODULE_ORDER` is populated in `load_boot_modules` with the
+//   TaskIds in limine.conf order.
+// - `next_to_release` starts at 1 (module 0 is already Running).
+// - Each `sys_module_ready` call from a boot module advances the cursor
+//   by one and wakes the task at the new cursor position.
+// - Once `next_to_release >= len`, the chain is complete and subsequent
+//   `sys_module_ready` calls are no-ops (harmless for modules that call
+//   it redundantly or for late-loaded modules).
+// ============================================================================
+
+use crate::scheduler::TaskId;
+
+/// Ordered roster of boot-loaded tasks + a cursor tracking which one to
+/// release next. Populated by `load_boot_modules`, advanced by
+/// `handle_module_ready`.
+pub struct BootModuleOrder {
+    tasks: [Option<TaskId>; MAX_MODULES],
+    len: u8,
+    /// Index of the next module to unblock. Starts at 1 because module 0
+    /// is the first module in limine.conf and runs `Ready` from boot.
+    /// Reaching `len` means the chain is complete.
+    next_to_release: u8,
+}
+
+impl Default for BootModuleOrder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BootModuleOrder {
+    pub const fn new() -> Self {
+        Self {
+            tasks: [None; MAX_MODULES],
+            len: 0,
+            next_to_release: 1,
+        }
+    }
+
+    /// Append a TaskId to the ordered roster. Returns false if full.
+    pub fn push(&mut self, tid: TaskId) -> bool {
+        let idx = self.len as usize;
+        if idx >= MAX_MODULES {
+            return false;
+        }
+        self.tasks[idx] = Some(tid);
+        self.len += 1;
+        true
+    }
+
+    /// Advance the release cursor. Returns the TaskId of the module now
+    /// eligible to run (to be unblocked by the caller), or `None` if the
+    /// chain is complete.
+    pub fn advance(&mut self) -> Option<TaskId> {
+        let idx = self.next_to_release as usize;
+        if idx >= self.len as usize {
+            return None;
+        }
+        let tid = self.tasks[idx];
+        self.next_to_release += 1;
+        tid
+    }
+
+    /// Number of registered boot tasks.
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Current cursor position. Diagnostic / test use.
+    pub fn cursor(&self) -> u8 {
+        self.next_to_release
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +260,71 @@ mod tests {
         reg.register(b"shell", data.as_ptr(), 1);
         assert_eq!(reg.get_name(0), Some(b"shell".as_slice()));
         assert_eq!(reg.get_name(1), None);
+    }
+
+    // ========================================================================
+    // BootModuleOrder — sequential boot-release chain
+    // ========================================================================
+
+    #[test]
+    fn test_boot_order_new_is_empty() {
+        let order = BootModuleOrder::new();
+        assert_eq!(order.len(), 0);
+        assert!(order.is_empty());
+        assert_eq!(order.cursor(), 1);
+    }
+
+    #[test]
+    fn test_boot_order_push_grows_len() {
+        let mut order = BootModuleOrder::new();
+        assert!(order.push(TaskId(1)));
+        assert!(order.push(TaskId(2)));
+        assert!(order.push(TaskId(3)));
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn test_boot_order_push_fills_to_capacity() {
+        let mut order = BootModuleOrder::new();
+        for i in 0..MAX_MODULES as u32 {
+            assert!(order.push(TaskId(i)));
+        }
+        assert_eq!(order.len(), MAX_MODULES);
+        // Overflow pushed entries must be refused.
+        assert!(!order.push(TaskId(999)));
+        assert_eq!(order.len(), MAX_MODULES);
+    }
+
+    #[test]
+    fn test_boot_order_advance_walks_chain() {
+        let mut order = BootModuleOrder::new();
+        order.push(TaskId(10));  // module 0
+        order.push(TaskId(20));  // module 1
+        order.push(TaskId(30));  // module 2
+
+        // Initial cursor is 1: module 0 runs first without any advance().
+        // First advance returns module 1 (TaskId(20)).
+        assert_eq!(order.advance(), Some(TaskId(20)));
+        // Second advance returns module 2 (TaskId(30)).
+        assert_eq!(order.advance(), Some(TaskId(30)));
+        // Third advance: chain complete.
+        assert_eq!(order.advance(), None);
+        // Repeated advances past the end stay None — idempotent.
+        assert_eq!(order.advance(), None);
+    }
+
+    #[test]
+    fn test_boot_order_advance_on_empty_is_none() {
+        let mut order = BootModuleOrder::new();
+        assert_eq!(order.advance(), None);
+    }
+
+    #[test]
+    fn test_boot_order_single_module_has_no_chain_work() {
+        let mut order = BootModuleOrder::new();
+        order.push(TaskId(5));
+        // len == 1, cursor starts at 1, so advance() returns None
+        // immediately — there's nothing after module 0 to release.
+        assert_eq!(order.advance(), None);
     }
 }

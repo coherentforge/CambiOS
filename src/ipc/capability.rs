@@ -19,7 +19,8 @@ use core::fmt;
 ///
 /// Phase 3.2b introduces `CreateProcess` as the first system capability
 /// (ADR-008 § Migration Path). Phase 3.2d.iii adds `CreateChannel`
-/// (ADR-005).
+/// (ADR-005). Phase GUI-0+ (ADR-011) adds `LegacyPortIo`,
+/// `MapFramebuffer`, and `LargeChannel` for the future graphics stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityKind {
     /// IPC endpoint access with specific rights.
@@ -32,6 +33,25 @@ pub enum CapabilityKind {
     /// Right to create shared-memory channels (Phase 3.2d.iii, ADR-005).
     /// Checked at `SYS_CHANNEL_CREATE` before allocating channel memory.
     CreateChannel,
+    /// Right to access whitelisted ISA legacy I/O ports via
+    /// `SYS_PORT_IO` ([ADR-011](docs/adr/011-graphics-architecture-and-scaling.md)).
+    /// Currently the whitelist is `0x60` and `0x64` (PS/2 controller). Granted
+    /// only to PS/2 input driver boot modules. Without this capability, a
+    /// `SYS_PORT_IO` to a non-PCI-BAR port returns `PermissionDenied`.
+    /// Reserved for future input-driver landings; not yet checked anywhere.
+    LegacyPortIo,
+    /// Right to call `SYS_MAP_FRAMEBUFFER` and receive a per-display
+    /// framebuffer mapping ([ADR-011](docs/adr/011-graphics-architecture-and-scaling.md)).
+    /// Granted to the compositor (pre-GPU) and gpu-driver (post-GPU). Without
+    /// this capability the syscall returns `PermissionDenied`. The kernel
+    /// holds the physical framebuffer address; userspace never specifies it.
+    MapFramebuffer,
+    /// Right to allocate channels above the standard `MAX_CHANNEL_PAGES`
+    /// envelope per-call ([ADR-011](docs/adr/011-graphics-architecture-and-scaling.md)
+    /// — graphics surface buffers can run to hundreds of MiB at 4K HDR).
+    /// Reserved for future tier-aware policy enforcement; not yet checked.
+    /// Today every process may allocate up to `MAX_CHANNEL_PAGES` (256 MiB).
+    LargeChannel,
 }
 
 /// Errors from capability operations
@@ -95,6 +115,18 @@ pub struct ProcessCapabilities {
     /// System capability: can this process create shared-memory channels?
     /// Phase 3.2d.iii (ADR-005). Checked at `SYS_CHANNEL_CREATE`.
     create_channel: bool,
+    /// System capability: can this process access whitelisted ISA legacy
+    /// I/O ports (PS/2 controller, etc.) via `SYS_PORT_IO`?
+    /// Phase GUI-0+ (ADR-011). Reserved for future input-driver work.
+    legacy_port_io: bool,
+    /// System capability: can this process map a Limine-reported
+    /// framebuffer via `SYS_MAP_FRAMEBUFFER`?
+    /// Phase GUI-0 (ADR-011). Granted to the compositor/gpu-driver.
+    map_framebuffer: bool,
+    /// System capability: can this process allocate channels above the
+    /// standard per-call envelope?
+    /// Phase GUI-0+ (ADR-011). Reserved for future tier-aware policy.
+    large_channel: bool,
 }
 
 impl ProcessCapabilities {
@@ -107,6 +139,9 @@ impl ProcessCapabilities {
             principal: None,
             create_process: false,
             create_channel: false,
+            legacy_port_io: false,
+            map_framebuffer: false,
+            large_channel: false,
         }
     }
 
@@ -244,6 +279,9 @@ impl ProcessCapabilities {
         match kind {
             CapabilityKind::CreateProcess => self.create_process = true,
             CapabilityKind::CreateChannel => self.create_channel = true,
+            CapabilityKind::LegacyPortIo => self.legacy_port_io = true,
+            CapabilityKind::MapFramebuffer => self.map_framebuffer = true,
+            CapabilityKind::LargeChannel => self.large_channel = true,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -253,6 +291,9 @@ impl ProcessCapabilities {
         match kind {
             CapabilityKind::CreateProcess => self.create_process,
             CapabilityKind::CreateChannel => self.create_channel,
+            CapabilityKind::LegacyPortIo => self.legacy_port_io,
+            CapabilityKind::MapFramebuffer => self.map_framebuffer,
+            CapabilityKind::LargeChannel => self.large_channel,
             CapabilityKind::Endpoint => false,
         }
     }
@@ -262,6 +303,9 @@ impl ProcessCapabilities {
         match kind {
             CapabilityKind::CreateProcess => self.create_process = false,
             CapabilityKind::CreateChannel => self.create_channel = false,
+            CapabilityKind::LegacyPortIo => self.legacy_port_io = false,
+            CapabilityKind::MapFramebuffer => self.map_framebuffer = false,
+            CapabilityKind::LargeChannel => self.large_channel = false,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -711,9 +755,12 @@ impl CapabilityManager {
         }
         caps.count = 0;
 
-        // Clear system capabilities (Phase 3.2b, 3.2d.iii)
+        // Clear system capabilities (Phase 3.2b, 3.2d.iii, Phase GUI-0+).
         caps.create_process = false;
         caps.create_channel = false;
+        caps.legacy_port_io = false;
+        caps.map_framebuffer = false;
+        caps.large_channel = false;
 
         Ok(count)
     }

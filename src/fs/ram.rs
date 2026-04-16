@@ -89,9 +89,12 @@ impl RamObjectStore {
 }
 
 impl ObjectStore for RamObjectStore {
-    fn get(&self, hash: &[u8; 32]) -> Result<&CambiObject, StoreError> {
+    fn get(&mut self, hash: &[u8; 32]) -> Result<CambiObject, StoreError> {
         let idx = self.find_index(hash).ok_or(StoreError::NotFound)?;
-        self.objects[idx].as_ref().ok_or(StoreError::NotFound)
+        self.objects[idx]
+            .as_ref()
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
     fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError> {
@@ -120,7 +123,7 @@ impl ObjectStore for RamObjectStore {
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError> {
+    fn list(&mut self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError> {
         let mut result = Vec::with_capacity(self.count);
         for i in 0..MAX_OBJECTS {
             if let Some(ref obj) = self.objects[i] {
@@ -172,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_get_not_found() {
-        let store = make_store();
+        let mut store = make_store();
         let fake_hash = [0xFFu8; 32];
         assert_eq!(store.get(&fake_hash), Err(StoreError::NotFound));
     }
@@ -244,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_list_empty() {
-        let store = make_store();
+        let mut store = make_store();
         let listing = store.list().unwrap();
         assert!(listing.is_empty());
     }

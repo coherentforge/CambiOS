@@ -201,6 +201,28 @@ pub enum SyscallNumber {
     /// capacity, consumer attached, per-CPU staging occupancy) into
     /// a user buffer. Any process may call.
     AuditInfo = 34,
+
+    /// map_framebuffer(index: u32, out_desc: *mut u8, desc_len: u32) -> i32
+    /// Map a Limine-reported framebuffer (selected by zero-based
+    /// `index`) into the calling process and write a 32-byte
+    /// `FramebufferDescriptor` to `out_desc`:
+    ///   { vaddr: u64, width: u32, height: u32, pitch: u32, bpp: u16,
+    ///     red_size: u8, red_shift: u8,
+    ///     green_size: u8, green_shift: u8,
+    ///     blue_size: u8, blue_shift: u8, _reserved: u8 }
+    /// Returns 0 on success.
+    /// Capability-gated: requires `CapabilityKind::MapFramebuffer`.
+    /// Phase GUI-0 ([ADR-011](docs/adr/011-graphics-architecture-and-scaling.md)).
+    MapFramebuffer = 35,
+    /// SYS_MODULE_READY (36): signal that this boot module has finished
+    /// initialization. The kernel's boot-release chain advances: the next
+    /// module in `BOOT_MODULE_ORDER` (if any) is unblocked from
+    /// `BlockReason::BootGate` so it can run its own `_start`.
+    /// No arguments, no return payload (returns 0).
+    /// Intentionally identity-exempt — boot modules can call this before
+    /// the rest of the trusted-service chain is up (e.g., key-store
+    /// isn't needed for signing a no-op call).
+    ModuleReady = 36,
 }
 
 impl SyscallNumber {
@@ -227,7 +249,8 @@ impl SyscallNumber {
             Self::RevokeCapability |
             Self::ChannelCreate | Self::ChannelAttach |
             Self::ChannelClose | Self::ChannelRevoke | Self::ChannelInfo |
-            Self::AuditAttach | Self::AuditInfo
+            Self::AuditAttach | Self::AuditInfo |
+            Self::MapFramebuffer
         )
     }
 
@@ -269,6 +292,8 @@ impl SyscallNumber {
             32 => Some(Self::ChannelInfo),
             33 => Some(Self::AuditAttach),
             34 => Some(Self::AuditInfo),
+            35 => Some(Self::MapFramebuffer),
+            36 => Some(Self::ModuleReady),
             _ => None,
         }
     }
@@ -403,6 +428,11 @@ mod tests {
         SyscallNumber::GetTime,
         SyscallNumber::Print,
         SyscallNumber::GetPrincipal,
+        // `ModuleReady` is called by every boot module at the end of its
+        // own init, including modules that run before the key-store /
+        // identity infrastructure is fully up. Making it identity-gated
+        // would create a bootstrap circular dependency.
+        SyscallNumber::ModuleReady,
     ];
 
     #[test]
@@ -436,6 +466,7 @@ mod tests {
             SyscallNumber::ChannelClose, SyscallNumber::ChannelRevoke,
             SyscallNumber::ChannelInfo, SyscallNumber::AuditAttach,
             SyscallNumber::AuditInfo,
+            SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
         ];
 
         for &num in &all {
@@ -453,16 +484,17 @@ mod tests {
 
     #[test]
     fn exempt_set_is_minimal() {
-        // The exempt set must be exactly 6 syscalls. If this test fails,
+        // The exempt set must be exactly 7 syscalls (Exit, Yield, GetPid,
+        // GetTime, Print, GetPrincipal, ModuleReady). If this test fails,
         // someone added a new exempt syscall — that requires justification.
-        assert_eq!(EXEMPT.len(), 6, "exempt set size changed — review required");
+        assert_eq!(EXEMPT.len(), 7, "exempt set size changed — review required");
     }
 
     #[test]
     fn all_syscall_numbers_covered() {
-        // Verify from_u64 round-trips for all defined values (0..=34),
+        // Verify from_u64 round-trips for all defined values (0..=36),
         // ensuring no gap in the requires_identity() match.
-        for i in 0..=34u64 {
+        for i in 0..=36u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             // Just exercise requires_identity to confirm no panic

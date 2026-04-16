@@ -178,4 +178,51 @@ Before flipping HZ_100 → HZ_1000, a measurement pass should quantify: overhead
 
 ## Divergence
 
-*(appended as implementation diverges from the plan)*
+### 2026-04-14 — Bootloader abstraction landed ahead of graphics work
+
+A new concern surfaced after this ADR was drafted: the dependency on Limine
+(a single-maintainer hobby/research bootloader) is acceptable for v1 but not
+for the long-term "CambiOS distribution" horizon. Jason's planned response
+is a CambiOS-native firmware/bootloader called **camBIOS** that replaces the
+UEFI + Limine stack and addresses OEM boot quirks across architectures.
+
+To avoid a kernel-wide refactor when camBIOS lands, a `BootInfo` abstraction
+was added *before* the first graphics-phase consumer (`SYS_MAP_FRAMEBUFFER`)
+was wired. Location: `src/boot/mod.rs` + `src/boot/limine.rs`. The kernel
+now reads a kernel-owned `BootInfo` struct (memory map, framebuffer list
+with full pixel format, RSDP, modules, HHDM offset) populated once at boot
+by the active adapter. No `limine::*` types leak past the adapter.
+
+Scope decisions:
+
+- **In scope now:** pure-data boot information (memory map, framebuffers,
+  RSDP, modules, HHDM offset). All consumers refactored.
+- **Deferred to camBIOS time:** Limine's MP active-wake mechanism
+  (`goto_address` semantics) is not abstracted. `ap_entry` still uses
+  `limine::mp::Cpu` directly. Rationale: MP is a mechanism not pure data,
+  and the right abstraction is easier to design when camBIOS exists.
+- **Also deferred:** the one early `HHDM_REQUEST.get_response()` call in
+  `kmain` (needed before serial is up on AArch64, which is needed before
+  `println!` in `populate`). Single-line chicken-and-egg; not worth
+  contorting the init order.
+
+### 2026-04-14 — Phase GUI-0 chunk 1 landed (capabilities + SYS_MAP_FRAMEBUFFER + libsys wrappers)
+
+Three of the five "deferred to later phases" items from the original
+Decision section landed in the same commit as the bootloader abstraction,
+while the other two remain deferred:
+
+- **Landed:** `CapabilityKind::{LegacyPortIo, MapFramebuffer, LargeChannel}`
+  (with grant/check/revoke + revoke-on-exit wiring); `SYS_MAP_FRAMEBUFFER`
+  (#35) handler capability-gated on `MapFramebuffer`; `libsys::wait_irq`
+  and `libsys::map_framebuffer` wrappers; Limine pixel-format + multi-
+  display enumeration (captured into `BootInfo::framebuffers` with full
+  bpp/pitch/mask fields).
+- **Still deferred:** PS/2 legacy ISA port whitelist in `handle_port_io`
+  (pending input-driver phase); `SYS_SLEEP` + `BlockReason::TimerWait`
+  wire-up (scheduler ISR touch — should coincide with tick-rate review);
+  default tick-rate bump HZ_100 → HZ_1000 (needs measurement pass).
+
+All three new `CapabilityKind` variants are currently granted to nobody.
+The first grant sites land with their respective consumers (compositor
+boot module, ps2-kbd/ps2-mouse boot modules, tier-aware policy).

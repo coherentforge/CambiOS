@@ -57,7 +57,7 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (386 tests, all passing)
+# Run tests (447 tests, all passing)
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
@@ -84,6 +84,10 @@ make img-aarch64 && make run-aarch64
 
 # Build fs-service only (standalone Rust crate)
 make fs-service
+
+# Create the backing file for the virtio-blk device (64 MiB raw image).
+# `make run` depends on this target; idempotent — leaves an existing image alone.
+make disk-img
 
 # Build ELF signing tool (host-side, for signing boot modules)
 make sign-tool
@@ -181,8 +185,12 @@ src/
 │   ├── buffer.rs             # StagingBuffer: lock-free SPSC ring buffer (per-CPU, formally verifiable)
 │   └── drain.rs              # AuditRing (global ring buffer, HHDM-backed), drain_tick() (BSP timer ISR piggyback)
 ├── fs/
-│   ├── mod.rs                # CambiObject, ObjectStore trait, Blake3 hashing, Ed25519 sign/verify
-│   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects)
+│   ├── mod.rs                # CambiObject, ObjectStore trait (by-value get, &mut self), Blake3 hashing, Ed25519 sign/verify
+│   ├── block.rs              # BlockDevice trait (4 KiB sectors), MemBlockDevice (testing)
+│   ├── disk.rs               # DiskObjectStore<B: BlockDevice> (Phase 4a.i, ADR-010 on-disk format)
+│   ├── lazy_disk.rs          # LazyDiskStore — deferred-init wrapper, OBJECT_STORE backing (Phase 4a.iii)
+│   ├── virtio_blk_device.rs  # VirtioBlkDevice: BlockDevice — kernel IPC client to user/virtio-blk driver (Phase 4a.iii)
+│   └── ram.rs                # RamObjectStore (fixed-capacity 256 objects, Phase 0 fallback)
 ├── interrupts/
 │   ├── mod.rs                # IDT setup, exception/device ISR handlers
 │   ├── pic.rs                # 8259 PIC driver (disabled at boot, x86_64 only)
@@ -236,6 +244,11 @@ user/
 │   └── src/main.rs           # Claims bootstrap key at boot, signs ObjectStore puts
 ├── virtio-net/               # Virtio-net driver — boot module, IPC endpoint 20
 │   └── src/                  # main.rs + transport.rs, virtqueue.rs, device.rs, pci.rs
+├── virtio-blk/               # Virtio-blk driver — boot module (Phase 4a.ii/4a.iii)
+│   └── src/                  # main.rs + transport.rs, virtqueue.rs, device.rs, pci.rs
+│                             # endpoint 24 = user clients (recv_verified)
+│                             # endpoint 26 = kernel-only commands (recv_msg, no cap check)
+│                             # endpoint 25 = kernel's reply endpoint (handle_write intercept)
 ├── i219-net/                 # Intel I219-LM driver — boot module (Dell 3630 bare metal)
 │   └── src/                  # main.rs + mmio.rs, pci.rs, phy.rs, regs.rs, ring.rs
 ├── udp-stack/                # UDP/IP network service — boot module, IPC endpoint 21
@@ -334,9 +347,10 @@ ConsoleRead=24, Spawn=25, WaitTask=26,
 RevokeCapability=27,
 ChannelCreate=28, ChannelAttach=29, ChannelClose=30,
 ChannelRevoke=31, ChannelInfo=32,
-AuditAttach=33, AuditInfo=34
+AuditAttach=33, AuditInfo=34,
+MapFramebuffer=35, ModuleReady=36
 ```
-All 35 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+All 37 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **Exit**: Marks task as Terminated in scheduler and calls `CapabilityManager::revoke_all_for_process()` to reclaim endpoint capabilities (see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
@@ -370,6 +384,8 @@ All 35 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **ChannelInfo**: Read channel metadata (state, role, sizes, addresses, tick) into user buffer
 - **AuditAttach**: Attach as the audit ring consumer. Maps kernel audit ring pages RO into caller's address space. Restricted to bootstrap Principal (Phase 3.3). Returns user vaddr
 - **AuditInfo**: Read audit ring statistics (total produced, total dropped, capacity, consumer attached, per-CPU staging occupancy) into a 48-byte user buffer. Any process may call
+- **MapFramebuffer**: Maps a Limine-reported framebuffer (selected by zero-based index) into the calling process and writes a 32-byte `FramebufferDescriptor` (vaddr + geometry + pixel format) to a caller buffer. Kernel holds the physical address; userspace never specifies it. Capability-gated (`MapFramebuffer`). Multi-monitor: call once per display. Phase GUI-0 (ADR-011)
+- **ModuleReady**: Signals that a boot module has finished initialization (endpoint registration, etc.). Used by sequential boot-time module loading: kernel blocks the next module in `BOOT_MODULE_ORDER` behind a `BlockReason::BootGate` until the current module calls `ModuleReady`. Every boot module's `_start` calls `sys::module_ready()` after setup
 
 ## Development Conventions
 
@@ -481,10 +497,12 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
 | **Identity / Principal / sender_principal** | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) (intent only) |
 | **ObjectStore / CambiObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
+| **Persistent ObjectStore / on-disk format / BlockDevice** | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) | `src/fs/block.rs`, `src/fs/disk.rs`; [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) for the `CambiObject` model the format serializes |
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
 | **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
 | **Architecture port (RISC-V, etc.)** | This file's "Multi-Platform Strategy" section | `src/arch/x86_64/mod.rs` and `src/arch/aarch64/mod.rs` as the public API to match |
 | **Graphics / compositor / GUI / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channels are the surface-buffer transport); graphics stack itself is not built yet (see ADR-011 phased plan) |
+| **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) (Principals and load-bearing identity — signed input devices participate in this model). No code yet; the wire format is the first thing to land when the first input driver ships. |
 | **Security review / threat model** | [SECURITY.md](SECURITY.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](PHILOSOPHY.md) | All ADRs |
 | **"Is X done yet?" / current state** | [STATUS.md](STATUS.md) | — |
 
@@ -500,7 +518,7 @@ These documents capture architectural decisions that implementation must align w
 - **[SECURITY.md](SECURITY.md)** — Security posture, enforcement table, threat model.
 - **[ASSUMPTIONS.md](ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
 - **[GOVERNANCE.md](GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
-- **[docs/adr/](docs/adr/)** — Architecture decision records (ADRs 000-011). Read the ones in the Required Reading map for the subsystem you're touching.
+- **[docs/adr/](docs/adr/)** — Architecture decision records (ADRs 000-012). Read the ones in the Required Reading map for the subsystem you're touching.
 
 Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
 
@@ -510,7 +528,7 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 386 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c), 44 audit infrastructure tests (Phase 3.3: 14 staging buffer + 18 event types + 12 ring/drain), 4 identity gate tests (exempt set validation, coverage, minimality), 2 new ceiling tests (Phase GUI-0 bounds bump: channel at MAX_CHANNEL_PAGES, allocate_contiguous at HEAP_PAGES)
+- 447 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c), 44 audit infrastructure tests (Phase 3.3: 14 staging buffer + 18 event types + 12 ring/drain), 4 identity gate tests (exempt set validation, coverage, minimality), 2 ceiling tests (Phase GUI-0 bounds bump: channel at MAX_CHANNEL_PAGES, allocate_contiguous at HEAP_PAGES), 8 BootInfo abstraction tests (Phase GUI-0 bootloader abstraction: empty/push/full/kind labels/size accounting), plus Phase 4a.i DiskObjectStore + block device coverage
 
 ## Post-Change Review Protocol
 
@@ -589,7 +607,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 | Category | Files | Auto-refresh? | Rule |
 |---|---|---|---|
 | **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
-| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-011) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
+| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-012) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
 | **design / source_of_truth** | [CambiOS.md](CambiOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 

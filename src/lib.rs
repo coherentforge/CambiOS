@@ -34,6 +34,7 @@ pub mod syscalls;
 pub mod process;
 pub mod acpi;
 pub mod fs;
+pub mod boot;
 pub mod boot_modules;
 pub mod audit;
 pub mod policy;
@@ -504,14 +505,28 @@ pub static AUDIT_RING: Spinlock<Option<audit::drain::AuditRing>> = Spinlock::new
 
 /// Object store — content-addressed signed object storage (lock position 9).
 ///
-/// Initialized at boot after all other subsystems. Phase 0 uses RamObjectStore
-/// (fixed-capacity, RAM-backed). Phase 1+ adds disk-backed implementations.
-pub static OBJECT_STORE: Spinlock<Option<Box<fs::ram::RamObjectStore>>> = Spinlock::new(None);
+/// Initialized at boot after all other subsystems. Held as a trait object so
+/// the backend can be swapped (RAM for Phase 0–3, disk for Phase 4) without
+/// touching the syscall dispatcher. The `Send` bound lets the store move
+/// between CPUs under the spinlock; no implementation holds non-Send state.
+pub static OBJECT_STORE: Spinlock<Option<Box<dyn fs::ObjectStore + Send>>> = Spinlock::new(None);
 
 /// Boot module registry — maps module names to Limine module memory.
 /// Read-only after boot. Used by the Spawn syscall to find modules by name.
 pub static BOOT_MODULE_REGISTRY: Spinlock<boot_modules::BootModuleRegistry> =
     Spinlock::new(boot_modules::BootModuleRegistry::new());
+
+/// Sequential boot-release chain state. `load_boot_modules` pushes each
+/// loaded task's TaskId into this roster in limine.conf order; module 0
+/// runs `Ready` from boot while modules 1..N start `Blocked` on
+/// `BlockReason::BootGate`. Each module's `SYS_MODULE_READY` call
+/// advances the cursor and unblocks the next one.
+///
+/// Independent lock domain — acquired briefly by the `SYS_MODULE_READY`
+/// handler and released before calling into the scheduler to wake the
+/// released task. Not part of the main lock hierarchy.
+pub static BOOT_MODULE_ORDER: Spinlock<boot_modules::BootModuleOrder> =
+    Spinlock::new(boot_modules::BootModuleOrder::new());
 
 // ============================================================================
 // Policy service infrastructure (Phase 3.4, ADR-006)

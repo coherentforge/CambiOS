@@ -284,6 +284,11 @@ pub enum BlockReason {
     ChildWait,
     /// Waiting for policy service to respond to a syscall query (Phase 3.4)
     PolicyWait(u64),
+    /// Boot-time gate: module loaded but not yet released. `load_boot_modules`
+    /// parks modules 1..N in this state; each predecessor's `sys_module_ready`
+    /// call wakes the next module in the chain. See `BOOT_MODULE_ORDER` in
+    /// `src/lib.rs`.
+    BootGate,
 }
 
 impl fmt::Display for BlockReason {
@@ -299,6 +304,7 @@ impl fmt::Display for BlockReason {
             BlockReason::DebuggerWait => write!(f, "DebuggerWait"),
             BlockReason::ChildWait => write!(f, "ChildWait"),
             BlockReason::PolicyWait(qid) => write!(f, "PolicyWait({})", qid),
+            BlockReason::BootGate => write!(f, "BootGate"),
         }
     }
 }

@@ -236,6 +236,7 @@ pub extern "C" fn _start() -> ! {
     sys::register_endpoint(FS_ENDPOINT);
 
     sys::print(b"[FS] ready on endpoint 16\n");
+    sys::module_ready();
 
     // Service loop: receive verified message, dispatch command, send response.
     // recv_verified rejects anonymous senders — if the kernel doesn't stamp

@@ -160,6 +160,14 @@ unsafe extern "C" fn kmain() -> ! {
     // Store HHDM offset FIRST — AArch64 needs it for ALL MMIO addresses
     // (PL011 UART, GIC). Limine on AArch64 does NOT identity-map device MMIO
     // in TTBR0 — only RAM is identity-mapped. All MMIO must go through HHDM.
+    //
+    // This is the **only** place in the kernel that reads a Limine static
+    // directly outside of `boot/limine.rs`. It's a chicken-and-egg case: HHDM
+    // is needed for the AArch64 MMIO mapping that itself precedes serial
+    // output, and `boot::limine::populate` (which logs warnings on truncation)
+    // requires serial. The full BootInfo is populated below, after serial is
+    // up — and the HHDM offset there is read from the same Limine response
+    // for consistency. See `src/boot/mod.rs` for the abstraction rationale.
     if let Some(hhdm_response) = HHDM_REQUEST.get_response() {
         arcos_core::set_hhdm_offset(hhdm_response.offset());
     }
@@ -236,46 +244,55 @@ unsafe extern "C" fn kmain() -> ! {
     println!("=== CambiOS Microkernel [v0.2.0] ===");
     println!("Booted via Limine\n");
 
+    // Populate kernel-owned BootInfo from the Limine response statics.
+    // After this call, the rest of the kernel reads `arcos_core::boot::info()`
+    // and never touches `limine::*` types (modulo the AP-wakeup path in
+    // `ap_entry`, which depends on Limine's MP active-wake mechanism and is
+    // documented in src/boot/limine.rs as a deferred abstraction).
+    arcos_core::boot::limine::populate(
+        &HHDM_REQUEST,
+        &MEMORY_MAP_REQUEST,
+        &FRAMEBUFFER_REQUEST,
+        &RSDP_REQUEST,
+        &MODULE_REQUEST,
+    );
+
     let hhdm_offset = arcos_core::hhdm_offset();
     println!("HHDM offset: {:#x}", hhdm_offset);
 
-    // Report memory map
-    if let Some(memmap_response) = MEMORY_MAP_REQUEST.get_response() {
-        let entries = memmap_response.entries();
-        println!("Memory map: {} entries", entries.len());
-        for (i, entry) in entries.iter().enumerate() {
-            let type_str = match entry.entry_type {
-                limine::memory_map::EntryType::USABLE => "Usable",
-                limine::memory_map::EntryType::RESERVED => "Reserved",
-                limine::memory_map::EntryType::ACPI_RECLAIMABLE => "ACPI Reclaim",
-                limine::memory_map::EntryType::ACPI_NVS => "ACPI NVS",
-                limine::memory_map::EntryType::BAD_MEMORY => "Bad",
-                limine::memory_map::EntryType::BOOTLOADER_RECLAIMABLE => "Bootloader",
-                limine::memory_map::EntryType::EXECUTABLE_AND_MODULES => "Executable",
-                limine::memory_map::EntryType::FRAMEBUFFER => "Framebuffer",
-                _ => "Unknown",
-            };
-            println!(
-                "  [{:2}] {:#016x} - {:#016x} len={:#x} ({})",
-                i,
-                entry.base,
-                entry.base + entry.length,
-                entry.length,
-                type_str,
-            );
-        }
-    } else {
-        println!("WARNING: No memory map from bootloader");
+    // Report memory map (read from kernel-owned BootInfo, not Limine).
+    let info = arcos_core::boot::info();
+    let regions = info.memory_regions();
+    println!("Memory map: {} entries", regions.len());
+    for (i, region) in regions.iter().enumerate() {
+        println!(
+            "  [{:2}] {:#016x} - {:#016x} len={:#x} ({})",
+            i,
+            region.base,
+            region.base + region.length,
+            region.length,
+            region.kind.as_str(),
+        );
     }
 
-    // Report framebuffer
-    if let Some(fb_response) = FRAMEBUFFER_REQUEST.get_response() {
-        if let Some(fb) = fb_response.framebuffers().next() {
+    // Report framebuffers (multi-display-aware).
+    let fb_count = info.framebuffers().count();
+    if fb_count == 0 {
+        println!("Framebuffers: none reported");
+    } else {
+        println!("Framebuffers: {} display(s)", fb_count);
+        for (i, fb) in info.framebuffers().enumerate() {
             println!(
-                "Framebuffer: {}x{} @ {:#x}",
-                fb.width(),
-                fb.height(),
-                fb.addr() as usize,
+                "  [{}] {}x{} @ {:#x} pitch={} bpp={} format=R{}<<{} G{}<<{} B{}<<{}",
+                i,
+                fb.width,
+                fb.height,
+                fb.phys_addr,
+                fb.pitch,
+                fb.bpp,
+                fb.red_mask_size, fb.red_mask_shift,
+                fb.green_mask_size, fb.green_mask_shift,
+                fb.blue_mask_size, fb.blue_mask_shift,
             );
         }
     }
@@ -375,9 +392,7 @@ unsafe extern "C" fn kmain() -> ! {
         // x86_64: APIC timer + I/O APIC + device IRQs
         // Disables PIC, enables Local APIC, parses ACPI for I/O APIC,
         // calibrates APIC timer at 100Hz, routes device IRQs.
-        let rsdp_phys = RSDP_REQUEST.get_response()
-            .map(|r| r.address() as u64)
-            .unwrap_or(0);
+        let rsdp_phys = arcos_core::boot::info().rsdp_phys.unwrap_or(0);
 
         // Map ACPI physical memory into the HHDM before parsing.
         map_acpi_regions(rsdp_phys);
@@ -515,29 +530,24 @@ const KERNEL_HEAP_SIZE: u64 = 4 * 1024 * 1024;
 static KERNEL_HEAP_PHYS_BASE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Initialize the kernel heap allocator from the Limine physical memory map.
+/// Initialize the kernel heap allocator from the kernel-owned BootInfo
+/// memory map (populated by `boot::limine::populate` at early boot).
 ///
-/// Finds a large USABLE physical region, converts it to a virtual address via
+/// Finds a large Usable physical region, converts it to a virtual address via
 /// the HHDM offset, and hands it to the global allocator.
 fn init_kernel_heap() {
-    use limine::memory_map::EntryType;
+    use arcos_core::boot::MemoryRegionKind;
 
-    let hhdm_offset = HHDM_REQUEST
-        .get_response()
-        .expect("HHDM response required for kernel heap")
-        .offset();
+    let info = arcos_core::boot::info();
+    let hhdm_offset = info.hhdm_offset;
 
-    let memmap = MEMORY_MAP_REQUEST
-        .get_response()
-        .expect("Memory map required for kernel heap");
-
-    // Find the largest USABLE region that can hold our heap
+    // Find the largest Usable region that can hold our heap
     let mut best: Option<(u64, u64)> = None; // (base, length)
-    for entry in memmap.entries() {
-        if entry.entry_type == EntryType::USABLE && entry.length >= KERNEL_HEAP_SIZE {
+    for region in info.memory_regions() {
+        if region.kind == MemoryRegionKind::Usable && region.length >= KERNEL_HEAP_SIZE {
             match best {
-                Some((_, best_len)) if entry.length <= best_len => {}
-                _ => best = Some((entry.base, entry.length)),
+                Some((_, best_len)) if region.length <= best_len => {}
+                _ => best = Some((region.base, region.length)),
             }
         }
     }
@@ -579,25 +589,23 @@ fn init_kernel_heap() {
     let _ = (used, free); // suppress unused warning in release
 }
 
-/// Initialize the physical frame allocator from the Limine memory map.
+/// Initialize the physical frame allocator from the BootInfo memory map.
 ///
-/// Marks all USABLE regions as available, then reserves the kernel heap
+/// Marks all Usable regions as available, then reserves the kernel heap
 /// and process heap regions so they can't be double-allocated.
 fn init_frame_allocator() {
-    use limine::memory_map::EntryType;
+    use arcos_core::boot::MemoryRegionKind;
     use arcos_core::FRAME_ALLOCATOR;
     use arcos_core::memory::frame_allocator::PAGE_SIZE;
 
-    let memmap = MEMORY_MAP_REQUEST
-        .get_response()
-        .expect("Memory map required for frame allocator");
+    let info = arcos_core::boot::info();
 
     let mut fa = FRAME_ALLOCATOR.lock();
 
-    // Pass 1: Add all USABLE regions
-    for entry in memmap.entries() {
-        if entry.entry_type == EntryType::USABLE {
-            fa.add_region(entry.base, entry.length);
+    // Pass 1: Add all Usable regions
+    for region in info.memory_regions() {
+        if region.kind == MemoryRegionKind::Usable {
+            fa.add_region(region.base, region.length);
         }
     }
 
@@ -775,7 +783,7 @@ fn audit_init() {
 /// so `parse_acpi()` can read them via the standard `phys + hhdm` path.
 #[cfg(target_arch = "x86_64")]
 fn map_acpi_regions(rsdp_phys: u64) {
-    use limine::memory_map::EntryType;
+    use arcos_core::boot::MemoryRegionKind;
     use arcos_core::FRAME_ALLOCATOR;
     use arcos_core::memory::paging;
     use x86_64::structures::paging::PageTableFlags;
@@ -794,32 +802,30 @@ fn map_acpi_regions(rsdp_phys: u64) {
         let _ = paging::map_page(&mut pt, page_phys + hhdm, page_phys, flags, &mut fa_guard);
     }
 
-    // Map all ACPI-related and small RESERVED regions.
+    // Map all ACPI-related and small Reserved regions.
     // With Limine base revision 3, only Usable/Bootloader/Executable/Framebuffer
-    // regions are in the HHDM. ACPI tables may be in ACPI_RECLAIMABLE, ACPI_NVS,
-    // or RESERVED regions (SeaBIOS puts ACPI tables in RESERVED memory).
-    // Map small RESERVED regions (< 1 MB) to safely cover BIOS data and ACPI tables
+    // regions are in the HHDM. ACPI tables may be in AcpiReclaimable, AcpiNvs,
+    // or Reserved regions (SeaBIOS puts ACPI tables in Reserved memory).
+    // Map small Reserved regions (< 1 MB) to safely cover BIOS data and ACPI tables
     // without accidentally mapping huge MMIO ranges.
     const MAX_RESERVED_MAP_SIZE: u64 = 1024 * 1024; // 1 MB
     let mut mapped_pages = 0usize;
-    if let Some(memmap) = MEMORY_MAP_REQUEST.get_response() {
-        for entry in memmap.entries() {
-            let should_map = match entry.entry_type {
-                EntryType::ACPI_RECLAIMABLE | EntryType::ACPI_NVS => true,
-                EntryType::RESERVED if entry.length <= MAX_RESERVED_MAP_SIZE => true,
-                _ => false,
-            };
-            if should_map {
-                let base = entry.base & !0xFFF;
-                let end = (entry.base + entry.length + 0xFFF) & !0xFFF;
-                let page_count = ((end - base) / 4096) as usize;
-                for i in 0..page_count {
-                    let phys = base + (i as u64) * 4096;
-                    // Ignore AlreadyMapped — page may overlap with an existing mapping
-                    let _ = paging::map_page(&mut pt, phys + hhdm, phys, flags, &mut fa_guard);
-                }
-                mapped_pages += page_count;
+    for region in arcos_core::boot::info().memory_regions() {
+        let should_map = match region.kind {
+            MemoryRegionKind::AcpiReclaimable | MemoryRegionKind::AcpiNvs => true,
+            MemoryRegionKind::Reserved if region.length <= MAX_RESERVED_MAP_SIZE => true,
+            _ => false,
+        };
+        if should_map {
+            let base = region.base & !0xFFF;
+            let end = (region.base + region.length + 0xFFF) & !0xFFF;
+            let page_count = ((end - base) / 4096) as usize;
+            for i in 0..page_count {
+                let phys = base + (i as u64) * 4096;
+                // Ignore AlreadyMapped — page may overlap with an existing mapping
+                let _ = paging::map_page(&mut pt, phys + hhdm, phys, flags, &mut fa_guard);
             }
+            mapped_pages += page_count;
         }
     }
 
@@ -926,23 +932,14 @@ fn register_process_capabilities(process_id: ProcessId) {
 fn load_boot_modules(scheduler: &mut Scheduler) {
     use arcos_core::loader::{self, SignedBinaryVerifier};
     use arcos_core::FRAME_ALLOCATOR;
-    use arcos_core::boot_modules::strip_module_name;
 
-    let module_response = match MODULE_REQUEST.get_response() {
-        Some(r) => r,
-        None => {
-            println!("  No boot modules (ModuleRequest not answered)");
-            return;
-        }
-    };
-
-    let modules = module_response.modules();
-    if modules.is_empty() {
+    let info = arcos_core::boot::info();
+    if info.module_count() == 0 {
         println!("  No boot modules found");
         return;
     }
 
-    println!("Loading {} boot module(s)...", modules.len());
+    println!("Loading {} boot module(s)...", info.module_count());
 
     // Use SignedBinaryVerifier with the bootstrap public key as the trust anchor.
     // All boot modules must be signed by the bootstrap key (via sign-elf tool).
@@ -950,14 +947,13 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
     let verifier = SignedBinaryVerifier::with_key(bootstrap.public_key);
     let mut loaded_count = 0u32;
 
-    for (i, module) in modules.iter().enumerate() {
-        let path = module.path().to_bytes();
-        let size = module.size();
-        let addr = module.addr();
+    for (i, module) in info.modules().enumerate() {
+        let size = module.size;
+        let addr = module.phys_addr as *const u8;
+        let short_name = module.name_bytes();
 
-        // Display module info (path is a CStr, convert to str for printing)
-        let path_str = core::str::from_utf8(path).unwrap_or("<invalid utf8>");
-        println!("  Module {}: {} ({} bytes at {:#x})", i, path_str, size, addr as u64);
+        let name_str = core::str::from_utf8(short_name).unwrap_or("<invalid utf8>");
+        println!("  Module {}: {} ({} bytes at {:#x})", i, name_str, size, addr as u64);
 
         if size == 0 {
             println!("    ✗ Skipped (empty module)");
@@ -1003,7 +999,6 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 register_process_capabilities(process_id);
 
                 // Register in boot module registry for runtime Spawn syscall
-                let short_name = strip_module_name(path);
                 BOOT_MODULE_REGISTRY.lock().register(short_name, addr, size as usize);
 
                 // Phase 3.4: identify the policy service by module name
@@ -1015,10 +1010,53 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                     println!("    ✓ Policy service identified as process {}", process_id.slot());
                 }
 
+                // Phase GUI-0 / Phase GUI-1 (ADR-011): grant the
+                // `MapFramebuffer` system capability to modules that
+                // need to call `SYS_MAP_FRAMEBUFFER`. Today only
+                // fb-demo; future: compositor, virtio-gpu / intel-gpu
+                // drivers. Grant is name-based rather than
+                // all-boot-modules because MapFramebuffer is a
+                // hardware-access capability, narrower than the
+                // default send/receive + CreateProcess grant.
+                if short_name == b"fb-demo" {
+                    use arcos_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = arcos_core::CAPABILITY_MANAGER.lock();
+                    if let Some(cap_mgr) = cap_guard.as_mut() {
+                        let _ = cap_mgr.grant_system_capability(
+                            process_id,
+                            CapabilityKind::MapFramebuffer,
+                        );
+                        println!(
+                            "    ✓ Granted MapFramebuffer to {} (process {})",
+                            core::str::from_utf8(short_name).unwrap_or("?"),
+                            process_id.slot(),
+                        );
+                    }
+                }
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.0, result.process_id.slot(), result.entry_point
                 );
+
+                // Sequential boot-release chain: append this task to the
+                // ordered roster. Every loaded module after the first
+                // starts Blocked on `BootGate` — it stays parked until
+                // its predecessor calls `sys::module_ready()`, at which
+                // point `handle_module_ready` wakes it.
+                //
+                // Module 0 (`loaded_count == 0` at this point) runs
+                // Ready as before. This preserves the invariant the
+                // scheduler already relies on: at least one task
+                // (besides idle) is runnable at boot.
+                arcos_core::BOOT_MODULE_ORDER.lock().push(result.task_id);
+                if loaded_count > 0 {
+                    let _ = scheduler.block_task(
+                        result.task_id,
+                        arcos_core::scheduler::BlockReason::BootGate,
+                    );
+                }
+
                 loaded_count += 1;
             }
             Err(e) => {
@@ -1168,22 +1206,31 @@ fn bootstrap_identity_init() {
     println!("  Principal: {}", bootstrap);
 }
 
-/// Initialize the object store (RAM-backed, Phase 0).
+/// Initialize the object store — Phase 4a.iii wires the disk-backed
+/// `LazyDiskStore` so objects persist across reboots. The handshake with
+/// the virtio-blk user-space driver happens on the first `SYS_OBJ_*` call
+/// (driver isn't running yet at this boot stage). Until that handshake,
+/// the store has no capacity and every `get` returns a deferred error;
+/// first write will trigger the init.
 ///
-/// Lock ordering position: 8 (after INTERRUPT_ROUTER at 7).
+/// Lock ordering position: 9 (OBJECT_STORE). No hierarchy violation when
+/// calling into `VirtioBlkDevice::call` under this lock — the device uses
+/// `SHARDED_IPC` (per-endpoint shard locks, outside the main hierarchy)
+/// and `PER_CPU_SCHEDULER` (per-CPU, no cycle with OBJECT_STORE since
+/// scheduler / ISR code never acquires OBJECT_STORE).
 fn object_store_init() {
-    use arcos_core::fs::ram::RamObjectStore;
+    use arcos_core::fs::disk::MAX_OBJECTS_ON_DISK;
+    use arcos_core::fs::lazy_disk::LazyDiskStore;
+    use arcos_core::fs::ObjectStore;
 
-    let store = match RamObjectStore::new_boxed() {
-        Some(s) => s,
-        None => {
-            println!("✗ Failed to allocate RamObjectStore — halting");
-            arcos_core::halt();
-        }
-    };
+    let store = alloc::boxed::Box::new(LazyDiskStore::new(MAX_OBJECTS_ON_DISK));
+    let store: alloc::boxed::Box<dyn ObjectStore + Send> = store;
     *OBJECT_STORE.lock() = Some(store);
 
-    println!("✓ Object store initialized (RAM, capacity: {} objects)", arcos_core::fs::ram::MAX_OBJECTS);
+    println!(
+        "✓ Object store initialized (disk, lazy init, capacity up to {} objects)",
+        MAX_OBJECTS_ON_DISK
+    );
 }
 
 /// Initialize process table — populate the first 3 kernel processes.

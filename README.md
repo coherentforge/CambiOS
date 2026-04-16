@@ -1,5 +1,9 @@
 # CambiOS
 
+A secure bridge from human consciousness to the electron.
+
+---
+
 > *Your computer... is not your own.*
 
 Before your OS boots, before your kernel loads, before any software you chose runs — a separate processor with its own OS, network stack, and private keys is already running. You didn't install it, and you can't uninstall, audit, or turn it off. Intel machines run the Management Engine. On AMD it's the Platform Security Processor. It has DMA access to your memory. It runs whether your machine is on or off, as long as it has power. 
@@ -14,7 +18,11 @@ Ready to take it back? CambiOS is your response.
 
 ## What CambiOS Is
 
-CambiOS (in development) is a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer system for interaction that is verifiably yours. Closing it requires sovereign silicon - and that's part of where this is going. Until then, CambiOS is a complete software foundation with no extraction above the hardware line: a formally-verified microkernel, memory-safe, cryptographic identity, zero-trust networking, and AI-powered security that works for the owner rather than the vendor.
+CambiOS is a general-purpose operating system that is verifiably yours. 
+GUI, real applications, real privacy — not a locked-down appliance, 
+not a research project. A computer you can trust because you can verify it.
+
+We are developing a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer system for interaction that is verifiably yours. Closing it requires sovereign silicon - and that's part of where this is going. Until then, CambiOS is a complete software foundation with no extraction above the hardware line: a formally-verified microkernel, memory-safe, cryptographic identity, zero-trust networking, and AI-powered security that works for the owner rather than the vendor.
 
 At its foundation is a microkernel written for formal verification from first principles in Rust:
 
@@ -222,6 +230,26 @@ Narrative walkthroughs that explain how CambiOS works by following real things t
 - [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) — Capability revocation and audit telemetry
 - [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) — Boot-time-sized kernel object tables
 - [ADR-009](docs/adr/009-purpose-tiers-scope.md) — Purpose, tiers, scope, and governance
+
+---
+
+## Licensing and Enforcement
+
+The CambiOS microkernel, filesystem, and networking stack are MIT licensed. 
+Use them freely. Build on them. Fork them.
+
+The userspace ecosystem — drivers, identity services, hardware compatibility 
+layers — is GPLv3. Contribute back.
+
+The kernel only loads signed modules. Coherent Forge signs GPL-compliant 
+modules for the official distribution. Users control their own trust chain 
+— they can add signing keys, remove ours, or replace it entirely. 
+It's their machine.
+
+Anyone can fork the code. The MIT license allows it. But you can't call 
+it CambiOS unless the security model is intact. 
+
+The code enforcement is technical. The naming enforcement is legal.
 
 ---
 

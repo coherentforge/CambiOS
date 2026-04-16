@@ -797,6 +797,56 @@ impl Scheduler {
         unsafe { crate::arch::context_switch(current_ctx, next_ctx) };
     }
 
+    /// Purge every scheduler-held reference to `task_id`.
+    ///
+    /// Called by the task-exit path (`handle_exit`) to establish the
+    /// invariant that by the time the final `yield_save_and_switch` lets
+    /// control return to `schedule()`, the scheduler contains zero
+    /// references to the exiting task's TaskId.
+    ///
+    /// Before this helper existed, `handle_exit` relied on marking the
+    /// task `Terminated` (but leaving it in the `tasks` array) and
+    /// letting `find_next_ready_task`'s lazy-pop clean up ready-queue
+    /// entries, while leaving `current_task` pointing at the exiting
+    /// TaskId. Under concurrent teardown that left a window where the
+    /// scheduler could dereference through the exiting task's slot in
+    /// an inconsistent state.
+    ///
+    /// This helper closes that window by:
+    /// - Clearing `current_task` if it matches — the scheduler now has
+    ///   no current task on this CPU until the next `schedule()` picks
+    ///   one (which will skip the `current_task` re-enqueue path
+    ///   entirely because `current_task` is `None`).
+    /// - Walking every priority band's ready queue and evicting any
+    ///   entry equal to `task_id`. No more stale pops to worry about.
+    /// - Clearing `task.in_ready_queue` on the slot itself so any
+    ///   future re-enqueue sees a consistent starting state.
+    /// - Decrementing `runnable_count` if the task was in a Ready state,
+    ///   matching the bookkeeping `remove_task` does for the same
+    ///   reason.
+    ///
+    /// Does NOT remove the task from the `tasks` array — `handle_exit`'s
+    /// downstream cleanup path uses the task's state (process_id,
+    /// parent_task, exit_code, kernel_stack_top) after calling this
+    /// helper, and slot reuse is handled elsewhere.
+    pub fn purge_task(&mut self, task_id: TaskId) {
+        if self.current_task == Some(task_id) {
+            self.current_task = None;
+        }
+        for band in 0..NUM_PRIORITY_BANDS {
+            self.ready_queues[band].retain(|&tid| tid != task_id);
+        }
+        let idx = task_id.0 as usize;
+        if let Some(Some(task)) = self.tasks.get_mut(idx) {
+            if task.in_ready_queue {
+                task.in_ready_queue = false;
+            }
+            if task.state == TaskState::Ready {
+                self.runnable_count = self.runnable_count.saturating_sub(1);
+            }
+        }
+    }
+
     // ========================================================================
     // Task migration primitives
     // ========================================================================
@@ -875,6 +925,42 @@ impl Scheduler {
     /// Get task count (number of active tasks in this scheduler).
     pub fn task_count(&self) -> usize {
         self.task_count
+    }
+
+    /// Dump every task slot's (id, state, in_ready_queue flag) to serial.
+    /// Diagnostic-only; used by the idle-loop heartbeat when chasing a
+    /// scheduler bug.
+    pub fn debug_dump_tasks(&self) {
+        crate::println!(
+            "    tasks.len={} task_count={} current_task={:?} runnable_count={}",
+            self.tasks.len(), self.task_count, self.current_task, self.runnable_count,
+        );
+        // Bound iteration to the first MAX_TASKS = 256 legitimate slots;
+        // any corruption past that tells us the Vec buffer overflowed.
+        let bound = core::cmp::min(self.tasks.len(), 16);
+        let mut found = 0;
+        for idx in 0..bound {
+            if let Some(task) = self.tasks.get(idx).and_then(|s| s.as_ref()) {
+                crate::println!(
+                    "    slot {}: id={} state={:?} in_q={} band={} saved_rsp={:#x}",
+                    idx,
+                    task.id.0,
+                    task.state,
+                    task.in_ready_queue,
+                    priority_to_band(task.priority),
+                    task.saved_rsp,
+                );
+                found += 1;
+                if found >= self.task_count { break; }
+            }
+        }
+        for band in (0..NUM_PRIORITY_BANDS).rev() {
+            crate::print!("    ready_queue[band {}] len={}:", band, self.ready_queues[band].len());
+            for tid in self.ready_queues[band].iter() {
+                crate::print!(" {}", tid.0);
+            }
+            crate::println!();
+        }
     }
 
     /// Count non-idle runnable tasks (Ready + Running, excluding idle task 0).
@@ -1130,6 +1216,107 @@ mod tests {
         let mut sched = Scheduler::new();
         sched.init().unwrap();
         assert!(sched.remove_task(TaskId(5)).is_err());
+    }
+
+    // ====================================================================
+    // purge_task — exit-path scheduler reference cleanup
+    // ====================================================================
+
+    #[test]
+    fn test_purge_task_clears_current_task() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Manually set current_task to the created task to simulate it
+        // being the Running task on this CPU.
+        sched.current_task = Some(tid);
+
+        sched.purge_task(tid);
+        assert!(sched.current_task.is_none());
+    }
+
+    #[test]
+    fn test_purge_task_leaves_other_current_task_alone() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let keeper = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let doomed = sched.create_task(0x110000, 0x210000, Priority::NORMAL).unwrap();
+        sched.current_task = Some(keeper);
+
+        sched.purge_task(doomed);
+        assert_eq!(sched.current_task, Some(keeper));
+    }
+
+    #[test]
+    fn test_purge_task_removes_from_ready_queue() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // create_task puts the task in Ready state and enqueues it.
+        // Sanity-check: the task is in some ready queue.
+        let total_before: usize = sched.ready_queues.iter().map(|q| q.len()).sum();
+        assert!(total_before > 0);
+
+        sched.purge_task(tid);
+
+        // No ready_queues entry should still reference the purged TaskId.
+        for band in 0..NUM_PRIORITY_BANDS {
+            assert!(
+                !sched.ready_queues[band].iter().any(|&t| t == tid),
+                "band {} still contains purged tid {:?}",
+                band,
+                tid
+            );
+        }
+    }
+
+    #[test]
+    fn test_purge_task_preserves_other_queue_entries() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let keeper = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let doomed = sched.create_task(0x110000, 0x210000, Priority::NORMAL).unwrap();
+
+        sched.purge_task(doomed);
+
+        // `keeper` must still be present somewhere in a ready queue.
+        let keeper_still_queued = sched
+            .ready_queues
+            .iter()
+            .any(|q| q.iter().any(|&t| t == keeper));
+        assert!(keeper_still_queued, "keeper was accidentally purged");
+
+        // And `doomed` is gone from every queue.
+        for band in 0..NUM_PRIORITY_BANDS {
+            assert!(!sched.ready_queues[band].iter().any(|&t| t == doomed));
+        }
+    }
+
+    #[test]
+    fn test_purge_task_decrements_runnable_count_for_ready_task() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let runnable_before = sched.runnable_count;
+        assert!(runnable_before > 0);
+
+        sched.purge_task(tid);
+        assert_eq!(sched.runnable_count, runnable_before - 1);
+    }
+
+    #[test]
+    fn test_purge_task_idempotent() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.current_task = Some(tid);
+
+        // Two back-to-back purges must not panic or double-decrement anything.
+        sched.purge_task(tid);
+        let runnable_after_first = sched.runnable_count;
+        sched.purge_task(tid);
+        assert_eq!(sched.runnable_count, runnable_after_first);
+        assert!(sched.current_task.is_none());
     }
 
     #[test]

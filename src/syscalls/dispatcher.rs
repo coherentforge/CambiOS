@@ -278,6 +278,10 @@ impl SyscallDispatcher {
             // Phase 3.3: audit infrastructure (ADR-007)
             SyscallNumber::AuditAttach => Self::handle_audit_attach(args, &ctx),
             SyscallNumber::AuditInfo => Self::handle_audit_info(args, &ctx),
+
+            // Phase GUI-0: graphics primitives (ADR-011)
+            SyscallNumber::MapFramebuffer => Self::handle_map_framebuffer(args, &ctx),
+            SyscallNumber::ModuleReady => Self::handle_module_ready(args, &ctx),
         }
     }
 
@@ -293,21 +297,35 @@ impl SyscallDispatcher {
     fn handle_exit(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let exit_code = args.arg1_u32();
 
-        // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held
+        // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held.
+        //
+        // We do three things atomically under the scheduler lock:
+        //   1. Mark the task Terminated + record exit_code and parent.
+        //   2. Call `purge_task` to establish the invariant that no
+        //      scheduler-held state still references this TaskId. Before
+        //      this step existed, the scheduler's `current_task` still
+        //      pointed at the exiting task and stale `ready_queues[band]`
+        //      entries relied on lazy cleanup during the next `schedule()`
+        //      pop — a window during which concurrent teardown (below)
+        //      could page-fault the next `Scheduler::schedule` call.
+        //   3. Capture the parent TaskId for wake-up outside the lock.
         let parent_to_wake = {
             let mut sched_guard = crate::local_scheduler().lock();
             if let Some(sched) = sched_guard.as_mut() {
-                if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
+                let parent = if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
                     task.state = crate::scheduler::TaskState::Terminated;
                     task.exit_code = exit_code;
                     task.parent_task
                 } else {
                     None
-                }
+                };
+                sched.purge_task(ctx.task_id);
+                parent
             } else {
                 None
             }
         };
+
 
         // Wake parent if it's blocked in WaitTask
         if let Some(parent_id) = parent_to_wake {
@@ -330,6 +348,7 @@ impl SyscallDispatcher {
             }
         };
 
+
         // Phase 3.2d.iii: revoke all channels the exiting process is
         // party to (as creator or peer). For each revoked channel, unmap
         // pages from the surviving peer, issue TLB shootdown, and free
@@ -340,11 +359,11 @@ impl SyscallDispatcher {
         let channels_revoked = {
             let mut chan_guard = crate::CHANNEL_MANAGER.lock();
             if let Some(chan_mgr) = chan_guard.as_mut() {
-                let (revoked, count) = chan_mgr.revoke_all_for_process(ctx.process_id);
+                let revoked = chan_mgr.revoke_all_for_process(ctx.process_id);
                 drop(chan_guard); // release CHANNEL_MANAGER(5) before PROCESS_TABLE(6)
 
-                // Teardown each revoked channel's mappings.
-                for record in revoked.iter().take(count).flatten() {
+                let count = revoked.len();
+                for record in revoked.iter() {
                     Self::teardown_channel_mappings(record);
                 }
                 count
@@ -377,6 +396,7 @@ impl SyscallDispatcher {
             }
         };
 
+
         crate::audit::emit(crate::audit::RawAuditEvent::process_terminated(
             ctx.process_id, exit_code as i32, 0, crate::audit::now(), 0,
         ));
@@ -399,6 +419,31 @@ impl SyscallDispatcher {
             // never re-enqueued so this loop does not return.
             unsafe { crate::arch::yield_save_and_switch(); }
         }
+    }
+
+    /// SYS_MODULE_READY (36): advance the sequential boot-release chain.
+    ///
+    /// Called by each boot module's `_start` after it has finished init
+    /// (endpoint registration, state setup, any other one-shot work) and
+    /// is about to enter its service loop. The handler advances the
+    /// `BOOT_MODULE_ORDER` cursor and wakes the next module in the
+    /// roster, which was parked in `BlockReason::BootGate` by
+    /// `load_boot_modules`.
+    ///
+    /// No arguments, no return payload. Identity-exempt (see
+    /// `SyscallNumber::requires_identity`).
+    ///
+    /// Idempotent: if the chain is already complete or the calling task
+    /// isn't a boot module, the call is a no-op.
+    fn handle_module_ready(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        let next_tid = {
+            let mut order = crate::BOOT_MODULE_ORDER.lock();
+            order.advance()
+        };
+        if let Some(tid) = next_tid {
+            crate::wake_task_on_cpu(tid);
+        }
+        Ok(0)
     }
 
     // ========================================================================
@@ -426,6 +471,31 @@ impl SyscallDispatcher {
         // Read user buffer into kernel
         let mut kbuf = [0u8; 256];
         read_user_buffer(ctx.cr3, user_buf, len, &mut kbuf)?;
+
+        // Virtio-blk kernel response endpoint (Phase 4a.iii): writes here
+        // skip the capability check and land in SHARDED_IPC. The kernel is
+        // the only consumer; trust is by endpoint choice (mirror of the
+        // POLICY_RESP_ENDPOINT pattern below). Note: NO scheduler wake —
+        // `VirtioBlkDevice::call` polls for the reply on the same endpoint
+        // after its wake-driver send, so an extra wake here is redundant
+        // and (empirically) provokes a subtle interaction that stalls the
+        // driver's own virtqueue self-test. The blocked kernel task on
+        // MessageWait(25) will still resume when its timer slice runs.
+        const BLK_KERNEL_RESP_ENDPOINT: u32 = 25;
+        if endpoint_id == BLK_KERNEL_RESP_ENDPOINT {
+            let ep = crate::ipc::EndpointId(endpoint_id);
+            let mut msg = crate::ipc::Message::new(
+                crate::ipc::EndpointId(ctx.process_id.slot()),
+                ep,
+            );
+            if msg.set_payload(&kbuf[..len]).is_err() {
+                return Err(SyscallError::InvalidArg);
+            }
+            if crate::SHARDED_IPC.send_message(ep, msg).is_err() {
+                return Err(SyscallError::OutOfMemory);
+            }
+            return Ok(len as u64);
+        }
 
         // Policy response interception — before any lock acquisition.
         // Writes to POLICY_RESP_ENDPOINT are consumed by the kernel (never
@@ -1005,6 +1075,17 @@ impl SyscallDispatcher {
                 // Drop IPC/capability locks here
             };
 
+            // Virtio-blk kernel-command endpoint (Phase 4a.iii): kernel-origin
+            // commands land in `SHARDED_IPC` (not `IPC_MANAGER`). Scoped
+            // narrowly to endpoint 26 so other recv paths — which have no
+            // reason to consult SHARDED_IPC today — are unaffected.
+            const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
+            let msg = if endpoint_id == BLK_KERNEL_CMD_ENDPOINT {
+                msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
+            } else {
+                msg
+            };
+
             if let Some(msg) = msg {
                 let payload = msg.payload();
                 let payload_len = core::cmp::min(payload.len(), buf_len - 36);
@@ -1110,7 +1191,6 @@ impl SyscallDispatcher {
         let mut store_guard = crate::OBJECT_STORE.lock();
         let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        use crate::fs::ObjectStore;
         store.put(obj).map_err(|e| match e {
             crate::fs::StoreError::CapacityExceeded => SyscallError::OutOfMemory,
             crate::fs::StoreError::InvalidObject => SyscallError::InvalidArg,
@@ -1147,32 +1227,31 @@ impl SyscallDispatcher {
         let mut hash = [0u8; 32];
         read_user_buffer(ctx.cr3, hash_ptr, 32, &mut hash)?;
 
-        // Look up in OBJECT_STORE
-        let store_guard = crate::OBJECT_STORE.lock();
-        let store = store_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-
-        use crate::fs::ObjectStore;
-        let obj = store.get(&hash).map_err(|e| match e {
-            crate::fs::StoreError::NotFound => SyscallError::EndpointNotFound,
-            _ => SyscallError::InvalidArg,
-        })?;
+        // Look up in OBJECT_STORE. The trait's `get` now returns an owned
+        // CambiObject, so the lock can be released before signature
+        // verification and the userspace write. Keeping the lock scope
+        // minimal is a precondition for future disk-backed backends that
+        // must not hold OBJECT_STORE across block I/O.
+        let obj = {
+            let mut store_guard = crate::OBJECT_STORE.lock();
+            let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            store.get(&hash).map_err(|e| match e {
+                crate::fs::StoreError::NotFound => SyscallError::EndpointNotFound,
+                _ => SyscallError::InvalidArg,
+            })?
+        };
 
         // Verify signature if the object is signed (non-empty signature).
         // Unsigned objects (empty signature) are returned as-is for backward
         // compatibility — the caller can check the signature field if needed.
         if !obj.signature.is_empty_sig()
             && !crate::fs::verify_signature(&obj.owner, &obj.content, &obj.signature) {
-                drop(store_guard);
                 return Err(SyscallError::PermissionDenied);
             }
 
         let copy_len = core::cmp::min(obj.content.len(), out_buf_len);
-        let content_slice = &obj.content[..copy_len];
-
-        // Must copy before dropping lock (can't hold reference across drop)
         let mut kbuf = [0u8; 4096];
-        kbuf[..copy_len].copy_from_slice(content_slice);
-        drop(store_guard);
+        kbuf[..copy_len].copy_from_slice(&obj.content[..copy_len]);
 
         write_user_buffer(ctx.cr3, out_buf, &kbuf[..copy_len])?;
 
@@ -1200,18 +1279,15 @@ impl SyscallDispatcher {
         // caller_principal already resolved by dispatch()
         let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
-        // Check ownership then delete
+        // Check ownership then delete. `get` returns owned — ownership check
+        // does not keep a borrow alive across the subsequent `delete` call.
         let mut store_guard = crate::OBJECT_STORE.lock();
         let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        use crate::fs::ObjectStore;
 
-        // Verify caller is owner before deleting
-        {
-            let obj = store.get(&hash).map_err(|_| SyscallError::EndpointNotFound)?;
-            if obj.owner != principal.public_key {
-                return Err(SyscallError::PermissionDenied);
-            }
+        let obj = store.get(&hash).map_err(|_| SyscallError::EndpointNotFound)?;
+        if obj.owner != principal.public_key {
+            return Err(SyscallError::PermissionDenied);
         }
 
         store.delete(&hash).map_err(|_| SyscallError::EndpointNotFound)?;
@@ -1239,10 +1315,9 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        let store_guard = crate::OBJECT_STORE.lock();
-        let store = store_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+        let mut store_guard = crate::OBJECT_STORE.lock();
+        let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        use crate::fs::ObjectStore;
         let listing = store.list().map_err(|_| SyscallError::InvalidArg)?;
         drop(store_guard);
 
@@ -1357,7 +1432,6 @@ impl SyscallDispatcher {
         let mut store_guard = crate::OBJECT_STORE.lock();
         let store = store_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        use crate::fs::ObjectStore;
         store.put(obj).map_err(|e| match e {
             crate::fs::StoreError::CapacityExceeded => SyscallError::OutOfMemory,
             crate::fs::StoreError::InvalidObject => SyscallError::InvalidArg,
@@ -1550,6 +1624,130 @@ impl SyscallDispatcher {
         write_user_buffer(ctx.cr3, out_paddr_ptr, &paddr_bytes)?;
 
         Ok(dma_vaddr)
+    }
+
+    /// SYS_MAP_FRAMEBUFFER: Map a Limine-reported framebuffer (selected by
+    /// `index`) into the calling process's address space, and write a
+    /// 32-byte `FramebufferDescriptor` to the user-provided output buffer.
+    ///
+    /// Args: arg1 = framebuffer_index (u32), arg2 = out_desc_ptr,
+    ///       arg3 = out_desc_len (must be ≥ FB_DESC_SIZE)
+    ///
+    /// The kernel holds the physical framebuffer address; userspace never
+    /// passes it in. This is the [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md)
+    /// per-display scanout path: a multi-monitor compositor calls this once
+    /// per display.
+    ///
+    /// Capability-gated: caller must hold
+    /// `CapabilityKind::MapFramebuffer`. Without it, returns
+    /// `PermissionDenied`.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7).
+    fn handle_map_framebuffer(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let index = args.arg1_u32() as usize;
+        let out_desc_ptr = args.arg2;
+        let out_desc_len = args.arg_usize(3);
+
+        /// Wire-format size of the descriptor written to userspace.
+        /// ARCHITECTURAL: 32 bytes is the documented v1 layout — see the
+        /// SyscallNumber::MapFramebuffer doc for the field map. Future
+        /// extensions need a new syscall + cap, not a quiet size bump.
+        const FB_DESC_SIZE: usize = 32;
+
+        if out_desc_len < FB_DESC_SIZE {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Capability check.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(
+                    ctx.process_id,
+                    crate::ipc::capability::CapabilityKind::MapFramebuffer,
+                )
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
+        // Look up the requested framebuffer in the kernel-owned BootInfo.
+        let info = crate::boot::info();
+        let fb = info
+            .framebuffers()
+            .nth(index)
+            .ok_or(SyscallError::InvalidArg)?;
+
+        // Compute the framebuffer footprint in pages, page-aligning the
+        // physical base just in case.
+        let phys_base = fb.phys_addr & !0xFFF;
+        let phys_offset_in_page = (fb.phys_addr & 0xFFF) as u64;
+        let total_bytes = fb.size_bytes() + phys_offset_in_page;
+        let num_pages = total_bytes.div_ceil(4096) as u32;
+
+        // Allocate VMA region for the user-side mapping.
+        let mut pt_guard = crate::PROCESS_TABLE.lock();
+        let vma = pt_guard
+            .as_mut()
+            .and_then(|pt| pt.vma_mut(ctx.process_id))
+            .ok_or(SyscallError::InvalidArg)?;
+        let region_vaddr = vma
+            .allocate_region(num_pages)
+            .ok_or(SyscallError::OutOfMemory)?;
+
+        // Map each page with uncacheable (MMIO) flags.
+        let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+        for i in 0..num_pages as u64 {
+            let page_vaddr = region_vaddr + i * 4096;
+            let page_phys = phys_base + i * 4096;
+
+            // SAFETY: cr3 is valid; phys_base comes from BootInfo which
+            // was populated from Limine's framebuffer response, and
+            // framebuffer memory is outside the frame allocator's
+            // tracked range (Limine reports it as Framebuffer, not Usable).
+            unsafe {
+                let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
+                crate::memory::paging::map_page(
+                    &mut pt,
+                    page_vaddr,
+                    page_phys,
+                    crate::memory::paging::flags::user_mmio(),
+                    &mut fa_guard,
+                )
+                .map_err(|_| SyscallError::OutOfMemory)?;
+            }
+        }
+        drop(fa_guard);
+        drop(pt_guard);
+
+        // The user vaddr is the start of the mapped region plus the
+        // intra-page offset (preserves alignment to whatever Limine
+        // returned, even though Limine's FB is page-aligned in practice).
+        let user_vaddr = region_vaddr + phys_offset_in_page;
+
+        // Build the 32-byte descriptor (little-endian, packed layout).
+        let mut desc = [0u8; FB_DESC_SIZE];
+        desc[0..8].copy_from_slice(&user_vaddr.to_le_bytes());
+        desc[8..12].copy_from_slice(&fb.width.to_le_bytes());
+        desc[12..16].copy_from_slice(&fb.height.to_le_bytes());
+        desc[16..20].copy_from_slice(&fb.pitch.to_le_bytes());
+        desc[20..22].copy_from_slice(&fb.bpp.to_le_bytes());
+        desc[22] = fb.red_mask_size;
+        desc[23] = fb.red_mask_shift;
+        desc[24] = fb.green_mask_size;
+        desc[25] = fb.green_mask_shift;
+        desc[26] = fb.blue_mask_size;
+        desc[27] = fb.blue_mask_shift;
+        // desc[28..32] reserved (zeroed)
+
+        write_user_buffer(ctx.cr3, out_desc_ptr, &desc)?;
+
+        Ok(0)
     }
 
     /// SYS_DEVICE_INFO: Query PCI device info by index.

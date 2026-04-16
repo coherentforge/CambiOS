@@ -19,6 +19,7 @@
 //! See [ADR-005](../../docs/adr/005-ipc-primitives-control-and-bulk.md)
 //! for the design.
 
+use alloc::vec::Vec;
 use crate::ipc::{ProcessId, Principal};
 
 // ============================================================================
@@ -554,19 +555,21 @@ impl ChannelManager {
 
     /// Revoke all channels involving a given ProcessId (as creator or peer).
     ///
-    /// Used by the process exit cleanup path (`handle_exit`). Returns
-    /// an array of revoked records and the count, so the caller can
-    /// unmap pages and free frames for each.
+    /// Used by the process exit cleanup path (`handle_exit`). Returns the
+    /// list of revoked records so the caller can unmap pages and free
+    /// frames for each.
     ///
     /// The returned records have `state = Revoked`. Slots are freed and
-    /// generations incremented.
+    /// generations incremented. The Vec is heap-allocated: returning a
+    /// fixed-size `[Option<ChannelRecord>; MAX_CHANNELS]` here would put
+    /// tens of KiB on the caller's kernel stack (MAX_CHANNELS × ~140 B),
+    /// and with 8 KiB kernel stacks that overflows into adjacent kernel
+    /// heap — which held the exiting CPU's scheduler. Heap-allocate.
     pub fn revoke_all_for_process(
         &mut self,
         pid: ProcessId,
-    ) -> ([Option<ChannelRecord>; MAX_CHANNELS], usize) {
-        let mut revoked: [Option<ChannelRecord>; MAX_CHANNELS] =
-            [const { None }; MAX_CHANNELS];
-        let mut revoked_count = 0usize;
+    ) -> Vec<ChannelRecord> {
+        let mut revoked: Vec<ChannelRecord> = Vec::new();
 
         for idx in 0..MAX_CHANNELS {
             let dominated = if let Some(record) = &self.channels[idx] {
@@ -586,13 +589,12 @@ impl ChannelManager {
                     taken.state = ChannelState::Revoked;
                     self.count -= 1;
                     self.generations[idx] = self.generations[idx].wrapping_add(1);
-                    revoked[revoked_count] = Some(taken);
-                    revoked_count += 1;
+                    revoked.push(taken);
                 }
             }
         }
 
-        (revoked, revoked_count)
+        revoked
     }
 }
 
@@ -1055,12 +1057,10 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.count(), 3);
 
-        let (revoked, count) = mgr.revoke_all_for_process(test_pid(1));
-        assert_eq!(count, 2);
-        assert!(revoked[0].is_some());
-        assert!(revoked[1].is_some());
-        assert_eq!(revoked[0].as_ref().unwrap().state, ChannelState::Revoked);
-        assert_eq!(revoked[1].as_ref().unwrap().state, ChannelState::Revoked);
+        let revoked = mgr.revoke_all_for_process(test_pid(1));
+        assert_eq!(revoked.len(), 2);
+        assert_eq!(revoked[0].state, ChannelState::Revoked);
+        assert_eq!(revoked[1].state, ChannelState::Revoked);
         // The third channel (owned by pid 3) is untouched.
         assert_eq!(mgr.count(), 1);
     }
@@ -1085,17 +1085,17 @@ mod tests {
         assert_eq!(mgr.count(), 1);
 
         // Revoke all for the peer (pid 2).
-        let (revoked, count) = mgr.revoke_all_for_process(test_pid(2));
-        assert_eq!(count, 1);
-        assert_eq!(revoked[0].as_ref().unwrap().state, ChannelState::Revoked);
+        let revoked = mgr.revoke_all_for_process(test_pid(2));
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].state, ChannelState::Revoked);
         assert_eq!(mgr.count(), 0);
     }
 
     #[test]
     fn test_revoke_all_for_process_empty() {
         let mut mgr = ChannelManager::new();
-        let (_, count) = mgr.revoke_all_for_process(test_pid(99));
-        assert_eq!(count, 0);
+        let revoked = mgr.revoke_all_for_process(test_pid(99));
+        assert_eq!(revoked.len(), 0);
     }
 
     #[test]

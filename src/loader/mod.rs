@@ -30,7 +30,18 @@ use core::mem::size_of;
 ///      validator with stack-allocated context, channel teardown that walks
 ///      process tables. Watch for stack-overflow double-faults landing on IST1.
 ///      See ASSUMPTIONS.md.
-const KERNEL_STACK_SIZE: usize = 8192;
+/// SCAFFOLDING: per-task kernel stack size.
+/// Why: the original 8 KiB was an unconscious bound — never sized for the
+/// real frame budget. Real kernel paths in this build push past it
+/// (debug `blake3::avx2::hash8` alone wants ~272 KiB; even fixed paths
+/// like channel revoke briefly held arrays in the tens of KiB). Adjacent
+/// kstacks are heap-allocated contiguously with no guard pages, so an
+/// overflow corrupts the next task's saved context and produces a GPF
+/// or silent reschedule death. 32 KiB gives ~4× headroom over current
+/// observed usage and costs MAX_TASKS × 32 KiB ≈ 8 MiB of kernel memory.
+/// Replace when: per-kstack guard-page mapping lands (then this becomes a
+/// HARDWARE-bounded value driven by the page-fault report, not a guess).
+const KERNEL_STACK_SIZE: usize = 32 * 1024;
 
 /// SCAFFOLDING: default user stack 16 pages (64 KiB).
 /// Why: conservative default that fits all current services.

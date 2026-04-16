@@ -220,6 +220,28 @@ pub fn register_endpoint(endpoint_id: u32) -> i64 {
     syscall_raw3(SYS_REGISTER_ENDPOINT, endpoint_id as u64, 0, 0)
 }
 
+const SYS_MODULE_READY: u64 = 36;
+
+/// Signal to the kernel that this boot module has finished initialization
+/// and is about to enter its service loop.
+///
+/// The kernel's sequential boot-release chain: modules 1..N of the
+/// `limine.conf` roster start `Blocked` on `BootGate`. Each module's
+/// `module_ready()` call advances the cursor and wakes the next module,
+/// guaranteeing deterministic boot ordering — each service's
+/// "[X] ready on endpoint N\n" print appears in strict limine.conf
+/// order, and the shell's `arcos>` prompt arrives only after everything
+/// it depends on is up.
+///
+/// Identity-exempt (does not require a bound Principal). Safe to call
+/// before the key-store / signing infrastructure is reachable.
+///
+/// Always returns 0. Idempotent at the kernel side: a second call from
+/// the same module, or a call from a late-loaded module, is a no-op.
+pub fn module_ready() {
+    syscall_raw3(SYS_MODULE_READY, 0, 0, 0);
+}
+
 pub fn yield_now() {
     syscall_raw3(SYS_YIELD, 0, 0, 0);
 }
@@ -581,4 +603,169 @@ pub fn audit_info(out_buf: &mut [u8]) -> i64 {
         out_buf.len() as u64,
         0,
     )
+}
+
+// ============================================================================
+// Hardware-IRQ wait + framebuffer mapping (Phase GUI-0, ADR-011)
+// ============================================================================
+
+const SYS_WAIT_IRQ: u64 = 5;
+const SYS_MAP_FRAMEBUFFER: u64 = 35;
+
+/// Block this task until the named IRQ fires.
+///
+/// IRQ numbers follow the I/O APIC GSI convention: 1 = keyboard, 12 = PS/2
+/// mouse, etc. `irq` must be < 224 (the kernel's MAX_DEVICE_IRQ ceiling).
+/// Returns 0 on wake. Negative codes on registration failure (already
+/// claimed, invalid IRQ, etc.).
+///
+/// Today only one task may register per IRQ (first-come-first-served).
+pub fn wait_irq(irq: u32) -> i64 {
+    syscall_raw3(SYS_WAIT_IRQ, irq as u64, 0, 0)
+}
+
+/// Layout of the descriptor returned by [`map_framebuffer`].
+///
+/// Wire-format size: 32 bytes, little-endian, `#[repr(C)]`. Mirrors the
+/// kernel-side layout in `handle_map_framebuffer` (see ADR-011).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FramebufferDescriptor {
+    /// User-space virtual address where the framebuffer pages are mapped.
+    pub vaddr: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per scanline (≥ width × bpp/8).
+    pub pitch: u32,
+    pub bpp: u16,
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+    /// Reserved (zero today).
+    pub reserved: u32,
+}
+
+/// Wire-format size of `FramebufferDescriptor`.
+pub const FRAMEBUFFER_DESCRIPTOR_SIZE: usize = 32;
+
+/// Map the framebuffer at `index` (zero-based, per-display) into this
+/// process and fill `out` with its descriptor.
+///
+/// Multi-monitor: call once per display. `index = 0` is the primary;
+/// out-of-range indices return `Err(-1)` with no mapping made.
+///
+/// Capability-gated: caller must hold
+/// `CapabilityKind::MapFramebuffer`. Without it, returns
+/// `Err(-3)` (PermissionDenied).
+///
+/// Returns `Ok(())` on success; the user vaddr is in `out.vaddr`.
+pub fn map_framebuffer(index: u32, out: &mut FramebufferDescriptor) -> Result<(), i64> {
+    let mut buf = [0u8; FRAMEBUFFER_DESCRIPTOR_SIZE];
+    let rc = syscall_raw3(
+        SYS_MAP_FRAMEBUFFER,
+        index as u64,
+        buf.as_mut_ptr() as u64,
+        FRAMEBUFFER_DESCRIPTOR_SIZE as u64,
+    );
+    if rc < 0 {
+        return Err(rc);
+    }
+    out.vaddr = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+    out.width = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
+    out.height = u32::from_le_bytes(buf[12..16].try_into().unwrap_or([0; 4]));
+    out.pitch = u32::from_le_bytes(buf[16..20].try_into().unwrap_or([0; 4]));
+    out.bpp = u16::from_le_bytes(buf[20..22].try_into().unwrap_or([0; 2]));
+    out.red_mask_size = buf[22];
+    out.red_mask_shift = buf[23];
+    out.green_mask_size = buf[24];
+    out.green_mask_shift = buf[25];
+    out.blue_mask_size = buf[26];
+    out.blue_mask_shift = buf[27];
+    out.reserved = u32::from_le_bytes(buf[28..32].try_into().unwrap_or([0; 4]));
+    Ok(())
+}
+
+// ============================================================================
+// Virtio-blk driver IPC client (Phase 4a.ii)
+// ============================================================================
+//
+// Thin wrappers over the `write` + `recv_verified` pair for talking to the
+// virtio-blk driver at endpoint 22. Each wrapper sends a single control-frame
+// request and polls the caller's own endpoint for the response. `block_read`
+// and `block_write` are deliberately absent — the 4 KiB data path is Phase
+// 4a.iii work and the protocol (multi-frame, channel, shared map) has not
+// landed. Callers that need bulk I/O today must roll their own path.
+
+/// IPC endpoint registered by the virtio-blk driver. Endpoint 22 is the
+/// policy-service query channel; virtio-blk lives on 24.
+pub const BLK_DRIVER_ENDPOINT: u32 = 24;
+
+const BLK_CMD_FLUSH: u8 = 3;
+const BLK_CMD_GET_CAPACITY: u8 = 4;
+const BLK_CMD_GET_STATUS: u8 = 5;
+
+const BLK_STATUS_OK: u8 = 0;
+
+/// Poll the caller's endpoint for up to 20 yields waiting for a reply.
+/// Returns the verified message's payload bytes copied into `out`, or `None`
+/// on timeout / anonymous sender / transport error.
+fn blk_await_reply(caller_endpoint: u32, out: &mut [u8; 256]) -> Option<usize> {
+    let mut buf = [0u8; 292];
+    for _ in 0..20 {
+        if let Some(msg) = recv_verified(caller_endpoint, &mut buf) {
+            let payload = msg.payload();
+            let n = core::cmp::min(payload.len(), out.len());
+            out[..n].copy_from_slice(&payload[..n]);
+            return Some(n);
+        }
+        yield_now();
+    }
+    None
+}
+
+/// Ask the virtio-blk driver for the device capacity, in 512-byte sectors.
+///
+/// `caller_endpoint` is the caller's own IPC endpoint — the driver's reply
+/// lands there. Returns `None` if the driver is absent, the reply times out,
+/// or the device reports no capacity.
+pub fn block_capacity(caller_endpoint: u32) -> Option<u64> {
+    if write(BLK_DRIVER_ENDPOINT, &[BLK_CMD_GET_CAPACITY]) < 0 {
+        return None;
+    }
+    let mut reply = [0u8; 256];
+    let n = blk_await_reply(caller_endpoint, &mut reply)?;
+    if n < 9 || reply[0] != BLK_STATUS_OK {
+        return None;
+    }
+    Some(u64::from_le_bytes(reply[1..9].try_into().ok()?))
+}
+
+/// Ask the driver to issue a `VIRTIO_BLK_T_FLUSH`. Returns `true` on success.
+pub fn block_flush(caller_endpoint: u32) -> bool {
+    if write(BLK_DRIVER_ENDPOINT, &[BLK_CMD_FLUSH]) < 0 {
+        return false;
+    }
+    let mut reply = [0u8; 256];
+    match blk_await_reply(caller_endpoint, &mut reply) {
+        Some(n) if n >= 1 => reply[0] == BLK_STATUS_OK,
+        _ => false,
+    }
+}
+
+/// Probe the driver — returns `Some(alive)` where `alive` reflects whether
+/// the device and its virtqueue are healthy. `None` means the driver itself
+/// is not reachable.
+pub fn block_status(caller_endpoint: u32) -> Option<bool> {
+    if write(BLK_DRIVER_ENDPOINT, &[BLK_CMD_GET_STATUS]) < 0 {
+        return None;
+    }
+    let mut reply = [0u8; 256];
+    let n = blk_await_reply(caller_endpoint, &mut reply)?;
+    if n < 2 || reply[0] != BLK_STATUS_OK {
+        return None;
+    }
+    Some(reply[1] != 0)
 }

@@ -152,6 +152,7 @@ pub extern "C" fn _start() -> ! {
     } else {
         sys::print(b"[KS] ready on endpoint 17\n");
     }
+    sys::module_ready();
 
     // Step 3: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];

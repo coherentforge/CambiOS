@@ -11,7 +11,13 @@
 //!
 //! The interfaces defined here are permanent. The implementations evolve.
 
+pub mod block;
+pub mod disk;
+#[cfg(not(test))]
+pub mod lazy_disk;
 pub mod ram;
+#[cfg(not(test))]
+pub mod virtio_blk_device;
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -198,6 +204,13 @@ impl ObjectCapSet {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    /// Iterate over the active capabilities (skipping empty slots).
+    pub fn iter(&self) -> impl Iterator<Item = &ObjectCapability> {
+        self.caps[..self.count as usize]
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+    }
 }
 
 // ============================================================================
@@ -339,10 +352,19 @@ impl core::fmt::Display for StoreError {
 /// Not a traditional block-device filesystem. Every backing store
 /// (RAM, disk, sovereign cloud, P2P) implements this trait.
 ///
-/// Phase 1B: RamObjectStore with Blake3 hashing + Ed25519 signatures.
+/// `get` returns an owned `CambiObject`. A disk-backed store cannot honor a
+/// borrowed return without leaking page-cache policy into the trait; the
+/// kernel-side caller already copies content into a bounded kernel buffer
+/// before writing to userspace, so owning the return is effectively free for
+/// the small objects the v1 syscall path permits.
+///
+/// `get` and `list` take `&mut self` because any non-memory-backed store
+/// mutates internal queue state on reads (virtio descriptor rings, bounce
+/// buffers, cache bookkeeping). Callers serialize access through the
+/// `OBJECT_STORE` spinlock.
 pub trait ObjectStore {
     /// Retrieve an object by content hash.
-    fn get(&self, hash: &[u8; 32]) -> Result<&CambiObject, StoreError>;
+    fn get(&mut self, hash: &[u8; 32]) -> Result<CambiObject, StoreError>;
 
     /// Store an object. Returns the content hash (the object's address).
     /// The store verifies `content_hash` matches the content on put.
@@ -351,8 +373,10 @@ pub trait ObjectStore {
     /// Delete an object by content hash.
     fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError>;
 
-    /// List all objects with lightweight metadata.
-    fn list(&self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError>;
+    /// List all objects with lightweight metadata. Disk-backed stores may
+    /// return zero-filled `ObjectMeta` (the hash is authoritative; callers
+    /// that need metadata call `get`).
+    fn list(&mut self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError>;
 
     /// Number of objects currently stored.
     fn count(&self) -> usize;

@@ -30,6 +30,8 @@ KS_SERVICE_DIR := user/key-store-service
 KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-key-store-service
 NET_DRIVER_DIR := user/virtio-net
 NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-net
+BLK_DRIVER_DIR := user/virtio-blk
+BLK_DRIVER_ELF := $(BLK_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-blk
 I219_DRIVER_DIR := user/i219-net
 I219_DRIVER_ELF := $(I219_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-i219-net
 UDP_STACK_DIR := user/udp-stack
@@ -38,6 +40,8 @@ SHELL_DIR := user/shell
 SHELL_ELF := $(SHELL_DIR)/target/x86_64-unknown-none/release/arcos-shell
 POLICY_SERVICE_DIR := user/policy-service
 POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-policy-service
+FB_DEMO_DIR := user/fb-demo
+FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/arcos-fb-demo
 
 # User-space ELF binaries (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
@@ -46,10 +50,12 @@ USER_LD_AARCH64  := user/user-aarch64.ld
 FS_SERVICE_ELF_AARCH64 := $(FS_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-fs-service
 KS_SERVICE_ELF_AARCH64 := $(KS_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-key-store-service
 NET_DRIVER_ELF_AARCH64 := $(NET_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-virtio-net
+BLK_DRIVER_ELF_AARCH64 := $(BLK_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-virtio-blk
 I219_DRIVER_ELF_AARCH64 := $(I219_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-i219-net
 UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/arcos-udp-stack
 SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/arcos-shell
 POLICY_SERVICE_ELF_AARCH64 := $(POLICY_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-policy-service
+FB_DEMO_ELF_AARCH64 := $(FB_DEMO_DIR)/target/aarch64-unknown-none/release/arcos-fb-demo
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -68,7 +74,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -102,6 +108,13 @@ virtio-net:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Virtio-Net driver ready ==="
 
+virtio-blk:
+	@echo "=== Building Virtio-Blk driver ==="
+	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== Virtio-Blk driver ready ==="
+
 i219-net:
 	@echo "=== Building Intel I219-LM driver ==="
 	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -129,6 +142,13 @@ policy-service:
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Policy service ready ==="
+
+fb-demo:
+	@echo "=== Building fb-demo (Phase GUI-1) ==="
+	cd $(FB_DEMO_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== fb-demo ready ==="
 
 # AArch64 user-space build targets
 user-elf-aarch64:
@@ -158,6 +178,13 @@ virtio-net-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== Virtio-Net driver (AArch64) ready ==="
 
+virtio-blk-aarch64:
+	@echo "=== Building Virtio-Blk driver (AArch64) ==="
+	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== Virtio-Blk driver (AArch64) ready ==="
+
 i219-net-aarch64:
 	@echo "=== Building Intel I219-LM driver (AArch64) ==="
 	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -186,6 +213,13 @@ policy-service-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== Policy service (AArch64) ready ==="
 
+fb-demo-aarch64:
+	@echo "=== Building fb-demo (AArch64) ==="
+	cd $(FB_DEMO_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== fb-demo (AArch64) ready ==="
+
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release
@@ -205,7 +239,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service limine
+iso: kernel user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -220,14 +254,18 @@ iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack 
 	# virtio-net, i219-net, udp-stack disabled in limine.conf — scaffolded
 	# drivers hang in PCI discovery. Binaries still build via iso: deps
 	# but aren't loaded. Re-enable when the drivers are fully formed.
+	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
 	cp $(POLICY_SERVICE_ELF) iso_root/boot/policy-service.elf
+	cp $(FB_DEMO_ELF) iso_root/boot/fb-demo.elf
 	# Sign all modules (single invocation avoids repeated card contention)
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fb-demo.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -249,13 +287,30 @@ iso: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack 
 	rm -rf iso_root
 	@echo "=== $(ISO) ready ==="
 
-run: iso
+# Persistent backing file for the virtio-blk device. 64 MiB is enough for
+# the Phase 4a.i DiskObjectStore with 4096-slot capacity (~32 MiB used) plus
+# room to grow. The image file persists across `make run` invocations, which
+# is the whole point — reboot-cycle testing needs the bytes to survive.
+DISK_IMG := cambios-disk.img
+DISK_SIZE_MB := 64
+
+disk-img:
+	@if [ ! -f $(DISK_IMG) ]; then \
+		echo "=== Creating $(DISK_IMG) ($(DISK_SIZE_MB) MiB) ==="; \
+		qemu-img create -f raw $(DISK_IMG) $(DISK_SIZE_MB)M; \
+	else \
+		echo "=== $(DISK_IMG) already exists; leaving it alone ==="; \
+	fi
+
+run: iso disk-img
 	qemu-system-x86_64 \
 		-cdrom $(ISO) \
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
 		-device virtio-net-pci \
+		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
+		-device virtio-blk-pci,drive=cambios-disk0 \
 		-no-reboot
 
 run-uefi: iso

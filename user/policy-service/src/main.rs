@@ -88,6 +88,8 @@ const SYS_CHANNEL_REVOKE: u32 = 31;
 const SYS_CHANNEL_INFO: u32 = 32;
 const SYS_AUDIT_ATTACH: u32 = 33;
 const SYS_AUDIT_INFO: u32 = 34;
+const SYS_MAP_FRAMEBUFFER: u32 = 35;
+const SYS_MODULE_READY: u32 = 36;
 
 // ============================================================================
 // Syscall profiles (bitmap of allowed syscall numbers)
@@ -110,10 +112,11 @@ const fn profile(syscalls: &[u32]) -> Profile {
 
 /// Default profile — common syscalls every identified process may use.
 /// Covers panic (Exit), cooperation (Yield), identity (GetPid, GetPrincipal,
-/// GetTime), and diagnostic output (Print). Nothing that touches shared
-/// state or hardware.
+/// GetTime), diagnostic output (Print), and the boot-chain release call
+/// (ModuleReady). Nothing that touches shared state or hardware.
 const DEFAULT_PROFILE: Profile = profile(&[
     SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_GET_TIME, SYS_PRINT, SYS_GET_PRINCIPAL,
+    SYS_MODULE_READY,
 ]);
 
 /// Hello test module — minimal profile, just enough to print and exit.
@@ -138,6 +141,15 @@ const NET_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
         SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
         SYS_WAIT_IRQ, SYS_MAP_MMIO, SYS_ALLOC_DMA, SYS_DEVICE_INFO, SYS_PORT_IO,
+    ]);
+
+/// Block driver (virtio-blk) — same shape as the NIC drivers today:
+/// PCI discovery via DeviceInfo, legacy I/O-BAR programming via PortIo,
+/// DMA allocation via AllocDma. No MMIO or IRQ wait path yet (polled).
+const BLK_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
+    | profile(&[
+        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
+        SYS_DEVICE_INFO, SYS_ALLOC_DMA, SYS_PORT_IO,
     ]);
 
 /// UDP stack — network protocol service over IPC.
@@ -170,20 +182,21 @@ const SLOT_UNUSED: Profile = 0;
 /// Profile lookup table, indexed by ProcessId slot.
 /// Out-of-range slots get DEFAULT_PROFILE (conservative: only safe syscalls).
 ///
-/// Slot order matches limine.conf module ordering. Network drivers
-/// (virtio-net, i219-net, udp-stack) are currently disabled — their
-/// profiles are kept here for when they return.
+/// Slot order matches limine.conf module ordering (see Divergence of
+/// ADR-002-adjacent boot sequencing). Network drivers (virtio-net,
+/// i219-net, udp-stack) are currently disabled — their profiles are
+/// kept here for when they return.
 const SLOT_PROFILES: [Profile; 16] = [
     SLOT_UNUSED,          //  0: kernel idle
     SLOT_UNUSED,          //  1: kernel process 1
     SLOT_UNUSED,          //  2: kernel process 2
-    HELLO_PROFILE,        //  3: hello.elf
-    SLOT_UNUSED,          //  4: policy-service (bypassed in kernel)
-    KEY_STORE_PROFILE,    //  5: key-store-service
-    FS_SERVICE_PROFILE,   //  6: fs-service
+    SLOT_UNUSED,          //  3: policy-service (bypassed in kernel)
+    KEY_STORE_PROFILE,    //  4: key-store-service
+    FS_SERVICE_PROFILE,   //  5: fs-service
+    BLK_DRIVER_PROFILE,   //  6: virtio-blk
     SHELL_PROFILE,        //  7: shell
-    DEFAULT_PROFILE,      //  8+: spawned/unknown — conservative default
-    DEFAULT_PROFILE,      //  9
+    HELLO_PROFILE,        //  8: hello.elf
+    DEFAULT_PROFILE,      //  9+: spawned/unknown — conservative default
     DEFAULT_PROFILE,      // 10
     DEFAULT_PROFILE,      // 11
     DEFAULT_PROFILE,      // 12
@@ -197,6 +210,8 @@ const SLOT_PROFILES: [Profile; 16] = [
 const _NET_DRIVER_PROFILE_KEPT: Profile = NET_DRIVER_PROFILE;
 #[allow(dead_code)]
 const _UDP_STACK_PROFILE_KEPT: Profile = UDP_STACK_PROFILE;
+#[allow(dead_code)]
+const _SYS_MAP_FRAMEBUFFER_KEPT: u32 = SYS_MAP_FRAMEBUFFER;
 
 /// Return the syscall profile for a given process slot.
 fn profile_for(caller_pid: u32) -> Profile {
@@ -234,6 +249,7 @@ pub extern "C" fn _start() -> ! {
     sys::register_endpoint(POLICY_QUERY_ENDPOINT);
 
     sys::print(b"[POLICY] ready on endpoint 22\n");
+    sys::module_ready();
 
     // Service loop: recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
