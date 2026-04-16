@@ -505,6 +505,22 @@ test:
 	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
 # =============================================================================
+# make verify — run Kani formal-verification proofs.
+#
+# Proofs live in `verification/<crate>/` and reuse kernel source via
+# `#[path]` includes (no copy, no fork). Kani uses its own bundled
+# nightly toolchain, so this works regardless of `rust-toolchain.toml`.
+#
+# Run after any change to a proven module (currently: BuddyAllocator).
+# A proof failure means the property no longer holds — investigate before
+# committing.
+# =============================================================================
+.PHONY: verify
+verify:
+	@echo "=== Kani proofs: BuddyAllocator ==="
+	cd verification/buddy-proofs && cargo kani
+
+# =============================================================================
 # make stats — derive canonical counts from source code.
 #
 # CLAUDE.md and STATUS.md must not hardcode these numbers; they drift
