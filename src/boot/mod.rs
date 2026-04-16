@@ -51,7 +51,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 ///      Memory cost: 128 × ~24 B ≈ 3 KiB in `.bss`.
 /// Replace when: a real firmware reports >128 entries (extremely
 ///      unusual; would indicate badly-fragmented memory map worth
-///      investigating regardless). See ASSUMPTIONS.md.
+///      investigating regardless). See docs/ASSUMPTIONS.md.
 pub const MAX_MEMORY_REGIONS: usize = 128;
 
 /// SCAFFOLDING: max framebuffers (= active displays) the boot protocol

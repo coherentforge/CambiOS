@@ -56,7 +56,7 @@ Before the first edit, stop and confirm with the user when any of these apply. T
 - **New `unsafe` invariant.** About to add `unsafe` that introduces a *new kind* of safety obligation (not mechanically matching a pre-existing pattern in the same module). Mechanical copies are fine; new invariants need user sign-off so the audit trail is intentional.
 - **ADR rewrite.** About to edit an ADR's original decision text. Use a `## Divergence` appendix or a new superseding ADR instead — original reasoning is immutable history.
 - **Lock hierarchy change.** About to add a new lock to the hierarchy, reorder entries, or change `IrqSpinlock` vs plain `Spinlock`. Formally relevant, cross-subsystem, and exactly the class of change that breaks invariants silently.
-- **SCAFFOLDING bound without v1 math.** About to pick a `const MAX_*` value without working through Dev Convention 8's extrapolation: v1-endgame workload, ≤25% utilization, memory cost. See [ASSUMPTIONS.md](ASSUMPTIONS.md).
+- **SCAFFOLDING bound without v1 math.** About to pick a `const MAX_*` value without working through Dev Convention 8's extrapolation: v1-endgame workload, ≤25% utilization, memory cost. See [ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 - **Dynamic dispatch in kernel.** About to introduce a trait object (`Box<dyn …>`, `&dyn …`) in kernel hot paths. Violates the Formal Verification rule ("no dynamic dispatch"). Propose the monomorphized design first.
 - **Panic / unwrap / expect in non-test kernel code.** Every kernel failure must be a typed `Result`. If the only forward motion seems to be a panic, stop — the error type is probably wrong.
 - **Telemetry / analytics / phone-home.** Project principle is zero telemetry. Any feature that emits data off-device (even "anonymous") is a stop.
@@ -106,7 +106,7 @@ Why each non-obvious rule was added, so a future session can generalize instead 
 
 7. **Never assume zeroed memory equals `None` for `Option<T>`.** Rust does not guarantee the Option discriminant layout — the compiler may assign discriminant 0 to `Some` (not `None`), especially for large structs on bare-metal targets. Always use explicit `core::ptr::write(None)` when initializing heap-allocated arrays of `Option<T>`.
 
-8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](ASSUMPTIONS.md). Templates:
+8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Templates:
 
 ```rust
 /// SCAFFOLDING: <one-line statement of the constraint>
@@ -128,9 +128,9 @@ const CACHE_CAPACITY: usize = 32;
 
 1. Estimate **(a)** current workload, **(b)** v1 workload after all phases land, **(c)** memory cost at candidate multiples of the v1 estimate.
 2. Pick the smallest value where the v1 estimate is approximately **≤ 25% of the bound** AND the memory cost is still comfortable. "≤ 25%" means the bound has ~4× headroom above the v1 estimate — enough that a surprising workload or an unplanned consumer (a new audit channel, a second policy cache) does not push against the wall.
-3. Record the math in the row for that constant in [ASSUMPTIONS.md](ASSUMPTIONS.md) — the "Why this number" column should show the v1 workload estimate and the memory cost, not just "big enough."
+3. Record the math in the row for that constant in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md) — the "Why this number" column should show the v1 workload estimate and the memory cost, not just "big enough."
 
-When you add a new bound or change one, update the matching table in [ASSUMPTIONS.md](ASSUMPTIONS.md) in the same change. Step 8 of the Post-Change Review Protocol lists this as an explicit checklist item.
+When you add a new bound or change one, update the matching table in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md) in the same change. Step 8 of the Post-Change Review Protocol lists this as an explicit checklist item.
 
 ## Post-Change Review Protocol
 
@@ -214,9 +214,9 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 
 | Category | Files | Auto-refresh? | Rule |
 |---|---|---|---|
-| **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
+| **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](docs/ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
 | **decision_record** | [docs/adr/](docs/adr/) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
-| **design / source_of_truth** | [CambiOS.md](CambiOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
+| **design / source_of_truth** | [CambiOS.md](docs/CambiOS.md), [identity.md](docs/identity.md), [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md), [win-compat.md](docs/win-compat.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md), [SECURITY.md](docs/SECURITY.md), [GOVERNANCE.md](docs/GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 
 **Concrete checklist for the change you just made:**
@@ -227,7 +227,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference / Lock Ordering / Syscall Numbers tables.
 6. Did this change resolve a Platform Gotcha in CLAUDE.md or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
 7. Did this change cite a doc that doesn't exist yet? → Either create the doc or remove the citation.
-8. Did this change add or modify a numeric `const`, fixed-size array, or `MAX_*` bound in kernel code? → Tag it with `SCAFFOLDING` / `ARCHITECTURAL` / `HARDWARE` / `TUNING` per Development Convention 8, and add or update the row in [ASSUMPTIONS.md](ASSUMPTIONS.md). Unconscious bounds are not allowed.
+8. Did this change add or modify a numeric `const`, fixed-size array, or `MAX_*` bound in kernel code? → Tag it with `SCAFFOLDING` / `ARCHITECTURAL` / `HARDWARE` / `TUNING` per Development Convention 8, and add or update the row in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Unconscious bounds are not allowed.
 
 ## Common Failure Signatures
 
@@ -502,10 +502,10 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **IPC control path (256-byte messages)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/mod.rs`, `src/ipc/interceptor.rs` |
 | **IPC bulk path (channels — Phase 3)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (channels are the audit transport) |
 | **Capabilities, grant/revoke, delegation** | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) | `src/ipc/capability.rs` |
-| **Process tables / tier configuration / boot-time object sizing** | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md), [ADR-009](docs/adr/009-purpose-tiers-scope.md) | `src/process.rs`, `src/ipc/capability.rs`, [ASSUMPTIONS.md § Tier policies](ASSUMPTIONS.md) |
+| **Process tables / tier configuration / boot-time object sizing** | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md), [ADR-009](docs/adr/009-purpose-tiers-scope.md) | `src/process.rs`, `src/ipc/capability.rs`, [ASSUMPTIONS.md § Tier policies](docs/ASSUMPTIONS.md) |
 | **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/interceptor.rs` |
-| **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
-| **Identity / Principal / sender_principal** | [identity.md](identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) (intent only) |
+| **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
+| **Identity / Principal / sender_principal** | [identity.md](docs/identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) | [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) (intent only) |
 | **ObjectStore / CambiObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
 | **Persistent ObjectStore / on-disk format / BlockDevice** | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) | `src/fs/block.rs`, `src/fs/disk.rs`; [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) for the `CambiObject` model the format serializes |
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
@@ -513,21 +513,21 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Architecture port (RISC-V — in progress, future archs)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), this file's "Multi-Platform Strategy" section, plan file at `/Users/jasonricca/.claude/plans/melodic-tumbling-muffin.md` | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
 | **Graphics / compositor / GUI / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channels are the surface-buffer transport); graphics stack itself is not built yet (see ADR-011 phased plan) |
 | **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) (Principals and load-bearing identity — signed input devices participate in this model). No code yet; the wire format is the first thing to land when the first input driver ships. |
-| **Security review / threat model** | [SECURITY.md](SECURITY.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](PHILOSOPHY.md) | All ADRs |
+| **Security review / threat model** | [SECURITY.md](docs/SECURITY.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) | All ADRs |
 | **"Is X done yet?" / current state** | [STATUS.md](STATUS.md) | — |
 
 ## Design Documents
 
 These documents capture architectural decisions that implementation must align with. Pure intent goes in the design docs and ADRs; current implementation status goes in [STATUS.md](STATUS.md).
 
-- **[CambiOS.md](CambiOS.md)** — Source-of-truth architecture document (vision, principles, what CambiOS *is*).
-- **[identity.md](identity.md)** — Identity architecture: what identity means in CambiOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model.
-- **[FS-and-ID-design-plan.md](FS-and-ID-design-plan.md)** — Phase intent for identity + storage. Content-addressed ObjectStore, CambiObject model, bootstrap identity, IPC sender_principal stamping. Flows from identity.md.
-- **[win-compat.md](win-compat.md)** — Windows compatibility layer design: sandboxed PE loader, AI-translated Win32 shim tiers, virtual registry/filesystem, sandboxed Principal model, target application phases (business → CAD → instrumentation).
-- **[PHILOSOPHY.md](PHILOSOPHY.md)** — Why CambiOS exists, the AI-watches-not-decides stance, the verification-first commitment.
-- **[SECURITY.md](SECURITY.md)** — Security posture, enforcement table, threat model.
-- **[ASSUMPTIONS.md](ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
-- **[GOVERNANCE.md](GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
+- **[CambiOS.md](docs/CambiOS.md)** — Source-of-truth architecture document (vision, principles, what CambiOS *is*).
+- **[identity.md](docs/identity.md)** — Identity architecture: what identity means in CambiOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model.
+- **[FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md)** — Phase intent for identity + storage. Content-addressed ObjectStore, CambiObject model, bootstrap identity, IPC sender_principal stamping. Flows from identity.md.
+- **[win-compat.md](docs/win-compat.md)** — Windows compatibility layer design: sandboxed PE loader, AI-translated Win32 shim tiers, virtual registry/filesystem, sandboxed Principal model, target application phases (business → CAD → instrumentation).
+- **[PHILOSOPHY.md](docs/PHILOSOPHY.md)** — Why CambiOS exists, the AI-watches-not-decides stance, the verification-first commitment.
+- **[SECURITY.md](docs/SECURITY.md)** — Security posture, enforcement table, threat model.
+- **[ASSUMPTIONS.md](docs/ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
+- **[GOVERNANCE.md](docs/GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
 - **[docs/adr/](docs/adr/)** — Architecture decision records. Read the ones in the Required Reading map for the subsystem you're touching. (Run `ls docs/adr/` for the current set; do not cite a range here — it drifts.)
 
 Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.

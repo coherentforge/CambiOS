@@ -1,6 +1,6 @@
 # CambiOS Syscalls
 
-This document describes the syscall interface that userspace processes (drivers, services) use to request kernel services. All 18 syscalls are fully implemented in [`src/syscalls/dispatcher.rs`](src/syscalls/dispatcher.rs).
+This document describes the syscall interface that userspace processes (drivers, services) use to request kernel services. All 18 syscalls are fully implemented in [`src/syscalls/dispatcher.rs`](../src/syscalls/dispatcher.rs).
 
 ## Overview
 
@@ -12,7 +12,7 @@ User-space buffer access is performed via page-table walks through the process's
 
 ### x86_64 — SYSCALL/SYSRET
 
-The `syscall` instruction traps into the kernel. Entry point: [`src/arch/x86_64/syscall.rs`](src/arch/x86_64/syscall.rs).
+The `syscall` instruction traps into the kernel. Entry point: [`src/arch/x86_64/syscall.rs`](../src/arch/x86_64/syscall.rs).
 
 | Register | Purpose |
 |----------|---------|
@@ -26,7 +26,7 @@ The `syscall` instruction traps into the kernel. Entry point: [`src/arch/x86_64/
 
 ### AArch64 — SVC
 
-The `svc #0` instruction generates a synchronous exception routed via VBAR_EL1. Entry point: [`src/arch/aarch64/syscall.rs`](src/arch/aarch64/syscall.rs). The exception handler verifies ESR_EL1 EC=0x15 (SVC from AArch64).
+The `svc #0` instruction generates a synchronous exception routed via VBAR_EL1. Entry point: [`src/arch/aarch64/syscall.rs`](../src/arch/aarch64/syscall.rs). The exception handler verifies ESR_EL1 EC=0x15 (SVC from AArch64).
 
 | Register | Purpose |
 |----------|---------|
@@ -387,12 +387,12 @@ ssize_t sys_obj_list(void *out_buf, size_t out_buf_len);
 
 ## Capability-Based Access Control
 
-All IPC syscalls are subject to capability checks via [`src/ipc/capability.rs`](src/ipc/capability.rs):
+All IPC syscalls are subject to capability checks via [`src/ipc/capability.rs`](../src/ipc/capability.rs):
 
 - **SYS_WRITE / SYS_READ / SYS_RECV_MSG**: Require SEND or RECEIVE capability on the endpoint
 - **SYS_REGISTER_ENDPOINT**: Grants FULL capability (send/recv/delegate) to the caller
 
-Additionally, the zero-trust interceptor ([`src/ipc/interceptor.rs`](src/ipc/interceptor.rs)) runs a pre-dispatch policy check on every syscall and enforces send/recv hooks on IPC operations.
+Additionally, the zero-trust interceptor ([`src/ipc/interceptor.rs`](../src/ipc/interceptor.rs)) runs a pre-dispatch policy check on every syscall and enforces send/recv hooks on IPC operations.
 
 ## Identity-Aware IPC
 

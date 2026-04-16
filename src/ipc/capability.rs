@@ -95,7 +95,7 @@ pub struct Capability {
 ///      but this per-process cap is still a fixed compile-time 32.
 /// Replace when: Phase 3 work hits this — the policy service holds one capability
 ///      per service it mediates, the audit consumer holds one per producer.
-///      32 will get tight fast. See ASSUMPTIONS.md.
+///      32 will get tight fast. See docs/ASSUMPTIONS.md.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessCapabilities {
     /// Process ID

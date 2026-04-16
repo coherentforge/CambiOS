@@ -18,7 +18,7 @@ use super::{CambiObject, ObjectStore, ObjectMeta, StoreError, content_hash};
 ///      get/delete/list is fine at this size.
 /// Replace when: persistent ObjectStore (Phase 4) lands — that backend will be
 ///      dynamically sized and this constant goes away. Until then, the first
-///      time we want to store > 256 objects this is the wall. See ASSUMPTIONS.md.
+///      time we want to store > 256 objects this is the wall. See docs/ASSUMPTIONS.md.
 pub const MAX_OBJECTS: usize = 256;
 
 /// RAM-backed ObjectStore.

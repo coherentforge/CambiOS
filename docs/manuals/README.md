@@ -1,6 +1,6 @@
 # CambiOS Manuals
 
-These are narrative walkthroughs of how CambiOS works. They follow real things — a message, a boot sequence, a packet, a signature — through the system, explaining what happens and why at each step. They are not reference material (see the [architecture document](../../CambiOS.md) and [syscall reference](../../SYSCALLS.md) for that). They are stories.
+These are narrative walkthroughs of how CambiOS works. They follow real things — a message, a boot sequence, a packet, a signature — through the system, explaining what happens and why at each step. They are not reference material (see the [architecture document](../CambiOS.md) and [syscall reference](../SYSCALLS.md) for that). They are stories.
 
 Each manual is self-contained. Read whichever one interests you.
 

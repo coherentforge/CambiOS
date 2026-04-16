@@ -16,7 +16,7 @@
 //! - Encoding helpers (`encode_superblock`, `encode_record_header`, ...) are
 //!   pure functions over byte buffers — testable on host without a device.
 //! - All numeric bounds (`MAX_OBJECTS_ON_DISK`, `MAX_CONTENT_BYTES_ON_DISK`)
-//!   are documented in ASSUMPTIONS.md per Development Convention 8.
+//!   are documented in docs/ASSUMPTIONS.md per Development Convention 8.
 
 extern crate alloc;
 
@@ -54,7 +54,7 @@ pub const FORMAT_VERSION: u32 = 1;
 ///      free-map) ≈ 200 KiB against the 4 MiB kernel heap.
 /// Replace when: Phase 5 (social log) or Phase 7 (SSB federation) cause
 ///      object counts to approach ~1000; bump to 16384 or 65536, verify
-///      heap budget, update ASSUMPTIONS.md.
+///      heap budget, update docs/ASSUMPTIONS.md.
 pub const MAX_OBJECTS_ON_DISK: u64 = 4096;
 
 /// SCAFFOLDING: maximum content length per object on disk. Matches

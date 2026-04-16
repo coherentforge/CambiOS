@@ -22,7 +22,7 @@ This ADR fixes both problems at once. It writes down the reasoning behind the ex
 
 ## The Reframe
 
-The framing that resolves this is taken directly from [CambiOS.md](../../CambiOS.md) and [PHILOSOPHY.md](../../PHILOSOPHY.md), which both already authorize what we're about to do. The relevant principle is:
+The framing that resolves this is taken directly from [CambiOS.md](../CambiOS.md) and [PHILOSOPHY.md](../PHILOSOPHY.md), which both already authorize what we're about to do. The relevant principle is:
 
 > **The kernel mediates *policy*, not *bytes*.**
 
@@ -32,7 +32,7 @@ A capability check at IPC send time is *policy*: "is process A allowed to send a
 
 A 4 MB framebuffer copy is *not policy*. It's *bytes*. The decision about whether the display server is allowed to share memory with its client is the same kind of decision as the IPC capability check — made once, structurally enforced, requires no per-byte mediation. Once the decision is made, the bytes flow through the page tables (which the MMU enforces on every access, in hardware, at full memory bandwidth) without any additional kernel involvement.
 
-This reframe does not weaken security. It moves enforcement from a per-byte check (which is theatre, because by the time bytes are flowing the security decision has already been made) to a per-channel check at setup time (which is the actual moment authority is granted). [CambiOS.md line 134](../../CambiOS.md) already encodes this: "There is no shared memory between services unless explicitly granted through a capability."
+This reframe does not weaken security. It moves enforcement from a per-byte check (which is theatre, because by the time bytes are flowing the security decision has already been made) to a per-channel check at setup time (which is the actual moment authority is granted). [CambiOS.md line 134](../CambiOS.md) already encodes this: "There is no shared memory between services unless explicitly granted through a capability."
 
 ## Decision
 
@@ -241,7 +241,7 @@ The key invariant: **a revoked channel cannot leak data after revocation.** Once
 
 - Channels are accessible only through capabilities (matches ADR-000's "no ambient authority")
 - Channels have unforgeable creator/peer identity (matches ADR-003's identity model)
-- Channels can be revoked (matches the gap analysis in [SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis))
+- Channels can be revoked (matches the gap analysis in [SECURITY.md § Gap Analysis](../SECURITY.md#gap-analysis))
 - Channels are auditable: every channel has a kernel-signed record naming who created it, who attached, when, and for what purpose
 
 The TCB does not grow. The channel manager is a few hundred lines added to the kernel; it operates on the same primitives (page tables, frame allocator, capability manager, IPI for TLB shootdown) that the kernel already has.
@@ -280,7 +280,7 @@ Several alternatives were considered before settling on two distinct primitives.
 
 ### Option D: External shared memory primitive (the chosen option, written here for completeness)
 
-**Why chosen.** Solves the throughput problem structurally — the kernel is not on the data path, so its throughput limit does not apply. Composes with the existing capability and identity systems. Authorized by [CambiOS.md line 134](../../CambiOS.md). Verifiable as a separate, simpler invariant set than the control IPC. Enables real workloads (video, file I/O, LLM inference, audio) without compromising the control path's security properties.
+**Why chosen.** Solves the throughput problem structurally — the kernel is not on the data path, so its throughput limit does not apply. Composes with the existing capability and identity systems. Authorized by [CambiOS.md line 134](../CambiOS.md). Verifiable as a separate, simpler invariant set than the control IPC. Enables real workloads (video, file I/O, LLM inference, audio) without compromising the control path's security properties.
 
 The tradeoff: more kernel code (channel manager), more user-space discipline (ring buffer protocols), and a different threat model conversation (the channel data is between the two peers, not inspectable by the kernel — but the *topology* is). All three of these are acceptable in exchange for an architecture that scales to general-purpose workloads.
 
@@ -316,9 +316,9 @@ These are out of scope for the ADR but worth recording so they're not rediscover
 - **[ADR-003](003-content-addressed-storage-and-identity.md)** — Identity primitives (channels carry creator + peer Principals)
 - **[ADR-006](006-policy-service.md)** — Policy externalization (channel creation may be policy-gated)
 - **[ADR-007](007-capability-revocation-and-telemetry.md)** — Revocation mechanics + telemetry consumers (channel close paths and AI observability)
-- **[CambiOS.md § The Microkernel](../../CambiOS.md)** — Source-of-truth: "no shared memory between services unless explicitly granted through a capability"
+- **[CambiOS.md § The Microkernel](../CambiOS.md)** — Source-of-truth: "no shared memory between services unless explicitly granted through a capability"
 - **[CLAUDE.md § Lock Ordering](../../CLAUDE.md#lock-ordering)** — Channel manager will sit at a new position in the hierarchy (TBD during implementation)
-- **[SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis)** — Capability revocation gap (closes via ADR-007 + channels)
+- **[SECURITY.md § Gap Analysis](../SECURITY.md#gap-analysis)** — Capability revocation gap (closes via ADR-007 + channels)
 - **[SCHEDULER.md § Blocking and Wake Primitives](../../src/scheduler/SCHEDULER.md#blocking-and-wake-primitives)** — Notification path (channels reuse existing IPC wake)
 
 ## See Also in CLAUDE.md

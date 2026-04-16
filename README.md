@@ -207,14 +207,14 @@ Narrative walkthroughs that explain how CambiOS works by following real things t
 ## Design Documents
 
 - [STATUS.md](STATUS.md) — Canonical "what is built" doc: subsystem status, phase markers, v1 roadmap, test counts, known issues
-- [CambiOS.md](CambiOS.md) — Source-of-truth architecture document
-- [PHILOSOPHY.md](PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind CambiOS
-- [identity.md](identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
-- [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md) — Phase intent for identity + storage
-- [win-compat.md](win-compat.md) — Windows compatibility layer design (PE loader, AI-translated shims, sandboxed Principal)
-- [SECURITY.md](SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
-- [SYSCALLS.md](SYSCALLS.md) — All syscalls: numbers, arguments, behavior, calling conventions
-- [INTERRUPT_ROUTING.md](INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
+- [CambiOS.md](docs/CambiOS.md) — Source-of-truth architecture document
+- [PHILOSOPHY.md](docs/PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind CambiOS
+- [identity.md](docs/identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
+- [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) — Phase intent for identity + storage
+- [win-compat.md](docs/win-compat.md) — Windows compatibility layer design (PE loader, AI-translated shims, sandboxed Principal)
+- [SECURITY.md](docs/SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
+- [SYSCALLS.md](docs/SYSCALLS.md) — All syscalls: numbers, arguments, behavior, calling conventions
+- [INTERRUPT_ROUTING.md](docs/INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
 - [src/scheduler/SCHEDULER.md](src/scheduler/SCHEDULER.md) — Scheduler internals
 - [CLAUDE.md](CLAUDE.md) — Kernel technical reference and required-reading map by subsystem
 

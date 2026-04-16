@@ -4,7 +4,7 @@
 
 This is the source document for CambiOS. Everything else — contributor guides, marketing copy, technical references — derives from what's written here. If a decision contradicts this document, this document wins or this document gets updated. There is no third option.
 
-The architectural commitments that this document carries narratively are made formal and cite-able in **[ADR-009](docs/adr/009-purpose-tiers-scope.md)** — purpose statements, deployment tiers, hardware floors, and scope boundaries. Governance and funding commitments are in **[GOVERNANCE.md](GOVERNANCE.md)**. When a future decision needs a stable reference for what CambiOS *is*, cite ADR-009. When it needs a reference for how CambiOS is *run*, cite GOVERNANCE.md.
+The architectural commitments that this document carries narratively are made formal and cite-able in **[ADR-009](adr/009-purpose-tiers-scope.md)** — purpose statements, deployment tiers, hardware floors, and scope boundaries. Governance and funding commitments are in **[GOVERNANCE.md](GOVERNANCE.md)**. When a future decision needs a stable reference for what CambiOS *is*, cite ADR-009. When it needs a reference for how CambiOS is *run*, cite GOVERNANCE.md.
 
 ---
 
@@ -42,7 +42,7 @@ CambiOS will never phone home - there is no home to phone. It will never collect
 
 We aren't strapping a little chat-boy on the desktop here. AI/LLM compose a structural component of the operating system — the same way virtual memory or preemptive scheduling is a structural component. Checking code before execution, detecting anomalous behavior at runtime, adapting legacy applications to run on unfamiliar hardware, live-patching if and when updates are needed - all supervised by fast and light specialized models. These are capabilities that the system depends on to function, to safeguard user data and ensure malicious code is caught and sandboxed, and to truly improve overall UX.
 
-This applies at the tiers of CambiOS that include AI components (see [ADR-009 § Deployment Tiers](docs/adr/009-purpose-tiers-scope.md)). CambiOS is delivered in three tiers: an embedded tier with no AI, a standard tier with no AI but with the full non-AI feature set, and a full tier with all AI components. On tiers without AI, the features described above degrade gracefully to non-AI alternatives where they exist or are absent where they do not. The architecture is the same across all tiers; the set of user-space services compiled into the boot image is what differs.
+This applies at the tiers of CambiOS that include AI components (see [ADR-009 § Deployment Tiers](adr/009-purpose-tiers-scope.md)). CambiOS is delivered in three tiers: an embedded tier with no AI, a standard tier with no AI but with the full non-AI feature set, and a full tier with all AI components. On tiers without AI, the features described above degrade gracefully to non-AI alternatives where they exist or are absent where they do not. The architecture is the same across all tiers; the set of user-space services compiled into the boot image is what differs.
 
 ### 5. Identity Is Cryptographic, Not Secret-Based
 
@@ -377,7 +377,7 @@ The social protocol (described in the Networking section) provides the infrastru
 
 ### UX Tier Dependencies
 
-The spatial interface, workflow AI, and contextual adaptation described above require local LLM inference and are features of the full (Tier 3) deployment of CambiOS. On Tier 2 (no AI), CambiOS provides a traditional windowing shell with the same security, privacy, and sovereignty properties as Tier 3 but without the contextual adaptation. On Tier 1 (embedded), most UX features are absent by design — embedded deployments are typically headless or use a minimal console. This is graceful degradation, not missing functionality: a Tier 2 deployment is a complete, usable operating system with a traditional but modern shell; a Tier 1 deployment is a complete, usable embedded kernel. See [ADR-009](docs/adr/009-purpose-tiers-scope.md) for the full tier model.
+The spatial interface, workflow AI, and contextual adaptation described above require local LLM inference and are features of the full (Tier 3) deployment of CambiOS. On Tier 2 (no AI), CambiOS provides a traditional windowing shell with the same security, privacy, and sovereignty properties as Tier 3 but without the contextual adaptation. On Tier 1 (embedded), most UX features are absent by design — embedded deployments are typically headless or use a minimal console. This is graceful degradation, not missing functionality: a Tier 2 deployment is a complete, usable operating system with a traditional but modern shell; a Tier 1 deployment is a complete, usable embedded kernel. See [ADR-009](adr/009-purpose-tiers-scope.md) for the full tier model.
 
 ---
 
@@ -391,7 +391,7 @@ The primary development target. CambiOS boots via the Limine protocol, runs a cu
 
 AArch64 boots on QEMU `virt` (GICv3 required) and runs preemptive scheduling with EL0 user tasks. The full memory subsystem is operational — kernel heap, bitmap frame allocator, per-process page tables with TTBR0/TTBR1 split. GICv3 (Distributor + Redistributor + ICC system registers), ARM Generic Timer at 100Hz, PL011 UART, SVC-based syscall entry, and SMP (AP startup via Limine MP protocol) are all implemented. All boot modules build for AArch64 via shared `libsys` syscall wrappers. Voluntary context switch is implemented for both architectures.
 
-For the up-to-date list of remaining gaps (device IRQ routing on AArch64, SMP timer on AP, bare-metal testing) see [STATUS.md](STATUS.md).
+For the up-to-date list of remaining gaps (device IRQ routing on AArch64, SMP timer on AP, bare-metal testing) see [STATUS.md](../STATUS.md).
 
 ### Future Considerations
 
@@ -399,13 +399,13 @@ CambiOS's architecture does not assume x86 or ARM. The platform abstraction is a
 
 ### Deployment Tiers
 
-CambiOS is delivered in three compile-time tiers. The kernel is the same across tiers; what differs is which user-space services are included in the boot image. Full details in [ADR-009](docs/adr/009-purpose-tiers-scope.md).
+CambiOS is delivered in three compile-time tiers. The kernel is the same across tiers; what differs is which user-space services are included in the boot image. Full details in [ADR-009](adr/009-purpose-tiers-scope.md).
 
 - **Tier 1 — CambiOS-Embedded** — 256 MB to 1 GB RAM. Full microkernel, minimal core services. No AI. No shell beyond minimal console. No compositor. For fixed-function devices where CambiOS's security architecture is valuable but AI inference is not available.
 - **Tier 2 — CambiOS-Standard** — 1 GB to 16 GB RAM. Full microkernel, full core services, hand-coded Windows compatibility, traditional windowing shell. No AI components. For users who want CambiOS's security, privacy, and sovereignty commitments on hardware that cannot run local LLMs, or who prefer not to run AI components.
 - **Tier 3 — CambiOS-Full** — 8 GB+ RAM, ideally with GPU or NPU for AI workloads. Everything. The spatial UX, the security AI watcher, AI-assisted Windows compatibility, the full native ecosystem. The primary development target and the tier that embodies the full CambiOS vision.
 
-The tiers are user choices informed by hardware guidance, not kernel classifications. Hardware provenance (commodity vs vendor-audited vs fully open) is a separate axis and is discussed in [ADR-009's Hardware Supply Chain section](docs/adr/009-purpose-tiers-scope.md).
+The tiers are user choices informed by hardware guidance, not kernel classifications. Hardware provenance (commodity vs vendor-audited vs fully open) is a separate axis and is discussed in [ADR-009's Hardware Supply Chain section](adr/009-purpose-tiers-scope.md).
 
 ---
 
@@ -433,11 +433,11 @@ The microkernel is real and running on both x86_64 and AArch64. It is not a desi
 - **Storage** uses content-addressed objects — Blake3 hashes, Ed25519 signatures verified on retrieval, ownership enforced per-principal.
 - **Networking** has a working vertical slice: user-space virtio-net driver, stateless UDP/IP stack, and a working NTP demo that queries an external time server through QEMU's SLIRP network.
 
-For the canonical, kept-current breakdown — every subsystem, every phase, every test count, every known issue — see **[STATUS.md](STATUS.md)**. This file (CambiOS.md) is for *intent*, not *current state*.
+For the canonical, kept-current breakdown — every subsystem, every phase, every test count, every known issue — see **[STATUS.md](../STATUS.md)**. This file (CambiOS.md) is for *intent*, not *current state*.
 
 ### What Comes Next
 
-The v1 target is an interactive, network-capable, identity-rooted OS running on real hardware with persistent storage. The dependency-ordered roadmap (shell → bare-metal boot → real NIC driver → DHCP/DNS → TCP → persistent storage → mesh networking → AI integration) lives in [STATUS.md § v1 Roadmap progress](STATUS.md#v1-roadmap-progress) so the order doesn't drift across documents. The architectural substrate that the post-shell items sit on — the bulk-data IPC channel primitive, externalized policy decisions, capability revocation, and audit telemetry — is described in [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-006](docs/adr/006-policy-service.md), and [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md).
+The v1 target is an interactive, network-capable, identity-rooted OS running on real hardware with persistent storage. The dependency-ordered roadmap (shell → bare-metal boot → real NIC driver → DHCP/DNS → TCP → persistent storage → mesh networking → AI integration) lives in [STATUS.md § v1 Roadmap progress](../STATUS.md#v1-roadmap-progress) so the order doesn't drift across documents. The architectural substrate that the post-shell items sit on — the bulk-data IPC channel primitive, externalized policy decisions, capability revocation, and audit telemetry — is described in [ADR-005](adr/005-ipc-primitives-control-and-bulk.md), [ADR-006](adr/006-policy-service.md), and [ADR-007](adr/007-capability-revocation-and-telemetry.md).
 
 ### What We Don't Know Yet
 

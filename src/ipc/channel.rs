@@ -37,7 +37,7 @@ use crate::ipc::{ProcessId, Principal};
 ///      ≈ 40 KiB. Negligible.
 /// Replace when: the first service needs more than ~4 simultaneous
 ///      channels and the table fills up, OR when multi-monitor + many-client
-///      graphics workloads exceed 60 active channels. See ASSUMPTIONS.md.
+///      graphics workloads exceed 60 active channels. See docs/ASSUMPTIONS.md.
 pub const MAX_CHANNELS: usize = 256;
 
 /// SCAFFOLDING: soft cap on channel size in pages (256 MiB = 65536 pages).
@@ -53,7 +53,7 @@ pub const MAX_CHANNELS: usize = 256;
 ///      displays pushes single-surface size past 256 MiB. The tier-aware
 ///      policy service (Phase 3.4) and a future `LargeChannel` capability
 ///      should gate these allocations before the ceiling rises further.
-///      See ASSUMPTIONS.md.
+///      See docs/ASSUMPTIONS.md.
 pub const MAX_CHANNEL_PAGES: u32 = 65536;
 
 /// ARCHITECTURAL: minimum channel size is one page (4 KiB).

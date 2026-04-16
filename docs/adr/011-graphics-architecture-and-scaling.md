@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-04-13
 - **Depends on:** [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC Bulk Path — Channels), [ADR-007](007-capability-revocation-and-telemetry.md) (Revocation + Telemetry), [ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers)
-- **Related:** [CambiOS.md](../../CambiOS.md) § "Graphics and windowing runs in user-space", [PHILOSOPHY.md](../../PHILOSOPHY.md)
+- **Related:** [CambiOS.md](../CambiOS.md) § "Graphics and windowing runs in user-space", [PHILOSOPHY.md](../PHILOSOPHY.md)
 - **Supersedes:** N/A
 
 ## Problem
@@ -99,7 +99,7 @@ Clients send `FrameReady { damage: [Rect; N] }` (N ≤ 16; fallback to "full sur
 
 ### Numeric bounds raised in Phase GUI-0 (this ADR's immediate action)
 
-Eight SCAFFOLDING bounds are widened now, ahead of graphics implementation. All rationale is captured in [ASSUMPTIONS.md](../../ASSUMPTIONS.md) rows for each; this table summarizes:
+Eight SCAFFOLDING bounds are widened now, ahead of graphics implementation. All rationale is captured in [ASSUMPTIONS.md](../ASSUMPTIONS.md) rows for each; this table summarizes:
 
 | Bound | Old | New | Rationale (full detail in ASSUMPTIONS.md) |
 |---|---|---|---|

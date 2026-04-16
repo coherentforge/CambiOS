@@ -36,7 +36,7 @@ pub const PAGE_SIZE: u64 = 4096;
 ///      (multi-level bitmap or sparse tree) rather than growing the flat
 ///      bitmap further — at 32 GiB the bitmap would be 1 MiB, at 64 GiB it
 ///      would be 2 MiB, and the linear-scan allocator becomes prohibitively
-///      slow for allocate_contiguous of large regions. See ASSUMPTIONS.md.
+///      slow for allocate_contiguous of large regions. See docs/ASSUMPTIONS.md.
 const MAX_FRAMES: usize = 4194304;
 
 /// Bitmap words needed: 4194304 / 64 = 65536

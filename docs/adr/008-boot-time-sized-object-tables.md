@@ -140,7 +140,7 @@ Five fields, two clamps, one arithmetic derivation using a compile-time constant
 - **Tier 2 — CambiOS-Standard (no AI).** `{ min_slots: 128, max_slots: 4096, ram_budget_ppm: 20_000, ram_budget_floor: 16 MiB, ram_budget_ceiling: 64 MiB }`. Reads as: "2% of RAM, clamped 16 MiB to 64 MiB, for between 128 and 4096 slots." Sized for a typical single-user desktop or workstation; operators on shared multi-user machines or heavy build farms can raise the ceiling in a custom tier configuration.
 - **Tier 3 — CambiOS-Full.** `{ min_slots: 256, max_slots: 65536, ram_budget_ppm: 30_000, ram_budget_floor: 64 MiB, ram_budget_ceiling: 512 MiB }`. Reads as: "3% of RAM, clamped 64 MiB to 512 MiB, for between 256 and 65536 slots." Sized to accommodate heavy general-purpose workloads (large builds, many user applications, AI services with per-request workers). Operators with workloads exceeding 65536 processes can raise the ceiling in a custom tier configuration — the cap is a default, not a physical limit.
 
-These values are starting points, not final commitments. They are documented in [ASSUMPTIONS.md](../../ASSUMPTIONS.md) and can be tuned when real workload data exists. The kernel binary is identical across tiers per ADR-009's "same kernel binary across tiers" commitment; what differs is the `TableSizingPolicy` value compiled in from the tier's configuration.
+These values are starting points, not final commitments. They are documented in [ASSUMPTIONS.md](../ASSUMPTIONS.md) and can be tuned when real workload data exists. The kernel binary is identical across tiers per ADR-009's "same kernel binary across tiers" commitment; what differs is the `TableSizingPolicy` value compiled in from the tier's configuration.
 
 **5. Two clamps, two failure modes, both preventable.** The interface has two clamps because the two bounds prevent two different kinds of failure:
 
@@ -232,7 +232,7 @@ The page-aligned boundary between the two tables prevents cache-line-level false
 
 **Kernel heap stays at its current size for Wave 2a.** The kernel heap is currently 4 MiB. Phase 3 subsystems other than the object tables (audit ring buffers per [ADR-007](007-capability-revocation-and-telemetry.md), channel bookkeeping metadata per [ADR-005](005-ipc-primitives-control-and-bulk.md), per-CPU policy caches per [ADR-006](006-policy-service.md)) may still pressure the heap and may warrant growing it in a future commit, but that growth is decoupled from the table sizing question this ADR resolves. A future ADR or implementation commit can address the kernel heap independently once the shape of the pressure is known.
 
-**Frame allocator interaction.** The kernel object table region is a large one-shot allocation that the frame allocator sees as a single call at init time. The frame allocator's bitmap-based design already handles contiguous multi-frame allocations; no new allocator mechanism is required. The region is allocated before any user-space process exists, so there is no contention with user-space allocations. The frame allocator's bitmap is sized to cover the machine's physical memory range (see the `MAX_FRAMES` entry in [ASSUMPTIONS.md](../../ASSUMPTIONS.md)); on hardware with large physical memory ranges, the bitmap grows accordingly, which is already tracked as a scaffolding concern for the bare-metal bring-up.
+**Frame allocator interaction.** The kernel object table region is a large one-shot allocation that the frame allocator sees as a single call at init time. The frame allocator's bitmap-based design already handles contiguous multi-frame allocations; no new allocator mechanism is required. The region is allocated before any user-space process exists, so there is no contention with user-space allocations. The frame allocator's bitmap is sized to cover the machine's physical memory range (see the `MAX_FRAMES` entry in [ASSUMPTIONS.md](../ASSUMPTIONS.md)); on hardware with large physical memory ranges, the bitmap grows accordingly, which is already tracked as a scaffolding concern for the bare-metal bring-up.
 
 ### Lookup, iteration, and bounds
 
@@ -399,7 +399,7 @@ The migration from the current dense-array-with-`MAX_PROCESSES` design to the bo
 **Wave 2a.0 — Prep commit (methodology and documentation).** Ready to commit alongside this ADR. Contains:
 - The Post-Change Review Protocol amendment for flagging pre-existing warnings.
 - The Development Convention 8 refinement for bounds sizing with end-in-mind.
-- New rows in [ASSUMPTIONS.md](../../ASSUMPTIONS.md) for the tier policies and `TableSizingPolicy` fields, each pointing at this ADR for rationale.
+- New rows in [ASSUMPTIONS.md](../ASSUMPTIONS.md) for the tier policies and `TableSizingPolicy` fields, each pointing at this ADR for rationale.
 - CLAUDE.md updates: documentation cross-references to this ADR and [ADR-009](009-purpose-tiers-scope.md).
 
 **Wave 2a — `MAX_PROCESSES` becomes runtime; tables move to a dedicated region.** Changes:
@@ -567,7 +567,7 @@ This ADR commits to introducing the generation counter as part of Wave 2c, along
 - **[CLAUDE.md § Memory Layout](../../CLAUDE.md#memory-layout)** — Memory layout reference. This ADR adds the kernel object table region as a new entry in the memory layout, distinct from the kernel heap.
 - **[CLAUDE.md § Formal Verification](../../CLAUDE.md#formal-verification-non-negotiable-constraint)** — Verification posture. This ADR's Verification Stance section defends the claim that boot-time-sized tables with dedicated-region storage preserve the verification properties the posture requires.
 - **[STATUS.md](../../STATUS.md)** — Implementation status. This ADR's Wave 2 sub-waves will update STATUS.md as they land.
-- **[ASSUMPTIONS.md](../../ASSUMPTIONS.md)** — Numeric bounds catalog. This ADR adds rows for the tier policies (`TIER1_POLICY`, `TIER2_POLICY`, `TIER3_POLICY`) as TUNING entries. The existing `MAX_PROCESSES` row is removed as the constant itself is removed.
+- **[ASSUMPTIONS.md](../ASSUMPTIONS.md)** — Numeric bounds catalog. This ADR adds rows for the tier policies (`TIER1_POLICY`, `TIER2_POLICY`, `TIER3_POLICY`) as TUNING entries. The existing `MAX_PROCESSES` row is removed as the constant itself is removed.
 
 ## See Also in CLAUDE.md
 

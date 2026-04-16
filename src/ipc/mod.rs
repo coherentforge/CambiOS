@@ -23,7 +23,7 @@ use core::fmt;
 /// Replace when: a Phase 3 service needs more than 32 endpoints, or the IPC
 ///      shard array becomes a contention point at higher process counts.
 ///      Eventually this should track `config::num_slots()` the same way.
-///      See ASSUMPTIONS.md.
+///      See docs/ASSUMPTIONS.md.
 pub const MAX_ENDPOINTS: usize = 32;
 
 /// Message endpoint identifier
@@ -296,7 +296,7 @@ impl CapabilityRights {
 ///      Pre-allocated 32 endpoints × 16 messages × ~280 B ≈ 140 KiB at boot.
 /// Replace when: Phase 3 audit telemetry channel (ADR-007) starts seeing bursts
 ///      that overflow this — first dropped event is the trigger. Note: bumping
-///      this also bumps the boot memory cost linearly. See ASSUMPTIONS.md.
+///      this also bumps the boot memory cost linearly. See docs/ASSUMPTIONS.md.
 ///
 /// Heap-allocated at boot via IpcManager::new_boxed().
 pub struct EndpointQueue {

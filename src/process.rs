@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 ///      ≈ 6 KiB per process. Trivial across boot modules.
 /// Replace when: channels (ADR-005) attach shared-memory mappings as VMAs —
 ///      the first service that holds 50+ channels is on the edge. Or any
-///      future mmap-style API. See ASSUMPTIONS.md.
+///      future mmap-style API. See docs/ASSUMPTIONS.md.
 const MAX_VMAS: usize = 256;
 
 /// Base virtual address for dynamic user-space allocations.
@@ -171,7 +171,7 @@ impl VmaTracker {
 /// Replace when: a process needs more than 4 MiB of heap — the right
 ///      fix at that point is per-process heap sizing (spawn
 ///      argument), not bumping the global constant again. See
-///      ASSUMPTIONS.md.
+///      docs/ASSUMPTIONS.md.
 pub const HEAP_SIZE: u64 = 0x400000;
 
 /// Number of 4 KiB frames in a process heap (4 MiB / 4 KiB = 1024).

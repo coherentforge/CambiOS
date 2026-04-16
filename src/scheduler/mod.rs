@@ -144,7 +144,7 @@ pub fn on_voluntary_yield(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) 
 /// Replace when: a single CPU is regularly seeing > 100 active tasks, or AI
 ///      inference services start spawning per-request worker tasks. Must stay
 ///      in sync with the `MAX_TASKS` re-export in lib.rs and `TASK_CPU_MAP`'s
-///      array size. See ASSUMPTIONS.md.
+///      array size. See docs/ASSUMPTIONS.md.
 const MAX_TASKS: usize = 256;
 
 /// ARCHITECTURAL: priority taxonomy is 4 bands — Idle / Low / Normal / High+Critical.

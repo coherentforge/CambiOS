@@ -6,7 +6,7 @@
 - **Superseded by parts of:** ADR-006 (Policy Service) reframes the Layer 1 hook as a thin client of an externalized policy service rather than as in-kernel policy code. The pipeline shape is unchanged.
 - **Context:** Wiring the zero-trust security model into the syscall and IPC hot paths
 
-> *For implementation status of each layer (enforced, scaffolding, designed) see [SECURITY.md § Enforcement Status Summary](../../SECURITY.md). This ADR captures the decision; status lives with the code.*
+> *For implementation status of each layer (enforced, scaffolding, designed) see [SECURITY.md § Enforcement Status Summary](../SECURITY.md). This ADR captures the decision; status lives with the code.*
 
 ## Problem
 
@@ -142,7 +142,7 @@ Test coverage of each layer (current counts and what they exercise) lives in [ST
 - [ADR-000](000-zta-and-cap.md): Zero-Trust Architecture and Capability-Based Access Control
 - [ADR-005](005-ipc-primitives-control-and-bulk.md): IPC Primitives — Control Path and Bulk Path
 - [ADR-006](006-policy-service.md): Policy Service — Externalized Policy Decisions
-- [SECURITY.md](../../SECURITY.md): Living enforcement status reference
+- [SECURITY.md](../SECURITY.md): Living enforcement status reference
 - `src/ipc/interceptor.rs`: IpcInterceptor trait + DefaultInterceptor
 - `src/ipc/capability.rs`: CapabilityManager + ProcessCapabilities
 - `src/ipc/mod.rs`: send/recv with capability + interceptor enforcement

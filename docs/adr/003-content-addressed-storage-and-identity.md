@@ -178,8 +178,8 @@ Test counts and what each test covers (Principal construction, IPC sender stampi
 
 - [ADR-000](000-zta-and-cap.md): Zero-Trust Architecture and Capability-Based Access Control
 - [ADR-004](004-cryptographic-integrity.md): Cryptographic integrity (Blake3 + Ed25519)
-- [identity.md](../../identity.md): Identity architecture (authoritative design document)
-- [FS-and-ID-design-plan.md](../../FS-and-ID-design-plan.md): Phase intent for identity + storage
+- [identity.md](../identity.md): Identity architecture (authoritative design document)
+- [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md): Phase intent for identity + storage
 - `src/fs/mod.rs`, `src/fs/ram.rs`: CambiObject and RamObjectStore
 - `src/ipc/mod.rs`: Principal type, sender_principal stamping
 - `src/ipc/capability.rs`: Principal binding on ProcessCapabilities

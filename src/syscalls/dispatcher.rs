@@ -41,7 +41,7 @@ const MAX_DEVICE_IRQ: u32 = 224;
 /// Replace when: a user-space service needs to read or write > 4 KiB in one
 ///      syscall and gets a confusing failure at exactly the boundary. Channels
 ///      (ADR-005) are the long-term answer for bulk data; until then this needs
-///      to grow on demand. See ASSUMPTIONS.md.
+///      to grow on demand. See docs/ASSUMPTIONS.md.
 const MAX_USER_BUFFER: usize = 4096;
 
 /// Canonical user-space address ceiling.
@@ -728,7 +728,7 @@ impl SyscallDispatcher {
         //      software-renderer back buffers, font atlases) without forcing
         //      channel use. Sized for the v1 endgame graphics target (ADR-011).
         // Replace when: a legitimate workload needs > 64 MiB in a single
-        //      allocate call. See ASSUMPTIONS.md.
+        //      allocate call. See docs/ASSUMPTIONS.md.
         if size == 0 || size > 64 * 1024 * 1024 {
             return Err(SyscallError::InvalidArg);
         }
@@ -1572,7 +1572,7 @@ impl SyscallDispatcher {
         //      at 64 MiB is sufficient.
         // Replace when: single-display HDR surfaces exceed 64 MiB, or a
         //      workload needs a single large MMIO region larger than that.
-        //      See ASSUMPTIONS.md.
+        //      See docs/ASSUMPTIONS.md.
         if num_pages == 0 || num_pages > 16384 {
             return Err(SyscallError::InvalidArg);
         }
@@ -1654,7 +1654,7 @@ impl SyscallDispatcher {
         //      linear-scan cost on the frame allocator bitmap.
         // Replace when: GPU driver work needs GiB-class single DMA
         //      allocations, at which point also revisit the
-        //      allocate_contiguous algorithm. See ASSUMPTIONS.md.
+        //      allocate_contiguous algorithm. See docs/ASSUMPTIONS.md.
         if num_pages == 0 || num_pages > 32768 {
             return Err(SyscallError::InvalidArg);
         }

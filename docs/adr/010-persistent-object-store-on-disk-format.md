@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-04-14
 - **Depends on:** [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-004](004-cryptographic-integrity.md) (Blake3 + Ed25519)
-- **Related:** [identity.md](../../identity.md), [FS-and-ID-design-plan.md](../../FS-and-ID-design-plan.md), [ADR-005](005-ipc-primitives-control-and-bulk.md)
+- **Related:** [identity.md](../identity.md), [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md), [ADR-005](005-ipc-primitives-control-and-bulk.md)
 - **Supersedes:** N/A
 
 ## Context
@@ -152,7 +152,7 @@ Mount's record scan is a `for i in 0..capacity_slots` loop. `capacity_slots` is 
 - `src/fs/disk.rs` — `DiskObjectStore` (the reference reader/writer of this format).
 - `src/fs/mod.rs` — `ObjectStore` trait, `CambiObject`, `SignatureBytes`.
 - `ASSUMPTIONS.md` — `BLOCK_SIZE`, `MAX_OBJECTS_ON_DISK`, `MAX_CONTENT_BYTES_ON_DISK`, `ARCOBJ_MAGIC`, `ARCOREC_MAGIC_OCCUPIED`.
-- [FS-and-ID-design-plan.md § Phase 4](../../FS-and-ID-design-plan.md) — design intent for persistent storage.
+- [FS-and-ID-design-plan.md § Phase 4](../FS-and-ID-design-plan.md) — design intent for persistent storage.
 
 ## Divergence
 

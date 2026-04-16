@@ -16,11 +16,11 @@ Right now the answer is hardcoded in the kernel:
 - `SYS_REGISTER_ENDPOINT` grants the calling process full rights on the new endpoint, no questions asked
 - Boot module loading grants the bootstrap Principal full rights on the kernel processes, with the trust check baked into `BinaryVerifier`
 - Delegation is allowed if the source holds the `delegate` right and is not escalating beyond what they already have
-- The `IpcInterceptor::on_syscall` hook exists at [src/syscalls/dispatcher.rs](../../src/syscalls/dispatcher.rs) but its default policy is permissive — it always returns `Allow`. [SECURITY.md](../../SECURITY.md) lists per-process syscall allowlists as "Not implemented" (gap #1, highest priority)
+- The `IpcInterceptor::on_syscall` hook exists at [src/syscalls/dispatcher.rs](../../src/syscalls/dispatcher.rs) but its default policy is permissive — it always returns `Allow`. [SECURITY.md](../SECURITY.md) lists per-process syscall allowlists as "Not implemented" (gap #1, highest priority)
 
-Each of these decisions is *policy*. Each one is currently expressed as Rust code inside the kernel. Each one is therefore impossible to update without recompiling the kernel, impossible to observe without instrumenting the kernel, and impossible to drive from a separate process — including the AI security service that [PHILOSOPHY.md](../../PHILOSOPHY.md) and [CambiOS.md](../../CambiOS.md) both describe as a userspace observer.
+Each of these decisions is *policy*. Each one is currently expressed as Rust code inside the kernel. Each one is therefore impossible to update without recompiling the kernel, impossible to observe without instrumenting the kernel, and impossible to drive from a separate process — including the AI security service that [PHILOSOPHY.md](../PHILOSOPHY.md) and [CambiOS.md](../CambiOS.md) both describe as a userspace observer.
 
-The architectural intent is already documented. [CambiOS.md line 88](../../CambiOS.md) lists "Policy" as one of the **Core Services** in the layer diagram, sitting *above* the microkernel. [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) explicitly says the AI security layer "observes without controlling the microkernel" and "enforces through capabilities already present in the system." [SECURITY.md gap #1](../../SECURITY.md#gap-analysis) names per-process syscall allowlists as the highest-impact missing piece, with the explicit note that "the hook exists. Just needs policy tables."
+The architectural intent is already documented. [CambiOS.md line 88](../CambiOS.md) lists "Policy" as one of the **Core Services** in the layer diagram, sitting *above* the microkernel. [PHILOSOPHY.md lines 73-99](../PHILOSOPHY.md) explicitly says the AI security layer "observes without controlling the microkernel" and "enforces through capabilities already present in the system." [SECURITY.md gap #1](../SECURITY.md#gap-analysis) names per-process syscall allowlists as the highest-impact missing piece, with the explicit note that "the hook exists. Just needs policy tables."
 
 So the gap is not "we need to invent a policy mechanism." The gap is "we need to give the existing policy slot a real implementation, *and* we need to put that implementation outside the kernel so it can evolve independently and be observed by the AI security layer."
 
@@ -53,7 +53,7 @@ Extract authorization policy decisions into a **user-space policy service**, acc
 | **Policy logic** | Inside `policy-service`, replaceable | The default implementation is hardcoded "allow if signed by bootstrap key + on the syscall allowlist for this binary's stated profile." Replaceable with rule-based, ML-informed, or human-attended logic without kernel changes. |
 | **AI observation** | Separate user-space `ai-watcher` (future) | Subscribes to telemetry from the policy service. Recommends policy changes via IPC. **Never makes decisions directly.** Cannot bypass the policy service. The policy service decides whether to act on AI recommendations. |
 
-This is the layering [CambiOS.md line 88](../../CambiOS.md) already specifies. The kernel does five things ("Scheduling | Memory | IPC | Capabilities | Interrupts"); Policy is one of the Core Services *above* the kernel. The capability manager stays in the kernel because that's where mechanical enforcement happens. The decision-making layer moves up.
+This is the layering [CambiOS.md line 88](../CambiOS.md) already specifies. The kernel does five things ("Scheduling | Memory | IPC | Capabilities | Interrupts"); Policy is one of the Core Services *above* the kernel. The capability manager stays in the kernel because that's where mechanical enforcement happens. The decision-making layer moves up.
 
 ### How a policy decision happens
 
@@ -170,7 +170,7 @@ This means:
 - A user who doesn't trust the AI can run with `ai-watcher` disabled — the policy service still works, just without anomaly recommendations.
 - The user remains in the loop. The default v0 policy service has no AI integration at all. AI integration is opt-in, configurable, and replaceable.
 
-This matches [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md):
+This matches [PHILOSOPHY.md lines 73-99](../PHILOSOPHY.md):
 
 > "Security LLM watches syscalls, detects anomalies, revokes capabilities when patterns diverge from expected behavior. It *observes* without *controlling* the microkernel. It enforces through capabilities already present in the system."
 
@@ -281,7 +281,7 @@ This matches CLAUDE.md's verification posture: kernel code is verification-targe
 
 **Why considered.** The interceptor already exists. Adding more rules to `DefaultInterceptor` is mechanically easy. No new IPC, no new service, no new failure modes.
 
-**Why rejected.** It violates the architectural intent in [CambiOS.md line 88](../../CambiOS.md) ("Policy" as a Core Service above the kernel) and [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) ("AI watches without controlling the kernel"). It also makes AI integration impossible without putting the AI in the kernel, which everyone agrees is a non-starter. The default interceptor is fine as a fallback; it is not where the actual policy logic should live long-term.
+**Why rejected.** It violates the architectural intent in [CambiOS.md line 88](../CambiOS.md) ("Policy" as a Core Service above the kernel) and [PHILOSOPHY.md lines 73-99](../PHILOSOPHY.md) ("AI watches without controlling the kernel"). It also makes AI integration impossible without putting the AI in the kernel, which everyone agrees is a non-starter. The default interceptor is fine as a fallback; it is not where the actual policy logic should live long-term.
 
 ### Option B: Load policy as a kernel module (Linux LSM-style)
 
@@ -319,7 +319,7 @@ This ADR's implementation can be sequenced incrementally:
 
 7. **Test against the existing test suite.** All 218 tests should still pass. Any test that does fail is identifying a behavior change that needs investigation.
 
-8. **Add per-process syscall allowlists** in the policy service (closes [SECURITY.md gap #1](../../SECURITY.md#gap-analysis)). The first real policy that the kernel never had.
+8. **Add per-process syscall allowlists** in the policy service (closes [SECURITY.md gap #1](../SECURITY.md#gap-analysis)). The first real policy that the kernel never had.
 
 9. **Add capability grant/revoke decisions** through the policy service. Closes the kernel→userspace migration of decision logic.
 
@@ -335,9 +335,9 @@ Steps 1–7 establish the architectural slot without changing observable behavio
 - **[ADR-002](002-three-layer-enforcement-pipeline.md)** — The interceptor pattern this ADR makes real (the `on_syscall` hook is the slot that's getting filled)
 - **[ADR-005](005-ipc-primitives-control-and-bulk.md)** — Channel creation goes through policy too (`should_allow_channel_create`)
 - **[ADR-007](007-capability-revocation-and-telemetry.md)** — Revocation primitive used by the policy service; audit telemetry consumed by the AI watcher
-- **[CambiOS.md § Architecture](../../CambiOS.md)** — Layer diagram showing "Policy" as a Core Service above the microkernel
-- **[PHILOSOPHY.md](../../PHILOSOPHY.md) lines 73-99** — "AI observes without controlling the kernel"
-- **[SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis)** — Items 1, 5, "Runtime behavioral AI" all addressed by this ADR + ADR-007
+- **[CambiOS.md § Architecture](../CambiOS.md)** — Layer diagram showing "Policy" as a Core Service above the microkernel
+- **[PHILOSOPHY.md](../PHILOSOPHY.md) lines 73-99** — "AI observes without controlling the kernel"
+- **[SECURITY.md § Gap Analysis](../SECURITY.md#gap-analysis)** — Items 1, 5, "Runtime behavioral AI" all addressed by this ADR + ADR-007
 - **[SCHEDULER.md § Blocking and Wake Primitives](../../src/scheduler/SCHEDULER.md#blocking-and-wake-primitives)** — `BlockReason::PolicyWait` joins the existing block reasons
 
 ## See Also in CLAUDE.md

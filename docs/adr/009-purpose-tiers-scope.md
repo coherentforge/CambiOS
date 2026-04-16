@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-04-11
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities)
-- **Related:** [CambiOS.md](../../CambiOS.md), [PHILOSOPHY.md](../../PHILOSOPHY.md), [SECURITY.md](../../SECURITY.md), [win-compat.md](../../win-compat.md), [identity.md](../../identity.md), [GOVERNANCE.md](../../GOVERNANCE.md)
+- **Related:** [CambiOS.md](../CambiOS.md), [PHILOSOPHY.md](../PHILOSOPHY.md), [SECURITY.md](../SECURITY.md), [win-compat.md](../win-compat.md), [identity.md](../identity.md), [GOVERNANCE.md](../GOVERNANCE.md)
 - **Supersedes:** N/A
 
 ## Context
@@ -12,15 +12,15 @@ Load-bearing framing assumptions about what CambiOS is, what hardware it targets
 
 ## Problem
 
-CambiOS's documentation describes a system with ambitious goals: a verified microkernel, AI-integrated security, spatial UX, Windows compatibility, user sovereignty, platform-agnostic hardware support. Each of these is individually articulated in [CambiOS.md](../../CambiOS.md) and [PHILOSOPHY.md](../../PHILOSOPHY.md). None of them is individually contradicted. But several of them, taken together, surface ambiguities that the documentation has not resolved:
+CambiOS's documentation describes a system with ambitious goals: a verified microkernel, AI-integrated security, spatial UX, Windows compatibility, user sovereignty, platform-agnostic hardware support. Each of these is individually articulated in [CambiOS.md](../CambiOS.md) and [PHILOSOPHY.md](../PHILOSOPHY.md). None of them is individually contradicted. But several of them, taken together, surface ambiguities that the documentation has not resolved:
 
-**Is AI integral to CambiOS, or is it an optional feature?** [CambiOS.md § Principles](../../CambiOS.md) states "AI as Infrastructure, Not Application" and describes AI as "load-bearing components that the system depends on to function." This reads as integral. But no document has committed to a hardware profile that makes this true — a machine that cannot run a useful LLM cannot run the full CambiOS architecture, yet nothing in the documentation says CambiOS requires such a machine. The tension has not been forced.
+**Is AI integral to CambiOS, or is it an optional feature?** [CambiOS.md § Principles](../CambiOS.md) states "AI as Infrastructure, Not Application" and describes AI as "load-bearing components that the system depends on to function." This reads as integral. But no document has committed to a hardware profile that makes this true — a machine that cannot run a useful LLM cannot run the full CambiOS architecture, yet nothing in the documentation says CambiOS requires such a machine. The tension has not been forced.
 
 **What does "platform-agnostic" mean concretely?** CambiOS targets x86_64 and AArch64 today, with RISC-V planned. Its kernel code is `no_std`, position-independent, and could in principle run on any hardware with the right drivers. But "the kernel could run on anything" is not the same as "the full OS is supported on anything." A 256 MB embedded board cannot run the AI watcher. A 16 TB datacenter server can run all of CambiOS with room to spare. What is the project's actual commitment?
 
-**Is the spatial / contextually aware UX a serious goal, or is it an aspiration?** [CambiOS.md § User Experience](../../CambiOS.md) describes a 3D spatial interface with workflow AI and cross-context memory. This is described as a feature of CambiOS, not as a future possibility. But no document commits to the hardware required to make it work. Classical ML and hardcoded rules are insufficient for the adaptation a contextually aware system requires — real contextual awareness across the diversity of user tasks (programming, writing, tax preparation, music production, research, collaboration) requires language-model-scale pattern recognition. If the UX is a serious goal, local LLMs are a hard requirement, and the hardware profile must accommodate them.
+**Is the spatial / contextually aware UX a serious goal, or is it an aspiration?** [CambiOS.md § User Experience](../CambiOS.md) describes a 3D spatial interface with workflow AI and cross-context memory. This is described as a feature of CambiOS, not as a future possibility. But no document commits to the hardware required to make it work. Classical ML and hardcoded rules are insufficient for the adaptation a contextually aware system requires — real contextual awareness across the diversity of user tasks (programming, writing, tax preparation, music production, research, collaboration) requires language-model-scale pattern recognition. If the UX is a serious goal, local LLMs are a hard requirement, and the hardware profile must accommodate them.
 
-**Is Windows compatibility a destination or a bridge?** [win-compat.md](../../win-compat.md) frames the compat layer as a transition aid — a way for Windows users to switch to CambiOS without abandoning their software. This framing is right but has not been made explicit enough for architectural decisions to rely on it. If Windows compat is a destination, CambiOS has to match Windows's effective floor and performance. If it is a bridge, the compat layer can run in a sandbox with a constrained resource budget and be allowed to be slower than native. The difference matters for every ADR that touches compatibility.
+**Is Windows compatibility a destination or a bridge?** [win-compat.md](../win-compat.md) frames the compat layer as a transition aid — a way for Windows users to switch to CambiOS without abandoning their software. This framing is right but has not been made explicit enough for architectural decisions to rely on it. If Windows compat is a destination, CambiOS has to match Windows's effective floor and performance. If it is a bridge, the compat layer can run in a sandbox with a constrained resource budget and be allowed to be slower than native. The difference matters for every ADR that touches compatibility.
 
 **Is embedded / small-device support maintained as a first-class target or a secondary one?** The platform-agnostic framing suggests first-class. The AI-integral framing suggests not. These cannot both be true for the same configuration of CambiOS. But they can both be true if CambiOS commits to a tiered deployment model where the AI-integral configuration and the embedded configuration are distinct build targets.
 
@@ -94,7 +94,7 @@ This principle addresses Purpose 4 (good UX is worth its cost) and constrains im
 
 ### 5. Pragmatic backward compatibility
 
-CambiOS does not compromise its architecture to accommodate legacy patterns from other operating systems. Windows compatibility (see [win-compat.md](../../win-compat.md)) is a bridge for users switching from Windows, not a destination for CambiOS as a project. The compatibility layer runs in sandboxes, receives constrained resource budgets, is explicitly allowed to run slower than native, and is expected to become less important over time as native CambiOS software matures. The same philosophy applies to POSIX compatibility: a thin translation layer for existing software during the bootstrap period, not a long-term dependency. CambiOS's architecture is designed to obsolete the compatibility layers, not depend on them.
+CambiOS does not compromise its architecture to accommodate legacy patterns from other operating systems. Windows compatibility (see [win-compat.md](../win-compat.md)) is a bridge for users switching from Windows, not a destination for CambiOS as a project. The compatibility layer runs in sandboxes, receives constrained resource budgets, is explicitly allowed to run slower than native, and is expected to become less important over time as native CambiOS software matures. The same philosophy applies to POSIX compatibility: a thin translation layer for existing software during the bootstrap period, not a long-term dependency. CambiOS's architecture is designed to obsolete the compatibility layers, not depend on them.
 
 This principle keeps compatibility work from slowly becoming the center of gravity of the project. It applies to Tiers 2 and 3.
 
@@ -126,7 +126,7 @@ CambiOS is delivered in three compile-time deployment tiers. Each tier produces 
 
 **Target hardware:** Modern general-purpose hardware with 8 GB or more of RAM, a 64-bit CPU (x86_64 or AArch64), and ideally GPU or NPU acceleration for AI workloads. This is the primary development target and the tier that embodies the full CambiOS vision.
 
-**Included:** Everything. The full microkernel. The full core service set. All AI components (security watcher, UX context model, AI-assisted compatibility). The spatial, contextually aware UX. AI-assisted Windows compatibility with intelligent translation. The full native application ecosystem. Every feature described in [CambiOS.md](../../CambiOS.md).
+**Included:** Everything. The full microkernel. The full core service set. All AI components (security watcher, UX context model, AI-assisted compatibility). The spatial, contextually aware UX. AI-assisted Windows compatibility with intelligent translation. The full native application ecosystem. Every feature described in [CambiOS.md](../CambiOS.md).
 
 **Excluded:** Nothing.
 
@@ -152,7 +152,7 @@ The tier model describes what CambiOS does on the software side. It does not ful
 
 CambiOS's principles include "Platform Is an Implementation Detail" — the architecture abstraction boundary is clean and the software runs on whatever CPU speaks the right instruction set. This is true about the software. It does not mean the software is the only thing that matters to a user's security posture. A user running CambiOS on commodity consumer hardware has a meaningfully different threat model than a user running it on hardware where the firmware, CPU microcode, boot chain, and supply chain have all been audited. CambiOS's software guarantees are the same in both cases. The user's real-world security story is not.
 
-**What CambiOS cannot defend against at the hardware layer.** Modern x86_64 ships with closed firmware (Intel ME, AMD PSP) that runs in a privilege level below the operating system. A compromised CPU, compromised microcode, or tampered boot firmware is outside CambiOS's defensive surface. AArch64 is similar on many commodity platforms (TrustZone secure monitor blobs, vendor firmware). CambiOS's verification efforts apply to the kernel and user-space code that CambiOS itself writes; they do not apply to the hardware and firmware the kernel runs on top of. This is acknowledged in [CambiOS.md § What CambiOS Does Not Protect Against](../../CambiOS.md) as a side note, but it is a first-class part of the threat model and should be surfaced as such.
+**What CambiOS cannot defend against at the hardware layer.** Modern x86_64 ships with closed firmware (Intel ME, AMD PSP) that runs in a privilege level below the operating system. A compromised CPU, compromised microcode, or tampered boot firmware is outside CambiOS's defensive surface. AArch64 is similar on many commodity platforms (TrustZone secure monitor blobs, vendor firmware). CambiOS's verification efforts apply to the kernel and user-space code that CambiOS itself writes; they do not apply to the hardware and firmware the kernel runs on top of. This is acknowledged in [CambiOS.md § What CambiOS Does Not Protect Against](../CambiOS.md) as a side note, but it is a first-class part of the threat model and should be surfaced as such.
 
 **The hardware spectrum.** Users evaluating CambiOS can be placed along a rough spectrum of hardware provenance:
 
@@ -188,7 +188,7 @@ CambiOS's principles include "Platform Is an Implementation Detail" — the arch
 ### Out of scope
 
 - **Real-time operating system deployments (hard or firm RTOS).** CambiOS targets general-purpose use across all three tiers. RTOS workloads have different scheduling, latency, and verification requirements than CambiOS commits to. A future fork or variant could target RTOS use cases, but that is not this project.
-- **High-assurance military / defense workloads.** CambiOS's project effort, design decisions, and development priorities are oriented toward civilian use cases. The project does not commit effort to the specific requirements of military procurement, high-assurance certification (EAL6+, Common Criteria), or classified-information-handling workloads. CambiOS is openly developed and the project cannot and does not attempt to prevent anyone from using the software; but the project's effort goes toward the users it is trying to serve, and military or defense deployments are not among them. The project's position on funding from defense research agencies is documented in [GOVERNANCE.md](../../GOVERNANCE.md).
+- **High-assurance military / defense workloads.** CambiOS's project effort, design decisions, and development priorities are oriented toward civilian use cases. The project does not commit effort to the specific requirements of military procurement, high-assurance certification (EAL6+, Common Criteria), or classified-information-handling workloads. CambiOS is openly developed and the project cannot and does not attempt to prevent anyone from using the software; but the project's effort goes toward the users it is trying to serve, and military or defense deployments are not among them. The project's position on funding from defense research agencies is documented in [GOVERNANCE.md](../GOVERNANCE.md).
 - **Backward compatibility with pre-UEFI firmware, BIOS-only boot, or 32-bit CPU architectures.** CambiOS targets modern boot firmware and 64-bit CPUs.
 - **Maintenance of ports to closed-source proprietary hardware without community interest.** The project will accept ports but does not commit to maintaining them.
 - **Matching any existing operating system feature-for-feature.** CambiOS builds what CambiOS needs, not what Linux, Windows, or macOS happen to have.
@@ -201,7 +201,7 @@ CambiOS's principles include "Platform Is an Implementation Detail" — the arch
 - **The specific model architecture for the UX AI.** Same.
 - **The CambiOS-Embedded build mechanism.** Implementation detail — likely Cargo feature flags plus boot manifest variants. Will be addressed at implementation time.
 - **The criteria for adding or removing tiers.** If the three-tier model turns out to need a fourth tier (e.g., a "server" tier with different service emphasis) or fewer tiers, that is a future ADR's job.
-- **Project governance and funding.** Documented separately in [GOVERNANCE.md](../../GOVERNANCE.md).
+- **Project governance and funding.** Documented separately in [GOVERNANCE.md](../GOVERNANCE.md).
 
 ## Relationship to Other ADRs
 
@@ -217,14 +217,14 @@ Future ADRs should cite this one when their scope, hardware assumptions, or tier
 
 ## Cross-References
 
-- [CambiOS.md](../../CambiOS.md) — Source-of-truth architecture document. This ADR makes explicit the commitments that CambiOS.md carries implicitly. CambiOS.md is updated to cross-reference this ADR for tier-specific scope and hardware commitments.
-- [PHILOSOPHY.md](../../PHILOSOPHY.md) — Project philosophy. The Purpose Statements section aligns with and makes concrete the philosophical stance described there, particularly the "AI watches without controlling" framing.
-- [GOVERNANCE.md](../../GOVERNANCE.md) — Project governance, funding, and contributor commitments. Addresses the funding and institutional independence questions that are adjacent to but distinct from this ADR's architectural commitments.
+- [CambiOS.md](../CambiOS.md) — Source-of-truth architecture document. This ADR makes explicit the commitments that CambiOS.md carries implicitly. CambiOS.md is updated to cross-reference this ADR for tier-specific scope and hardware commitments.
+- [PHILOSOPHY.md](../PHILOSOPHY.md) — Project philosophy. The Purpose Statements section aligns with and makes concrete the philosophical stance described there, particularly the "AI watches without controlling" framing.
+- [GOVERNANCE.md](../GOVERNANCE.md) — Project governance, funding, and contributor commitments. Addresses the funding and institutional independence questions that are adjacent to but distinct from this ADR's architectural commitments.
 - [CLAUDE.md](../../CLAUDE.md) — Kernel technical reference. Several sections of CLAUDE.md should reference this ADR once it lands (see "See Also in CLAUDE.md" below).
-- [SECURITY.md](../../SECURITY.md) — Security posture document. Purpose 2 is where SECURITY.md's threat model connects to this ADR.
-- [win-compat.md](../../win-compat.md) — Windows compatibility design. This ADR makes explicit that Windows compat is a bridge (Principle 5) and scopes it to Tiers 2 and 3.
-- [identity.md](../../identity.md) — Identity architecture. Purpose 3 (user sovereignty) is operationalized in identity.md's Principal and key management model.
-- [ASSUMPTIONS.md](../../ASSUMPTIONS.md) — Numeric bounds catalog. This ADR does not itself add numeric bounds to the catalog (the tier floors are documentation commitments, not kernel constants), but future ADRs that land tier-dependent bounds will cite this ADR.
+- [SECURITY.md](../SECURITY.md) — Security posture document. Purpose 2 is where SECURITY.md's threat model connects to this ADR.
+- [win-compat.md](../win-compat.md) — Windows compatibility design. This ADR makes explicit that Windows compat is a bridge (Principle 5) and scopes it to Tiers 2 and 3.
+- [identity.md](../identity.md) — Identity architecture. Purpose 3 (user sovereignty) is operationalized in identity.md's Principal and key management model.
+- [ASSUMPTIONS.md](../ASSUMPTIONS.md) — Numeric bounds catalog. This ADR does not itself add numeric bounds to the catalog (the tier floors are documentation commitments, not kernel constants), but future ADRs that land tier-dependent bounds will cite this ADR.
 
 ## See Also in CLAUDE.md
 

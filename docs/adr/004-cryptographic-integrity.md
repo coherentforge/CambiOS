@@ -215,8 +215,8 @@ New tests to add:
 ## References
 
 - ADR-003: Content-Addressed Storage and Cryptographic Identity
-- [identity.md](../../identity.md): Identity architecture — Ed25519 as classical foundation, ML-DSA-65 as post-quantum target
-- [FS-and-ID-design-plan.md](../../FS-and-ID-design-plan.md): Phase 1 specification
+- [identity.md](../identity.md): Identity architecture — Ed25519 as classical foundation, ML-DSA-65 as post-quantum target
+- [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md): Phase 1 specification
 - `blake3` crate: https://crates.io/crates/blake3
 - `ed25519-compact` crate: https://crates.io/crates/ed25519-compact
 - Bernstein et al., "High-speed high-security signatures" (2012) — Ed25519 specification

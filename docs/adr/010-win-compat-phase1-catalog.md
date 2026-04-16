@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-04-13
 - **Companion to:** [ADR-010](010-win-compat-api-ai-boundary.md) — classification rules and decision procedure
-- **Applies to:** Phase 1 target applications (QuickBooks Desktop, Sage 50, Lacerte, Drake) per [win-compat.md](../../win-compat.md) § Phase 1
+- **Applies to:** Phase 1 target applications (QuickBooks Desktop, Sage 50, Lacerte, Drake) per [win-compat.md](../win-compat.md) § Phase 1
 
 ## Purpose
 

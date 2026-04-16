@@ -172,7 +172,7 @@ The components this ADR describes:
 | `IpcManager` | `src/ipc/mod.rs` | Message passing with capability + interceptor checks |
 | `SyscallDispatcher` | `src/syscalls/dispatcher.rs` | Syscall entry with interceptor pre-dispatch |
 
-For the current implementation status of each item (enforced vs. scaffolding vs. designed), see [SECURITY.md § Enforcement Status Summary](../../SECURITY.md). For test counts, see [STATUS.md](../../STATUS.md).
+For the current implementation status of each item (enforced vs. scaffolding vs. designed), see [SECURITY.md § Enforcement Status Summary](../SECURITY.md). For test counts, see [STATUS.md](../../STATUS.md).
 
 ### Lock ordering (security-critical globals)
 

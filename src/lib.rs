@@ -92,7 +92,7 @@ use memory::frame_allocator::FrameAllocator;
 /// Why: matches xAPIC 8-bit APIC ID space; statically-sized per-CPU arrays for
 ///      schedulers, timers, and frame caches.
 /// Replace when: x2APIC support (32-bit IDs) lands, or a > 256-core target appears.
-///      Not a v1 concern. See ASSUMPTIONS.md.
+///      Not a v1 concern. See docs/ASSUMPTIONS.md.
 pub const MAX_CPUS: usize = 256;
 
 /// Per-CPU scheduler instances. Each CPU owns PER_CPU_SCHEDULER[cpu_id].
@@ -185,7 +185,7 @@ pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
 /// Why: must equal `scheduler::MAX_TASKS` (the per-CPU bound). The TASK_CPU_MAP
 ///      array is sized from this; lock-free cross-CPU wake reads it.
 /// Replace when: the per-CPU MAX_TASKS in scheduler/mod.rs grows. They are paired
-///      and must move together. See ASSUMPTIONS.md.
+///      and must move together. See docs/ASSUMPTIONS.md.
 pub const MAX_TASKS: usize = 256;
 
 /// Sentinel value meaning "task unassigned / no CPU".

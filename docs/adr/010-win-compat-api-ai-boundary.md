@@ -3,12 +3,12 @@
 - **Status:** Proposed
 - **Date:** 2026-04-13
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-007](007-capability-revocation-and-telemetry.md) (Audit Telemetry), [ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers)
-- **Related:** [win-compat.md](../../win-compat.md), [docs/adr/010-win-compat-phase1-catalog.md](010-win-compat-phase1-catalog.md) (sibling catalog)
+- **Related:** [win-compat.md](../win-compat.md), [docs/adr/010-win-compat-phase1-catalog.md](010-win-compat-phase1-catalog.md) (sibling catalog)
 - **Supersedes:** N/A
 
 ## Context
 
-[win-compat.md](../../win-compat.md) describes a four-tier translation model for the Windows compatibility layer — Tier 0 static shims, Tier 1 JIT shims, Tier 2 behavioral pattern translation, Tier 3 interactive fallback. It names the tiers but does not define the decision rules that assign a given Win32 API call to a given tier, and it does not specify the mechanics of the boundary between them.
+[win-compat.md](../win-compat.md) describes a four-tier translation model for the Windows compatibility layer — Tier 0 static shims, Tier 1 JIT shims, Tier 2 behavioral pattern translation, Tier 3 interactive fallback. It names the tiers but does not define the decision rules that assign a given Win32 API call to a given tier, and it does not specify the mechanics of the boundary between them.
 
 Without those rules, any attempt to scaffold the `user/win-compat/` crate produces code that bakes in tier assignments by implication — the very act of putting `CreateFileW` under `shims/kernel32.rs` implicitly classifies it as Tier 0, whether or not that classification is correct. If the classification is later revisited, every shim file gets rewritten. Worse, the contract between the static shim layer and the AI translator service — who validates what, who signs what, what the audit trail looks like — gets invented ad hoc at implementation time rather than designed deliberately.
 
@@ -267,7 +267,7 @@ The PE process cannot tell which tier served its call — from its perspective, 
 
 ## Cross-References
 
-- [win-compat.md](../../win-compat.md) — Updated to reference this ADR as the authoritative source for tier classification rules, plan grammar, validation pipeline, and audit schema. Sections that described these in prose are shortened to a one-line reference.
+- [win-compat.md](../win-compat.md) — Updated to reference this ADR as the authoritative source for tier classification rules, plan grammar, validation pipeline, and audit schema. Sections that described these in prose are shortened to a one-line reference.
 - [docs/adr/010-win-compat-phase1-catalog.md](010-win-compat-phase1-catalog.md) — Sibling document containing the per-function tier assignments for the Phase 1 Win32 surface. Applies this ADR's rules to today's target.
 - [STATUS.md](../../STATUS.md) — Windows compatibility remains "Planned (post-v1)." This ADR is a design landing, not an implementation landing.
 - [CLAUDE.md](../../CLAUDE.md) — Required Reading table gets a new row when the scaffolding lands: "Windows compatibility / PE loader / shim layer" pointing to this ADR and its catalog.

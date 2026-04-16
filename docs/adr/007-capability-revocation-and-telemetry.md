@@ -10,7 +10,7 @@
 
 CambiOS has working capability *grants*: every IPC endpoint has rights, every process has a capability table, every operation checks its right against the table. What's missing is the ability to **take capabilities back**.
 
-[SECURITY.md gap #5](../../SECURITY.md#gap-analysis) flags this directly: "Required before any real multi-service deployment. A driver update needs to revoke the old driver's capabilities." The use cases are concrete and not hypothetical:
+[SECURITY.md gap #5](../SECURITY.md#gap-analysis) flags this directly: "Required before any real multi-service deployment. A driver update needs to revoke the old driver's capabilities." The use cases are concrete and not hypothetical:
 
 - A user-space service is updated; its replacement holds new capabilities; the old service's capabilities must be revoked atomically before the new service starts handling requests.
 - A driver is detected to be misbehaving (sending traffic to unauthorized endpoints, accessing memory it shouldn't, exhibiting anomalous syscall patterns); the policy service decides to revoke its IPC capabilities to contain the damage.
@@ -20,7 +20,7 @@ CambiOS has working capability *grants*: every IPC endpoint has rights, every pr
 
 The kernel today cannot do any of this. Capabilities are granted at process creation or via delegation; they live until the process exits. There is no `revoke()` method. There is no way for a third party to invalidate a granted right. There is no kernel primitive that says "this capability is no longer valid, regardless of who holds it."
 
-The second missing piece is the telemetry that makes revocation *useful*. [PHILOSOPHY.md lines 73-99](../../PHILOSOPHY.md) describes the AI security service as a watcher:
+The second missing piece is the telemetry that makes revocation *useful*. [PHILOSOPHY.md lines 73-99](../PHILOSOPHY.md) describes the AI security service as a watcher:
 
 > "Security LLM watches syscalls, detects anomalies, revokes capabilities when patterns diverge from expected behavior. It *observes* without *controlling* the microkernel."
 
@@ -152,7 +152,7 @@ With revocation, the policy service from [ADR-006](006-policy-service.md) become
 - A driver update can revoke the old driver's capabilities atomically before granting them to the new driver
 - A user can manually revoke a capability via a future shell command, with the policy service as the gatekeeper
 
-This closes [SECURITY.md gap #5](../../SECURITY.md#gap-analysis) and provides the substrate for [PHILOSOPHY.md's](../../PHILOSOPHY.md) "AI revokes capabilities when patterns diverge."
+This closes [SECURITY.md gap #5](../SECURITY.md#gap-analysis) and provides the substrate for [PHILOSOPHY.md's](../PHILOSOPHY.md) "AI revokes capabilities when patterns diverge."
 
 ## Audit Telemetry
 
@@ -410,9 +410,9 @@ The order is deliberate: revocation comes first because it has no dependencies o
 - **[ADR-002](002-three-layer-enforcement-pipeline.md)** — Enforcement pipeline (capability check still happens; revocation makes the check fail post-revoke)
 - **[ADR-005](005-ipc-primitives-control-and-bulk.md)** — Channels (audit telemetry uses the channel primitive; channel revocation uses the primitive defined here)
 - **[ADR-006](006-policy-service.md)** — Policy service (the primary consumer of audit telemetry and the primary caller of `SYS_REVOKE_CAPABILITY`)
-- **[CambiOS.md § AI Integration](../../CambiOS.md)** — Three pillars: security, compatibility, operations. The audit telemetry substrate enables Pillar 1 (Security AI)
-- **[PHILOSOPHY.md](../../PHILOSOPHY.md) lines 73-99** — "AI watches without controlling" — this ADR provides the *something to watch*
-- **[SECURITY.md § Gap Analysis](../../SECURITY.md#gap-analysis)** — Closes gap #5 (capability revocation) and provides the substrate for items "Audit logging" and "Runtime behavioral AI"
+- **[CambiOS.md § AI Integration](../CambiOS.md)** — Three pillars: security, compatibility, operations. The audit telemetry substrate enables Pillar 1 (Security AI)
+- **[PHILOSOPHY.md](../PHILOSOPHY.md) lines 73-99** — "AI watches without controlling" — this ADR provides the *something to watch*
+- **[SECURITY.md § Gap Analysis](../SECURITY.md#gap-analysis)** — Closes gap #5 (capability revocation) and provides the substrate for items "Audit logging" and "Runtime behavioral AI"
 
 ## See Also in CLAUDE.md
 

@@ -121,7 +121,7 @@ pub const SLOT_OVERHEAD: usize = core::mem::size_of::<ProcessDescriptor>()
 // Per-tier policies
 // ============================================================================
 //
-// Defaults from ADR-008 § Decision. Documented in ASSUMPTIONS.md § Tier
+// Defaults from ADR-008 § Decision. Documented in docs/ASSUMPTIONS.md § Tier
 // policies with replacement criteria.
 
 /// TUNING: Tier 1 (CambiOS-Embedded) default policy.
