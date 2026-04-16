@@ -566,6 +566,12 @@ stats:
 symbols:
 	python3 tools/gen-symbols.py
 
+# Verify ADR cross-references and regenerate docs/adr/INDEX.md.
+# Exit nonzero if any ADR references a missing or superseded ADR, or
+# if two ADRs share a number. Run after any ADR edit or addition.
+check-adrs:
+	python3 tools/check-adrs.py
+
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
 IMG_AARCH64 := cambios-aarch64.img
