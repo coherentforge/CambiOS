@@ -153,11 +153,10 @@ impl VirtioBlkDevice {
         }
 
         // 4. Poll the response endpoint with cooperative yields. Each yield
-        //    hands the CPU back to the scheduler; when all other tasks
-        //    yield/block too, the CPU reaches idle → hlt, which lets the
-        //    QEMU-TCG event loop advance the virtio-blk request. Once the
-        //    driver replies, the reply lands in `SHARDED_IPC.shard[25]`
-        //    via the `handle_write` endpoint-25 intercept.
+        //    hands the CPU back to the scheduler; virtio-blk (polling both
+        //    ep24 and ep26 via SYS_TRY_RECV_MSG) picks up the command, sends
+        //    the reply to ep25 via handle_write's intercept, and our next
+        //    recv_message call finds it.
         for _ in 0..MAX_WAIT_ITERATIONS {
             if let Some(reply) = crate::SHARDED_IPC.recv_message(EndpointId(self.response_endpoint))
             {
@@ -177,7 +176,7 @@ impl VirtioBlkDevice {
         Err(BlockError::NotReady)
     }
 
-    fn ensure_handshake(&mut self) -> Result<(), BlockError> {
+    pub fn ensure_handshake(&mut self) -> Result<(), BlockError> {
         if self.initialized {
             return Ok(());
         }

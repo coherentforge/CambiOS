@@ -255,11 +255,23 @@ pub fn write(endpoint: u32, buf: &[u8]) -> i64 {
     syscall_raw3(SYS_WRITE, endpoint as u64, buf.as_ptr() as u64, buf.len() as u64)
 }
 
-/// Receive IPC message with sender identity.
-/// Returns total bytes in buf, or 0 if no message, or negative error.
+/// Receive IPC message with sender identity (blocking).
+/// Returns total bytes in buf (≥36) on success, or negative error.
+/// Blocks on `MessageWait(endpoint)` when no message is queued.
 /// buf layout: [sender_principal:32][from_endpoint:4][payload:N]
 pub fn recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
     syscall_raw3(SYS_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+const SYS_TRY_RECV_MSG: u64 = 37;
+
+/// Non-blocking variant of `recv_msg`. Returns bytes received (≥36) or 0
+/// if no message is queued — never blocks. Required for services that
+/// poll multiple endpoints (e.g., a driver listening on both a user-facing
+/// endpoint and a kernel-command endpoint): blocking `recv_msg` on one
+/// endpoint would miss wakes on the other.
+pub fn try_recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
+    syscall_raw3(SYS_TRY_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
 }
 
 /// Store object. Writes 32-byte hash to out_hash. Returns 0 or negative error.

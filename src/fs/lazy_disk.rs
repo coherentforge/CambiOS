@@ -1,78 +1,76 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! Lazy-initialized disk-backed ObjectStore wrapper.
+//! Lazy-initialized disk-backed ObjectStore swap.
 //!
-//! Phase 4a.iii installs a `DiskObjectStore<VirtioBlkDevice>` as the kernel's
-//! `OBJECT_STORE` backing. Construction requires reading the superblock, which
-//! requires the virtio-blk user-space driver to be already running so it can
-//! answer the handshake IPC. That condition is not met at `object_store_init`
-//! time — drivers come up with the scheduler, after `object_store_init` has
-//! already wired the store.
+//! At boot, `OBJECT_STORE` holds a `RamObjectStore` (in-memory, fast, no IPC).
+//! On the first `SYS_OBJ_*` syscall, `ensure_disk_store()` is called **before**
+//! acquiring the `OBJECT_STORE` lock. It handshakes with the user-space
+//! virtio-blk driver over IPC (which yields the calling task), creates a
+//! `DiskObjectStore`, and swaps it in under the lock. Subsequent calls see
+//! the disk store and skip the handshake (atomic fast path).
 //!
-//! `LazyDiskStore` defers the handshake + `open_or_format` to the first
-//! `ObjectStore` method call. By that point the caller is a user task making
-//! a `SYS_OBJ_*` syscall, which is exactly the context `VirtioBlkDevice::call`
-//! needs — a valid `TaskId` to block on `MessageWait(25)` and yield.
+//! ## Why not hold OBJECT_STORE across the handshake?
 //!
-//! On every subsequent call the wrapper is a zero-cost pass-through to the
-//! inner `DiskObjectStore`.
+//! `VirtioBlkDevice::call` yields the calling task via `yield_save_and_switch`.
+//! Holding a `Spinlock` across a yield violates the spinlock contract — the
+//! scheduler may migrate the lock holder or allow another task to spin on the
+//! same lock indefinitely. In practice, holding `OBJECT_STORE` across the
+//! handshake caused a permanent stall: the calling task yielded inside the
+//! IPC poll loop, virtio-blk processed the message and replied, but the
+//! calling task was never re-scheduled because the spinlock interaction
+//! prevented the scheduler from picking it up correctly.
+//!
+//! The fix: handshake first (no locks held), then install under lock (fast,
+//! no IPC, no yield).
 
-extern crate alloc;
-use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fs::disk::DiskObjectStore;
 use crate::fs::virtio_blk_device::VirtioBlkDevice;
-use crate::fs::{CambiObject, ObjectMeta, ObjectStore, StoreError};
 
-pub struct LazyDiskStore {
-    inner: Option<DiskObjectStore<VirtioBlkDevice>>,
-    capacity_slots: u64,
-}
+/// Atomic flag: `true` once the disk store has been successfully installed
+/// in `OBJECT_STORE`. Fast-path check — avoids re-entering the handshake
+/// on every subsequent syscall.
+static DISK_STORE_READY: AtomicBool = AtomicBool::new(false);
 
-impl LazyDiskStore {
-    pub fn new(capacity_slots: u64) -> Self {
-        Self {
-            inner: None,
-            capacity_slots,
+/// Ensure the disk-backed `ObjectStore` is installed. Must be called
+/// **without** holding `OBJECT_STORE`. No-op after the first successful
+/// call (atomic fast path).
+///
+/// On failure (driver not available, device error, format failure), the
+/// existing `RamObjectStore` remains — arcobj commands work but objects
+/// don't persist across reboots.
+pub fn ensure_disk_store() {
+    if DISK_STORE_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    // Phase 1: handshake + open, no locks held. IPC yields are safe here.
+    let mut device = VirtioBlkDevice::new();
+    if device.ensure_handshake().is_err() {
+        // Driver not available (e.g., AArch64 with no virtio-blk device).
+        // Mark ready so we don't retry on every syscall.
+        DISK_STORE_READY.store(true, Ordering::Release);
+        crate::println!("  [ObjectStore] disk handshake failed, staying on RAM store");
+        return;
+    }
+
+    let capacity = device.capacity_blocks_cached();
+    let store = match DiskObjectStore::open_or_format(device, capacity) {
+        Ok(s) => s,
+        Err(e) => {
+            DISK_STORE_READY.store(true, Ordering::Release);
+            crate::println!("  [ObjectStore] disk open/format failed ({:?}), staying on RAM store", e);
+            return;
         }
+    };
+
+    // Phase 2: install under lock (fast — no IPC, no yield).
+    {
+        let mut guard = crate::OBJECT_STORE.lock();
+        *guard = Some(alloc::boxed::Box::new(store));
     }
 
-    /// Perform the first-time handshake + superblock read. Must be called
-    /// from a user-task syscall context (needs a current task for
-    /// `VirtioBlkDevice::call` to block on `MessageWait(25)`).
-    fn ensure(&mut self) -> Result<(), StoreError> {
-        if self.inner.is_some() {
-            return Ok(());
-        }
-        let device = VirtioBlkDevice::new();
-        let store = DiskObjectStore::open_or_format(device, self.capacity_slots)?;
-        self.inner = Some(store);
-        Ok(())
-    }
-}
-
-impl ObjectStore for LazyDiskStore {
-    fn get(&mut self, hash: &[u8; 32]) -> Result<CambiObject, StoreError> {
-        self.ensure()?;
-        self.inner.as_mut().unwrap().get(hash)
-    }
-
-    fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError> {
-        self.ensure()?;
-        self.inner.as_mut().unwrap().put(object)
-    }
-
-    fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
-        self.ensure()?;
-        self.inner.as_mut().unwrap().delete(hash)
-    }
-
-    fn list(&mut self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError> {
-        self.ensure()?;
-        self.inner.as_mut().unwrap().list()
-    }
-
-    fn count(&self) -> usize {
-        self.inner.as_ref().map(|s| s.count()).unwrap_or(0)
-    }
+    DISK_STORE_READY.store(true, Ordering::Release);
+    crate::println!("  [ObjectStore] disk store active (capacity {} blocks)", capacity);
 }

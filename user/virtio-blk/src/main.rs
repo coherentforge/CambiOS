@@ -675,69 +675,95 @@ pub extern "C" fn _start() -> ! {
     let mut resp_buf = [0u8; 256];
     let mut kern_recv_buf = [0u8; 292];
 
+    // Dual-endpoint service loop. We MUST use try_recv_msg (non-blocking)
+    // on both endpoints: a blocking recv on one would park the task on
+    // MessageWait(that endpoint), and a wake targeting the other endpoint
+    // would miss us. That's what caused the Phase 4b arcobj handshake
+    // stall before SYS_TRY_RECV_MSG (37) landed.
     loop {
-        // Poll the user-facing endpoint first (existing identity-verified
-        // path). `recv_verified` returns None on empty or anonymous sender.
-        if let Some(msg) = sys::recv_verified(BLK_ENDPOINT, &mut recv_buf) {
-            if let Some((cmd, _cmd_data)) = msg.command() {
-                let resp_len = match cmd {
-                    CMD_READ_BLOCK | CMD_WRITE_BLOCK => handle_unimplemented(&mut resp_buf),
-                    CMD_FLUSH => handle_flush(&mut driver, &mut resp_buf),
-                    CMD_GET_CAPACITY => handle_get_capacity(&driver, &mut resp_buf),
-                    CMD_GET_STATUS => handle_get_status(&driver, &mut resp_buf),
-                    _ => {
-                        resp_buf[0] = STATUS_ERROR;
-                        1
-                    }
-                };
-                sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
-            }
-            continue;
-        }
+        let mut did_work = false;
 
-        // Poll the kernel-facing endpoint. The kernel's sender_principal is
-        // None (anonymous) — `recv_verified` would reject it — so we use raw
-        // `recv_msg`. Trust is conferred by endpoint choice: only the kernel
-        // is supposed to speak on 26; user-space processes have no reason to
-        // register a capability here.
-        let n = sys::recv_msg(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf);
+        // Poll the user-facing endpoint (identity-required).
+        let n = sys::try_recv_msg(BLK_ENDPOINT, &mut recv_buf);
         if n > 0 {
             let total = n as usize;
-            // IPC frame layout: [principal:32][from:4][payload:N]. We ignore
-            // the principal here; see note above.
-            if total < 37 {
-                continue;
+            if total >= 37 {
+                // Reject anonymous senders on the user endpoint (mirrors
+                // what recv_verified's check did previously).
+                let mut principal_zero = true;
+                for &b in &recv_buf[0..32] {
+                    if b != 0 { principal_zero = false; break; }
+                }
+                if !principal_zero {
+                    // payload[0] = cmd, payload[1..] = args
+                    let cmd = recv_buf[36];
+                    let from_ep = u32::from_le_bytes(recv_buf[32..36].try_into().unwrap());
+                    let resp_len = match cmd {
+                        CMD_READ_BLOCK | CMD_WRITE_BLOCK => handle_unimplemented(&mut resp_buf),
+                        CMD_FLUSH => handle_flush(&mut driver, &mut resp_buf),
+                        CMD_GET_CAPACITY => handle_get_capacity(&driver, &mut resp_buf),
+                        CMD_GET_STATUS => handle_get_status(&driver, &mut resp_buf),
+                        _ => {
+                            resp_buf[0] = STATUS_ERROR;
+                            1
+                        }
+                    };
+                    sys::write(from_ep, &resp_buf[..resp_len]);
+                }
             }
-            let payload = &kern_recv_buf[36..total];
-            let resp_len = handle_kernel_cmd(&mut driver, payload, &mut resp_buf);
-            if resp_len > 0 {
-                sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf[..resp_len]);
-            }
-            continue;
+            did_work = true;
         }
 
-        sys::yield_now();
+        // Poll the kernel-facing endpoint (kernel is anonymous sender —
+        // trust is by endpoint choice; nobody else registers ep26).
+        let n = sys::try_recv_msg(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf);
+        if n > 0 {
+            let total = n as usize;
+            if total >= 37 {
+                let payload = &kern_recv_buf[36..total];
+                let resp_len = handle_kernel_cmd(&mut driver, payload, &mut resp_buf);
+                if resp_len > 0 {
+                    sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf[..resp_len]);
+                }
+            }
+            did_work = true;
+        }
+
+        if !did_work {
+            sys::yield_now();
+        }
     }
 }
 
 fn no_device_loop() -> ! {
-    // Still signal boot-chain ready — otherwise downstream modules (shell,
-    // hello) would remain Blocked on BootGate forever when virtio-blk is
-    // absent or failed to initialize. The driver answers NO_DEVICE to any
-    // caller; the boot chain keeps advancing.
+    // Also register the kernel endpoint so handshakes get a fast NO_DEVICE
+    // response instead of timing out after ~100s. Signal boot-chain ready
+    // so downstream modules are released.
+    sys::register_endpoint(BLK_KERNEL_CMD_ENDPOINT);
     sys::module_ready();
 
     let mut recv_buf = [0u8; 256];
+    let mut kern_recv_buf = [0u8; 292];
     let resp_buf = [STATUS_NO_DEVICE; 1];
 
     loop {
-        let msg = match sys::recv_verified(BLK_ENDPOINT, &mut recv_buf) {
-            Some(m) => m,
-            None => {
-                sys::yield_now();
-                continue;
-            }
-        };
-        sys::write(msg.from_endpoint(), &resp_buf);
+        let mut did_work = false;
+
+        let n = sys::try_recv_msg(BLK_ENDPOINT, &mut recv_buf);
+        if n > 0 && (n as usize) >= 37 {
+            let from_ep = u32::from_le_bytes(recv_buf[32..36].try_into().unwrap());
+            sys::write(from_ep, &resp_buf);
+            did_work = true;
+        }
+
+        let n = sys::try_recv_msg(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf);
+        if n > 0 {
+            sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf);
+            did_work = true;
+        }
+
+        if !did_work {
+            sys::yield_now();
+        }
     }
 }

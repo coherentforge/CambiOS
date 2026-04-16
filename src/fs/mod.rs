@@ -19,6 +19,16 @@ pub mod ram;
 #[cfg(not(test))]
 pub mod virtio_blk_device;
 
+/// Test-mode stub for lazy_disk. The real module performs IPC handshake
+/// with the user-space virtio-blk driver; in host tests neither IPC nor
+/// the driver exists, so syscall-handler tests get a no-op.
+#[cfg(test)]
+pub mod lazy_disk {
+    pub fn ensure_disk_store() {
+        // No-op: tests use RamObjectStore directly.
+    }
+}
+
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::ipc::Principal;

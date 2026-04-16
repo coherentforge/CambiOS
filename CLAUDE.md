@@ -32,18 +32,50 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 ## Development Environment
 
 - **Host:** macOS (Apple Silicon)
-- **Kernel targets:** `x86_64-unknown-none` and `aarch64-unknown-none` (ELF, bare metal)
+- **Kernel targets:** `x86_64-unknown-none`, `aarch64-unknown-none`, and `riscv64gc-unknown-none-elf` (ELF, bare metal). RISC-V backend is in progress (Phase R-0 done) — see [ADR-013](docs/adr/013-riscv64-architecture-support.md) and [STATUS.md](STATUS.md) RISC-V port phases.
 - **Unit tests:** `cargo test --lib` (runs natively on macOS)
 - **Integration testing:** QEMU (installed via Homebrew)
 - **AArch64 boot media:** FAT disk image via `mtools` (ISO/cdrom doesn't work for AArch64 UEFI on QEMU)
+- **RISC-V boot:** OpenSBI (M-mode firmware, ships with QEMU as `-bios default`) hands a DTB pointer to a custom S-mode boot stub at `src/boot/riscv.rs`. No Limine on RISC-V.
 
 ## Critical Rules
 
-- **NEVER** suggest `cargo run` or `cargo build` without `--target x86_64-unknown-none` or `--target aarch64-unknown-none` for kernel crates.
+- **NEVER** suggest `cargo run` or `cargo build` without `--target x86_64-unknown-none`, `--target aarch64-unknown-none`, or `--target riscv64gc-unknown-none-elf` for kernel crates.
 - **NEVER** suggest running kernel binaries directly on the host. Always use QEMU.
 - **AArch64 QEMU MUST use** `-machine virt,gic-version=3` (GICv3 required for ICC system registers).
+- **RISC-V QEMU MUST use** `-machine virt -bios default` (loads OpenSBI as M-mode firmware; the kernel is the S-mode payload). No vendor-specific machine types — generic-first per [ADR-013](docs/adr/013-riscv64-architecture-support.md).
+- **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). During RISC-V Phases R-1 through R-6 (the riscv64 backend is mid-construction and not expected to build between phase boundaries), use `make check-stable` (x86_64 + aarch64). After Phase R-6 lands, use `make check-all` (all three) as the permanent gate. The discipline is identical: no commits regress any *currently buildable* arch.
 - **ALWAYS*** all new files are tagged for copyright: // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
+
+## Stop-and-Ask Gate
+
+Before the first edit, stop and confirm with the user when any of these apply. The cost of pausing is a sentence; the cost of proceeding wrong is a debug session or a silent design drift. User standing preference: questions over wrong assumptions — "I don't know" is acceptable.
+
+- **Unread subsystem.** About to modify a subsystem listed in the [Required Reading](#required-reading-by-subsystem) map without having read its docs *this session*. Re-read first, or flag the reading gap.
+- **New `unsafe` invariant.** About to add `unsafe` that introduces a *new kind* of safety obligation (not mechanically matching a pre-existing pattern in the same module). Mechanical copies are fine; new invariants need user sign-off so the audit trail is intentional.
+- **ADR rewrite.** About to edit an ADR's original decision text. Use a `## Divergence` appendix or a new superseding ADR instead — original reasoning is immutable history.
+- **Lock hierarchy change.** About to add a new lock to the hierarchy, reorder entries, or change `IrqSpinlock` vs plain `Spinlock`. Formally relevant, cross-subsystem, and exactly the class of change that breaks invariants silently.
+- **SCAFFOLDING bound without v1 math.** About to pick a `const MAX_*` value without working through Dev Convention 8's extrapolation: v1-endgame workload, ≤25% utilization, memory cost. See [ASSUMPTIONS.md](ASSUMPTIONS.md).
+- **Dynamic dispatch in kernel.** About to introduce a trait object (`Box<dyn …>`, `&dyn …`) in kernel hot paths. Violates the Formal Verification rule ("no dynamic dispatch"). Propose the monomorphized design first.
+- **Panic / unwrap / expect in non-test kernel code.** Every kernel failure must be a typed `Result`. If the only forward motion seems to be a panic, stop — the error type is probably wrong.
+- **Telemetry / analytics / phone-home.** Project principle is zero telemetry. Any feature that emits data off-device (even "anonymous") is a stop.
+- **Portable module drift.** About to add `#[cfg(target_arch = …)]` to `src/scheduler/`, `src/ipc/`, `src/process.rs`, `src/loader/elf.rs`, or another portable module. Factor an `arch::` helper instead, or escalate.
+- **Identity-gate bypass.** About to add a syscall without updating `requires_identity()` + the identity tests in [src/syscalls/mod.rs](src/syscalls/mod.rs), or add an IPC receiver that uses plain `recv_msg` where `recv_verified` is the load-bearing variant.
+- **Destructive or shared-state action.** `git reset --hard`, branch deletion, force-push, `rm -rf` under the repo, or any action visible outside this machine. The top-level "Executing actions with care" rule applies; this bullet is the local reminder.
+
+This list is not exhaustive. The rule: **when you are about to modify something the user would want to be consulted on before the first edit, stop before the first edit.**
+
+## Prompt-Shaping Changelog
+
+Why each non-obvious rule was added, so a future session can generalize instead of pattern-matching on surface syntax. Keep entries terse (`YYYY-MM-DD — change — reason/failure it addresses`). Newest first.
+
+- **2026-04-16** — Added `arch::interrupts_enabled()` helper (x86_64 / AArch64 / RISC-V + host stub) and `debug_assert!` at heap entry, `map_page` (both arches), `Scheduler::block_task`. Reason: prose invariants ("disable interrupts before `block_task`", "heap alloc requires `memory::init()` first", "page-align before `map_page`") lose force across sessions; code-level asserts fire at the bad callsite every build.
+- **2026-04-16** — Reverted a proposed `bind_principal` `debug_assert!`. Lesson: asserts and negative-path tests on the same invariant collide — the test intentionally triggers the error, and the assert fires on it. Test wins because it runs in release. Rule: before adding an assert, check for an existing `test_X_rejects_Y` — if it exists, the invariant is already enforced louder than an assert can.
+- **2026-04-16** — Added Failure Mode Signatures section (Common Failure Signatures). Reason: Claude Code sees compiler errors and QEMU hangs first, not architectural concepts. Maps the observed symptom text back to the root cause + where to look.
+- **2026-04-16** — Tiered the Post-Change Review Protocol (scope triage: small change → §1 + §8; subsystem change → full §1–§8). Reason: one-size-fits-all checklist on a typo produces fatigue, which gets paid in skipped steps later.
+- **2026-04-16** — Added Stop-and-Ask Gate. Reason: user standing preference ("questions over wrong assumptions") wasn't encoded in CLAUDE.md, only in memory; without an explicit gate, ambiguous cross-subsystem changes proceeded on guesswork.
+- **2026-04-16** — `make stats` target + stripped hard-coded syscall/test counts from prose. Reason: counts duplicated across CLAUDE.md / STATUS.md drifted silently (doc said "37 syscalls" when actual was 38; lock hierarchy duplicated with one copy missing `CHANNEL_MANAGER`). Canonical source is code; run `make stats` when a number actually matters.
 
 ## Quick Reference
 
@@ -57,9 +89,25 @@ cargo build --target x86_64-unknown-none
 # Build AArch64 kernel (release)
 cargo build --target aarch64-unknown-none --release
 
-# Run tests (447 tests, all passing)
+# Build RISC-V kernel (release) — Phase R-0 done; full kernel currently
+# fails to compile pending Phase R-1 arch backend. ADR-013.
+cargo build --target riscv64gc-unknown-none-elf --release
+
+# Tri-arch regression gate (MANDATORY before commits). During Phases
+# R-1..R-6 of the RISC-V port (riscv64 backend mid-construction), use
+# check-stable. After R-6 lands, use check-all as the permanent gate.
+# ADR-013 § Tri-Architecture Regression Discipline.
+make check-stable     # x86_64 + aarch64 (use during RISC-V buildup)
+make check-all        # x86_64 + aarch64 + riscv64 (post-R-6)
+
+# Run tests. Test count is not cited here — run `make stats` when you
+# need it (syscall count, test count, .rs file counts are all derived
+# from source). Canonical counts live in code, not prose.
 # Note: must use --manifest-path if cwd could be user/fs-service/
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+
+# Derived counts (syscalls, tests, LOC) — run when a number actually matters.
+make stats
 
 # Build for a specific deployment tier (Phase 3.2a / ADR-008 / ADR-009).
 # CAMBIOS_TIER selects which TableSizingPolicy is compiled in. Default
@@ -73,7 +121,7 @@ CAMBIOS_TIER=tier3 cargo build --target x86_64-unknown-none --release   # same a
 # Generate symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols
 
-# Build ISO + run in QEMU (x86_64) — includes kernel, hello.elf, fs-service
+# Build ISO + run in QEMU (x86_64) — includes kernel + boot modules (policy, ks, fs, virtio-blk, shell)
 make iso && make run
 
 # Just run (rebuilds kernel + user modules automatically)
@@ -81,6 +129,10 @@ make run
 
 # Build FAT image + run in QEMU (AArch64)
 make img-aarch64 && make run-aarch64
+
+# Build + run RISC-V kernel in QEMU virt with OpenSBI (Phase R-0 builds
+# the target; Phase R-1+ produces useful boot output)
+make run-riscv64
 
 # Build fs-service only (standalone Rust crate)
 make fs-service
@@ -123,7 +175,7 @@ These tools return semantically precise results (no false positives from comment
 
 ## Project Overview
 
-CambiOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting x86_64 and AArch64. It boots via the Limine v8.x protocol and has preemptive multitasking with ring 3 user tasks.
+CambiOS is a verification-ready microkernel OS written in Rust (`no_std`) targeting **x86_64**, **AArch64**, and **riscv64gc** (Phase R-0 done; full backend in progress per [ADR-013](docs/adr/013-riscv64-architecture-support.md)). It boots via the Limine v8.x protocol on x86_64 and AArch64; via OpenSBI + custom S-mode stub on RISC-V. Preemptive multitasking with ring 3 (x86), EL0 (AArch64), or U-mode (RISC-V) user tasks.
 
 **Current state:** see [STATUS.md](STATUS.md). That file is the canonical source for what is built, what is in progress, and what is planned, including test counts, subsystem status, phase markers, v1 roadmap progress, and known issues. **This file (CLAUDE.md) is the technical reference for the kernel** — conventions, rules, lock ordering, build commands, required-reading map. Status info is intentionally not duplicated here so the two files cannot drift.
 
@@ -334,23 +386,13 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 - **IPI primitives** in `apic.rs`: `send_ipi()`, `send_ipi_all_excluding_self()`, `send_ipi_self()` via ICR
 - **TLB shootdown** via vector 0xFE (`tlb.rs`): `shootdown_page()`, `shootdown_range()`, `shootdown_all()` — broadcast IPI, target CPUs execute `invlpg` or CR3 reload, initiating CPU spins on atomic pending counter
 - **Cross-CPU task wake**: `TASK_CPU_MAP` (`[AtomicU16; 256]` in `lib.rs`) tracks task→CPU assignment (lock-free). `wake_task_on_cpu(TaskId)` reads the map and acquires the correct CPU's scheduler to wake. `block_local_task(TaskId, BlockReason)` uses `local_scheduler()`. All IPC helpers, ISR dispatch, and diagnostics use these instead of hardcoded `PER_CPU_SCHEDULER[0]`. `migrate_task_between()` updates the map atomically.
+- **IPC reply-endpoint registry**: `REPLY_ENDPOINT` (`[AtomicU32; 256]` in `lib.rs`) stores the first endpoint each process registered via `SYS_REGISTER_ENDPOINT`. `handle_write` uses this as the `from` field of outgoing messages, so receivers doing `sys::write(msg.from_endpoint(), reply)` route replies back to a queue the sender is actually listening on. Falls back to pid-slot when a process has never registered. Landed in Phase 4b — before this fix, `from` was the sender's pid slot, which was always a different number from the registered endpoint, and any reply sent via `msg.from_endpoint()` went into a queue nobody read.
 
 ### Syscall Numbers
-```
-Exit=0, Write=1, Read=2, Allocate=3, Free=4, WaitIrq=5,
-RegisterEndpoint=6, Yield=7, GetPid=8, GetTime=9, Print=10,
-BindPrincipal=11, GetPrincipal=12, RecvMsg=13,
-ObjPut=14, ObjGet=15, ObjDelete=16, ObjList=17,
-ClaimBootstrapKey=18, ObjPutSigned=19,
-MapMmio=20, AllocDma=21, DeviceInfo=22, PortIo=23,
-ConsoleRead=24, Spawn=25, WaitTask=26,
-RevokeCapability=27,
-ChannelCreate=28, ChannelAttach=29, ChannelClose=30,
-ChannelRevoke=31, ChannelInfo=32,
-AuditAttach=33, AuditInfo=34,
-MapFramebuffer=35, ModuleReady=36
-```
-All 37 syscalls are implemented in `src/syscalls/dispatcher.rs`:
+
+The canonical list is the `SyscallNumber` enum in [src/syscalls/mod.rs](src/syscalls/mod.rs) — that is the ABI. Run `make stats` for the current count. The per-syscall summaries below describe *behavior*, not *existence*; if you need the authoritative list of numbers, read the enum.
+
+Handlers live in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs). Behavior summaries:
 - **Exit**: Marks task as Terminated in scheduler and calls `CapabilityManager::revoke_all_for_process()` to reclaim endpoint capabilities (see [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial
 - **Write**: Page-table-walk user buffer → IPC send (capability + interceptor checks, sender_principal stamped)
 - **Read**: IPC recv (capability + interceptor checks) → page-table-walk write to user buffer
@@ -362,7 +404,8 @@ All 37 syscalls are implemented in `src/syscalls/dispatcher.rs`:
 - **GetPid / GetTime / Print**: Fully functional
 - **BindPrincipal**: Binds a 32-byte Principal (public key) to a process. Restricted: only the bootstrap Principal can call this
 - **GetPrincipal**: Returns the calling process's bound Principal (32 bytes)
-- **RecvMsg**: Like Read but returns `[sender_principal:32][from_endpoint:4][payload:N]` — identity-aware receive
+- **RecvMsg**: Like Read but returns `[sender_principal:32][from_endpoint:4][payload:N]` — identity-aware receive. Blocks on `MessageWait(endpoint)` when no message is queued
+- **TryRecvMsg** (Phase 4b): Non-blocking variant of RecvMsg — returns 0 immediately if empty, never blocks. Required for services that poll multiple endpoints (virtio-blk listens on ep24 + ep26; blocking on one would miss wakes on the other). `from_endpoint` is the sender's **reply endpoint** (first endpoint they registered), tracked in `REPLY_ENDPOINT` since Phase 4b — fixes a pre-existing bug where `from = pid_slot` caused replies to land on the wrong queue
 - **ObjPut**: Store CambiObject with caller as author/owner, returns 32-byte content hash
 - **ObjGet**: Retrieve object content by hash
 - **ObjDelete**: Delete object (ownership enforced — only owner can delete)
@@ -429,9 +472,9 @@ const CACHE_CAPACITY: usize = 32;
 
 When you add a new bound or change one, update the matching table in [ASSUMPTIONS.md](ASSUMPTIONS.md) in the same change. Step 8 of the Post-Change Review Protocol lists this as an explicit checklist item.
 
-## Multi-Platform Strategy (x86_64, AArch64, RISC-V planned)
+## Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 
-CambiOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The architecture abstraction is in place:
+CambiOS runs on **x86_64** and **AArch64** today, with **riscv64gc** in progress (Phase R-0 build infrastructure done; Phase R-1+ implements the arch backend per [ADR-013](docs/adr/013-riscv64-architecture-support.md)). The architecture abstraction is in place:
 
 ### Current Portability Boundary
 - `src/arch/mod.rs` — cfg-gated shim that re-exports the active backend
@@ -443,29 +486,35 @@ CambiOS runs on **x86_64** and **AArch64** today, with **RISC-V** planned. The a
 - `src/memory/buddy_allocator.rs`, `frame_allocator.rs` — portable (address-space agnostic)
 
 ### Arch-Specific Parity Status
-| x86_64 Module | Responsibility | AArch64 Status |
-|---|---|---|
-| `arch/x86_64/gdt.rs` | GDT + TSS + segment selectors | Done — `arch/aarch64/mod.rs::gdt` shim (EL1/EL0 config, `set_kernel_stack` via TPIDR_EL1) |
-| `arch/x86_64/syscall.rs` | SYSCALL/SYSRET via MSRs | Done — SVC instruction + ESR_EL1 routing in `sync_el0_stub` |
-| `arch/x86_64/mod.rs` | SavedContext, context_switch, timer ISR, yield_save_and_switch | Done — full assembly: context_save/restore/switch, timer_isr_stub, yield_save_and_switch + yield_inner |
-| `interrupts/mod.rs` | x86 IDT setup | Done — AArch64 exception vector table at VBAR_EL1 |
-| `arch/x86_64/apic.rs` | Local APIC timer + PIC disable + IPI | Done — GICv3 (gic.rs) + ARM Generic Timer (timer.rs) |
-| `arch/x86_64/tlb.rs` | TLB shootdown via IPI | Done — TLBI broadcast instructions (tlb.rs) |
-| `interrupts/pic.rs` | 8259 PIC (disabled, legacy) | N/A (no legacy PIC on ARM) |
-| `interrupts/pit.rs` | 8254 PIT (calibration only) | N/A (ARM Generic Timer is direct, no calibration needed) |
-| `memory/paging.rs` | x86_64 4-level page tables | Done — AArch64 4-level page tables in `memory/mod.rs` |
-| `io/mod.rs` | uart_16550 (x86 port I/O) | Done — PL011 UART (MMIO) |
-| `platform/mod.rs` | CR4 feature detection | Done — MIDR_EL1 CPU identification, arch-specific features |
-| `arch/x86_64/ioapic.rs` | I/O APIC device IRQ routing | **Gap** — GIC SPI enable exists but not wired into boot path |
-| `arch/x86_64/percpu.rs` | Per-CPU data via GS base | Done — `arch/aarch64/percpu.rs` via TPIDR_EL1 |
+| x86_64 Module | Responsibility | AArch64 Status | RISC-V Status |
+|---|---|---|---|
+| `arch/x86_64/gdt.rs` | GDT + TSS + segment selectors | Done — `arch/aarch64/mod.rs::gdt` shim (EL1/EL0 config, `set_kernel_stack` via TPIDR_EL1) | Phase R-3 — `gdt` shim (no segments; `set_kernel_stack` via PerCpu through `tp` register) |
+| `arch/x86_64/syscall.rs` | SYSCALL/SYSRET via MSRs | Done — SVC instruction + ESR_EL1 routing in `sync_el0_stub` | Phase R-3/R-4 — `ecall` instruction + `scause==8` dispatch in unified trap handler; `stvec` install |
+| `arch/x86_64/mod.rs` | SavedContext, context_switch, timer ISR, yield_save_and_switch | Done — full assembly: context_save/restore/switch, timer_isr_stub, yield_save_and_switch + yield_inner | Phase R-3 — single trap vector at `stvec`, `scause`-dispatched, sscratch/tp swap on U→S, callee-saved context_switch |
+| `interrupts/mod.rs` | x86 IDT setup | Done — AArch64 exception vector table at VBAR_EL1 | Phase R-3 — single S-mode trap vector at `stvec`, scause-dispatched |
+| `arch/x86_64/apic.rs` | Local APIC timer + PIC disable + IPI | Done — GICv3 (gic.rs) + ARM Generic Timer (timer.rs) | Phase R-3 — SBI `sbi_set_timer` (no chip driver); SBI `sbi_send_ipi` for IPI |
+| `arch/x86_64/tlb.rs` | TLB shootdown via IPI | Done — TLBI broadcast instructions (tlb.rs) | Phase R-3 (local) / Phase R-5 (remote) — `sfence.vma` local; SBI IPI + remote `sfence.vma` (or Svinval `sinval.vma` if available) |
+| `interrupts/pic.rs` | 8259 PIC (disabled, legacy) | N/A (no legacy PIC on ARM) | N/A |
+| `interrupts/pit.rs` | 8254 PIT (calibration only) | N/A (ARM Generic Timer is direct, no calibration needed) | N/A (timer base frequency comes from DTB `/cpus/timebase-frequency`) |
+| `memory/paging.rs` | x86_64 4-level page tables | Done — AArch64 4-level page tables in `memory/mod.rs` | Phase R-2 — Sv48 4-level page tables in shared `memory/mod.rs` paging module (already `#[cfg(not(target_arch = "x86_64"))]` — auto-includes RISC-V; only PTE bit constants differ from AArch64 descriptors) |
+| `io/mod.rs` | uart_16550 (x86 port I/O) | Done — PL011 UART (MMIO) | Phase R-1 — NS16550 UART (MMIO at `0x10000000` on QEMU virt; address discovered from DTB on real hardware) |
+| `platform/mod.rs` | CR4 feature detection | Done — MIDR_EL1 CPU identification, arch-specific features | Phase R-4 — `misa` CSR for ISA extensions; CPU info from DTB (most M-mode IDs are not S-mode-readable) |
+| `arch/x86_64/ioapic.rs` | I/O APIC device IRQ routing | **Gap** — GIC SPI enable exists but not wired into boot path | Phase R-3 — PLIC driver (`arch/riscv64/plic.rs`); `claim()`/`complete()` in trap handler when `scause` indicates external interrupt |
+| `arch/x86_64/percpu.rs` | Per-CPU data via GS base | Done — `arch/aarch64/percpu.rs` via TPIDR_EL1 | Phase R-1 — `arch/riscv64/percpu.rs` via `tp` register; `csrrw tp, sscratch, tp` swap on trap entry (analogous to x86 swapgs) |
+| **boot adapter** | `boot::limine::populate()` (x86_64 + AArch64) | Same Limine adapter | Phase R-1 — `boot::riscv::populate(dtb_phys)` reads DTB, populates BootInfo, no Limine |
 
 ### Rules for New Code
 - **Never put arch-specific code in portable modules.** If it touches registers, instructions, or hardware directly, it goes under `src/arch/<target>/`.
 - **New arch backends must match the public API** defined by `src/arch/x86_64/mod.rs`: `SavedContext`, `context_switch()`, `timer_isr_inner()`, etc.
 - **The AArch64 target triple is `aarch64-unknown-none`** with `linker-aarch64.ld` (`elf64-littleaarch64`).
+- **The RISC-V target triple is `riscv64gc-unknown-none-elf`** with `linker-riscv64.ld` (`elf64-littleriscv`). Code model must be `medium` — `medlow` cannot reach the higher-half kernel.
 - **Keep the interrupt subsystem portable where possible.** `interrupts/routing.rs` is already arch-independent. The PIC/PIT modules should move under `arch/x86_64/` eventually.
-- **Bootloader:** Limine 8.7.0 supports AArch64 UEFI. Same boot protocol, same request statics. AArch64 uses FAT disk image (not ISO) for QEMU boot.
+- **Bootloader:**
+  - x86_64 / AArch64 — Limine 8.7.0 (UEFI on both, plus BIOS on x86_64).
+  - RISC-V — OpenSBI in M-mode (ships with QEMU as `-bios default`) hands a DTB pointer to a custom S-mode boot stub. No Limine on RISC-V (Limine does not support it). See [ADR-013](docs/adr/013-riscv64-architecture-support.md).
 - **AArch64 MMIO must be explicitly mapped.** Limine's HHDM on AArch64 only covers RAM. Device MMIO (PL011, GIC) must be mapped into TTBR1 via `early_map_mmio()` at early boot.
+- **RISC-V follows generic-first, never board-specific.** Use RISC-V standards (SBI, DTB, PLIC, CLINT, virtio-mmio); discover MMIO addresses from the DTB. No vendor-specific code paths in the core arch backend ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Strategic Posture).
+- **Three-architecture cfg discipline.** Prefer `#[cfg(not(target_arch = "x86_64"))]` when AArch64 + RISC-V share behavior (e.g., the shared paging module). Use positive cfgs for all three only when behavior diverges. When a 3-way cfg block emerges in inline code, factor a portable `arch::` helper instead of carrying three inline arms.
 
 ## Platform Gotchas
 
@@ -477,6 +526,28 @@ These are persistent platform/bootloader quirks that any new code in the boot or
 - **AArch64 QEMU requires GICv3.** Must use `-machine virt,gic-version=3` because the GIC driver uses ICC system registers (GICv3). Default GICv2 causes Undefined Instruction on `mrs ICC_SRE_EL1`.
 - **ELF loader doesn't merge overlapping segment permissions.** If two PT_LOAD segments share a page with different permissions (e.g., .text RX and .got RW), the first segment's permissions are used. User-space linker scripts work around this with `ALIGN(4096)` before `.data`. Loader fix is tracked in [STATUS.md](STATUS.md).
 - **`SYS_WAIT_IRQ` unregistered-IRQ wake fallback.** Registered device IRQs use targeted single-CPU wake via `TASK_CPU_MAP`. Unregistered IRQs fall back to all-CPU scan with `try_lock()` — if SCHEDULER lock is contended, wake is deferred to the next timer tick. Acceptable; not a bug.
+
+## Common Failure Signatures
+
+Map the error string or symptom you actually observe back to the likely root cause. These pairings exist because the symptom rarely names the invariant it violated — a compiler error or a silent QEMU hang says nothing about "lock ordering" or "HHDM gap."
+
+- **`error[E0152]: found duplicate lang item 'panic_impl'`** → a crate in the dependency tree pulled in `std`. Kernel and userspace modules are both `no_std`; most commonly triggered when a new dependency's default features include `std`. Disable default features on the offender and pick only `no_std`-compatible flags.
+
+- **`link error: undefined reference to 'memcpy'` / `memset` / `memmove`** → new crate missing the `compiler_builtins` `mem` feature, or kernel linker flags lost `-C link-arg=--no-undefined`. Cross-check the failing module's `Cargo.toml` against a working sibling (`user/fs-service`, `user/shell`).
+
+- **QEMU reboots / triple-faults immediately after "booting kernel…"** → IDT not installed yet (any exception before `interrupts::init()` is a triple fault), or the double-fault handler faulted because IST1 isn't pointing at valid memory. Check the boot sequence in [src/microkernel/main.rs](src/microkernel/main.rs) for ordering regressions.
+
+- **AArch64 "Undefined Instruction" exception at `mrs ICC_SRE_EL1`** → QEMU running default GICv2. Must use `-machine virt,gic-version=3`. (Duplicates a Platform Gotcha intentionally — this error text should resolve to its cause from either direction.)
+
+- **Kernel panic "allocation failed" / `GlobalAlloc::alloc` returns null in early boot** → attempted `Box::new` / `Vec::new` before `memory::init()` ran. Move the allocation after init, or pre-allocate a static. The `debug_assert!` at the top of [src/memory/heap.rs](src/memory/heap.rs) will name this directly in debug builds.
+
+- **`#PF` in kernel with CR2 = user vaddr during a syscall** → the user pointer belongs to a process whose page tables aren't currently loaded in CR3 (e.g., kernel reading a peer's channel buffer while in a third process's context). Use the page-walk helpers in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs) rather than dereferencing user pointers directly. *Note: this codebase does not enable SMAP, so `stac`/`clac` is not the cause — don't go looking for it.*
+
+- **QEMU output stops mid-run with no panic, no reboot, no further timer ticks** → a silent hang. Locate the last thing that printed and check the code path immediately after it:
+  - *Touched a lock used from an ISR?* → it must use `try_lock()`, not `lock()`. A blocking ISR lock deadlocks the CPU.
+  - *Touched lock ordering?* → re-check the [Lock Ordering](#lock-ordering-must-be-followed-to-prevent-deadlock) hierarchy. Acquiring a lower-numbered lock while holding a higher-numbered one freezes the CPU that hits the violation. No runtime "deadlock detected" message is printed — silence *is* the diagnostic.
+  - *Touched the timer ISR?* → missing APIC EOI (`apic::write_eoi()`) or GIC EOI means no further timer interrupts fire.
+  - *Touched yield / context switch?* → a lock held across `yield_save_and_switch` freezes the next task to try to acquire it.
 
 ## Roadmap
 
@@ -500,7 +571,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Persistent ObjectStore / on-disk format / BlockDevice** | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) | `src/fs/block.rs`, `src/fs/disk.rs`; [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) for the `CambiObject` model the format serializes |
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
 | **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
-| **Architecture port (RISC-V, etc.)** | This file's "Multi-Platform Strategy" section | `src/arch/x86_64/mod.rs` and `src/arch/aarch64/mod.rs` as the public API to match |
+| **Architecture port (RISC-V — in progress, future archs)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), this file's "Multi-Platform Strategy" section, plan file at `/Users/jasonricca/.claude/plans/melodic-tumbling-muffin.md` | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
 | **Graphics / compositor / GUI / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channels are the surface-buffer transport); graphics stack itself is not built yet (see ADR-011 phased plan) |
 | **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) (Principals and load-bearing identity — signed input devices participate in this model). No code yet; the wire format is the first thing to land when the first input driver ships. |
 | **Security review / threat model** | [SECURITY.md](SECURITY.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](PHILOSOPHY.md) | All ADRs |
@@ -518,7 +589,7 @@ These documents capture architectural decisions that implementation must align w
 - **[SECURITY.md](SECURITY.md)** — Security posture, enforcement table, threat model.
 - **[ASSUMPTIONS.md](ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
 - **[GOVERNANCE.md](GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
-- **[docs/adr/](docs/adr/)** — Architecture decision records (ADRs 000-012). Read the ones in the Required Reading map for the subsystem you're touching.
+- **[docs/adr/](docs/adr/)** — Architecture decision records. Read the ones in the Required Reading map for the subsystem you're touching. (Run `ls docs/adr/` for the current set; do not cite a range here — it drifts.)
 
 Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
 
@@ -528,11 +599,20 @@ Any work on identity, storage, filesystem, IPC architecture, capabilities, polic
 - Explicit state tracking via enums (TaskState, etc.)
 - Error handling via Result types throughout
 - BuddyAllocator is pure bookkeeping (address-space agnostic) for testability
-- 447 unit tests run on host macOS target (`x86_64-apple-darwin`), including 12 portable AArch64 logic tests, 50 identity/ObjectStore/crypto tests, 7 signed ELF verifier tests, 1 PerCpu field offset test, 11 capability revocation tests (Phase 3.1), 16 tier configuration tests + 5 kernel object table region tests (Phase 3.2a), 7 BuddyAllocator reserved-prefix tests (Phase 3.2a SLOT_OVERHEAD shrink), 7 system capability (CreateProcess) tests (Phase 3.2b), 7 ProcessId generation counter tests (Phase 3.2c), 44 audit infrastructure tests (Phase 3.3: 14 staging buffer + 18 event types + 12 ring/drain), 4 identity gate tests (exempt set validation, coverage, minimality), 2 ceiling tests (Phase GUI-0 bounds bump: channel at MAX_CHANNEL_PAGES, allocate_contiguous at HEAP_PAGES), 8 BootInfo abstraction tests (Phase GUI-0 bootloader abstraction: empty/push/full/kind labels/size accounting), plus Phase 4a.i DiskObjectStore + block device coverage
+- Unit tests run on host macOS target (`x86_64-apple-darwin`). Current count is derived — run `make stats` or `make test`. Test categories span: portable AArch64 logic, identity/ObjectStore/crypto, signed ELF verifier, capability revocation, tier configuration + kernel object tables, BuddyAllocator reserved-prefix, system capabilities, ProcessId generation counters, audit infrastructure (staging + event types + ring/drain), identity gate (exempt set validation + coverage + minimality), ceiling bounds, BootInfo abstraction, DiskObjectStore + block device. [STATUS.md](STATUS.md) tracks per-subsystem coverage notes.
 
 ## Post-Change Review Protocol
 
 After any code change, run through this checklist systematically before considering the change complete.
+
+### Scope triage (do this first)
+
+Running the full 8-step protocol on a typo fix produces fatigue that gets paid in skipped steps later. Decide which tier applies before you start:
+
+- **Small change** — typo, comment prose, whitespace, unused-import removal, local variable rename, STATUS.md note, or documentation-only edit that doesn't touch invariants. Run only **§1 (Build Verification)** and **§8 (Documentation Sync)**. Skip §2–§7.
+- **Subsystem change** — anything that touches a module's public API, an `unsafe` block, the lock hierarchy, the syscall ABI, the boot path, a kernel invariant, a cross-cutting concern, or an ADR-worthy decision. Run the **full protocol §1–§8, in order**. This tier is where drift becomes load-bearing.
+
+**When unsure, run the full protocol.** Over-auditing a small change costs minutes; under-auditing a subsystem change costs a deadlock the next maintainer has to debug. If the Stop-and-Ask Gate fired during planning, this is automatically a subsystem change.
 
 ### 1. Build Verification
 ```bash
@@ -570,14 +650,11 @@ All builds and clippy must pass with zero errors. Do not skip any step.
 - No raw pointer dereference without a bounds or null check nearby
 
 ### 3. Lock Ordering
-Verify no change introduces a lock ordering violation:
-```
-SCHEDULER(1) → TIMER(2) → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7) → OBJECT_STORE(8)
-```
+Verify no change introduces a lock ordering violation against the canonical hierarchy in the [Lock Ordering](#lock-ordering-must-be-followed-to-prevent-deadlock) section above. **Do not duplicate the hierarchy here** — it drifted once and will drift again. Checklist:
 - Lower-numbered locks must be acquired before higher-numbered ones
 - `try_lock()` in ISR context is acceptable (already established pattern)
 - Holding multiple locks simultaneously requires explicit justification
+- If you are *adding or reordering a lock*, trip the Stop-and-Ask gate before editing — lock hierarchy changes are cross-subsystem and formally relevant
 
 ### 4. Architecture Portability
 - New x86-specific code is behind `#[cfg(target_arch = "x86_64")]`
@@ -607,7 +684,7 @@ Docs in this repo are categorized by how they relate to the code, and that deter
 | Category | Files | Auto-refresh? | Rule |
 |---|---|---|---|
 | **implementation_reference** | [STATUS.md](STATUS.md), [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ASSUMPTIONS.md](ASSUMPTIONS.md), and any `*.md` colocated with code that documents *current* implementation | **Yes** | If your change moves a subsystem's status (built/in-progress/planned), test count, known issue, implementation detail, or numeric bound, update the matching doc *in the same change*. Set `last_synced_to_code:` in the frontmatter to today's date. |
-| **decision_record** | [docs/adr/](docs/adr/) (ADRs 000-012) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
+| **decision_record** | [docs/adr/](docs/adr/) | **Append-only divergence** | The original decision text is immutable history — never rewrite it. If a decision is wrong or superseded, write a new ADR that supersedes it. However, when implementation diverges from the plan described in an ADR (deferred work, changed approach, new information), append a **`## Divergence`** section at the end of the ADR documenting *what* changed and *why*. This keeps the original reasoning intact while ensuring the ADR doesn't silently become fiction. ADRs must NOT contain status info ("X tests passing", "currently implemented in Y") — that drifts. They can name files and structs as a starting point, but never as a current-state claim. |
 | **design / source_of_truth** | [CambiOS.md](CambiOS.md), [identity.md](identity.md), [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md), [win-compat.md](win-compat.md), [PHILOSOPHY.md](PHILOSOPHY.md), [SECURITY.md](SECURITY.md), [GOVERNANCE.md](GOVERNANCE.md) | **No** — human only | These describe intent and design, not current state. If implementation reveals a design problem, propose the change to the user; don't silently rewrite. They link to STATUS.md for the implementation status of any phase or feature. |
 | **index** | [README.md](README.md), [CLAUDE.md](CLAUDE.md) (this file) | **Light touch** | Update only when the structure changes (new doc, new ADR, new build command, new lock in the hierarchy). Status info goes in STATUS.md, not here. |
 

@@ -74,7 +74,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -239,7 +239,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo limine
+iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -247,24 +247,18 @@ iso: kernel user-elf fs-service key-store-service virtio-net virtio-blk i219-net
 	mkdir -p iso_root/EFI/BOOT
 	# Copy kernel binary
 	cp $(KERNEL) iso_root/boot/cambios_microkernel
-	# Copy user-space ELF modules
-	cp $(USER_ELF) iso_root/boot/hello.elf
+	# Copy + sign boot modules (must match limine.conf module order)
+	cp $(POLICY_SERVICE_ELF) iso_root/boot/policy-service.elf
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
-	# virtio-net, i219-net, udp-stack disabled in limine.conf — scaffolded
-	# drivers hang in PCI discovery. Binaries still build via iso: deps
-	# but aren't loaded. Re-enable when the drivers are fully formed.
 	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
-	cp $(POLICY_SERVICE_ELF) iso_root/boot/policy-service.elf
 	cp $(FB_DEMO_ELF) iso_root/boot/fb-demo.elf
-	# Sign all modules (single invocation avoids repeated card contention)
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fb-demo.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
@@ -510,6 +504,27 @@ verify-usb:
 test:
 	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
+# =============================================================================
+# make stats — derive canonical counts from source code.
+#
+# CLAUDE.md and STATUS.md must not hardcode these numbers; they drift
+# silently and become load-bearing lies. Run this target when a count
+# actually matters. Intentionally cheap (no full build required for
+# syscall/LOC counts; test count uses `--list` which only needs compiled
+# test binaries).
+# =============================================================================
+.PHONY: stats
+stats:
+	@echo "=== CambiOS stats (derived from source) ==="
+	@printf "Syscalls:        "
+	@sed -n '/^pub enum SyscallNumber/,/^}/p' src/syscalls/mod.rs | grep -Ec '^[[:space:]]+[A-Z][A-Za-z]+ = [0-9]+,'
+	@printf "Kernel .rs:      "
+	@find src -name '*.rs' | wc -l | tr -d ' '
+	@printf "Userspace .rs:   "
+	@find user -name '*.rs' -not -path '*/target/*' | wc -l | tr -d ' '
+	@printf "Tests (lib):     "
+	@RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin -- --list 2>/dev/null | awk '/^[0-9]+ tests?,/ {print $$1; found=1; exit} END {if (!found) print "(build first: make test)"}'
+
 # Generate machine-readable symbol index for AI-assisted development.
 # Output: .symbols (gitignored). Read by Claude Code at session start
 # to avoid repeated grep calls for symbol locations and line numbers.
@@ -524,7 +539,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 shell-aarch64 policy-service-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -535,32 +550,23 @@ img-aarch64: kernel-aarch64 user-elf-aarch64 fs-service-aarch64 key-store-servic
 	mmd -i $(IMG_AARCH64) ::/boot/limine
 	mcopy -i $(IMG_AARCH64) $(LIMINE_DIR)/BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
 	mcopy -i $(IMG_AARCH64) $(KERNEL_AARCH64) ::/boot/cambios_microkernel
-	# Copy + sign all AArch64 user-space modules
-	cp $(USER_ELF_AARCH64) /tmp/hello-signed.elf
+	# Copy + sign AArch64 boot modules (must match limine.conf module order)
+	cp $(POLICY_SERVICE_ELF_AARCH64) /tmp/policy-service-signed.elf
 	cp $(KS_SERVICE_ELF_AARCH64) /tmp/key-store-service-signed.elf
 	cp $(FS_SERVICE_ELF_AARCH64) /tmp/fs-service-signed.elf
-	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
-	cp $(I219_DRIVER_ELF_AARCH64) /tmp/i219-net-signed.elf
-	cp $(UDP_STACK_ELF_AARCH64) /tmp/udp-stack-signed.elf
+	cp $(BLK_DRIVER_ELF_AARCH64) /tmp/virtio-blk-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
-	cp $(POLICY_SERVICE_ELF_AARCH64) /tmp/policy-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/i219-net-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
-	mcopy -i $(IMG_AARCH64) /tmp/hello-signed.elf ::/boot/hello.elf
+	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
-	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
-	mcopy -i $(IMG_AARCH64) /tmp/i219-net-signed.elf ::/boot/i219-net.elf
-	mcopy -i $(IMG_AARCH64) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
+	mcopy -i $(IMG_AARCH64) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
-	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/policy-service-signed.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
@@ -576,6 +582,74 @@ run-aarch64: img-aarch64
 		-no-reboot \
 		-bios $(EFI_FW_AARCH64) \
 		-drive file=$(IMG_AARCH64),format=raw
+
+# ---------------------------------------------------------------------------
+# RISC-V (riscv64gc) targets — Phase R-N (see docs/adr/013, plan file)
+#
+# Bootloader model: OpenSBI (M-mode) ships with QEMU via `-bios default`
+# and hands control to our kernel in S-mode. The kernel's S-mode boot
+# stub (src/boot/riscv.rs — Phase R-1) parses the DTB that OpenSBI
+# passes in a1 and populates BootInfo. No Limine on RISC-V.
+#
+# Per the approved plan, hardware is TBD (CambiOS-designed); development
+# target is QEMU `-machine virt` as the canonical standards-compliant
+# RISC-V machine (NS16550 UART at 0x10000000, PLIC, CLINT, virtio-mmio).
+# ---------------------------------------------------------------------------
+KERNEL_RISCV64 := target/riscv64gc-unknown-none-elf/release/cambios_microkernel
+
+kernel-riscv64:
+	cargo build --target riscv64gc-unknown-none-elf --release
+
+# Phase R-1+: will boot to serial. Currently a scaffold — no boot stub yet.
+# `-kernel <elf>` tells QEMU to load our ELF as an OpenSBI payload;
+# OpenSBI then jumps to our entry point in S-mode.
+run-riscv64: kernel-riscv64
+	qemu-system-riscv64 \
+		-machine virt \
+		-cpu rv64 \
+		-smp 2 \
+		-m 4G \
+		-serial mon:stdio \
+		-display none \
+		-no-reboot \
+		-bios default \
+		-kernel $(KERNEL_RISCV64)
+
+# ---------------------------------------------------------------------------
+# Tri-architecture regression gate. Any commit that breaks any arch is
+# blocked. Tracks ADR-013's "Tri-Architecture Regression Discipline".
+#
+# Two gates exist:
+#
+#   - check-stable: x86_64 + aarch64 only. Use this during Phases R-1
+#     through R-6 of the RISC-V port, when the riscv64 backend is
+#     under construction and not expected to build between phase
+#     boundaries. Every commit during the RISC-V buildup must pass
+#     check-stable.
+#
+#   - check-all: all three including riscv64. Use this once a RISC-V
+#     phase milestone has restored the backend to a buildable state,
+#     and as the permanent gate after Phase R-6 lands. Every commit
+#     post-R-6 must pass check-all.
+#
+# The discipline is the same either way — no commits that regress any
+# *currently buildable* architecture. The two gates exist only because
+# the riscv64 backend is mid-construction.
+# ---------------------------------------------------------------------------
+check-all: check-x86 check-aarch64 check-riscv64
+	@echo "=== All three architectures build cleanly ==="
+
+check-stable: check-x86 check-aarch64
+	@echo "=== x86_64 + aarch64 build cleanly (RISC-V intentionally excluded — see Makefile comment) ==="
+
+check-x86:
+	cargo build --target x86_64-unknown-none --release
+
+check-aarch64:
+	cargo build --target aarch64-unknown-none --release
+
+check-riscv64:
+	cargo build --target riscv64gc-unknown-none-elf --release
 
 clean:
 	cargo clean

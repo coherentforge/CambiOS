@@ -156,6 +156,27 @@ pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
     &PER_CPU_TIMER[cpu_id]
 }
 
+/// Get the current hart's scheduler lock (RISC-V).
+///
+/// # Safety
+/// `tp` register must have been initialized via `percpu::init_bsp` or
+/// `percpu::init_ap`. True after the S-mode boot stub (Phase R-1)
+/// runs.
+#[cfg(target_arch = "riscv64")]
+pub fn local_scheduler() -> &'static IrqSpinlock<Option<Box<Scheduler>>> {
+    // SAFETY: `tp` points at a valid PerCpu after boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_SCHEDULER[cpu_id]
+}
+
+/// Get the current hart's timer lock (RISC-V).
+#[cfg(target_arch = "riscv64")]
+pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
+    // SAFETY: `tp` initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_TIMER[cpu_id]
+}
+
 // ============================================================================
 // Global task → CPU mapping (lock-free via atomics)
 // ============================================================================
@@ -528,6 +549,21 @@ pub static BOOT_MODULE_REGISTRY: Spinlock<boot_modules::BootModuleRegistry> =
 pub static BOOT_MODULE_ORDER: Spinlock<boot_modules::BootModuleOrder> =
     Spinlock::new(boot_modules::BootModuleOrder::new());
 
+/// Per-process reply-endpoint registry. Indexed by `ProcessId::slot()`.
+/// Stores the first endpoint the process registered via `SYS_REGISTER_ENDPOINT`
+/// — this becomes the `from` field of messages the process sends, so that
+/// receivers can `sys::write(msg.from_endpoint(), reply)` back to a queue
+/// the sender is actually listening on.
+///
+/// A zero value means "not yet registered" — handle_write falls back to
+/// the process slot number in that case (same as before this registry
+/// existed, so old paths degrade gracefully).
+///
+/// SCAFFOLDING: fixed-size `[AtomicU32; 256]`. Why: matches scheduler's
+/// `MAX_TASKS = 256`. Replace when: process/task slot model changes.
+pub static REPLY_ENDPOINT: [core::sync::atomic::AtomicU32; 256] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 256];
+
 // ============================================================================
 // Policy service infrastructure (Phase 3.4, ADR-006)
 // ============================================================================
@@ -579,6 +615,14 @@ pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
 pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
     // SAFETY: TPIDR_EL1 initialized at boot; cpu_id is a pure read.
     let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_FRAME_CACHE[cpu_id]
+}
+
+/// Get the current hart's frame cache lock (RISC-V).
+#[cfg(target_arch = "riscv64")]
+pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
+    // SAFETY: `tp` initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
     &PER_CPU_FRAME_CACHE[cpu_id]
 }
 
@@ -714,13 +758,22 @@ pub fn halt() -> ! {
     // Subsequent WFI will sleep forever.
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
 
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: `csrci sstatus, 2` clears SIE (S-mode interrupt enable).
+    // With SIE clear, no S-mode interrupt is delivered; subsequent WFI
+    // sleeps until an NMI-equivalent, which CambiOS never uses — permanent stop.
+    unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)); }
+
     loop {
         #[cfg(target_arch = "x86_64")]
         hlt();
         #[cfg(target_arch = "aarch64")]
         // SAFETY: WFI with all exceptions masked — permanent halt.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: WFI with SIE cleared — permanent halt on this hart.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
         core::hint::spin_loop();
     }
 }
@@ -733,6 +786,16 @@ pub fn halt() -> ! {
 #[inline(always)]
 pub fn wfi() {
     // SAFETY: WFI is always safe at EL1.
+    unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+}
+
+/// Wait for interrupt (RISC-V — same semantics as AArch64 WFI).
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub fn wfi() {
+    // SAFETY: WFI is always safe from S-mode. It hints the hart to
+    // sleep until an enabled interrupt is pending; behaves like nop
+    // if no interrupt is ever delivered.
     unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
 }
 

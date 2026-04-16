@@ -253,6 +253,7 @@ impl SyscallDispatcher {
             SyscallNumber::BindPrincipal => Self::handle_bind_principal(args, &ctx),
             SyscallNumber::GetPrincipal => Self::handle_get_principal(args, &ctx),
             SyscallNumber::RecvMsg => Self::handle_recv_msg(args, &ctx),
+            SyscallNumber::TryRecvMsg => Self::handle_try_recv_msg(args, &ctx),
             SyscallNumber::ObjPut => Self::handle_obj_put(args, &ctx),
             SyscallNumber::ObjGet => Self::handle_obj_get(args, &ctx),
             SyscallNumber::ObjDelete => Self::handle_obj_delete(args, &ctx),
@@ -526,10 +527,20 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Build IPC message
+        // Build IPC message. `from` is the sender's reply endpoint (the
+        // first endpoint they registered), so receivers can route replies
+        // via `msg.from_endpoint()`. Falls back to the process slot if
+        // the sender has never registered an endpoint.
         let endpoint = crate::ipc::EndpointId(endpoint_id);
+        let slot = ctx.process_id.slot() as usize;
+        let reply_ep = if slot < crate::REPLY_ENDPOINT.len() {
+            crate::REPLY_ENDPOINT[slot].load(core::sync::atomic::Ordering::Acquire)
+        } else {
+            0
+        };
+        let from_ep = if reply_ep != 0 { reply_ep } else { ctx.process_id.slot() };
         let mut msg = crate::ipc::Message::new(
-            crate::ipc::EndpointId(ctx.process_id.slot()),
+            crate::ipc::EndpointId(from_ep),
             endpoint,
         );
         if msg.set_payload(&kbuf[..len]).is_err() {
@@ -674,6 +685,20 @@ impl SyscallDispatcher {
         crate::audit::emit(crate::audit::RawAuditEvent::capability_granted(
             ctx.process_id, ctx.process_id, endpoint, 0x0F, crate::audit::now(), 0,
         ));
+
+        // Record the first-registered endpoint as this process's reply
+        // endpoint. Subsequent register_endpoint calls do not overwrite
+        // it — the first one wins. Receivers use msg.from_endpoint() to
+        // route replies back to a queue the sender actually listens on.
+        let slot = ctx.process_id.slot() as usize;
+        if slot < crate::REPLY_ENDPOINT.len() {
+            let _ = crate::REPLY_ENDPOINT[slot].compare_exchange(
+                0,
+                endpoint_id,
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         Ok(0)
     }
@@ -1142,6 +1167,71 @@ impl SyscallDispatcher {
         }
     }
 
+    /// SYS_TRY_RECV_MSG (37): non-blocking variant of RecvMsg.
+    ///
+    /// Returns the bytes written on success (≥36 = 32-byte principal +
+    /// 4-byte from-endpoint + payload), or 0 if the queue is empty.
+    /// Does NOT block — services that poll multiple endpoints use this
+    /// to avoid parking on one endpoint while another has a wake-up
+    /// ready (virtio-blk: ep24 user, ep26 kernel).
+    ///
+    /// This mirrors `handle_recv_msg` but with the block-and-yield
+    /// tail replaced by a bare `Ok(0)` return. Keep the two in sync if
+    /// the header format or capability check changes.
+    fn handle_try_recv_msg(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let endpoint_id = args.arg1_u32();
+        let user_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        if buf_len < 36 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let endpoint = crate::ipc::EndpointId(endpoint_id);
+
+        // Lock ordering matches handle_recv_msg: IPC_MANAGER(3) → CAPABILITY_MANAGER(4)
+        let msg = {
+            let mut ipc_guard = crate::IPC_MANAGER.lock();
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+
+            let ipc_mgr = ipc_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+
+            ipc_mgr
+                .recv_message_with_capability(ctx.process_id, endpoint, cap_mgr)
+                .map_err(|_| SyscallError::PermissionDenied)?
+        };
+
+        // Virtio-blk kernel-command endpoint (same special case as handle_recv_msg)
+        const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
+        let msg = if endpoint_id == BLK_KERNEL_CMD_ENDPOINT {
+            msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
+        } else {
+            msg
+        };
+
+        if let Some(msg) = msg {
+            let payload = msg.payload();
+            let payload_len = core::cmp::min(payload.len(), buf_len - 36);
+
+            let mut header = [0u8; 36];
+            if let Some(principal) = msg.sender_principal {
+                header[0..32].copy_from_slice(&principal.public_key);
+            }
+            header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
+
+            write_user_buffer(ctx.cr3, user_buf, &header)?;
+            if payload_len > 0 {
+                write_user_buffer(ctx.cr3, user_buf + 36, &payload[..payload_len])?;
+            }
+
+            Ok((36 + payload_len) as u64)
+        } else {
+            // Non-blocking: caller polls and decides what to do.
+            Ok(0)
+        }
+    }
+
     // ========================================================================
     // ObjectStore syscalls
     // ========================================================================
@@ -1155,6 +1245,9 @@ impl SyscallDispatcher {
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential, not nested.
     fn handle_obj_put(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        // Ensure disk store is initialized (handshake outside lock).
+        crate::fs::lazy_disk::ensure_disk_store();
+
         let content_ptr = args.arg1;
         let content_len = args.arg_usize(2);
         let out_hash = args.arg3;
@@ -1215,6 +1308,8 @@ impl SyscallDispatcher {
     ///
     /// Lock ordering: OBJECT_STORE(9) only.
     fn handle_obj_get(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        crate::fs::lazy_disk::ensure_disk_store();
+
         let hash_ptr = args.arg1;
         let out_buf = args.arg2;
         let out_buf_len = args.arg_usize(3);
@@ -1266,6 +1361,8 @@ impl SyscallDispatcher {
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential.
     fn handle_obj_delete(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        crate::fs::lazy_disk::ensure_disk_store();
+
         let hash_ptr = args.arg1;
 
         if ctx.cr3 == 0 {
@@ -1303,6 +1400,8 @@ impl SyscallDispatcher {
     ///
     /// Lock ordering: OBJECT_STORE(9) only.
     fn handle_obj_list(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        crate::fs::lazy_disk::ensure_disk_store();
+
         let out_buf = args.arg1;
         let out_buf_len = args.arg_usize(2);
 
@@ -1385,6 +1484,8 @@ impl SyscallDispatcher {
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential.
     fn handle_obj_put_signed(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        crate::fs::lazy_disk::ensure_disk_store();
+
         let content_ptr = args.arg1;
         let content_len = args.arg_usize(2);
         let sig_ptr = args.arg3;
@@ -2029,6 +2130,9 @@ impl SyscallDispatcher {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: TPIDR_EL1 base is valid after percpu_init; pure read from per-CPU data.
             { unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } }
+            #[cfg(target_arch = "riscv64")]
+            // SAFETY: tp is valid after percpu_init; pure read from per-CPU data.
+            { unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() } }
         };
         crate::set_task_cpu(new_task_id.0, cpu_id as u16);
 

@@ -514,6 +514,114 @@ unsafe extern "C" fn kmain() -> ! {
 }
 
 // ============================================================================
+// RISC-V kmain — separate entry from kmain() above (which expects Limine).
+//
+// `_start` (in src/arch/riscv64/entry.rs) calls this with the hart id
+// and DTB physical address that OpenSBI passed in registers a0/a1.
+// Phase R-1 keeps this minimal: install an empty BootInfo, bring up
+// the NS16550 UART through direct MMIO, print a banner, halt. Phase
+// R-2 grows real DTB parsing + paging + frame allocator init here.
+// ============================================================================
+
+/// RISC-V boot entry called from `_start` (arch/riscv64/entry.rs).
+///
+/// Receives `hart_id` (a0) and `dtb_phys` (a1) from OpenSBI.
+///
+/// By the time we get here, the boot trampoline has already enabled
+/// Sv48 paging with:
+///   - identity map 0..512 GiB (low half, L3[0])
+///   - HHDM at 0xffff_8000_0000_0000 (L3[256], same L2 as identity)
+///   - higher-half kernel at 0xffffffff80000000 (L3[511], L2[510])
+///
+/// So we are running at the higher-half VMA, UART MMIO is reachable
+/// both via identity (low) and via HHDM, and taking `&` of any static
+/// gives a higher-half virtual address. The kernel's portable code
+/// assumes exactly this layout.
+///
+/// Phase R-2 expands this entry with: DTB parse → frame allocator →
+/// kernel heap init. Phase R-3 continues with trap vector, timer,
+/// scheduler. This function is the single continuation point for
+/// Phase R-N growth; everything lands here first.
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
+    // HHDM offset set by the Sv48 boot trampoline in entry.rs. This
+    // must match the `HHDM_OFFSET` constant there (and the L3[256]
+    // index the boot table uses).
+    arcos_core::set_hhdm_offset(arcos_core::arch::riscv64::entry::HHDM_OFFSET);
+
+    // Bring up serial BEFORE boot::riscv::populate so any diagnostic
+    // prints inside the DTB walker (warnings, overflow markers) land
+    // on the console. SERIAL1 reaches NS16550 through HHDM now that
+    // paging is on and HHDM_OFFSET is set.
+    //
+    // SAFETY: Called once as the first init step on this hart. No
+    // other code accesses SERIAL1 yet.
+    unsafe { arcos_core::io::init(); }
+
+    // SAFETY: First-time install of BootInfo from the riscv boot
+    // adapter. Walks the DTB OpenSBI handed us and populates memory
+    // regions + reservations.
+    unsafe { arcos_core::boot::riscv::populate(dtb_phys); }
+
+    println!("=== CambiOS Microkernel [v0.2.0] (RISC-V Phase R-2) ===");
+    println!(
+        "Booted via OpenSBI on hart {}, DTB @ {:#x}",
+        hart_id, dtb_phys
+    );
+    println!("Sv48 paging: kernel @ higher-half, HHDM @ {:#x}",
+        arcos_core::arch::riscv64::entry::HHDM_OFFSET);
+
+    // Quick sanity check that we're really at the higher-half VMA.
+    // `kmain_riscv64 as u64` gives this function's virtual address; it
+    // should start with 0xffffffff if paging + jump worked.
+    let self_addr = kmain_riscv64 as *const () as u64;
+    println!(
+        "Self VA = {:#x} — higher-half: {}",
+        self_addr,
+        if (self_addr >> 32) == 0xffffffff { "OK" } else { "FAIL" }
+    );
+
+    println!();
+    println!("Memory map from DTB:");
+    for (i, region) in arcos_core::boot::info().memory_regions().iter().enumerate() {
+        println!(
+            "  [{}] {:#018x} - {:#018x} ({} KiB) {}",
+            i,
+            region.base,
+            region.base + region.length,
+            region.length / 1024,
+            region.kind.as_str()
+        );
+    }
+    println!();
+
+    // Phase R-2.c: memory subsystem bring-up.
+    // SAFETY: called once, single-hart, immediately after DTB populate.
+    unsafe { arcos_core::memory::init(); }
+    init_kernel_heap();
+    init_frame_allocator();
+
+    // Smoke-test: allocate a Box and verify the pointer + stored value.
+    // Confirms the heap + allocator + paging are all wired correctly.
+    {
+        use alloc::boxed::Box;
+        let boxed: Box<u64> = Box::new(0xCA_B1_05_DEADBEEFu64);
+        let ptr = &*boxed as *const u64 as u64;
+        println!("✓ Box::new: value {:#x} at vaddr {:#x}", *boxed, ptr);
+        // Drop at end of scope returns memory to the allocator.
+    }
+
+    println!();
+    println!("Phase R-2.c milestone: heap + frame allocator + Box::new OK.");
+    println!("Next: shared paging module RISC-V arm (R-2.d).");
+    println!("Halting.");
+
+    // Phase R-3 will continue with trap vector + scheduler from here.
+    arcos_core::halt();
+}
+
+// ============================================================================
 // Kernel heap initialization from Limine memory map
 // ============================================================================
 
@@ -553,6 +661,62 @@ fn init_kernel_heap() {
     }
 
     let (phys_base, region_len) = best.expect("No usable memory region large enough for kernel heap");
+    // On boot protocols that deliver "full RAM as one Usable region +
+    // overlay reservations" (the RISC-V DTB path), the chosen Usable
+    // region can start inside OpenSBI / kernel-image / DTB territory.
+    // Advance `phys_base` past any non-Usable region that *starts
+    // within* our chosen span.
+    //
+    // Limine-populated BootInfo has non-overlapping Usable/non-Usable
+    // regions, so this loop is a no-op in practice on x86/AArch64.
+    let mut phys_base = phys_base;
+    let mut region_len = region_len;
+    loop {
+        // Pick the *lowest-base* overlay inside our current span. Iterating
+        // in array order would incorrectly skip past overlays near the end
+        // of the span before handling the one at the start, collapsing the
+        // big middle gap.
+        let overlap = info
+            .memory_regions()
+            .iter()
+            .filter(|r| {
+                r.kind != MemoryRegionKind::Usable
+                    && r.base >= phys_base
+                    && r.base < phys_base + region_len
+            })
+            .min_by_key(|r| r.base);
+        match overlap {
+            Some(r) => {
+                // Two cases:
+                //  (a) overlay starts at phys_base → advance past its tail
+                //  (b) overlay starts *after* phys_base → we have a usable
+                //      gap before it. If that gap is big enough, clamp
+                //      region_len to it and stop.
+                if r.base > phys_base {
+                    let gap = r.base - phys_base;
+                    if gap >= KERNEL_HEAP_SIZE {
+                        region_len = gap;
+                        break;
+                    }
+                    // Gap too small — keep searching past the overlay.
+                }
+                let new_base = r.base + r.length;
+                if new_base >= phys_base + region_len {
+                    // Overlay runs off the end of our span — nothing left.
+                    region_len = 0;
+                    break;
+                }
+                region_len = (phys_base + region_len) - new_base;
+                phys_base = new_base;
+            }
+            None => break,
+        }
+    }
+    // 2 MiB alignment keeps things tidy for future large-page heap extension.
+    let align: u64 = 0x20_0000;
+    let aligned_base = (phys_base + align - 1) & !(align - 1);
+    region_len = region_len.saturating_sub(aligned_base - phys_base);
+    let phys_base = aligned_base;
 
     // Skip first 1MB of region to avoid any low-memory conflicts
     let safe_offset: u64 = 0x200000_u64.saturating_sub(phys_base);
@@ -616,6 +780,31 @@ fn init_frame_allocator() {
     // - Kernel heap (base was chosen dynamically by init_kernel_heap)
     let heap_phys = KERNEL_HEAP_PHYS_BASE.load(core::sync::atomic::Ordering::Acquire);
     fa.reserve_region(heap_phys, KERNEL_HEAP_SIZE);
+
+    // RISC-V (and any future boot adapter using the "full RAM as one
+    // Usable region + overlay reservations" model): iterate non-Usable
+    // regions and reserve them explicitly. Limine-populated BootInfo
+    // already has non-overlapping Usable/non-Usable regions, so this
+    // pass is a no-op on x86/AArch64 in practice — but making it
+    // portable keeps init_frame_allocator protocol-agnostic.
+    //
+    // ExecutableAndModules = kernel image / boot modules. Reserved =
+    // DTB / hardware MMIO. BootloaderReclaimable = OpenSBI / Limine
+    // itself. All must stay off-limits to the frame allocator.
+    for region in info.memory_regions() {
+        match region.kind {
+            MemoryRegionKind::ExecutableAndModules
+            | MemoryRegionKind::Reserved
+            | MemoryRegionKind::BootloaderReclaimable
+            | MemoryRegionKind::AcpiReclaimable
+            | MemoryRegionKind::AcpiNvs
+            | MemoryRegionKind::BadMemory
+            | MemoryRegionKind::Framebuffer => {
+                fa.reserve_region(region.base, region.length);
+            }
+            MemoryRegionKind::Usable | MemoryRegionKind::Unknown(_) => {}
+        }
+    }
     //
     // Phase 3.2a (ADR-008): per-process heaps are no longer pre-reserved
     // as a fixed slab at PROCESS_HEAP_BASE. Instead, each process
@@ -1219,18 +1408,19 @@ fn bootstrap_identity_init() {
 /// and `PER_CPU_SCHEDULER` (per-CPU, no cycle with OBJECT_STORE since
 /// scheduler / ISR code never acquires OBJECT_STORE).
 fn object_store_init() {
-    use arcos_core::fs::disk::MAX_OBJECTS_ON_DISK;
-    use arcos_core::fs::lazy_disk::LazyDiskStore;
+    use arcos_core::fs::ram::RamObjectStore;
     use arcos_core::fs::ObjectStore;
 
-    let store = alloc::boxed::Box::new(LazyDiskStore::new(MAX_OBJECTS_ON_DISK));
+    // Boot with RamObjectStore — fast, no IPC, no driver dependency.
+    // The first SYS_OBJ_* syscall calls ensure_disk_store() (outside any
+    // lock) to handshake with virtio-blk and swap in a DiskObjectStore.
+    // If the handshake fails (no driver, no device), RAM store persists
+    // — arcobj works but objects don't survive reboot.
+    let store = RamObjectStore::new_boxed().expect("RamObjectStore alloc failed");
     let store: alloc::boxed::Box<dyn ObjectStore + Send> = store;
     *OBJECT_STORE.lock() = Some(store);
 
-    println!(
-        "✓ Object store initialized (disk, lazy init, capacity up to {} objects)",
-        MAX_OBJECTS_ON_DISK
-    );
+    println!("✓ Object store initialized (RAM, disk upgrade deferred to first use)");
 }
 
 /// Initialize process table — populate the first 3 kernel processes.
@@ -1748,6 +1938,18 @@ fn distribute_tasks_to_aps() {
 /// Must be called after all BSP subsystems are initialized (GDT, IDT, APIC,
 /// scheduler, etc.) and after `init_hardware_interrupts()`.
 unsafe fn start_application_processors() {
+    // RISC-V SMP brings up secondary harts via SBI `sbi_hart_start`, not
+    // Limine's MP request. The full cross-arch refactor is Phase R-5
+    // (ADR-013 Decision on BootProtocol trait); until then RISC-V runs
+    // single-hart with this early no-op return.
+    #[cfg(target_arch = "riscv64")]
+    {
+        println!("  RISC-V SMP deferred to Phase R-5 — BSP only for now");
+        return;
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
     let mp_response = match MP_REQUEST.get_response() {
         Some(r) => r,
         None => {
@@ -1820,6 +2022,7 @@ unsafe fn start_application_processors() {
         "  ✓ {}/{} AP(s) online (total CPUs: {})",
         ready, expected, ready as usize + 1
     );
+    } // end #[cfg(not(target_arch = "riscv64"))]
 }
 
 /// Main microkernel event loop
@@ -1871,30 +2074,14 @@ fn microkernel_loop() -> ! {
     }
 
     // Tick-based gating: deterministic frequency regardless of interrupt rate.
-    // Status every 10s (1000 ticks @ 100Hz), invariants every 60s (6000 ticks).
-    let mut last_status_tick: u64 = 0;
+    // Invariant check every 60s (6000 ticks @ 100Hz). The periodic status
+    // tick ("[Tick N] Tasks: ...") was removed in Phase 4b — it cluttered
+    // serial output without providing runtime value. Invariant verification
+    // stays: it halts on corruption, which is silent and load-bearing.
     let mut last_verify_tick: u64 = 0;
 
     loop {
         let ticks = Timer::get_ticks();
-
-        // Periodic status reporting (every ~10 seconds)
-        if ticks >= last_status_tick + 1000 {
-            last_status_tick = ticks;
-            // Use try_lock to avoid blocking the idle loop under contention
-            if let Some(scheduler) = arcos_core::local_scheduler().try_lock() {
-                if let Some(sched) = scheduler.as_ref() {
-                    let stats = sched.stats();
-                    println!(
-                        "  [Tick {}] Tasks: {}, Current: {:?}, State: {:?}",
-                        ticks,
-                        stats.active_tasks,
-                        stats.current_task,
-                        stats.state
-                    );
-                }
-            }
-        }
 
         // Periodic invariant verification (every ~60 seconds)
         if ticks >= last_verify_tick + 6000 {

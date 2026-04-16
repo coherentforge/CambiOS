@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide numeric bound catalog
 auto_refresh: required
-last_synced_to_code: 2026-04-15 (KERNEL_STACK_SIZE bump 8 KiB \u2192 32 KiB)
+last_synced_to_code: 2026-04-16 (Phase 4b: REPLY_ENDPOINT registry added)
 authoritative_for: every fixed numeric bound, fixed-size array, hard limit in kernel code — what kind of bound it is, why this number, and what triggers re-evaluation
 -->
 
@@ -77,6 +77,7 @@ These are the ones that will need to grow as the system matures. They are correc
 | Constant | Value | Where | Why this number | Replace when |
 |---|---|---|---|---|
 | `MAX_TASKS` (per CPU) | 256 | [src/scheduler/mod.rs:126](src/scheduler/mod.rs#L126), [src/lib.rs:157](src/lib.rs#L157) | Heap-allocated, per-CPU. Originally raised from 32 to support multi-core workloads. | Current workloads sit far below 256. Revisit when a single CPU is regularly seeing >100 active tasks, or when AI inference services start spawning per-request worker tasks. |
+| `REPLY_ENDPOINT` (size) | 256 | [src/lib.rs](src/lib.rs) | `[AtomicU32; 256]` — one slot per process, indexed by `ProcessId::slot()`. Stores the first endpoint each process registered; `handle_write` uses it as the `from` field of outgoing messages so receivers can route replies via `msg.from_endpoint()`. Sized to match `MAX_TASKS`; 1 KiB in `.bss`. Landed in Phase 4b to fix the pid-slot-as-reply-address bug that broke all service-reply paths. | Process/task slot model changes (e.g., slot count goes above 256, or multi-endpoint-per-process routing becomes a real feature rather than implicitly "first wins"). |
 | `MAX_CPUS` | 256 | [src/lib.rs:91](src/lib.rs#L91), [src/arch/x86_64/percpu.rs:23](src/arch/x86_64/percpu.rs#L23), [src/arch/aarch64/percpu.rs:23](src/arch/aarch64/percpu.rs#L23), [src/arch/aarch64/gic.rs:30](src/arch/aarch64/gic.rs#L30) | Matches xAPIC 8-bit APIC ID space; statically-sized per-CPU arrays. | x2APIC support (32-bit IDs) or > 256-core targets. Not a v1 concern. |
 | `MAX_ENDPOINTS` | 32 | [src/ipc/mod.rs:22](src/ipc/mod.rs#L22) | Historically matched `MAX_PROCESSES` (one endpoint per service). Sharded IPC has one shard per endpoint; static array. | `MAX_PROCESSES` is gone as of Phase 3.2a — the process table now scales with tier policy. This endpoint cap should eventually move too (tie it to `config::num_slots()` or a new `MAX_ENDPOINTS_PER_SLOT * num_slots()` computation). First Phase 3 service that needs >32 endpoints is the trigger. |
 | Per-process capability table | 32 | [src/ipc/capability.rs:59](src/ipc/capability.rs#L59) | Bounded set for verification; cache-line-friendly linear scan. | Phase 3 work: the policy service holds one capability per service it mediates, the audit consumer holds one per producer. 32 will get tight fast. |

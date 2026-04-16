@@ -90,6 +90,7 @@ const SYS_AUDIT_ATTACH: u32 = 33;
 const SYS_AUDIT_INFO: u32 = 34;
 const SYS_MAP_FRAMEBUFFER: u32 = 35;
 const SYS_MODULE_READY: u32 = 36;
+const SYS_TRY_RECV_MSG: u32 = 37;
 
 // ============================================================================
 // Syscall profiles (bitmap of allowed syscall numbers)
@@ -119,7 +120,9 @@ const DEFAULT_PROFILE: Profile = profile(&[
     SYS_MODULE_READY,
 ]);
 
-/// Hello test module — minimal profile, just enough to print and exit.
+/// Hello test module — minimal profile (print and exit). Removed from
+/// boot chain in Phase 4b; can still be spawned via `spawn hello`.
+#[allow(dead_code)]
 const HELLO_PROFILE: Profile = DEFAULT_PROFILE;
 
 /// Key-store service — claims bootstrap key, signs object puts over IPC.
@@ -146,9 +149,11 @@ const NET_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
 /// Block driver (virtio-blk) — same shape as the NIC drivers today:
 /// PCI discovery via DeviceInfo, legacy I/O-BAR programming via PortIo,
 /// DMA allocation via AllocDma. No MMIO or IRQ wait path yet (polled).
+/// Needs SYS_TRY_RECV_MSG because virtio-blk listens on two endpoints
+/// (user ep24, kernel ep26) and must poll both non-blockingly.
 const BLK_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
-        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
+        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG, SYS_TRY_RECV_MSG,
         SYS_DEVICE_INFO, SYS_ALLOC_DMA, SYS_PORT_IO,
     ]);
 
@@ -195,8 +200,8 @@ const SLOT_PROFILES: [Profile; 16] = [
     FS_SERVICE_PROFILE,   //  5: fs-service
     BLK_DRIVER_PROFILE,   //  6: virtio-blk
     SHELL_PROFILE,        //  7: shell
-    HELLO_PROFILE,        //  8: hello.elf
-    DEFAULT_PROFILE,      //  9+: spawned/unknown — conservative default
+    DEFAULT_PROFILE,      //  8+: spawned/unknown — conservative default
+    DEFAULT_PROFILE,      //  9
     DEFAULT_PROFILE,      // 10
     DEFAULT_PROFILE,      // 11
     DEFAULT_PROFILE,      // 12

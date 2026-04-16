@@ -223,6 +223,14 @@ pub enum SyscallNumber {
     /// the rest of the trusted-service chain is up (e.g., key-store
     /// isn't needed for signing a no-op call).
     ModuleReady = 36,
+    /// SYS_TRY_RECV_MSG (37): non-blocking variant of RecvMsg. Returns 0
+    /// immediately if no message is queued, instead of parking the task
+    /// on `MessageWait(endpoint)`. Required for services that must poll
+    /// multiple endpoints (e.g., virtio-blk: ep24 user, ep26 kernel) —
+    /// blocking recv on one endpoint would miss wakes on the other.
+    /// Arg layout matches RecvMsg: arg1=endpoint, arg2=user_buf, arg3=buf_len.
+    /// Returns: bytes received (>=36 for header + payload) or 0 if empty.
+    TryRecvMsg = 37,
 }
 
 impl SyscallNumber {
@@ -236,7 +244,7 @@ impl SyscallNumber {
     /// fork cannot run the standard userspace ecosystem.
     pub const fn requires_identity(&self) -> bool {
         matches!(self,
-            Self::Write | Self::Read | Self::RecvMsg |
+            Self::Write | Self::Read | Self::RecvMsg | Self::TryRecvMsg |
             Self::Allocate | Self::Free |
             Self::RegisterEndpoint |
             Self::WaitIrq | Self::MapMmio | Self::AllocDma |
@@ -294,6 +302,7 @@ impl SyscallNumber {
             34 => Some(Self::AuditInfo),
             35 => Some(Self::MapFramebuffer),
             36 => Some(Self::ModuleReady),
+            37 => Some(Self::TryRecvMsg),
             _ => None,
         }
     }
@@ -467,6 +476,7 @@ mod tests {
             SyscallNumber::ChannelInfo, SyscallNumber::AuditAttach,
             SyscallNumber::AuditInfo,
             SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
+            SyscallNumber::TryRecvMsg,
         ];
 
         for &num in &all {
@@ -492,9 +502,9 @@ mod tests {
 
     #[test]
     fn all_syscall_numbers_covered() {
-        // Verify from_u64 round-trips for all defined values (0..=36),
+        // Verify from_u64 round-trips for all defined values (0..=37),
         // ensuring no gap in the requires_identity() match.
-        for i in 0..=36u64 {
+        for i in 0..=37u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             // Just exercise requires_identity to confirm no panic
