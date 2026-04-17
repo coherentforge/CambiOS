@@ -9,6 +9,12 @@
 use crate::syscalls::{SyscallNumber, SyscallArgs, SyscallResult, SyscallError};
 use crate::scheduler::TaskId;
 use crate::ipc::ProcessId;
+// `ObjectStore` trait must be in scope so method calls (`put`/`get`/etc.) on
+// `ObjectStoreBackend` resolve via its `impl ObjectStore for ObjectStoreBackend`
+// (ADR-003 § Divergence). Previously implicit when `OBJECT_STORE` was a
+// `Box<dyn ObjectStore>`; now required because dispatch is monomorphized.
+#[allow(unused_imports)]
+use crate::fs::ObjectStore;
 
 /// Syscall handler context
 ///

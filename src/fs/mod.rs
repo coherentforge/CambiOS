@@ -393,6 +393,79 @@ pub trait ObjectStore {
 }
 
 // ============================================================================
+// ObjectStoreBackend — enum-dispatch shim for the kernel-side OBJECT_STORE
+// ============================================================================
+//
+// The trait above is the *specification* — what every backend must implement.
+// `ObjectStoreBackend` is the *impl shim* used at the kernel `OBJECT_STORE`
+// static. It exists to satisfy CLAUDE.md's Formal Verification rule against
+// `dyn` dispatch on kernel hot paths (every SYS_OBJ_* syscall touches this
+// store). See ADR-003 § Divergence for the full decision rationale.
+//
+// Each backend lives behind a `Box<T>` so the per-variant memory cost stays
+// off the boot stack. Adding a new backend = one new variant + one new arm
+// per delegated method — closed-world, exhaustive, monomorphized.
+//
+// Test mode (`cfg(test)`) excludes the LazyDisk variant because
+// `VirtioBlkDevice` is not available in host tests; tests construct
+// only `Ram`.
+
+/// Enum-dispatch shim for `ObjectStore` backends installed at the kernel-side
+/// `OBJECT_STORE` static. See module-level note above.
+pub enum ObjectStoreBackend {
+    /// In-RAM, fixed-capacity store. Boot default; persistent only across
+    /// the kernel's lifetime.
+    Ram(alloc::boxed::Box<ram::RamObjectStore>),
+
+    /// Disk-backed store fronted by the user-space virtio-blk driver. Swapped
+    /// in by `lazy_disk::ensure_disk_store` on first `SYS_OBJ_*` call.
+    #[cfg(not(test))]
+    LazyDisk(alloc::boxed::Box<disk::DiskObjectStore<virtio_blk_device::VirtioBlkDevice>>),
+}
+
+impl ObjectStore for ObjectStoreBackend {
+    fn get(&mut self, hash: &[u8; 32]) -> Result<CambiObject, StoreError> {
+        match self {
+            Self::Ram(s) => s.get(hash),
+            #[cfg(not(test))]
+            Self::LazyDisk(s) => s.get(hash),
+        }
+    }
+
+    fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError> {
+        match self {
+            Self::Ram(s) => s.put(object),
+            #[cfg(not(test))]
+            Self::LazyDisk(s) => s.put(object),
+        }
+    }
+
+    fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
+        match self {
+            Self::Ram(s) => s.delete(hash),
+            #[cfg(not(test))]
+            Self::LazyDisk(s) => s.delete(hash),
+        }
+    }
+
+    fn list(&mut self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError> {
+        match self {
+            Self::Ram(s) => s.list(),
+            #[cfg(not(test))]
+            Self::LazyDisk(s) => s.list(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Self::Ram(s) => s.count(),
+            #[cfg(not(test))]
+            Self::LazyDisk(s) => s.count(),
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

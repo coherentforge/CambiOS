@@ -1461,13 +1461,16 @@ fn bootstrap_identity_init() {
 /// scheduler / ISR code never acquires OBJECT_STORE).
 fn object_store_init() {
     use arcos_core::fs::ram::RamObjectStore;
-    use arcos_core::fs::ObjectStore;
+    use arcos_core::fs::ObjectStoreBackend;
 
     // Boot with RamObjectStore — fast, no IPC, no driver dependency.
     // The first SYS_OBJ_* syscall calls ensure_disk_store() (outside any
     // lock) to handshake with virtio-blk and swap in a DiskObjectStore.
     // If the handshake fails (no driver, no device), RAM store persists
     // — arcobj works but objects don't survive reboot.
+    //
+    // Backend dispatch is monomorphized via `ObjectStoreBackend` enum (no
+    // `dyn` trait object) per ADR-003 § Divergence.
     let store = match RamObjectStore::new_boxed() {
         Some(s) => s,
         None => {
@@ -1475,8 +1478,7 @@ fn object_store_init() {
             arcos_core::halt();
         }
     };
-    let store: alloc::boxed::Box<dyn ObjectStore + Send> = store;
-    *OBJECT_STORE.lock() = Some(store);
+    *OBJECT_STORE.lock() = Some(ObjectStoreBackend::Ram(store));
 
     println!("✓ Object store initialized (RAM, disk upgrade deferred to first use)");
 }

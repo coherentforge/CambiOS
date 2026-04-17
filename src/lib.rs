@@ -526,11 +526,16 @@ pub static AUDIT_RING: Spinlock<Option<audit::drain::AuditRing>> = Spinlock::new
 
 /// Object store — content-addressed signed object storage (lock position 9).
 ///
-/// Initialized at boot after all other subsystems. Held as a trait object so
-/// the backend can be swapped (RAM for Phase 0–3, disk for Phase 4) without
-/// touching the syscall dispatcher. The `Send` bound lets the store move
-/// between CPUs under the spinlock; no implementation holds non-Send state.
-pub static OBJECT_STORE: Spinlock<Option<Box<dyn fs::ObjectStore + Send>>> = Spinlock::new(None);
+/// Initialized at boot after all other subsystems. Held as `ObjectStoreBackend`
+/// (an enum-dispatch shim, see [src/fs/mod.rs](crate::fs::ObjectStoreBackend))
+/// so dispatch is monomorphized at compile time — required by CLAUDE.md's
+/// Formal Verification rule against `dyn` trait objects on kernel hot paths.
+/// The trait `fs::ObjectStore` remains the specification each backend
+/// implements; the enum is the impl shim. See ADR-003 § Divergence for the
+/// decision rationale. The lazy RAM→Disk swap pattern in
+/// [src/fs/lazy_disk.rs](crate::fs::lazy_disk) is preserved by reassigning
+/// the variant under the lock.
+pub static OBJECT_STORE: Spinlock<Option<fs::ObjectStoreBackend>> = Spinlock::new(None);
 
 /// Boot module registry — maps module names to Limine module memory.
 /// Read-only after boot. Used by the Spawn syscall to find modules by name.

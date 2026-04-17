@@ -11,8 +11,9 @@
 //!
 //! - `DiskObjectStore<B>` — generic store. Owns a `B: BlockDevice` and the
 //!   in-memory indices (`hash -> slot`, per-slot free bit). No trait objects
-//!   in the hot path; the outer `Box<dyn ObjectStore>` boundary lives at
-//!   `OBJECT_STORE` in `lib.rs`.
+//!   anywhere on the path: `OBJECT_STORE` in `lib.rs` holds an
+//!   `ObjectStoreBackend` enum that dispatches via match arms (ADR-003 §
+//!   Divergence), so backend selection is monomorphized at compile time.
 //! - Encoding helpers (`encode_superblock`, `encode_record_header`, ...) are
 //!   pure functions over byte buffers — testable on host without a device.
 //! - All numeric bounds (`MAX_OBJECTS_ON_DISK`, `MAX_CONTENT_BYTES_ON_DISK`)

@@ -66,9 +66,13 @@ pub fn ensure_disk_store() {
     };
 
     // Phase 2: install under lock (fast — no IPC, no yield).
+    // Wraps the disk store in the `LazyDisk` variant of `ObjectStoreBackend`
+    // (enum-dispatch shim per ADR-003 § Divergence) — no `dyn` trait object.
     {
         let mut guard = crate::OBJECT_STORE.lock();
-        *guard = Some(alloc::boxed::Box::new(store));
+        *guard = Some(crate::fs::ObjectStoreBackend::LazyDisk(
+            alloc::boxed::Box::new(store),
+        ));
     }
 
     DISK_STORE_READY.store(true, Ordering::Release);

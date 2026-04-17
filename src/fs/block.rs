@@ -74,7 +74,9 @@ impl core::fmt::Display for BlockError {
 /// through the `OBJECT_STORE` spinlock.
 ///
 /// `Send` supertrait is required because `DiskObjectStore` owns a
-/// `Box<dyn BlockDevice>` and lives inside `Box<dyn ObjectStore + Send>`.
+/// `B: BlockDevice` and is wrapped (boxed) inside the `LazyDisk` variant
+/// of `ObjectStoreBackend`, which sits behind the `OBJECT_STORE` spinlock
+/// and may be accessed from any CPU.
 pub trait BlockDevice: Send {
     /// Total number of blocks the backend exposes.
     fn capacity_blocks(&self) -> u64;
