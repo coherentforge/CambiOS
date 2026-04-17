@@ -35,9 +35,11 @@ pub mod entry;
 pub mod paging;
 pub mod percpu;
 pub mod plic;
+pub mod sbi;
 pub mod syscall;
 pub mod timer;
 pub mod tlb;
+pub mod trap;
 
 /// Read the current hart's S-mode interrupt-enable state.
 ///

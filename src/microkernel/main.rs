@@ -614,11 +614,58 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
 
     println!();
     println!("Phase R-2 milestone: Sv48 + higher-half + DTB + heap + Box::new OK.");
-    println!("Next: trap vector + SBI timer + scheduler (Phase R-3).");
-    println!("Halting.");
 
-    // Phase R-3 will continue with trap vector + scheduler from here.
-    arcos_core::halt();
+    // Phase R-3.b+c: trap vector + SBI timer.
+    //
+    // Install the S-mode trap vector so any trap lands on our
+    // handler. Then read the platform timebase from BootInfo (DTB
+    // /cpus/timebase-frequency) and arm the first 100 Hz timer tick.
+    // Finally flip sstatus.SIE to let the timer actually preempt the
+    // WFI loop below.
+    //
+    // SAFETY: boot::install has populated BootInfo; the kernel stack
+    // is set up; we're single-hart during boot; interrupts are still
+    // masked on entry (we explicitly enable them below).
+    unsafe {
+        arcos_core::arch::riscv64::trap::install();
+    }
+
+    if let Some(tb) = arcos_core::boot::info().timer_base_frequency_hz {
+        println!(
+            "✓ DTB /cpus/timebase-frequency = {} Hz (from DTB)",
+            tb
+        );
+    } else {
+        println!("⚠ DTB did not report timebase-frequency — timer init will panic");
+    }
+
+    // SAFETY: trap vector just installed; base frequency is present
+    // (we panic in timer::init if not).
+    let reload = unsafe { arcos_core::arch::riscv64::timer::init(100) };
+    println!("✓ SBI timer armed at 100 Hz (reload = {} ticks)", reload);
+
+    // SAFETY: trap handler is live, per-hart state is initialized,
+    // the timer is armed. Safe to take interrupts now.
+    unsafe {
+        arcos_core::arch::riscv64::trap::enable_interrupts();
+    }
+
+    println!();
+    println!("Phase R-3.b+c milestone: trap vector + SBI timer live.");
+    println!("Expecting a '[R-3 tick N]' line every 500 ms (every 50 ticks).");
+    println!();
+
+    // Idle loop: wfi parks the hart until the next interrupt.
+    // The trap handler increments TICK_COUNT and rearms; the next
+    // wfi wakes on the following tick. Exit the loop with ctrl-c /
+    // QEMU signal (no structured exit path until R-3.f wires the
+    // scheduler).
+    loop {
+        // SAFETY: wfi is always legal in S-mode. On a hart with STIE
+        // set, it blocks until the timer (or any enabled interrupt)
+        // fires, at which point control re-enters the trap vector.
+        unsafe { core::arch::asm!("wfi", options(nostack, nomem, preserves_flags)); }
+    }
 }
 
 // ============================================================================

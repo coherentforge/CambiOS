@@ -182,6 +182,11 @@ fn is_memory_node(name: &[u8]) -> bool {
     rest.is_empty() || rest.starts_with(b"@")
 }
 
+/// Match a node name against `/cpus` (always un-addressed; no `@`).
+fn is_cpus_node(name: &[u8]) -> bool {
+    name == b"cpus"
+}
+
 /// Parse `reg` property values as (address, size) pairs. Assumes
 /// `#address-cells = 2` and `#size-cells = 2` at the root (standard
 /// for QEMU virt and most RISC-V platforms). Reads pairs of u64s
@@ -203,11 +208,16 @@ fn parse_reg_pairs(prop_value: &[u8], mut callback: impl FnMut(u64, u64)) {
 }
 
 /// Walk the DTB, calling `on_memory(base, size)` for each
-/// `/memory@*` node's `reg` property.
+/// `/memory@*` node's `reg` property and `on_cpu_timebase(hz)` for
+/// the `/cpus` node's `timebase-frequency` property (once per DTB).
 ///
 /// # Safety
 /// `dtb_phys` must point at a valid FDT blob.
-unsafe fn walk_dtb(dtb_phys: u64, mut on_memory: impl FnMut(u64, u64)) -> Option<u32> {
+unsafe fn walk_dtb(
+    dtb_phys: u64,
+    mut on_memory: impl FnMut(u64, u64),
+    mut on_cpu_timebase: impl FnMut(u32),
+) -> Option<u32> {
     let ptr = dtb_phys as *const u8;
 
     // SAFETY: caller guarantees a valid FDT at this address.
@@ -226,21 +236,24 @@ unsafe fn walk_dtb(dtb_phys: u64, mut on_memory: impl FnMut(u64, u64)) -> Option
     let struct_block = &full_blob[struct_start..struct_end];
 
     // Strings block — prop name lookups.
-    // (Not used yet — we match prop names via their raw nameoff from
-    // the strings block. For now we only care about "reg" on memory
-    // nodes and can match by offset after one lookup.)
+    // We match prop names via `nameoff` into the strings block.
 
-    // State machine: walk tokens. Track depth so we know when a
-    // BEGIN_NODE is at depth 1 (top-level child of the root) and
-    // track whether the current node is a memory node.
+    // State machine: walk tokens. Track depth + per-depth flags for
+    // which interesting-ancestor context the current node inherits
+    // from. Only direct children of the root matter for our match set
+    // (/memory@* and /cpus), but the stack-based approach generalizes
+    // if a future addition needs deeper tracking.
     let mut depth: usize = 0;
     let mut pos: usize = 0;
     let mut in_memory_node = false;
+    let mut in_cpus_node = false;
     let mut tokens_processed = 0;
 
-    // Stack of "is this ancestor a memory node" booleans. Only the
-    // top-of-stack (current node) matters for prop matching.
+    // Parallel stacks: at each ancestor depth, is this ancestor the
+    // /memory or /cpus node? Flags rebuild on END_NODE by re-OR'ing
+    // the still-active depths.
     let mut in_memory_stack = [false; MAX_DEPTH];
+    let mut in_cpus_stack = [false; MAX_DEPTH];
 
     while pos + 4 <= struct_block.len() && tokens_processed < MAX_TOKENS {
         tokens_processed += 1;
@@ -254,11 +267,16 @@ unsafe fn walk_dtb(dtb_phys: u64, mut on_memory: impl FnMut(u64, u64)) -> Option
                 pos = next_pos;
 
                 let is_mem = depth == 1 && is_memory_node(name);
+                let is_cpus = depth == 1 && is_cpus_node(name);
                 if depth < MAX_DEPTH {
                     in_memory_stack[depth] = is_mem;
+                    in_cpus_stack[depth] = is_cpus;
                 }
                 if is_mem {
                     in_memory_node = true;
+                }
+                if is_cpus {
+                    in_cpus_node = true;
                 }
                 depth += 1;
             }
@@ -267,16 +285,16 @@ unsafe fn walk_dtb(dtb_phys: u64, mut on_memory: impl FnMut(u64, u64)) -> Option
                     break; // Malformed — END without matching BEGIN
                 }
                 depth -= 1;
-                // Re-check whether any remaining ancestor is a memory
-                // node (in practice only direct children matter, but
-                // this is the safe way to track nesting).
-                in_memory_node = if depth > 0 {
-                    in_memory_stack[..depth]
-                        .iter()
-                        .any(|&flag| flag)
+                // Rebuild "in interesting ancestor" flags after leaving
+                // one level. In practice only the direct ancestor at
+                // depth 1 ever matches; the stack scan is defensive.
+                if depth > 0 {
+                    in_memory_node = in_memory_stack[..depth].iter().any(|&f| f);
+                    in_cpus_node = in_cpus_stack[..depth].iter().any(|&f| f);
                 } else {
-                    false
-                };
+                    in_memory_node = false;
+                    in_cpus_node = false;
+                }
             }
             FDT_PROP => {
                 // PROP header: u32 len, u32 nameoff
@@ -294,24 +312,37 @@ unsafe fn walk_dtb(dtb_phys: u64, mut on_memory: impl FnMut(u64, u64)) -> Option
                 let value = &struct_block[pos..pos + len];
                 pos = (pos + len + 3) & !3; // align to 4
 
-                // Only care about "reg" on memory nodes.
-                if in_memory_node {
-                    let strings_start = header.off_dt_strings as usize;
-                    let strings_end = strings_start + header.size_dt_strings as usize;
-                    if nameoff < header.size_dt_strings as usize && strings_end <= full_blob.len()
-                    {
-                        let strings = &full_blob[strings_start..strings_end];
-                        let prop_name_end = strings[nameoff..]
-                            .iter()
-                            .position(|&b| b == 0)
-                            .map(|i| nameoff + i)
-                            .unwrap_or(strings.len());
-                        let prop_name = &strings[nameoff..prop_name_end];
-                        if prop_name == b"reg" {
-                            parse_reg_pairs(value, |base, size| {
-                                on_memory(base, size);
-                            });
-                        }
+                if !in_memory_node && !in_cpus_node {
+                    continue;
+                }
+
+                // Resolve the property name from the strings block.
+                let strings_start = header.off_dt_strings as usize;
+                let strings_end = strings_start + header.size_dt_strings as usize;
+                if nameoff >= header.size_dt_strings as usize
+                    || strings_end > full_blob.len()
+                {
+                    continue;
+                }
+                let strings = &full_blob[strings_start..strings_end];
+                let prop_name_end = strings[nameoff..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|i| nameoff + i)
+                    .unwrap_or(strings.len());
+                let prop_name = &strings[nameoff..prop_name_end];
+
+                if in_memory_node && prop_name == b"reg" {
+                    parse_reg_pairs(value, |base, size| {
+                        on_memory(base, size);
+                    });
+                } else if in_cpus_node && prop_name == b"timebase-frequency" {
+                    // timebase-frequency is usually a u32 at `/cpus`.
+                    // On some DTBs it is per-cpu, but QEMU virt and
+                    // every standards-compliant RISC-V platform we
+                    // care about emit it at the parent.
+                    if value.len() >= 4 {
+                        on_cpu_timebase(be_u32_at(value, 0));
                     }
                 }
             }
@@ -349,19 +380,25 @@ pub unsafe fn populate(dtb_phys: u64) {
     // downstream consumers — which go through boot::info() — see it.
     info.hhdm_offset = crate::hhdm_offset();
 
-    // Walk the DTB for /memory@* nodes. Each `reg` base/size pair
-    // becomes a MemoryRegionKind::Usable region.
-    //
+    // Walk the DTB for /memory@* nodes and /cpus/timebase-frequency.
+    let mut timer_hz: Option<u32> = None;
     // SAFETY: caller promises a valid FDT at dtb_phys.
     let dtb_totalsize = unsafe {
-        walk_dtb(dtb_phys, |base, size| {
-            let _ = info.push_memory_region(MemoryRegion {
-                base,
-                length: size,
-                kind: MemoryRegionKind::Usable,
-            });
-        })
+        walk_dtb(
+            dtb_phys,
+            |base, size| {
+                let _ = info.push_memory_region(MemoryRegion {
+                    base,
+                    length: size,
+                    kind: MemoryRegionKind::Usable,
+                });
+            },
+            |hz| {
+                timer_hz = Some(hz);
+            },
+        )
     };
+    info.timer_base_frequency_hz = timer_hz;
 
     // Reserve OpenSBI's range on QEMU virt (0x80000000..0x80200000).
     // Real platforms: OpenSBI's extent comes from `/reserved-memory`

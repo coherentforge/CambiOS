@@ -203,6 +203,13 @@ pub struct BootInfo {
     /// boot protocol reported one.
     pub rsdp_phys: Option<u64>,
 
+    /// Platform timer base frequency in Hz, when the boot adapter has
+    /// authoritative knowledge of it. RISC-V populates from the DTB's
+    /// `/cpus/timebase-frequency` property; x86_64 and AArch64 leave
+    /// this `None` (x86 calibrates APIC via PIT; AArch64 reads
+    /// `CNTFRQ_EL0` directly).
+    pub timer_base_frequency_hz: Option<u32>,
+
     memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
     memory_region_count: usize,
 
@@ -225,6 +232,7 @@ impl BootInfo {
         Self {
             hhdm_offset: 0,
             rsdp_phys: None,
+            timer_base_frequency_hz: None,
             memory_regions: [ZERO_REGION; MAX_MEMORY_REGIONS],
             memory_region_count: 0,
             framebuffers: [None; MAX_FRAMEBUFFERS],
