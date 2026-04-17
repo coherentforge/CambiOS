@@ -2913,3 +2913,283 @@ impl SyscallDispatcher {
         Ok(0)
     }
 }
+
+// ============================================================================
+// Tests — Cut 1: validation surface
+// ============================================================================
+//
+// These tests exercise every check that runs before a handler touches a
+// kernel global. They cover:
+//   - read_user_buffer / write_user_buffer early-exit guards (zero-len,
+//     MAX_USER_BUFFER cap, USER_SPACE_END crossing, addr overflow, cr3=0).
+//   - Handler-level argument validation (length bounds, key length,
+//     buffer-size minimums).
+//   - Pure handlers (handle_get_pid).
+//
+// Out of scope for this cut:
+//   - Multi-page traversal inside read_user_buffer / write_user_buffer
+//     (needs a fake translator — Cut 2).
+//   - Handlers that call ensure_disk_store() or other global initializers
+//     before validation (handle_obj_put/get/delete/list).
+//   - Lock acquisition, IPC enqueue, and page-table-walk paths
+//     (need fixture-initialized globals — Cut 3).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{Principal, ProcessId};
+    use crate::scheduler::TaskId;
+
+    /// Build a SyscallContext that handlers can read but that will fail
+    /// any call into read_user_buffer / write_user_buffer (cr3=0).
+    /// This isolates pre-globals validation paths.
+    fn fake_ctx() -> SyscallContext {
+        SyscallContext {
+            process_id: ProcessId::new(7, 1),
+            task_id: TaskId(3),
+            cr3: 0,
+            caller_principal: Some(Principal::from_public_key([1u8; 32])),
+        }
+    }
+
+    fn args(a1: u64, a2: u64, a3: u64) -> SyscallArgs {
+        SyscallArgs::new(a1, a2, a3, 0, 0, 0)
+    }
+
+    // ---- read_user_buffer early-exit guards --------------------------------
+
+    #[test]
+    fn read_user_buffer_len_zero_short_circuits() {
+        // cr3=0 would normally fail; len=0 returns Ok(0) first.
+        let mut dst = [0u8; 16];
+        assert_eq!(read_user_buffer(0, 0x1000, 0, &mut dst), Ok(0));
+    }
+
+    #[test]
+    fn read_user_buffer_len_exceeds_dst_capacity_invalid() {
+        let mut dst = [0u8; 16];
+        assert_eq!(
+            read_user_buffer(0xDEAD_0000, 0x1000, 17, &mut dst),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn read_user_buffer_len_exceeds_max_buffer_invalid() {
+        let mut dst = [0u8; MAX_USER_BUFFER + 16];
+        assert_eq!(
+            read_user_buffer(0xDEAD_0000, 0x1000, MAX_USER_BUFFER + 1, &mut dst),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn read_user_buffer_addr_at_userspace_end_invalid() {
+        let mut dst = [0u8; 16];
+        assert_eq!(
+            read_user_buffer(0xDEAD_0000, USER_SPACE_END, 1, &mut dst),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn read_user_buffer_addr_overflow_invalid() {
+        let mut dst = [0u8; 16];
+        // user_addr + len wraps past u64::MAX.
+        assert_eq!(
+            read_user_buffer(0xDEAD_0000, u64::MAX, 16, &mut dst),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn read_user_buffer_addr_crosses_userspace_end_invalid() {
+        let mut dst = [0u8; 16];
+        // start sits below USER_SPACE_END but [start, start+len) crosses it.
+        let start = USER_SPACE_END - 8;
+        assert_eq!(
+            read_user_buffer(0xDEAD_0000, start, 16, &mut dst),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn read_user_buffer_cr3_zero_with_nonzero_len_invalid() {
+        let mut dst = [0u8; 16];
+        // All upstream guards pass; cr3=0 is the failure.
+        assert_eq!(
+            read_user_buffer(0, 0x1000, 16, &mut dst),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    // ---- write_user_buffer early-exit guards -------------------------------
+
+    #[test]
+    fn write_user_buffer_len_zero_short_circuits() {
+        let src: [u8; 0] = [];
+        assert_eq!(write_user_buffer(0, 0x1000, &src), Ok(0));
+    }
+
+    #[test]
+    fn write_user_buffer_len_exceeds_max_buffer_invalid() {
+        let src = [0u8; MAX_USER_BUFFER + 1];
+        assert_eq!(
+            write_user_buffer(0xDEAD_0000, 0x1000, &src),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn write_user_buffer_addr_at_userspace_end_invalid() {
+        let src = [0u8; 1];
+        assert_eq!(
+            write_user_buffer(0xDEAD_0000, USER_SPACE_END, &src),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn write_user_buffer_addr_overflow_invalid() {
+        let src = [0u8; 16];
+        assert_eq!(
+            write_user_buffer(0xDEAD_0000, u64::MAX, &src),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn write_user_buffer_addr_crosses_userspace_end_invalid() {
+        let src = [0u8; 16];
+        let start = USER_SPACE_END - 8;
+        assert_eq!(
+            write_user_buffer(0xDEAD_0000, start, &src),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn write_user_buffer_cr3_zero_with_nonzero_len_invalid() {
+        let src = [0u8; 16];
+        assert_eq!(
+            write_user_buffer(0, 0x1000, &src),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    // ---- handle_get_pid ----------------------------------------------------
+
+    #[test]
+    fn handle_get_pid_returns_ctx_slot() {
+        // fake_ctx() has slot=7.
+        let ctx = fake_ctx();
+        assert_eq!(
+            SyscallDispatcher::handle_get_pid(args(0, 0, 0), &ctx),
+            Ok(7),
+        );
+    }
+
+    // ---- handle_write validation -------------------------------------------
+
+    #[test]
+    fn handle_write_len_zero_returns_ok_zero() {
+        let ctx = fake_ctx();
+        // arg1=endpoint, arg2=user_buf, arg3=len=0.
+        assert_eq!(
+            SyscallDispatcher::handle_write(args(16, 0x1000, 0), &ctx),
+            Ok(0),
+        );
+    }
+
+    #[test]
+    fn handle_write_len_over_256_returns_invalid() {
+        let ctx = fake_ctx();
+        assert_eq!(
+            SyscallDispatcher::handle_write(args(16, 0x1000, 257), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    // ---- handle_print validation -------------------------------------------
+
+    #[test]
+    fn handle_print_len_zero_returns_ok_zero() {
+        let ctx = fake_ctx();
+        // arg1=user_buf, arg2=len=0.
+        assert_eq!(
+            SyscallDispatcher::handle_print(args(0x1000, 0, 0), &ctx),
+            Ok(0),
+        );
+    }
+
+    #[test]
+    fn handle_print_len_over_256_returns_invalid() {
+        let ctx = fake_ctx();
+        assert_eq!(
+            SyscallDispatcher::handle_print(args(0x1000, 257, 0), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    // ---- handle_bind_principal validation ----------------------------------
+
+    #[test]
+    fn handle_bind_principal_pubkey_len_zero_invalid() {
+        let ctx = fake_ctx();
+        // arg1=target_pid, arg2=pubkey_ptr, arg3=pubkey_len=0.
+        assert_eq!(
+            SyscallDispatcher::handle_bind_principal(args(1, 0x1000, 0), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn handle_bind_principal_pubkey_len_31_invalid() {
+        let ctx = fake_ctx();
+        assert_eq!(
+            SyscallDispatcher::handle_bind_principal(args(1, 0x1000, 31), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn handle_bind_principal_pubkey_len_64_invalid() {
+        let ctx = fake_ctx();
+        // Common confusion with secret-key length — must still reject.
+        assert_eq!(
+            SyscallDispatcher::handle_bind_principal(args(1, 0x1000, 64), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    // ---- handle_get_principal validation -----------------------------------
+
+    #[test]
+    fn handle_get_principal_buf_zero_invalid() {
+        let ctx = fake_ctx();
+        // arg1=out_buf, arg2=buf_len=0.
+        assert_eq!(
+            SyscallDispatcher::handle_get_principal(args(0x1000, 0, 0), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn handle_get_principal_buf_31_invalid() {
+        let ctx = fake_ctx();
+        // 32-byte public key requires buf_len >= 32.
+        assert_eq!(
+            SyscallDispatcher::handle_get_principal(args(0x1000, 31, 0), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    // ---- handle_recv_msg / handle_try_recv_msg validation ------------------
+    //
+    // Deferred to Cut 3: handle_recv_msg's body transitively references
+    // `arch::yield_save_and_switch`, an asm-defined symbol that only links
+    // on kernel targets. Even branches that never execute the asm pull the
+    // symbol into the linker's resolution set. Cut 3 will land a host stub
+    // for the asm primitives so the full handler bodies are linkable, after
+    // which the buf_len < 36 check on both handlers becomes testable here.
+}

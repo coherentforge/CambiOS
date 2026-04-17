@@ -20,7 +20,7 @@ use crate::ipc::interceptor::InterceptDecision;
 use crate::ipc::{EndpointId, Message, ProcessId};
 use crate::scheduler::TaskId;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::AtomicU8;
 
 // ============================================================================
 // Constants
@@ -585,6 +585,7 @@ pub fn policy_check(
 #[cfg(not(test))]
 pub fn expire_pending_queries() {
     use crate::scheduler::Timer;
+    use core::sync::atomic::Ordering;
 
     let current_tick = Timer::get_ticks();
 
