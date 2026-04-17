@@ -398,7 +398,15 @@ pub struct IpcManager {
     queues: [EndpointQueue; MAX_ENDPOINTS],
     /// Sync rendezvous channels (request/reply)
     sync_channels: [SyncChannel; MAX_ENDPOINTS],
-    /// Zero-trust interceptor (set after boot init)
+    /// Zero-trust interceptor (set after boot init).
+    ///
+    /// VERIFICATION DEBT (CLAUDE.md Formal Verification — "no trait objects in
+    /// kernel hot paths"): IPC interceptor dispatch runs on every IPC send/recv.
+    /// Migrate to enum-dispatch following the ObjectStore precedent in ADR-003
+    /// § Divergence. Pattern: `enum IpcInterceptorBackend { Default(...),
+    /// PolicyService(...), ... } + impl IpcInterceptor for IpcInterceptorBackend`.
+    /// The trait stays as the specification; the enum monomorphizes dispatch.
+    /// See [STATUS.md § Known issues] for tracking.
     interceptor: Option<Box<dyn interceptor::IpcInterceptor>>,
 }
 
@@ -931,6 +939,13 @@ pub struct ShardedIpcManager {
     /// Zero-trust interceptor (set once at boot, read-only thereafter).
     /// Protected by its own lock since it's rarely accessed and never mutated
     /// after boot.
+    ///
+    /// VERIFICATION DEBT (CLAUDE.md Formal Verification — "no trait objects in
+    /// kernel hot paths"): same debt as the legacy `IpcManager.interceptor`
+    /// field above; migrate to enum-dispatch per the ADR-003 § Divergence
+    /// precedent (`enum IpcInterceptorBackend { ... } + impl IpcInterceptor
+    /// for IpcInterceptorBackend`). Both sites must be migrated together so
+    /// the type and the swap mechanism stay symmetric.
     interceptor: Spinlock<Option<Box<dyn interceptor::IpcInterceptor>>>,
 }
 
