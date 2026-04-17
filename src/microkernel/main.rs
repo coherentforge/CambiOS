@@ -21,52 +21,10 @@
 extern crate arcos_core;
 extern crate alloc;
 
-// ============================================================================
-// Lock ordering — see arcos_core::lib.rs for the authoritative hierarchy
-// ============================================================================
-//
-// PER_CPU_SCHEDULER[*](1) → PER_CPU_TIMER[*](2) → IPC_MANAGER(3) →
-// CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) → PROCESS_TABLE(6) →
-// FRAME_ALLOCATOR(7) → INTERRUPT_ROUTER(8) → OBJECT_STORE(9)
-//
-// Lower-numbered locks must be acquired before higher-numbered ones.
-// Sequential (non-nested) acquisitions are always safe — release the first
-// before acquiring the second.  Nested acquisitions must follow the order.
-//
-// Per-CPU lock rule: NEVER hold two different CPUs' scheduler (or timer)
-// locks simultaneously.  If cross-CPU access is required (e.g., task
-// migration), acquire in ascending CPU index order.
-//
-// Key patterns in this file:
-//   ipc_send_and_notify:  IPC_MANAGER(3) released, then SCHEDULER(1)   ✓ (sequential)
-//   sync_ipc_*:           IPC_MANAGER(3) released, then SCHEDULER(1)   ✓ (sequential)
-//
-// ============================================================================
-// Scalability constraints (known architectural limits)
-// ============================================================================
-//
-// These are documented here for future work, not immediate fixes.
-//
-// SCHEDULER:
-//   - MAX_TASKS=32 is the hard ceiling across all CPUs. With 256 CPUs, most
-//     cores idle. Needs per-CPU task arrays or dynamic allocation.
-//   - find_next_ready_task() does a two-pass O(32) scan on every timer tick
-//     (100Hz × cpu_count). Replace with per-priority run queues or bitmap.
-//   - on_timer_isr() uses try_lock(): if the scheduler lock is contended,
-//     the timer tick is silently skipped (no preemption, no time accounting).
-//
-// IPC:
-//   - Single global IPC_MANAGER lock serializes all endpoints across all CPUs.
-//     Needs per-endpoint sharding or lock-free queues.
-//   - MAX_ENDPOINTS=32, queue depth=16. Under load, QueueFull rejections.
-//   - Capability verify_access() is O(32) per message send/recv.
-//
-// MEMORY:
-//   - Single global FRAME_ALLOCATOR lock; allocate() scans up to 8192 bitmap
-//     words under fragmentation. Needs per-CPU free-lists or zone allocators.
-//   - map_range() holds FRAME_ALLOCATOR for N page allocations (e.g., 262
-//     frames for a 1MB allocation). Should batch or use per-CPU caches.
-//   - Kernel heap is first-fit linked-list with no size-class segregation.
+// Lock hierarchy: canonical definition lives in `arcos_core::lib.rs`.
+// CLAUDE.md § Lock Ordering documents the rule. Do not duplicate the
+// hierarchy here — duplicates drift, and CLAUDE.md's Post-Change Review §3
+// explicitly forbids it.
 
 use alloc::boxed::Box;
 use limine::BaseRevision;
