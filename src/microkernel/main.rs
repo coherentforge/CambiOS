@@ -173,65 +173,86 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     // AArch64: Diagnose and map MMIO devices before any I/O.
-    // Limine's HHDM only covers RAM, not device MMIO.
+    // Limine's HHDM only covers RAM, not device MMIO. Each unsafe scope
+    // below is sized to the single operation it covers, with its own
+    // SAFETY comment naming the specific invariants at play.
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: Called at early boot (single-threaded, interrupts disabled).
-    // System register access (TCR_EL1, TTBR1_EL1) is valid at EL1.
-    // early_map_mmio() maps device MMIO into the HHDM page tables.
-    unsafe {
-        // Read TCR_EL1 to determine actual VA width
-        let tcr: u64;
-        core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr, options(nostack, nomem));
+    {
+        // Read TCR_EL1 to determine actual VA width.
+        // SAFETY: Reading TCR_EL1 is valid at EL1 with no preconditions
+        // beyond running at EL1, which is established by Limine on entry.
+        let tcr: u64 = unsafe {
+            let v: u64;
+            core::arch::asm!("mrs {}, tcr_el1", out(reg) v, options(nostack, nomem));
+            v
+        };
         let t1sz = (tcr >> 16) & 0x3F;
         // VA bits for TTBR1 = 64 - T1SZ
         // If T1SZ=25 → 39-bit VA → TTBR1 covers 0xFFFFFF8000000000+
         // If T1SZ=16 → 48-bit VA → TTBR1 covers 0xFFFF000000000000+
 
-        // Widen TCR_EL1.T1SZ to 16 (48-bit VA space) if it's smaller,
-        // so that the full HHDM range is addressable.
         if t1sz > 16 {
-            let new_tcr = (tcr & !(0x3F << 16)) | (16 << 16);
-            core::arch::asm!(
-                "msr tcr_el1, {}",
-                "isb",
-                in(reg) new_tcr,
-                options(nostack),
-            );
-        }
-
-        // Now map MMIO devices into TTBR1
-        use arcos_core::memory::paging::early_map_mmio;
-        // PL011 UART0 at 0x0900_0000 (QEMU virt)
-        if let Err(_) = early_map_mmio(0x0900_0000) {
-            // Can't print — UART isn't mapped yet. Just halt.
-            loop { core::arch::asm!("wfe", options(nostack, nomem)); }
-        }
-        // GIC Distributor at 0x0800_0000 (QEMU virt) — map 64KB region.
-        // Failure is fatal: scheduling requires GIC for timer interrupts.
-        for page in 0..16u64 {
-            if let Err(_) = early_map_mmio(0x0800_0000 + page * 0x1000) {
-                loop { core::arch::asm!("wfe", options(nostack, nomem)); }
+            // Widen TCR_EL1.T1SZ to 16 (48-bit VA space) so the full HHDM
+            // range is addressable.
+            // SAFETY: Single-threaded boot, EL1. Widening T1SZ *enlarges*
+            // (never shrinks) the addressable VA range, so no existing
+            // TTBR1 mapping becomes invalid. The trailing ISB orders the
+            // TCR write before any subsequent TTBR1 walk uses the wider VA.
+            unsafe {
+                let new_tcr = (tcr & !(0x3F << 16)) | (16 << 16);
+                core::arch::asm!(
+                    "msr tcr_el1, {}",
+                    "isb",
+                    in(reg) new_tcr,
+                    options(nostack),
+                );
             }
         }
-        // GIC Redistributor at 0x080A_0000 (QEMU virt)
-        // Each CPU's GICR frame is 128KB (0x20000 stride, two 64KB frames).
-        // Map enough for 4 CPUs: 4 × 32 pages = 128 pages = 512KB.
+
+        use arcos_core::memory::paging::early_map_mmio;
+
+        // PL011 UART0 at 0x0900_0000 (QEMU virt). Failure is fatal: serial
+        // is the only console, and we have no way to report why we failed.
+        // SAFETY: Single-threaded early boot, HHDM offset stored above.
+        // early_map_mmio uses bootstrap frames from kernel .bss (frame
+        // allocator is not initialized yet) and writes leaf descriptors
+        // into TTBR1 page tables Limine handed us.
+        if unsafe { early_map_mmio(0x0900_0000) }.is_err() {
+            // SAFETY: wfe is unconditionally legal at EL1.
+            loop { unsafe { core::arch::asm!("wfe", options(nostack, nomem)); } }
+        }
+
+        // GIC Distributor at 0x0800_0000 (QEMU virt) — 64 KiB region (16 pages).
+        // Failure is fatal: scheduling requires GIC for timer interrupts.
+        for page in 0..16u64 {
+            // SAFETY: same invariants as PL011 mapping above.
+            if unsafe { early_map_mmio(0x0800_0000 + page * 0x1000) }.is_err() {
+                // SAFETY: wfe is unconditionally legal at EL1.
+                loop { unsafe { core::arch::asm!("wfe", options(nostack, nomem)); } }
+            }
+        }
+
+        // GIC Redistributor at 0x080A_0000 (QEMU virt). Each CPU's GICR
+        // frame is 128 KiB (0x20000 stride, two 64 KiB frames).
+        // Map enough for 4 CPUs: 4 × 32 pages = 128 pages = 512 KiB.
         for page in 0..128u64 {
-            if let Err(_) = early_map_mmio(0x080A_0000 + page * 0x1000) {
-                loop { core::arch::asm!("wfe", options(nostack, nomem)); }
+            // SAFETY: same invariants as PL011 mapping above.
+            if unsafe { early_map_mmio(0x080A_0000 + page * 0x1000) }.is_err() {
+                // SAFETY: wfe is unconditionally legal at EL1.
+                loop { unsafe { core::arch::asm!("wfe", options(nostack, nomem)); } }
             }
         }
     }
 
-    // Early diagnostic on AArch64: write to PL011 via HHDM to confirm entry
+    // Early diagnostic on AArch64: write to PL011 via HHDM to confirm entry.
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: PL011 UART0 was mapped into HHDM by early_map_mmio above.
-    // write_volatile targets the UART data register (single-threaded boot).
-    unsafe {
+    {
         let hhdm = arcos_core::hhdm_offset();
         let uart = (0x0900_0000u64 + hhdm) as *mut u8;
-        // SAFETY: PL011 UART0 at HHDM address. Just mapped via early_map_mmio.
-        core::ptr::write_volatile(uart, b'K');
+        // SAFETY: PL011 UART0 data register was mapped into HHDM by the
+        // early_map_mmio call above, single-threaded boot, no concurrent
+        // writers. write_volatile is the only operation that needs unsafe.
+        unsafe { core::ptr::write_volatile(uart, b'K'); }
     }
 
     // Initialize serial output FIRST so panic messages are visible
@@ -707,7 +728,13 @@ fn init_kernel_heap() {
         }
     }
 
-    let (phys_base, region_len) = best.expect("No usable memory region large enough for kernel heap");
+    let (phys_base, region_len) = match best {
+        Some(pair) => pair,
+        None => {
+            println!("✗ No usable memory region large enough for kernel heap — halting");
+            arcos_core::halt();
+        }
+    };
     // On boot protocols that deliver "full RAM as one Usable region +
     // overlay reservations" (the RISC-V DTB path), the chosen Usable
     // region can start inside OpenSBI / kernel-image / DTB territory.
@@ -966,10 +993,20 @@ fn init_kernel_object_tables() {
     // `Box<T>` wrappers around `&'static mut [...]` slices — the slot
     // storage lives in the object table region, only the small
     // header lands on the kernel heap.
-    let process_table = ProcessTable::from_object_slice(table.process_slots, hhdm)
-        .expect("failed to wrap ProcessTable around object table slice");
-    let capability_manager = CapabilityManager::from_object_slice(table.capability_slots)
-        .expect("failed to wrap CapabilityManager around object table slice");
+    let process_table = match ProcessTable::from_object_slice(table.process_slots, hhdm) {
+        Some(pt) => pt,
+        None => {
+            println!("✗ Failed to wrap ProcessTable around object table slice — halting");
+            arcos_core::halt();
+        }
+    };
+    let capability_manager = match CapabilityManager::from_object_slice(table.capability_slots) {
+        Some(cm) => cm,
+        None => {
+            println!("✗ Failed to wrap CapabilityManager around object table slice — halting");
+            arcos_core::halt();
+        }
+    };
 
     *PROCESS_TABLE.lock() = Some(process_table);
     *CAPABILITY_MANAGER.lock() = Some(capability_manager);
@@ -1351,9 +1388,13 @@ fn capability_manager_init() {
     use arcos_core::ipc::capability::CapabilityKind;
 
     let mut guard = CAPABILITY_MANAGER.lock();
-    let cap_mgr = guard
-        .as_mut()
-        .expect("CAPABILITY_MANAGER must be initialized by init_kernel_object_tables");
+    let cap_mgr = match guard.as_mut() {
+        Some(m) => m,
+        None => {
+            println!("✗ CAPABILITY_MANAGER not initialized before capability_manager_init — halting");
+            arcos_core::halt();
+        }
+    };
 
     // Only register processes that already exist in the process table (0-2).
     // Processes 3+ are registered on-demand when user tasks are created.
@@ -1463,7 +1504,13 @@ fn object_store_init() {
     // lock) to handshake with virtio-blk and swap in a DiskObjectStore.
     // If the handshake fails (no driver, no device), RAM store persists
     // — arcobj works but objects don't survive reboot.
-    let store = RamObjectStore::new_boxed().expect("RamObjectStore alloc failed");
+    let store = match RamObjectStore::new_boxed() {
+        Some(s) => s,
+        None => {
+            println!("✗ RamObjectStore allocation failed — halting");
+            arcos_core::halt();
+        }
+    };
     let store: alloc::boxed::Box<dyn ObjectStore + Send> = store;
     *OBJECT_STORE.lock() = Some(store);
 
@@ -1481,9 +1528,13 @@ fn process_table_init() {
 
     // Lock order: PROCESS_TABLE (5) -> FRAME_ALLOCATOR (6). Valid.
     let mut pt_guard = PROCESS_TABLE.lock();
-    let pt = pt_guard
-        .as_mut()
-        .expect("PROCESS_TABLE must be initialized by init_kernel_object_tables");
+    let pt = match pt_guard.as_mut() {
+        Some(pt) => pt,
+        None => {
+            println!("✗ PROCESS_TABLE not initialized before process_table_init — halting");
+            arcos_core::halt();
+        }
+    };
 
     let mut fa_guard = FRAME_ALLOCATOR.lock();
 
