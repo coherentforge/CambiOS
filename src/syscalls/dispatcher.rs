@@ -3252,12 +3252,30 @@ mod tests {
 
     // ---- handle_recv_msg / handle_try_recv_msg validation ------------------
     //
-    // Deferred to Cut 3: handle_recv_msg's body transitively references
-    // `arch::yield_save_and_switch`, an asm-defined symbol that only links
-    // on kernel targets. Even branches that never execute the asm pull the
-    // symbol into the linker's resolution set. Cut 3 will land a host stub
-    // for the asm primitives so the full handler bodies are linkable, after
-    // which the buf_len < 36 check on both handlers becomes testable here.
+    // Cut 3a unlocked these: the host asm-stub block in arch/x86_64/mod.rs
+    // (cfg(any(fuzzing, test))) provides `yield_save_and_switch` so handler
+    // bodies referencing it now link in test builds. Validation paths still
+    // exit before any asm symbol is invoked.
+
+    #[test]
+    fn handle_recv_msg_buf_below_header_invalid() {
+        let ctx = fake_ctx();
+        // 36 = 32-byte sender principal + 4-byte from_endpoint.
+        // arg1=ep, arg2=buf, arg3=buf_len=35.
+        assert_eq!(
+            SyscallDispatcher::handle_recv_msg(args(16, 0x1000, 35), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
+
+    #[test]
+    fn handle_try_recv_msg_buf_below_header_invalid() {
+        let ctx = fake_ctx();
+        assert_eq!(
+            SyscallDispatcher::handle_try_recv_msg(args(16, 0x1000, 35), &ctx),
+            Err(SyscallError::InvalidArg),
+        );
+    }
 
     // ========================================================================
     // Cut 2: multi-page traversal — copy_from_user_pages / copy_to_user_pages

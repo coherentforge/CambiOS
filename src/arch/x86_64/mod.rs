@@ -101,7 +101,7 @@ extern "C" {
     pub fn context_switch(current_ctx: *mut CpuContext, next_ctx: *const CpuContext) -> !;
 }
 
-#[cfg(not(fuzzing))]
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     // =================================================================
     // context_save(ctx: *mut CpuContext)
@@ -337,7 +337,7 @@ pub fn cpu_to_saved_context(cpu: &CpuContext, saved: &mut SavedContext) {
 // calls the Rust handler which may decide to switch tasks, then restores registers
 // from the (potentially different) SavedContext and returns via iretq.
 
-#[cfg(not(fuzzing))]
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     ".global timer_isr_stub",
     "timer_isr_stub:",
@@ -511,7 +511,7 @@ extern "C" {
     pub fn yield_save_and_switch();
 }
 
-#[cfg(not(fuzzing))]
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     ".global yield_save_and_switch",
     "yield_save_and_switch:",
@@ -588,15 +588,20 @@ core::arch::global_asm!(
 );
 
 // ============================================================================
-// Fuzz stubs — satisfy linker when cargo-fuzz sets --cfg fuzzing
+// Asm symbol stubs — satisfy linker for non-kernel targets (fuzz + host test)
 // ============================================================================
 //
-// These replace global_asm! symbols during fuzzing. The fuzz targets exercise
-// pure-logic modules (ELF parser, capability, allocator) and never call these
-// kernel runtime primitives, but the linker requires them to exist because
-// non-fuzzing code (SyscallDispatcher, Scheduler) references them.
+// These replace global_asm! symbols on builds that don't / can't link the
+// real bare-metal asm: cargo-fuzz (sets --cfg fuzzing) and host unit tests
+// (cfg(test) on the x86_64-apple-darwin target — the asm directives are
+// ELF-flavored and Mach-O linker doesn't resolve `_yield_save_and_switch`).
+//
+// Fuzz targets exercise pure-logic modules (ELF parser, capability,
+// allocator) and never call these. Host syscall-dispatcher tests exercise
+// validation paths that exit before reaching any asm primitive. In both
+// cases the linker just needs the symbols to exist.
 
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, test))]
 mod fuzz_asm_stubs {
     use crate::scheduler::CpuContext;
 
@@ -605,7 +610,7 @@ mod fuzz_asm_stubs {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn context_restore(_ctx: *const CpuContext) -> ! {
-        unreachable!("context_restore called during fuzzing")
+        unreachable!("context_restore called outside kernel target")
     }
 
     #[unsafe(no_mangle)]
@@ -613,7 +618,7 @@ mod fuzz_asm_stubs {
         _current_ctx: *mut CpuContext,
         _next_ctx: *const CpuContext,
     ) -> ! {
-        unreachable!("context_switch called during fuzzing")
+        unreachable!("context_switch called outside kernel target")
     }
 
     #[unsafe(no_mangle)]

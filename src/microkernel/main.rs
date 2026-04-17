@@ -78,12 +78,11 @@ use limine::request::{
 use x86_64::instructions::hlt;
 use arcos_core::println;
 use arcos_core::BOOT_MODULE_REGISTRY;
-use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, BlockReason, TaskId};
-use arcos_core::ipc::{EndpointId, IpcManager, Message, ProcessId, CapabilityRights};
-use arcos_core::interrupts::{IrqNumber, InterruptContext};
+use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, TaskId};
+use arcos_core::ipc::{EndpointId, IpcManager, ProcessId, CapabilityRights};
 
 // Use the global statics from the library crate
-use arcos_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, INTERRUPT_ROUTER, BOOTSTRAP_PRINCIPAL, OBJECT_STORE};
+use arcos_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, BOOTSTRAP_PRINCIPAL, OBJECT_STORE};
 
 
 
@@ -260,7 +259,11 @@ unsafe extern "C" fn kmain() -> ! {
     unsafe { arcos_core::io::init(); }
 
     // Verify Limine protocol is supported (panics with a message if not)
-    assert!(BASE_REVISION.is_supported(), "Limine base revision not supported!");
+    if !BASE_REVISION.is_supported() {
+        // Serial is up; print a named diagnostic before halting.
+        println!("✗ Limine base revision not supported by this kernel — halting");
+        arcos_core::halt();
+    }
 
     println!("=== CambiOS Microkernel [v0.2.0] ===");
     println!("Booted via Limine\n");
@@ -797,11 +800,14 @@ fn init_kernel_heap() {
     let phys_base = phys_base + safe_offset;
     let region_len = region_len - safe_offset;
 
-    assert!(
-        region_len >= KERNEL_HEAP_SIZE,
-        "Largest usable region too small after skipping low memory ({:#x} < {:#x})",
-        region_len, KERNEL_HEAP_SIZE,
-    );
+    if region_len < KERNEL_HEAP_SIZE {
+        println!(
+            "✗ Largest usable region too small after skipping low memory \
+             ({:#x} < {:#x}) — halting",
+            region_len, KERNEL_HEAP_SIZE,
+        );
+        arcos_core::halt();
+    }
 
     // Use only what we need from this region
     let heap_size = KERNEL_HEAP_SIZE as usize;
@@ -1555,243 +1561,6 @@ fn process_table_init() {
     }
 
     println!("✓ Process table initialized");
-}
-
-/// Helper: Send IPC message and wake receiver
-///
-/// This is the pattern drivers use to send to services.
-/// Uses per-endpoint sharded IPC — only locks the target endpoint shard,
-/// not the global IPC_MANAGER. Different endpoints on different CPUs
-/// never contend on the same lock.
-#[allow(dead_code)]
-fn ipc_send_and_notify(endpoint: EndpointId, msg: Message) -> bool {
-    // Queue the message via sharded IPC (per-endpoint lock only)
-    if arcos_core::SHARDED_IPC.send_message(endpoint, msg).is_err() {
-        return false;
-    }
-
-    // Try to wake the highest-priority receiver across online CPUs.
-    // Only scans ONLINE_CPU_COUNT schedulers (not all MAX_CPUS=256).
-    {
-        let mut best: Option<TaskId> = None;
-        let mut best_priority = arcos_core::scheduler::Priority::IDLE;
-        let cpu_count = arcos_core::ONLINE_CPU_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize;
-
-        for sched_lock in PER_CPU_SCHEDULER.iter().take(cpu_count) {
-            let guard = sched_lock.lock();
-            if let Some(sched) = guard.as_ref() {
-                if let Some(tid) = sched.find_highest_priority_receiver(endpoint.0) {
-                    if let Some(task) = sched.get_task_pub(tid) {
-                        if best.is_none() || task.priority > best_priority {
-                            best = Some(tid);
-                            best_priority = task.priority;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(receiver_id) = best {
-            arcos_core::wake_task_on_cpu(receiver_id);
-        }
-    }
-    
-    true
-}
-
-/// Helper: Try to receive IPC message or block caller
-///
-/// This is the pattern services use to wait for messages.
-/// Returns message if available, blocks caller if queue is empty.
-#[allow(dead_code)]
-fn ipc_recv_or_block(current_task: TaskId, endpoint: EndpointId) -> Option<Message> {
-    // Try to get message via sharded IPC (per-endpoint lock only)
-    if let Some(msg) = arcos_core::SHARDED_IPC.recv_message(endpoint) {
-        return Some(msg);
-    }
-
-    // Queue is empty - block caller on its local CPU's scheduler
-    arcos_core::block_local_task(current_task, BlockReason::MessageWait(endpoint.0));
-
-    None
-}
-
-
-/// Receive IPC message with capability enforcement
-///
-/// Safe version using spinlock guards (no unsafe raw pointers).
-/// Lock ordering: CAPABILITY_MANAGER → IPC_MANAGER   (nested)
-///
-/// Flow:
-/// 1. Receive (process) requests message from endpoint
-/// 2. Capability manager verifies receiver has RECEIVE right
-/// 3. If denied, returns PermissionDenied error
-/// 4. If allowed, returns message or None if queue empty
-#[allow(dead_code)]
-fn ipc_recv_with_capability(
-    receiver_process: ProcessId,
-    endpoint: EndpointId,
-) -> Result<Option<Message>, &'static str> {
-    // Lock order: IPC_MANAGER (must come after CAPABILITY_MANAGER in global order)
-    // Global order is CAPABILITY_MANAGER → IPC_MANAGER , so check capability FIRST
-    let cap_guard = CAPABILITY_MANAGER.lock();
-    let cap_mgr = cap_guard.as_ref().unwrap();
-    if cap_mgr.verify_access(receiver_process, endpoint, CapabilityRights::RECV_ONLY).is_err() {
-        return Err("Access denied - insufficient capabilities");
-    }
-    drop(cap_guard); // Explicitly release capability lock
-    
-    // Now acquire IPC manager to receive message
-    let mut ipc_guard = IPC_MANAGER.lock();
-    let ipc_mgr = ipc_guard.as_mut().unwrap();
-    Ok(ipc_mgr.recv_message(endpoint))
-}
-
-// ============================================================================
-// Synchronous IPC helpers
-// ============================================================================
-
-/// Synchronous send: deposit message on endpoint, block sender until receiver picks up
-///
-/// Lock ordering: IPC_MANAGER released before SCHEDULER acquired.
-///
-/// Returns true if send completed (receiver was already waiting),
-/// false if sender was blocked (will be woken when receiver calls sync_recv).
-#[allow(dead_code)]
-fn sync_ipc_send(sender_task: TaskId, endpoint: EndpointId, msg: Message) -> bool {
-    use arcos_core::ipc::SyncSendResult;
-
-    // Deposit via sharded IPC (per-endpoint lock only)
-    let result = arcos_core::SHARDED_IPC.sync_send(endpoint, msg, sender_task.0);
-
-    match result {
-        Ok(SyncSendResult::ReceiverWoken(receiver_task_id)) => {
-            arcos_core::wake_task_on_cpu(TaskId(receiver_task_id));
-            true
-        }
-        Ok(SyncSendResult::SenderMustBlock) => {
-            arcos_core::block_local_task(sender_task, BlockReason::SyncSendWait(endpoint.0));
-            false
-        }
-        Err(_) => false,
-    }
-}
-
-/// Synchronous receive: pick up message or block until one arrives
-///
-/// Uses per-endpoint sharded IPC — endpoint lock released before scheduler.
-#[allow(dead_code)]
-fn sync_ipc_recv(receiver_task: TaskId, endpoint: EndpointId) -> Option<Message> {
-    use arcos_core::ipc::SyncRecvResult;
-
-    let result = arcos_core::SHARDED_IPC.sync_recv(endpoint, receiver_task.0);
-
-    match result {
-        Ok(SyncRecvResult::Message(msg, wake_sender)) => {
-            if let Some(sender_task_id) = wake_sender {
-                arcos_core::wake_task_on_cpu(TaskId(sender_task_id));
-            }
-            Some(msg)
-        }
-        Ok(SyncRecvResult::ReceiverMustBlock) => {
-            arcos_core::block_local_task(receiver_task, BlockReason::SyncRecvWait(endpoint.0));
-            None
-        }
-        Err(_) => None,
-    }
-}
-
-/// Synchronous call: send message + block until reply (RPC pattern)
-///
-/// Uses per-endpoint sharded IPC — endpoint lock released before scheduler.
-#[allow(dead_code)]
-fn sync_ipc_call(caller_task: TaskId, endpoint: EndpointId, msg: Message) {
-    use arcos_core::ipc::SyncCallResult;
-
-    let result = arcos_core::SHARDED_IPC.sync_call(endpoint, msg, caller_task.0);
-
-    match result {
-        Ok(SyncCallResult::ReceiverWoken(receiver_task_id)) => {
-            arcos_core::wake_task_on_cpu(TaskId(receiver_task_id));
-            arcos_core::block_local_task(caller_task, BlockReason::SyncReplyWait(endpoint.0));
-        }
-        Ok(SyncCallResult::CallerMustBlock) => {
-            arcos_core::block_local_task(caller_task, BlockReason::SyncReplyWait(endpoint.0));
-        }
-        Err(_) => {}
-    }
-}
-
-/// Synchronous reply: complete an RPC cycle by sending reply to blocked caller
-///
-/// Uses per-endpoint sharded IPC — endpoint lock released before scheduler.
-#[allow(dead_code)]
-fn sync_ipc_reply(endpoint: EndpointId, reply: Message) -> bool {
-    let caller_task = arcos_core::SHARDED_IPC.sync_reply(endpoint, reply);
-
-    match caller_task {
-        Ok(caller_task_id) => {
-            arcos_core::wake_task_on_cpu(TaskId(caller_task_id));
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// Dispatch an interrupt to its registered driver
-///
-/// This is the critical path that bridges hardware events to driver tasks:
-/// 
-/// 1. Hardware generates interrupt (e.g., timer tick, keyboard press)
-/// 2. CPU delivers to IDT handler 
-/// 3. Handler calls this function with IRQ number
-/// 4. Look up which driver (task) is registered to handle this IRQ
-/// 5. Create InterruptContext with event details
-/// 6. Queue IPC message to driver's endpoint
-/// 7. Wake driver task (remove from Blocked state)
-/// 8. Scheduler will run driver on next schedule() call
-///
-/// Lock ordering: sequential (non-nested), so global order does not apply.
-/// INTERRUPT_ROUTER released before IPC_MANAGER acquired.
-/// IPC_MANAGER released before SCHEDULER acquired.
-///
-/// Result: Drivers don't poll or spin; they sleep until their interrupt fires.
-#[allow(dead_code)]
-pub fn dispatch_interrupt(irq: IrqNumber, timestamp_ticks: u64) {
-    // Step 1: Look up handler task (acquire and release INTERRUPT_ROUTER early)
-    let route_info = {
-        let router = INTERRUPT_ROUTER.lock();
-        router.lookup(irq)
-    }; // router lock released here
-    
-    let route = match route_info {
-        Some(r) => r,
-        None => return, // No handler registered for this IRQ
-    };
-    
-    // Step 2: Create interrupt context message
-    let context = InterruptContext::new(irq, timestamp_ticks, 0);
-    let message_data = [
-        (context.irq.0 as u32) as u8,
-        (timestamp_ticks & 0xFF) as u8,
-        ((timestamp_ticks >> 8) & 0xFF) as u8,
-        ((timestamp_ticks >> 16) & 0xFF) as u8,
-    ];
-
-    // Step 3: Create IPC message to driver
-    let mut msg = Message::new(
-        EndpointId(0),                      // From kernel (endpoint 0)
-        EndpointId(route.irq.0 as u32),    // To driver's IRQ endpoint
-    );
-    let _ = msg.set_payload(&message_data);
-
-    // Step 4: Queue message via sharded IPC (per-endpoint lock only)
-    if arcos_core::SHARDED_IPC.send_message(EndpointId(route.irq.0 as u32), msg).is_err() {
-        return; // Failed to queue
-    }
-    
-    // Step 5: Wake the driver task on its owning CPU
-    arcos_core::wake_task_on_cpu(route.handler_task);
 }
 
 // ============================================================================

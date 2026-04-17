@@ -285,7 +285,7 @@ extern "C" {
 //
 // Called via `call` from Rust, returns via `ret`. The far return in the
 // middle switches CS to KERNEL_CS without disturbing the outer call/ret.
-#[cfg(not(fuzzing))]
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     ".global gdt_reload_segments",
     "gdt_reload_segments:",
