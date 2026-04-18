@@ -152,7 +152,7 @@ Test coverage of each layer (current counts and what they exercise) lives in [ST
 ## Divergence
 
 - **Date:** 2026-04-17
-- **Implementation:** commit `<TBD — backfill when the enum-dispatch change lands>`
+- **Implementation:** commit `1f5cb2d` (`ipc/interceptor: dyn dispatch → IpcInterceptorBackend enum`)
 - **Trigger:** Formal-verification audit identified `interceptor: Option<Box<dyn IpcInterceptor>>` (on both `IpcManager` and `ShardedIpcManager`) as a `dyn` trait object on a kernel hot path. Every IPC `send` and `recv` invokes the interceptor; `SyscallDispatcher::dispatch` invokes it pre-handler. CLAUDE.md's Formal Verification rule against trait objects in kernel hot paths applies. Same precedent as [ADR-003 § Divergence](003-content-addressed-storage-and-identity.md#divergence) for `OBJECT_STORE`.
 
 ### What changed
