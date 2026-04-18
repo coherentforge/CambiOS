@@ -188,7 +188,7 @@ Test counts and what each test covers (Principal construction, IPC sender stampi
 ## Divergence
 
 - **Date:** 2026-04-17
-- **Implementation:** commit `<TBD — backfill when the enum-dispatch change lands>`
+- **Implementation:** commit `6aec800` (`fs/OBJECT_STORE: dyn dispatch → ObjectStoreBackend enum`)
 - **Trigger:** Formal-verification audit of [src/microkernel/main.rs](../../src/microkernel/main.rs) surfaced `static OBJECT_STORE: Spinlock<Option<Box<dyn fs::ObjectStore + Send>>>` ([src/lib.rs:533](../../src/lib.rs#L533)) as a `dyn` trait object on a kernel hot path. CLAUDE.md's Formal Verification rule says: *"No trait objects in kernel hot paths. Monomorphized generics are statically analyzable; dynamic dispatch is not."* `ObjectStore::get` / `put` / `delete` / `list` are called from every `SYS_OBJ_*` syscall handler — unambiguously a hot path.
 
 ### What changed
