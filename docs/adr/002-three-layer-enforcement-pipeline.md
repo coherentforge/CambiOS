@@ -148,3 +148,69 @@ Test coverage of each layer (current counts and what they exercise) lives in [ST
 - `src/ipc/mod.rs`: send/recv with capability + interceptor enforcement
 - `src/syscalls/dispatcher.rs`: Syscall dispatch with pre-dispatch interceptor
 - `src/loader/mod.rs`: BinaryVerifier trait + DefaultVerifier
+
+## Divergence
+
+- **Date:** 2026-04-17
+- **Implementation:** commit `<TBD — backfill when the enum-dispatch change lands>`
+- **Trigger:** Formal-verification audit identified `interceptor: Option<Box<dyn IpcInterceptor>>` (on both `IpcManager` and `ShardedIpcManager`) as a `dyn` trait object on a kernel hot path. Every IPC `send` and `recv` invokes the interceptor; `SyscallDispatcher::dispatch` invokes it pre-handler. CLAUDE.md's Formal Verification rule against trait objects in kernel hot paths applies. Same precedent as [ADR-003 § Divergence](003-content-addressed-storage-and-identity.md#divergence) for `OBJECT_STORE`.
+
+### What changed
+
+Kernel-side interceptor dispatch moves from `Box<dyn IpcInterceptor>` to an enum dispatch shim:
+
+```rust
+pub enum IpcInterceptorBackend {
+    Default(DefaultInterceptor),
+    // future: PolicyService(PolicyServiceInterceptor) — when ADR-006 lands
+}
+
+impl IpcInterceptor for IpcInterceptorBackend {
+    fn on_send(&self, sender: ProcessId, endpoint: EndpointId, msg: &Message)
+        -> InterceptDecision
+    {
+        match self {
+            Self::Default(i) => i.on_send(sender, endpoint, msg),
+        }
+    }
+    // ... on_recv / on_delegate / on_syscall delegated identically
+}
+
+// In IpcManager and ShardedIpcManager:
+interceptor: Option<IpcInterceptorBackend>,
+```
+
+### Reconciling with the original "custom policies without kernel recompilation" intent
+
+The original ADR-002 text argued that the trait-object design enables custom interceptors without recompiling the kernel. This intent was **superseded by ADR-006** before the interceptor migration even happened. ADR-006 reframes the substitution model: policy decisions move *outside the kernel entirely* into a userspace `policy-service`, which the in-kernel `IpcInterceptor` upcalls into. The kernel-side interceptor becomes a thin client of the external service, not a swappable in-kernel policy module.
+
+In practice, "swap a different in-kernel interceptor without recompiling" was never viable for CambiOS — the kernel is signed, monolithic, and rooted in the bootstrap Principal. Any in-kernel code change requires a kernel rebuild + re-signing. The runtime extensibility ADR-002 sought is achieved by the policy-service IPC boundary, not by `dyn` dispatch in kernel code.
+
+So the in-kernel interceptor impl set is closed-world by construction:
+- `DefaultInterceptor` — current; permissive baseline (endpoint bounds, payload size, no self-send, all syscalls allowed).
+- `PolicyServiceInterceptor` — future; thin upcall client per ADR-006 (lands when the policy-service IPC path is built).
+- Possibly a `LegacyInterceptor` or test-only impl in unit-test scopes (still permitted: tests can use `dyn` per the Formal Verification rule's "non-test kernel code" qualifier).
+
+That's three enumerable variants, not an open extension point. Enum dispatch fits the actual world.
+
+### What did *not* change
+
+- **The `IpcInterceptor` trait remains the specification** with all four hooks (`on_send`, `on_recv`, `on_delegate`, `on_syscall`), `Send + Sync` bounds, and current decision/deny-reason types. Backends still `impl IpcInterceptor for ...`.
+- **The three-layer enforcement pipeline** described in this ADR is intact: pre-dispatch hook → capability check → structural validation. Only the in-kernel storage/dispatch of the hook changes.
+- **Test code using `dyn IpcInterceptor`** (e.g., the `DenyAllSends` mock in `interceptor.rs`'s test module) is unchanged — `dyn` is permitted in non-kernel test scopes.
+
+### Cost
+
+Adding a new in-kernel interceptor (e.g., when `PolicyServiceInterceptor` lands) requires one new enum variant and one new arm per delegated method (4 hooks × 1 arm each = 4 arms). Closed-world, exhaustive match, monomorphized. The compiler enforces every method updates the new variant — exactly the verification-friendly cost.
+
+### Why not other options
+
+| Considered | Why rejected |
+|---|---|
+| Keep `dyn`, document the verification debt in `ASSUMPTIONS.md` | Pure deferral. The fix is structurally cheap and the debt is on the hot IPC path. Same logic as ADR-003. |
+| Drop the `IpcInterceptor` trait; single concrete struct with internal `Backend` enum | Loses the spec/impl separation. The trait is the layer-1/layer-3 contract that ADR-006's policy-service implementation also satisfies via its in-kernel client. Conflating them erases the audit point. |
+| Static-dispatch generics on `IpcManager<I: IpcInterceptor>` | Doesn't compile for the global `IPC_MANAGER` static — same blocker as `OBJECT_STORE`. |
+
+### Verification
+
+After this change, every IPC `send`/`recv`, every delegation, and every syscall pre-dispatch dispatches via match-arm calls. The trait remains as the specification. The kernel binary contains no `dyn IpcInterceptor` references. The two `// VERIFICATION DEBT:` markers in `src/ipc/mod.rs` (and the corresponding [STATUS.md § Known issues](../../STATUS.md#known-issues) entry) are removed in the same change.

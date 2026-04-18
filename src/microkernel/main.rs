@@ -1328,13 +1328,15 @@ fn ipc_init() {
     };
 
     // Install zero-trust IPC interceptor on legacy IPC_MANAGER
-    use arcos_core::ipc::interceptor::DefaultInterceptor;
-    ipc.set_interceptor(Box::new(DefaultInterceptor::new()));
+    use arcos_core::ipc::interceptor::{DefaultInterceptor, IpcInterceptorBackend};
+    // Enum-dispatch shim per ADR-002 § Divergence — no `dyn` trait object.
+    ipc.set_interceptor(IpcInterceptorBackend::Default(DefaultInterceptor::new()));
 
     *IPC_MANAGER.lock() = Some(ipc);
 
-    // Also install interceptor on the sharded IPC manager
-    arcos_core::SHARDED_IPC.set_interceptor(Box::new(DefaultInterceptor::new()));
+    // Also install interceptor on the sharded IPC manager.
+    arcos_core::SHARDED_IPC
+        .set_interceptor(IpcInterceptorBackend::Default(DefaultInterceptor::new()));
 
     println!("✓ IPC manager ready [interceptor active, per-endpoint sharding enabled]");
 }

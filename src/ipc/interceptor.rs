@@ -150,6 +150,81 @@ impl DefaultInterceptor {
     }
 }
 
+// ============================================================================
+// IpcInterceptorBackend — enum-dispatch shim for kernel-side interceptor
+// ============================================================================
+//
+// The trait above is the *specification* — what every backend must implement.
+// `IpcInterceptorBackend` is the *impl shim* used at the kernel-side
+// `IpcManager.interceptor` and `ShardedIpcManager.interceptor` fields. It
+// exists to satisfy CLAUDE.md's Formal Verification rule against `dyn`
+// dispatch on kernel hot paths (interceptor runs on every IPC send/recv
+// and every syscall pre-dispatch). See ADR-002 § Divergence for the full
+// decision rationale (and the reconciliation with ADR-006's reframe of
+// runtime extensibility into the userspace policy-service).
+//
+// In-kernel impl set is closed-world by construction:
+//   - Default: permissive baseline (current).
+//   - PolicyService: thin upcall client (future, when ADR-006 lands).
+// Adding a new variant = one new arm in each of the 4 trait methods.
+
+/// Enum-dispatch shim for `IpcInterceptor` backends installed at the
+/// `IpcManager.interceptor` and `ShardedIpcManager.interceptor` fields.
+/// See module-level note above and ADR-002 § Divergence.
+pub enum IpcInterceptorBackend {
+    /// Permissive baseline interceptor — endpoint bounds, payload size,
+    /// no self-send, all syscalls allowed.
+    Default(DefaultInterceptor),
+    // Future: PolicyService(PolicyServiceInterceptor) — lands when ADR-006's
+    // userspace policy-service IPC path is built. Until then, this enum has
+    // exactly one variant.
+}
+
+impl IpcInterceptor for IpcInterceptorBackend {
+    fn on_send(
+        &self,
+        sender: ProcessId,
+        endpoint: EndpointId,
+        msg: &Message,
+    ) -> InterceptDecision {
+        match self {
+            Self::Default(i) => i.on_send(sender, endpoint, msg),
+        }
+    }
+
+    fn on_recv(
+        &self,
+        receiver: ProcessId,
+        endpoint: EndpointId,
+    ) -> InterceptDecision {
+        match self {
+            Self::Default(i) => i.on_recv(receiver, endpoint),
+        }
+    }
+
+    fn on_delegate(
+        &self,
+        source: ProcessId,
+        target: ProcessId,
+        endpoint: EndpointId,
+        rights: CapabilityRights,
+    ) -> InterceptDecision {
+        match self {
+            Self::Default(i) => i.on_delegate(source, target, endpoint, rights),
+        }
+    }
+
+    fn on_syscall(
+        &self,
+        caller: ProcessId,
+        syscall: SyscallNumber,
+    ) -> InterceptDecision {
+        match self {
+            Self::Default(i) => i.on_syscall(caller, syscall),
+        }
+    }
+}
+
 impl IpcInterceptor for DefaultInterceptor {
     fn on_send(
         &self,

@@ -13,6 +13,11 @@ pub mod interceptor;
 extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt;
+// Bring the IpcInterceptor trait into scope so calls like `interceptor.on_send(...)`
+// on `&IpcInterceptorBackend` resolve via its trait impl (ADR-002 § Divergence).
+// Previously implicit when the field was `Box<dyn IpcInterceptor>`; now required
+// because dispatch is monomorphized through the enum.
+use interceptor::IpcInterceptor as _;
 
 /// SCAFFOLDING: maximum number of IPC endpoints in the system.
 /// Why: one endpoint per service in the simple case. Sharded IPC has one
@@ -400,14 +405,10 @@ pub struct IpcManager {
     sync_channels: [SyncChannel; MAX_ENDPOINTS],
     /// Zero-trust interceptor (set after boot init).
     ///
-    /// VERIFICATION DEBT (CLAUDE.md Formal Verification — "no trait objects in
-    /// kernel hot paths"): IPC interceptor dispatch runs on every IPC send/recv.
-    /// Migrate to enum-dispatch following the ObjectStore precedent in ADR-003
-    /// § Divergence. Pattern: `enum IpcInterceptorBackend { Default(...),
-    /// PolicyService(...), ... } + impl IpcInterceptor for IpcInterceptorBackend`.
-    /// The trait stays as the specification; the enum monomorphizes dispatch.
-    /// See [STATUS.md § Known issues] for tracking.
-    interceptor: Option<Box<dyn interceptor::IpcInterceptor>>,
+    /// Held as `IpcInterceptorBackend` (enum-dispatch shim) so dispatch is
+    /// monomorphized per ADR-002 § Divergence. The trait `IpcInterceptor`
+    /// remains the specification each backend implements.
+    interceptor: Option<interceptor::IpcInterceptorBackend>,
 }
 
 /// Synchronous IPC channel for a single endpoint
@@ -638,7 +639,7 @@ impl IpcManager {
     /// Install a zero-trust interceptor for IPC policy enforcement.
     ///
     /// Called once during boot after IpcManager is allocated.
-    pub fn set_interceptor(&mut self, interceptor: Box<dyn interceptor::IpcInterceptor>) {
+    pub fn set_interceptor(&mut self, interceptor: interceptor::IpcInterceptorBackend) {
         self.interceptor = Some(interceptor);
     }
 
@@ -856,10 +857,6 @@ impl IpcManager {
         Some(self.sync_channels[endpoint.0 as usize].state())
     }
 
-    /// Get a reference to the installed interceptor (if any).
-    pub fn interceptor(&self) -> Option<&dyn interceptor::IpcInterceptor> {
-        self.interceptor.as_deref()
-    }
 }
 
 /// Result of a synchronous send operation
@@ -940,13 +937,11 @@ pub struct ShardedIpcManager {
     /// Protected by its own lock since it's rarely accessed and never mutated
     /// after boot.
     ///
-    /// VERIFICATION DEBT (CLAUDE.md Formal Verification — "no trait objects in
-    /// kernel hot paths"): same debt as the legacy `IpcManager.interceptor`
-    /// field above; migrate to enum-dispatch per the ADR-003 § Divergence
-    /// precedent (`enum IpcInterceptorBackend { ... } + impl IpcInterceptor
-    /// for IpcInterceptorBackend`). Both sites must be migrated together so
-    /// the type and the swap mechanism stay symmetric.
-    interceptor: Spinlock<Option<Box<dyn interceptor::IpcInterceptor>>>,
+    /// Held as `IpcInterceptorBackend` (enum-dispatch shim) per ADR-002
+    /// § Divergence — same migration as the `IpcManager.interceptor` field
+    /// above. Both sites moved together to keep the type and swap mechanism
+    /// symmetric.
+    interceptor: Spinlock<Option<interceptor::IpcInterceptorBackend>>,
 }
 
 impl Default for ShardedIpcManager {
@@ -963,7 +958,7 @@ impl ShardedIpcManager {
     }
 
     /// Install a zero-trust interceptor (called once during boot).
-    pub fn set_interceptor(&self, i: Box<dyn interceptor::IpcInterceptor>) {
+    pub fn set_interceptor(&self, i: interceptor::IpcInterceptorBackend) {
         *self.interceptor.lock() = Some(i);
     }
 
