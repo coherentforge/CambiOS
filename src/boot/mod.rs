@@ -210,6 +210,22 @@ pub struct BootInfo {
     /// `CNTFRQ_EL0` directly).
     pub timer_base_frequency_hz: Option<u32>,
 
+    /// Platform-level interrupt controller MMIO range
+    /// `(phys_base, size_bytes)`, when the boot adapter has
+    /// authoritative knowledge. RISC-V populates from the DTB's
+    /// `/soc/plic@*` node's `reg` property; x86_64 and AArch64 leave
+    /// this `None` (APIC/IOAPIC and GIC addresses arrive via ACPI /
+    /// separate paths).
+    pub plic_mmio: Option<(u64, u64)>,
+
+    /// Console IRQ number — the hardware interrupt line the primary
+    /// UART signals on. RISC-V populates from the DTB's
+    /// `/soc/serial@*/interrupts` property (single-cell encoding on
+    /// QEMU virt — source ID into the PLIC). Left `None` on x86_64
+    /// (IRQ 4 hardcoded in legacy ISA) and AArch64 (PL011 IRQ from
+    /// GIC).
+    pub console_irq: Option<u32>,
+
     memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
     memory_region_count: usize,
 
@@ -233,6 +249,8 @@ impl BootInfo {
             hhdm_offset: 0,
             rsdp_phys: None,
             timer_base_frequency_hz: None,
+            plic_mmio: None,
+            console_irq: None,
             memory_regions: [ZERO_REGION; MAX_MEMORY_REGIONS],
             memory_region_count: 0,
             framebuffers: [None; MAX_FRAMEBUFFERS],

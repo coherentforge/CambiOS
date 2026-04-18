@@ -172,19 +172,75 @@ fn read_name<'a>(data: &'a [u8], offset: usize) -> (&'a [u8], usize) {
     (name, aligned)
 }
 
-/// Match a node name against `/memory` or `/memory@<addr>`. The DTB
-/// encodes `memory@80000000` for a memory node at physical 0x80000000.
-fn is_memory_node(name: &[u8]) -> bool {
-    if !name.starts_with(b"memory") {
-        return false;
-    }
-    let rest = &name[b"memory".len()..];
-    rest.is_empty() || rest.starts_with(b"@")
+/// Interesting-ancestor kind tracked per depth in the DTB walker.
+///
+/// Replaces earlier parallel boolean stacks (`in_memory_stack`,
+/// `in_cpus_stack`) with one enum per depth — same information density,
+/// easier to extend, and the property-dispatch match reads as a single
+/// switch on `device_stack[depth-1]` instead of a cascade of `if`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    /// Not a node we care about.
+    None,
+    /// `/memory@*` — `reg` property gives usable RAM ranges.
+    Memory,
+    /// `/cpus` — parent of per-hart nodes; owns the platform
+    /// `timebase-frequency` property.
+    Cpus,
+    /// `/soc` — the bus-like parent that holds PLIC, serial, virtio,
+    /// etc. We never read props directly from `/soc` but descend into
+    /// its children.
+    Soc,
+    /// `/soc/plic@*` — `reg` → MMIO base + size of the PLIC.
+    Plic,
+    /// `/soc/serial@*` — `interrupts` → PLIC source ID of the console
+    /// UART.
+    Serial,
 }
 
-/// Match a node name against `/cpus` (always un-addressed; no `@`).
-fn is_cpus_node(name: &[u8]) -> bool {
-    name == b"cpus"
+/// Classify a node name into a [`DeviceKind`] given its depth and the
+/// parent node's kind. Called from the walker on every `BEGIN_NODE`.
+///
+/// The walker treats nodes at depth 1 as root-level (parent = the
+/// unnamed root), and depth 2 as `/soc/*` children when `parent ==
+/// DeviceKind::Soc`. Deeper nesting is `None` — we do not care about
+/// anything below `/soc/plic@*/interrupts-extended`'s referenced
+/// interrupt-controller subnodes.
+fn classify_node(depth: usize, parent: DeviceKind, name: &[u8]) -> DeviceKind {
+    match depth {
+        1 => {
+            if name.starts_with(b"memory") {
+                let rest = &name[b"memory".len()..];
+                if rest.is_empty() || rest.starts_with(b"@") {
+                    return DeviceKind::Memory;
+                }
+            }
+            if name == b"cpus" {
+                return DeviceKind::Cpus;
+            }
+            if name == b"soc" {
+                return DeviceKind::Soc;
+            }
+            DeviceKind::None
+        }
+        2 if parent == DeviceKind::Soc => {
+            if name.starts_with(b"plic") {
+                // Matches both `plic` and `plic@0c000000` forms.
+                let rest = &name[b"plic".len()..];
+                if rest.is_empty() || rest.starts_with(b"@") {
+                    return DeviceKind::Plic;
+                }
+            }
+            if name.starts_with(b"serial") {
+                let rest = &name[b"serial".len()..];
+                if rest.is_empty() || rest.starts_with(b"@") {
+                    return DeviceKind::Serial;
+                }
+            }
+            DeviceKind::None
+        }
+        _ => DeviceKind::None,
+    }
 }
 
 /// Parse `reg` property values as (address, size) pairs. Assumes
@@ -207,17 +263,56 @@ fn parse_reg_pairs(prop_value: &[u8], mut callback: impl FnMut(u64, u64)) {
     }
 }
 
-/// Walk the DTB, calling `on_memory(base, size)` for each
-/// `/memory@*` node's `reg` property and `on_cpu_timebase(hz)` for
-/// the `/cpus` node's `timebase-frequency` property (once per DTB).
+/// Collected facts the kernel needs from the DTB. Populated by a
+/// single pass of [`walk_dtb`]; consumed by [`populate`] to build the
+/// public `BootInfo`.
+///
+/// Everything here is plain data — no kernel types leak in. The walker
+/// is deliberately the only place that touches big-endian FDT byte
+/// layout.
+struct DtbFacts {
+    memory: [(u64, u64); super::MAX_MEMORY_REGIONS],
+    memory_count: usize,
+    timer_base_hz: Option<u32>,
+    plic_mmio: Option<(u64, u64)>,
+    console_irq: Option<u32>,
+    totalsize: u32,
+}
+
+impl DtbFacts {
+    const fn new() -> Self {
+        Self {
+            // Manual init — `Default` on arrays > 32 requires const
+            // generics + manual impl we don't need here.
+            memory: [(0u64, 0u64); super::MAX_MEMORY_REGIONS],
+            memory_count: 0,
+            timer_base_hz: None,
+            plic_mmio: None,
+            console_irq: None,
+            totalsize: 0,
+        }
+    }
+
+    fn push_memory(&mut self, base: u64, size: u64) {
+        if self.memory_count < self.memory.len() {
+            self.memory[self.memory_count] = (base, size);
+            self.memory_count += 1;
+        }
+    }
+}
+
+/// Walk the DTB and collect the facts the kernel needs in one pass.
+/// Returns `None` on invalid/truncated FDT.
+///
+/// Matches:
+/// - `/memory@*` → `reg` → memory regions (usable RAM).
+/// - `/cpus` → `timebase-frequency` → platform timer tick rate.
+/// - `/soc/plic@*` → `reg` → PLIC MMIO base + size.
+/// - `/soc/serial@*` → `interrupts` → console IRQ source ID.
 ///
 /// # Safety
 /// `dtb_phys` must point at a valid FDT blob.
-unsafe fn walk_dtb(
-    dtb_phys: u64,
-    mut on_memory: impl FnMut(u64, u64),
-    mut on_cpu_timebase: impl FnMut(u32),
-) -> Option<u32> {
+unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
     let ptr = dtb_phys as *const u8;
 
     // SAFETY: caller guarantees a valid FDT at this address.
@@ -236,24 +331,25 @@ unsafe fn walk_dtb(
     let struct_block = &full_blob[struct_start..struct_end];
 
     // Strings block — prop name lookups.
-    // We match prop names via `nameoff` into the strings block.
+    let strings_start = header.off_dt_strings as usize;
+    let strings_end = strings_start + header.size_dt_strings as usize;
+    if strings_end > full_blob.len() {
+        return None;
+    }
+    let strings = &full_blob[strings_start..strings_end];
 
-    // State machine: walk tokens. Track depth + per-depth flags for
-    // which interesting-ancestor context the current node inherits
-    // from. Only direct children of the root matter for our match set
-    // (/memory@* and /cpus), but the stack-based approach generalizes
-    // if a future addition needs deeper tracking.
+    let mut facts = DtbFacts::new();
+    facts.totalsize = header.totalsize;
+
+    // Walk state.
     let mut depth: usize = 0;
     let mut pos: usize = 0;
-    let mut in_memory_node = false;
-    let mut in_cpus_node = false;
     let mut tokens_processed = 0;
 
-    // Parallel stacks: at each ancestor depth, is this ancestor the
-    // /memory or /cpus node? Flags rebuild on END_NODE by re-OR'ing
-    // the still-active depths.
-    let mut in_memory_stack = [false; MAX_DEPTH];
-    let mut in_cpus_stack = [false; MAX_DEPTH];
+    // Stack of DeviceKind per ancestor depth. `device_stack[d]` is the
+    // kind of the node opened at depth d. `current_kind()` below looks
+    // up the innermost depth's kind to dispatch property parsing.
+    let mut device_stack = [DeviceKind::None; MAX_DEPTH];
 
     while pos + 4 <= struct_block.len() && tokens_processed < MAX_TOKENS {
         tokens_processed += 1;
@@ -266,17 +362,16 @@ unsafe fn walk_dtb(
                 let (name, next_pos) = read_name(struct_block, pos);
                 pos = next_pos;
 
-                let is_mem = depth == 1 && is_memory_node(name);
-                let is_cpus = depth == 1 && is_cpus_node(name);
+                let parent = if depth == 0 {
+                    DeviceKind::None
+                } else if depth - 1 < MAX_DEPTH {
+                    device_stack[depth - 1]
+                } else {
+                    DeviceKind::None
+                };
+                let kind = classify_node(depth, parent, name);
                 if depth < MAX_DEPTH {
-                    in_memory_stack[depth] = is_mem;
-                    in_cpus_stack[depth] = is_cpus;
-                }
-                if is_mem {
-                    in_memory_node = true;
-                }
-                if is_cpus {
-                    in_cpus_node = true;
+                    device_stack[depth] = kind;
                 }
                 depth += 1;
             }
@@ -285,15 +380,8 @@ unsafe fn walk_dtb(
                     break; // Malformed — END without matching BEGIN
                 }
                 depth -= 1;
-                // Rebuild "in interesting ancestor" flags after leaving
-                // one level. In practice only the direct ancestor at
-                // depth 1 ever matches; the stack scan is defensive.
-                if depth > 0 {
-                    in_memory_node = in_memory_stack[..depth].iter().any(|&f| f);
-                    in_cpus_node = in_cpus_stack[..depth].iter().any(|&f| f);
-                } else {
-                    in_memory_node = false;
-                    in_cpus_node = false;
+                if depth < MAX_DEPTH {
+                    device_stack[depth] = DeviceKind::None;
                 }
             }
             FDT_PROP => {
@@ -305,26 +393,31 @@ unsafe fn walk_dtb(
                 let nameoff = be_u32_at(struct_block, pos + 4) as usize;
                 pos += 8;
 
-                // Bounds-check the value.
                 if pos + len > struct_block.len() {
                     break;
                 }
                 let value = &struct_block[pos..pos + len];
                 pos = (pos + len + 3) & !3; // align to 4
 
-                if !in_memory_node && !in_cpus_node {
+                // Which interesting node are we inside? `depth - 1`
+                // because the prop belongs to the most recently opened
+                // node, and we incremented depth on BEGIN_NODE.
+                if depth == 0 {
+                    continue;
+                }
+                let kind = if depth - 1 < MAX_DEPTH {
+                    device_stack[depth - 1]
+                } else {
+                    DeviceKind::None
+                };
+                if kind == DeviceKind::None {
                     continue;
                 }
 
                 // Resolve the property name from the strings block.
-                let strings_start = header.off_dt_strings as usize;
-                let strings_end = strings_start + header.size_dt_strings as usize;
-                if nameoff >= header.size_dt_strings as usize
-                    || strings_end > full_blob.len()
-                {
+                if nameoff >= header.size_dt_strings as usize {
                     continue;
                 }
-                let strings = &full_blob[strings_start..strings_end];
                 let prop_name_end = strings[nameoff..]
                     .iter()
                     .position(|&b| b == 0)
@@ -332,34 +425,47 @@ unsafe fn walk_dtb(
                     .unwrap_or(strings.len());
                 let prop_name = &strings[nameoff..prop_name_end];
 
-                if in_memory_node && prop_name == b"reg" {
-                    parse_reg_pairs(value, |base, size| {
-                        on_memory(base, size);
-                    });
-                } else if in_cpus_node && prop_name == b"timebase-frequency" {
-                    // timebase-frequency is usually a u32 at `/cpus`.
-                    // On some DTBs it is per-cpu, but QEMU virt and
-                    // every standards-compliant RISC-V platform we
-                    // care about emit it at the parent.
-                    if value.len() >= 4 {
-                        on_cpu_timebase(be_u32_at(value, 0));
+                match (kind, prop_name) {
+                    (DeviceKind::Memory, b"reg") => {
+                        parse_reg_pairs(value, |base, size| {
+                            facts.push_memory(base, size);
+                        });
                     }
+                    (DeviceKind::Cpus, b"timebase-frequency") => {
+                        // u32 at /cpus on QEMU virt and every
+                        // standards-compliant RISC-V platform we care
+                        // about.
+                        if facts.timer_base_hz.is_none() && value.len() >= 4 {
+                            facts.timer_base_hz = Some(be_u32_at(value, 0));
+                        }
+                    }
+                    (DeviceKind::Plic, b"reg") => {
+                        // Under /soc `#address-cells = #size-cells =
+                        // 2`. One pair = 16 bytes.
+                        if facts.plic_mmio.is_none() && value.len() >= 16 {
+                            let base = be_u64_at(value, 0);
+                            let size = be_u64_at(value, 8);
+                            facts.plic_mmio = Some((base, size));
+                        }
+                    }
+                    (DeviceKind::Serial, b"interrupts") => {
+                        // QEMU virt encodes the console IRQ as a
+                        // single u32 (PLIC source ID). Multi-cell
+                        // interrupt-parents are a future concern.
+                        if facts.console_irq.is_none() && value.len() >= 4 {
+                            facts.console_irq = Some(be_u32_at(value, 0));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            FDT_NOP => {
-                // Skip.
-            }
-            FDT_END => {
-                break;
-            }
-            _ => {
-                // Unknown token — malformed DTB, stop.
-                break;
-            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => break, // Unknown token — malformed, stop.
         }
     }
 
-    Some(header.totalsize)
+    Some(facts)
 }
 
 // ============================================================================
@@ -380,25 +486,26 @@ pub unsafe fn populate(dtb_phys: u64) {
     // downstream consumers — which go through boot::info() — see it.
     info.hhdm_offset = crate::hhdm_offset();
 
-    // Walk the DTB for /memory@* nodes and /cpus/timebase-frequency.
-    let mut timer_hz: Option<u32> = None;
+    // Walk the DTB once; collect memory + /cpus/timebase-frequency +
+    // /soc/plic reg + /soc/serial interrupts.
+    //
     // SAFETY: caller promises a valid FDT at dtb_phys.
-    let dtb_totalsize = unsafe {
-        walk_dtb(
-            dtb_phys,
-            |base, size| {
-                let _ = info.push_memory_region(MemoryRegion {
-                    base,
-                    length: size,
-                    kind: MemoryRegionKind::Usable,
-                });
-            },
-            |hz| {
-                timer_hz = Some(hz);
-            },
-        )
-    };
-    info.timer_base_frequency_hz = timer_hz;
+    let facts = unsafe { walk_dtb(dtb_phys) };
+    let dtb_totalsize = facts.as_ref().map(|f| f.totalsize);
+
+    if let Some(facts) = &facts {
+        for i in 0..facts.memory_count {
+            let (base, size) = facts.memory[i];
+            let _ = info.push_memory_region(MemoryRegion {
+                base,
+                length: size,
+                kind: MemoryRegionKind::Usable,
+            });
+        }
+        info.timer_base_frequency_hz = facts.timer_base_hz;
+        info.plic_mmio = facts.plic_mmio;
+        info.console_irq = facts.console_irq;
+    }
 
     // Reserve OpenSBI's range on QEMU virt (0x80000000..0x80200000).
     // Real platforms: OpenSBI's extent comes from `/reserved-memory`

@@ -110,6 +110,12 @@ pub struct Ns16550 {
 impl Ns16550 {
     /// THR: Transmit Holding Register (write) / RHR: Receive (read)
     const THR: usize = 0;
+    /// IER: Interrupt Enable Register — offset 1 (when DLAB=0).
+    const IER: usize = 1;
+    /// IER.ERBFI (Enable Received Data Available Interrupt) — bit 0.
+    /// Setting this asserts the UART's IRQ line on every byte that
+    /// arrives in the RHR, routed via PLIC.
+    const IER_ERBFI: u8 = 1 << 0;
     /// LSR: Line Status Register
     const LSR: usize = 5;
     /// LSR.THRE (Transmit Holding Register Empty) — bit 5
@@ -215,6 +221,35 @@ macro_rules! println {
     ($($arg:tt)*) => {{
         $crate::io::print(format_args!("{}\n", format_args!($($arg)*)))
     }};
+}
+
+/// Enable the NS16550 "received data available" interrupt on RISC-V.
+///
+/// After this is called, every byte landing in the RHR asserts the
+/// UART's IRQ line, which the PLIC routes to S-mode external
+/// interrupts. The trap handler then reads the byte via [`read_byte`]
+/// inside `plic::dispatch_pending` while the first real console
+/// driver is not yet running (R-3.d diagnostic path).
+///
+/// x86_64 and AArch64 do not need this — their device IRQ paths are
+/// wired via different driver code; the console on those arches stays
+/// in polling mode driven by `SYS_CONSOLE_READ`.
+///
+/// # Safety
+/// UART MMIO must already be mapped (io::init has run). Called once
+/// from kmain during boot.
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn enable_console_rx_irq() {
+    let mut guard = SERIAL1.lock();
+    let Some(serial) = guard.as_mut() else { return };
+    // SAFETY: serial.base is the HHDM-mapped NS16550 MMIO region.
+    // IER is 8-bit at offset 1 of the device register file.
+    unsafe {
+        core::ptr::write_volatile(
+            (serial.base + Ns16550::IER) as *mut u8,
+            Ns16550::IER_ERBFI,
+        );
+    }
 }
 
 /// Read a single byte from the serial console, if one is available.

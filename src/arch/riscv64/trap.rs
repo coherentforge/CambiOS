@@ -223,13 +223,16 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
                 unsafe { super::timer::on_timer_interrupt(); }
             }
             IRQ_EXTERNAL => {
-                // PLIC-routed device IRQ. R-3.d will wire this into
-                // the portable interrupt router.
-                panic!(
-                    "riscv64: S-mode external interrupt without PLIC driver \
-                     (Phase R-3.d pending). stval={:#x}",
-                    stval,
-                );
+                // PLIC-routed device IRQ. `dispatch_pending` drains
+                // every pending source: claim → router lookup (or
+                // R-3.d inline UART fallback) → complete.
+                //
+                // SAFETY: trap handler runs with interrupts masked;
+                // the PLIC driver is safe to call from ISR context
+                // (its only lock — `crate::INTERRUPT_ROUTER` — is
+                // acquired via try_lock).
+                let _ = stval; // stval is zero for external IRQs.
+                unsafe { super::plic::dispatch_pending(); }
             }
             IRQ_SOFTWARE => {
                 // IPI. R-5 will handle cross-hart wake / TLB shootdown.

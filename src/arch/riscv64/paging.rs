@@ -167,65 +167,58 @@ pub unsafe fn kernel_root_phys() -> u64 {
 }
 
 // ============================================================================
-// Early-boot MMIO mapping (no allocator required)
+// Early-boot MMIO mapping — no-op on RISC-V
 // ============================================================================
 
-/// Map a single 4 KiB MMIO page into the current page table.
+/// Range already covered by the boot-trampoline HHDM gigapages.
 ///
-/// Runs before the heap and frame allocator are online. Uses the shared
-/// bootstrap frame pool in [`crate::memory::paging`] for missing
-/// intermediate L1/L2/L3 tables.
+/// `src/arch/riscv64/entry.rs` populates the identity + HHDM L1 level
+/// with four 1 GiB gigapages (L1[0..4]), so physical addresses in
+/// `[0, 4 GiB)` — every device MMIO range on QEMU virt — are reachable
+/// via `HHDM + phys` without any runtime mapping work. Real CambiOS
+/// hardware will be sized so MMIO falls within this window too (ADR-013
+/// § Strategic Posture — generic-first; the gigapage count stays in
+/// the boot trampoline, not here).
+const HHDM_GIGAPAGE_COVERAGE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Confirm a physical address is already reachable through the boot
+/// HHDM. Returns `Ok(())` without touching the page table.
 ///
-/// ## Device memory attribution on RISC-V
+/// ## Why this is a no-op (unlike AArch64)
 ///
-/// This function leaves the Svpbmt field (bits 62:61) zero. That means
-/// the PTE itself does not declare the page as device memory — the
-/// hart's Physical Memory Attribute (PMA) table is trusted to mark the
-/// MMIO region strongly-ordered / non-cacheable. On QEMU virt this is
-/// the case by construction; on CambiOS-designed RISC-V hardware the
-/// PMA configuration is a hardware-design concern (ADR-013 § Strategic
-/// Posture — generic-first). If we eventually target a platform with a
-/// permissive default PMA, this is where Svpbmt `PBMT=IO` gets added.
+/// On AArch64, Limine's HHDM on QEMU virt covers only RAM; device MMIO
+/// (PL011, GIC, GICR) has to be mapped into TTBR1 explicitly. The
+/// shared `early_map_mmio_arch` driver handles that with a 3-frame
+/// bootstrap pool.
+///
+/// On RISC-V the boot trampoline we own (`src/arch/riscv64/entry.rs`)
+/// uses 1 GiB gigapages spanning `[0, 4 GiB)` in the HHDM region. That
+/// covers every MMIO device QEMU virt exposes (PLIC `0x0c00_0000`,
+/// NS16550 `0x1000_0000`, CLINT `0x0200_0000`, virtio-mmio
+/// `0x1000_1000..`, ECAM `0x3000_0000`). Writing a 4 KiB leaf PTE at
+/// those addresses would demote the gigapage and — worse — my earlier
+/// shared driver misread the gigapage as "unmapped" and clobbered it,
+/// causing a load-access fault on the next HHDM read.
+///
+/// Device-memory attribution is the hart's PMA table's job per ADR-013
+/// § Decision 5 — gigapage PTE attributes carry no Svpbmt flag and do
+/// not need to. If a future CambiOS hardware target extends phys space
+/// past 4 GiB or uses MMIO above that boundary, the fix lives in the
+/// boot trampoline (add gigapages) rather than here.
 ///
 /// # Safety
 /// - HHDM offset must already be set.
-/// - `phys_addr` must be a valid MMIO physical address.
-/// - Single-core boot only.
+/// - `phys_addr` must be a valid MMIO physical address below
+///   `HHDM_GIGAPAGE_COVERAGE`.
+/// - Single-hart boot only.
 pub unsafe fn early_map_mmio(phys_addr: u64) -> Result<(), &'static str> {
-    let pa = phys_addr & !0xFFF;
-    // SAFETY: caller guarantees HHDM set + phys_addr is valid MMIO.
-    // The shared helper walks HHDM-mapped tables during single-core boot.
-    unsafe {
-        crate::memory::paging::early_map_mmio_arch(
-            pa,
-            kernel_root_phys(),
-            |pa_frame| {
-                // Kernel RW MMIO leaf: V+R+W+A+D+G. No U (kernel-only),
-                // no X (never execute MMIO), no Svpbmt (trust PMA).
-                ((pa_frame >> 12) << 10)
-                    | PTE_V
-                    | PTE_R
-                    | PTE_W
-                    | PTE_A
-                    | PTE_D
-                    | PTE_G
-            },
-            |va| {
-                // sfence.vma for a single VA. Target VA encoded in rs1;
-                // asid = x0 means "all ASIDs".
-                //
-                // SAFETY: sfence.vma is legal from S-mode and only
-                // affects this hart's TLB. Closure body inherits the
-                // enclosing `unsafe` in `early_map_mmio` — single-core
-                // boot, S-mode.
-                core::arch::asm!(
-                    "sfence.vma {va}, zero",
-                    va = in(reg) va,
-                    options(nostack),
-                );
-            },
-        )
+    if phys_addr >= HHDM_GIGAPAGE_COVERAGE {
+        return Err(
+            "early_map_mmio: phys_addr outside boot-HHDM gigapage coverage \
+             (>4 GiB); extend src/arch/riscv64/entry.rs boot trampoline",
+        );
     }
+    Ok(())
 }
 
 // ============================================================================

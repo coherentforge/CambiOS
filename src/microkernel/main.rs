@@ -626,15 +626,61 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     let reload = unsafe { arcos_core::arch::riscv64::timer::init(100) };
     println!("✓ SBI timer armed at 100 Hz (reload = {} ticks)", reload);
 
+    // Phase R-3.d: PLIC driver — init from DTB-reported MMIO range,
+    // enable the console UART source, and record its IRQ number so
+    // the trap handler's R-3.d inline RX diagnostic can match it.
+    match arcos_core::boot::info().plic_mmio {
+        Some((phys_base, size_bytes)) => {
+            println!(
+                "✓ DTB /soc/plic reg = {:#x}..{:#x} ({} KiB)",
+                phys_base,
+                phys_base + size_bytes,
+                size_bytes / 1024,
+            );
+            // SAFETY: BootInfo was populated from the DTB; the PLIC
+            // region is a real MMIO range and we're in single-hart
+            // early boot with interrupts masked.
+            unsafe {
+                arcos_core::arch::riscv64::plic::init(phys_base, size_bytes)
+                    .expect("plic::init failed — DTB reported implausible range");
+            }
+            println!("✓ PLIC initialized (hart 0 S-mode, threshold=0, SEIE set)");
+
+            if let Some(irq) = arcos_core::boot::info().console_irq {
+                // SAFETY: PLIC init has published MMIO base; enable is
+                // idempotent; source range bounded by MAX_SOURCES.
+                unsafe { arcos_core::arch::riscv64::plic::enable_irq(irq); }
+                arcos_core::arch::riscv64::plic::set_console_irq(irq);
+                // SAFETY: UART MMIO was mapped by io::init; IER write
+                // is single-byte at a fixed offset.
+                unsafe { arcos_core::io::enable_console_rx_irq(); }
+                println!(
+                    "✓ Console IRQ {} armed (DTB /soc/serial/interrupts); \
+                     NS16550 IER.ERBFI set",
+                    irq,
+                );
+            } else {
+                println!("⚠ DTB did not report /soc/serial/interrupts — \
+                    no console RX IRQ");
+            }
+        }
+        None => {
+            println!("⚠ DTB did not report /soc/plic — skipping PLIC init, \
+                sie.SEIE stays clear");
+        }
+    }
+
     // SAFETY: trap handler is live, per-hart state is initialized,
-    // the timer is armed. Safe to take interrupts now.
+    // the timer is armed, and (if the DTB reported them) PLIC +
+    // console IRQ are wired. Safe to take interrupts now.
     unsafe {
         arcos_core::arch::riscv64::trap::enable_interrupts();
     }
 
     println!();
-    println!("Phase R-3.b+c milestone: trap vector + SBI timer live.");
-    println!("Expecting a '[R-3 tick N]' line every 500 ms (every 50 ticks).");
+    println!("Phase R-3.d milestone: trap vector + SBI timer + PLIC + console RX live.");
+    println!("Timer: '[R-3 tick N]' every 500 ms.");
+    println!("Console RX: press any key in the QEMU console — expect '[R-3 RX] 0xNN'.");
     println!();
 
     // Idle loop: wfi parks the hart until the next interrupt.
