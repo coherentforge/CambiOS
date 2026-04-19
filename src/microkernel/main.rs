@@ -727,26 +727,24 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         }
     }
 
+    // Phase R-6: kernel subsystems that the portable load_boot_modules
+    // path depends on. Same order as the x86_64/aarch64 call sequence
+    // in the Limine boot path — ipc → caps → identity → object store.
+    // Without these, SignedBinaryVerifier rejects every module because
+    // BOOTSTRAP_PRINCIPAL is still zero, and capability binding for
+    // kernel processes never happens.
+    ipc_init();
+    capability_manager_init();
+    bootstrap_identity_init();
+    object_store_init();
+
     // Phase R-3.f: scheduler + Timer object install. The Scheduler's
     // idle task (Task 0) is implicitly the kmain flow we're running —
     // `Scheduler::init` marks it Running and current. The first
-    // timer IRQ will fill in its saved_rsp.
+    // timer IRQ will fill in its saved_rsp. scheduler_init_riscv64
+    // also runs load_boot_modules against the fresh scheduler before
+    // publishing it into PER_CPU_SCHEDULER[0].
     scheduler_init_riscv64();
-
-    // Phase R-4.b observable milestone: spawn hello-riscv64 as a
-    // U-mode process. Hello ecall's SYS_GETPID + SYS_PRINT×3 + SYS_
-    // YIELD + SYS_EXIT — exercising trap-vector U↔S swap, syscall
-    // dispatcher, and user page tables end-to-end. When hello exits
-    // the scheduler reaps it and the hart returns to the wfi idle
-    // loop below.
-    //
-    // SAFETY: scheduler is installed; frame allocator is live;
-    // process table is live; we're single-hart in early boot with
-    // interrupts masked.
-    match unsafe { spawn_hello_riscv64() } {
-        Ok(tid) => println!("✓ Spawned hello-riscv64 user task as TaskId({})", tid.0),
-        Err(e) => println!("⚠ hello-riscv64 spawn failed: {}", e),
-    }
 
     // Phase R-5.b: mark BSP online in the TLB-shootdown mask and
     // probe the SBI IPI extension (warn-only if absent — single-
@@ -772,11 +770,11 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     unsafe { start_application_processors(); }
 
     println!();
-    println!("Phase R-5.a milestone: SMP live. APs bootstrapped via SBI HSM, each");
-    println!("hart runs its own scheduler + timer. hello-riscv64 ran on BSP (hart 0).");
-    println!("Cross-hart TLB shootdowns now fire organically from the loader path —");
-    println!("every hello-riscv64 exit unmaps its ELF segments + user stack, each");
-    println!("unmap_page calls shootdown_page, each broadcasts the SBI IPI.");
+    println!("Phase R-6 milestone: SMP live + signed boot modules loaded from initrd.");
+    println!("Each hart runs its own scheduler + timer; the BOOT_MODULE_ORDER chain");
+    println!("releases services in roster order. Cross-hart TLB shootdowns fire");
+    println!("organically from the loader path — every process exit unmaps its ELF");
+    println!("segments + user stack, each unmap_page broadcasts the SBI IPI.");
     println!("Console RX still routed: press a key → '[R-3 RX] 0xNN'.");
     println!();
 
@@ -798,10 +796,10 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
 
 /// Create the Scheduler + Timer and install them in PER_CPU[0].
 ///
-/// Mirrors the x86_64 / AArch64 `scheduler_init` but does not load
-/// boot modules — R-3.f lands before the RISC-V user-space path
-/// (R-4), so the only initial task is idle (Task 0 from
-/// `Scheduler::init`).
+/// Mirrors the x86_64 / AArch64 `scheduler_init`: builds the scheduler,
+/// runs `load_boot_modules` against it (signed ELFs delivered via the
+/// R-6 initrd path — see `src/boot/initrd.rs` + `src/boot/riscv.rs`
+/// `/chosen` walker), then installs it into `PER_CPU_SCHEDULER[0]`.
 #[cfg(target_arch = "riscv64")]
 fn scheduler_init_riscv64() {
     let mut scheduler = Scheduler::new_boxed();
@@ -811,6 +809,20 @@ fn scheduler_init_riscv64() {
     }
     // Register idle task (slot 0) in the global task→CPU map.
     arcos_core::set_task_cpu(0, 0);
+
+    // Load signed boot modules from the initrd (BootInfo.modules).
+    // `load_boot_modules` is arch-independent: same SignedBinaryVerifier,
+    // same capability / BOOT_MODULE_ORDER wiring as x86_64 / aarch64.
+    load_boot_modules(&mut scheduler);
+
+    // Register every freshly-loaded task in the global task→CPU map
+    // (everything on hart 0 for now; later passes migrate).
+    for slot in 0..arcos_core::MAX_TASKS as u32 {
+        if scheduler.get_task_pub(TaskId(slot)).is_some() {
+            arcos_core::set_task_cpu(slot, 0);
+        }
+    }
+
     *PER_CPU_SCHEDULER[0].lock() = Some(scheduler);
 
     let mut timer = match Timer::new(TimerConfig::HZ_100) {
@@ -828,17 +840,6 @@ fn scheduler_init_riscv64() {
 
     println!("✓ Scheduler + Timer installed on hart 0 (idle task = kmain idle loop)");
 }
-
-/// Embedded hello-riscv64 ELF image. Built at repo-make time (see
-/// Makefile `user-elf-riscv64` target) and baked into the kernel's
-/// `.rodata` so R-4.b can spawn it without an external loader. Will
-/// be replaced by DTB `/chosen/linux,initrd-{start,end}` lookup when
-/// R-6 lands real boot-module delivery on RISC-V.
-#[cfg(target_arch = "riscv64")]
-static HELLO_RISCV64_ELF: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/user/hello-riscv64.elf"
-));
 
 /// RISC-V AP entry (called from `_ap_start` after paging is enabled
 /// and sp is in higher-half). Per-hart init mirrors the BSP flow:
@@ -915,57 +916,6 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
         // SAFETY: wfi is always legal in S-mode with SIE set.
         unsafe { core::arch::asm!("wfi", options(nostack, nomem, preserves_flags)); }
     }
-}
-
-/// Spawn the embedded hello-riscv64 ELF as a U-mode task.
-///
-/// Routes through the portable `loader::load_elf_process` with the
-/// permissive `DefaultVerifier` — hello-riscv64 is unsigned for R-4.b
-/// (Ed25519 signing of RISC-V boot modules lands with the full
-/// initrd + DTB path in R-6). The loader already contains a riscv64
-/// SavedContext arm (SPP=0 SPIE=1 in sstatus, sp=DEFAULT_STACK_TOP),
-/// so all we have to do is feed it the bytes.
-///
-/// # Safety
-/// - `FRAME_ALLOCATOR` and `PROCESS_TABLE` must be initialized.
-/// - Scheduler must live in `PER_CPU_SCHEDULER[0]`.
-/// - Must run during single-hart early boot, before interrupts are
-///   enabled (the task can't be dispatched mid-setup).
-#[cfg(target_arch = "riscv64")]
-unsafe fn spawn_hello_riscv64() -> Result<TaskId, &'static str> {
-    use arcos_core::FRAME_ALLOCATOR;
-    use arcos_core::loader::{self, DefaultVerifier};
-
-    let mut pt_guard = PROCESS_TABLE.lock();
-    let pt = pt_guard
-        .as_mut()
-        .ok_or("hello-riscv64: PROCESS_TABLE not initialized")?;
-    let mut fa_guard = FRAME_ALLOCATOR.lock();
-    let mut sched_guard = PER_CPU_SCHEDULER[0].lock();
-    let sched = sched_guard
-        .as_mut()
-        .ok_or("hello-riscv64: scheduler not installed")?;
-
-    // Permissive verifier — the bytes came from our own build
-    // (via include_bytes!), not untrusted input. Signing lands in R-6
-    // when the DTB initrd path replaces include_bytes!.
-    let verifier = DefaultVerifier::new();
-
-    let loaded = loader::load_elf_process(
-        HELLO_RISCV64_ELF,
-        Priority::NORMAL,
-        &verifier,
-        pt,
-        &mut fa_guard,
-        sched,
-    )
-    .map_err(|_e| "hello-riscv64: load_elf_process failed")?;
-
-    // Register in the global task→CPU map (all on hart 0 until R-5's
-    // SMP bring-up).
-    arcos_core::set_task_cpu(loaded.task_id.0, 0);
-
-    Ok(loaded.task_id)
 }
 
 // ============================================================================

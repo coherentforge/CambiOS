@@ -49,6 +49,16 @@ COMPOSITOR_ELF := $(COMPOSITOR_DIR)/target/x86_64-unknown-none/release/arcos-com
 USER_ELF_RISCV64 := user/hello-riscv64.elf
 USER_SRC_RISCV64 := user/hello-riscv64.S
 USER_LD_RISCV64  := user/user-riscv64.ld
+FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-fs-service
+KS_SERVICE_ELF_RISCV64 := $(KS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-key-store-service
+BLK_DRIVER_ELF_RISCV64 := $(BLK_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-virtio-blk
+SHELL_ELF_RISCV64 := $(SHELL_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-shell
+POLICY_SERVICE_ELF_RISCV64 := $(POLICY_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-policy-service
+
+# RISC-V initrd artifacts
+INITRD_RISCV64 := initrd-riscv64.img
+MKINITRD_DIR := tools/mkinitrd
+MKINITRD := $(MKINITRD_DIR)/target/aarch64-apple-darwin/release/mkinitrd
 
 # User-space ELF binaries (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
@@ -82,7 +92,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo compositor user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo compositor user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -253,10 +263,53 @@ compositor-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== compositor (AArch64) ready ==="
 
+# RISC-V user-space build targets (R-6 / ADR-013)
+# Services build with the same CARGO_ENCODED_RUSTFLAGS shape as x86_64/aarch64;
+# only the linker script and target triple differ.
+fs-service-riscv64:
+	@echo "=== Building FS service (RISC-V) ==="
+	cd $(FS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== FS service (RISC-V) ready ==="
+
+key-store-service-riscv64:
+	@echo "=== Building Key Store service (RISC-V) ==="
+	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== Key Store service (RISC-V) ready ==="
+
+virtio-blk-riscv64:
+	@echo "=== Building Virtio-Blk driver (RISC-V) ==="
+	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== Virtio-Blk driver (RISC-V) ready ==="
+
+shell-riscv64:
+	@echo "=== Building Shell (RISC-V) ==="
+	cd $(SHELL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== Shell (RISC-V) ready ==="
+
+policy-service-riscv64:
+	@echo "=== Building Policy service (RISC-V) ==="
+	cd $(POLICY_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== Policy service (RISC-V) ready ==="
+
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release
 	@echo "=== sign-elf ready ==="
+
+mkinitrd:
+	@echo "=== Building mkinitrd host tool ==="
+	cd $(MKINITRD_DIR) && cargo build --release
+	@echo "=== mkinitrd ready ==="
 
 # Export the bootstrap public key from the signing source.
 # Run this once after setting up your YubiKey to generate bootstrap_pubkey.bin.
@@ -680,13 +733,47 @@ run-aarch64: img-aarch64
 # ---------------------------------------------------------------------------
 KERNEL_RISCV64 := target/riscv64gc-unknown-none-elf/release/cambios_microkernel
 
-kernel-riscv64: $(USER_ELF_RISCV64)
+# hello-riscv64.elf is no longer include_bytes!'d by the kernel (R-6
+# replaced it with the initrd path), so no user-elf dependency here.
+# The user/hello-riscv64.S assembly source remains for one-off smoke
+# testing via `make user-elf-riscv64`.
+kernel-riscv64:
 	cargo build --target riscv64gc-unknown-none-elf --release
 
-# Phase R-1+: will boot to serial. Currently a scaffold — no boot stub yet.
-# `-kernel <elf>` tells QEMU to load our ELF as an OpenSBI payload;
-# OpenSBI then jumps to our entry point in S-mode.
-run-riscv64: kernel-riscv64
+# Build + sign all RISC-V boot modules and pack them into the initrd the
+# kernel parses at boot (see src/boot/initrd.rs + src/boot/riscv.rs
+# /chosen walker). Produces $(INITRD_RISCV64) in the repo root; QEMU
+# passes this via `-initrd`.
+img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 shell-riscv64 sign-tool mkinitrd
+	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
+	rm -rf initrd_root_riscv64
+	mkdir -p initrd_root_riscv64
+	cp $(POLICY_SERVICE_ELF_RISCV64) initrd_root_riscv64/policy-service.elf
+	cp $(KS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/key-store-service.elf
+	cp $(FS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/fs-service.elf
+	cp $(BLK_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-blk.elf
+	cp $(SHELL_ELF_RISCV64)          initrd_root_riscv64/shell.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/policy-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/key-store-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fs-service.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-blk.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/shell.elf
+	# Module order matches limine.conf on x86_64/aarch64 — the kernel's
+	# BOOT_MODULE_ORDER release chain is positional, so the service
+	# roster must be identical across arches (future ADR-018 manifest
+	# will make this explicit).
+	$(MKINITRD) --out $(INITRD_RISCV64) \
+		--module policy-service=initrd_root_riscv64/policy-service.elf \
+		--module key-store-service=initrd_root_riscv64/key-store-service.elf \
+		--module fs-service=initrd_root_riscv64/fs-service.elf \
+		--module virtio-blk=initrd_root_riscv64/virtio-blk.elf \
+		--module shell=initrd_root_riscv64/shell.elf
+	rm -rf initrd_root_riscv64
+	@echo "=== $(INITRD_RISCV64) ready ==="
+
+# Boot the RISC-V kernel in QEMU virt under OpenSBI, with the R-6
+# signed boot modules delivered through -initrd.
+run-riscv64: kernel-riscv64 img-riscv64
 	qemu-system-riscv64 \
 		-machine virt \
 		-cpu rv64 \
@@ -696,7 +783,8 @@ run-riscv64: kernel-riscv64
 		-display none \
 		-no-reboot \
 		-bios default \
-		-kernel $(KERNEL_RISCV64)
+		-kernel $(KERNEL_RISCV64) \
+		-initrd $(INITRD_RISCV64)
 
 # ---------------------------------------------------------------------------
 # Tri-architecture regression gate. Any commit that breaks any arch is
@@ -736,5 +824,5 @@ check-riscv64:
 
 clean:
 	cargo clean
-	rm -f $(ISO) $(IMG_X86) $(IMG_AARCH64)
-	rm -rf iso_root
+	rm -f $(ISO) $(IMG_X86) $(IMG_AARCH64) $(INITRD_RISCV64)
+	rm -rf iso_root initrd_root_riscv64
