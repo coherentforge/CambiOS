@@ -345,11 +345,17 @@ pub mod paging {
 
     /// Create a new L0 page table for a user process.
     ///
-    /// Returns the physical address of a freshly zeroed L0 table. On
-    /// AArch64 the L0 is fine with zero kernel-half entries because the
-    /// kernel lives in TTBR1. On RISC-V the kernel and user share a
-    /// single `satp`, so Phase R-4 will extend this to copy kernel-half
-    /// entries from the boot page table before returning.
+    /// Returns the physical address of a freshly zeroed L0 table.
+    ///
+    /// On AArch64 the L0 is fine with zero kernel-half entries because
+    /// the kernel lives in TTBR1 (separate translation regime from the
+    /// user's TTBR0). On RISC-V there is no TTBR split — kernel and
+    /// user share a single `satp` — so the new L0's upper half
+    /// (indices 256..512, covering VA `0xffff_8000_0000_0000` and up)
+    /// must carry the same entries as the currently-loaded root, or
+    /// the first kernel-side trap taken while this satp is loaded
+    /// would fault fetching its own instructions (kernel text
+    /// unmapped).
     pub fn create_process_page_table(
         frame_alloc: &mut FrameAllocator,
     ) -> Result<u64, PagingError> {
@@ -364,6 +370,31 @@ pub mod paging {
                 0,
                 PAGE_SIZE as usize,
             );
+        }
+
+        // RISC-V: copy kernel-half L0 entries (indices 256..512) from
+        // the currently-active satp root so the kernel is still mapped
+        // after `csrw satp, new_root` swaps address spaces. Otherwise
+        // the next trap faults on instruction-fetch.
+        #[cfg(target_arch = "riscv64")]
+        {
+            // SAFETY: csrr satp is always legal from S-mode; walker
+            // reads use HHDM-mapped tables; single-writer-at-boot.
+            unsafe {
+                let satp: u64;
+                core::arch::asm!(
+                    "csrr {0}, satp",
+                    out(reg) satp,
+                    options(nostack, nomem, preserves_flags),
+                );
+                let current_root_phys = (satp & ((1u64 << 44) - 1)) << 12;
+                let src = phys_to_virt(current_root_phys) as *const u64;
+                let dst = phys_to_virt(frame.addr);
+                for i in 256..512 {
+                    let entry = core::ptr::read(src.add(i));
+                    core::ptr::write(dst.add(i), entry);
+                }
+            }
         }
 
         Ok(frame.addr)

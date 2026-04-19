@@ -273,9 +273,23 @@ core::arch::global_asm!(
     "csrw satp, t2",
     "sfence.vma",
 
-    // At this point paging is on. PC is still at a low physical
-    // address, but L3[0] identity-maps that range, so execution
-    // continues from the next instruction. Now absolute-jump to
+    // Promote sp from its pre-paging physical identity form (low VA
+    // 0x80340xxx via L0[0]) to the higher-half kernel VA form
+    // (0xffffffff_80340xxx via L0[511]). Add the VMA–LMA offset
+    // (0xffffffff_00000000) that the linker script encodes. Without
+    // this, sp stays in the low identity window — fine as long as
+    // the active satp has L0[0] pointing at L2_IDENTITY, but broken
+    // the instant `create_process_page_table` hands us a root that
+    // only copies L0[256..512] (the kernel half). The first
+    // context switch to a user task would leave sp pointing at an
+    // unmapped address in the new satp.
+    "li t4, -1",
+    "slli t4, t4, 32",              // t4 = 0xffffffff00000000
+    "add sp, sp, t4",               // sp now higher-half kernel VA
+
+    // At this point paging is on and sp is higher-half. PC is still
+    // at a low physical address, but L3[0] identity-maps that range,
+    // so the next instruction executes. Now absolute-jump to
     // kmain_riscv64's higher-half virtual address.
     "jr t3",
     // Unreachable — kmain_riscv64 is `-> !`.

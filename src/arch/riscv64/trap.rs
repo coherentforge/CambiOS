@@ -369,7 +369,16 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
             5 => panic!("riscv64 fault: load access fault @ sepc={:#x} stval={:#x}", sepc, stval),
             6 => panic!("riscv64 fault: store/AMO address misaligned @ sepc={:#x} stval={:#x}", sepc, stval),
             7 => panic!("riscv64 fault: store/AMO access fault @ sepc={:#x} stval={:#x}", sepc, stval),
-            8 => panic!("riscv64 fault: ECALL from U-mode — user syscalls not wired until R-4"),
+            8 => {
+                // ECALL from U-mode — the R-4 syscall entry point.
+                // The Rust-side handler extracts a7/a0..a5 from the
+                // SavedContext, dispatches, writes the return value
+                // back to a0, and bumps sepc past the 4-byte ecall
+                // so sret resumes at the next user instruction.
+                // SAFETY: ISR context; `saved` was populated by the
+                // trap vector's U→S entry path.
+                return unsafe { super::syscall::ecall_handler_inner(saved as u64) };
+            }
             9 => panic!("riscv64 fault: ECALL from S-mode — kernel ecalls must go through sbi wrappers"),
             12 => panic!("riscv64 fault: instruction page fault @ sepc={:#x} stval={:#x}", sepc, stval),
             13 => panic!("riscv64 fault: load page fault @ sepc={:#x} stval={:#x}", sepc, stval),

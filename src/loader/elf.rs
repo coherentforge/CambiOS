@@ -20,7 +20,13 @@ const ELF_TYPE_EXECUTABLE: u16 = 2;
 const ELF_MACHINE_EXPECTED: u16 = 0x3E; // EM_X86_64
 #[cfg(target_arch = "aarch64")]
 const ELF_MACHINE_EXPECTED: u16 = 0xB7; // EM_AARCH64
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(target_arch = "riscv64")]
+const ELF_MACHINE_EXPECTED: u16 = 0xF3; // EM_RISCV
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+)))]
 const ELF_MACHINE_EXPECTED: u16 = 0x00; // unknown — will reject all ELFs
 
 /// Public re-export for `build_boot_elf()` to use.

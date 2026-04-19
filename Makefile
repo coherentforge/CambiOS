@@ -45,6 +45,11 @@ FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/arcos-fb-demo
 COMPOSITOR_DIR := user/compositor
 COMPOSITOR_ELF := $(COMPOSITOR_DIR)/target/x86_64-unknown-none/release/arcos-compositor
 
+# User-space ELF binaries (RISC-V)
+USER_ELF_RISCV64 := user/hello-riscv64.elf
+USER_SRC_RISCV64 := user/hello-riscv64.S
+USER_LD_RISCV64  := user/user-riscv64.ld
+
 # User-space ELF binaries (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
 USER_SRC_AARCH64 := user/hello-aarch64.S
@@ -166,6 +171,17 @@ user-elf-aarch64:
 	clang -target aarch64-unknown-none -nostdlib -ffreestanding -c $(USER_SRC_AARCH64) -o user/hello-aarch64.o
 	ld.lld -T $(USER_LD_AARCH64) -nostdlib --no-dynamic-linker -static user/hello-aarch64.o -o $(USER_ELF_AARCH64)
 	@echo "=== $(USER_ELF_AARCH64) ready ==="
+
+# RISC-V user-space build targets
+user-elf-riscv64: $(USER_ELF_RISCV64)
+
+$(USER_ELF_RISCV64): $(USER_SRC_RISCV64) $(USER_LD_RISCV64)
+	@echo "=== Building user-space ELF (RISC-V) ==="
+	clang -target riscv64-unknown-none-elf -march=rv64gc -mno-relax \
+		-nostdlib -ffreestanding -c $(USER_SRC_RISCV64) -o user/hello-riscv64.o
+	ld.lld -T $(USER_LD_RISCV64) -nostdlib --no-dynamic-linker -static \
+		user/hello-riscv64.o -o $(USER_ELF_RISCV64)
+	@echo "=== $(USER_ELF_RISCV64) ready ==="
 
 fs-service-aarch64:
 	@echo "=== Building FS service (AArch64) ==="
@@ -647,7 +663,7 @@ run-aarch64: img-aarch64
 # ---------------------------------------------------------------------------
 KERNEL_RISCV64 := target/riscv64gc-unknown-none-elf/release/cambios_microkernel
 
-kernel-riscv64:
+kernel-riscv64: $(USER_ELF_RISCV64)
 	cargo build --target riscv64gc-unknown-none-elf --release
 
 # Phase R-1+: will boot to serial. Currently a scaffold — no boot stub yet.

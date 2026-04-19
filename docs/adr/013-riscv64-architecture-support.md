@@ -389,3 +389,42 @@ Total 128 bytes, 8-byte aligned. Offsets documented inline for the asm.
 - `make run-riscv64` with stdin feed still produces `[R-3.f ping N]` continuously + `[R-3 RX] 0xNN ('c')` on keypress.
 
 **How to apply.** R-4.b wires the first U-mode code. Checkpoint before trying to sret to user: the `sscratch` invariant must be primed (`sscratch = kernel_tp`) — the process-spawn path that builds a user task's initial SavedContext should set it, just as R-3.f's kernel-ping-spawn set `gp`/`tp`/`sstatus`. The cleanest place is inside `create_isr_task`'s RISC-V user-task variant, or right before the first sret to U.
+
+### 2026-04-18 — Phase R-4.b: hello-riscv64 runs in U-mode
+
+**What changed.** The RISC-V port now executes U-mode code. `make run-riscv64` loads the bundled `hello-riscv64.elf` as a user process, the scheduler dispatches it, `sret` drops it to U-mode, and `ecall` lands back in the kernel's syscall dispatcher. Hello prints `[Module] Hello from boot module (riscv64)!` three times and exits cleanly via `SYS_EXIT`. The full trap-vector U↔S swap from R-4.a is exercised end-to-end.
+
+**Pieces landed.**
+
+- [user/hello-riscv64.S](../../user/hello-riscv64.S) + [user/user-riscv64.ld](../../user/user-riscv64.ld) — minimal U-mode program mirroring `hello-aarch64.S`: `SYS_GETPID` → loop×3 { `SYS_PRINT`; `SYS_YIELD` } → `SYS_EXIT`. Entry at `0x400000`. Built by `clang -target riscv64-unknown-none-elf -march=rv64gc -mno-relax` + `ld.lld`.
+- [Makefile](../../Makefile) — `user-elf-riscv64` target; `kernel-riscv64` depends on it so `include_bytes!` always finds the ELF.
+- [src/loader/elf.rs](../../src/loader/elf.rs) — `EM_RISCV = 0xF3` added to the `ELF_MACHINE_EXPECTED` cfg match.
+- [src/arch/riscv64/syscall.rs](../../src/arch/riscv64/syscall.rs) — `ecall_handler_inner(saved_sp)` extracts `a7` = syscall number and `a0..a5` = args from the SavedContext, resolves current task/process/cr3 from the scheduler, dispatches through the portable `SyscallDispatcher::dispatch`, writes the result back to `a0` (= `gpr[10]`), and bumps `sepc` by 4 so `sret` resumes at the instruction after the `ecall`.
+- [src/arch/riscv64/trap.rs](../../src/arch/riscv64/trap.rs) — cause-8 (ECALL from U-mode) arm routes through `ecall_handler_inner` instead of panicking.
+- [src/microkernel/main.rs](../../src/microkernel/main.rs) — `HELLO_RISCV64_ELF = include_bytes!(...)`; `spawn_hello_riscv64` calls `loader::load_elf_process` with `DefaultVerifier` (unsigned — signing lands in R-6 with initrd+DTB). `kmain_riscv64` now also calls `init_kernel_object_tables` + `process_table_init` so `ProcessTable` is live before the load.
+
+**Two integration bugs found + fixed.**
+
+1. **`create_process_page_table` left RISC-V user L0s without kernel-half mappings.** On AArch64 with TTBR0/TTBR1 split, user L0 tables are clean by design (kernel lives in TTBR1). On RISC-V there is no TTBR split — the kernel and the active user task share one `satp`. When the scheduler swapped `satp` to hello's fresh L0, L0[256..512] was all zero. Kernel text (mapped via L0[511] in the boot root) became unmapped. The first kernel-side access after the swap (the upcoming trap vector's instruction fetch) faulted silently into an unmapped range. **Fix:** [src/memory/mod.rs](../../src/memory/mod.rs) — `create_process_page_table`'s riscv64 arm now copies the upper half (indices 256..512) from the currently-active `satp` root into the freshly allocated L0 before returning, so every user page table carries kernel-side mappings transitively.
+
+2. **Boot stack sp stayed in its pre-paging physical identity form.** [src/arch/riscv64/entry.rs](../../src/arch/riscv64/entry.rs) computed `sp = &BOOT_STACK + BOOT_STACK_SIZE` before enabling paging, giving the physical address (e.g., `0x80340008`). After `csrw satp`, that sp *still* works — as long as the active satp has L0[0] pointing at the identity gigapage (true of the boot root). But when the scheduler swapped to hello's satp (kernel-half copied, low half zero), the low-identity mapping vanished and the boot-stack sp became invalid. The timer ISR save-path faulted on its first store. **Fix:** entry.rs now adds the VMA–LMA offset (`0xffffffff_00000000` per the linker script) to `sp` right before jumping to `kmain_riscv64`, so the kernel executes on the higher-half VA mapping of BOOT_STACK from day one.
+
+**Scope for R-4.b.**
+
+- No libsys riscv64 ecall stubs yet (`hello.S` uses raw assembly). Landing libsys bindings is a follow-up once a Rust user-space service needs them.
+- No per-user-crate `.cargo/config.toml` riscv64 blocks — the ~10 existing user services stay x86_64/aarch64-only until R-6 brings them up with virtio-mmio.
+- hello-riscv64 is UNSIGNED; `spawn_hello_riscv64` uses `DefaultVerifier`. Ed25519 signing of RISC-V boot modules is R-6 scope, gated on the DTB/`/chosen/linux,initrd-{start,end}` boot-module delivery path.
+- The R-3.f kernel ping task is removed — replaced by hello as the scheduler's observable workload.
+
+**Verification.**
+
+- `make check-all` green across all three arches.
+- `cargo test --lib --target x86_64-apple-darwin` — 487/487.
+- `make run-riscv64`:
+  - `✓ Spawned hello-riscv64 user task as TaskId(1)`
+  - `[Module] Hello from boot module (riscv64)!`
+  - `[Module] Hello from boot module (riscv64)!`
+  - `[Module] Hello from boot module (riscv64)!`
+  - (hello exits; scheduler reaps; hart returns to idle wfi)
+
+**How to apply.** R-5 (SMP) is next. The `percpu::init_ap` path is already in place; hart enumeration from DTB + `sbi_hart_start` + per-hart `sscratch=0` + trap vector re-installation per hart are the remaining pieces. R-6 ships virtio-mmio + libsys + real signed boot modules + shell.
