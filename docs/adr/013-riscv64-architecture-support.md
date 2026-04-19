@@ -368,3 +368,24 @@ Total 128 bytes, 8-byte aligned. Offsets documented inline for the asm.
 - R-3.d's inline UART-RX fallback in `plic::dispatch_pending` still stands; removed once a user-space console driver registers in `INTERRUPT_ROUTER`.
 
 **How to apply.** R-4 picks up from here — add the `sscratch`/`tp` swap front-end to `_riscv_trap_vector` so traps from U-mode correctly flip per-CPU state, extend the ELF loader for `EM_RISCV` (0xF3), and the first user process with `ecall`-based syscalls via libsys replaces the kernel ping task as the scheduler's real workload. R-3 is complete.
+
+### 2026-04-18 — Phase R-4.a: trap vector `sscratch`/`tp` swap front-end
+
+**What changed.** `_riscv_trap_vector` now handles U-mode entry correctly: on `csrrw tp, sscratch, tp`, a non-zero new `tp` indicates a U→S trap, and the vector switches to the kernel stack from `PerCpu.kernel_stack_top`, records the user's `sp`/`tp` into the SavedContext's `gpr[2]` and `gpr[4]` slots, and dispatches. On return, `sstatus.SPP` decides the restore path — SPP=1 restores as before; SPP=0 writes `sscratch = kernel_tp` and restores including the user-valued `tp` and `sp` before `sret`. Existing S→S traps (the R-3.f preemption path) behave identically through a `swap`/`swap-back` pair — verified end-to-end via the kernel ping task and console RX still working.
+
+**Convention.** The existing R-3.f invariant — `tp = kernel_tp`, `sscratch = 0` while kernel executes — is preserved. Before entering U-mode for the first time, the sret-to-U path sets `sscratch = kernel_tp` so the next U→S trap's swap delivers the kernel PerCpu pointer into `tp`. Cleared back to 0 on every S→S return.
+
+**Pieces.**
+
+- [src/arch/riscv64/percpu.rs](../../src/arch/riscv64/percpu.rs) — `PerCpu` grew a `user_sp_scratch: u64` field at offset 40. The trap vector's `sd sp, 40(tp)` on U-entry stashes user sp here because we need it before the full SavedContext is allocated (we haven't switched to the kernel stack yet). `init_bsp` clears both `user_sp_scratch` and `sscratch` (via `csrw sscratch, zero`) so the invariant is established from hart-0 boot.
+- [src/arch/riscv64/trap.rs](../../src/arch/riscv64/trap.rs) — trap vector asm rewritten. Entry: swap + branch on origin. From-S: second swap restores `tp`, allocate frame on current sp, save all regs. From-U: stash user sp, load kernel sp, allocate frame, save user_sp/user_tp from scratch sources into gpr[2]/gpr[4]. Shared tail: sepc/sstatus + dispatch. Exit: branch on new `sstatus.SPP` (bit 8 via `andi t1, t0, 0x100`) — to-S restores directly, to-U sets `sscratch = tp` (= kernel_tp) first so the next U→S trap picks up the swap.
+- No Rust-side changes to `_riscv_rust_trap_handler` — the handler continues returning the SavedContext pointer, and `mv sp, a0` before the restore tail honors any frame swap.
+
+**Scaffolding note.** The U-mode entry path compiles and the vector is ready, but no U-mode code runs yet — that lands in R-4.b (ELF `EM_RISCV` + libsys `ecall` stubs + `hello-riscv64`). Until then only the S→S path is exercised. R-3.f's regression gate (kernel ping + stdin RX through the shared trap vector) stayed identical on the new code, so the swap infrastructure is inert for the kernel-only workload.
+
+**Verification.**
+- `make check-all` green all three arches.
+- `cargo test --lib --target x86_64-apple-darwin` — 487/487.
+- `make run-riscv64` with stdin feed still produces `[R-3.f ping N]` continuously + `[R-3 RX] 0xNN ('c')` on keypress.
+
+**How to apply.** R-4.b wires the first U-mode code. Checkpoint before trying to sret to user: the `sscratch` invariant must be primed (`sscratch = kernel_tp`) — the process-spawn path that builds a user task's initial SavedContext should set it, just as R-3.f's kernel-ping-spawn set `gp`/`tp`/`sstatus`. The cleanest place is inside `create_isr_task`'s RISC-V user-task variant, or right before the first sret to U.

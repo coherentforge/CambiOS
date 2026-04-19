@@ -5,26 +5,39 @@
 //! Single entry point for all exceptions and interrupts, installed at
 //! `stvec` with MODE=0 (direct). `scause` distinguishes what happened.
 //!
-//! ## Phase R-3.b+c scope: kernel-mode entry only
+//! ## Phase R-4.a scope: U↔S-capable vector
 //!
-//! This first landing handles traps **from S-mode only** — the timer
-//! interrupt firing while the kernel idle-loops in `wfi`. That is the
-//! only trap source in the current milestone (no user code until R-4,
-//! no PLIC-routed device IRQs until R-3.d). Because every trap here
-//! comes from the kernel, we skip the `sscratch`/`tp` swap dance that
-//! U-mode entry requires — `tp` is already the kernel per-CPU pointer,
-//! `sp` is already the kernel stack.
+//! Handles traps from both S-mode (kernel preemption, kernel-side
+//! breakpoints) and U-mode (`ecall` syscalls, page faults from user
+//! code, device IRQs arriving while user runs). The split is driven
+//! by the `sscratch` ↔ `tp` swap convention:
 //!
-//! When Phase R-4 lands user code, this vector grows a front-end that:
-//!   1. Tests `sstatus.SPP` (bit 8) to detect U→S entry.
-//!   2. Swaps `tp` with `sscratch` on U→S to get the kernel per-CPU ptr.
-//!   3. Loads kernel `sp` from `tp + PerCpu::kernel_stack_top_offset`.
-//!   4. Reverses the swap on S→U return.
+//! - While the kernel executes: `tp` = kernel PerCpu pointer,
+//!   `sscratch` = 0 (sentinel).
+//! - While user executes: `tp` = user's thread pointer,
+//!   `sscratch` = kernel PerCpu pointer (pre-set on the sret-to-U
+//!   return path).
 //!
-//! The body below never touches `sscratch` and never assumes a swap has
-//! happened. That means until R-4 extends it, a trap from U-mode would
-//! corrupt the kernel stack — so until the R-4 front-end is in, nothing
-//! may enter U-mode. The kernel stays in S-mode end-to-end.
+//! Entry sequence: `csrrw tp, sscratch, tp` atomically swaps the two.
+//! If the *new* `tp` is non-zero, we came from user (we now hold the
+//! kernel PerCpu); otherwise we came from kernel and swap back.
+//!
+//! On U→S entry the vector additionally:
+//!   1. Stashes the user `sp` into `PerCpu.user_sp_scratch` (offset 40).
+//!   2. Loads the kernel stack from `PerCpu.kernel_stack_top` (off 24).
+//!   3. Saves the user's original `tp` (now in `sscratch`) into the
+//!      SavedContext's gpr[4] slot.
+//!   4. Saves the user's `sp` (from the PerCpu scratch slot) into gpr[2].
+//!
+//! On S→U return the vector additionally:
+//!   1. Sets `sscratch` back to the kernel PerCpu pointer so the next
+//!      U→S trap picks up the swap.
+//!   2. Restores the user's `tp` from the SavedContext.
+//!
+//! S→S (kernel preempted by kernel-mode timer) behaves identically to
+//! R-3's original kernel-only vector: no PerCpu reads, no sscratch
+//! writes beyond the initial swap/swap-back pair, the full frame is
+//! allocated on the *current* sp.
 //!
 //! ## Trap frame layout
 //!
@@ -56,25 +69,37 @@ use super::SavedContext;
 
 // Exported symbol: `_riscv_trap_vector`.
 //
-// Path: allocate 288B trap frame on current sp, save x1 + x3..x31 at
-// their natural offsets (x0 is hardwired zero; skipped), compute and
-// save original sp, capture sepc + sstatus, call rust_trap_handler,
-// then restore everything (including sp last) and sret.
+// Entry:
+//   csrrw tp, sscratch, tp     — atomic swap
+//   if new tp != 0 → from U-mode (tp now = kernel PerCpu)
+//   if new tp == 0 → from S-mode (sscratch now holds kernel PerCpu; swap back)
+//
+// Both paths converge on the save/dispatch tail after laying the
+// 288-byte SavedContext on the kernel sp, with gpr[2]=sp and
+// gpr[4]=tp filled from the correct source (original kernel values
+// on S-entry, PerCpu scratch + sscratch on U-entry).
+//
+// Exit: branches on the NEW sstatus.SPP — SPP=1 restores for sret to
+// S; SPP=0 writes sscratch = kernel_tp (so the next U→S trap's swap
+// lands tp = kernel PerCpu) and restores including tp/sp from the
+// user-valued frame.
 core::arch::global_asm!(
     r#"
     .section .text.trap
     .globl _riscv_trap_vector
     .align 4
 _riscv_trap_vector:
-    // Allocate SavedContext (288 bytes, 16-byte aligned).
-    addi sp, sp, -288
+    // === Entry: swap tp ↔ sscratch, branch on origin ===
+    csrrw tp, sscratch, tp
+    bnez tp, 10f                    // tp != 0 → came from U-mode
 
-    // Save x1 (ra) and x3..x31 at their natural offsets.
-    // x0 is hardwired zero; its slot at offset 0 is never touched.
-    // x2 (sp) is handled specially below (we need its pre-trap value).
+    // From S-mode: pre-trap sscratch was 0 (kernel invariant), so the
+    // swap put tp=0 and sscratch=kernel_tp. Restore via a second swap.
+    csrrw tp, sscratch, tp          // tp = kernel_tp, sscratch = 0
+    addi sp, sp, -288               // allocate SavedContext on kernel sp
     sd x1,   8(sp)
     sd x3,  24(sp)
-    sd x4,  32(sp)
+    sd x4,  32(sp)                  // tp (kernel_tp; matches running kernel)
     sd x5,  40(sp)
     sd x6,  48(sp)
     sd x7,  56(sp)
@@ -102,40 +127,77 @@ _riscv_trap_vector:
     sd x29, 232(sp)
     sd x30, 240(sp)
     sd x31, 248(sp)
+    addi t0, sp, 288                // pre-trap kernel sp
+    sd t0, 16(sp)                   // gpr[2] = pre-trap sp
+    j 20f
 
-    // Save pre-trap sp at gpr[2] offset (= current sp + 288).
-    // t0 (x5) was just saved, so we can freely use it.
-    addi t0, sp, 288
-    sd t0, 16(sp)
+10:
+    // From U-mode: post-swap tp = kernel PerCpu, sscratch = user_tp.
+    // Stash user sp, load kernel stack, allocate frame.
+    sd sp, 40(tp)                   // PerCpu.user_sp_scratch = user_sp
+    ld sp, 24(tp)                   // sp = PerCpu.kernel_stack_top
+    addi sp, sp, -288
+    sd x1,   8(sp)
+    sd x3,  24(sp)
+    // x4 (tp) is currently kernel_tp; the user's tp is in sscratch.
+    // Skip `sd x4` here — gpr[4] is written from sscratch below so
+    // the frame carries user_tp for the sret-to-U restore path.
+    sd x5,  40(sp)
+    sd x6,  48(sp)
+    sd x7,  56(sp)
+    sd x8,  64(sp)
+    sd x9,  72(sp)
+    sd x10, 80(sp)
+    sd x11, 88(sp)
+    sd x12, 96(sp)
+    sd x13, 104(sp)
+    sd x14, 112(sp)
+    sd x15, 120(sp)
+    sd x16, 128(sp)
+    sd x17, 136(sp)
+    sd x18, 144(sp)
+    sd x19, 152(sp)
+    sd x20, 160(sp)
+    sd x21, 168(sp)
+    sd x22, 176(sp)
+    sd x23, 184(sp)
+    sd x24, 192(sp)
+    sd x25, 200(sp)
+    sd x26, 208(sp)
+    sd x27, 216(sp)
+    sd x28, 224(sp)
+    sd x29, 232(sp)
+    sd x30, 240(sp)
+    sd x31, 248(sp)
+    ld t0, 40(tp)                   // t0 = user_sp (from PerCpu scratch)
+    sd t0, 16(sp)                   // gpr[2] = user_sp
+    csrr t0, sscratch               // t0 = user_tp
+    sd t0, 32(sp)                   // gpr[4] = user_tp
 
-    // Capture sepc + sstatus.
+20:
+    // === Shared: save sepc + sstatus, dispatch ===
     csrr t0, sepc
     sd t0, 256(sp)
     csrr t0, sstatus
     sd t0, 264(sp)
 
-    // Call _riscv_rust_trap_handler(saved_ctx, scause, stval) -> u64.
-    // a0 = &SavedContext (current sp).
-    // a1 = scause, a2 = stval.
-    // The handler returns (in a0) the SavedContext pointer to restore
-    // from — same as input for exceptions and non-switching timer
-    // ticks, a *different* SavedContext for a preempting context
-    // switch. `mv sp, a0` below honors that; all subsequent loads
-    // address the restore frame rather than the entry frame.
     mv   a0, sp
     csrr a1, scause
     csrr a2, stval
     call _riscv_rust_trap_handler
-    mv   sp, a0
+    mv   sp, a0                     // handler may have swapped frames
 
-    // Restore sepc + sstatus first (they may have been updated by the
-    // handler to redirect the return).
+    // Restore sepc + sstatus first.
     ld t0, 264(sp)
     csrw sstatus, t0
-    ld t0, 256(sp)
-    csrw sepc, t0
+    ld t1, 256(sp)
+    csrw sepc, t1
 
-    // Restore x1 + x3..x31. Skip x2 (sp); we restore it last.
+    // Branch on the NEW sstatus.SPP (bit 8) for return mode.
+    andi t1, t0, 0x100
+    beqz t1, 30f                    // SPP == 0 → return to U-mode
+
+    // === Restore for sret to S-mode ===
     ld x1,   8(sp)
     ld x3,  24(sp)
     ld x4,  32(sp)
@@ -166,11 +228,45 @@ _riscv_trap_vector:
     ld x29, 232(sp)
     ld x30, 240(sp)
     ld x31, 248(sp)
-
-    // Restore sp last: loads the saved pre-trap sp from 16(sp), which
-    // equals (current sp + 288), effectively deallocating the frame.
     ld sp, 16(sp)
+    sret
 
+30:
+    // === Restore for sret to U-mode ===
+    // Current tp = kernel_tp (handler didn't touch it); stash it in
+    // sscratch so the NEXT U→S trap's swap drops kernel_tp into tp.
+    csrw sscratch, tp
+    ld x1,   8(sp)
+    ld x3,  24(sp)
+    ld x4,  32(sp)                  // tp = user_tp (from frame)
+    ld x5,  40(sp)
+    ld x6,  48(sp)
+    ld x7,  56(sp)
+    ld x8,  64(sp)
+    ld x9,  72(sp)
+    ld x10, 80(sp)
+    ld x11, 88(sp)
+    ld x12, 96(sp)
+    ld x13, 104(sp)
+    ld x14, 112(sp)
+    ld x15, 120(sp)
+    ld x16, 128(sp)
+    ld x17, 136(sp)
+    ld x18, 144(sp)
+    ld x19, 152(sp)
+    ld x20, 160(sp)
+    ld x21, 168(sp)
+    ld x22, 176(sp)
+    ld x23, 184(sp)
+    ld x24, 192(sp)
+    ld x25, 200(sp)
+    ld x26, 208(sp)
+    ld x27, 216(sp)
+    ld x28, 224(sp)
+    ld x29, 232(sp)
+    ld x30, 240(sp)
+    ld x31, 248(sp)
+    ld sp, 16(sp)                   // sp = user_sp (from frame)
     sret
     "#
 );

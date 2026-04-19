@@ -38,16 +38,17 @@ pub const MAX_CPUS: usize = 256;
 
 /// Per-CPU data structure. Layout matches AArch64 for cross-arch parity.
 ///
-/// ## Layout (offsets used by trap handler assembly in Phase R-3)
-/// | Offset | Field            | Size |
-/// |--------|------------------|------|
-/// |   0    | self_ptr         |  8   |
-/// |   8    | cpu_id           |  4   |
-/// |  12    | (pad)            |  4   |
-/// |  16    | hart_id          |  8   |
-/// |  24    | kernel_stack_top |  8   |
-/// |  32    | current_task_id  |  4   |
-/// |  36    | interrupt_depth  |  4   |
+/// ## Layout (offsets used by trap handler assembly)
+/// | Offset | Field             | Size |
+/// |--------|-------------------|------|
+/// |   0    | self_ptr          |  8   |
+/// |   8    | cpu_id            |  4   |
+/// |  12    | (pad)             |  4   |
+/// |  16    | hart_id           |  8   |
+/// |  24    | kernel_stack_top  |  8   |
+/// |  32    | current_task_id   |  4   |
+/// |  36    | interrupt_depth   |  4   |
+/// |  40    | user_sp_scratch   |  8   |
 #[repr(C)]
 pub struct PerCpu {
     /// Pointer to self — allows `ld x0, 0(tp)` to fetch the struct.
@@ -59,12 +60,18 @@ pub struct PerCpu {
     hart_id: u64,
     /// Kernel stack top for the current task. Updated by
     /// [`super::gdt::set_kernel_stack`] on every context switch.
-    /// Read by the trap handler on U→S entry (Phase R-3).
+    /// Read by the trap handler on U→S entry.
     kernel_stack_top: u64,
     /// Task ID currently running on this hart (0 = idle/none).
     current_task_id: u32,
     /// Interrupt nesting depth (0 = thread context, >0 = trap context).
     interrupt_depth: u32,
+    /// Phase R-4 trap-entry scratch: on U→S entry the vector stashes
+    /// the user's `sp` here (via `sd sp, 40(tp)`) before loading the
+    /// kernel stack from `kernel_stack_top`, then immediately copies
+    /// it back into the SavedContext's gpr[2] slot once the trap
+    /// frame is allocated. Never accessed outside the trap vector.
+    user_sp_scratch: u64,
 }
 
 // SAFETY: Each PerCpu is only touched by its owning hart (`tp` is set
@@ -84,6 +91,7 @@ impl PerCpu {
             kernel_stack_top: 0,
             current_task_id: 0,
             interrupt_depth: 0,
+            user_sp_scratch: 0,
         }
     }
 
@@ -171,10 +179,18 @@ pub unsafe fn init_bsp(hart_id: u64) {
         (*percpu).hart_id = hart_id;
         (*percpu).current_task_id = 0;
         (*percpu).interrupt_depth = 0;
+        (*percpu).user_sp_scratch = 0;
 
+        // Set tp = kernel PerCpu pointer; clear sscratch = 0. The
+        // trap vector's entry `csrrw tp, sscratch, tp` expects this
+        // invariant during kernel execution: sscratch == 0 (sentinel
+        // for "trap came from kernel"). Before entering U-mode for
+        // the first time, the sret-return path sets sscratch =
+        // kernel_tp so the next U→S trap picks up the swap.
         core::arch::asm!(
-            "mv tp, {0}",
-            in(reg) percpu as u64,
+            "mv tp, {ptr}",
+            "csrw sscratch, zero",
+            ptr = in(reg) percpu as u64,
             options(nostack, nomem, preserves_flags),
         );
     }
