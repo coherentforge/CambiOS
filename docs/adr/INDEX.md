@@ -20,10 +20,10 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 008 | [Boot-Time-Sized Kernel Object Tables](008-boot-time-sized-object-tables.md) | Proposed | 2026-04-11 |
 | 009 | [Purpose, Deployment Tiers, and Scope Boundaries](009-purpose-tiers-scope.md) | Proposed | 2026-04-11 |
 | 010 | [Persistent ObjectStore — on-disk format](010-persistent-object-store-on-disk-format.md) | Proposed | 2026-04-14 |
-| 010 | [Windows Compatibility — The API/AI Boundary](010-win-compat-api-ai-boundary.md) | Proposed | 2026-04-13 |
-| 010 | [Catalog: Phase 1 Win32 Surface — Tier Assignments](010-win-compat-phase1-catalog.md) | Proposed | 2026-04-13 |
 | 011 | [Graphics Architecture and Scaling Assumptions](011-graphics-architecture-and-scaling.md) | Proposed | 2026-04-13 |
 | 012 | [Input Architecture and Device Classes](012-input-architecture-and-device-classes.md) | Proposed | 2026-04-14 |
 | 013 | [RISC-V (riscv64gc) Architecture Support](013-riscv64-architecture-support.md) | Proposed | 2026-04-15 |
 | 014 | [Compositor ↔ Scanout-Driver Protocol](014-compositor-scanout-driver-protocol.md) | Proposed | 2026-04-15 |
 | 015 | [Storage Tiers and the Commitment Ladder](015-storage-tiers-and-commitment-ladder.md) | Proposed | 2026-04-16 |
+| 016 | [Windows Compatibility — The API/AI Boundary](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-13 |
+| 017 | [Catalog: Phase 1 Win32 Surface — Tier Assignments](017-win-compat-phase1-catalog.md) | Proposed | 2026-04-13 |

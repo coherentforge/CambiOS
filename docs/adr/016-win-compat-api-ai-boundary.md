@@ -1,9 +1,10 @@
-# ADR-010: Windows Compatibility — The API/AI Boundary
+# ADR-016: Windows Compatibility — The API/AI Boundary
 
 - **Status:** Proposed
 - **Date:** 2026-04-13
+- **Renumbered:** 2026-04-19 — was ADR-010; `make check-adrs` flagged the shared-number collision with [ADR-010 Persistent ObjectStore](010-persistent-object-store-on-disk-format.md), which is wired throughout the storage subsystem and retains 010. The two win-compat ADRs moved to 016 + 017.
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-007](007-capability-revocation-and-telemetry.md) (Audit Telemetry), [ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers)
-- **Related:** [win-compat.md](../win-compat.md), [docs/adr/010-win-compat-phase1-catalog.md](010-win-compat-phase1-catalog.md) (sibling catalog)
+- **Related:** [win-compat.md](../win-compat.md), [ADR-017](017-win-compat-phase1-catalog.md) (sibling catalog)
 - **Supersedes:** N/A
 
 ## Context
@@ -103,7 +104,7 @@ Given a function's five scores, assign tier:
 
 ## Phase 1 Catalog
 
-The full per-function tier assignment for the ~80 Win32 functions covering Phase 1 (business applications: QuickBooks, Sage 50, tax prep) is in the sibling document [docs/adr/010-win-compat-phase1-catalog.md](010-win-compat-phase1-catalog.md). Summary:
+The full per-function tier assignment for the ~80 Win32 functions covering Phase 1 (business applications: QuickBooks, Sage 50, tax prep) is in the sibling document [ADR-017](017-win-compat-phase1-catalog.md). Summary:
 
 - **Tier 0 (static):** ~52 functions. The bulk of kernel32 (file I/O, memory, time, process ID), ntdll (heap, TLS basics), advapi32 (core registry operations), user32 (message pump primitives).
 - **Tier 1 (JIT):** ~18 functions. Rare ntdll internals, uncommon advapi32 (security tokens, crypto API stubs), GDI DC/font variants, shell32 folder path resolution.
@@ -268,7 +269,7 @@ The PE process cannot tell which tier served its call — from its perspective, 
 ## Cross-References
 
 - [win-compat.md](../win-compat.md) — Updated to reference this ADR as the authoritative source for tier classification rules, plan grammar, validation pipeline, and audit schema. Sections that described these in prose are shortened to a one-line reference.
-- [docs/adr/010-win-compat-phase1-catalog.md](010-win-compat-phase1-catalog.md) — Sibling document containing the per-function tier assignments for the Phase 1 Win32 surface. Applies this ADR's rules to today's target.
+- [ADR-017](017-win-compat-phase1-catalog.md) — Sibling document containing the per-function tier assignments for the Phase 1 Win32 surface. Applies this ADR's rules to today's target.
 - [STATUS.md](../../STATUS.md) — Windows compatibility remains "Planned (post-v1)." This ADR is a design landing, not an implementation landing.
 - [CLAUDE.md](../../CLAUDE.md) — Required Reading table gets a new row when the scaffolding lands: "Windows compatibility / PE loader / shim layer" pointing to this ADR and its catalog.
 

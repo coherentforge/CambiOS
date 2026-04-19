@@ -1,22 +1,23 @@
-# ADR-010 Catalog: Phase 1 Win32 Surface — Tier Assignments
+# ADR-017 Catalog: Phase 1 Win32 Surface — Tier Assignments
 
 - **Status:** Proposed
 - **Date:** 2026-04-13
-- **Companion to:** [ADR-010](010-win-compat-api-ai-boundary.md) — classification rules and decision procedure
+- **Renumbered:** 2026-04-19 — was ADR-010; see [ADR-016](016-win-compat-api-ai-boundary.md) renumber note.
+- **Companion to:** [ADR-016](016-win-compat-api-ai-boundary.md) — classification rules and decision procedure
 - **Applies to:** Phase 1 target applications (QuickBooks Desktop, Sage 50, Lacerte, Drake) per [win-compat.md](../win-compat.md) § Phase 1
 
 ## Purpose
 
-ADR-010 defines the rules. This document applies them. Each Win32 function in the Phase 1 surface is classified using the five-axis decision procedure (determinism, statefulness, frequency, risk surface, argument complexity) and assigned a tier. Scaffolding of `user/win-compat/` uses this catalog as the source of truth for per-function tier tags in the shim dispatch table.
+ADR-016 defines the rules. This document applies them. Each Win32 function in the Phase 1 surface is classified using the five-axis decision procedure (determinism, statefulness, frequency, risk surface, argument complexity) and assigned a tier. Scaffolding of `user/win-compat/` uses this catalog as the source of truth for per-function tier tags in the shim dispatch table.
 
 When a new Win32 function enters the Phase 1 surface (because a target application calls it and we didn't anticipate it), add it here using the decision procedure. The ADR itself needs revision only if the rules change.
 
 ## Classification Shorthand
 
-Tier values from ADR-010 § Decision Procedure:
+Tier values from ADR-016 § Decision Procedure:
 
 - **T0** — Static shim. Hand-coded in `user/win-compat/src/shims/<dll>.rs`. Deterministic, fixed or bounded arguments, risk ≠ High.
-- **T1** — JIT plan. Translator produces plan on first call, cached per ADR-010 § Caching and Promotion.
+- **T1** — JIT plan. Translator produces plan on first call, cached per ADR-016 § Caching and Promotion.
 - **T2** — Behavioral pattern. Part of a named multi-call sequence; translation happens once per pattern, not per call.
 - **T3** — Interactive fallback. Not a default assignment; reached only when T1/T2 translation fails validation.
 - **R** — Router. Argument-sensitive; see the per-function sub-routing for which sub-handler fires.
@@ -41,7 +42,7 @@ Core process, memory, file I/O, threading. Most of the hot path lives here.
 | `HeapAlloc` | T0 | Heap allocation. Hot. Statefulness=Handle-scoped. |
 | `HeapFree` | T0 | Heap free. Hot. |
 | `HeapDestroy` | T0 | Heap teardown. Cold. |
-| `CreateThread` | T1 | Thread model not yet finalized in CambiOS sandboxes. See Open Question in ADR-010. |
+| `CreateThread` | T1 | Thread model not yet finalized in CambiOS sandboxes. See Open Question in ADR-016. |
 | `ExitThread` | T1 | Depends on CreateThread semantics. |
 | `WaitForSingleObject` | T1 | Multiple object kinds (thread, mutex, event); argument-shape inspection needed. |
 | `GetModuleHandleW` | T0 | Lookup in sandbox's loaded-module table. |
@@ -239,7 +240,7 @@ Multi-call patterns translated as sequences, not as individual functions.
 | Windowing bootstrap | `RegisterClassExW`, `CreateWindowExW`, `ShowWindow`, `UpdateWindow` | Standard window creation sequence. Mapped to UI service window creation. |
 | File open dialog | `GetOpenFileNameW` (plus callbacks, subclassing) | Common-dialog file selection. Mapped to UI service file picker. |
 | Printing pipeline | `StartDoc`, `StartPage`, GDI calls, `EndPage`, `EndDoc` | Print job construction. Mapped to print service job submission. |
-| SEH dispatch | `RtlAddVectoredExceptionHandler`, exception trigger, `RtlRemoveVectoredExceptionHandler` | Sandbox-scoped exception handling. Requires kernel SEH support (Open Question in ADR-010). |
+| SEH dispatch | `RtlAddVectoredExceptionHandler`, exception trigger, `RtlRemoveVectoredExceptionHandler` | Sandbox-scoped exception handling. Requires kernel SEH support (Open Question in ADR-016). |
 | Drag-and-drop | `DoDragDrop`, `IDropSource` / `IDropTarget` vtable calls | OLE drag-and-drop protocol. Deferred to Phase 2 (CAD apps use this heavily). |
 
 ## Summary

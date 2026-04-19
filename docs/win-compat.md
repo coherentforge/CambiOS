@@ -11,7 +11,7 @@ This document captures the design for CambiOS's Windows application compatibilit
 
 For the identity model that governs how sandboxed processes interact with the system, see [identity.md](identity.md).
 For the object store that mediates file access, see [FS-and-ID-design-plan.md](FS-and-ID-design-plan.md).
-For the authoritative rules defining which Win32 functions are served by static shims vs. the AI translator (the API/AI boundary, plan grammar, validation pipeline, caching, audit schema), see [ADR-010](adr/010-win-compat-api-ai-boundary.md) and the companion [Phase 1 catalog](adr/010-win-compat-phase1-catalog.md). Sections below that describe these topics are kept brief; ADR-010 is the source of truth.
+For the authoritative rules defining which Win32 functions are served by static shims vs. the AI translator (the API/AI boundary, plan grammar, validation pipeline, caching, audit schema), see [ADR-016](adr/016-win-compat-api-ai-boundary.md) and the companion [ADR-017 Phase 1 catalog](adr/017-win-compat-phase1-catalog.md). Sections below that describe these topics are kept brief; ADR-016 is the source of truth.
 
 ---
 
@@ -108,7 +108,7 @@ Sandboxed processes have no network access by default. The sandbox policy can gr
 └─────────────────────┘
 ```
 
-**Endpoint allocation note.** Earlier drafts of this document named endpoint 20 for win-compat and endpoint 21 for the AI translator, but those endpoints are now in use by the virtio-net driver (20) and UDP stack (21). The revised allocation is: win-compat control endpoint = 24, AI translator = 25, with per-sandbox private endpoints drawn from the tier-policy pool (see the endpoint-sizing ADR landing alongside ADR-010).
+**Endpoint allocation note.** Earlier drafts of this document named endpoint 20 for win-compat and endpoint 21 for the AI translator, but those endpoints are now in use by the virtio-net driver (20) and UDP stack (21). The revised allocation is: win-compat control endpoint = 24, AI translator = 25, with per-sandbox private endpoints drawn from the tier-policy pool (see the endpoint-sizing ADR landing alongside ADR-016).
 
 ### Crate Structure
 
@@ -157,7 +157,7 @@ The AI translator is the one component that lives outside `win-compat` — it ru
 
 This is the fast path. Known APIs, known translations, no AI involved.
 
-**AI Translator** (endpoint 25, separate service) — The novel component. When the shim layer encounters an API call it doesn't have a static translation for, or when a sequence of calls forms a pattern that needs higher-level understanding, `win-compat` forwards the request to the AI translator over IPC. The translator's output is a validated *interpretation plan* (not emitted code) that the dispatcher executes under the sandbox's capabilities. The full plan grammar, validation pipeline, caching model, and signature requirements are in [ADR-010](adr/010-win-compat-api-ai-boundary.md).
+**AI Translator** (endpoint 25, separate service) — The novel component. When the shim layer encounters an API call it doesn't have a static translation for, or when a sequence of calls forms a pattern that needs higher-level understanding, `win-compat` forwards the request to the AI translator over IPC. The translator's output is a validated *interpretation plan* (not emitted code) that the dispatcher executes under the sandbox's capabilities. The full plan grammar, validation pipeline, caching model, and signature requirements are in [ADR-016](adr/016-win-compat-api-ai-boundary.md).
 
 **Virtual Filesystem** — Maps Windows path conventions to ObjectStore queries. Maintains a path-to-hash index per sandbox. Handles drive letters, UNC paths, and Windows path separators. Translates Windows file attributes and timestamps to CambiObject metadata.
 
@@ -205,9 +205,9 @@ This is where the AI has a structural advantage over static reimplementation: it
 
 ### Translation Tiers and Boundary Rules
 
-The four-tier model (Tier 0 static / Tier 1 JIT / Tier 2 behavioral / Tier 3 interactive) is specified in [ADR-010](adr/010-win-compat-api-ai-boundary.md). The ADR defines the decision procedure (determinism, statefulness, frequency, risk surface, argument complexity), the plan grammar the AI translator emits, the validation pipeline every plan passes before execution, the cache and promotion rules, and the audit schema.
+The four-tier model (Tier 0 static / Tier 1 JIT / Tier 2 behavioral / Tier 3 interactive) is specified in [ADR-016](adr/016-win-compat-api-ai-boundary.md). The ADR defines the decision procedure (determinism, statefulness, frequency, risk surface, argument complexity), the plan grammar the AI translator emits, the validation pipeline every plan passes before execution, the cache and promotion rules, and the audit schema.
 
-The companion [Phase 1 catalog](adr/010-win-compat-phase1-catalog.md) applies those rules to the ~100 Win32 functions the Phase 1 target apps (QuickBooks, Sage 50, Lacerte, Drake) call. Summary: ~71 Tier 0 static shims, ~19 Tier 1 JIT plans, 6 Tier 2 behavioral patterns, 4 argument-sensitive routers. New Win32 functions are classified using the ADR's procedure and added to the catalog; the ADR itself changes only if the rules change.
+The companion [ADR-017 Phase 1 catalog](adr/017-win-compat-phase1-catalog.md) applies those rules to the ~100 Win32 functions the Phase 1 target apps (QuickBooks, Sage 50, Lacerte, Drake) call. Summary: ~71 Tier 0 static shims, ~19 Tier 1 JIT plans, 6 Tier 2 behavioral patterns, 4 argument-sensitive routers. New Win32 functions are classified using the ADR's procedure and added to the catalog; the ADR itself changes only if the rules change.
 
 ### Model Placement
 
