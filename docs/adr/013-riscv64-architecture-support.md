@@ -291,3 +291,39 @@ A consequence: if a future CambiOS RISC-V hardware target has MMIO above 4 GiB, 
 **How to apply.** When R-4 wires the first RISC-V user-space driver (likely fs-service via virtio-mmio), register the driver's TaskId in `crate::INTERRUPT_ROUTER.register(IrqNumber(X), task, priority)`. The PLIC's `dispatch_pending` will then route via the existing IPC wake path instead of falling through to the inline console-RX diagnostic. The inline path in [src/arch/riscv64/plic.rs](../../src/arch/riscv64/plic.rs)'s `dispatch_pending` (the branch matching `CONSOLE_IRQ`) is a R-3.d milestone scaffold marked for removal when a real console driver registers.
 
 When Phase R-5 brings up APs, generalize `HART0_S_CONTEXT` (currently a hardcoded `1`) to compute `hart * 2 + 1` per target hart, or read context-to-hart mapping from the DTB's `/soc/plic/interrupts-extended` property (which lists `<phandle> <irq>` pairs per context).
+
+### 2026-04-18 — Phase R-3.e: context-switch primitives (scaffolding for R-3.f)
+
+**What changed.** Replaced the R-1 panic stubs for `context_save` / `context_restore` / `context_switch` / `yield_save_and_switch` in [src/arch/riscv64/mod.rs](../../src/arch/riscv64/mod.rs) with real implementations, added a RISC-V `CpuContext` arm to [src/scheduler/task.rs](../../src/scheduler/task.rs), and wrote real `saved_to_cpu_context` / `cpu_to_saved_context` converters. No consumer is wired yet — these are scaffolding for R-3.f's scheduler integration, which will be the first production caller.
+
+**CpuContext layout.** 16 u64 fields matching the AArch64 shape:
+- `s0..s11` (x8/x9/x18..x27) — 12 RISC-V callee-saved registers
+- `ra` (x1) — preserved as the caller's post-call PC
+- `sp` (x2) — stack pointer
+- `pc` — resume PC (set to `ra` at save time so `context_restore` branches back to the instruction after the `call context_save` that reached us)
+- `sstatus` — snapshot for forward compatibility with FP dirty-state bits
+
+Total 128 bytes, 8-byte aligned. Offsets documented inline for the asm.
+
+**Explicit context-switch assembly.** Three `global_asm!` entry points following the AArch64 pattern (stp/ldp → sd/ld, `ret` → `ret`, `br x2` → `jr t0`):
+
+- `context_save(ctx: *mut CpuContext)` — stores s0..s11 + ra + sp + `ra` (as pc) + sstatus, then returns normally.
+- `context_restore(ctx: *const CpuContext) -> !` — loads the 16 fields back and `jr t0` (saved pc).
+- `context_switch(current: *mut, next: *const) -> !` — the save + restore fused.
+
+**Voluntary yield assembly.** `yield_save_and_switch` builds a synthetic SavedContext on the kernel stack (identical layout to what the trap vector would push on preemption) and rides the same restore path. Key differences from the trap-vector save:
+
+1. Masks SIE via `csrci sstatus, 2` before the save, not hardware-implicit.
+2. Sets synthetic `sepc = .Lyield_resume` — the post-`sret` landing inside the same function.
+3. Sets synthetic `sstatus` with SPP=1 (bit 8) + SPIE=1 (bit 5) via `ori t0, t0, 0x120`. `sret` then pops: mode ← S (from SPP), SIE ← 1 (from SPIE). Lands at `.Lyield_resume` in S-mode with interrupts re-enabled.
+4. Saves x1 at offset 8 before the scheduler call → the caller's pre-yield `ra`. After `sret` restores x1 from the (possibly different) SavedContext, the trailing `ret` at `.Lyield_resume` branches back to the kernel path that called `yield_save_and_switch`.
+
+**`yield_inner` Rust handler.** Takes the current SavedContext SP, calls `crate::scheduler::on_voluntary_yield(current_sp)` — which returns `(new_sp, Option<ContextSwitchHint>)` — and applies arch-side per-hart state updates from the hint before returning `new_sp` to the asm. Kernel stack top goes through `gdt::set_kernel_stack` (writes `PerCpu.kernel_stack_top` via `tp+24`). Page-table root update reads current `satp`, compares PPN × 4 KiB against `hint.page_table_root`, and on mismatch writes a new `satp = (MODE=9 Sv48 << 60) | PPN` + `sfence.vma zero, zero`.
+
+**Mapping to SavedContext.** `saved_to_cpu_context` pulls `s0` from `gpr[8]`, `s1` from `gpr[9]`, `s2..s11` from `gpr[18..27]`, `ra` from `gpr[1]`, `sp` from `gpr[2]`, `pc` from `sepc`. The reverse direction zeros the full `gpr[..32]` first then writes only the callee-saved slots — caller-saved registers must not leak values across task resumes.
+
+**Nothing is consumed yet.** No production path calls `context_switch` or `yield_save_and_switch` on RISC-V until R-3.f wires a real `on_voluntary_yield` pathway through the scheduler's portable arm branches (halt/wfi/local_scheduler/local_timer). This is deliberate per the project's "skip test hooks when next step consumes" feedback — the R-3.f scheduler integration is the real consumer, and writing a synthetic two-task test here would be scaffolding we'd throw away when R-3.f lands.
+
+**Verification.** `make check-all` green all three arches. `cargo test --lib --target x86_64-apple-darwin` — 487/487 host tests pass. `make run-riscv64` still reaches the R-3.d milestone unchanged (timer ticks + stdin-fed console RX still observable) — the context-switch primitives are unreachable at this phase.
+
+**How to apply.** R-3.f's scheduler integration will be the first real test of this code. If subtle bugs surface then (register ordering, sstatus bits, sp restore timing), they are intentionally deferred: debugging the layered R-3.e + R-3.f intersection is cheaper than building a synthetic two-task harness here that we'd throw away. The AArch64 scheduler path is the reference for the portable wiring — the RISC-V arch primitives here match its shape pin-for-pin.

@@ -215,8 +215,101 @@ impl CpuContext {
     }
 }
 
-/// CpuContext compiled out — provide a fallback for test/other targets
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+/// CPU context for a task (RISC-V rv64 register state)
+///
+/// Stores the AAPCS-callee-saved set plus return path (ra + sp + pc) and
+/// an sstatus snapshot (for FP state bits once that's wired — today the
+/// kernel doesn't touch FP). Caller-saved registers (a0–a7, t0–t6) are
+/// not preserved across voluntary context switches; they live in
+/// SavedContext when preemption is the switch mechanism.
+///
+/// ## Register layout (offsets for assembly)
+/// ```text
+/// s0=0,  s1=8,  s2=16, s3=24, s4=32, s5=40, s6=48, s7=56,
+/// s8=64, s9=72, s10=80, s11=88,
+/// ra=96, sp=104, pc=112, sstatus=120
+/// ```
+/// Total size: 128 bytes (16 × 8), 8-byte aligned.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[cfg(target_arch = "riscv64")]
+pub struct CpuContext {
+    /// s0 (x8) — also the frame pointer on AAPCS.
+    pub s0: u64,
+    /// s1 (x9).
+    pub s1: u64,
+    /// s2 (x18).
+    pub s2: u64,
+    /// s3 (x19).
+    pub s3: u64,
+    /// s4 (x20).
+    pub s4: u64,
+    /// s5 (x21).
+    pub s5: u64,
+    /// s6 (x22).
+    pub s6: u64,
+    /// s7 (x23).
+    pub s7: u64,
+    /// s8 (x24).
+    pub s8: u64,
+    /// s9 (x25).
+    pub s9: u64,
+    /// s10 (x26).
+    pub s10: u64,
+    /// s11 (x27).
+    pub s11: u64,
+    /// Return address (x1) — preserved as the caller's post-call PC.
+    pub ra: u64,
+    /// Stack pointer (x2).
+    pub sp: u64,
+    /// Saved program counter (sepc on trap entry, or the saved `ra`
+    /// when `context_save` captured the frame). The target of the
+    /// resume `jr` / `sret`.
+    pub pc: u64,
+    /// Saved supervisor status. Today only FP-dirty bits would make
+    /// this non-trivial; kept for forward compatibility.
+    pub sstatus: u64,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl CpuContext {
+    /// Create a new task context for a given entry point and stack.
+    ///
+    /// Zeros the callee-saved set; sets `ra = entry_point` so the
+    /// first `context_restore` branches to the entry via its `jr
+    /// saved.pc` path. `sstatus = 0` starts the task with S-mode
+    /// interrupts enabled only after the arch-side wrapper OR's in
+    /// SIE at restore time — today the voluntary-yield path in
+    /// `src/arch/riscv64/mod.rs` handles this via SPIE on sret.
+    pub fn new(entry_point: u64, stack_pointer: u64) -> Self {
+        CpuContext {
+            s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0,
+            s8: 0, s9: 0, s10: 0, s11: 0,
+            ra: entry_point, // so `ret` after context_restore branches here
+            sp: stack_pointer,
+            pc: entry_point,
+            sstatus: 0,
+        }
+    }
+
+    /// Verify context is in valid state
+    pub fn verify_integrity(&self) -> Result<(), &'static str> {
+        if self.pc == 0 {
+            return Err("PC cannot be zero");
+        }
+        if self.sp == 0 {
+            return Err("SP cannot be zero");
+        }
+        Ok(())
+    }
+}
+
+/// CpuContext compiled out — provide a fallback for test/other targets.
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+)))]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct CpuContext {
@@ -224,7 +317,11 @@ pub struct CpuContext {
     pub sp: u64,
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+)))]
 impl CpuContext {
     pub fn new(entry_point: u64, stack_pointer: u64) -> Self {
         CpuContext { pc: entry_point, sp: stack_pointer }
