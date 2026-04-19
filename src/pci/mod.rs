@@ -1,12 +1,15 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! PCI bus enumeration via x86 Configuration Space mechanism 1
+//! PCI (and PCI-shaped) device table
 //!
-//! Performs a brute-force scan of bus 0 at boot, discovering devices and
-//! reading their BARs. Results are stored in a static table that is written
-//! once during `scan()` and read-only thereafter.
+//! Holds a kernel-global table of devices surfaced through the
+//! `SYS_DEVICE_INFO` syscall. On x86_64 the table is populated by the
+//! Configuration Space mechanism 1 scan ([`scan`]). On riscv64 it is
+//! populated from DTB-discovered virtio-mmio regions via
+//! [`register_virtio_mmio`] — the syscall shape is the same either way,
+//! so user-space drivers use unchanged discovery code.
 //!
-//! # Port I/O
+//! # Port I/O (x86_64 only)
 //!
 //! PCI configuration space access uses 32-bit port I/O at:
 //! - `0x0CF8` — CONFIG_ADDRESS (write bus/device/function/offset)
@@ -14,9 +17,11 @@
 //!
 //! # Safety
 //!
-//! `scan()` is unsafe because it performs raw port I/O and writes to PCI
-//! config space (BAR size detection). It must be called exactly once,
-//! during BSP boot, before any driver tries to claim a device.
+//! `scan()` (x86_64) is unsafe because it performs raw port I/O and
+//! writes to PCI config space (BAR size detection). It must be called
+//! exactly once, during BSP boot, before any driver tries to claim a
+//! device. `register_virtio_mmio` (riscv64) has an analogous
+//! single-writer-at-boot invariant.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,9 +29,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub const MAX_PCI_DEVICES: usize = 32;
 
 /// CONFIG_ADDRESS port (0x0CF8).
+#[cfg(target_arch = "x86_64")]
 const CONFIG_ADDRESS: u16 = 0x0CF8;
 
 /// CONFIG_DATA port (0x0CFC).
+#[cfg(target_arch = "x86_64")]
 const CONFIG_DATA: u16 = 0x0CFC;
 
 // ---------------------------------------------------------------------------
@@ -85,7 +92,7 @@ static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [PciDevice::EMPTY; MAX_PCI_DE
 static DEVICE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
-// 32-bit port I/O helpers
+// 32-bit port I/O helpers (x86_64 only)
 // ---------------------------------------------------------------------------
 
 /// Write a 32-bit value to an x86 I/O port.
@@ -93,6 +100,7 @@ static DEVICE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// # Safety
 /// The caller must ensure `port` is a valid I/O port and that the write is
 /// appropriate in the current hardware state.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn outl(port: u16, value: u32) {
     // SAFETY: Caller guarantees port validity. 32-bit OUT instruction.
@@ -111,6 +119,7 @@ unsafe fn outl(port: u16, value: u32) {
 /// # Safety
 /// The caller must ensure `port` is a valid I/O port and that the read is
 /// appropriate in the current hardware state.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn inl(port: u16) -> u32 {
     let value: u32;
@@ -127,7 +136,7 @@ unsafe fn inl(port: u16) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// PCI configuration space access
+// PCI configuration space access (x86_64 only)
 // ---------------------------------------------------------------------------
 
 /// Build a CONFIG_ADDRESS value for the given BDF + register offset.
@@ -137,6 +146,7 @@ unsafe fn inl(port: u16) -> u32 {
 /// 31      24 23    16 15   11 10    8 7       2 1 0
 /// | Enable | Reserved|  Bus  | Device| Function| Offset | 00 |
 /// ```
+#[cfg(target_arch = "x86_64")]
 #[inline]
 const fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     // Bit 31: enable configuration space mapping
@@ -152,6 +162,7 @@ const fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 /// # Safety
 /// Must be called with interrupts in a safe state (boot or IRQs disabled).
 /// `offset` must be dword-aligned (bits 1:0 = 0).
+#[cfg(target_arch = "x86_64")]
 unsafe fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let addr = config_address(bus, device, function, offset);
     // SAFETY: CONFIG_ADDRESS (0xCF8) is a standard PCI port. Selecting the config register.
@@ -166,6 +177,7 @@ unsafe fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u3
 /// Must be called with interrupts in a safe state. Writing to PCI config
 /// space can have side effects (e.g., BAR reprogramming). The caller must
 /// know what they are doing.
+#[cfg(target_arch = "x86_64")]
 unsafe fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     let addr = config_address(bus, device, function, offset);
     // SAFETY: CONFIG_ADDRESS (0xCF8) is a standard PCI port. Selecting the config register.
@@ -175,10 +187,11 @@ unsafe fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, valu
 }
 
 // ---------------------------------------------------------------------------
-// BAR decoding
+// BAR decoding (x86_64 only)
 // ---------------------------------------------------------------------------
 
 /// BAR register offsets in PCI config space (0x10 .. 0x24, six BARs).
+#[cfg(target_arch = "x86_64")]
 const BAR_OFFSETS: [u8; 6] = [0x10, 0x14, 0x18, 0x1C, 0x20, 0x24];
 
 /// Decode BARs for a device, including BAR size detection.
@@ -187,6 +200,7 @@ const BAR_OFFSETS: [u8; 6] = [0x10, 0x14, 0x18, 0x1C, 0x20, 0x24];
 /// Temporarily writes 0xFFFF_FFFF to each BAR (standard size-detection
 /// protocol) and restores the original value. Must not be called while
 /// any driver is actively using the device.
+#[cfg(target_arch = "x86_64")]
 unsafe fn decode_bars(
     bus: u8,
     device: u8,
@@ -320,6 +334,7 @@ unsafe fn decode_bars(
 /// - Must be called at boot before drivers access PCI devices.
 /// - Performs port I/O and temporarily writes to PCI BARs for size detection.
 /// - Not reentrant and not thread-safe (single-writer at boot).
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn scan() {
     let mut count = 0usize;
 
@@ -402,6 +417,8 @@ pub fn get_device(index: usize) -> Option<&'static PciDevice> {
 ///
 /// Returns `true` if the port is within a known PCI I/O BAR, `false` otherwise.
 /// Used by the kernel to validate port I/O syscalls from user-space.
+/// x86_64 only — aarch64/riscv64 do not expose a port-I/O syscall.
+#[cfg(target_arch = "x86_64")]
 pub fn is_port_in_pci_bar(port: u16) -> bool {
     let count = device_count();
     let port_u64 = port as u64;
@@ -431,4 +448,122 @@ pub fn find_by_vendor_device(vendor: u16, device: u16) -> Option<&'static PciDev
     // by scan_bus. Shared reference only.
     let devices = unsafe { &DEVICES[..count] };
     devices.iter().find(|dev| dev.vendor_id == vendor && dev.device_id == device)
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic device registration (non-PCI carriers surfaced through the
+// same syscall shape — currently riscv64 virtio-mmio, see ADR-013 / R-6)
+// ---------------------------------------------------------------------------
+
+/// Virtio vendor ID used for synthetic virtio-mmio entries, matching the
+/// OASIS virtio-over-PCI convention so user-space service discovery code
+/// (e.g. `find_virtio_blk()`) recognizes the synthetic entries without
+/// special-casing the carrier.
+const SYNTHETIC_VIRTIO_VENDOR_ID: u16 = 0x1AF4;
+
+/// Offset of the `DeviceID` register inside a virtio-mmio v1 register
+/// file (virtio spec §4.2.2).
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
+
+/// Register a virtio-mmio device discovered via the DTB.
+///
+/// Reads the virtio `DeviceID` from the MMIO region (via HHDM — the
+/// region must be covered by the boot-time HHDM gigapage mapping, which
+/// on QEMU virt is true for all standard virtio-mmio slots), then pushes
+/// a synthesized [`PciDevice`] into the global table. The synthesized
+/// entry uses the virtio-over-PCI vendor/device ID convention
+/// (vendor = 0x1AF4, device = 0x1000 + virtio_id - 1), which is what
+/// existing user-space drivers already look up via
+/// [`find_by_vendor_device`] / the `SYS_DEVICE_INFO` syscall.
+///
+/// BAR 0 is populated with the MMIO region as a memory-mapped BAR so
+/// the driver's `sys::map_mmio` + transport-selection path fires the
+/// `LegacyMmioTransport` branch.
+///
+/// Returns `false` if the MMIO region reports an invalid MagicValue,
+/// a non-legacy version, a zero DeviceID (QEMU exposes empty slots),
+/// or the global table is full. In all failure cases the table is
+/// left unchanged.
+///
+/// # Safety
+/// - Must be called at boot before any reader of the device table.
+/// - Must not race with [`scan`] or another `register_virtio_mmio`.
+/// - `hhdm_offset` must already be published via [`crate::hhdm_offset`].
+/// - `phys_base` must point at real virtio-mmio hardware whose MMIO
+///   region is kernel-readable at `hhdm_offset + phys_base`.
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn register_virtio_mmio(phys_base: u64, size: u64) -> bool {
+    // Virtio-mmio v1 layout — mirrors the user-space transport in
+    // user/virtio-blk/src/transport.rs and user/virtio-net/src/transport.rs.
+    const MAGIC_OFFSET: usize = 0x000;
+    const VERSION_OFFSET: usize = 0x004;
+    const EXPECTED_MAGIC: u32 = 0x74726976; // "virt"
+    const EXPECTED_VERSION_LEGACY: u32 = 1;
+
+    let vbase = (phys_base + crate::hhdm_offset()) as *const u32;
+
+    // SAFETY: caller guarantees this region is HHDM-mapped and maps to
+    // real virtio-mmio hardware. Volatile 32-bit reads are the
+    // spec-defined access width.
+    let magic = unsafe { core::ptr::read_volatile(vbase.byte_add(MAGIC_OFFSET)) };
+    if magic != EXPECTED_MAGIC {
+        return false;
+    }
+    // SAFETY: same as above.
+    let version = unsafe { core::ptr::read_volatile(vbase.byte_add(VERSION_OFFSET)) };
+    if version != EXPECTED_VERSION_LEGACY {
+        return false;
+    }
+    // SAFETY: same as above.
+    let virtio_id =
+        unsafe { core::ptr::read_volatile(vbase.byte_add(VIRTIO_MMIO_DEVICE_ID_OFFSET)) };
+    if virtio_id == 0 {
+        // QEMU advertises 8 virtio-mmio slots at fixed addresses and
+        // reports `DeviceID == 0` for unpopulated ones. That is not an
+        // error — the slot is just empty.
+        return false;
+    }
+
+    let current = DEVICE_COUNT.load(Ordering::Acquire);
+    if current >= MAX_PCI_DEVICES {
+        return false;
+    }
+
+    // OASIS virtio-over-PCI transitional mapping:
+    //   virtio_id 1 (net)   → device 0x1000
+    //   virtio_id 2 (blk)   → device 0x1001
+    //   virtio_id 3 (cons)  → device 0x1002
+    //   ...
+    let synthetic_device_id = 0x1000u16.wrapping_add((virtio_id as u16).wrapping_sub(1));
+
+    // Size caps at u32 — virtio-mmio regions are small (≤ 4 KiB in
+    // practice) so truncation of an unexpectedly large value just
+    // reports 0 and any user-space driver that notices will fail the
+    // subsequent `map_mmio` rather than reading past the region.
+    let bar_size: u32 = u32::try_from(size).unwrap_or(0);
+
+    let mut bars = [0u64; 6];
+    let mut bar_sizes = [0u32; 6];
+    let mut bar_is_io = [false; 6];
+    bars[0] = phys_base;
+    bar_sizes[0] = bar_size;
+    bar_is_io[0] = false; // MMIO, not I/O port
+
+    // SAFETY: index checked above; we are the sole writer during boot.
+    unsafe {
+        DEVICES[current] = PciDevice {
+            bus: 0,
+            device: 0,
+            function: 0,
+            vendor_id: SYNTHETIC_VIRTIO_VENDOR_ID,
+            device_id: synthetic_device_id,
+            class: 0,
+            subclass: 0,
+            bars,
+            bar_sizes,
+            bar_is_io,
+        };
+    }
+    DEVICE_COUNT.store(current + 1, Ordering::Release);
+    true
 }

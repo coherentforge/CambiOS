@@ -38,7 +38,6 @@ pub mod boot;
 pub mod boot_modules;
 pub mod audit;
 pub mod policy;
-#[cfg(target_arch = "x86_64")]
 pub mod pci;
 
 // Kernel heap allocator — initialized from Limine memory map in kmain

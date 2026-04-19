@@ -691,6 +691,42 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         }
     }
 
+    // Phase R-6: virtio-mmio discovery. DTB populated BootInfo with
+    // every `/soc/virtio_mmio@*` region; we now probe each one for
+    // magic/version/device-id and synthesize a PCI-shaped entry in
+    // the global device table so the unchanged `SYS_DEVICE_INFO`
+    // syscall surfaces them to user-space drivers. Empty QEMU slots
+    // (DeviceID == 0) silently drop out — see `pci::register_virtio_mmio`.
+    //
+    // SAFETY: HHDM is live, BootInfo is installed, no user task is
+    // running yet, no other writer touches the pci table.
+    {
+        let mut registered = 0usize;
+        for region in arcos_core::boot::info().virtio_mmio_devices() {
+            unsafe {
+                if arcos_core::pci::register_virtio_mmio(region.phys_base, region.size) {
+                    registered += 1;
+                }
+            }
+        }
+        println!(
+            "✓ Virtio-MMIO: {} device(s) registered (DTB advertised {})",
+            registered,
+            arcos_core::boot::info().virtio_mmio_devices().count(),
+        );
+        for i in 0..arcos_core::pci::device_count() {
+            if let Some(dev) = arcos_core::pci::get_device(i) {
+                println!(
+                    "  virtio-mmio {:04x}:{:04x} BAR0={:#x} size={}",
+                    dev.vendor_id,
+                    dev.device_id,
+                    dev.bars[0],
+                    dev.bar_sizes[0],
+                );
+            }
+        }
+    }
+
     // Phase R-3.f: scheduler + Timer object install. The Scheduler's
     // idle task (Task 0) is implicitly the kmain flow we're running —
     // `Scheduler::init` marks it Running and current. The first

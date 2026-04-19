@@ -71,6 +71,18 @@ pub const MAX_FRAMEBUFFERS: usize = 8;
 ///      registry holds the spawnable view.
 pub const MAX_BOOT_MODULES: usize = 16;
 
+/// SCAFFOLDING: max virtio-mmio device regions discovered from the boot
+/// protocol. RISC-V QEMU virt populates from DTB `/soc/virtio_mmio@*`
+/// nodes; x86_64 and AArch64 leave this empty (virtio devices come
+/// through PCI enumeration instead).
+/// Why: QEMU virt exposes 8 slots by default. v1 endgame virtio
+///      workload is blk + net + gpu + input + audio ≈ 5 active devices.
+///      16 gives ~3× headroom on v1 and bounded iteration. Memory
+///      cost: 16 × 16 B ≈ 256 B. See docs/ASSUMPTIONS.md.
+/// Replace when: a QEMU machine config or real silicon exposes >16
+///      virtio-mmio regions.
+pub const MAX_VIRTIO_MMIO_DEVICES: usize = 16;
+
 /// SCAFFOLDING: max harts enumerated from the boot protocol.
 /// Why: the RISC-V DTB lists one `cpu@N` node per hart. v1 CambiOS
 ///      target hardware is ≤8 cores; workstation-class RISC-V silicon
@@ -190,6 +202,20 @@ impl ModuleInfo {
     }
 }
 
+/// A virtio-mmio device region reported by the boot protocol.
+///
+/// On RISC-V the DTB's `/soc/virtio_mmio@*/reg` property gives us the
+/// physical base and byte size of the MMIO register file. The device
+/// kind (net, blk, …) is not in the DTB — it's in the device's
+/// `DeviceID` register at offset 0x008, which the kernel reads after
+/// boot to synthesize a PCI-shaped device descriptor for the
+/// `SYS_DEVICE_INFO` syscall (see ADR-013 / R-6).
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioMmioInfo {
+    pub phys_base: u64,
+    pub size: u64,
+}
+
 // ============================================================================
 // BootInfo — the aggregated, kernel-owned view
 // ============================================================================
@@ -253,6 +279,12 @@ pub struct BootInfo {
 
     modules: [Option<ModuleInfo>; MAX_BOOT_MODULES],
     module_count: usize,
+
+    /// Virtio-mmio regions discovered by the boot adapter. RISC-V
+    /// populates from DTB `/soc/virtio_mmio@*`; x86_64 and AArch64
+    /// leave this empty (those targets route virtio through PCI).
+    virtio_mmio_devices: [Option<VirtioMmioInfo>; MAX_VIRTIO_MMIO_DEVICES],
+    virtio_mmio_count: usize,
 }
 
 impl BootInfo {
@@ -278,6 +310,8 @@ impl BootInfo {
             framebuffer_count: 0,
             modules: [const { None }; MAX_BOOT_MODULES],
             module_count: 0,
+            virtio_mmio_devices: [const { None }; MAX_VIRTIO_MMIO_DEVICES],
+            virtio_mmio_count: 0,
         }
     }
 
@@ -360,6 +394,23 @@ impl BootInfo {
     /// Module count.
     pub fn module_count(&self) -> usize {
         self.module_count
+    }
+
+    /// Append a virtio-mmio region. Returns false if the table is full.
+    pub fn push_virtio_mmio(&mut self, info: VirtioMmioInfo) -> bool {
+        if self.virtio_mmio_count >= MAX_VIRTIO_MMIO_DEVICES {
+            return false;
+        }
+        self.virtio_mmio_devices[self.virtio_mmio_count] = Some(info);
+        self.virtio_mmio_count += 1;
+        true
+    }
+
+    /// All virtio-mmio regions reported by the boot protocol.
+    pub fn virtio_mmio_devices(&self) -> impl Iterator<Item = &VirtioMmioInfo> {
+        self.virtio_mmio_devices[..self.virtio_mmio_count]
+            .iter()
+            .filter_map(|v| v.as_ref())
     }
 }
 
@@ -529,6 +580,41 @@ mod tests {
         }
         assert!(!info.push_module(empty_module()));
         assert_eq!(info.module_count(), MAX_BOOT_MODULES);
+    }
+
+    #[test]
+    fn test_bootinfo_virtio_mmio_push_and_iterate() {
+        let mut info = BootInfo::empty();
+        assert_eq!(info.virtio_mmio_devices().count(), 0);
+        assert!(info.push_virtio_mmio(VirtioMmioInfo {
+            phys_base: 0x1000_1000,
+            size: 0x200,
+        }));
+        assert!(info.push_virtio_mmio(VirtioMmioInfo {
+            phys_base: 0x1000_2000,
+            size: 0x200,
+        }));
+        let collected: alloc::vec::Vec<_> = info
+            .virtio_mmio_devices()
+            .map(|v| (v.phys_base, v.size))
+            .collect();
+        assert_eq!(collected, [(0x1000_1000, 0x200), (0x1000_2000, 0x200)]);
+    }
+
+    #[test]
+    fn test_bootinfo_virtio_mmio_full() {
+        let mut info = BootInfo::empty();
+        for _ in 0..MAX_VIRTIO_MMIO_DEVICES {
+            assert!(info.push_virtio_mmio(VirtioMmioInfo {
+                phys_base: 0x1000_1000,
+                size: 0x200,
+            }));
+        }
+        assert!(!info.push_virtio_mmio(VirtioMmioInfo {
+            phys_base: 0x1000_1000,
+            size: 0x200,
+        }));
+        assert_eq!(info.virtio_mmio_devices().count(), MAX_VIRTIO_MMIO_DEVICES);
     }
 
     #[test]

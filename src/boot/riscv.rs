@@ -198,6 +198,11 @@ enum DeviceKind {
     /// `/soc/serial@*` — `interrupts` → PLIC source ID of the console
     /// UART.
     Serial,
+    /// `/soc/virtio_mmio@*` — `reg` → MMIO base + size of a virtio
+    /// device register file. The actual device kind (net, blk, …) lives
+    /// in the `DeviceID` register inside the MMIO space and is resolved
+    /// in kernel boot after HHDM is up (R-6, ADR-013).
+    VirtioMmio,
 }
 
 /// Classify a node name into a [`DeviceKind`] given its depth and the
@@ -237,6 +242,14 @@ fn classify_node(depth: usize, parent: DeviceKind, name: &[u8]) -> DeviceKind {
                 let rest = &name[b"serial".len()..];
                 if rest.is_empty() || rest.starts_with(b"@") {
                     return DeviceKind::Serial;
+                }
+            }
+            if name.starts_with(b"virtio_mmio") {
+                // QEMU virt node names look like `virtio_mmio@10001000`;
+                // accept both the bare form and any `@address` suffix.
+                let rest = &name[b"virtio_mmio".len()..];
+                if rest.is_empty() || rest.starts_with(b"@") {
+                    return DeviceKind::VirtioMmio;
                 }
             }
             DeviceKind::None
@@ -292,6 +305,8 @@ struct DtbFacts {
     console_irq: Option<u32>,
     harts: [u64; super::MAX_HARTS],
     hart_count: usize,
+    virtio_mmio: [(u64, u64); super::MAX_VIRTIO_MMIO_DEVICES],
+    virtio_mmio_count: usize,
     totalsize: u32,
 }
 
@@ -305,6 +320,8 @@ impl DtbFacts {
             console_irq: None,
             harts: [0u64; super::MAX_HARTS],
             hart_count: 0,
+            virtio_mmio: [(0u64, 0u64); super::MAX_VIRTIO_MMIO_DEVICES],
+            virtio_mmio_count: 0,
             totalsize: 0,
         }
     }
@@ -322,6 +339,13 @@ impl DtbFacts {
             self.hart_count += 1;
         }
     }
+
+    fn push_virtio_mmio(&mut self, base: u64, size: u64) {
+        if self.virtio_mmio_count < self.virtio_mmio.len() {
+            self.virtio_mmio[self.virtio_mmio_count] = (base, size);
+            self.virtio_mmio_count += 1;
+        }
+    }
 }
 
 /// Walk the DTB and collect the facts the kernel needs in one pass.
@@ -330,8 +354,10 @@ impl DtbFacts {
 /// Matches:
 /// - `/memory@*` → `reg` → memory regions (usable RAM).
 /// - `/cpus` → `timebase-frequency` → platform timer tick rate.
+/// - `/cpus/cpu@N` → `reg` → hart IDs.
 /// - `/soc/plic@*` → `reg` → PLIC MMIO base + size.
 /// - `/soc/serial@*` → `interrupts` → console IRQ source ID.
+/// - `/soc/virtio_mmio@*` → `reg` → virtio-mmio device regions.
 ///
 /// # Safety
 /// `dtb_phys` must point at a valid FDT blob.
@@ -486,6 +512,19 @@ unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
                             facts.push_hart(be_u32_at(value, 0) as u64);
                         }
                     }
+                    (DeviceKind::VirtioMmio, b"reg") => {
+                        // Under /soc `#address-cells = #size-cells = 2`.
+                        // Each virtio-mmio node has one (base, size)
+                        // pair = 16 bytes. Multiple pairs would mean a
+                        // single node serving multiple regions, which
+                        // QEMU virt and any virtio-mmio platform we
+                        // care about do not do.
+                        if value.len() >= 16 {
+                            let base = be_u64_at(value, 0);
+                            let size = be_u64_at(value, 8);
+                            facts.push_virtio_mmio(base, size);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -537,6 +576,13 @@ pub unsafe fn populate(dtb_phys: u64) {
         info.console_irq = facts.console_irq;
         for i in 0..facts.hart_count {
             let _ = info.push_hart(facts.harts[i]);
+        }
+        for i in 0..facts.virtio_mmio_count {
+            let (phys_base, size) = facts.virtio_mmio[i];
+            let _ = info.push_virtio_mmio(super::VirtioMmioInfo {
+                phys_base,
+                size,
+            });
         }
     }
 
