@@ -82,7 +82,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo compositor user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 sign-tool export-pubkey
+.PHONY: all kernel iso run run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo compositor user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 sign-tool export-pubkey
 
 all: iso
 
@@ -593,6 +593,23 @@ symbols:
 # if two ADRs share a number. Run after any ADR edit or addition.
 check-adrs:
 	python3 tools/check-adrs.py
+
+# Enforce CLAUDE.md Development Convention 9 (every deferral is a
+# conscious deferral). Scans kernel source + design docs for deferral
+# tokens (TODO/FIXME/eventually/placeholder/TBD/for-now/etc.) and flags
+# any without a Revisit when: / Replace when: / named-concept trigger
+# within 3 lines. Baseline exemptions in tools/check-deferrals-baseline.txt.
+# The goal is to not grow the baseline; don't treat clearing it as a
+# session-end imperative. Exits nonzero on new violations.
+check-deferrals:
+	python3 tools/check-deferrals.py
+
+# Regenerate the deferrals baseline from scratch. Use when you've
+# intentionally added a deferral that carries a real (but unrecognized)
+# trigger, or when a legitimate cleanup removed pre-existing entries.
+# Review the diff before committing.
+update-deferrals-baseline:
+	python3 tools/check-deferrals.py --update-baseline
 
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel

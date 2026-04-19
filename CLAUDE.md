@@ -81,6 +81,7 @@ Commit at natural topic boundaries within a session, not at session end. The cos
 
 Why each non-obvious rule was added, so a future session can generalize instead of pattern-matching on surface syntax. Keep entries terse (`YYYY-MM-DD — change — reason/failure it addresses`). Newest first.
 
+- **2026-04-19** — Added Development Convention 9 ("Every deferral is a conscious deferral") + `make check-deferrals` lint + baseline file. Reason: ADR-006 carried a forward reference to "ADR-021 Init Process" for months, pointing at an anchor in CLAUDE.md that also didn't exist. When `make check-adrs` landed (2026-04-16) it caught the forward reference, but only because that specific shape (ADR-NNN cite) was lint-able. Within one session three more instances of the same pattern surfaced across different surfaces: a discarded return value meant to become load-bearing (`_vma_count` in `reclaim_user_vmas`), Frame-A identity vestiges flagged in memory but not cleaned up, and the R-5.b shootdown self-test that was only rescued from drift because its ADR entry happened to flag it in prose. Common shape: a deferral whose revisit trigger is "whenever someone notices" instead of an observable condition. Convention 9 mirrors Convention 8's template — SCAFFOLDING bounds already require `Replace when:` with an observable trigger; the discipline now extends to decisions, ADR prose, and code comments via `Revisit when:`. The lint grep-catches the high-signal token shapes (TODO/FIXME/eventually/later/placeholder/for-now/TBD) and flags any without a trigger within 3 lines. Baseline file (`tools/check-deferrals-baseline.txt`) exempts pre-existing instances so the lint is a don't-grow-the-baseline gate, not a boil-the-ocean blocker.
 - **2026-04-16** — Added Commit Cadence rule. Reason: session-end-only commits accumulate unrelated work (a RISC-V commit silently swept in this session's prompt-shaping code edits because `git commit -a` was used in a parallel session). Rule: topic-boundary commits, explicit file staging, Claude drafts / user executes.
 - **2026-04-16** — Layered the doc: operational sections (Dev Conventions, Post-Change Review, Failure Signatures, Worked Examples) promoted above reference material; directory tree + per-syscall behavior descriptions demoted to the bottom. Reason: instructions near the top of context are absorbed more reliably; what-to-do outranks what-to-look-up.
 - **2026-04-16** — Added `arch::interrupts_enabled()` helper (x86_64 / AArch64 / RISC-V + host stub) and `debug_assert!` at heap entry, `map_page` (both arches), `Scheduler::block_task`. Reason: prose invariants ("disable interrupts before `block_task`", "heap alloc requires `memory::init()` first", "page-align before `map_page`") lose force across sessions; code-level asserts fire at the bad callsite every build.
@@ -132,6 +133,31 @@ const CACHE_CAPACITY: usize = 32;
 3. Record the math in the row for that constant in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md) — the "Why this number" column should show the v1 workload estimate and the memory cost, not just "big enough."
 
 When you add a new bound or change one, update the matching table in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md) in the same change. Step 8 of the Post-Change Review Protocol lists this as an explicit checklist item.
+
+9. **Every deferral is a conscious deferral.** Any "figure it out later" — TODO, placeholder, temporary workaround, "eventually," "when X lands," forward reference without an anchor — must carry a **Revisit when:** line naming an observable trigger. "When it matters" doesn't count. Applies to ADR prose, code comments, doc citations, and commit messages. Unconscious deferrals are how load-bearing placeholders age into lies between the session that wrote them and the session that would have caught them. Concrete triggers look like:
+
+   - *A named commit or subphase:* "Revisit when R-6 lands" (observable: git log names R-6 commit).
+   - *A workload crossing a threshold:* "Revisit when a second boot module needs user-declared endpoints" (observable: second call-site appears).
+   - *A subsystem landing:* "Revisit when the init-process ADR lands" (observable: ADR file exists + check-adrs resolves the reference).
+   - *A measured metric:* "Revisit when audit ring drop counter > 0 under nominal load" (observable: `SYS_AUDIT_INFO` output).
+
+   Vague triggers that **fail** the rule: "later," "eventually," "in the future," "when that matters," "TBD." These are indistinguishable from no trigger at all. If you can't name an observable trigger, the decision isn't ready to defer — either make it now or escalate. The existing SCAFFOLDING bound convention (Convention 8) already follows this template for numeric bounds via `Replace when:`; Convention 9 extends the discipline from bounds to decisions.
+
+   Template for code comments:
+
+   ```rust
+   // Deferred: <one-line statement of the deferral>
+   // Why: <what information we don't yet have, or why deferring is cheaper than deciding now>
+   // Revisit when: <observable trigger>
+   ```
+
+   Template for ADR prose:
+
+   ```markdown
+   > **Deferred decision.** <statement>. **Revisit when:** <observable trigger>.
+   ```
+
+   The [`make check-deferrals`](Makefile) lint scans ADRs + kernel source for deferral tokens without adjacent triggers; run it alongside `make check-adrs` when editing design docs. It's noisy on first introduction (baseline exemptions live in `tools/check-deferrals-baseline.txt`); the goal is to not *grow* the baseline, not to clear it overnight.
 
 ## Post-Change Review Protocol
 
