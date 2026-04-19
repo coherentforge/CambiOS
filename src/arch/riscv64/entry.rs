@@ -70,6 +70,44 @@ pub const BOOT_STACK_SIZE: usize = 16 * 1024;
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
 
 // ============================================================================
+// AP (Application Processor) bootstrap — Phase R-5
+// ============================================================================
+
+/// SCAFFOLDING: maximum number of APs we can bootstrap simultaneously.
+/// Why: each AP needs a fixed boot stack. 8 is the v1 CambiOS
+///      hardware target (≤8 cores) with headroom; exceeds QEMU virt's
+///      realistic `-smp N` configurations. Memory cost:
+///      8 × 16 KiB = 128 KiB in `.bss`.
+/// Replace when: R-6 or later retargets a platform with > 8 harts.
+///      See docs/ASSUMPTIONS.md.
+pub const MAX_AP_BOOT_STACKS: usize = 8;
+
+/// SCAFFOLDING: per-AP boot stack size.
+/// Why: matches `BOOT_STACK_SIZE` — same workload (percpu init, trap
+///      vector install, timer init, scheduler install, idle loop).
+///      Per-task kernel stacks replace this once the scheduler
+///      dispatches the AP's first task.
+pub const AP_BOOT_STACK_SIZE: usize = 16 * 1024;
+
+/// Per-AP boot stack pool. Indexed by `cpu_index` (the `opaque`
+/// argument we pass to `sbi_hart_start`). Sized by
+/// `MAX_AP_BOOT_STACKS`. Each AP writes its sp to the top of its
+/// slot (`&AP_BOOT_STACKS[idx] + AP_BOOT_STACK_SIZE`).
+#[unsafe(link_section = ".bss.ap_boot_stacks")]
+static mut AP_BOOT_STACKS: [[u8; AP_BOOT_STACK_SIZE]; MAX_AP_BOOT_STACKS] =
+    [[0; AP_BOOT_STACK_SIZE]; MAX_AP_BOOT_STACKS];
+
+/// BSP-computed Sv48 satp value, published for APs to read.
+///
+/// `riscv64_fill_boot_page_tables` writes this after constructing the
+/// boot page tables. `_ap_start` reads it before enabling paging so
+/// APs share exactly the BSP's address space (identity + HHDM +
+/// kernel gigapage). Using an `AtomicU64` keeps the write visible to
+/// all harts with release/acquire ordering.
+pub static BOOT_SATP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+// ============================================================================
 // Sv48 boot page tables (static, page-aligned, in .bss)
 // ============================================================================
 
@@ -206,7 +244,16 @@ pub unsafe extern "C" fn riscv64_fill_boot_page_tables() -> u64 {
     }
 
     // Compute satp. Mode=9 (Sv48), ASID=0, PPN=l3_phys >> 12.
-    SATP_MODE_SV48 | (l3_phys >> 12)
+    let satp = SATP_MODE_SV48 | (l3_phys >> 12);
+
+    // Publish to BOOT_SATP so APs (woken later via sbi_hart_start)
+    // can read it in their pre-paging stub and enter the same
+    // address space the BSP built. Release ordering pairs with the
+    // `ld` the AP stub does through acquire-equivalent serialization
+    // (SBI hart_start itself is a full barrier between BSP and AP).
+    BOOT_SATP.store(satp, Ordering::Release);
+
+    satp
 }
 
 // ============================================================================
@@ -240,16 +287,21 @@ core::arch::global_asm!(
     "csrci sstatus, 0x2",
     // Park any hart that isn't hart 0 (Phase R-5 reads BSP from DTB).
     "bnez a0, .Lpark_hart",
-    // Preserve OpenSBI-provided args in callee-saved regs across the
-    // Rust call below. s0 = hart_id, s1 = dtb_phys.
-    "mv s0, a0",
-    "mv s1, a1",
+    // Preserve OpenSBI-provided args in callee-saved regs across
+    // the Rust call below. Use s2/s3 — not s0/s1 — because on
+    // RISC-V `s0 == fp == x8`, and the `mv fp, zero` below would
+    // clobber any value stashed in s0. (Historic BSP-only bug: the
+    // hart_id save landed in s0 and got overwritten; BSP happened
+    // to boot on hart 0 so the observable value always matched. The
+    // R-5.a AP path has hart_id != 0 and exposed the bug.)
+    "mv s2, a0",                    // s2 = hart_id
+    "mv s3, a1",                    // s3 = dtb_phys
     // Set up boot stack: sp = &BOOT_STACK + BOOT_STACK_SIZE.
     // RISC-V stacks grow downward; sp points one past the top.
     "la t0, {boot_stack}",
     "li t1, {boot_stack_size}",
     "add sp, t0, t1",
-    // Zero frame pointer per ABI (entry frame has no caller).
+    // Zero frame pointer per ABI (safe: we use s2/s3, not s0/s1).
     "mv fp, zero",
 
     // Call Rust to fill the Sv48 boot page tables and get the satp value.
@@ -266,8 +318,8 @@ core::arch::global_asm!(
     "ld t3, 0(t1)",                 // t3 = virtual addr of kmain_riscv64
 
     // Restore OpenSBI args for the Rust call below.
-    "mv a0, s0",                    // a0 = hart_id
-    "mv a1, s1",                    // a1 = dtb_phys
+    "mv a0, s2",                    // a0 = hart_id
+    "mv a1, s3",                    // a1 = dtb_phys
 
     // Enable Sv48 paging.
     "csrw satp, t2",
@@ -315,6 +367,8 @@ core::arch::global_asm!(
 extern "C" {
     #[allow(dead_code)]
     fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> !;
+    #[allow(dead_code)]
+    fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> !;
 }
 
 /// Absolute virtual address of `kmain_riscv64`, resolved by the
@@ -323,3 +377,89 @@ extern "C" {
 #[unsafe(link_section = ".rodata.boot")]
 #[unsafe(no_mangle)]
 static KMAIN_RISCV64_VADDR: unsafe extern "C" fn(u64, u64) -> ! = kmain_riscv64;
+
+/// Absolute virtual address of `kmain_riscv64_ap` — same trick as
+/// `KMAIN_RISCV64_VADDR` but for the AP entry Rust function. `_ap_start`
+/// loads this before enabling paging.
+#[unsafe(link_section = ".rodata.boot")]
+#[unsafe(no_mangle)]
+static KMAIN_RISCV64_AP_VADDR: unsafe extern "C" fn(u64, u64) -> ! = kmain_riscv64_ap;
+
+// ============================================================================
+// Assembly entry: _ap_start (secondary hart wakeup)
+// ============================================================================
+//
+// OpenSBI's `sbi_hart_start(hart_id, start_addr_phys, opaque)` enters
+// here on the target hart in S-mode with paging disabled, SIE masked,
+// a0 = hart_id, a1 = opaque. CambiOS passes `cpu_index` as opaque —
+// the index into `PER_CPU_SCHEDULER` / `PER_CPU_TIMER` / `PER_CPU_DATA`
+// this AP should own.
+//
+// The stub mirrors `_start`'s post-paging pieces (no need to rebuild
+// page tables — APs share the BSP's satp via BOOT_SATP):
+//   1. Save a0 (hart_id) / a1 (cpu_idx) in callee-saved s0 / s1.
+//   2. Load this AP's boot stack from AP_BOOT_STACKS[cpu_idx].
+//   3. Load BOOT_SATP and enable paging. sfence.vma.
+//   4. Promote sp to higher-half VA (VMA–LMA offset = 0xffffffff_00000000).
+//   5. Load higher-half VA of kmain_riscv64_ap.
+//   6. Restore args (a0 = cpu_idx, a1 = hart_id) and `jr` to kmain.
+//
+// SAFETY reasoning mirrors `_start`'s global_asm block: all `la`s
+// resolve to physical addresses pre-paging (PC-relative from phys PC),
+// static statics are placed in the kernel image the BSP mapped, the
+// CSR writes are legal in S-mode, and `mul` is part of the `M`
+// extension (implicit in rv64gc).
+core::arch::global_asm!(
+    ".section .text.boot, \"ax\"",
+    ".global _ap_start",
+    ".type _ap_start, @function",
+    "_ap_start:",
+    // Save OpenSBI-provided args in s2/s3 — not s0/s1. On RISC-V
+    // `s0` is `fp` (same register, x8); a later `mv fp, zero` (the
+    // ABI-recommended frame-pointer-reset) would overwrite hart_id
+    // if we stashed it in s0. Using s2/s3 keeps the ABI reset and
+    // the preserve working together.
+    "mv s2, a0",                      // s2 = hart_id
+    "mv s3, a1",                      // s3 = cpu_index
+
+    // Compute sp = &AP_BOOT_STACKS[cpu_idx] + AP_BOOT_STACK_SIZE.
+    "la t0, {ap_boot_stacks}",        // t0 = phys base of stack array
+    "li t1, {ap_boot_stack_size}",    // t1 = per-AP size
+    "mul t2, s3, t1",                 // t2 = cpu_idx * size
+    "add t0, t0, t2",                 // t0 = this AP's stack base
+    "add sp, t0, t1",                 // sp = stack_top (one past end)
+
+    // Zero frame pointer per ABI (safe now: we use s2/s3, not s0/s1).
+    "mv fp, zero",
+
+    // Load BSP's satp from BOOT_SATP.
+    "la t0, {boot_satp}",
+    "ld t2, 0(t0)",
+
+    // Load higher-half VA of kmain_riscv64_ap (before paging switch
+    // so the `la` resolves against the current physical PC).
+    "la t0, {kmain_ap_vaddr_holder}",
+    "ld t3, 0(t0)",
+
+    // Enable Sv48 paging.
+    "csrw satp, t2",
+    "sfence.vma",
+
+    // Promote sp from pre-paging identity form to higher-half VA.
+    // VMA – LMA = 0xffffffff_00000000 per linker script.
+    "li t4, -1",
+    "slli t4, t4, 32",
+    "add sp, sp, t4",
+
+    // Restore args for the Rust call: a0 = cpu_idx, a1 = hart_id.
+    "mv a0, s3",
+    "mv a1, s2",
+
+    // Jump to higher-half AP kmain.
+    "jr t3",
+
+    ap_boot_stacks = sym AP_BOOT_STACKS,
+    ap_boot_stack_size = const AP_BOOT_STACK_SIZE,
+    boot_satp = sym BOOT_SATP,
+    kmain_ap_vaddr_holder = sym KMAIN_RISCV64_AP_VADDR,
+);

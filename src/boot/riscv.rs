@@ -187,6 +187,8 @@ enum DeviceKind {
     /// `/cpus` — parent of per-hart nodes; owns the platform
     /// `timebase-frequency` property.
     Cpus,
+    /// `/cpus/cpu@N` — per-hart node; `reg` gives the hart ID.
+    Cpu,
     /// `/soc` — the bus-like parent that holds PLIC, serial, virtio,
     /// etc. We never read props directly from `/soc` but descend into
     /// its children.
@@ -239,6 +241,18 @@ fn classify_node(depth: usize, parent: DeviceKind, name: &[u8]) -> DeviceKind {
             }
             DeviceKind::None
         }
+        2 if parent == DeviceKind::Cpus => {
+            // `cpu@N` — per-hart node. `reg` is a 1-cell u32 (hart id
+            // per the DT bindings) because /cpus sets `#address-cells
+            // = 1`, `#size-cells = 0`.
+            if name.starts_with(b"cpu") {
+                let rest = &name[b"cpu".len()..];
+                if rest.is_empty() || rest.starts_with(b"@") {
+                    return DeviceKind::Cpu;
+                }
+            }
+            DeviceKind::None
+        }
         _ => DeviceKind::None,
     }
 }
@@ -276,19 +290,21 @@ struct DtbFacts {
     timer_base_hz: Option<u32>,
     plic_mmio: Option<(u64, u64)>,
     console_irq: Option<u32>,
+    harts: [u64; super::MAX_HARTS],
+    hart_count: usize,
     totalsize: u32,
 }
 
 impl DtbFacts {
     const fn new() -> Self {
         Self {
-            // Manual init — `Default` on arrays > 32 requires const
-            // generics + manual impl we don't need here.
             memory: [(0u64, 0u64); super::MAX_MEMORY_REGIONS],
             memory_count: 0,
             timer_base_hz: None,
             plic_mmio: None,
             console_irq: None,
+            harts: [0u64; super::MAX_HARTS],
+            hart_count: 0,
             totalsize: 0,
         }
     }
@@ -297,6 +313,13 @@ impl DtbFacts {
         if self.memory_count < self.memory.len() {
             self.memory[self.memory_count] = (base, size);
             self.memory_count += 1;
+        }
+    }
+
+    fn push_hart(&mut self, hart_id: u64) {
+        if self.hart_count < self.harts.len() {
+            self.harts[self.hart_count] = hart_id;
+            self.hart_count += 1;
         }
     }
 }
@@ -456,6 +479,13 @@ unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
                             facts.console_irq = Some(be_u32_at(value, 0));
                         }
                     }
+                    (DeviceKind::Cpu, b"reg") => {
+                        // /cpus sets `#address-cells = 1`, so the
+                        // `reg` is a single u32 hart id.
+                        if value.len() >= 4 {
+                            facts.push_hart(be_u32_at(value, 0) as u64);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -505,6 +535,9 @@ pub unsafe fn populate(dtb_phys: u64) {
         info.timer_base_frequency_hz = facts.timer_base_hz;
         info.plic_mmio = facts.plic_mmio;
         info.console_irq = facts.console_irq;
+        for i in 0..facts.hart_count {
+            let _ = info.push_hart(facts.harts[i]);
+        }
     }
 
     // Reserve OpenSBI's range on QEMU virt (0x80000000..0x80200000).

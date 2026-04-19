@@ -71,6 +71,18 @@ pub const MAX_FRAMEBUFFERS: usize = 8;
 ///      registry holds the spawnable view.
 pub const MAX_BOOT_MODULES: usize = 16;
 
+/// SCAFFOLDING: max harts enumerated from the boot protocol.
+/// Why: the RISC-V DTB lists one `cpu@N` node per hart. v1 CambiOS
+///      target hardware is ≤8 cores; workstation-class RISC-V silicon
+///      (SiFive P870, T-Head C910) ships ≤4 cores per socket. 8 gives
+///      ~2× headroom with bounded iteration and negligible memory
+///      cost (64 B). Larger platforms are deferred to the post-v1
+///      SMP-scale pass. x86_64 and AArch64 populate hart IDs via
+///      Limine's MP response and ignore this bound; RISC-V uses it
+///      directly. See docs/ASSUMPTIONS.md.
+/// Replace when: targeting a RISC-V platform with > 8 cores.
+pub const MAX_HARTS: usize = 8;
+
 /// Maximum bytes captured from a module's path (must match
 /// [`crate::boot_modules::MAX_NAME_LEN`]).
 pub const MAX_MODULE_NAME_LEN: usize = 64;
@@ -226,6 +238,13 @@ pub struct BootInfo {
     /// GIC).
     pub console_irq: Option<u32>,
 
+    /// Hart IDs discovered from the boot protocol. Index 0 is the
+    /// boot hart (BSP). RISC-V populates from DTB `/cpus/cpu@N/reg`;
+    /// x86_64 and AArch64 leave this `None` — their AP wakeup uses
+    /// Limine's MP response directly.
+    harts: [Option<u64>; MAX_HARTS],
+    hart_count: usize,
+
     memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
     memory_region_count: usize,
 
@@ -251,6 +270,8 @@ impl BootInfo {
             timer_base_frequency_hz: None,
             plic_mmio: None,
             console_irq: None,
+            harts: [None; MAX_HARTS],
+            hart_count: 0,
             memory_regions: [ZERO_REGION; MAX_MEMORY_REGIONS],
             memory_region_count: 0,
             framebuffers: [None; MAX_FRAMEBUFFERS],
@@ -288,6 +309,28 @@ impl BootInfo {
         self.modules[self.module_count] = Some(module);
         self.module_count += 1;
         true
+    }
+
+    /// Append a hart ID. Returns false if the table is full.
+    pub fn push_hart(&mut self, hart_id: u64) -> bool {
+        if self.hart_count >= MAX_HARTS {
+            return false;
+        }
+        self.harts[self.hart_count] = Some(hart_id);
+        self.hart_count += 1;
+        true
+    }
+
+    /// All hart IDs reported by the boot protocol.
+    pub fn harts(&self) -> impl Iterator<Item = u64> + '_ {
+        self.harts[..self.hart_count]
+            .iter()
+            .filter_map(|h| *h)
+    }
+
+    /// Hart count.
+    pub fn hart_count(&self) -> usize {
+        self.hart_count
     }
 
     /// All valid memory regions reported by the boot protocol.

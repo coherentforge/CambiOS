@@ -428,3 +428,53 @@ Total 128 bytes, 8-byte aligned. Offsets documented inline for the asm.
   - (hello exits; scheduler reaps; hart returns to idle wfi)
 
 **How to apply.** R-5 (SMP) is next. The `percpu::init_ap` path is already in place; hart enumeration from DTB + `sbi_hart_start` + per-hart `sscratch=0` + trap vector re-installation per hart are the remaining pieces. R-6 ships virtio-mmio + libsys + real signed boot modules + shell.
+
+### 2026-04-18 — Phase R-5.a: AP bring-up via SBI HSM
+
+**What changed.** Secondary harts wake on RISC-V. `make run-riscv64` now reports `✓ AP hart=1 cpu_idx=1 online` alongside the BSP's init banner — hart 1 runs its own trap vector + timer + scheduler idle loop, and `AP_READY_COUNT` synchronizes hands-off before the milestone print.
+
+**Wiring.**
+
+- [src/arch/riscv64/sbi.rs](../../src/arch/riscv64/sbi.rs) — `sbi_hart_start(hart_id, start_addr_phys, opaque) -> SbiRet` (HSM extension, EID=0x48534D, FID=0). Also `sbi_probe_extension(eid)` for R-5.b.
+- [src/boot/mod.rs](../../src/boot/mod.rs) — `BootInfo.harts: [Option<u64>; MAX_HARTS]` (new field) with `push_hart` + `harts()` iterator + `hart_count()`. `MAX_HARTS = 8` SCAFFOLDING.
+- [src/boot/riscv.rs](../../src/boot/riscv.rs) — DTB walker's `DeviceKind` enum gains `Cpu`; `/cpus/cpu@N/reg` harvests hart ids; `DtbFacts.harts[8]` fills BootInfo.
+- [src/arch/riscv64/entry.rs](../../src/arch/riscv64/entry.rs) — three new pieces:
+  - `AP_BOOT_STACKS: [[u8; 16 KiB]; 8]` — per-AP boot stacks in `.bss.ap_boot_stacks`. 128 KiB total; indexed by `cpu_index`.
+  - `BOOT_SATP: AtomicU64` — BSP publishes its satp value after `riscv64_fill_boot_page_tables`; APs load it in their pre-paging stub and enter the same address space (identity + HHDM + kernel gigapage shared).
+  - `_ap_start` global_asm — AP entry from OpenSBI. Saves `a0 = hart_id` + `a1 = cpu_idx` into `s2/s3` (not `s0/s1` — see bug below), computes `sp` from `AP_BOOT_STACKS[cpu_idx]`, loads `BOOT_SATP`, `csrw satp`, `sfence.vma`, promotes `sp` to higher-half (add `0xffffffff_00000000`), and `jr` to `kmain_riscv64_ap`.
+- [src/microkernel/main.rs](../../src/microkernel/main.rs) — `kmain_riscv64_ap(cpu_index, hart_id)` runs `percpu::init_ap` → `trap::install` → `timer::init(100)` → per-hart `Scheduler::new_boxed` + `Timer::new(HZ_100)` into `PER_CPU_*[cpu_idx]` → signals `AP_READY_COUNT` → enables SIE → drops into wfi idle. `start_application_processors` gained a riscv64 branch: iterates `BootInfo.harts`, skips BSP by comparing with `current_percpu().apic_id()`, dispatches `sbi_hart_start` per AP, spins on `AP_READY_COUNT` until every dispatched hart is online.
+
+**Bug found and fixed: `s0 == fp == x8`.** My first AP commit crashed with `hart=0` logged from hart 1. The asm stashed `a0 = hart_id` in `s0`, then later ran `mv fp, zero` (ABI frame-pointer reset). On RISC-V `s0` IS `fp` (same register — `x8`). The `mv fp, zero` overwrote hart_id with 0. BSP had the same latent bug in `_start` but never manifested: BSP always runs as hart 0, so the pre- and post-zero values coincidentally matched. R-5.a surfaced it by having an AP with hart_id = 1. Fix: use `s2`/`s3` for arg preservation in both `_start` and `_ap_start`. Still zeroes `fp` per ABI; the stashed values are in a different register class.
+
+**Milestone output.**
+
+```
+  Waking 1 AP(s) via SBI HSM (total harts: 2; _ap_start phys = 0x8020004a)
+  → sbi_hart_start(hart=1, cpu_idx=1) dispatched
+  ✓ AP hart=1 cpu_idx=1 online
+  ✓ 1 AP(s) online (total harts: 2)
+
+Phase R-5.a milestone: SMP live. APs bootstrapped via SBI HSM, each
+hart runs its own scheduler + timer. hello-riscv64 ran on BSP (hart 0).
+
+[Module] Hello from boot module (riscv64)!
+[Module] Hello from boot module (riscv64)!
+[Module] Hello from boot module (riscv64)!
+  [Exit] pid=3 task=1 code=0 (reclaimed 0 cap(s), 0 chan(s), heap+vma+pt)
+```
+
+The AP idles after init — no cross-hart work scheduled yet (R-6 distributes real drivers). The point R-5.a proves: the hart wakes, its scheduler is live, and it coexists with the BSP cleanly.
+
+**Out of scope for R-5.a.**
+
+- Remote TLB shootdown — lands in R-5.b. Any user-space work that unmaps a page while that page could be cached in another hart's TLB needs cross-hart invalidation. Today the only cross-hart state write is `csrw satp` at first dispatch, and each hart only loads its own process table (no shared user mappings between harts yet).
+- `BootProtocol` trait factoring. Plan file called this out for R-5; deferred per ADR-013 open question. Two implementations (Limine MP on x86/aarch64, SBI HSM on RISC-V) converge on the same `PER_CPU_*[idx] + tp + trap vector + timer + scheduler` shape, but the trait is cosmetic — not load-bearing for correctness, and three concrete arches is still a manageable amount of arch-gated code.
+- Task migration to APs. `distribute_tasks_to_aps` exists on x86/aarch64 and could run on RISC-V too, but there are no registered user tasks beyond hello and hello lives on BSP.
+
+**Verification.**
+
+- `make check-all` green all three arches.
+- `cargo test --lib --target x86_64-apple-darwin` — 487/487.
+- `make run-riscv64` — both harts online, hello still completes its 3 prints + exit on BSP.
+
+**How to apply.** R-5.b (next) adds SBI IPI for remote TLB shootdown. `sbi_send_ipi` via the IPI extension, probe for Svinval with `sbi_probe_extension`. The trap vector's `IRQ_SOFTWARE` arm (currently panics) wires through to a hart-local `sfence.vma` on the requested VA range. R-6 ships virtio-mmio + libsys + shell.

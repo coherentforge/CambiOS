@@ -720,10 +720,18 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         arcos_core::arch::riscv64::trap::enable_interrupts();
     }
 
+    // Phase R-5.a: wake secondary harts via SBI HSM. Each AP runs
+    // `_ap_start` → `kmain_riscv64_ap`, installs its own trap vector +
+    // timer + scheduler, and signals AP_READY_COUNT. BSP blocks here
+    // until every dispatched AP is online, so post-SMP init runs with
+    // the full hart set available.
+    // SAFETY: BSP per-hart state is fully initialized; SBI is ready;
+    // any wakeup error is reported and continues.
+    unsafe { start_application_processors(); }
+
     println!();
-    println!("Phase R-4.b milestone: U-mode live. hello-riscv64 runs in U-mode");
-    println!("and calls SYS_GETPID + SYS_PRINT + SYS_YIELD + SYS_EXIT via ecall.");
-    println!("Expect '[Module] Hello from boot module (riscv64)!' printed 3x, then exit.");
+    println!("Phase R-5.a milestone: SMP live. APs bootstrapped via SBI HSM, each");
+    println!("hart runs its own scheduler + timer. hello-riscv64 ran on BSP (hart 0).");
     println!("Console RX still routed: press a key → '[R-3 RX] 0xNN'.");
     println!();
 
@@ -786,6 +794,77 @@ static HELLO_RISCV64_ELF: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/user/hello-riscv64.elf"
 ));
+
+/// RISC-V AP entry (called from `_ap_start` after paging is enabled
+/// and sp is in higher-half). Per-hart init mirrors the BSP flow:
+/// percpu tp, trap vector, SBI timer, PER_CPU scheduler + Timer,
+/// signal BSP, enable SIE, drop into idle wfi. No work is scheduled
+/// on APs yet — R-5.a's milestone is that the hart comes online
+/// cleanly; R-6 + user-space services will distribute load.
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
+    let cpu_idx = cpu_index as usize;
+
+    // SAFETY: per-AP bring-up, all steps run exactly once per hart
+    // in the defined order below. BSP has already initialized shared
+    // hardware (PLIC, frame allocator, process table, heap); each
+    // unsafe call sets up only this hart's private state (tp,
+    // stvec, sie.STIE) or installs a per-hart scheduler instance.
+    unsafe {
+        // Step 1: per-hart data (writes tp + clears sscratch).
+        arcos_core::arch::riscv64::percpu::init_ap(cpu_idx, hart_id);
+
+        // Step 2: trap vector (per-hart stvec).
+        arcos_core::arch::riscv64::trap::install();
+
+        // Step 3: SBI timer — reads BootInfo for timebase, enables
+        // sie.STIE, arms first tick.
+        let _reload = arcos_core::arch::riscv64::timer::init(100);
+    }
+
+    // Step 4: per-hart scheduler + Timer. `local_scheduler()` /
+    // `local_timer()` index PER_CPU_SCHEDULER / PER_CPU_TIMER by
+    // `current_percpu().cpu_id()` — which we just set in init_ap.
+    {
+        use arcos_core::scheduler::{Scheduler, Timer, TimerConfig};
+
+        let mut scheduler = Scheduler::new_boxed();
+        if scheduler.init().is_err() {
+            println!("⚠ AP cpu_idx={} hart={}: scheduler.init() failed", cpu_idx, hart_id);
+        } else {
+            arcos_core::set_task_cpu(0, cpu_idx as u16);
+            *PER_CPU_SCHEDULER[cpu_idx].lock() = Some(scheduler);
+        }
+
+        match Timer::new(TimerConfig::HZ_100) {
+            Ok(mut timer) => {
+                let _ = timer.init();
+                *PER_CPU_TIMER[cpu_idx].lock() = Some(timer);
+            }
+            Err(e) => println!(
+                "⚠ AP cpu_idx={} hart={}: Timer::new failed: {}",
+                cpu_idx, hart_id, e,
+            ),
+        }
+    }
+
+    // Step 5: signal BSP that this AP has fully initialized.
+    AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+
+    println!("  ✓ AP hart={} cpu_idx={} online", hart_id, cpu_idx);
+
+    // Step 6: enable SIE and enter idle wfi. The scheduler sits
+    // with just its idle task for R-5.a; R-6 + task migration will
+    // fill it.
+    // SAFETY: trap vector installed; PerCpu/timer/scheduler all live.
+    unsafe { arcos_core::arch::riscv64::trap::enable_interrupts(); }
+    loop {
+        // SAFETY: wfi is always legal in S-mode with SIE set.
+        unsafe { core::arch::asm!("wfi", options(nostack, nomem, preserves_flags)); }
+    }
+}
 
 /// Spawn the embedded hello-riscv64 ELF as a U-mode task.
 ///
@@ -1955,13 +2034,91 @@ fn distribute_tasks_to_aps() {
 /// Must be called after all BSP subsystems are initialized (GDT, IDT, APIC,
 /// scheduler, etc.) and after `init_hardware_interrupts()`.
 unsafe fn start_application_processors() {
-    // RISC-V SMP brings up secondary harts via SBI `sbi_hart_start`, not
-    // Limine's MP request. The full cross-arch refactor is Phase R-5
-    // (ADR-013 Decision on BootProtocol trait); until then RISC-V runs
-    // single-hart with this early no-op return.
+    // RISC-V SMP — Phase R-5.a. Iterate harts reported by the DTB
+    // (`/cpus/cpu@N/reg`), skip the BSP (our own hart_id), and wake
+    // each AP via SBI HSM's `sbi_hart_start`. The target PA is the
+    // `_ap_start` assembly entry in `src/arch/riscv64/entry.rs`,
+    // which loads the AP's boot stack, flips satp to the BSP's root
+    // (published via `BOOT_SATP`), and jumps to `kmain_riscv64_ap`.
+    // The `opaque` argument carries `cpu_index` — the index the AP
+    // uses to reach its PER_CPU_SCHEDULER / PER_CPU_TIMER / percpu
+    // slot.
+    //
+    // Long-term this is where a `BootProtocol` trait would factor:
+    // x86_64 + AArch64 use Limine's MP response, RISC-V uses SBI
+    // HSM, and the BSP is the same portable code. For now the
+    // arch-gated branches live here.
     #[cfg(target_arch = "riscv64")]
     {
-        println!("  RISC-V SMP deferred to Phase R-5 — BSP only for now");
+        use arcos_core::arch::riscv64::entry::MAX_AP_BOOT_STACKS;
+        use arcos_core::arch::riscv64::sbi;
+
+        let info = arcos_core::boot::info();
+        let hart_count = info.hart_count();
+        if hart_count <= 1 {
+            println!("  Single-hart (DTB reported {} hart(s))", hart_count);
+            return;
+        }
+
+        // Own hart id (the BSP) — skip it when dispatching APs.
+        let bsp_hart_id = unsafe {
+            arcos_core::arch::riscv64::percpu::current_percpu().apic_id()
+        } as u64;
+
+        // `_ap_start` is linked at a higher-half VMA; SBI needs the
+        // LMA (physical address). The linker script sets
+        // VMA - LMA = 0xffffffff_00000000.
+        extern "C" {
+            fn _ap_start();
+        }
+        let ap_start_phys = (_ap_start as *const () as u64)
+            .wrapping_sub(0xffff_ffff_0000_0000);
+
+        println!(
+            "  Waking {} AP(s) via SBI HSM (total harts: {}; _ap_start phys = {:#x})",
+            hart_count - 1, hart_count, ap_start_phys,
+        );
+
+        // cpu_index 0 is the BSP. APs claim 1, 2, ... in the order
+        // the DTB enumerates them. Bounded by MAX_AP_BOOT_STACKS.
+        let mut next_cpu_idx: u64 = 1;
+        let mut dispatched: u32 = 0;
+        for hart_id in info.harts() {
+            if hart_id == bsp_hart_id {
+                continue;
+            }
+            if (next_cpu_idx as usize) >= MAX_AP_BOOT_STACKS {
+                println!(
+                    "  ⚠ Out of AP boot stacks (MAX_AP_BOOT_STACKS={}) — \
+                     skipping hart {}",
+                    MAX_AP_BOOT_STACKS, hart_id,
+                );
+                break;
+            }
+            let err = unsafe { sbi::sbi_hart_start(hart_id, ap_start_phys, next_cpu_idx) };
+            if err == 0 {
+                println!(
+                    "  → sbi_hart_start(hart={}, cpu_idx={}) dispatched",
+                    hart_id, next_cpu_idx,
+                );
+                next_cpu_idx += 1;
+                dispatched += 1;
+            } else {
+                println!(
+                    "  ✗ sbi_hart_start(hart={}) failed: SBI err={}",
+                    hart_id, err,
+                );
+            }
+        }
+
+        // Spin-wait for APs to signal readiness. Matches the AArch64
+        // pattern — AP counter lands here via AP_READY_COUNT.
+        if dispatched > 0 {
+            while AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire) < dispatched {
+                core::hint::spin_loop();
+            }
+            println!("  ✓ {} AP(s) online (total harts: {})", dispatched, hart_count);
+        }
         return;
     }
 

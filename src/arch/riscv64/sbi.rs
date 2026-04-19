@@ -96,3 +96,86 @@ pub fn read_time() -> u64 {
     }
     t
 }
+
+// ============================================================================
+// HSM — Hart State Management extension (SBI v0.2+)
+// ============================================================================
+//
+// Extension ID "HSM" = 0x48534D. Function 0 = hart_start.
+// Signature: sbi_hart_start(hart_id, start_addr, opaque) -> SbiRet.
+// On success, the target hart begins execution in S-mode at `start_addr`
+// with paging disabled and interrupts masked. a0 receives `hart_id`,
+// a1 receives `opaque`. This is the RISC-V AP-wakeup primitive — the
+// replacement for Limine's MP `goto_address` on x86_64 / AArch64.
+
+/// SBI HSM extension ID.
+const SBI_EXT_HSM: u64 = 0x48534D;
+/// HSM function: hart_start.
+const SBI_HSM_HART_START: u64 = 0;
+
+/// SBI Base extension — `probe_extension(eid)`. Returns 0 if the
+/// extension is absent, non-zero if present. Used by R-5.b to decide
+/// whether to use SBI-IPI-based TLB shootdown or a fallback.
+const SBI_EXT_BASE: u64 = 0x10;
+const SBI_BASE_PROBE_EXTENSION: u64 = 3;
+
+/// Start a secondary hart at a physical address.
+///
+/// On success the target hart leaves its M-mode-parked state, runs
+/// OpenSBI's HSM handoff code, and enters S-mode at `start_addr` with
+/// `a0 = hart_id`, `a1 = opaque`, paging off, SIE masked. It is the
+/// caller's responsibility to install a boot stub at `start_addr`
+/// that sets up a stack, enables paging (same boot root as the BSP
+/// or a per-AP root), and proceeds to per-hart Rust init.
+///
+/// Returns the SBI error code (0 on success). Non-fatal — the caller
+/// logs and continues if a hart refuses to start.
+///
+/// # Safety
+/// Must be called from S-mode. The `start_addr` must be a valid
+/// physical address with executable code and `opaque` must be
+/// meaningful to that code.
+#[inline]
+pub unsafe fn sbi_hart_start(hart_id: u64, start_addr_phys: u64, opaque: u64) -> i64 {
+    let err: i64;
+    // SAFETY: ecall to M-mode is always legal from S-mode. The SBI
+    // call doesn't touch the S-mode stack. Clobber list covers the
+    // ABI-visible registers the call may modify.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SBI_EXT_HSM,
+            in("a6") SBI_HSM_HART_START,
+            in("a0") hart_id,
+            in("a1") start_addr_phys,
+            in("a2") opaque,
+            lateout("a0") err,
+            lateout("a1") _,
+            options(nostack),
+        );
+    }
+    err
+}
+
+/// Probe whether an SBI extension is present.
+///
+/// Returns 0 if absent, non-zero if the M-mode firmware implements
+/// the extension. R-5.b uses this for Svinval / TIME v2 detection.
+#[inline]
+#[allow(dead_code)] // wired in R-5.b
+pub fn sbi_probe_extension(eid: u64) -> i64 {
+    let value: i64;
+    // SAFETY: pure ecall, no stack access.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SBI_EXT_BASE,
+            in("a6") SBI_BASE_PROBE_EXTENSION,
+            in("a0") eid,
+            lateout("a0") _,
+            lateout("a1") value,
+            options(nostack),
+        );
+    }
+    value
+}
