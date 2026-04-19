@@ -597,6 +597,19 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     println!();
     println!("Phase R-2 milestone: Sv48 + higher-half + DTB + heap + Box::new OK.");
 
+    // Phase R-3.f: per-hart data via `tp`. The scheduler and any
+    // other portable code that reaches through `tp` (audit drain,
+    // local_scheduler, local_timer) depend on a valid PerCpu
+    // pointer; without this, the first timer ISR's
+    // `scheduler::on_timer_isr` dereferences stale OpenSBI-left
+    // garbage in `tp` and takes a load-access fault.
+    //
+    // SAFETY: single-hart boot, paging is active, no prior per-hart
+    // code has run.
+    unsafe {
+        arcos_core::arch::riscv64::percpu::init_bsp(hart_id);
+    }
+
     // Phase R-3.b+c: trap vector + SBI timer.
     //
     // Install the S-mode trap vector so any trap lands on our
@@ -670,30 +683,211 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         }
     }
 
+    // Phase R-3.f: scheduler + Timer object install. The Scheduler's
+    // idle task (Task 0) is implicitly the kmain flow we're running —
+    // `Scheduler::init` marks it Running and current. The first
+    // timer IRQ will fill in its saved_rsp.
+    scheduler_init_riscv64();
+
+    // Phase R-3.f observable milestone: add one kernel "ping" task.
+    // Round-robin between idle (kmain's wfi loop below) and ping
+    // demonstrates timer-driven preemption end-to-end.
+    //
+    // SAFETY: scheduler is installed; frame allocator is live; we're
+    // still single-hart in early boot with interrupts masked.
+    match unsafe { spawn_riscv64_ping_task() } {
+        Ok(tid) => println!("✓ Spawned kernel ping task as TaskId({})", tid.0),
+        Err(e) => println!("⚠ Kernel ping spawn failed: {:?}", e),
+    }
+
     // SAFETY: trap handler is live, per-hart state is initialized,
-    // the timer is armed, and (if the DTB reported them) PLIC +
-    // console IRQ are wired. Safe to take interrupts now.
+    // the timer is armed, the scheduler holds the idle task, and (if
+    // the DTB reported them) PLIC + console IRQ are wired. Safe to
+    // take interrupts now.
     unsafe {
         arcos_core::arch::riscv64::trap::enable_interrupts();
     }
 
     println!();
-    println!("Phase R-3.d milestone: trap vector + SBI timer + PLIC + console RX live.");
-    println!("Timer: '[R-3 tick N]' every 500 ms.");
-    println!("Console RX: press any key in the QEMU console — expect '[R-3 RX] 0xNN'.");
+    println!("Phase R-3.f milestone: scheduler live, kernel preemption armed.");
+    println!("Expect '[R-3.f ping N]' output interleaving with idle wfi (idle has no log).");
+    println!("Console RX still routed: press a key → '[R-3 RX] 0xNN'.");
     println!();
 
-    // Idle loop: wfi parks the hart until the next interrupt.
-    // The trap handler increments TICK_COUNT and rearms; the next
-    // wfi wakes on the following tick. Exit the loop with ctrl-c /
-    // QEMU signal (no structured exit path until R-3.f wires the
-    // scheduler).
+    // Idle loop: wfi parks the hart until the next interrupt. This
+    // is the body of Task 0 (idle). When the scheduler preempts to
+    // another task, the trap vector's `mv sp, a0 ; sret` swaps out
+    // this stack; we resume here when the scheduler picks idle again.
     loop {
-        // SAFETY: wfi is always legal in S-mode. On a hart with STIE
-        // set, it blocks until the timer (or any enabled interrupt)
+        // SAFETY: wfi is always legal in S-mode. On a hart with SIE
+        // set, it blocks until the next interrupt (timer or external)
         // fires, at which point control re-enters the trap vector.
         unsafe { core::arch::asm!("wfi", options(nostack, nomem, preserves_flags)); }
     }
+}
+
+// ============================================================================
+// Phase R-3.f — RISC-V scheduler integration + kernel ping task
+// ============================================================================
+
+/// Create the Scheduler + Timer and install them in PER_CPU[0].
+///
+/// Mirrors the x86_64 / AArch64 `scheduler_init` but does not load
+/// boot modules — R-3.f lands before the RISC-V user-space path
+/// (R-4), so the only initial task is idle (Task 0 from
+/// `Scheduler::init`).
+#[cfg(target_arch = "riscv64")]
+fn scheduler_init_riscv64() {
+    let mut scheduler = Scheduler::new_boxed();
+    if let Err(e) = scheduler.init() {
+        println!("✗ Scheduler init failed: {:?}", e);
+        arcos_core::halt();
+    }
+    // Register idle task (slot 0) in the global task→CPU map.
+    arcos_core::set_task_cpu(0, 0);
+    *PER_CPU_SCHEDULER[0].lock() = Some(scheduler);
+
+    let mut timer = match Timer::new(TimerConfig::HZ_100) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("✗ Timer creation failed: {}", e);
+            arcos_core::halt();
+        }
+    };
+    if let Err(e) = timer.init() {
+        println!("✗ Timer init failed: {}", e);
+        arcos_core::halt();
+    }
+    *PER_CPU_TIMER[0].lock() = Some(timer);
+
+    println!("✓ Scheduler + Timer installed on hart 0 (idle task = kmain idle loop)");
+}
+
+/// Minimal kernel "ping" task — the R-3.f preemption milestone.
+///
+/// Entered on first dispatch via the trap vector's `sret`: sstatus's
+/// SPP=1 returns us to S-mode with SIE=1; sepc jumps to this
+/// function. The task prints an incrementing counter, burns ~100 ms
+/// of spin-loop so the timer preempts mid-spin, and repeats forever.
+/// Diagnostic only — removed when R-4 lands real RISC-V user tasks.
+///
+/// # Safety
+/// Must only be reached via the scheduler's first-dispatch restore
+/// (never called directly from kernel code).
+#[cfg(target_arch = "riscv64")]
+extern "C" fn riscv64_ping_task() -> ! {
+    let mut n: u32 = 0;
+    loop {
+        crate::println!("[R-3.f ping {}]", n);
+        n = n.wrapping_add(1);
+        // Burn ~10 timer quanta so preemption to idle + back is
+        // visibly spaced. Pure software spin; no WFI, no yield.
+        for _ in 0..5_000_000u64 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Allocate a fresh kernel stack, prime its top with a SavedContext
+/// that sret's to `riscv64_ping_task`, and register it with the
+/// scheduler via `create_isr_task`.
+///
+/// # Safety
+/// - Frame allocator must be live.
+/// - Scheduler must have been installed in PER_CPU_SCHEDULER[0].
+/// - Must be called during single-hart early boot, before interrupts
+///   are enabled (so the task can't be dispatched mid-setup).
+#[cfg(target_arch = "riscv64")]
+unsafe fn spawn_riscv64_ping_task() -> Result<TaskId, &'static str> {
+    use arcos_core::arch::riscv64::{ISR_FRAME_SIZE, SavedContext};
+    use arcos_core::FRAME_ALLOCATOR;
+
+    /// SCAFFOLDING: kernel ping task stack size (16 KiB = 4 pages).
+    /// Why: kernel-ping body is small — println + spin loop, no deep
+    ///      recursion. 4 pages leaves margin above the SavedContext
+    ///      (288 B) at the top. Memory cost: 16 KiB per ping task.
+    /// Replace when: the ping task (or its successor kernel tasks)
+    ///      grows heavy enough to spill.
+    const STACK_PAGES: u64 = 4;
+    const STACK_SIZE: u64 = STACK_PAGES * 4096;
+
+    // Allocate a contiguous run for the task's kernel stack.
+    let stack_phys_base = {
+        let mut fa = FRAME_ALLOCATOR.lock();
+        fa.allocate_contiguous(STACK_PAGES as usize)
+            .map_err(|_| "ping task: frame allocator exhausted")?
+            .addr
+    };
+    let hhdm = arcos_core::hhdm_offset();
+    let stack_virt_base = stack_phys_base + hhdm;
+    let stack_top = stack_virt_base + STACK_SIZE;
+
+    // Snapshot the calling hart's gp and tp — every kernel task on
+    // RISC-V must inherit these. gp is the linker-managed global
+    // pointer (constant per kernel image); tp is the per-hart PerCpu
+    // pointer that portable code (scheduler, local_timer, audit
+    // drain) reads through. Our trap vector doesn't swap tp
+    // (R-3.b+c kernel-mode-only scope), so if we sret into a task
+    // with tp=0 the first subsequent timer tick faults inside
+    // `scheduler::on_timer_isr` on a `lw a3, 8(tp)` deref.
+    let current_gp: u64;
+    let current_tp: u64;
+    // SAFETY: pure register reads; legal from S-mode and nomem-safe.
+    unsafe {
+        core::arch::asm!(
+            "mv {0}, gp",
+            "mv {1}, tp",
+            out(reg) current_gp,
+            out(reg) current_tp,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+
+    // Place an initial SavedContext at the top of the stack. On first
+    // dispatch, the trap vector's restore path reads this frame;
+    // `sret` pops sepc=entry, sstatus with SPP=1+SPIE=1, and loads
+    // sp = stack_top (so the task starts with a full empty stack).
+    let frame_addr = stack_top - ISR_FRAME_SIZE;
+    let frame_ptr = frame_addr as *mut SavedContext;
+    // SAFETY: frame_addr is within the freshly-allocated stack range,
+    // HHDM-mapped, and aligned to 16 bytes (ISR_FRAME_SIZE=288 and
+    // stack_top is 4-KiB aligned). Zero-init is safe for a fresh frame.
+    unsafe {
+        core::ptr::write_bytes(frame_ptr, 0, 1);
+        // gpr[2] = sp at task start. We want the task to see a fully
+        // available stack, so sp=stack_top. After sret, the trap-exit
+        // code loads sp from gpr[2] and the task runs with an empty
+        // stack above the frame (which becomes scratch).
+        (*frame_ptr).gpr[2] = stack_top;
+        (*frame_ptr).gpr[3] = current_gp;
+        (*frame_ptr).gpr[4] = current_tp;
+        (*frame_ptr).sepc = riscv64_ping_task as *const () as u64;
+        // sstatus: SPP=1 (bit 8, return to S-mode), SPIE=1 (bit 5, SIE
+        // post-sret). Other bits zero — no FP, no MPRV.
+        (*frame_ptr).sstatus = (1u64 << 8) | (1u64 << 5);
+    }
+
+    // Register with the scheduler. `saved_rsp` = frame address; on
+    // next timer tick's context switch, `timer_isr_inner` returns
+    // this SP and the trap vector restores from this frame.
+    let mut sched_guard = PER_CPU_SCHEDULER[0].lock();
+    let sched = sched_guard
+        .as_mut()
+        .ok_or("ping task: scheduler not installed")?;
+    let tid = sched
+        .create_isr_task(
+            riscv64_ping_task as *const () as u64,
+            frame_addr,
+            stack_top,
+            Priority::NORMAL,
+        )
+        .map_err(|_| "ping task: scheduler.create_isr_task failed")?;
+
+    // Register the task in the global task→CPU map (all on CPU 0
+    // until R-5's SMP bring-up distributes across harts).
+    arcos_core::set_task_cpu(tid.0, 0);
+
+    Ok(tid)
 }
 
 // ============================================================================

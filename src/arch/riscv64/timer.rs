@@ -30,18 +30,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::sbi;
 
 // ============================================================================
-// Configuration — set by `init`, read by `rearm` and the ISR path
+// Configuration — set by `init`, read by `rearm`
 // ============================================================================
 
 /// Ticks of the `time` CSR per timer interrupt. 0 until `init` runs;
 /// the trap handler treats a zero reload as "timer not armed yet" and
 /// refuses to rearm.
 static RELOAD: AtomicU64 = AtomicU64::new(0);
-
-/// Monotonic tick counter. Updated by the trap handler on every S-mode
-/// timer interrupt. Published via [`tick_count`] for debug/boot
-/// diagnostic output.
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
 // Public API
@@ -117,41 +112,10 @@ pub unsafe fn rearm() {
     unsafe { sbi::sbi_set_timer(deadline) };
 }
 
-/// Current tick count (monotonic, increments once per interrupt).
-#[inline]
-pub fn tick_count() -> u64 {
-    TICK_COUNT.load(Ordering::Acquire)
-}
-
-// ============================================================================
-// Interrupt path — invoked from `super::trap::rust_trap_handler`
-// ============================================================================
-
-/// Called from the trap handler when a supervisor timer interrupt
-/// fires. Rearms the timer, bumps the tick counter, and logs a
-/// milestone line every 50 ticks (twice a second at 100 Hz) so the
-/// Phase R-3.b+c milestone is observable on serial.
-///
-/// Phase R-3.f will replace the logging with a call into
-/// `crate::scheduler::on_timer_isr` for preemption.
-///
-/// # Safety
-/// ISR context — interrupts are masked; no allocation, no blocking.
-/// Printing from an ISR is deliberately kept to milestone diagnostic
-/// lines and will be removed in R-3.f when the scheduler takes over.
-pub unsafe fn on_timer_interrupt() {
-    // SAFETY: SBI call and rearm are safe from S-mode ISR context.
-    unsafe { rearm() };
-
-    let ticks = TICK_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
-
-    // R-3.b+c milestone cadence: log every half second at 100 Hz.
-    // Removed when R-3.f wires the scheduler.
-    if ticks % 50 == 0 {
-        crate::println!(
-            "[R-3 tick {}] sbi_set_timer live; time={}",
-            ticks,
-            sbi::read_time(),
-        );
-    }
-}
+// The R-3.b+c diagnostic `on_timer_interrupt` (rearm + tick counter +
+// per-50-tick println) was superseded in R-3.f: the trap handler now
+// routes `IRQ_TIMER` directly to `super::timer_isr_inner` which rearms
+// via `rearm()` above and delegates scheduling to
+// `crate::scheduler::on_timer_isr`. Keep `init` / `rearm` here as the
+// public timer surface; context-switch decisions live in the portable
+// scheduler, not this module.

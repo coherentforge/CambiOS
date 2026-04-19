@@ -327,3 +327,44 @@ Total 128 bytes, 8-byte aligned. Offsets documented inline for the asm.
 **Verification.** `make check-all` green all three arches. `cargo test --lib --target x86_64-apple-darwin` — 487/487 host tests pass. `make run-riscv64` still reaches the R-3.d milestone unchanged (timer ticks + stdin-fed console RX still observable) — the context-switch primitives are unreachable at this phase.
 
 **How to apply.** R-3.f's scheduler integration will be the first real test of this code. If subtle bugs surface then (register ordering, sstatus bits, sp restore timing), they are intentionally deferred: debugging the layered R-3.e + R-3.f intersection is cheaper than building a synthetic two-task harness here that we'd throw away. The AArch64 scheduler path is the reference for the portable wiring — the RISC-V arch primitives here match its shape pin-for-pin.
+
+### 2026-04-18 — Phase R-3.f: scheduler live, 100 Hz preemption milestone
+
+**What changed.** R-3's capstone — the RISC-V scheduler path is wired end-to-end, kernel-task preemption is observable, and every R-3.a–R-3.e primitive has a production caller. `make run-riscv64` now emits `[R-3.f ping N]` once per quantum from a ping kernel task, with idle `wfi` in between, proving timer-driven round-robin works. The R-3.d console RX path coexists cleanly — stdin-fed bytes land `[R-3 RX] 0xNN` interleaved with ping output.
+
+**Wiring.**
+
+- **Trap handler returns `*mut SavedContext`.** `_riscv_rust_trap_handler` in `src/arch/riscv64/trap.rs` changed from `-> ()` to `-> u64`. The trap vector's asm gained `mv sp, a0` after `call`, so the restore path addresses whatever SavedContext the handler returns. For timer ticks that context may be a *different task's* frame (preemptive switch); for exceptions / external IRQs / non-switching ticks it's the input frame unchanged.
+- **`timer_isr_inner` (`src/arch/riscv64/mod.rs`).** New Rust entry point mirroring AArch64's shape: rearms the SBI timer, calls `crate::scheduler::on_timer_isr(current_sp)`, applies `ContextSwitchHint` (kernel stack via `gdt::set_kernel_stack`, satp via `csrw satp + sfence.vma zero, zero` when the root differs), returns `new_sp`. The trap handler's `IRQ_TIMER` arm calls straight through.
+- **`scheduler::on_timer_isr` grew a riscv64 arm.** Audit-ring drain + policy-query expiration now fires on hart 0 for RISC-V too — matches x86_64 and AArch64 modulo the percpu accessor (`crate::arch::riscv64::percpu::current_percpu().cpu_id()`).
+- **`on_timer_interrupt` deleted from `src/arch/riscv64/timer.rs`.** The R-3.b+c per-tick diagnostic (tick counter + 50-tick println) is gone; `init` and `rearm` remain as the public timer surface.
+- **`scheduler_init_riscv64` in `kmain_riscv64`.** Allocates `Scheduler::new_boxed`, calls `init` (implicit idle task = kmain's wfi loop), installs in `PER_CPU_SCHEDULER[0]`; creates `Timer::new(TimerConfig::HZ_100)`, installs in `PER_CPU_TIMER[0]`. No boot-module loading — that's R-4/R-6 scope.
+
+**Observable preemption: the kernel ping task.**
+
+`riscv64_ping_task` is a kernel-mode function — `loop { println!("[R-3.f ping {n}]"); spin_loop × 5M; n += 1; }` — spawned via `spawn_riscv64_ping_task`. That helper:
+
+1. Allocates 4 pages (16 KiB) of kernel stack via `FrameAllocator::allocate_contiguous`, translates to HHDM VA.
+2. Builds an initial SavedContext at `stack_top - ISR_FRAME_SIZE`: zeros all GPRs, then fills `gpr[2]=sp=stack_top`, `gpr[3]=current_gp`, `gpr[4]=current_tp`, `sepc=ping_fn_addr`, `sstatus=SPP=1 | SPIE=1`.
+3. Registers via `Scheduler::create_isr_task`. On first dispatch the trap vector's restore path pops the synthetic frame; `sret` lands in the ping function at S-mode with SIE re-enabled.
+
+**Surprise fix 1: `percpu::init_bsp(hart_id)` was never called on RISC-V.** The scheduler's `on_timer_isr` reads `PerCpu.cpu_id` through `tp`, and `tp` is the thread-pointer register. Without `init_bsp` setting `tp` to point at `PER_CPU_DATA[0]`, `tp` held a stale OpenSBI-left value (phys `0x8004a000` — inside OpenSBI's M-mode data region). The first timer ISR deref `lw a3, 8(tp)` took a load-access fault from PMP. Fix: call `arcos_core::arch::riscv64::percpu::init_bsp(hart_id)` early in `kmain_riscv64`, right after paging is up and before the trap vector installs.
+
+**Surprise fix 2: kernel tasks must inherit `gp` and `tp` in their initial SavedContext.** Once `init_bsp` fixed the idle path, the next timer tick inside the ping task faulted at `stval=0x8` — because my ping SavedContext zero-initialized every GPR, including `tp`. After `sret` into ping, `tp=0`; on the next preemption the trap vector saved `tp=0` into ping's new frame and handed it to the scheduler, which dereffed `0+8` → load-access fault at phys 0. Fix: snapshot `gp` and `tp` via inline asm when spawning, copy into `gpr[3]` and `gpr[4]` of the initial frame. Every RISC-V kernel task must now inherit the spawner's `gp`/`tp`. Once R-4 adds the U→S `sscratch`/`tp` swap to the trap vector, user tasks will have their own `tp` (whatever the user wants) while the kernel always recovers the PerCpu pointer via `sscratch`.
+
+**Verification.**
+
+- `make check-stable` green (x86_64 + aarch64 release builds unchanged).
+- `cargo test --lib --target x86_64-apple-darwin` — **487 pass / 0 fail**.
+- `make run-riscv64` observes:
+  - `✓ Scheduler + Timer installed on hart 0 (idle task = kmain idle loop)`
+  - `✓ Spawned kernel ping task as TaskId(1)`
+  - `[R-3.f ping 0]` through `[R-3.f ping 49]` in a 6-second QEMU run — ~8 Hz visible cadence, driven by the 5M-iteration spin plus println latency straddling timer quanta.
+  - Stdin `Xy` feed still produces `[R-3 RX] 0x58 ('X')` + `[R-3 RX] 0x79 ('y')` interleaved with ping output — R-3.d path untouched, PLIC and timer IRQs coexist through the shared trap vector.
+
+**Leftover diagnostics (removed when R-4 replaces them).**
+
+- The ping task itself is R-3.f milestone scaffolding — deleted when a real RISC-V user-space driver spawns (R-4+).
+- R-3.d's inline UART-RX fallback in `plic::dispatch_pending` still stands; removed once a user-space console driver registers in `INTERRUPT_ROUTER`.
+
+**How to apply.** R-4 picks up from here — add the `sscratch`/`tp` swap front-end to `_riscv_trap_vector` so traps from U-mode correctly flip per-CPU state, extend the ELF loader for `EM_RISCV` (0xF3), and the first user process with `ecall`-based syscalls via libsys replaces the kernel ping task as the scheduler's real workload. R-3 is complete.

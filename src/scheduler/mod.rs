@@ -66,6 +66,15 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
             crate::policy::expire_pending_queries();
         }
     }
+    #[cfg(all(not(test), target_arch = "riscv64"))]
+    {
+        // SAFETY: `tp` initialized after boot; cpu_id is a pure read.
+        let cpu_id = unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() };
+        if cpu_id == 0 {
+            crate::audit::drain::drain_tick();
+            crate::policy::expire_pending_queries();
+        }
+    }
 
     // Tick scheduler and potentially switch tasks
     if let Some(mut sched_guard) = crate::local_scheduler().try_lock() {

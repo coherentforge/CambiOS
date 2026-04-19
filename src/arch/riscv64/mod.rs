@@ -471,6 +471,67 @@ core::arch::global_asm!(
     "ret",
 );
 
+/// Rust handler for the timer ISR.
+///
+/// Called from `_riscv_rust_trap_handler`'s `IRQ_TIMER` arm with a
+/// pointer to the preempted task's SavedContext on the kernel stack.
+/// Rearms the SBI timer, runs the portable `scheduler::on_timer_isr`,
+/// applies the arch-side per-hart updates the scheduler requests,
+/// and returns the SavedContext pointer the trap vector should
+/// restore from. Identical in shape to AArch64's `timer_isr_inner`
+/// (minus GIC EOI — RISC-V timer IRQs clear implicitly on re-arm).
+///
+/// # Safety
+/// ISR context — interrupts masked, trap frame valid on kernel stack.
+#[no_mangle]
+extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
+    // Rearm the SBI timer first. SBI's set_timer implicitly clears
+    // STIP once the deadline moves past the current `time`, so this
+    // both drops the pending bit and programs the next tick.
+    //
+    // SAFETY: ISR context — SBI ecall is legal from S-mode.
+    unsafe { timer::rearm(); }
+
+    let (new_sp, hint) = crate::scheduler::on_timer_isr(current_sp);
+
+    // Apply arch-side per-hart state updates the scheduler recorded.
+    // Same shape as `yield_inner` below — if the scheduler switched
+    // to a task owned by a different process, update the kernel
+    // stack pointer and the satp page-table root.
+    if let Some(hint) = hint {
+        if hint.kernel_stack_top != 0 {
+            // SAFETY: ISR context; hint.kernel_stack_top is the next
+            // task's kernel stack, validated by the scheduler.
+            unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
+        }
+        if hint.page_table_root != 0 {
+            // SAFETY: satp read/write is legal from S-mode; the
+            // hint's page-table root came from the scheduler.
+            unsafe {
+                let current_satp: u64;
+                core::arch::asm!(
+                    "csrr {0}, satp",
+                    out(reg) current_satp,
+                    options(nostack, nomem, preserves_flags),
+                );
+                let current_root = (current_satp & ((1u64 << 44) - 1)) << 12;
+                if current_root != hint.page_table_root {
+                    let ppn = hint.page_table_root >> 12;
+                    let new_satp = (9u64 << 60) | ppn; // Sv48 mode = 9
+                    core::arch::asm!(
+                        "csrw satp, {0}",
+                        "sfence.vma zero, zero",
+                        in(reg) new_satp,
+                        options(nostack),
+                    );
+                }
+            }
+        }
+    }
+
+    new_sp
+}
+
 /// Rust handler for voluntary context switch.
 ///
 /// Called from the `yield_save_and_switch` assembly with a pointer to
@@ -478,12 +539,6 @@ core::arch::global_asm!(
 /// which task to resume next and applies arch-side per-hart state
 /// updates (kernel stack + satp) before returning the SP of the
 /// target task's SavedContext.
-///
-/// Phase R-3.e note: the scheduler entry point
-/// `crate::scheduler::on_voluntary_yield` is wired in R-3.f. Until
-/// then this function compiles but is unreachable — `yield_save_and_switch`
-/// is not called from any production path until R-3.f adds the first
-/// voluntary-yield consumer.
 #[no_mangle]
 extern "C" fn yield_inner(current_sp: u64) -> u64 {
     let (new_sp, hint) = crate::scheduler::on_voluntary_yield(current_sp);

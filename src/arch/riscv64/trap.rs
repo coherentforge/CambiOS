@@ -114,14 +114,19 @@ _riscv_trap_vector:
     csrr t0, sstatus
     sd t0, 264(sp)
 
-    // Call _riscv_rust_trap_handler(saved_ctx, scause, stval).
+    // Call _riscv_rust_trap_handler(saved_ctx, scause, stval) -> u64.
     // a0 = &SavedContext (current sp).
     // a1 = scause, a2 = stval.
-    // The handler may mutate the frame (for future ERET changes).
+    // The handler returns (in a0) the SavedContext pointer to restore
+    // from — same as input for exceptions and non-switching timer
+    // ticks, a *different* SavedContext for a preempting context
+    // switch. `mv sp, a0` below honors that; all subsequent loads
+    // address the restore frame rather than the entry frame.
     mv   a0, sp
     csrr a1, scause
     csrr a2, stval
     call _riscv_rust_trap_handler
+    mv   sp, a0
 
     // Restore sepc + sstatus first (they may have been updated by the
     // handler to redirect the return).
@@ -196,6 +201,15 @@ const IRQ_SOFTWARE: u64 = 1;
 /// range if another arch backend later defines its own
 /// `rust_trap_handler`. The asm `call` in the vector matches.
 ///
+/// ## Return value
+///
+/// Returns the SavedContext pointer (as a `u64`) the trap vector
+/// should restore from. For synchronous exceptions and non-switching
+/// interrupt ticks this is always the input `saved`. For a preempting
+/// timer tick it's the *next* task's SavedContext — the scheduler
+/// returned a different stack pointer via [`timer_isr_inner`] and we
+/// propagate it all the way back to the asm's `mv sp, a0; sret` pair.
+///
 /// # Safety
 /// - Only the trap vector may call this. The assembly guarantees
 ///   `saved` points to a live SavedContext, `scause` and `stval` are
@@ -207,20 +221,21 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
     saved: *mut SavedContext,
     scause: u64,
     stval: u64,
-) {
+) -> u64 {
     let is_interrupt = scause & SCAUSE_INTERRUPT != 0;
     let code = scause & SCAUSE_CODE_MASK;
 
     if is_interrupt {
         match code {
             IRQ_TIMER => {
-                // Clear the pending bit by re-arming; SBI's set_timer
-                // implicitly clears STIP once the deadline moves past
-                // the current `time`.
-                //
-                // SAFETY: sbi::sbi_set_timer is safe to call from
-                // S-mode with interrupts masked (we're in an ISR).
-                unsafe { super::timer::on_timer_interrupt(); }
+                // Rearm the timer and run the portable scheduler's
+                // tick. Returns the SavedContext pointer to restore
+                // from (same as input for non-switching ticks, a
+                // different stack for preemptive context switch).
+                // ISR context with interrupts masked; the handler
+                // rearms SBI and acquires scheduler locks via
+                // try_lock per the portable contract.
+                return super::timer_isr_inner(saved as u64);
             }
             IRQ_EXTERNAL => {
                 // PLIC-routed device IRQ. `dispatch_pending` drains
@@ -266,6 +281,11 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
             other => panic!("riscv64 fault: unknown exception code {} @ sepc={:#x} stval={:#x}", other, sepc, stval),
         }
     }
+
+    // External IRQs fall through to here after `dispatch_pending` —
+    // no context swap, restore from the same frame we arrived on.
+    // (Every exception arm panics; the IRQ_TIMER arm returned early.)
+    saved as u64
 }
 
 // ============================================================================
