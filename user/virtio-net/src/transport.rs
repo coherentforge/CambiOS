@@ -1,36 +1,22 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! Virtio legacy (transitional) PCI transport layer.
+//! Virtio legacy transport layer for virtio-net.
 //!
-//! Implements the virtio 0.9.x / 1.0 legacy register interface over PCI I/O
-//! port BARs. This is the transport QEMU exposes for `-device virtio-net-pci`.
+//! Two carrier variants share a single public API via [`Transport`]:
 //!
-//! ## Register layout (BAR 0, I/O port space)
+//! - [`LegacyPciTransport`] — virtio 0.9.x / 1.0 legacy registers over PCI I/O
+//!   port space (x86_64, aarch64).
+//! - [`LegacyMmioTransport`] — virtio-mmio v1 legacy (riscv64 QEMU virt).
 //!
-//! | Offset | Size | Name                    |
-//! |--------|------|-------------------------|
-//! | 0x00   | 4    | Device Features         |
-//! | 0x04   | 4    | Guest Features          |
-//! | 0x08   | 4    | Queue Address (PFN)     |
-//! | 0x0C   | 2    | Queue Size              |
-//! | 0x0E   | 2    | Queue Select            |
-//! | 0x10   | 2    | Queue Notify            |
-//! | 0x12   | 1    | Device Status           |
-//! | 0x13   | 1    | ISR Status              |
-//! | 0x14   | 6    | MAC address (net only)  |
+//! The wire protocol is identical; only the register map and access mechanism
+//! differ. Both expose the same methods so the driver is oblivious to the
+//! discovery path.
 
 use arcos_libsys as sys;
 
-/// Legacy virtio register offsets (I/O port BAR).
-const REG_DEVICE_FEATURES: u16 = 0x00;
-const REG_GUEST_FEATURES: u16 = 0x04;
-const REG_QUEUE_PFN: u16 = 0x08;
-const REG_QUEUE_SIZE: u16 = 0x0C;
-const REG_QUEUE_SELECT: u16 = 0x0E;
-const REG_QUEUE_NOTIFY: u16 = 0x10;
-const REG_DEVICE_STATUS: u16 = 0x12;
-const REG_ISR_STATUS: u16 = 0x13;
-const REG_MAC_ADDR: u16 = 0x14;
+// ============================================================================
+// Shared constants (wire-protocol, not register-layout)
+// ============================================================================
 
 /// Device status bits.
 pub const STATUS_ACKNOWLEDGE: u8 = 1;
@@ -43,19 +29,29 @@ pub const STATUS_FAILED: u8 = 128;
 pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 
-/// Legacy PCI transport for a virtio device.
-pub struct LegacyTransport {
-    /// Base I/O port (from PCI BAR 0).
+// ============================================================================
+// LegacyPciTransport — port I/O over kernel-validated PortIo syscall
+// ============================================================================
+
+/// Legacy virtio-pci register offsets (I/O port BAR).
+const PCI_REG_DEVICE_FEATURES: u16 = 0x00;
+const PCI_REG_GUEST_FEATURES: u16 = 0x04;
+const PCI_REG_QUEUE_PFN: u16 = 0x08;
+const PCI_REG_QUEUE_SIZE: u16 = 0x0C;
+const PCI_REG_QUEUE_SELECT: u16 = 0x0E;
+const PCI_REG_QUEUE_NOTIFY: u16 = 0x10;
+const PCI_REG_DEVICE_STATUS: u16 = 0x12;
+const PCI_REG_ISR_STATUS: u16 = 0x13;
+const PCI_REG_MAC_ADDR: u16 = 0x14;
+
+pub struct LegacyPciTransport {
     io_base: u16,
 }
 
-impl LegacyTransport {
-    /// Create a transport handle for the given I/O port base.
+impl LegacyPciTransport {
     pub fn new(io_base: u16) -> Self {
         Self { io_base }
     }
-
-    // -- Register access (all go through the kernel PortIo syscall) ----------
 
     fn read8(&self, offset: u16) -> u8 {
         match sys::port_read8(self.io_base + offset) {
@@ -96,71 +92,201 @@ impl LegacyTransport {
         }
     }
 
-    // -- Device lifecycle ----------------------------------------------------
-
-    /// Reset the device (write 0 to status).
-    pub fn reset(&self) {
-        self.write8(REG_DEVICE_STATUS, 0);
-    }
-
-    /// Read device status register.
-    pub fn status(&self) -> u8 {
-        self.read8(REG_DEVICE_STATUS)
-    }
-
-    /// Set device status bits (OR'd with current status).
-    pub fn set_status(&self, bits: u8) {
+    fn reset(&self) { self.write8(PCI_REG_DEVICE_STATUS, 0); }
+    fn status(&self) -> u8 { self.read8(PCI_REG_DEVICE_STATUS) }
+    fn set_status(&self, bits: u8) {
         let current = self.status();
-        self.write8(REG_DEVICE_STATUS, current | bits);
+        self.write8(PCI_REG_DEVICE_STATUS, current | bits);
     }
-
-    /// Read device-offered features.
-    pub fn device_features(&self) -> u32 {
-        self.read32(REG_DEVICE_FEATURES)
+    fn device_features(&self) -> u32 { self.read32(PCI_REG_DEVICE_FEATURES) }
+    fn set_guest_features(&self, f: u32) { self.write32(PCI_REG_GUEST_FEATURES, f); }
+    fn select_queue(&self, q: u16) { self.write16(PCI_REG_QUEUE_SELECT, q); }
+    fn queue_size(&self) -> u16 { self.read16(PCI_REG_QUEUE_SIZE) }
+    fn set_queue_pfn(&self, pfn: u32) { self.write32(PCI_REG_QUEUE_PFN, pfn); }
+    fn notify_queue(&self, q: u16) -> bool {
+        sys::port_write16(self.io_base + PCI_REG_QUEUE_NOTIFY, q).is_ok()
     }
-
-    /// Write driver-accepted features.
-    pub fn set_guest_features(&self, features: u32) {
-        self.write32(REG_GUEST_FEATURES, features);
-    }
-
-    // -- Queue configuration -------------------------------------------------
-
-    /// Select a virtqueue by index for subsequent queue operations.
-    pub fn select_queue(&self, queue_idx: u16) {
-        self.write16(REG_QUEUE_SELECT, queue_idx);
-    }
-
-    /// Read the maximum queue size for the currently selected queue.
-    pub fn queue_size(&self) -> u16 {
-        self.read16(REG_QUEUE_SIZE)
-    }
-
-    /// Set the queue address (page frame number of the descriptor area).
-    /// Legacy virtio uses a single PFN for the combined desc+avail+used area.
-    /// For split queues, this is `phys_addr / 4096`.
-    pub fn set_queue_pfn(&self, pfn: u32) {
-        self.write32(REG_QUEUE_PFN, pfn);
-    }
-
-    /// Notify the device that the given queue has new available buffers.
-    pub fn notify_queue(&self, queue_idx: u16) -> bool {
-        sys::port_write16(self.io_base + REG_QUEUE_NOTIFY, queue_idx).is_ok()
-    }
-
-    /// Read and acknowledge the ISR status (clears the interrupt).
-    pub fn isr_status(&self) -> u8 {
-        self.read8(REG_ISR_STATUS)
-    }
-
-    // -- Network-specific registers ------------------------------------------
-
-    /// Read the device MAC address (6 bytes at offset 0x14-0x19).
-    pub fn read_mac(&self) -> [u8; 6] {
+    #[allow(dead_code)]
+    fn isr_status(&self) -> u8 { self.read8(PCI_REG_ISR_STATUS) }
+    fn read_mac(&self) -> [u8; 6] {
         let mut mac = [0u8; 6];
         for i in 0..6 {
-            mac[i] = self.read8(REG_MAC_ADDR + i as u16);
+            mac[i] = self.read8(PCI_REG_MAC_ADDR + i as u16);
         }
         mac
+    }
+}
+
+// ============================================================================
+// LegacyMmioTransport — volatile MMIO over sys::map_mmio region
+// ============================================================================
+
+/// Virtio-mmio v1 legacy register offsets (virtio spec §4.2.2, legacy).
+const MMIO_REG_MAGIC_VALUE: usize = 0x000;
+const MMIO_REG_VERSION: usize = 0x004;
+const MMIO_REG_DEVICE_ID: usize = 0x008;
+#[allow(dead_code)]
+const MMIO_REG_VENDOR_ID: usize = 0x00c;
+const MMIO_REG_HOST_FEATURES: usize = 0x010;
+const MMIO_REG_HOST_FEATURES_SEL: usize = 0x014;
+const MMIO_REG_GUEST_FEATURES: usize = 0x020;
+const MMIO_REG_GUEST_FEATURES_SEL: usize = 0x024;
+const MMIO_REG_GUEST_PAGE_SIZE: usize = 0x028;
+const MMIO_REG_QUEUE_SEL: usize = 0x030;
+const MMIO_REG_QUEUE_NUM_MAX: usize = 0x034;
+const MMIO_REG_QUEUE_NUM: usize = 0x038;
+const MMIO_REG_QUEUE_ALIGN: usize = 0x03c;
+const MMIO_REG_QUEUE_PFN: usize = 0x040;
+const MMIO_REG_QUEUE_NOTIFY: usize = 0x050;
+#[allow(dead_code)]
+const MMIO_REG_INTERRUPT_STATUS: usize = 0x060;
+#[allow(dead_code)]
+const MMIO_REG_INTERRUPT_ACK: usize = 0x064;
+const MMIO_REG_STATUS: usize = 0x070;
+
+/// Device-specific config region — for virtio-net the first 6 bytes are MAC.
+const MMIO_REG_CONFIG_BASE: usize = 0x100;
+const MMIO_REG_MAC_ADDR: usize = MMIO_REG_CONFIG_BASE + 0x00;
+
+const MMIO_MAGIC: u32 = 0x74726976;
+const MMIO_VERSION_LEGACY: u32 = 1;
+const MMIO_DEVICE_ID_NET: u32 = 1;
+const MMIO_GUEST_PAGE_SIZE: u32 = 4096;
+
+pub struct LegacyMmioTransport {
+    base: *mut u32,
+}
+
+// SAFETY: Only volatile reads/writes; no shared mutable state across threads.
+unsafe impl Send for LegacyMmioTransport {}
+unsafe impl Sync for LegacyMmioTransport {}
+
+impl LegacyMmioTransport {
+    pub fn new(mmio_base_vaddr: u64) -> Option<Self> {
+        let base = mmio_base_vaddr as *mut u32;
+        let t = Self { base };
+        if t.read_raw(MMIO_REG_MAGIC_VALUE) != MMIO_MAGIC {
+            sys::print(b"[NET] mmio: bad MagicValue\n");
+            return None;
+        }
+        if t.read_raw(MMIO_REG_VERSION) != MMIO_VERSION_LEGACY {
+            sys::print(b"[NET] mmio: not v1 legacy\n");
+            return None;
+        }
+        if t.read_raw(MMIO_REG_DEVICE_ID) != MMIO_DEVICE_ID_NET {
+            sys::print(b"[NET] mmio: not a virtio-net device\n");
+            return None;
+        }
+        t.write_raw(MMIO_REG_GUEST_PAGE_SIZE, MMIO_GUEST_PAGE_SIZE);
+        Some(t)
+    }
+
+    fn read_raw(&self, offset: usize) -> u32 {
+        // SAFETY: base is a kernel-mapped MMIO region of at least 0x200 bytes;
+        // offsets used here are within that range, aligned to 4 bytes.
+        unsafe { core::ptr::read_volatile(self.base.byte_add(offset)) }
+    }
+
+    fn write_raw(&self, offset: usize, val: u32) {
+        // SAFETY: same as read_raw.
+        unsafe { core::ptr::write_volatile(self.base.byte_add(offset), val) }
+    }
+
+    fn reset(&self) { self.write_raw(MMIO_REG_STATUS, 0); }
+    fn status(&self) -> u8 { self.read_raw(MMIO_REG_STATUS) as u8 }
+    fn set_status(&self, bits: u8) {
+        let current = self.read_raw(MMIO_REG_STATUS);
+        self.write_raw(MMIO_REG_STATUS, current | bits as u32);
+    }
+    fn device_features(&self) -> u32 {
+        self.write_raw(MMIO_REG_HOST_FEATURES_SEL, 0);
+        self.read_raw(MMIO_REG_HOST_FEATURES)
+    }
+    fn set_guest_features(&self, f: u32) {
+        self.write_raw(MMIO_REG_GUEST_FEATURES_SEL, 0);
+        self.write_raw(MMIO_REG_GUEST_FEATURES, f);
+    }
+    fn select_queue(&self, q: u16) { self.write_raw(MMIO_REG_QUEUE_SEL, q as u32); }
+    fn queue_size(&self) -> u16 { self.read_raw(MMIO_REG_QUEUE_NUM_MAX) as u16 }
+    fn set_queue_num(&self, n: u16) { self.write_raw(MMIO_REG_QUEUE_NUM, n as u32); }
+    fn set_queue_align(&self, align: u32) { self.write_raw(MMIO_REG_QUEUE_ALIGN, align); }
+    fn set_queue_pfn(&self, pfn: u32) { self.write_raw(MMIO_REG_QUEUE_PFN, pfn); }
+    fn notify_queue(&self, q: u16) -> bool {
+        self.write_raw(MMIO_REG_QUEUE_NOTIFY, q as u32);
+        true
+    }
+    #[allow(dead_code)]
+    fn isr_status(&self) -> u8 { self.read_raw(MMIO_REG_INTERRUPT_STATUS) as u8 }
+    fn read_mac(&self) -> [u8; 6] {
+        // MAC lives in device config; byte reads are legal there per spec.
+        // Read two 32-bit words and slice the bytes we need.
+        let lo = self.read_raw(MMIO_REG_MAC_ADDR);
+        let hi = self.read_raw(MMIO_REG_MAC_ADDR + 4);
+        [
+            (lo & 0xFF) as u8,
+            ((lo >> 8) & 0xFF) as u8,
+            ((lo >> 16) & 0xFF) as u8,
+            ((lo >> 24) & 0xFF) as u8,
+            (hi & 0xFF) as u8,
+            ((hi >> 8) & 0xFF) as u8,
+        ]
+    }
+}
+
+// ============================================================================
+// Transport — dispatch enum
+// ============================================================================
+
+pub enum Transport {
+    LegacyPci(LegacyPciTransport),
+    LegacyMmio(LegacyMmioTransport),
+}
+
+impl Transport {
+    pub fn reset(&self) {
+        match self { Self::LegacyPci(t) => t.reset(), Self::LegacyMmio(t) => t.reset() }
+    }
+    pub fn status(&self) -> u8 {
+        match self { Self::LegacyPci(t) => t.status(), Self::LegacyMmio(t) => t.status() }
+    }
+    pub fn set_status(&self, bits: u8) {
+        match self { Self::LegacyPci(t) => t.set_status(bits), Self::LegacyMmio(t) => t.set_status(bits) }
+    }
+    pub fn device_features(&self) -> u32 {
+        match self { Self::LegacyPci(t) => t.device_features(), Self::LegacyMmio(t) => t.device_features() }
+    }
+    pub fn set_guest_features(&self, f: u32) {
+        match self { Self::LegacyPci(t) => t.set_guest_features(f), Self::LegacyMmio(t) => t.set_guest_features(f) }
+    }
+    pub fn select_queue(&self, q: u16) {
+        match self { Self::LegacyPci(t) => t.select_queue(q), Self::LegacyMmio(t) => t.select_queue(q) }
+    }
+    pub fn queue_size(&self) -> u16 {
+        match self { Self::LegacyPci(t) => t.queue_size(), Self::LegacyMmio(t) => t.queue_size() }
+    }
+    pub fn set_queue_num(&self, n: u16) {
+        match self {
+            Self::LegacyPci(_) => {}
+            Self::LegacyMmio(t) => t.set_queue_num(n),
+        }
+    }
+    pub fn set_queue_align(&self, align: u32) {
+        match self {
+            Self::LegacyPci(_) => {}
+            Self::LegacyMmio(t) => t.set_queue_align(align),
+        }
+    }
+    pub fn set_queue_pfn(&self, pfn: u32) {
+        match self { Self::LegacyPci(t) => t.set_queue_pfn(pfn), Self::LegacyMmio(t) => t.set_queue_pfn(pfn) }
+    }
+    pub fn notify_queue(&self, q: u16) -> bool {
+        match self { Self::LegacyPci(t) => t.notify_queue(q), Self::LegacyMmio(t) => t.notify_queue(q) }
+    }
+    #[allow(dead_code)]
+    pub fn isr_status(&self) -> u8 {
+        match self { Self::LegacyPci(t) => t.isr_status(), Self::LegacyMmio(t) => t.isr_status() }
+    }
+    pub fn read_mac(&self) -> [u8; 6] {
+        match self { Self::LegacyPci(t) => t.read_mac(), Self::LegacyMmio(t) => t.read_mac() }
     }
 }

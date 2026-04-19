@@ -59,12 +59,13 @@
 
 mod device;
 mod pci;
+#[allow(unsafe_code)]
 mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
 use arcos_libsys as sys;
-use transport::LegacyTransport;
+use transport::{LegacyMmioTransport, LegacyPciTransport, Transport};
 use virtqueue::{BounceBuffer, ChainSegment, VirtQueue};
 
 // ============================================================================
@@ -153,7 +154,7 @@ const SECTORS_PER_LOGICAL_BLOCK: u64 = (LOGICAL_BLOCK_SIZE / SECTOR_SIZE) as u64
 // ============================================================================
 
 struct BlkDriver {
-    transport: LegacyTransport,
+    transport: Transport,
     /// Device size in 512-byte sectors.
     capacity_sectors: u64,
     /// Whether the device negotiated `VIRTIO_BLK_F_FLUSH`. If not, `FLUSH`
@@ -174,9 +175,7 @@ struct BlkDriver {
 }
 
 impl BlkDriver {
-    fn init(io_base: u16) -> Option<Self> {
-        let transport = LegacyTransport::new(io_base);
-
+    fn init(transport: Transport) -> Option<Self> {
         // Step 1: reset.
         transport.reset();
 
@@ -225,6 +224,12 @@ impl BlkDriver {
             return None;
         }
         let queue = VirtQueue::new(device_qsize)?;
+
+        // Carrier-specific queue setup. On PCI legacy these are no-ops; on
+        // MMIO legacy QueueNum + QueueAlign MUST be written before QueuePFN
+        // (virtio spec §4.2.2).
+        transport.set_queue_num(device_qsize);
+        transport.set_queue_align(4096);
         transport.set_queue_pfn(queue.pfn());
 
         // Sanity: verify the device accepted our PFN.
@@ -636,23 +641,52 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Step 2: locate the legacy I/O BAR (address < 64K).
-    let mut io_base: u16 = 0;
-    for b in 0..6 {
-        let addr = dev.bars[b].addr;
-        if addr != 0 && addr < 0x10000 {
-            io_base = addr as u16;
-            break;
+    // Step 2: build the appropriate transport. BAR 0 classification tells
+    // us the carrier:
+    //   is_io=true  → virtio-pci legacy (port I/O, kernel-validated PortIo)
+    //   is_io=false → virtio-mmio legacy (sys::map_mmio + volatile access)
+    //
+    // The kernel-side discovery populates the same DeviceInfo schema either
+    // way (see ADR-013); the transport-selection logic is identical across
+    // archs from here on.
+    let bar0 = dev.bars[0];
+    let transport = if bar0.is_io {
+        let mut io_base: u16 = 0;
+        for b in 0..6 {
+            let addr = dev.bars[b].addr;
+            if addr != 0 && addr < 0x10000 {
+                io_base = addr as u16;
+                break;
+            }
         }
-    }
-    if io_base == 0 {
-        sys::print(b"[BLK] ERROR: no I/O BAR on virtio-blk device\n");
-        sys::register_endpoint(BLK_ENDPOINT);
-        no_device_loop();
-    }
+        if io_base == 0 {
+            sys::print(b"[BLK] ERROR: no I/O BAR on virtio-blk device\n");
+            sys::register_endpoint(BLK_ENDPOINT);
+            no_device_loop();
+        }
+        Transport::LegacyPci(LegacyPciTransport::new(io_base))
+    } else {
+        // Memory-mapped BAR 0: treat addr as a physical base, size in bytes.
+        // Map one page — virtio-mmio register file fits in 0x200 bytes.
+        let pages = ((bar0.size as u64 + 0xFFF) / 0x1000).max(1) as u32;
+        let mapped = sys::map_mmio(bar0.addr, pages);
+        if mapped < 0 {
+            sys::print(b"[BLK] ERROR: map_mmio failed for virtio-mmio region\n");
+            sys::register_endpoint(BLK_ENDPOINT);
+            no_device_loop();
+        }
+        match LegacyMmioTransport::new(mapped as u64) {
+            Some(t) => Transport::LegacyMmio(t),
+            None => {
+                sys::print(b"[BLK] ERROR: virtio-mmio region rejected magic/version/device check\n");
+                sys::register_endpoint(BLK_ENDPOINT);
+                no_device_loop();
+            }
+        }
+    };
 
     // Step 3: initialize.
-    let mut driver = match BlkDriver::init(io_base) {
+    let mut driver = match BlkDriver::init(transport) {
         Some(d) => d,
         None => {
             sys::print(b"[BLK] ERROR: device initialization failed\n");

@@ -33,12 +33,13 @@
 
 mod device;
 mod pci;
+#[allow(unsafe_code)]
 mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
 use arcos_libsys as sys;
-use transport::LegacyTransport;
+use transport::{LegacyMmioTransport, LegacyPciTransport, Transport};
 use virtqueue::{BounceBuffer, VirtQueue};
 
 // ============================================================================
@@ -87,7 +88,7 @@ const TX_QUEUE_IDX: u16 = 1;
 // ============================================================================
 
 struct NetDriver {
-    transport: LegacyTransport,
+    transport: Transport,
     mac: [u8; 6],
     rx_queue: VirtQueue,
     tx_queue: VirtQueue,
@@ -99,9 +100,7 @@ struct NetDriver {
 }
 
 impl NetDriver {
-    fn init(io_base: u16) -> Option<Self> {
-        let transport = LegacyTransport::new(io_base);
-
+    fn init(transport: Transport) -> Option<Self> {
         // Step 1: Reset
         transport.reset();
 
@@ -128,6 +127,10 @@ impl NetDriver {
         let rx_qsize = core::cmp::min(rx_qsize, 32); // Limit to avoid stack overflow
 
         let rx_queue = VirtQueue::new(rx_qsize)?;
+        // Carrier-specific queue setup. No-op on PCI legacy; required on MMIO
+        // legacy (QueueNum + QueueAlign before QueuePFN).
+        transport.set_queue_num(rx_qsize);
+        transport.set_queue_align(4096);
         transport.set_queue_pfn(rx_queue.pfn());
 
         // Step 5: Set up TX queue (queue 1)
@@ -140,6 +143,8 @@ impl NetDriver {
         let tx_qsize = core::cmp::min(tx_qsize, 32); // Limit to avoid stack overflow
 
         let tx_queue = VirtQueue::new(tx_qsize)?;
+        transport.set_queue_num(tx_qsize);
+        transport.set_queue_align(4096);
         transport.set_queue_pfn(tx_queue.pfn());
 
         // Step 6: Mark DRIVER_OK
@@ -392,24 +397,46 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Step 2: Find the I/O BAR for legacy virtio transport.
-    // The BAR address for I/O ports is always < 64K on x86.
-    let mut io_base: u16 = 0;
-    for b in 0..6 {
-        let addr = dev.bars[b].addr;
-        if addr != 0 && addr < 0x10000 {
-            io_base = addr as u16;
-            break;
+    // Step 2: Build the appropriate transport. BAR 0 classification selects
+    // the carrier: is_io=true → virtio-pci legacy; is_io=false → virtio-mmio
+    // legacy (riscv64 QEMU virt). Kernel-side discovery populates the same
+    // DeviceInfo schema regardless (see ADR-013).
+    let bar0 = dev.bars[0];
+    let transport = if bar0.is_io {
+        let mut io_base: u16 = 0;
+        for b in 0..6 {
+            let addr = dev.bars[b].addr;
+            if addr != 0 && addr < 0x10000 {
+                io_base = addr as u16;
+                break;
+            }
         }
-    }
-    if io_base == 0 {
-        sys::print(b"[NET] ERROR: no I/O BAR found on virtio-net device\n");
-        sys::register_endpoint(NET_ENDPOINT);
-        no_device_loop();
-    }
+        if io_base == 0 {
+            sys::print(b"[NET] ERROR: no I/O BAR found on virtio-net device\n");
+            sys::register_endpoint(NET_ENDPOINT);
+            no_device_loop();
+        }
+        Transport::LegacyPci(LegacyPciTransport::new(io_base))
+    } else {
+        let pages = ((bar0.size as u64 + 0xFFF) / 0x1000).max(1) as u32;
+        let mapped = sys::map_mmio(bar0.addr, pages);
+        if mapped < 0 {
+            sys::print(b"[NET] ERROR: map_mmio failed for virtio-mmio region\n");
+            sys::register_endpoint(NET_ENDPOINT);
+            no_device_loop();
+        }
+        match LegacyMmioTransport::new(mapped as u64) {
+            Some(t) => Transport::LegacyMmio(t),
+            None => {
+                sys::print(b"[NET] ERROR: virtio-mmio region rejected magic/version/device check\n");
+                sys::register_endpoint(NET_ENDPOINT);
+                no_device_loop();
+            }
+        }
+    };
 
     // Step 3: Initialize the virtio device + queues
-    let mut driver = match NetDriver::init(io_base) {
+    let mut driver = match NetDriver::init(transport) {
         Some(d) => d,
         None => {
             sys::print(b"[NET] ERROR: device initialization failed\n");

@@ -13,6 +13,7 @@
 //! |---------|-------------|-----------|------------|--------|
 //! | x86_64  | `syscall`   | RAX       | RDI..R9    | RAX    |
 //! | AArch64 | `svc #0`    | x8        | x0..x5     | x0     |
+//! | RISC-V  | `ecall`     | a7 (x17)  | a0..a5     | a0     |
 
 #![no_std]
 
@@ -170,6 +171,74 @@ fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
             lateout("x16") _,
             lateout("x17") _,
             lateout("x18") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ----------------------------------------------------------------------------
+// RISC-V (riscv64gc): ECALL instruction
+// ----------------------------------------------------------------------------
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: Invokes the kernel ecall handler. The kernel's trap vector
+    // saves the full SavedContext; `ecall_handler_inner` extracts a7 + a0..a5,
+    // dispatches, writes the return value into the saved a0 slot, and bumps
+    // sepc by 4. On sret, every register *other than* a0 is restored from
+    // the saved frame — but we mark a0-a7 + t0-t6 clobbered defensively so
+    // a future kernel ABI change (scratch use, signal delivery) can't
+    // silently corrupt caller state.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") arg1 as i64 => ret,
+            inlateout("a1") arg2 => _,
+            inlateout("a2") arg3 => _,
+            inlateout("a7") num => _,
+            lateout("a3") _,
+            lateout("a4") _,
+            lateout("a5") _,
+            lateout("a6") _,
+            lateout("t0") _,
+            lateout("t1") _,
+            lateout("t2") _,
+            lateout("t3") _,
+            lateout("t4") _,
+            lateout("t5") _,
+            lateout("t6") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: Same as syscall_raw3. a3 carries the 4th argument.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") arg1 as i64 => ret,
+            inlateout("a1") arg2 => _,
+            inlateout("a2") arg3 => _,
+            inlateout("a3") arg4 => _,
+            inlateout("a7") num => _,
+            lateout("a4") _,
+            lateout("a5") _,
+            lateout("a6") _,
+            lateout("t0") _,
+            lateout("t1") _,
+            lateout("t2") _,
+            lateout("t3") _,
+            lateout("t4") _,
+            lateout("t5") _,
+            lateout("t6") _,
             options(nostack),
         );
     }
