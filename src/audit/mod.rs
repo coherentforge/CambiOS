@@ -639,7 +639,9 @@ pub fn emit(event: RawAuditEvent) {
     }
 
     // Under test/fuzzing, emit is a no-op — there is no per-CPU hardware.
-    #[cfg(any(test, fuzzing))]
+    // Also a no-op on riscv64 until the audit per-CPU staging is wired
+    // through the RISC-V backend (post-R-5 work — see ADR-013).
+    #[cfg(any(test, fuzzing, target_arch = "riscv64"))]
     {
         let _ = event;
     }

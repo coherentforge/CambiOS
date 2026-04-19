@@ -84,6 +84,48 @@ impl VmaTracker {
         }
     }
 
+    /// Register a pre-determined virtual address region in the tracker.
+    ///
+    /// Unlike [`allocate_region`] (which bumps `next_vaddr`), this
+    /// accepts a caller-chosen `base_vaddr` — used by the ELF loader
+    /// to record user segments (mapped at the ELF's `p_vaddr`) and
+    /// the user stack (mapped at `DEFAULT_STACK_TOP - stack_size`).
+    /// Without this, loader-created mappings bypass the tracker, and
+    /// `reclaim_user_vmas` on process exit never sees them — the
+    /// leaf user frames leak and (on RISC-V) the organic TLB-
+    /// shootdown path never fires.
+    ///
+    /// Returns `true` if the entry was recorded, `false` if the
+    /// tracker is full (MAX_VMAS exceeded) or inputs are invalid.
+    /// Does NOT map pages — the caller must do frame alloc + map_page.
+    pub fn register_region(&mut self, base_vaddr: u64, num_pages: u32) -> bool {
+        if num_pages == 0 {
+            return false;
+        }
+        if base_vaddr & 0xFFF != 0 {
+            return false; // must be page-aligned
+        }
+        let Some(size) = (num_pages as u64).checked_mul(4096) else {
+            return false;
+        };
+        let Some(end) = base_vaddr.checked_add(size) else {
+            return false;
+        };
+        if end > 0x0000_8000_0000_0000 {
+            return false; // stays in lower-half user space
+        }
+
+        let Some(slot) = self.entries.iter().position(|e| e.is_none()) else {
+            return false;
+        };
+        self.entries[slot] = Some(VmaEntry {
+            base_vaddr,
+            num_pages,
+        });
+        self.count += 1;
+        true
+    }
+
     /// Allocate a virtual address region of `num_pages` pages.
     ///
     /// Returns the base virtual address, or `None` if no slots remain.
@@ -803,6 +845,63 @@ mod tests {
         assert_eq!(a2, VMA_ALLOC_BASE + 4096);
         // But the freed slot was reused in the array
         assert_eq!(vma.count(), 1);
+    }
+
+    #[test]
+    fn test_vma_register_region_basic() {
+        let mut vma = VmaTracker::new();
+        assert!(vma.register_region(0x400000, 2));
+        assert_eq!(vma.count(), 1);
+        let entry = vma.find(0x400000).unwrap();
+        assert_eq!(entry.base_vaddr, 0x400000);
+        assert_eq!(entry.num_pages, 2);
+    }
+
+    #[test]
+    fn test_vma_register_region_rejects_unaligned() {
+        let mut vma = VmaTracker::new();
+        assert!(!vma.register_region(0x400100, 1));
+        assert_eq!(vma.count(), 0);
+    }
+
+    #[test]
+    fn test_vma_register_region_rejects_zero_pages() {
+        let mut vma = VmaTracker::new();
+        assert!(!vma.register_region(0x400000, 0));
+        assert_eq!(vma.count(), 0);
+    }
+
+    #[test]
+    fn test_vma_register_region_rejects_kernel_space() {
+        let mut vma = VmaTracker::new();
+        // One page starting just past the canonical user-space end.
+        assert!(!vma.register_region(0x0000_8000_0000_0000, 1));
+        assert_eq!(vma.count(), 0);
+    }
+
+    #[test]
+    fn test_vma_register_region_coexists_with_allocate() {
+        // The loader uses register_region for fixed VAs; syscall Allocate
+        // uses allocate_region (bump). Both must populate the same tracker.
+        let mut vma = VmaTracker::new();
+        assert!(vma.register_region(0x400000, 1)); // ELF segment
+        let bump_addr = vma.allocate_region(2).unwrap(); // syscall Allocate
+        assert_eq!(bump_addr, VMA_ALLOC_BASE);
+        assert_eq!(vma.count(), 2);
+        assert!(vma.find(0x400000).is_some());
+        assert!(vma.find(bump_addr).is_some());
+    }
+
+    #[test]
+    fn test_vma_register_region_fills_all_slots() {
+        let mut vma = VmaTracker::new();
+        for i in 0..MAX_VMAS {
+            let base = 0x400000 + (i as u64) * 0x1000;
+            assert!(vma.register_region(base, 1));
+        }
+        // Next register must fail with no slots.
+        assert!(!vma.register_region(0x800000, 1));
+        assert_eq!(vma.count(), MAX_VMAS);
     }
 
     #[test]

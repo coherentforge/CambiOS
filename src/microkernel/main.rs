@@ -735,19 +735,12 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // any wakeup error is reported and continues.
     unsafe { start_application_processors(); }
 
-    // R-5.b one-shot self-test (removed when an organic consumer
-    // lands in R-6 — e.g. user unmap via SYS_FREE). Fire a benign
-    // cross-hart TLB shootdown at an unmapped VA. Each target hart's
-    // `sfence.vma` is a no-op on an unmapped VA; the round-trip
-    // proves the SBI IPI → trap vector → handle_ipi → ACK chain.
-    // `shootdown_page` is synchronous — if it returns, every target
-    // hart ACKed, so the line below doubles as a milestone marker.
-    arcos_core::arch::riscv64::tlb::shootdown_page(0xdead_beef_0000);
-    println!("✓ Cross-hart TLB shootdown exercised (broadcast + ACK round-trip)");
-
     println!();
     println!("Phase R-5.a milestone: SMP live. APs bootstrapped via SBI HSM, each");
     println!("hart runs its own scheduler + timer. hello-riscv64 ran on BSP (hart 0).");
+    println!("Cross-hart TLB shootdowns now fire organically from the loader path —");
+    println!("every hello-riscv64 exit unmaps its ELF segments + user stack, each");
+    println!("unmap_page calls shootdown_page, each broadcasts the SBI IPI.");
     println!("Console RX still routed: press a key → '[R-3 RX] 0xNN'.");
     println!();
 

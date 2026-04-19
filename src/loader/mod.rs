@@ -512,6 +512,18 @@ pub fn load_elf_process(
             }
             // BSS (memsz > filesz) is already zeroed from the write_bytes above
         }
+
+        // Record the segment's virtual range in the process VMA tracker so
+        // `reclaim_user_vmas` can free the leaf frames on exit (and, on
+        // architectures with remote-shootdown, drive the natural TLB
+        // invalidation traffic). MAX_LOAD_SEGMENTS (16) << MAX_VMAS (256);
+        // failure here is an invariant break, not a user-facing condition.
+        let vma = process_table
+            .vma_mut(process_id)
+            .ok_or(LoaderError::ProcessCreationFailed)?;
+        if !vma.register_region(page_aligned_vaddr, num_pages as u32) {
+            return Err(LoaderError::ProcessCreationFailed);
+        }
     }
 
     // --- Step 6: Allocate and map user stack ---
@@ -540,6 +552,14 @@ pub fn load_elf_process(
             )
             .map_err(|_| LoaderError::PagingFailed)?;
         }
+    }
+
+    // Record the user stack in the VMA tracker (see step 5 rationale).
+    let vma = process_table
+        .vma_mut(process_id)
+        .ok_or(LoaderError::ProcessCreationFailed)?;
+    if !vma.register_region(stack_base, DEFAULT_STACK_PAGES as u32) {
+        return Err(LoaderError::ProcessCreationFailed);
     }
 
     // --- Step 7: Allocate kernel stack + SavedContext ---

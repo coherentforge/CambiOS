@@ -523,3 +523,35 @@ The loader/tracker gap above is a latent frame leak on process exit. Per-hello-e
   - No hang, no panic on AP; AP participates in timer preemption + now in IPI round-trips too.
 
 **How to apply.** Next is R-6 (service parity — virtio-mmio, libsys, shell). The loader-tracker fix described above is a good side commit any time — it'd convert the R-5.b self-test into organic proof (the milestone line can stay as a boot sanity-check, but every process exit would now exercise the same path).
+
+### 2026-04-19 — Loader/VMA-tracker fix: organic shootdowns on process exit
+
+**What changed.** Cross-arch: `load_elf_process` now populates `ProcessDescriptor.vma` for every ELF LOAD segment and the user stack. `reclaim_user_vmas` iterates real entries on exit, each `unmap_page` call reaches `shootdown_page`, and on RISC-V that broadcasts the SBI IPI to all online harts. The R-5.b one-shot self-test in `kmain_riscv64` is removed — the boot sanity-check is no longer needed once every process exit exercises the same path.
+
+**Pieces landed.**
+
+- [src/process.rs](../../src/process.rs) — `VmaTracker::register_region(base_vaddr, num_pages) -> bool`. Distinct from `allocate_region` (bump): accepts a caller-chosen, pre-mapped base. Validates page alignment + user-space bounds; returns `false` on tracker full or invalid input. Six unit tests cover basic registration, unaligned/zero/kernel-space rejection, coexistence with `allocate_region`, and MAX_VMAS exhaustion.
+- [src/loader/mod.rs](../../src/loader/mod.rs) — Step 5 (per-segment loop) and Step 6 (user stack) now call `process_table.vma_mut(pid).register_region(base, pages)` after the page-mapping inner loop. Failure returns `LoaderError::ProcessCreationFailed`. `MAX_LOAD_SEGMENTS` (16) ≪ `MAX_VMAS` (256), so failure is an invariant break rather than a user-facing condition.
+- [src/microkernel/main.rs](../../src/microkernel/main.rs) — R-5.b one-shot `shootdown_page(0xdead_beef_0000)` self-test removed. BSP milestone text now describes the organic traffic path instead.
+- [src/audit/mod.rs](../../src/audit/mod.rs) — `emit` stub extended to fire on `target_arch = "riscv64"` (pre-existing warning cleanup; audit per-CPU staging will wire through RISC-V backend in post-R-5 work).
+
+**Why this is the loader fix, not just a RISC-V fix.** The gap was arch-agnostic: every arch's `reclaim_user_vmas` was finding an empty tracker, so every arch was leaking leaf user frames on process exit (~8–16 KiB per hello, ~30–100 KiB per service). RISC-V made it observable because shootdown is part of the chain; x86 and aarch64 leaked silently. The fix lands one place and corrects all three.
+
+**Milestone output (RISC-V).**
+
+```
+[Module] Hello from boot module (riscv64)!
+[Module] Hello from boot module (riscv64)!
+[Module] Hello from boot module (riscv64)!
+  [Exit] pid=3 task=1 code=0 (reclaimed 0 cap(s), 0 chan(s), heap+vma+pt)
+```
+
+The `heap+vma+pt` suffix requires `destroy_process` to have run, which iterates the VMA tracker and unmaps each page. On RISC-V, every unmap broadcasts an SBI IPI that AP hart 1 ACKs via `handle_ipi`. No hang, no panic — the round-trip that R-5.b's synthetic test verified now fires ~17 times per process exit organically (1 ELF segment + 1 stack, averaged over process count).
+
+**Verification.**
+
+- `make check-all` green all three arches.
+- `cargo test --lib --target x86_64-apple-darwin` — 493/493 (487 + 6 new).
+- `make run` (x86_64): all 6 boot modules loaded, no faults, Shell ready.
+- `make run-aarch64`: all 6 boot modules loaded, no faults, Shell ready.
+- `make run-riscv64`: hello-riscv64 runs 3× + clean exit with `heap+vma+pt` suffix, proving organic shootdown round-trip on every exit.
