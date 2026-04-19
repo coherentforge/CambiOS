@@ -203,6 +203,11 @@ enum DeviceKind {
     /// in the `DeviceID` register inside the MMIO space and is resolved
     /// in kernel boot after HHDM is up (R-6, ADR-013).
     VirtioMmio,
+    /// `/chosen` — holds `linux,initrd-start` and `linux,initrd-end`
+    /// when OpenSBI / QEMU hand us an initrd. The initrd is the R-6
+    /// boot-module carrier — its contents parse as the CambiOS initrd
+    /// archive format (see `src/boot/initrd.rs`).
+    Chosen,
 }
 
 /// Classify a node name into a [`DeviceKind`] given its depth and the
@@ -227,6 +232,9 @@ fn classify_node(depth: usize, parent: DeviceKind, name: &[u8]) -> DeviceKind {
             }
             if name == b"soc" {
                 return DeviceKind::Soc;
+            }
+            if name == b"chosen" {
+                return DeviceKind::Chosen;
             }
             DeviceKind::None
         }
@@ -270,6 +278,19 @@ fn classify_node(depth: usize, parent: DeviceKind, name: &[u8]) -> DeviceKind {
     }
 }
 
+/// Decode a `/chosen/linux,initrd-{start,end}` property value as a
+/// physical address. Historically encoded as big-endian u32 (4 bytes)
+/// on platforms that pre-date 64-bit DT addresses; OpenSBI / QEMU on
+/// 64-bit RISC-V may emit either width. Accept both: len==4 → u32 BE;
+/// len==8 → u64 BE. Anything else is rejected.
+fn parse_chosen_addr(value: &[u8]) -> Option<u64> {
+    match value.len() {
+        4 => Some(be_u32_at(value, 0) as u64),
+        8 => Some(be_u64_at(value, 0)),
+        _ => None,
+    }
+}
+
 /// Parse `reg` property values as (address, size) pairs. Assumes
 /// `#address-cells = 2` and `#size-cells = 2` at the root (standard
 /// for QEMU virt and most RISC-V platforms). Reads pairs of u64s
@@ -307,6 +328,9 @@ struct DtbFacts {
     hart_count: usize,
     virtio_mmio: [(u64, u64); super::MAX_VIRTIO_MMIO_DEVICES],
     virtio_mmio_count: usize,
+    /// (initrd_start_phys, initrd_end_phys) — end is exclusive, matching
+    /// the DTB convention. `None` if no initrd was advertised.
+    initrd_range: Option<(u64, u64)>,
     totalsize: u32,
 }
 
@@ -322,6 +346,7 @@ impl DtbFacts {
             hart_count: 0,
             virtio_mmio: [(0u64, 0u64); super::MAX_VIRTIO_MMIO_DEVICES],
             virtio_mmio_count: 0,
+            initrd_range: None,
             totalsize: 0,
         }
     }
@@ -358,6 +383,7 @@ impl DtbFacts {
 /// - `/soc/plic@*` → `reg` → PLIC MMIO base + size.
 /// - `/soc/serial@*` → `interrupts` → console IRQ source ID.
 /// - `/soc/virtio_mmio@*` → `reg` → virtio-mmio device regions.
+/// - `/chosen` → `linux,initrd-{start,end}` → initrd archive range.
 ///
 /// # Safety
 /// `dtb_phys` must point at a valid FDT blob.
@@ -512,6 +538,24 @@ unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
                             facts.push_hart(be_u32_at(value, 0) as u64);
                         }
                     }
+                    (DeviceKind::Chosen, b"linux,initrd-start") => {
+                        if let Some(start) = parse_chosen_addr(value) {
+                            let end = facts
+                                .initrd_range
+                                .map(|(_, e)| e)
+                                .unwrap_or(0);
+                            facts.initrd_range = Some((start, end));
+                        }
+                    }
+                    (DeviceKind::Chosen, b"linux,initrd-end") => {
+                        if let Some(end) = parse_chosen_addr(value) {
+                            let start = facts
+                                .initrd_range
+                                .map(|(s, _)| s)
+                                .unwrap_or(0);
+                            facts.initrd_range = Some((start, end));
+                        }
+                    }
                     (DeviceKind::VirtioMmio, b"reg") => {
                         // Under /soc `#address-cells = #size-cells = 2`.
                         // Each virtio-mmio node has one (base, size)
@@ -583,6 +627,50 @@ pub unsafe fn populate(dtb_phys: u64) {
                 phys_base,
                 size,
             });
+        }
+
+        // Parse the initrd archive (if any) and push each boot module
+        // into BootInfo.modules, matching the shape Limine populates on
+        // x86_64/aarch64. Symmetric module surface across arches means
+        // the future manifest-driven init (ADR-018) is a drop-in
+        // replacement, not an arch-specific fork.
+        if let Some((start, end)) = facts.initrd_range {
+            if end > start && start != 0 {
+                let size = (end - start) as usize;
+                let vbase = start + crate::hhdm_offset();
+                // SAFETY: initrd range came from the DTB; OpenSBI /
+                // QEMU placed real bytes there. First 4 GiB of phys is
+                // covered by the boot trampoline's HHDM gigapage, so
+                // the slice is readable via the higher-half map.
+                let archive_bytes = unsafe {
+                    core::slice::from_raw_parts(vbase as *const u8, size)
+                };
+                let parsed = super::initrd::parse(
+                    archive_bytes,
+                    start,
+                    super::MAX_BOOT_MODULES,
+                    |m| {
+                        let _ = info.push_module(m);
+                    },
+                );
+                if parsed == 0 {
+                    crate::println!(
+                        "[boot::riscv] warning: initrd at {:#x}..{:#x} \
+                         has bad magic or zero entries — no boot modules loaded",
+                        start,
+                        end,
+                    );
+                }
+
+                // Reserve the initrd extent so the frame allocator
+                // doesn't hand it out before the loader copies the
+                // boot modules into their own frames.
+                let _ = info.push_memory_region(MemoryRegion {
+                    base: start,
+                    length: (end - start),
+                    kind: MemoryRegionKind::BootloaderReclaimable,
+                });
+            }
         }
     }
 

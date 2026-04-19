@@ -1,0 +1,9 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
+[package]
+name = "mkinitrd"
+version = "0.1.0"
+edition = "2021"
+description = "CambiOS initrd archive builder (RISC-V boot-module carrier)"
+
+[dependencies]
