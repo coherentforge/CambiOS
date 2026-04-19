@@ -162,7 +162,6 @@ pub unsafe fn sbi_hart_start(hart_id: u64, start_addr_phys: u64, opaque: u64) ->
 /// Returns 0 if absent, non-zero if the M-mode firmware implements
 /// the extension. R-5.b uses this for Svinval / TIME v2 detection.
 #[inline]
-#[allow(dead_code)] // wired in R-5.b
 pub fn sbi_probe_extension(eid: u64) -> i64 {
     let value: i64;
     // SAFETY: pure ecall, no stack access.
@@ -179,3 +178,56 @@ pub fn sbi_probe_extension(eid: u64) -> i64 {
     }
     value
 }
+
+// ============================================================================
+// IPI extension (SBI v0.2+, EID "sPI" = 0x735049)
+// ============================================================================
+//
+// `send_ipi(hart_mask, hart_mask_base)` signals SSIP on every hart
+// whose bit is set in the mask. `hart_mask_base` shifts the mask —
+// bit N of hart_mask means hart `hart_mask_base + N`. A value of
+// `u64::MAX` for `hart_mask_base` broadcasts to *all* harts.
+//
+// Used by R-5.b's remote TLB shootdown: initiator sets the
+// shootdown payload, calls `sbi_send_ipi(targets, 0)`, each target
+// hart's trap vector catches the S-mode software interrupt and
+// drains the payload via `sfence.vma`.
+
+/// SBI IPI extension ID ("sPI" = 0x735049).
+const SBI_EXT_IPI: u64 = 0x735049;
+/// IPI function: send_ipi.
+const SBI_IPI_SEND_IPI: u64 = 0;
+
+/// Assert `sip.SSIP` on every hart whose bit is set in
+/// `hart_mask << hart_mask_base`. Returns the SBI error code (0 on
+/// success; typically 0 even when some harts in the mask are stopped
+/// or nonexistent — the firmware silently skips them).
+///
+/// # Safety
+/// Must be called from S-mode. Targets will take a trap on the
+/// S-mode software interrupt vector (`scause` = `1 << 63 | 1`); the
+/// caller is responsible for ensuring those harts have
+/// [`sstatus.SIE`] + `sie.SSIE` enabled and a handler ready to
+/// consume the shootdown payload.
+#[inline]
+pub unsafe fn sbi_send_ipi(hart_mask: u64, hart_mask_base: u64) -> i64 {
+    let err: i64;
+    // SAFETY: ecall to M-mode is always legal from S-mode.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SBI_EXT_IPI,
+            in("a6") SBI_IPI_SEND_IPI,
+            in("a0") hart_mask,
+            in("a1") hart_mask_base,
+            lateout("a0") err,
+            lateout("a1") _,
+            options(nostack),
+        );
+    }
+    err
+}
+
+/// Convenience: SBI IPI extension ID (exported so `tlb::init` can
+/// probe it at boot and fall back gracefully if absent).
+pub const IPI_EXTENSION_ID: u64 = SBI_EXT_IPI;

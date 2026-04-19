@@ -346,8 +346,17 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
                 unsafe { super::plic::dispatch_pending(); }
             }
             IRQ_SOFTWARE => {
-                // IPI. R-5 will handle cross-hart wake / TLB shootdown.
-                panic!("riscv64: S-mode software interrupt (IPI) not wired until R-5");
+                // R-5.b: SBI-delivered S-mode software interrupt.
+                // Currently the only producer is `tlb::broadcast_
+                // shootdown` on other harts — drain the payload +
+                // clear sip.SSIP + ACK.
+                //
+                // SAFETY: ISR context; `handle_ipi` runs the sfence
+                // and atomic counter update the initiator is
+                // waiting on. Further IPI uses (cross-hart wake
+                // for scheduler load-balancing) would land here in
+                // additional arms, discriminated by a payload tag.
+                unsafe { super::tlb::handle_ipi(); }
             }
             other => panic!("riscv64: unexpected S-mode interrupt cause={}", other),
         }
@@ -441,12 +450,19 @@ pub unsafe fn install() {
 /// before the per-CPU data is set up would leave the handler reading
 /// stale / null values on the first tick.
 pub unsafe fn enable_interrupts() {
-    // Set SSTATUS.SIE (bit 1).
+    // Enable sie.SSIE (bit 1) alongside SIE so the hart takes SBI
+    // IPIs. Per-source enables for timer (sie.STIE) and external
+    // (sie.SEIE) are set by `timer::init` and `plic::init`
+    // respectively; SSIE lives here because it's the generic
+    // "cross-hart wake / TLB shootdown" enable and not tied to a
+    // specific driver. `sie.SSIE` = bit 1.
     // SAFETY: csrs is a read-modify-write CSR op; legal from S-mode.
     unsafe {
         core::arch::asm!(
-            "csrs sstatus, {0}",
-            in(reg) 1u64 << 1,
+            "csrs sie, {0}",
+            "csrs sstatus, {1}",
+            in(reg) 1u64 << 1,              // sie.SSIE
+            in(reg) 1u64 << 1,              // sstatus.SIE
             options(nostack, nomem, preserves_flags),
         );
     }

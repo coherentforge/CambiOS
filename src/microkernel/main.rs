@@ -712,6 +712,12 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         Err(e) => println!("⚠ hello-riscv64 spawn failed: {}", e),
     }
 
+    // Phase R-5.b: mark BSP online in the TLB-shootdown mask and
+    // probe the SBI IPI extension (warn-only if absent — single-
+    // hart boots never fire a cross-hart shootdown).
+    arcos_core::arch::riscv64::tlb::mark_self_online(hart_id);
+    let _ = arcos_core::arch::riscv64::tlb::probe_ipi_extension();
+
     // SAFETY: trap handler is live, per-hart state is initialized,
     // the timer is armed, the scheduler holds the idle task, and (if
     // the DTB reported them) PLIC + console IRQ are wired. Safe to
@@ -728,6 +734,16 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // SAFETY: BSP per-hart state is fully initialized; SBI is ready;
     // any wakeup error is reported and continues.
     unsafe { start_application_processors(); }
+
+    // R-5.b one-shot self-test (removed when an organic consumer
+    // lands in R-6 — e.g. user unmap via SYS_FREE). Fire a benign
+    // cross-hart TLB shootdown at an unmapped VA. Each target hart's
+    // `sfence.vma` is a no-op on an unmapped VA; the round-trip
+    // proves the SBI IPI → trap vector → handle_ipi → ACK chain.
+    // `shootdown_page` is synchronous — if it returns, every target
+    // hart ACKed, so the line below doubles as a milestone marker.
+    arcos_core::arch::riscv64::tlb::shootdown_page(0xdead_beef_0000);
+    println!("✓ Cross-hart TLB shootdown exercised (broadcast + ACK round-trip)");
 
     println!();
     println!("Phase R-5.a milestone: SMP live. APs bootstrapped via SBI HSM, each");
@@ -849,15 +865,21 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
         }
     }
 
-    // Step 5: signal BSP that this AP has fully initialized.
+    // Step 5: mark this hart in the TLB-shootdown online mask. Must
+    // happen before `enable_interrupts` so a shootdown IPI fired by
+    // the BSP (mid-boot) lands on a ready handler — though in
+    // practice shootdowns are rare during bring-up.
+    arcos_core::arch::riscv64::tlb::mark_self_online(hart_id);
+
+    // Step 6: signal BSP that this AP has fully initialized.
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     println!("  ✓ AP hart={} cpu_idx={} online", hart_id, cpu_idx);
 
-    // Step 6: enable SIE and enter idle wfi. The scheduler sits
-    // with just its idle task for R-5.a; R-6 + task migration will
-    // fill it.
+    // Step 7: enable SIE + SSIE and enter idle wfi. The scheduler
+    // sits with just its idle task for R-5.a/b; R-6 + task migration
+    // will fill it.
     // SAFETY: trap vector installed; PerCpu/timer/scheduler all live.
     unsafe { arcos_core::arch::riscv64::trap::enable_interrupts(); }
     loop {

@@ -478,3 +478,48 @@ The AP idles after init — no cross-hart work scheduled yet (R-6 distributes re
 - `make run-riscv64` — both harts online, hello still completes its 3 prints + exit on BSP.
 
 **How to apply.** R-5.b (next) adds SBI IPI for remote TLB shootdown. `sbi_send_ipi` via the IPI extension, probe for Svinval with `sbi_probe_extension`. The trap vector's `IRQ_SOFTWARE` arm (currently panics) wires through to a hart-local `sfence.vma` on the requested VA range. R-6 ships virtio-mmio + libsys + shell.
+
+### 2026-04-19 — Phase R-5.b: remote TLB shootdown via SBI IPI
+
+**What changed.** Cross-hart TLB shootdown is live. `arch::tlb::shootdown_page` and `shootdown_range` on RISC-V now run a broadcast protocol: local `sfence.vma` first, then SBI IPI to every other online hart, then spin on an atomic ACK counter. Each target hart's trap vector catches the S-mode software interrupt (`scause = 1<<63 | 1`), drains the published payload (`SHOOTDOWN_VA` / `SHOOTDOWN_PAGES`), executes the matching local `sfence.vma`, clears `sip.SSIP`, and `fetch_add`s the ACK counter.
+
+**Pieces landed.**
+
+- [src/arch/riscv64/sbi.rs](../../src/arch/riscv64/sbi.rs) — `sbi_send_ipi(hart_mask, hart_mask_base)` via the IPI extension (EID `0x735049`, FID 0). `sbi_probe_extension` unlocked from R-5.a's `#[allow(dead_code)]` gate; `IPI_EXTENSION_ID` exported so `tlb::probe_ipi_extension` can warn if the extension is absent.
+- [src/arch/riscv64/tlb.rs](../../src/arch/riscv64/tlb.rs) — rewritten around `broadcast_shootdown`. New state: `ONLINE_HART_MASK: AtomicU64` (hart N sets bit N before enabling interrupts), `SHOOTDOWN_LOCK: Spinlock<()>` (serializes initiators), `SHOOTDOWN_VA` / `SHOOTDOWN_PAGES` / `SHOOTDOWN_ACK` (payload + counter). `PAGES_SENTINEL_ALL = u32::MAX` encodes "flush whole TLB." `handle_ipi` is the target-side drain; called from the trap vector under the existing R-3.b+c kernel-entry contract.
+- [src/arch/riscv64/trap.rs](../../src/arch/riscv64/trap.rs) — `IRQ_SOFTWARE` arm now calls `super::tlb::handle_ipi()` instead of panicking. `trap::enable_interrupts` now sets `sie.SSIE` alongside `sstatus.SIE` so the hart will actually take the software IPI (per-source enable; timer STIE and external SEIE live in their respective driver inits).
+- [src/microkernel/main.rs](../../src/microkernel/main.rs) — BSP `kmain_riscv64` and AP `kmain_riscv64_ap` both call `tlb::mark_self_online(hart_id)` right before enabling interrupts. `kmain_riscv64` also calls `probe_ipi_extension` for a one-time warning log and fires a one-shot self-test (`shootdown_page(0xdead_beef_0000)`) immediately after APs come online.
+
+**Milestone output.**
+
+```
+✓ AP hart=1 cpu_idx=1 online
+✓ 1 AP(s) online (total harts: 2)
+✓ Cross-hart TLB shootdown exercised (broadcast + ACK round-trip)
+```
+
+`shootdown_page` is synchronous. If the BSP→AP IPI path were broken, the call would hang and the subsequent milestone line would never print. Since it prints, every link in the chain (initiator local fence → SBI ecall → target trap vector → `handle_ipi` (clears `sip.SSIP`, sfence.vma, ACK) → initiator spin-wait completion) is working end-to-end.
+
+**Why a self-test rather than organic traffic.** The existing `load_elf_process` path maps user ELF segments + user stack via direct `paging::map_page` calls and does **not** insert entries into the `ProcessDescriptor.vma` tracker. `reclaim_user_vmas` at process-exit time iterates that (empty) tracker, returns 0, and never calls `paging::unmap_page`. No `unmap_page` → no shootdown. This gap is identical on x86_64 and AArch64 — the code is shared. Result: for today's sole user workload (hello-riscv64, loader-spawned), process exit reclaims page-table-structure frames (via `reclaim_process_page_tables`) but does **not** reclaim leaf user-data frames or issue shootdowns. The self-test lands the observable proof without taking on the loader-tracker fix as R-5.b scope.
+
+**Follow-up worth tracking** (not R-5.b scope, affects all three arches):
+
+The loader/tracker gap above is a latent frame leak on process exit. Per-hello-exit it's ~8–16 KiB; per-service (e.g., shell) ~30–100 KiB. Long-running systems with frequent process churn would accumulate. The fix lives at the loader / `ProcessDescriptor` layer: populate the VMA tracker when `load_elf_process` maps segments + user stack; `reclaim_user_vmas` then iterates real entries and the existing `unmap_page` path naturally triggers the R-5.b broadcast. Size: ~20 lines in `load_elf_process` + matching entries in `ProcessDescriptor`.
+
+**Out of scope for R-5.b.**
+
+- Svinval extension (`sinval.vma` broadcast). Probed via `sbi_probe_extension(IPI_EXTENSION_ID)` for logging, but not used for dispatch — the IPI protocol is universal. Svinval would avoid the IPI round-trip when available; a follow-up commit after the loader-tracker fix lands enough organic shootdown traffic to make the optimization worth measuring.
+- Cross-hart task migration IPIs. `sie.SSIE` is the only "SBI software interrupt" enable we care about; adding task-wake or scheduler-coordination IPIs would reuse the same path with a payload tag discriminating shootdown vs wake.
+- `BootProtocol` trait factoring (R-5.a already deferred).
+
+**Verification.**
+
+- `make check-all` green all three arches (x86_64 + aarch64 release builds unaffected; tlb.rs on RISC-V now ships the real protocol).
+- `cargo test --lib --target x86_64-apple-darwin` — 487/487.
+- `make run-riscv64`:
+  - `✓ AP hart=1 cpu_idx=1 online`
+  - `✓ Cross-hart TLB shootdown exercised (broadcast + ACK round-trip)`
+  - hello-riscv64 still runs 3× + clean exit on BSP
+  - No hang, no panic on AP; AP participates in timer preemption + now in IPI round-trips too.
+
+**How to apply.** Next is R-6 (service parity — virtio-mmio, libsys, shell). The loader-tracker fix described above is a good side commit any time — it'd convert the R-5.b self-test into organic proof (the milestone line can stay as a boot sanity-check, but every process exit would now exercise the same path).
