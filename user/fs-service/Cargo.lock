@@ -6,8 +6,13 @@ version = 4
 name = "arcos-fs-service"
 version = "0.1.0"
 dependencies = [
+ "arcos-libfs-proto",
  "arcos-libsys",
 ]
+
+[[package]]
+name = "arcos-libfs-proto"
+version = "0.1.0"
 
 [[package]]
 name = "arcos-libsys"

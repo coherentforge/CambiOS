@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 arcos-libsys = { path = "../libsys" }
+arcos-libfs-proto = { path = "../libfs-proto" }
 
 [profile.release]
 opt-level = "s"        # Size-optimized (small ELF)
