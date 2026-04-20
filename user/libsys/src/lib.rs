@@ -319,6 +319,16 @@ pub fn get_pid() -> u32 {
     syscall_raw3(SYS_GET_PID, 0, 0, 0) as u32
 }
 
+const SYS_GET_PRINCIPAL: u64 = 12;
+
+/// Read this process's bound Principal (32-byte Ed25519 public key).
+/// Returns 32 on success (caller buffer must be ≥32 bytes), or negative
+/// error. Unbound processes (no `BindPrincipal` at boot) see
+/// `Principal::ANONYMOUS` — 32 zero bytes.
+pub fn get_principal(out: &mut [u8; 32]) -> i64 {
+    syscall_raw3(SYS_GET_PRINCIPAL, out.as_mut_ptr() as u64, 32, 0)
+}
+
 /// Send IPC message (Write syscall).
 pub fn write(endpoint: u32, buf: &[u8]) -> i64 {
     syscall_raw3(SYS_WRITE, endpoint as u64, buf.as_ptr() as u64, buf.len() as u64)

@@ -1,0 +1,17 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
+[package]
+name = "arcos-libfs-proto"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free: no libsys, no alloc. This crate is the
+# single source of truth for the fs-service wire format, consumable by
+# the no-heap server and the heap-using client alike.
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"
