@@ -44,7 +44,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **NEVER** suggest running kernel binaries directly on the host. Always use QEMU.
 - **AArch64 QEMU MUST use** `-machine virt,gic-version=3` (GICv3 required for ICC system registers).
 - **RISC-V QEMU MUST use** `-machine virt -bios default` (loads OpenSBI as M-mode firmware; the kernel is the S-mode payload). No vendor-specific machine types — generic-first per [ADR-013](docs/adr/013-riscv64-architecture-support.md).
-- **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). During RISC-V Phases R-1 through R-6 (the riscv64 backend is mid-construction and not expected to build between phase boundaries), use `make check-stable` (x86_64 + aarch64). After Phase R-6 lands, use `make check-all` (all three) as the permanent gate. The discipline is identical: no commits regress any *currently buildable* arch.
+- **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Use `make check-all` (x86_64 + aarch64 + riscv64) as the permanent gate — R-6 landed 2026-04-19 so all three arches are now buildable at every commit boundary. `make check-stable` (x86_64 + aarch64 only) remains available as an escape hatch for future temporary backend breakage; the discipline is identical either way — no commits regress any *currently buildable* arch.
 - **ALWAYS*** all new files are tagged for copyright: // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
 
@@ -344,7 +344,7 @@ pub fn try_recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
 ```
 *Skipping:* userspace services can't call the syscall without raw `asm!`. The kernel side works; every consumer is broken until libsys catches up.
 
-**Verification:** after all seven, `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin` must pass (identity-gate tests exercise the new variant), and `make check-stable` must build clean on x86_64 + aarch64.
+**Verification:** after all seven, `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin` must pass (identity-gate tests exercise the new variant), and `make check-all` must build clean on x86_64 + aarch64 + riscv64.
 
 **Stop-and-Ask triggers in this flow:** does the new syscall belong in the exempt set? (Almost always no — default to identity-required.) Does it introduce a new kind of capability check? (If yes, trip the unread-subsystem gate on `src/ipc/capability.rs` first.) Does it need a new arch backend helper? (If yes, add to all three arch modules.)
 
@@ -364,12 +364,12 @@ cargo build --target aarch64-unknown-none --release
 # some phases intentionally don't build while the backend is under construction.
 cargo build --target riscv64gc-unknown-none-elf --release
 
-# Tri-arch regression gate (MANDATORY before commits). During Phases
-# R-1..R-6 of the RISC-V port (riscv64 backend mid-construction), use
-# check-stable. After R-6 lands, use check-all as the permanent gate.
+# Tri-arch regression gate (MANDATORY before commits). R-6 landed
+# 2026-04-19 so check-all is now the permanent gate; check-stable is
+# retained as an escape hatch for future temporary backend breakage.
 # ADR-013 § Tri-Architecture Regression Discipline.
-make check-stable     # x86_64 + aarch64 (use during RISC-V buildup)
-make check-all        # x86_64 + aarch64 + riscv64 (post-R-6)
+make check-all        # x86_64 + aarch64 + riscv64 (permanent gate)
+make check-stable     # x86_64 + aarch64 only (escape hatch)
 
 # Run tests. Test count is not cited here — run `make stats` when you
 # need it (syscall count, test count, .rs file counts are all derived

@@ -790,22 +790,20 @@ run-riscv64: kernel-riscv64 img-riscv64
 # Tri-architecture regression gate. Any commit that breaks any arch is
 # blocked. Tracks ADR-013's "Tri-Architecture Regression Discipline".
 #
-# Two gates exist:
+# R-6 landed 2026-04-19 — riscv64 now boots to shell end-to-end under
+# QEMU virt. check-all is the permanent gate; check-stable is retained
+# only as an escape hatch for future temporary backend breakage during
+# deep refactors.
 #
-#   - check-stable: x86_64 + aarch64 only. Use this during Phases R-1
-#     through R-6 of the RISC-V port, when the riscv64 backend is
-#     under construction and not expected to build between phase
-#     boundaries. Every commit during the RISC-V buildup must pass
-#     check-stable.
+#   - check-all: x86_64 + aarch64 + riscv64. The gate every commit
+#     must pass.
 #
-#   - check-all: all three including riscv64. Use this once a RISC-V
-#     phase milestone has restored the backend to a buildable state,
-#     and as the permanent gate after Phase R-6 lands. Every commit
-#     post-R-6 must pass check-all.
+#   - check-stable: x86_64 + aarch64 only. Use ONLY when deliberately
+#     in the middle of a refactor that intentionally breaks riscv64,
+#     and name the fact in the commit message.
 #
 # The discipline is the same either way — no commits that regress any
-# *currently buildable* architecture. The two gates exist only because
-# the riscv64 backend is mid-construction.
+# *currently buildable* architecture.
 # ---------------------------------------------------------------------------
 check-all: check-x86 check-aarch64 check-riscv64
 	@echo "=== All three architectures build cleanly ==="
