@@ -422,8 +422,31 @@ core::arch::global_asm!(
     "mv sp, a0",
 
     // Restore sepc + sstatus.
-    "ld t0, 264(sp)",
+    "ld t0, 264(sp)",                       // t0 = new sstatus
     "csrw sstatus, t0",
+
+    // Maintain the sscratch invariant across the upcoming sret:
+    //   SPP = 0 (target is U-mode)  → sscratch = kernel_tp so the
+    //       next U→S trap's `csrrw tp, sscratch, tp` lands tp = kernel PerCpu
+    //   SPP = 1 (target is S-mode)  → sscratch = 0 (the kernel-execution
+    //       invariant the trap vector's S-mode path relies on)
+    // Without this, dispatching a freshly-loaded U-mode task through the
+    // yield path leaves sscratch stale (0 or whoever's PerCpu was last
+    // installed before a kernel yield): the task's next ecall then swaps
+    // tp to 0, the trap vector falls through to the S-mode path, sp is
+    // not reloaded from PerCpu, and the first store onto the user sp
+    // page-faults (recursive storm at `sd ra, 0x8(sp)`).
+    //
+    // Must happen before the `ld x4, 32(sp)` below clobbers tp with the
+    // task's saved (possibly zero) tp value.
+    "andi t1, t0, 0x100",                   // t1 = sstatus.SPP bit
+    "bnez t1, 1f",                          // SPP=1 → fall through to zero-sscratch
+    "csrw sscratch, tp",                    // SPP=0 → sscratch = kernel_tp
+    "j 2f",
+    "1:",
+    "csrw sscratch, zero",
+    "2:",
+
     "ld t0, 256(sp)",
     "csrw sepc, t0",
 
