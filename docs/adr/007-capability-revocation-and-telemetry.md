@@ -135,7 +135,7 @@ The "in-flight operations complete" property is important. Revocation is not ret
 pub fn revoke(&mut self, capability: CapabilityHandle, revoker: ProcessId)
     -> Result<(), CapabilityError>;
 
-// Syscall (number TBD)
+// SYS_REVOKE_CAPABILITY = 27
 //   Args: arg1 = capability handle (u64)
 //   Returns: 0 on success, negative error code
 SYS_REVOKE_CAPABILITY
@@ -310,8 +310,11 @@ The second method is for process termination cleanup — when a process exits, a
 
 | Number | Name | Purpose |
 |---|---|---|
-| (TBD) | `SYS_REVOKE_CAPABILITY` | Revoke a capability the caller has authority to revoke |
-| (TBD) | `SYS_AUDIT_INFO` | Read kernel audit statistics: total events, dropped events, channel state |
+| 27 | `SYS_REVOKE_CAPABILITY` | Revoke a capability the caller has authority to revoke |
+| 33 | `SYS_AUDIT_ATTACH` | Attach as the audit ring consumer (maps ring RO into caller; bootstrap-Principal-only) |
+| 34 | `SYS_AUDIT_INFO` | Read kernel audit statistics: total events, dropped events, channel state |
+
+Canonical source: the `SyscallNumber` enum in [src/syscalls/mod.rs](../../src/syscalls/mod.rs).
 
 `SYS_AUDIT_INFO` exists for observability of the observer — the policy service needs to know if its audit consumer is keeping up.
 
@@ -333,7 +336,7 @@ If the policy service is not yet ready when events are produced (between steps 4
 
 ### Lock ordering
 
-The audit telemetry mechanism does not introduce a new lock to the hierarchy. The per-CPU staging buffers are lock-free (single producer per CPU, no contention). The global drain task acquires the audit channel ring lock briefly during drain, but the ring lock is at the same hierarchy position as the channel manager (TBD during implementation), and it is never held while acquiring scheduler or capability locks.
+The audit telemetry mechanism does not introduce a new lock to the main hierarchy. The per-CPU staging buffers (`PER_CPU_AUDIT_BUFFER[cpu]`) are lock-free (single producer per CPU, no contention). The global `AUDIT_RING` lives in its own lock domain — acquired by `drain_tick()` (try_lock from the BSP timer ISR, holds no other lock) and by the `SYS_AUDIT_ATTACH` / `SYS_AUDIT_INFO` handlers under a two-phase protocol that never holds it while `PROCESS_TABLE` or `FRAME_ALLOCATOR` is held. `audit::emit()` never touches it. See [CLAUDE.md § Lock Ordering](../../CLAUDE.md#lock-ordering) for the canonical map.
 
 The revocation primitive does add a new sequencing constraint: `revoke()` must hold `CAPABILITY_MANAGER(4)` and may need to acquire `PROCESS_TABLE(5)` and `FRAME_ALLOCATOR(6)` to clean up associated channel mappings. This matches the existing lock order — revocation always acquires in 4 → 5 → 6 sequence, never the reverse.
 

@@ -173,13 +173,13 @@ The kernel signature on the record is what makes channel telemetry trustworthy a
 
 | Number | Name | Purpose |
 |---|---|---|
-| (TBD) | `SYS_CHANNEL_CREATE` | Allocate a new channel; map RW into caller; return handle + capability token |
-| (TBD) | `SYS_CHANNEL_ATTACH` | Verify capability token, map RO/RW into caller; return handle |
-| (TBD) | `SYS_CHANNEL_CLOSE` | Unmap from both peers, free pages, revoke capability |
-| (TBD) | `SYS_CHANNEL_REVOKE` | Force-close from a third party with revoke authority |
-| (TBD) | `SYS_CHANNEL_INFO` | Read channel metadata (size, peers, purpose, byte counts) |
+| 28 | `SYS_CHANNEL_CREATE` | Allocate a new channel; map RW into caller; return handle + capability token |
+| 29 | `SYS_CHANNEL_ATTACH` | Verify capability token, map RO/RW into caller; return handle |
+| 30 | `SYS_CHANNEL_CLOSE` | Unmap from both peers, free pages, revoke capability |
+| 31 | `SYS_CHANNEL_REVOKE` | Force-close from a third party with revoke authority |
+| 32 | `SYS_CHANNEL_INFO` | Read channel metadata (size, peers, purpose, byte counts) |
 
-Numbers will be assigned when implementation lands. They are deliberately not specified here because the syscall numbering for CambiOS is contiguous and assigning them now would create gaps if implementation order shifts.
+Canonical source: the `SyscallNumber` enum in [src/syscalls/mod.rs](../../src/syscalls/mod.rs). Run `make stats` for the current count across the whole ABI.
 
 ### Notification
 
@@ -317,7 +317,7 @@ These are out of scope for the ADR but worth recording so they're not rediscover
 - **[ADR-006](006-policy-service.md)** — Policy externalization (channel creation may be policy-gated)
 - **[ADR-007](007-capability-revocation-and-telemetry.md)** — Revocation mechanics + telemetry consumers (channel close paths and AI observability)
 - **[CambiOS.md § The Microkernel](../CambiOS.md)** — Source-of-truth: "no shared memory between services unless explicitly granted through a capability"
-- **[CLAUDE.md § Lock Ordering](../../CLAUDE.md#lock-ordering)** — Channel manager will sit at a new position in the hierarchy (TBD during implementation)
+- **[CLAUDE.md § Lock Ordering](../../CLAUDE.md#lock-ordering)** — `CHANNEL_MANAGER` is position 5 in the canonical hierarchy (between `CAPABILITY_MANAGER`(4) and `PROCESS_TABLE`(6)). Per-channel shards (`SHARDED_IPC.shards[endpoint]`) are a separate lock domain — never held cross-endpoint, released before acquiring the scheduler for task wake.
 - **[SECURITY.md § Gap Analysis](../SECURITY.md#gap-analysis)** — Capability revocation gap (closes via ADR-007 + channels)
 - **[SCHEDULER.md § Blocking and Wake Primitives](../../src/scheduler/SCHEDULER.md#blocking-and-wake-primitives)** — Notification path (channels reuse existing IPC wake)
 
