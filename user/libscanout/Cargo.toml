@@ -1,0 +1,19 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
+[package]
+name = "arcos-libscanout"
+version = "0.1.0"
+edition = "2021"
+description = "Wire-format types and message tags for the CambiOS compositor ↔ scanout-driver protocol (ADR-014). Shared by user/compositor and every user/scanout-* implementation."
+
+[dependencies]
+
+[lib]
+name = "arcos_libscanout"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false

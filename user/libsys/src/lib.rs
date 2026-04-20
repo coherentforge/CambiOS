@@ -73,8 +73,10 @@ fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 #[inline(always)]
 fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     let ret: i64;
-    // SAFETY: Same as syscall_raw3. RCX carries the 4th argument in our ABI,
-    // but is still clobbered on return (CPU writes saved RIP there).
+    // SAFETY: Same as syscall_raw3. Arg4 goes in R10, not RCX — the SYSCALL
+    // instruction unconditionally writes saved RIP into RCX, destroying
+    // whatever we put there. The kernel's SyscallFrame reads R10 for arg4
+    // (see src/arch/x86_64/syscall.rs).
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -82,10 +84,10 @@ fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
             inlateout("rdi") arg1 => _,
             inlateout("rsi") arg2 => _,
             inlateout("rdx") arg3 => _,
-            inlateout("rcx") arg4 => _,
+            inlateout("r10") arg4 => _,
+            lateout("rcx") _,
             lateout("r8") _,
             lateout("r9") _,
-            lateout("r10") _,
             lateout("r11") _,
             options(nostack),
         );

@@ -1515,15 +1515,17 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                     println!("    ✓ Policy service identified as process {}", process_id.slot());
                 }
 
-                // Phase GUI-0 / Phase GUI-1 (ADR-011): grant the
+                // Phase GUI-0+ (ADR-011, ADR-014): grant the
                 // `MapFramebuffer` system capability to modules that
-                // need to call `SYS_MAP_FRAMEBUFFER`. Today only
-                // fb-demo; future: compositor, virtio-gpu / intel-gpu
-                // drivers. Grant is name-based rather than
-                // all-boot-modules because MapFramebuffer is a
-                // hardware-access capability, narrower than the
+                // need to call `SYS_MAP_FRAMEBUFFER`. Today fb-demo
+                // (one-shot smoke test) and scanout-limine (Phase
+                // Scanout-2 fallback driver). Per ADR-014 the
+                // compositor never holds this capability — only
+                // scanout-driver services do. Grant is name-based
+                // rather than all-boot-modules because MapFramebuffer
+                // is a hardware-access capability, narrower than the
                 // default send/receive + CreateProcess grant.
-                if short_name == b"fb-demo" {
+                if short_name == b"fb-demo" || short_name == b"scanout-limine" {
                     use arcos_core::ipc::capability::CapabilityKind;
                     let mut cap_guard = arcos_core::CAPABILITY_MANAGER.lock();
                     if let Some(cap_mgr) = cap_guard.as_mut() {

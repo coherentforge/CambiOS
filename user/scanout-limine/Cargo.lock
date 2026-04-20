@@ -3,17 +3,17 @@
 version = 4
 
 [[package]]
-name = "arcos-compositor"
-version = "0.1.0"
-dependencies = [
- "arcos-libscanout",
- "arcos-libsys",
-]
-
-[[package]]
 name = "arcos-libscanout"
 version = "0.1.0"
 
 [[package]]
 name = "arcos-libsys"
 version = "0.1.0"
+
+[[package]]
+name = "arcos-scanout-limine"
+version = "0.1.0"
+dependencies = [
+ "arcos-libscanout",
+ "arcos-libsys",
+]

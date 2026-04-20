@@ -1,143 +1,55 @@
 // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
-//! Scanout-driver protocol types and backend trait — Phase Scanout-1 (ADR-014).
+//! Compositor-internal scanout abstraction — Phase Scanout-1 (ADR-014).
 //!
-//! The compositor talks to whichever scanout-driver service has registered
-//! through this trait. Backends implement `ScanoutBackend` and translate
-//! the trait calls into IPC messages on `SCANOUT_DRIVER_ENDPOINT`. The
-//! compositor itself never touches hardware — see ADR-014 § Module Boundary.
+//! Wire-format types, message tags, and bound constants live in
+//! `arcos-libscanout` (shared with every `user/scanout-*` implementation).
+//! This module owns:
 //!
-//! This file holds:
-//! - Wire-format types shared with every scanout-driver
-//! - The `ScanoutBackend` trait the compositor uses internally
-//! - `HeadlessBackend` — the no-display fallback, used when no
-//!   scanout-driver registers within `SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS`
+//! - The `ScanoutBackend` trait — the compositor's *consumer-side*
+//!   abstraction over whichever scanout-driver is bound.
+//! - `ScanoutBuffer` — process-local handle to a mapped scanout region
+//!   (carries the compositor's vaddr; not on the wire).
+//! - `HeadlessBackend` — the no-display fallback used when no
+//!   scanout-driver registers within the handshake timeout.
+//!
+//! Per ADR-014, future implementors (`VirtioGpuBackend`, `IntelGpuBackend`,
+//! `LimineFbBackend`) live alongside but each is a thin IPC client over
+//! `arcos-libscanout`'s wire encoders. Compositor uses `Box<dyn
+//! ScanoutBackend>` chosen at startup probe — userspace dyn dispatch
+//! explicitly allowed (verification scope is the kernel, not userspace).
+
+// Re-export everything compositor consumers need so they can import from
+// a single place. Keeps the `use scanout::Foo` surface stable as
+// libscanout grows. Some re-exports are unused by main.rs today (Phase
+// Scanout-1 only consumes COMPOSITOR_ENDPOINT + ScanoutBackend +
+// HeadlessBackend); they exist as the consumer-facing surface for the
+// LimineFbBackend impl that lands next.
+#[allow(unused_imports)]
+pub use arcos_libscanout::{
+    DisplayInfo, DisplayState, Geometry, MAX_DAMAGE_RECTS_PER_FRAME, MAX_DISPLAYS_PER_DRIVER,
+    Mode, MsgTag, PixelFormat, Rect, SCANOUT_DRIVER_ENDPOINT, SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS,
+    ScanoutError,
+    COMPOSITOR_ENDPOINT,
+};
 
 // ============================================================================
-// Bounds
+// Compositor-side types (not on the wire)
 // ============================================================================
 
-/// SCAFFOLDING: max physical displays a single scanout-driver advertises.
-/// Why: matches `MAX_FRAMEBUFFERS = 8` in [src/boot/mod.rs] (BootInfo) — the
-///      compositor can't be told about more displays than the boot protocol
-///      can hold, and the realistic ceiling for a single workstation
-///      (consumer + pro multi-monitor rigs cap around 6) is well within 8.
-///      This is a *practical-ceiling* bound, not a v1-estimate-times-4 bound:
-///      we are not building a graphics subsystem to drive 32 displays.
-/// Replace when: BootInfo's MAX_FRAMEBUFFERS grows for multi-monitor reasons,
-///      or a real workload appears with >6 displays driven by one driver.
-///      Multi-driver topologies (integrated + discrete GPU) deferred to a
-///      future ADR per ADR-014 § Open Questions.
-pub const MAX_DISPLAYS_PER_DRIVER: usize = 8;
-
-/// SCAFFOLDING: max damage rects per FrameReady message.
-/// Why: must fit in the 256-byte control IPC payload alongside the message
-///      header (display_id, msg type, sequence). 16 rects × 12 B (x,y,w,h
-///      as u16 each) = 192 B leaves ~60 B for the envelope. Above 16 rects
-///      the compositor sends "full surface dirty" — strict upper bound that
-///      simple drivers (Limine fallback) can rely on.
-/// Replace when: never expected to. Compositors aggregate damage when they
-///      have many small rects; full-surface fallback handles the worst case.
-pub const MAX_DAMAGE_RECTS_PER_FRAME: usize = 16;
-
-/// TUNING: ticks the compositor waits at startup for a scanout-driver to
-/// register before falling back to `HeadlessBackend`.
-/// Trades: time-to-headless-fallback vs. time-for-driver-init. QEMU drivers
-/// come up in milliseconds; bare-metal drivers may need PCI probe + EDID
-/// I²C reads + GPU firmware load. 500 ticks @ 100 Hz = 5 s, generous on
-/// QEMU and tight-but-usable on real hardware.
-/// Revisit: first bare-metal Intel-UHD bring-up — measure observed init,
-/// set timeout to ~3× observed median.
-pub const SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS: u64 = 500;
-
-// ============================================================================
-// Endpoint constants (well-known, see ADR-014 § Endpoints)
-// ============================================================================
-
-/// IPC endpoint where scanout-drivers receive control messages from the
-/// compositor (RegisterCompositor, RequestScanoutBuffer, FrameReady, ...).
-/// The active scanout-driver registers this endpoint at boot.
-pub const SCANOUT_DRIVER_ENDPOINT: u32 = 27;
-
-/// IPC endpoint where the compositor receives scanout-driver async events
-/// (WelcomeCompositor, DisplayConnected, FrameDisplayed, ...). The
-/// compositor registers this endpoint at boot — singleton-by-Principal.
-pub const COMPOSITOR_ENDPOINT: u32 = 28;
-
-// ============================================================================
-// Wire-format types (shared with every scanout-driver implementation)
-// ============================================================================
-
-/// Display lifecycle state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DisplayState {
-    Disconnected = 0,
-    Connected = 1,
-}
-
-/// Pixel format advertised by a scanout-driver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PixelFormat {
-    /// 32-bit XRGB8888, no alpha — most common linear FB / virtio-gpu format.
-    Xrgb8888 = 0,
-    /// 32-bit BGRA8888 — alternate channel order.
-    Bgra8888 = 1,
-    /// 32-bit ARGB2_10_10_10 — HDR10-class wide gamut.
-    Argb2_10_10_10 = 2,
-}
-
-/// Geometry of a display's current scan mode.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Geometry {
-    pub width: u32,
-    pub height: u32,
-    /// Bytes per scanline (≥ width × bpp/8; may be padded for alignment).
-    pub pitch: u32,
-    /// Bits per pixel.
-    pub bpp: u16,
-}
-
-/// One mode in a display's mode list.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Mode {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_hz: u16,
-    pub format: PixelFormat,
-}
-
-/// Display advertisement — one per active output.
+/// Async event surfaced from a backend's `poll_event`.
 ///
-/// Sent by the scanout-driver at handshake and on hotplug. Compositor reads
-/// this to lay out windows and choose backing-scale per display.
+/// Modeled compositor-side rather than as a wire type because it carries
+/// process-local state (the compositor's mapping of newly-arrived
+/// scanout buffers, etc.). When a backend decodes a libscanout protocol
+/// message, it translates into this enum for the compositor to consume.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct DisplayInfo {
-    pub display_id: u32,
-    pub state: DisplayState,
-    pub geometry: Geometry,
-    /// Per-display backing scale factor × 100 (1×=100, 2×=200, fractional 1.25×=125).
-    pub backing_scale: u16,
-    pub refresh_hz: u16,
-    pub format: PixelFormat,
-    /// Bitfield: bit 0 = HDR10, bit 1 = VRR, bit 2 = partial-update support, ...
-    pub capabilities: u32,
-    /// Blake3 of full EDID, for stable identity across reboots / hotplug cycles.
-    pub edid_hash: [u8; 32],
-}
-
-/// Damage rectangle in display-local coordinates (post-composition pixels).
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub w: u16,
-    pub h: u16,
+pub enum ScanoutEvent {
+    DisplayConnected { info: DisplayInfo, scanout_channel_id: u64 },
+    DisplayDisconnected { display_id: u32 },
+    DisplayModeChanged { info: DisplayInfo, new_scanout_channel_id: u64 },
+    FrameDisplayed { display_id: u32, seq: u32, present_time_ticks: u64 },
+    FrameDropped { display_id: u32, seq: u32 },
 }
 
 /// Handle to a scanout buffer mapped into the compositor's address space.
@@ -154,43 +66,17 @@ pub struct ScanoutBuffer {
     pub channel_id: u64,
 }
 
-/// Errors from `ScanoutBackend` operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanoutError {
-    /// No display with the given id is currently attached.
-    NoSuchDisplay,
-    /// Mode was rejected by the driver (unsupported by hardware / EDID).
-    ModeRejected,
-    /// Frame submitted while a previous frame for this display is still
-    /// in flight — driver applies back-pressure. Compositor should slow
-    /// its render loop.
-    FrameDropped,
-    /// IPC transport failure (driver unreachable, capability lost, etc.).
-    TransportFailed,
-    /// Backend is in headless mode — no displays exist.
-    Headless,
-}
-
-/// Asynchronous event from the scanout-driver.
-#[derive(Clone, Copy, Debug)]
-pub enum ScanoutEvent {
-    DisplayConnected { info: DisplayInfo, scanout_channel_id: u64 },
-    DisplayDisconnected { display_id: u32 },
-    DisplayModeChanged { info: DisplayInfo, new_scanout_channel_id: u64 },
-    FrameDisplayed { display_id: u32, present_time_ticks: u64 },
-}
-
 // ============================================================================
-// ScanoutBackend trait — the compositor's internal abstraction
+// ScanoutBackend trait
 // ============================================================================
 
 /// What the compositor can ask of any scanout-driver.
 ///
-/// Implemented by `HeadlessBackend` (no-display fallback) and, in future,
-/// per-backend IPC client structs (`VirtioGpuBackend`, `IntelGpuBackend`,
-/// `LimineFbBackend`). The compositor uses dyn dispatch on
+/// Implemented by `HeadlessBackend` (no-display fallback) and, in
+/// future, per-backend IPC client structs (`VirtioGpuBackend`,
+/// `IntelGpuBackend`, `LimineFbBackend`). The compositor uses
 /// `Box<dyn ScanoutBackend>` — see ADR-014 § "Trait abstraction in the
-/// compositor (userspace dyn dispatch)" for the rationale.
+/// compositor (userspace dyn dispatch)".
 pub trait ScanoutBackend {
     /// All currently-connected displays this backend knows about.
     fn enumerate_displays(&self) -> &[DisplayInfo];
@@ -199,18 +85,19 @@ pub trait ScanoutBackend {
     /// mapped region. Driver allocates; compositor writes.
     fn attach_scanout(&mut self, display_id: u32) -> Result<ScanoutBuffer, ScanoutError>;
 
-    /// Tell the driver this frame is ready, optionally with damage rects.
-    /// `damage` is a *hint*, not a constraint; conformant drivers may ignore
-    /// it and do full-frame flips. If `damage.len() > MAX_DAMAGE_RECTS_PER_FRAME`,
-    /// compositor MUST send "full surface dirty" instead.
+    /// Tell the driver this frame is ready, optionally with damage
+    /// rects. `damage` is a *hint*, not a constraint; conformant
+    /// drivers may ignore it and do full-frame flips. If
+    /// `damage.len() > MAX_DAMAGE_RECTS_PER_FRAME`, compositor MUST
+    /// send "full surface dirty" instead.
     fn submit_frame(&mut self, display_id: u32, damage: &[Rect]) -> Result<(), ScanoutError>;
 
     /// Non-blocking poll for a scanout event (hotplug, ack, mode change).
     fn poll_event(&mut self) -> Option<ScanoutEvent>;
 
-    /// Request a mode change for a display (e.g. user resized resolution).
-    /// Driver responds asynchronously with `DisplayModeChanged` (success)
-    /// or `ModeRejected` error.
+    /// Request a mode change for a display (e.g. user resized
+    /// resolution). Driver responds asynchronously with
+    /// `ScanoutEvent::DisplayModeChanged` (success) or `ModeRejected`.
     fn request_mode(&mut self, display_id: u32, mode: Mode) -> Result<(), ScanoutError>;
 }
 
@@ -220,9 +107,8 @@ pub trait ScanoutBackend {
 
 /// The fallback backend when no scanout-driver registers within
 /// `SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS`. Compositor remains alive,
-/// accepts client connections (future), and silently swallows all
-/// display operations. Useful for headless servers, CI, and pre-driver
-/// bring-up.
+/// silently swallows all display operations. Useful for headless
+/// servers, CI, and pre-driver bring-up.
 pub struct HeadlessBackend;
 
 impl HeadlessBackend {
@@ -254,5 +140,175 @@ impl ScanoutBackend for HeadlessBackend {
 
     fn request_mode(&mut self, _display_id: u32, _mode: Mode) -> Result<(), ScanoutError> {
         Err(ScanoutError::Headless)
+    }
+}
+
+// ============================================================================
+// LimineFbBackend — Phase Scanout-2 fallback (talks to user/scanout-limine)
+// ============================================================================
+
+use arcos_libscanout::{
+    decode_frame_displayed, encode_frame_ready,
+};
+use arcos_libsys as sys;
+
+/// IPC client for `user/scanout-limine`.
+///
+/// Holds the displays advertised at handshake time and the scanout buffer
+/// the compositor writes pixels into. `submit_frame` encodes a
+/// `FrameReady` and sends it to `SCANOUT_DRIVER_ENDPOINT`; `poll_event`
+/// non-blocking-recvs from `COMPOSITOR_ENDPOINT` and decodes any
+/// driver-side events (today: `FrameDisplayed` only — full hotplug
+/// path lands once dynamic display add/remove is exercised).
+pub struct LimineFbBackend {
+    /// The single scanout buffer this backend owns. Limine fallback is
+    /// single-display by construction; multi-display lands with
+    /// virtio-gpu / Intel where it actually matters.
+    pub scanout: ScanoutBuffer,
+    displays: [DisplayInfo; 1],
+    next_seq: u32,
+    /// Latest received FrameDisplayed seq, for back-pressure / diagnostics.
+    pub last_displayed_seq: Option<u32>,
+    /// Latest received present time, for animation-clock alignment.
+    pub last_present_time: u64,
+}
+
+impl LimineFbBackend {
+    /// Build from the handshake reply: the `DisplayConnected`
+    /// `DisplayInfo` and the channel ID, which the compositor has
+    /// already attached (`SYS_CHANNEL_ATTACH`) to obtain the scanout
+    /// vaddr.
+    pub fn from_handshake(info: DisplayInfo, scanout: ScanoutBuffer) -> Self {
+        Self {
+            scanout,
+            displays: [info],
+            next_seq: 0,
+            last_displayed_seq: None,
+            last_present_time: 0,
+        }
+    }
+}
+
+impl ScanoutBackend for LimineFbBackend {
+    fn enumerate_displays(&self) -> &[DisplayInfo] {
+        &self.displays
+    }
+
+    fn attach_scanout(&mut self, display_id: u32) -> Result<ScanoutBuffer, ScanoutError> {
+        if display_id != self.scanout.display_id {
+            return Err(ScanoutError::NoSuchDisplay);
+        }
+        Ok(self.scanout)
+    }
+
+    fn submit_frame(&mut self, display_id: u32, damage: &[Rect]) -> Result<(), ScanoutError> {
+        if display_id != self.scanout.display_id {
+            return Err(ScanoutError::NoSuchDisplay);
+        }
+        let mut buf = [0u8; arcos_libscanout::MAX_MESSAGE_SIZE];
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+
+        // If damage exceeds the per-frame cap, send "full surface dirty"
+        // (zero rects) per ADR-014 § Reserved bounds.
+        let used_damage: &[Rect] = if damage.len() > MAX_DAMAGE_RECTS_PER_FRAME {
+            &[]
+        } else {
+            damage
+        };
+
+        let n = encode_frame_ready(&mut buf, display_id, seq, used_damage)
+            .ok_or(ScanoutError::InvalidMessage)?;
+        let rc = sys::write(SCANOUT_DRIVER_ENDPOINT, &buf[..n]);
+        if rc < 0 {
+            return Err(ScanoutError::TransportFailed);
+        }
+        Ok(())
+    }
+
+    fn poll_event(&mut self) -> Option<ScanoutEvent> {
+        // Non-blocking recv. recv_msg blocks; try_recv_msg returns 0 if
+        // empty. We need the latter to keep the render loop responsive.
+        let mut buf = [0u8; 320];
+        let n = sys::try_recv_msg(COMPOSITOR_ENDPOINT, &mut buf);
+        if n <= 0 {
+            return None;
+        }
+        let total = n as usize;
+        if total < 36 + 4 {
+            return None;
+        }
+        // Skip the 36-byte sender_principal + from_endpoint header that
+        // recv_msg prepends; the decoder operates on the payload only.
+        let payload = &buf[36..total];
+        let tag_bytes: [u8; 4] = payload[0..4].try_into().ok()?;
+        let tag = MsgTag::from_u32(u32::from_le_bytes(tag_bytes))?;
+        match tag {
+            MsgTag::FrameDisplayed => {
+                let (display_id, seq, present_time) = decode_frame_displayed(payload)?;
+                self.last_displayed_seq = Some(seq);
+                self.last_present_time = present_time;
+                Some(ScanoutEvent::FrameDisplayed { display_id, seq, present_time_ticks: present_time })
+            }
+            // Other event types (DisplayConnected/Disconnected/etc.)
+            // not handled in v0 — single-display, no hotplug. Drop
+            // silently rather than fail loudly.
+            _ => None,
+        }
+    }
+
+    fn request_mode(&mut self, _display_id: u32, _mode: Mode) -> Result<(), ScanoutError> {
+        // Limine FB has no mode change. Real backends (virtio-gpu,
+        // intel) implement this.
+        Err(ScanoutError::ModeRejected)
+    }
+}
+
+// ============================================================================
+// Backend dispatch
+// ============================================================================
+
+/// Runtime backend selection. Enum dispatch today (only Headless +
+/// Limine known); will become `Box<dyn ScanoutBackend>` per ADR-014 once
+/// virtio-gpu / Intel land and a heap allocator is wired in user-space.
+pub enum Backend {
+    Headless(HeadlessBackend),
+    Limine(LimineFbBackend),
+}
+
+impl ScanoutBackend for Backend {
+    fn enumerate_displays(&self) -> &[DisplayInfo] {
+        match self {
+            Self::Headless(b) => b.enumerate_displays(),
+            Self::Limine(b) => b.enumerate_displays(),
+        }
+    }
+
+    fn attach_scanout(&mut self, display_id: u32) -> Result<ScanoutBuffer, ScanoutError> {
+        match self {
+            Self::Headless(b) => b.attach_scanout(display_id),
+            Self::Limine(b) => b.attach_scanout(display_id),
+        }
+    }
+
+    fn submit_frame(&mut self, display_id: u32, damage: &[Rect]) -> Result<(), ScanoutError> {
+        match self {
+            Self::Headless(b) => b.submit_frame(display_id, damage),
+            Self::Limine(b) => b.submit_frame(display_id, damage),
+        }
+    }
+
+    fn poll_event(&mut self) -> Option<ScanoutEvent> {
+        match self {
+            Self::Headless(b) => b.poll_event(),
+            Self::Limine(b) => b.poll_event(),
+        }
+    }
+
+    fn request_mode(&mut self, display_id: u32, mode: Mode) -> Result<(), ScanoutError> {
+        match self {
+            Self::Headless(b) => b.request_mode(display_id, mode),
+            Self::Limine(b) => b.request_mode(display_id, mode),
+        }
     }
 }

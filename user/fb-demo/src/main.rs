@@ -28,13 +28,11 @@ use arcos_libsys::FramebufferDescriptor;
 pub extern "C" fn _start() -> ! {
     sys::print(b"[FB-DEMO] starting\r\n");
 
-    // Known issue (2026-04-14): after `SYS_MAP_FRAMEBUFFER` returns Ok
-    // at the kernel side, control never gets back to userspace —
-    // neither the descriptor-print below nor the panic handler run.
-    // The 1000-page MMIO mapping is suspected but not confirmed.
-    // fb-demo is disabled in limine.conf until this is tracked down;
-    // see STATUS.md Known Issues. The rest of this binary is correct
-    // once the return path works.
+    // Release the boot gate up-front. fb-demo is a leaf — nothing
+    // downstream depends on its completion — so signalling ready
+    // immediately lets shell come up in parallel.
+    sys::module_ready();
+
     let mut desc = FramebufferDescriptor::default();
     if let Err(rc) = sys::map_framebuffer(0, &mut desc) {
         print_int(b"[FB-DEMO] map_framebuffer rc=", rc);
