@@ -555,3 +555,39 @@ The `heap+vma+pt` suffix requires `destroy_process` to have run, which iterates 
 - `make run` (x86_64): all 6 boot modules loaded, no faults, Shell ready.
 - `make run-aarch64`: all 6 boot modules loaded, no faults, Shell ready.
 - `make run-riscv64`: hello-riscv64 runs 3× + clean exit with `heap+vma+pt` suffix, proving organic shootdown round-trip on every exit.
+
+### 2026-04-19 — Phase R-6: signed-module boot path to shell, sscratch invariant fix
+
+**What actually shipped vs what the ADR planned.** The R-6 line in [STATUS.md](../../STATUS.md)'s phase-markers table set the scope as "PCI ECAM MMIO, virtio-mmio transport, boot modules via `-initrd`, all user-space services". What landed delivers the service stack end-to-end but scopes the transport and boot-module carrier more narrowly than the table suggested, and surfaces a latent `sscratch` invariant hole that wasn't anticipated.
+
+**Divergences from the plan:**
+
+1. **PCI ECAM on riscv64 — skipped, not in R-6.** QEMU virt exposes virtio devices over virtio-mmio by default, so no PCI is needed to reach the service-parity milestone this ADR commits to. The pci module's x86_64 gate was lifted so the shared `DEVICES` table is cross-arch, but port-I/O internals (`outl`/`inl`, `scan`, `decode_bars`, `is_port_in_pci_bar`) stay `#[cfg(target_arch = "x86_64")]`. **Deferred.** *Revisit when:* a consumer (bare-metal riscv64 silicon or a QEMU config) actually needs virtio-pci on this arch. Until then it is conscious absence, not forgotten work.
+
+2. **Virtio-mmio v1 legacy only, not v2 modern.** Driver-side `LegacyMmioTransport` (`user/virtio-blk/src/transport.rs`, `user/virtio-net/src/transport.rs`) speaks v1: PFN-based queue setup (`GuestPageSize` + `QueueNum` + `QueueAlign` + `QueuePFN`), not v2's `QueueDescLow/High` + `QueueDriverLow/High` + `QueueDeviceLow/High`. Rationale: the existing virtio-pci driver path is also legacy, so a v1 MMIO transport keeps the driver's queue-setup code arch-agnostic; supporting both versions would leak the carrier into the driver's public API. **Deferred.** *Revisit when:* a modern-only virtio device (no legacy compat shim) appears on CambiOS's hardware roadmap.
+
+3. **initrd carrier — custom CAMBINIT format, not cpio.** `tools/mkinitrd` + `src/boot/initrd.rs` ship a minimal TLV: 16-byte archive header (magic `b"CAMBINIT"` + u32 version + u32 count) then 72-byte per-entry headers (u32 data_size + u32 name_len + 64-byte name slot) + 8-byte-aligned payloads. Parser is bounded (≤ `max_entries`, ≤ `archive_bytes.len()`) with six unit tests. Chosen over cpio newc because the parser is ~40 lines with no trailer-sentinel edge cases, which suits ADR-013's verification-transparency posture. Host tool lives under `tools/mkinitrd/` with its own `.cargo/config.toml` override (parent workspace targets bare-metal).
+
+4. **Module symmetry with Limine preserved.** The RISC-V path populates `BootInfo.modules` from the initrd using the same `ModuleInfo` struct that the Limine adapter fills on x86_64/AArch64 — positional, name-addressed, not arch-specific. The upcoming ADR-018 manifest-driven init replaces both adapters without arch-side rework; this is load-bearing for that drop-in. The kernel's `BOOT_MODULE_ORDER` sequential-release chain (`SYS_MODULE_READY`, `BlockReason::BootGate`) is consumed unchanged on riscv64.
+
+5. **DeviceInfo synthesis for virtio-mmio.** The kernel walks `/soc/virtio_mmio@*` under the same DTB pass as memory / cpus / plic / serial, and `pci::register_virtio_mmio` reads each region's `MagicValue` / `Version` / `DeviceID` via HHDM and synthesizes a `PciDevice` entry with the OASIS virtio-over-PCI transitional mapping (vendor = 0x1AF4, device = 0x1000 + virtio_id − 1). Empty QEMU slots (DeviceID == 0) drop silently. This lets existing user-space drivers (`find_virtio_blk()` / `find_virtio_net()`) match virtio-mmio devices without special-casing the carrier. The alternative — a separate MMIO-discovery syscall — would have forked every driver.
+
+6. **`sscratch` invariant was incomplete on the voluntary-yield path.** Decision 6 (this ADR, above) fixes per-CPU data via `tp` and the `sscratch ↔ tp` swap. The trap vector handled both return modes correctly (S-mode return keeps current `sscratch`; U-mode return writes `sscratch = kernel_tp` before sret). The `yield_save_and_switch` path — which builds a synthetic SavedContext in kernel and issues its own sret — did not. Dispatching a freshly-loaded U-mode task through the voluntary-yield path therefore left `sscratch = 0`, and the new task's first ecall's `csrrw tp, sscratch, tp` gave `tp = 0`. The `bnez tp` check fell through to the S-mode origin path, which does NOT reload sp from `PerCpu.kernel_stack_top`. sp stayed at the user stack (near `DEFAULT_STACK_TOP = 0x800000`); `sd ra, 0x8(sp)` faulted; the fault re-entered the trap vector with sp -= 288; recursive storm. QEMU `-d int` made this readable: first fault `tval = 0x7ffa78`, each subsequent fault `tval = prev − 288`. **Fix** (in `src/arch/riscv64/mod.rs::yield_save_and_switch` restore): after loading the new `sstatus` and before the `ld x4, 32(sp)` that clobbers tp, branch on `sstatus.SPP` — `SPP = 0` writes `sscratch = tp` (= kernel_tp); `SPP = 1` writes `sscratch = 0` (S-mode invariant). The trap vector's own return path was already correct; this closes the equivalent hole on the voluntary-yield side. **Not a divergence from design** — Decision 6 prescribed the invariant — but a divergence from the implementation that shipped in R-4.a: the invariant was maintained on the trap path only.
+
+7. **`kmain_riscv64` subsystem init order.** Before R-6, riscv64's `kmain` ran `scheduler_init_riscv64` (which then called `spawn_hello_riscv64` with `DefaultVerifier`) and skipped `ipc_init` / `capability_manager_init` / `bootstrap_identity_init` / `object_store_init` — they weren't needed when the only user task was the unsigned hello scaffold. R-6's wiring of portable `load_boot_modules` requires all four: `SignedBinaryVerifier` reads `BOOTSTRAP_PRINCIPAL` (zero until `bootstrap_identity_init`); the loader binds Principals via `CAPABILITY_MANAGER`; the object-store syscalls need `OBJECT_STORE`; IPC endpoints need `IPC_MANAGER`. Sequence now matches x86_64/AArch64. The `spawn_hello_riscv64` function + `HELLO_RISCV64_ELF` `include_bytes!` static were removed — ADR noted them as "retire with R-6", and R-6 retired them.
+
+8. **`make check-all` is now the permanent tri-arch gate.** This ADR's Process Commitment section specified `make check-all` as the gate; during R-1..R-6 the practical variant was `make check-stable` while the riscv64 backend was under construction. Post-R-6, all three arches are buildable at every commit boundary. CLAUDE.md + Makefile comment updated accordingly.
+
+**Carried forward unchanged from plan:**
+
+- Service roster (policy / key-store / fs / virtio-blk / shell) matches x86_64/AArch64 roster and order.
+- Endpoint numbers identical across arches (future ADR-018 manifest is arch-agnostic).
+- SBI timer + PLIC + per-hart `tp` + SBI IPI shootdown all stand.
+- BootProtocol trait factoring still deferred (Open Question #1 in this ADR) — three arches behind cfg-branches remain tractable.
+
+**Verification.**
+
+- `make check-all`: x86_64 + aarch64 + riscv64 all build clean as release.
+- `cargo test --lib --target x86_64-apple-darwin`: 501 tests pass (+6 initrd parser tests, +2 BootInfo virtio_mmio tests over the 2026-04-19 baseline of 493).
+- `make run-riscv64`: lands at `arcos>` shell prompt on both `-smp 1` and `-smp 2`. Five signed modules load + verify + release through the `BOOT_MODULE_ORDER` chain; `[POLICY] ready on endpoint 22` + `[Shell] ready on endpoint 18` banner to prompt.
+- Interactive `arcobj put/get` round-trip is manual only — no automated test in this ADR's scope; the kernel is stable at the prompt for it.

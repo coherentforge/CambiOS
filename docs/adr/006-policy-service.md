@@ -182,7 +182,9 @@ The "AI watches" stance is not a constraint we're imposing on top of the archite
 
 `policy-service` is a user-space ELF, like every other Core Service (fs-service, key-store, virtio-net, udp-stack). It runs in ring 3, holds capabilities for an IPC endpoint dedicated to policy queries, and is signed at build time by the bootstrap key. It is loaded as a boot module and started during the kernel's normal user-space service init phase.
 
-The kernel knows the policy service's IPC endpoint via a compile-time constant (or, eventually, via the boot manifest declared by the future init-process ADR, when that lands — the init-process design is deferred until a second boot module needs user-declared endpoints, at which point a hand-rolled compile-time table stops scaling). The endpoint is reserved for the policy service — no other process can register it.
+The kernel knows the policy service's IPC endpoint via a compile-time constant. The endpoint is reserved for the policy service — no other process can register it.
+
+> **Deferred decision.** Replacing the compile-time constant with a boot-manifest-declared endpoint under [ADR-018 (Init Process and Boot Manifest)](018-init-process-and-boot-manifest.md). **Revisit when:** ADR-018 moves from `Proposed` → `Accepted` and its manifest loader lands in the kernel. At that point every `(Principal, endpoint)` pair a service needs becomes data the manifest declares, and the hand-rolled constants here — plus the matching constants in `user/libsys/src/lib.rs` and `user/libfs-proto/src/lib.rs` — all become the manifest's responsibility.
 
 ### The upcall mechanism
 
