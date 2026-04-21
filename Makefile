@@ -53,6 +53,8 @@ VIRTIO_INPUT_DIR := user/virtio-input
 VIRTIO_INPUT_ELF := $(VIRTIO_INPUT_DIR)/target/x86_64-unknown-none/release/arcos-virtio-input
 HELLO_WINDOW_DIR := user/hello-window
 HELLO_WINDOW_ELF := $(HELLO_WINDOW_DIR)/target/x86_64-unknown-none/release/arcos-hello-window
+TREE_DIR := user/tree
+TREE_ELF := $(TREE_DIR)/target/x86_64-unknown-none/release/arcos-tree
 
 # User-space ELF binaries (RISC-V)
 FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-fs-service
@@ -82,6 +84,7 @@ FB_DEMO_ELF_AARCH64 := $(FB_DEMO_DIR)/target/aarch64-unknown-none/release/arcos-
 COMPOSITOR_ELF_AARCH64 := $(COMPOSITOR_DIR)/target/aarch64-unknown-none/release/arcos-compositor
 SCANOUT_LIMINE_ELF_AARCH64 := $(SCANOUT_LIMINE_DIR)/target/aarch64-unknown-none/release/arcos-scanout-limine
 HELLO_WINDOW_ELF_AARCH64 := $(HELLO_WINDOW_DIR)/target/aarch64-unknown-none/release/arcos-hello-window
+TREE_ELF_AARCH64 := $(TREE_DIR)/target/aarch64-unknown-none/release/arcos-tree
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -100,7 +103,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 tree-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -211,6 +214,13 @@ hello-window:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== hello-window ready ==="
 
+tree:
+	@echo "=== Building tree (first-party app, ADR-011 / ADR-012) ==="
+	cd $(TREE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== tree ready ==="
+
 # AArch64 user-space build targets
 user-elf-aarch64:
 	@echo "=== Building user-space ELF (AArch64) ==="
@@ -302,6 +312,13 @@ hello-window-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== hello-window (AArch64) ready ==="
 
+tree-aarch64:
+	@echo "=== Building tree (AArch64) ==="
+	cd $(TREE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== tree (AArch64) ready ==="
+
 # RISC-V user-space build targets (R-6 / ADR-013)
 # Services build with the same CARGO_ENCODED_RUSTFLAGS shape as x86_64/aarch64;
 # only the linker script and target triple differ.
@@ -364,7 +381,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu hello-window sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -386,7 +403,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-se
 	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
 	cp $(SCANOUT_VGPU_ELF) iso_root/boot/scanout-virtio-gpu.elf
 	cp $(VIRTIO_INPUT_ELF) iso_root/boot/virtio-input.elf
-	cp $(HELLO_WINDOW_ELF) iso_root/boot/hello-window.elf
+	cp $(TREE_ELF) iso_root/boot/tree.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
@@ -396,7 +413,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-se
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-virtio-gpu.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-input.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello-window.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/tree.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -782,7 +799,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 shell-aarch64 policy-service-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 shell-aarch64 policy-service-aarch64 compositor-aarch64 scanout-limine-aarch64 tree-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -801,7 +818,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
 	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
 	cp $(SCANOUT_LIMINE_ELF_AARCH64) /tmp/scanout-limine-signed.elf
-	cp $(HELLO_WINDOW_ELF_AARCH64) /tmp/hello-window-signed.elf
+	cp $(TREE_ELF_AARCH64) /tmp/tree-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
@@ -809,7 +826,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-limine-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-window-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/tree-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
@@ -817,8 +834,8 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
 	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
 	mcopy -i $(IMG_AARCH64) /tmp/scanout-limine-signed.elf ::/boot/scanout-limine.elf
-	mcopy -i $(IMG_AARCH64) /tmp/hello-window-signed.elf ::/boot/hello-window.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/shell-signed.elf /tmp/compositor-signed.elf /tmp/scanout-limine-signed.elf /tmp/hello-window-signed.elf
+	mcopy -i $(IMG_AARCH64) /tmp/tree-signed.elf ::/boot/tree.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/shell-signed.elf /tmp/compositor-signed.elf /tmp/scanout-limine-signed.elf /tmp/tree-signed.elf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="

@@ -430,6 +430,14 @@ fn handle_pointer_button(dev: &mut InputDevice, code: u16, value: u32) {
 }
 
 fn handle_pointer_rel(dev: &mut InputDevice, code: u16, value: i32) {
+    // Skip zero-delta relative events. QEMU's virtio-mouse emits heartbeat
+    // REL_X=0 / REL_Y=0 frames whenever the host cursor isn't moving; those
+    // carry no new information and produce no state change in any consumer,
+    // so dropping them at the source keeps serial output + compositor work
+    // proportional to actual motion.
+    if value == 0 {
+        return;
+    }
     let mut payload = PointerPayload {
         dx: 0,
         dy: 0,

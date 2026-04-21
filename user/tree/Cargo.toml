@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "arcos-tree"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS Tree — first-party Minesweeper-homage app validating the libgui + virtio-input stack end-to-end. 9x9 grass-and-trees grid; reveal the dirt, avoid the trees. Long-term: 3D forest on solve (out of scope for v0)."
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
+arcos-libgui = { path = "../libgui" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"
