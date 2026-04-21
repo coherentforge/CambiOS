@@ -260,7 +260,7 @@ The verification target this shape unlocks: a Hoare-triple proof of the form `{v
 
 **Phase 020.C — Make the compatibility shims internal.** `read_user_buffer` and `write_user_buffer` become `pub(crate)` (or private). Raw `u64` user pointers cannot cross into the handler-facing API. The type system is the enforcement.
 
-**Phase 020.D — Compile-fail tests.** Add `#[compile_fail]` tests (either trybuild or doc-test-style) that assert (a) slices cannot outlive their context, (b) `UserWriteSlice::read_into` does not compile, (c) raw `u64` does not satisfy `UserReadSlice::validate`'s signature.
+**Phase 020.D — Compile-fail tests.** *Deferred — see Open Problems.* The belt-and-suspenders pass (`#[compile_fail]` tests asserting lifetime + direction invariants via trybuild or doc-test) would prove that the type system *continues* to enforce the ADR-020 guarantees across future refactors. The type system enforces them *today* as a consequence of Phase C landing — Phase D is meta-protection, not primary protection, so it can wait.
 
 Each phase is independently revertable and lands on its own; 020.B can span many commits over weeks if needed without blocking other work.
 
@@ -277,6 +277,12 @@ Discussed above as Option D. Different bug class (phys/virt arithmetic confusion
 ### Unifying with `ExitInfo` output buffer (ADR-019)
 
 [ADR-019](019-process-fault-reaping-and-peer-generation.md) introduces an `ExitInfo` struct that `SYS_WAIT_TASK` writes into a caller-provided buffer. The clean landing sequence is: ADR-020 Phase A lands the types, then ADR-019's implementation uses `UserWriteSlice` for the `ExitInfo` output pointer from day one, so we never have a fresh handler site using raw `u64`. **Revisit when:** ADR-019 implementation starts — whichever ADR implements second inherits the types from whichever lands first.
+
+### Phase D compile-fail tests (deferred, not dropped)
+
+Phases A–C leave the type system as the sole enforcement mechanism: `UserReadSlice<'ctx>` cannot outlive its borrow; `UserWriteSlice` has no `read_into` method; raw `u64` doesn't match `::validate`'s signature. A refactor that silently weakens any of these would compile clean without a compile-fail test catching it. That's a real but modest risk today, judged lower than the infrastructure cost of the test harness (trybuild dev-dependency + per-test `.stderr` fixtures, or fragile no_std doc-test coverage).
+
+**Revisit when:** any of (a) a refactor lands that removes or weakens the `'ctx` lifetime parameter on either slice type, (b) a future `UserSlice` variant with runtime-determined direction is proposed, (c) CLAUDE.md's broader discipline grows a trybuild-based compile-fail test harness for other invariants (at which point marginal cost to add UserSlice coverage drops to near zero). All three are observable in code review or ADR traffic.
 
 ### `from_user_struct<T>(slice)` / `to_user_struct<T>(slice)` generic helpers
 
