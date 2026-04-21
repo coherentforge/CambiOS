@@ -103,7 +103,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 tree-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 tree-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -742,6 +742,16 @@ symbols:
 # if two ADRs share a number. Run after any ADR edit or addition.
 check-adrs:
 	python3 tools/check-adrs.py
+
+# Enforce STATUS.md commit-isolation (see tools/check-index-isolation.py).
+# Rejects commits that bundle a structural STATUS.md change (> 20 lines
+# changed) with any *.rs source file. Small Post-Change Review Step 8 row
+# updates are unaffected. Wired into .git/hooks/pre-commit; also runnable
+# manually via `make check-index-isolation`. Rationale: 2026-04-21 Tree v0
+# incident — parallel sessions both touched STATUS.md and one bundled the
+# other's restructure into a feature commit, requiring soft-reset + split.
+check-index-isolation:
+	@python3 tools/check-index-isolation.py
 
 # Enforce CLAUDE.md Development Convention 9 (every deferral is a
 # conscious deferral). Scans kernel source + design docs for deferral
