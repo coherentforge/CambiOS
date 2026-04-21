@@ -744,6 +744,22 @@ check-assumptions:
 update-assumptions-baseline:
 	python3 tools/check-assumptions.py --update-baseline
 
+# Enforce ADR-021 Phase C — no `.expect()` / `panic!()` /
+# `unimplemented!()` / `todo!()` in boot-path init code. Scans a
+# curated list of files (src/boot/**/*.rs, src/interrupts/mod.rs,
+# arch init modules). Runtime fault handlers are out of scope
+# (deferred per ADR-019). Baseline exemptions in
+# tools/check-boot-panics-baseline.txt; expected empty after
+# 021.B.1-B.3 migrations. Exits nonzero on any new site.
+check-boot-panics:
+	python3 tools/check-boot-panics.py
+
+# Regenerate the boot-panics baseline. Use only to acknowledge a
+# regression you're intentionally accepting — review the diff and
+# the justification before committing.
+update-boot-panics-baseline:
+	python3 tools/check-boot-panics.py --update-baseline
+
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
 IMG_AARCH64 := cambios-aarch64.img
