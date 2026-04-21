@@ -237,6 +237,8 @@ The kernel only loads signed modules. Users control their own trust chain: add s
 
 Anyone can fork the code — the license permits it. The name **CambiOS** belongs to the distribution whose security model is intact. Code enforcement is technical; naming enforcement is legal.
 
+CAMBIOS™ is a trademark of Oakland Heritage Builders Inc. Coherent Forge is a reserved corporate name (Delaware).
+
 ---
 
 ## References
