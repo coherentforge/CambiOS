@@ -47,6 +47,10 @@ docs/adr/016-win-compat-api-ai-boundary.md:139:eventually
 docs/adr/019-process-fault-reaping-and-peer-generation.md:257:deferred
 docs/adr/019-process-fault-reaping-and-peer-generation.md:265:deferred
 docs/adr/019-process-fault-reaping-and-peer-generation.md:275:deferred
+docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:191:deferred
+docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:209:deferred
+docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:247:deferred
+docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:267:deferred
 docs/identity.md:210:deferred
 docs/identity.md:329:eventually
 docs/identity.md:337:eventually
