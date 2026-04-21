@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:10:eventually
-CLAUDE.md:245:deferred
-CLAUDE.md:525:deferred
+CLAUDE.md:250:deferred
+CLAUDE.md:535:deferred
 STATUS.md:13:figure-out
 STATUS.md:161:deferred
 docs/CambiOS.md:226:deferred
@@ -44,6 +44,9 @@ docs/adr/015-storage-tiers-and-commitment-ladder.md:227:deferred
 docs/adr/015-storage-tiers-and-commitment-ladder.md:231:TBD
 docs/adr/015-storage-tiers-and-commitment-ladder.md:235:deferred
 docs/adr/016-win-compat-api-ai-boundary.md:139:eventually
+docs/adr/019-process-fault-reaping-and-peer-generation.md:257:deferred
+docs/adr/019-process-fault-reaping-and-peer-generation.md:265:deferred
+docs/adr/019-process-fault-reaping-and-peer-generation.md:275:deferred
 docs/identity.md:210:deferred
 docs/identity.md:329:eventually
 docs/identity.md:337:eventually
@@ -72,9 +75,9 @@ src/memory/mod.rs:630:placeholder
 src/memory/mod.rs:639:placeholder
 src/microkernel/main.rs:233:deferred
 src/microkernel/main.rs:819:for-now
-src/microkernel/main.rs:1724:deferred
-src/microkernel/main.rs:1753:deferred
-src/microkernel/main.rs:2050:for-now
+src/microkernel/main.rs:1726:deferred
+src/microkernel/main.rs:1755:deferred
+src/microkernel/main.rs:2052:for-now
 src/platform/mod.rs:352:for-now
 src/scheduler/mod.rs:260:placeholder
 src/scheduler/mod.rs:261:placeholder
@@ -95,5 +98,6 @@ src/syscalls/userspace.rs:195:TODO
 src/syscalls/userspace.rs:210:TODO
 src/syscalls/userspace.rs:227:TODO
 src/syscalls/userspace.rs:248:TODO
+user/libgui-proto/src/lib.rs:26:deferred
 user/shell/src/main.rs:19:eventually
 user/udp-stack/src/main.rs:771:for-now

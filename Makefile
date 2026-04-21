@@ -705,6 +705,21 @@ check-deferrals:
 update-deferrals-baseline:
 	python3 tools/check-deferrals.py --update-baseline
 
+# Enforce CLAUDE.md Development Convention 8 (every numeric bound is
+# a conscious bound). Scans src/**/*.rs for `const NAME: <numeric> = …`
+# declarations and flags any whose preceding 10 lines don't carry one
+# of SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING. Baseline
+# exemptions in tools/check-assumptions-baseline.txt. The goal is to
+# not grow the baseline. Exits nonzero on new violations.
+check-assumptions:
+	python3 tools/check-assumptions.py
+
+# Regenerate the assumptions baseline from scratch. Use when you've
+# intentionally added a tagged bound the lint didn't recognize, or
+# when a cleanup removed pre-existing entries. Review the diff.
+update-assumptions-baseline:
+	python3 tools/check-assumptions.py --update-baseline
+
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
 IMG_AARCH64 := cambios-aarch64.img
