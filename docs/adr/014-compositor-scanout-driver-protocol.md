@@ -254,4 +254,28 @@ A future optimization: compositor tells driver "this client surface IS the scano
 
 ## Divergence
 
-*(appended as implementation diverges from the plan)*
+### 2026-04-20 — Scanout-4.a / 4.b landed; modern virtio-pci transport plumbed through a new kernel syscall
+
+**What changed from the plan.** The original ADR said the scanout-driver "knows hardware MMIO" and is otherwise free to discover its device however it wants. The 4.a implementation took a specific path worth pinning down so future modern-virtio drivers inherit it:
+
+1. **Kernel-side PCI cap parsing.** Modern virtio-pci devices (device IDs `0x1040..=0x107F`) advertise their register structures through vendor-specific capabilities (`cap_vndr == 0x09`, virtio spec §4.1.4). Parsing those caps in userspace would require exposing raw PCI config-space reads through the syscall surface — a broader privilege than scanout drivers should hold. Instead, `pci::scan()` now parses virtio-modern caps at boot and stashes the (BAR, offset, length) triples for common/notify/isr/device-cfg plus `notify_off_multiplier` on every `PciDevice`. The parser is a pure function on a 256-byte config-space snapshot, so host-side unit tests can exercise it without hardware.
+
+2. **`SYS_VIRTIO_MODERN_CAPS = 38` as the boundary.** A new identity-required (no capability-gated) syscall writes the parsed `VirtioModernCaps` struct to a user buffer. Landed with ADR-020 `UserWriteSlice<'ctx>` from day one — the first syscall built on the typed user-buffer slice. Cost to drivers: one syscall + one struct; versus the old "every driver walks PCI caps itself" path, the kernel owns the spec knowledge and the driver owns only its device's register semantics.
+
+3. **Single-BAR simplifying assumption in scanout-virtio-gpu.** QEMU's virtio-gpu-pci packs all four cap structures into one BAR (BAR 4 on `-device virtio-gpu-pci`, BAR 2 on `-vga virtio`). 4.a's transport layer refuses to init if any cap points at a different BAR (`InitError::CapsSpanMultipleBars`). Multi-BAR support is deferred; the observable trigger is "a real device splits the structures across BARs." Both QEMU virtio-gpu shapes work because the driver reads `caps.common_cfg.bar` at runtime rather than hardcoding an index.
+
+4. **Frame path is double-copy in 4.b.** The ADR said "driver allocates, compositor writes." It did not commit to a single-copy path. 4.b's implementation accepts a double copy (compositor → channel RAM pages → driver's `alloc_dma` backing → virtio-gpu's internal TRANSFER copy) because channel pages are RAM and `RESOURCE_ATTACH_BACKING` needs DMA-contiguous physical addresses. A zero-copy path requires a new kernel primitive — either a DMA-backed channel flag on `SYS_CHANNEL_CREATE`, or a `share_dma_with_principal` syscall. Both are non-trivial design decisions. **Revisit when:** compositor frametime exceeds the memcpy budget (measurable: ~240 MB/s per display at 4 MiB × 60 Hz, invisible on QEMU); OR the first real-hardware scanout driver port (Intel UHD, Scanout-5) where DMA-cache behavior makes the copy cost actually visible.
+
+5. **QEMU flag reality: `-vga virtio` replaces `-vga std + -device virtio-gpu-pci`.** 4.a added `-device virtio-gpu-pci` as a secondary adapter alongside the default cirrus VGA. Visible output still came from the cirrus side (driven by scanout-limine). 4.b required the visible side to be virtio-gpu; `-vga virtio` is the single-adapter shape that makes virtio-vga (same device ID, same driver-side probe) the primary display so Cocoa/GTK show what our driver programs. Documented in `Makefile run` / `run-gui` comments.
+
+6. **scanout-limine coexistence resolved by boot-manifest swap, not runtime probe.** The plan mentioned scanout-limine as a fallback but didn't specify how the driver is chosen. 4.b removes `scanout-limine.elf` from `limine.conf`; the crate remains buildable (`make scanout-limine`) for future manual runs without virtio-gpu. Runtime probing ("if virtio-gpu not present, fall back to Limine FB") is a 4.c concern when a real host actually needs it.
+
+7. **hello-window (Scanout-3) paints green, composited over compositor's blue-green test frame.** The ADR doesn't commit to initial colors; this is implementation detail worth noting because the `make run-gui` observable is "blue-green canvas + green rectangle" (the compositor test frame uses cyan-ish background, hello-window is pure green).
+
+**What did NOT diverge.** The `ScanoutBackend` trait shape in the compositor stayed exactly as specified. The control-IPC + shared-memory-channel split per ADR-005 stayed. Endpoint numbers (27, 28) stayed. Both sides register-by-Principal at boot. Single compositor, single scanout driver, pairing at startup — all as designed.
+
+**Phases still deferred, with triggers.**
+
+- **Scanout-4.c** — damage-rect-aware partial TRANSFER/FLUSH; zero-copy frame path; multi-display; hotplug; EDID; RequestModeChange; aarch64/riscv64 scanout-virtio-gpu builds.
+- **Scanout-5 (Intel UHD)** — bare-metal Dell target. Untouched.
+- **Remote / headless backends** — still in the Open Questions section above; no work started.
