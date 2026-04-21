@@ -1064,8 +1064,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
+        // ADR-020 Phase B: read user text via typed slice.
+        let slice = UserReadSlice::validate(ctx, user_buf, len)?;
         let mut buf = [0u8; 256];
-        read_user_buffer(ctx.cr3, user_buf, len, &mut buf)?;
+        slice.read_into(&mut buf[..len])?;
 
         for &byte in &buf[..len] {
             crate::io::print(format_args!("{}", byte as char));
@@ -2203,9 +2205,10 @@ impl SyscallDispatcher {
         // Try to read one byte (polling — non-blocking)
         match crate::io::read_byte() {
             Some(byte) => {
-                // Write the byte to user buffer
+                // ADR-020 Phase B: write single byte via typed slice.
                 let kbuf = [byte];
-                write_user_buffer(ctx.cr3, user_buf, &kbuf)?;
+                let slice = UserWriteSlice::validate(ctx, user_buf, 1)?;
+                slice.write_from(&kbuf)?;
                 Ok(1)
             }
             None => Ok(0),
@@ -2249,9 +2252,10 @@ impl SyscallDispatcher {
             }
         }
 
-        // Read module name from user memory
+        // ADR-020 Phase B: read module name via typed slice.
+        let name_slice = UserReadSlice::validate(ctx, name_ptr, name_len)?;
         let mut name_buf = [0u8; 64];
-        read_user_buffer(ctx.cr3, name_ptr, name_len, &mut name_buf)?;
+        name_slice.read_into(&mut name_buf[..name_len])?;
         let name = &name_buf[..name_len];
 
         // Look up module in boot module registry
