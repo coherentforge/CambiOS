@@ -28,3 +28,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 016 | [Windows Compatibility — The API/AI Boundary](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-13 |
 | 017 | [Catalog: Phase 1 Win32 Surface — Tier Assignments](017-win-compat-phase1-catalog.md) | Proposed | 2026-04-13 |
 | 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Proposed | 2026-04-19 |
+| 019 | [Process Fault Reaping and Peer-Generation Signaling](019-process-fault-reaping-and-peer-generation.md) | Proposed | 2026-04-19 |
