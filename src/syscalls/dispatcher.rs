@@ -1098,9 +1098,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Read the 32-byte public key from user buffer
+        // ADR-020 Phase B: read 32-byte public key via typed slice.
+        let pubkey_slice = UserReadSlice::validate(ctx, pubkey_ptr, 32)?;
         let mut pubkey = [0u8; 32];
-        read_user_buffer(ctx.cr3, pubkey_ptr, 32, &mut pubkey)?;
+        pubkey_slice.read_into(&mut pubkey)?;
 
         // Restriction: only the bootstrap Principal can bind Principals.
         // caller_principal is already resolved by dispatch().
@@ -1143,7 +1144,9 @@ impl SyscallDispatcher {
         // caller_principal already resolved by dispatch()
         let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::InvalidArg)?;
 
-        write_user_buffer(ctx.cr3, out_buf, &principal.public_key)?;
+        // ADR-020 Phase B: write 32-byte public key via typed slice.
+        let out_slice = UserWriteSlice::validate(ctx, out_buf, 32)?;
+        out_slice.write_from(&principal.public_key)?;
 
         Ok(32)
     }
@@ -1579,8 +1582,9 @@ impl SyscallDispatcher {
             .claim()
             .ok_or(SyscallError::PermissionDenied)?;
 
-        // Write 64-byte secret key to user buffer
-        write_user_buffer(ctx.cr3, out_sk_ptr, &sk)?;
+        // ADR-020 Phase B: write 64-byte secret key via typed slice.
+        let sk_slice = UserWriteSlice::validate(ctx, out_sk_ptr, 64)?;
+        sk_slice.write_from(&sk)?;
 
         crate::println!("  [ClaimBootstrapKey] pid={} — key claimed, kernel copy zeroed", ctx.process_id.slot());
 
