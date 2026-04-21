@@ -394,9 +394,16 @@ pub unsafe fn init() {
 /// # Safety
 /// Must be called exactly once, after `init()` and subsystem initialization.
 /// Kernel heap must be initialized (for IST stack allocation).
+///
+/// Returns `Err(BootError)` if any subsystem init step fails. `kmain`
+/// dispatches to `boot::boot_failed` on error.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) {
+pub unsafe fn init_hardware_interrupts(
+    timer_frequency_hz: u32,
+    rsdp_phys: u64,
+) -> Result<(), crate::boot::BootError> {
     use crate::arch::x86_64::{apic, gdt, ioapic};
+    use crate::boot::BootError;
 
     // Step 1: Disable PIC — remap to 0xF0-0xFF and mask all lines
     // SAFETY: Called during single-threaded boot with interrupts disabled.
@@ -405,7 +412,7 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 
     // Step 2: Enable Local APIC
     // SAFETY: HHDM offset is set, single-threaded boot, interrupts disabled.
-    unsafe { apic::detect_and_init().expect("APIC initialization failed"); }
+    unsafe { apic::detect_and_init() }.map_err(|_| BootError::ApicInitFailed)?;
 
     // Step 2b: Initialize per-CPU data for BSP
     // SAFETY: APIC is initialized (ID readable). Single-threaded boot, interrupts disabled.
@@ -483,13 +490,17 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
     // Step 5: Allocate IST stack for double-fault (4 KB)
     {
         use alloc::alloc::{alloc, Layout};
+        /// ARCHITECTURAL: IST stack size for the double-fault handler.
+        /// 4 KiB is the minimum workable size — the handler itself is
+        /// minimal (prints and halts), and a larger stack is waste on
+        /// a per-CPU allocation that's never re-entered.
         const IST_STACK_SIZE: usize = 4096;
         let layout = Layout::from_size_align(IST_STACK_SIZE, 16)
-            .expect("IST stack layout");
+            .map_err(|_| BootError::IstStackLayoutInvalid)?;
         // SAFETY: Kernel heap is initialized. Layout is valid.
         let ist_base = unsafe { alloc(layout) };
         if ist_base.is_null() {
-            panic!("Failed to allocate double-fault IST stack");
+            return Err(BootError::IstStackAllocFailed);
         }
         let ist_top = ist_base as u64 + IST_STACK_SIZE as u64;
 
@@ -524,11 +535,14 @@ pub unsafe fn init_hardware_interrupts(timer_frequency_hz: u32, rsdp_phys: u64) 
 
     // Step 7: Calibrate and start APIC timer
     // SAFETY: APIC is enabled, PIC is disabled, interrupts still off.
-    let _bus_freq = unsafe { apic::configure_timer(timer_frequency_hz) };
+    unsafe { apic::configure_timer(timer_frequency_hz) }
+        .map_err(|_| BootError::ApicCalibrationFailed)?;
 
     // Step 8: Enable interrupts — all interrupt infrastructure is initialized.
     x86_64::instructions::interrupts::enable();
     crate::println!("  ✓ Interrupts enabled (APIC timer + device IRQs)");
+
+    Ok(())
 }
 
 /// Configure the interrupt descriptor table

@@ -115,15 +115,6 @@ src/arch/x86_64/apic.rs:74:PIT_CHANNEL0_DATA
 src/arch/x86_64/apic.rs:75:PIT_CMD
 src/arch/x86_64/apic.rs:77:PIT_FREQUENCY
 src/arch/x86_64/apic.rs:79:PIT_CALIBRATION_DIVISOR
-src/arch/x86_64/apic.rs:458:APIC_ICR_LOW
-src/arch/x86_64/apic.rs:460:APIC_ICR_HIGH
-src/arch/x86_64/apic.rs:463:ICR_DELIVERY_STATUS
-src/arch/x86_64/apic.rs:465:ICR_LEVEL_ASSERT
-src/arch/x86_64/apic.rs:468:ICR_DEST_NO_SHORTHAND
-src/arch/x86_64/apic.rs:470:ICR_DEST_SELF
-src/arch/x86_64/apic.rs:472:ICR_DEST_ALL_INCLUDING_SELF
-src/arch/x86_64/apic.rs:474:ICR_DEST_ALL_EXCLUDING_SELF
-src/arch/x86_64/apic.rs:477:ICR_DELIVERY_FIXED
 src/arch/x86_64/gdt.rs:26:KERNEL_CS
 src/arch/x86_64/gdt.rs:28:KERNEL_SS
 src/arch/x86_64/gdt.rs:30:USER_SS
@@ -195,7 +186,6 @@ src/fs/virtio_blk_device.rs:45:KCMD_FLUSH
 src/fs/virtio_blk_device.rs:46:KCMD_CAPACITY
 src/fs/virtio_blk_device.rs:49:STATUS_OK
 src/fs/virtio_blk_device.rs:52:VIRTIO_BLK_SECTOR_SIZE
-src/interrupts/mod.rs:486:IST_STACK_SIZE
 src/interrupts/pic.rs:14:PIC1_COMMAND
 src/interrupts/pic.rs:15:PIC1_DATA
 src/interrupts/pic.rs:18:PIC2_COMMAND

@@ -385,8 +385,13 @@ unsafe extern "C" fn kmain() -> ! {
         map_acpi_regions(rsdp_phys);
 
         // SAFETY: All subsystems initialized. HHDM offset is set.
+        // ADR-021 Phase B.2: typed BootError propagation from the
+        // interrupts subsystem (APIC init, IST stack alloc, APIC
+        // calibration). kmain returns `!` so no `?`; dispatch to
+        // boot_failed for the single typed halt path.
         unsafe {
-            arcos_core::interrupts::init_hardware_interrupts(100, rsdp_phys);
+            arcos_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
+                .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
         }
         println!("✓ APIC-driven scheduling active");
 

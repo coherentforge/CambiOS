@@ -280,18 +280,19 @@ pub unsafe fn write_eoi() {
 /// After calibration, programs the APIC timer to fire at the requested
 /// frequency on `TIMER_VECTOR`.
 ///
-/// Returns the calibrated bus frequency (ticks per second).
+/// Returns `Err(())` if PIT calibration reports a bus frequency of
+/// zero — the caller maps that to [`crate::boot::BootError::ApicCalibrationFailed`].
 ///
 /// # Safety
 /// Must be called during single-threaded boot with interrupts disabled.
 /// PIC must be disabled first (PIT Channel 0 won't generate an IRQ).
-pub unsafe fn configure_timer(frequency_hz: u32) -> u32 {
+pub unsafe fn configure_timer(frequency_hz: u32) -> Result<(), ()> {
     // SAFETY: Called during single-threaded boot with interrupts disabled.
     // PIT calibration is valid at this point.
     let bus_freq = unsafe { calibrate_against_pit() };
 
     if bus_freq == 0 {
-        panic!("APIC timer calibration failed: bus frequency is 0");
+        return Err(());
     }
 
     // SAFETY: APIC_TIMER_DCR is a valid APIC register offset.
@@ -314,7 +315,7 @@ pub unsafe fn configure_timer(frequency_hz: u32) -> u32 {
         frequency_hz, bus_freq / 1_000_000, initial_count
     );
 
-    bus_freq
+    Ok(())
 }
 
 /// Calibrate the APIC timer by measuring ticks during a PIT-timed window.
@@ -454,26 +455,32 @@ pub unsafe fn configure_timer_ap() {
 //   - ICR Low  (0x300): vector, delivery mode, dest shorthand, etc.
 // Writing ICR Low *triggers* the IPI, so ICR High must be written first.
 
-/// ICR Low DWORD register offset
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR Low DWORD MMIO offset.
 const APIC_ICR_LOW: u32 = 0x300;
-/// ICR High DWORD register offset
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR High DWORD MMIO offset.
 const APIC_ICR_HIGH: u32 = 0x310;
 
-/// ICR delivery status bit (bit 12). 1 = send pending.
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR bit 12, delivery status.
+/// 1 = send pending.
 const ICR_DELIVERY_STATUS: u32 = 1 << 12;
-/// ICR level assert (bit 14). Required for INIT/SIPI, set for Fixed too.
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR bit 14, level assert.
+/// Required for INIT/SIPI; set for Fixed too.
 const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 
-/// ICR destination shorthand: no shorthand (use destination field)
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR destination shorthand
+/// encoding 0b00, "no shorthand" (use destination field).
 const ICR_DEST_NO_SHORTHAND: u32 = 0b00 << 18;
-/// ICR destination shorthand: self
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR shorthand 0b01, self.
 const ICR_DEST_SELF: u32 = 0b01 << 18;
-/// ICR destination shorthand: all including self
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR shorthand 0b10,
+/// all processors including self.
 const ICR_DEST_ALL_INCLUDING_SELF: u32 = 0b10 << 18;
-/// ICR destination shorthand: all excluding self
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR shorthand 0b11,
+/// all processors excluding self.
 const ICR_DEST_ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
 
-/// ICR delivery mode: Fixed (0b000 << 8)
+/// HARDWARE: Intel SDM Vol 3 §10.6.1 — ICR delivery-mode bits 10:8,
+/// Fixed (0b000).
 const ICR_DELIVERY_FIXED: u32 = 0b000 << 8;
 
 /// Wait for the previous IPI to be accepted by the target.
