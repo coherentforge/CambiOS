@@ -354,7 +354,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo compositor scanout-virtio-gpu hello-window sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -362,7 +362,11 @@ iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo
 	mkdir -p iso_root/EFI/BOOT
 	# Copy kernel binary
 	cp $(KERNEL) iso_root/boot/cambios_microkernel
-	# Copy + sign boot modules (must match limine.conf module order)
+	# Copy + sign boot modules (must match limine.conf module order).
+	# scanout-limine is not loaded in the default manifest as of
+	# Scanout-4.b — kept buildable out-of-tree for non-virtio-gpu
+	# hosts. The default `run` / `run-gui` targets include
+	# -device virtio-gpu-pci so scanout-virtio-gpu is the driver.
 	cp $(POLICY_SERVICE_ELF) iso_root/boot/policy-service.elf
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
@@ -370,7 +374,6 @@ iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
 	cp $(FB_DEMO_ELF) iso_root/boot/fb-demo.elf
 	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
-	cp $(SCANOUT_LIMINE_ELF) iso_root/boot/scanout-limine.elf
 	cp $(SCANOUT_VGPU_ELF) iso_root/boot/scanout-virtio-gpu.elf
 	cp $(HELLO_WINDOW_ELF) iso_root/boot/hello-window.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
@@ -380,7 +383,6 @@ iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fb-demo.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-limine.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-virtio-gpu.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello-window.elf
 	# Copy Limine config (root + standard location)
@@ -419,6 +421,15 @@ disk-img:
 		echo "=== $(DISK_IMG) already exists; leaving it alone ==="; \
 	fi
 
+# `-vga virtio` replaces QEMU's default cirrus VGA with virtio-vga.
+# virtio-vga is a virtio-gpu device (vendor 0x1AF4, device 0x1050,
+# probed identically to virtio-gpu-pci) plus a VGA compatibility
+# mode Limine uses for its boot framebuffer. With default `-vga std`
+# + a *separate* `-device virtio-gpu-pci`, the Cocoa window shows
+# the primary cirrus adapter — nobody writes to it in Scanout-4.b
+# and the window is black. Unifying the adapter means what our
+# driver programs (SET_SCANOUT / TRANSFER / FLUSH) is what Cocoa
+# displays.
 run: iso disk-img
 	qemu-system-x86_64 \
 		-cdrom $(ISO) \
@@ -428,7 +439,7 @@ run: iso disk-img
 		-device virtio-net-pci \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 		-device virtio-blk-pci,drive=cambios-disk0 \
-		-device virtio-gpu-pci \
+		-vga virtio \
 		-no-reboot
 
 # Same as `run`, plus a graphical QEMU window (macOS Cocoa backend) so
@@ -445,7 +456,7 @@ run-gui: iso disk-img
 		-device virtio-net-pci \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 		-device virtio-blk-pci,drive=cambios-disk0 \
-		-device virtio-gpu-pci \
+		-vga virtio \
 		-no-reboot \
 		-display cocoa
 
