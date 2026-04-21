@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:10:eventually
-CLAUDE.md:251:deferred
-CLAUDE.md:544:deferred
+CLAUDE.md:252:deferred
+CLAUDE.md:545:deferred
 STATUS.md:13:figure-out
 docs/CambiOS.md:226:deferred
 docs/CambiOS.md:365:deferred
@@ -42,7 +42,6 @@ docs/adr/015-storage-tiers-and-commitment-ladder.md:225:TBD
 docs/adr/015-storage-tiers-and-commitment-ladder.md:227:deferred
 docs/adr/015-storage-tiers-and-commitment-ladder.md:231:TBD
 docs/adr/015-storage-tiers-and-commitment-ladder.md:235:deferred
-docs/adr/016-win-compat-api-ai-boundary.md:139:eventually
 docs/adr/019-process-fault-reaping-and-peer-generation.md:257:deferred
 docs/adr/019-process-fault-reaping-and-peer-generation.md:265:deferred
 docs/adr/019-process-fault-reaping-and-peer-generation.md:275:deferred
