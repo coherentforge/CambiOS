@@ -1366,9 +1366,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Read content from user buffer
+        // ADR-020 Phase B: read content via typed slice.
+        let content_slice = UserReadSlice::validate(ctx, content_ptr, content_len)?;
         let mut kbuf = [0u8; 4096];
-        let copied = read_user_buffer(ctx.cr3, content_ptr, content_len, &mut kbuf)?;
+        content_slice.read_into(&mut kbuf[..content_len])?;
 
         // caller_principal already resolved by dispatch(); identity gate
         // guarantees it's non-zero for this syscall.
@@ -1380,8 +1381,8 @@ impl SyscallDispatcher {
         // Create CambiObject with caller as author and owner
         let content_vec = {
             extern crate alloc;
-            let mut v = alloc::vec::Vec::with_capacity(copied);
-            v.extend_from_slice(&kbuf[..copied]);
+            let mut v = alloc::vec::Vec::with_capacity(content_len);
+            v.extend_from_slice(&kbuf[..content_len]);
             v
         };
         let obj = crate::fs::CambiObject::new(principal, content_vec, ticks);
@@ -1398,8 +1399,9 @@ impl SyscallDispatcher {
         })?;
         drop(store_guard);
 
-        // Write hash to user buffer
-        write_user_buffer(ctx.cr3, out_hash, &hash)?;
+        // ADR-020 Phase B: write 32-byte hash via typed slice.
+        let hash_slice = UserWriteSlice::validate(ctx, out_hash, 32)?;
+        hash_slice.write_from(&hash)?;
 
         Ok(0)
     }
@@ -1425,9 +1427,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Read 32-byte hash from user
+        // ADR-020 Phase B: read 32-byte hash via typed slice.
+        let hash_slice = UserReadSlice::validate(ctx, hash_ptr, 32)?;
         let mut hash = [0u8; 32];
-        read_user_buffer(ctx.cr3, hash_ptr, 32, &mut hash)?;
+        hash_slice.read_into(&mut hash)?;
 
         // Look up in OBJECT_STORE. The trait's `get` now returns an owned
         // CambiObject, so the lock can be released before signature
@@ -1452,10 +1455,10 @@ impl SyscallDispatcher {
             }
 
         let copy_len = core::cmp::min(obj.content.len(), out_buf_len);
-        let mut kbuf = [0u8; 4096];
-        kbuf[..copy_len].copy_from_slice(&obj.content[..copy_len]);
 
-        write_user_buffer(ctx.cr3, out_buf, &kbuf[..copy_len])?;
+        // ADR-020 Phase B: validate exact write amount.
+        let out_slice = UserWriteSlice::validate(ctx, out_buf, copy_len)?;
+        out_slice.write_from(&obj.content[..copy_len])?;
 
         Ok(copy_len as u64)
     }
@@ -1476,9 +1479,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Read 32-byte hash from user
+        // ADR-020 Phase B: read 32-byte hash via typed slice.
+        let hash_slice = UserReadSlice::validate(ctx, hash_ptr, 32)?;
         let mut hash = [0u8; 32];
-        read_user_buffer(ctx.cr3, hash_ptr, 32, &mut hash)?;
+        hash_slice.read_into(&mut hash)?;
 
         // caller_principal already resolved by dispatch()
         let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
@@ -1529,10 +1533,14 @@ impl SyscallDispatcher {
 
         let count = core::cmp::min(listing.len(), max_objects);
 
-        // Write packed hashes to user buffer
+        // ADR-020 Phase B: write each 32-byte hash via its own typed
+        // slice at the per-index offset. The slice type doesn't support
+        // partial / offset writes, so one slice per hash is the
+        // natural shape; validation cost is tiny (cheap checks only).
         for (i, (hash, _meta)) in listing.iter().take(count).enumerate() {
             let offset = (i * 32) as u64;
-            write_user_buffer(ctx.cr3, out_buf + offset, hash)?;
+            let hash_slice = UserWriteSlice::validate(ctx, out_buf + offset, 32)?;
+            hash_slice.write_from(hash)?;
         }
 
         Ok(count as u64)
@@ -1605,20 +1613,22 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Read content from user buffer
+        // ADR-020 Phase B: three independent typed slices — content in,
+        // signature in, hash out.
+        let content_slice = UserReadSlice::validate(ctx, content_ptr, content_len)?;
         let mut kbuf = [0u8; 4096];
-        let copied = read_user_buffer(ctx.cr3, content_ptr, content_len, &mut kbuf)?;
+        content_slice.read_into(&mut kbuf[..content_len])?;
 
-        // Read 64-byte signature from user buffer
+        let sig_slice = UserReadSlice::validate(ctx, sig_ptr, 64)?;
         let mut sig_bytes = [0u8; 64];
-        read_user_buffer(ctx.cr3, sig_ptr, 64, &mut sig_bytes)?;
+        sig_slice.read_into(&mut sig_bytes)?;
         let signature = crate::fs::SignatureBytes { data: sig_bytes };
 
         // caller_principal already resolved by dispatch()
         let principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
         // Verify the signature against the caller's Principal and content
-        if !crate::fs::verify_signature(&principal.public_key, &kbuf[..copied], &signature) {
+        if !crate::fs::verify_signature(&principal.public_key, &kbuf[..content_len], &signature) {
             return Err(SyscallError::PermissionDenied);
         }
 
@@ -1628,8 +1638,8 @@ impl SyscallDispatcher {
         // Create CambiObject with the verified signature
         let content_vec = {
             extern crate alloc;
-            let mut v = alloc::vec::Vec::with_capacity(copied);
-            v.extend_from_slice(&kbuf[..copied]);
+            let mut v = alloc::vec::Vec::with_capacity(content_len);
+            v.extend_from_slice(&kbuf[..content_len]);
             v
         };
         let mut obj = crate::fs::CambiObject::new(principal, content_vec, ticks);
@@ -1647,8 +1657,8 @@ impl SyscallDispatcher {
         })?;
         drop(store_guard);
 
-        // Write hash to user buffer
-        write_user_buffer(ctx.cr3, out_hash, &hash)?;
+        let hash_slice = UserWriteSlice::validate(ctx, out_hash, 32)?;
+        hash_slice.write_from(&hash)?;
 
         Ok(0)
     }
