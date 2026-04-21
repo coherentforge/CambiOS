@@ -30,12 +30,15 @@
 //! to give lock-free `&'static BootInfo` access after init, with a
 //! single `unsafe` block guarded by the atomic flag.
 
+pub mod error;
 pub mod limine;
 
 #[cfg(target_arch = "riscv64")]
 pub mod riscv;
 
 pub mod initrd;
+
+pub use error::{boot_failed, BootError};
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
