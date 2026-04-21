@@ -1,339 +1,249 @@
 # CambiOS
 
-A secure bridge from human consciousness to the electron.
+*A secure bridge from human consciousness to the electron.*
+
+CambiOS is a general-purpose operating system built on a verification-ready microkernel written in Rust. Every process is isolated, every binary is verified before it runs, every IPC message carries an unforgeable cryptographic identity, and nothing in the stack phones home. It targets **x86_64**, **AArch64**, and **RISC-V (riscv64gc)**, boots in QEMU on all three, and is designed to eventually run on sovereign silicon.
+
+- Why CambiOS exists → [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md)
+- What's built right now → [STATUS.md](STATUS.md)
+- Kernel technical reference and per-subsystem required reading → [CLAUDE.md](CLAUDE.md)
 
 ---
 
-> *Your computer... is not your own.*
+There are two essential problems with modern operating systems. The first we're fixing here. The second is on a longer arc.
 
-Before your OS boots, before your kernel loads, before any software you chose runs — a separate processor with its own OS, network stack, and private keys is already running. You didn't install it, and you can't uninstall, audit, or turn it off. Intel machines run the Management Engine. On AMD it's the Platform Security Processor. It has DMA access to your memory. It runs whether your machine is on or off, as long as it has power. 
+## The Software Problem
 
-This is not a conspiracy theory. It is documented hardware design. Even Apple's Secure Enclave cannot be verified for security. 
+It's an open secret. Modern operating systems — Windows, macOS, Linux — are inherently leaky, buggy, and insecure. They were designed for a world that no longer exists: one where vendors are trustworthy, your identity comes from "someone else," a password is adequate to protect it, and code was trusted to swim in one vast pool with no lanes or lifeguards. Every telemetry scandal, every ransomware story, every "a kernel extension crashed my laptop" moment traces back to one of those assumptions. Zero-day exploits come alive here, where memory safety really isn't, privilege equals access, and every attack is an escalation.
 
-Almost everything running on top of this foundation — whether Windows, macOS, Linux — layers additional extraction: telemetry baked into the kernel, analytics in the bootloader, identifiers that follow you across reinstalls. The software stack most people trust with their most sensitive data was designed, at a fundamental level, around interests that are not theirs.
+CambiOS rejects this, fundamentally, at the design level. Rust itself closes entire classes of memory bugs. The kernel (the "pool") is *very* small. Drivers and services run isolated in user-space — a crash here is more a hiccup than a blue screen of death. Every process has a cryptographic identity. Every binary is verified before it runs. Every IPC message carries an unforgeable sender. There are no privileges to escalate — no capabilities are given without established credentials. Nothing phones home. This is 99% of what's wrong with modern operating systems — and it's fixable today, in software, without waiting for anyone.
 
-Ready to take it back? CambiOS is your response.
+## The Hardware Problem
 
----
+Below all of that sits silicon with coprocessors you don't own. On Intel, the Management Engine: its own processor, its own network stack, its own private keys, DMA access to main memory, running whether the machine is "on" or just plugged in. AMD ships the Platform Security Processor. ARM ships TrustZone. This is documented hardware design, not conspiracy.
 
-## What CambiOS Is
-
-CambiOS is a general-purpose operating system that is verifiably yours. 
-GUI, real applications, real privacy — not a locked-down appliance, 
-not a research project. A computer you can trust because you can verify it.
-
-We are developing a complete modern operating system — one ordinary users can run, with a GUI, real applications, and a user experience that is inherently private and secure. Not as a locked-down appliance. As a general-purpose computer system for interaction that is verifiably yours. Closing it requires sovereign silicon - and that's part of where this is going. Until then, CambiOS is a complete software foundation with no extraction above the hardware line: a formally-verified microkernel, memory-safe, cryptographic identity, zero-trust networking, and AI-powered security that works for the owner rather than the vendor.
-
-At its foundation is a microkernel written for formal verification from first principles in Rust:
-
-- **Every process is isolated.** Device drivers, networking, and filesystems run in user-space. The kernel attack surface is minimal by design.
-- **Every binary is verified before it runs.** Cryptographic identity is threaded through the entire stack — from boot modules to IPC messages to stored objects.
-- **Every IPC message carries an unforgeable sender identity.** The kernel stamps it. Nothing in user-space can lie about who sent what.
-- **No telemetry. No analytics. No phone-home behavior.** Ever. Not now, not in future versions. This is a design constraint, not a policy.
-- **Designed to host LLM security services.** Behavioral anomaly detection, just-in-time binary analysis, and automatic threat quarantine — running locally, on hardware you control.
+CambiOS cannot neutralize those coprocessors. No software can. The long-term answer is open hardware all the way down, and we are building toward it. Until then, most people are running on x86 or ARM, and they deserve a software stack that does not add to the problem. In the not too distant future, our goal is an open architecture from silicon through software. A future where CambiOS runs on top of CamBIOS open source firmware — including the boot path and TPM. Until that day, we close the holes we can.
 
 ---
 
-## Honesty About the "Hardware Problem"
+## Status
 
-CambiOS runs on x86_64 and AArch64. On those platforms it dramatically reduces the software attack surface — capability-based IPC, zero-trust enforcement, cryptographic identity, verified execution protect against a vast category of threats that affect everyone running conventional systems.
+CambiOS boots to preemptive SMP multitasking on all three target architectures under QEMU. The security model — cryptographic identity, signed-binary verification, capability-checked IPC, content-addressed object store — is implemented and exercised end-to-end. Static analysis and fuzzing are active; formal verification is the destination.
 
-But it cannot remove Intel ME or AMD PSP. Those coprocessors sit below the kernel — ME and PSP on x86, TrustZone on ARM. No software can fully neutralize them. CambiOS is explicit about this rather than pretending otherwise.
-
-**True security and true sovereignty are undercut until the hardware beneath the kernel is open and auditable.** Everything CambiOS builds — verified boot, signed binaries, unforgeable identity — sits on a foundation it cannot yet inspect. That is not an acceptable permanent state.
-
-The long-term answer is open hardware all the way down. We're building toward that. In the meantime most people are on x86, and they deserve better security now, and clear eyes about what the silicon underneath still does.
-
----
-
-## Current State
-
-Built by one person, in a few months of coding. The full, current picture — what's built, what's in progress, what's planned, test counts, phase markers, known issues — lives in **[STATUS.md](STATUS.md)**.
-
-The headline:
-
-- CambiOS boots to stable preemptive SMP multitasking on **x86_64** and **AArch64** in QEMU. Both targets build clean in release. USB boot tooling is ready for bare-metal testing on a Dell Precision 3630.
-- The **security model is real and running**: cryptographic identity backed by a hardware YubiKey (no secret key in kernel memory), boot modules signed at build time and verified before execution, user-space services (filesystem, key store, networking, shell) isolated behind capability-checked IPC with every message carrying an unforgeable sender identity, content-addressed object store with Blake3 hashing and Ed25519 signatures.
-- **Phase 3 architecture is landing**: shared-memory data channels with MMU-enforced producer/consumer roles, capability revocation, boot-time-sized kernel object tables, generation-counter process IDs, full process lifecycle cleanup. The substrate that real workloads need — video, file I/O, AI inference — is being built now.
-- **Static analysis and fuzzing are active.** Clippy enforced on every change. `cargo-fuzz` targets cover the ELF parser, binary verifier, buddy allocator, and capability system — each with shadow-model oracles that catch invariant violations, not just crashes. Unsafe blocks are individually scoped with per-operation `// SAFETY:` comments. Miri and Kani proof harnesses are on the roadmap.
-- 316 unit tests. Lock ordering is documented and enforced. The code is written to be read.
-
-The kernel is real. The security model is real. This is not a prototype.
-
----
-
-## Architecture
-
-CambiOS is a full operating system. Its kernel is a microkernel and does five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Everything else - filesystems, networking, device drivers - all run as isolated user-space services communicating over capability-checked IPC.
-
-The attack surface is small by design. A buggy filesystem service can't take down the kernel. A compromised network driver can't read another process's memory. Isolation is structural, not policy.
-
-**Enforcement is layered and has no bypass:**
-```
-ELF binary arrives
-    → BinaryVerifier: W^X, entry point validation, overlap detection, signature check
-    → IPC send: capability check, interceptor hook, sender_principal stamp
-    → IPC recv: capability check, interceptor hook
-    → Syscall pre-dispatch: interceptor hook before handler
-    → ObjectStore: ownership enforced on every get/put/delete
-```
-
-Identity is a 32-byte Ed25519 public key bound to every process (quantum resistance planned.) The kernel stamps Identity onto every IPC message — unforgeable, no trust required from user-space. The bootstrap Principal derives from a compiled-in YubiKey public key. No private key lives in kernel memory.
-
-IPC has two paths: a **control path** (capability-based, sharded per-endpoint, fixed 256-byte messages for predictable verification) and a **bulk data path** (shared-memory channels with MMU-enforced producer/consumer/bidirectional roles). Three enforcement points: IpcManager send/recv, syscall pre-dispatch, capability delegation.
-For detailed internals — lock ordering, memory layout, syscall reference, scheduler design — see the Design Documents section below.
-
-## Boot Sequence
-
-CambiOS boots via the **Limine v8.7.0** boot protocol on both architectures.
-
-The boot sequence is where trust is established — before any user-space code runs.
-
-### x86_64
-
-1. Limine loads kernel ELF, provides memory map, HHDM, RSDP
-2. Kernel heap initialized (4MB), frame allocator initialized
-3. ACPI regions mapped into HHDM, MADT parsed for I/O APIC
-4. Per-CPU GDT/TSS installed, IDT loaded, SYSCALL MSRs configured
-5. PIC disabled, I/O APIC programmed, APIC timer started at 100Hz
-6. IPC manager, capability manager, and zero-trust interceptor initialized
-7. Bootstrap Principal created from compiled-in YubiKey public key, bound to kernel processes
-8. PCI bus scan, device table populated
-9. Kernel object tables sized from detected memory and tier policy, allocated contiguously
-10. Signed ELF boot modules loaded and verified (hello, key-store, fs-service, virtio-net, i219-net, udp-stack, shell) with per-process page tables
-11. AP cores started via Limine MP protocol — per-CPU GDT, APIC, scheduler
-12. Preemptive SMP scheduling begins
-
-### AArch64
-
-1. Limine loads kernel ELF, provides memory map, HHDM
-2. TCR_EL1.T1SZ widened to 16 (48-bit VA for HHDM)
-3. Early MMIO mapping: PL011 UART, GIC Distributor/Redistributor into TTBR1
-4. Kernel heap and frame allocator initialized
-5. GIC distributor, redistributor, and CPU interface initialized
-6. ARM Generic Timer started at 100Hz
-7. Exception vector table installed, SVC handler configured
-8. IPC manager, capability manager, and zero-trust interceptor initialized
-9. Bootstrap Principal created from compiled-in YubiKey public key, bound to kernel processes
-10. Kernel object tables sized from detected memory and tier policy, allocated contiguously
-11. Signed ELF boot modules loaded and verified with per-process page tables
-12. AP cores started via Limine MP protocol — per-CPU GIC, timer, scheduler
-13. Preemptive SMP scheduling begins
+[STATUS.md](STATUS.md) is the canonical account of what is built, in progress, and planned, including phase markers, per-subsystem status, and known issues. Run `make stats` for current syscall, test, and LOC counts (those numbers live in the source, not in prose).
 
 ---
 
 ## Building
 
-CambiOS builds on macOS (Apple Silicon) with Rust nightly (pinned — see `rust-toolchain.toml`). Kernel binaries run only in QEMU or on bare-metal target hardware — never directly on the host.
+Host: macOS (Apple Silicon). Kernel binaries run only under QEMU or on bare-metal target hardware — never on the host.
 
 Prerequisites:
-- Rust nightly (pinned date in `rust-toolchain.toml`; required for `abi_x86_interrupt` only)
-- Targets: `x86_64-unknown-none`, `aarch64-unknown-none`
-- QEMU via Homebrew
-- Limine v8.7.0 (auto-cloned to `/tmp/limine`)
-- `mtools` for AArch64 FAT disk images
-```
-Unit tests (host macOS)
+- Rust nightly (pinned in `rust-toolchain.toml`)
+- Targets: `x86_64-unknown-none`, `aarch64-unknown-none`, `riscv64gc-unknown-none-elf`
+- QEMU (Homebrew)
+- `mtools` (AArch64 FAT disk images)
+- Limine is auto-cloned; OpenSBI ships with QEMU as `-bios default` for RISC-V
+
+```bash
+# Unit tests (host macOS)
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
-# Run in QEMU — x86_64
-make run
+# Tri-architecture regression gate — REQUIRED before any commit
+make check-all              # x86_64 + aarch64 + riscv64
 
-# Run in QEMU — AArch64
+# Run in QEMU
+make run                    # x86_64
 make img-aarch64 && make run-aarch64
+make run-riscv64
 
-# Sign a boot module via YubiKey
+# Derived counts (syscalls, tests, LOC)
+make stats
+
+# Sign a boot module (YubiKey-backed; --seed <hex> for CI without hardware)
 ./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf <elf-file>
-
-# Sign via seed (CI / no hardware key)
-./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --seed <hex> <elf-file>
-
-# Fuzz a security-critical target (requires cargo-fuzz)
-cargo fuzz run fuzz_elf_parser
-cargo fuzz run fuzz_binary_verifier
-cargo fuzz run fuzz_buddy_allocator
-cargo fuzz run fuzz_capability
 ```
+
+The full build / test / lint commands and their rationale live in [CLAUDE.md](CLAUDE.md#quick-reference). If a command above drifts, CLAUDE.md is authoritative.
+
+---
+
+## Architecture
+
+CambiOS is a microkernel. The kernel handles five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Filesystems, networking, device drivers, window management, and every other service run as isolated user-space processes communicating over capability-checked IPC.
+
+This is structural isolation, not policy. A buggy filesystem service cannot corrupt the kernel. A compromised network driver cannot read another process's memory. A malicious module cannot forge the identity of a peer.
+
+### Enforcement pipeline
+
+Every piece of code that runs on CambiOS passes through the same sequence of checks, with no bypass:
+
+```
+ELF binary arrives
+    → BinaryVerifier: W^X, entry validation, overlap detection, Ed25519 signature
+    → IPC send:  capability check, interceptor hook, sender_principal stamp
+    → IPC recv:  capability check, interceptor hook
+    → Syscall pre-dispatch: interceptor hook before handler
+    → ObjectStore: ownership enforced on get / put / delete
+```
+
+The three interceptor hooks collapse into one trait that an out-of-kernel policy service can drive — see [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md).
+
+### Identity
+
+Every process is bound to a **Principal**: a 32-byte Ed25519 public key. The kernel stamps the sender's Principal onto every IPC message. It cannot be forged — user-space code never has the opportunity to write that field. Receivers enforce ownership, access control, and audit on the stamped identity rather than on sender claims.
+
+The bootstrap Principal derives from a compiled-in YubiKey public key. No private key ever lives in kernel memory. Quantum-resistant signatures are planned.
+
+Full model: [docs/identity.md](docs/identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md).
+
+### IPC
+
+Two paths, chosen by workload shape:
+
+- **Control path** — fixed-size (256-byte) messages, capability-gated, sharded per endpoint. Predictable for verification; used for commands, replies, and small events.
+- **Bulk data path** — shared-memory channels with MMU-enforced producer / consumer / bidirectional roles. Creator names the peer Principal; the kernel verifies identity on attach. Used for video frames, file payloads, and any workload where 256 bytes does not fit.
+
+See [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md).
+
+### Lock ordering and memory layout
+
+Strict lock hierarchy, no exceptions, documented and enforced in source. Every `unsafe` block carries a `// SAFETY:` comment. The canonical hierarchy and memory-layout tables live in [CLAUDE.md § Lock Ordering](CLAUDE.md#lock-ordering) and are intentionally not duplicated here — they drift.
+
+---
+
+## Boot Sequence
+
+All three architectures share the same high-level sequence:
+
+1. Firmware / bootloader loads the kernel ELF and hands over a memory description.
+2. Early MMU and exception-vector setup, heap and frame allocator initialization.
+3. Interrupt controller + timer + per-CPU data structures.
+4. IPC manager, capability manager, zero-trust interceptor.
+5. Bootstrap Principal built from the compiled-in YubiKey public key.
+6. Kernel object tables sized from detected memory and the active tier policy ([ADR-008](docs/adr/008-boot-time-sized-object-tables.md)).
+7. Signed ELF boot modules verified and loaded, one per entry in `BOOT_MODULE_ORDER`.
+8. AP cores come online with per-CPU scheduler state.
+9. Preemptive SMP scheduling begins.
+
+Where the architectures differ:
+
+- **x86_64 / AArch64** boot via Limine (version pinned in the Makefile). x86_64 also parses ACPI + programs the I/O APIC + calibrates the APIC timer via the PIT. AArch64 widens `TCR_EL1.T1SZ` and maps device MMIO (PL011, GIC) into TTBR1, then initializes GICv3 and the ARM Generic Timer.
+- **RISC-V** boots via OpenSBI in M-mode, which hands a DTB pointer to a custom S-mode stub in `src/boot/riscv.rs`. Timer and IPI go through SBI calls; external interrupts arrive via PLIC. No Limine — see [ADR-013](docs/adr/013-riscv64-architecture-support.md).
+
+The narrative walkthrough of what actually happens during boot, including the bootstrap paradoxes, is [Manual 01: Waking Up](docs/manuals/01-waking-up.md).
+
 ---
 
 ## Project Structure
 
 ```
 src/
-├── arch/x86_64/          # GDT, APIC, SYSCALL/SYSRET, TLB shootdown, SMP
-├── arch/aarch64/         # GICv3, ARM Generic Timer, SVC, TLBI, EL0/EL1
-├── scheduler/            # Priority-band preemptive SMP scheduler (portable)
-├── ipc/                  # Capability-based IPC, Principal, zero-trust interceptor
-├── syscalls/             # 33 syscalls, all implemented
-├── memory/               # Frame allocator, buddy allocator, per-process page tables
-├── fs/                   # CambiObject, ObjectStore, Blake3, Ed25519
-├── loader/               # ELF loader, BinaryVerifier, SignedBinaryVerifier
-├── pci/                  # PCI bus scan, device table, BAR decoding
-└── microkernel/main.rs   # Kernel entry point
+├── microkernel/main.rs      # Kernel entry, subsystem init sequence
+├── arch/                    # Per-architecture backends
+│   ├── x86_64/              #   GDT, APIC, SYSCALL/SYSRET, I/O APIC, TLB IPI, SMP
+│   ├── aarch64/             #   GICv3, ARM Generic Timer, SVC, TLBI, EL0/EL1
+│   └── riscv64/             #   PLIC, SBI timer/IPI, ecall dispatch, Sv48 paging
+├── boot/                    # Bootloader-abstracted BootInfo (Limine / OpenSBI adapters)
+├── scheduler/               # Priority-band preemptive SMP scheduler (portable)
+├── ipc/                     # Capability-based IPC, Principal, channels, interceptor
+├── syscalls/                # Syscall dispatch and handlers (list: `make stats`)
+├── memory/                  # Frame allocator, buddy allocator, page tables, object tables
+├── fs/                      # CambiObject, ObjectStore, Blake3, Ed25519, persistent disk store
+├── loader/                  # ELF loader, BinaryVerifier, SignedBinaryVerifier
+├── pci/                     # PCI bus scan, device table, BAR decoding
+├── audit/                   # Lock-free per-CPU audit buffers + global drain ring
+└── config/                  # Tier policy (compile-time deployment-tier selection)
 
-user/
-├── libsys/               # Shared syscall wrapper library
-├── fs-service/           # Filesystem service (endpoint 16)
-├── key-store-service/    # Ed25519 signing service (endpoint 17)
-├── virtio-net/           # Virtio-net driver (endpoint 20)
-├── i219-net/             # Intel I219-LM driver (bare-metal target)
-├── udp-stack/            # UDP/IP network service (endpoint 21)
-└── shell/                # Interactive serial shell
+user/                        # User-space services — each one is an isolated boot module
+├── libsys/                  # Syscall wrapper library (the only unsafe user-space crate)
+├── libfs-proto/ libgui-proto/ libscanout/ libterm/ libflag/   # Service-protocol libraries
+├── fs-service/              # Content-addressed object store front-end
+├── key-store-service/       # Ed25519 signing service (bootstrap-key holder)
+├── policy-service/          # Out-of-kernel policy decisions via interceptor hook
+├── virtio-{net,blk}/ i219-net/ udp-stack/ dhcp-client/   # Network + storage drivers / stack
+├── compositor/ scanout-{limine,virtio-gpu}/              # Graphics stack (ADR-011/014)
+└── shell/                   # Interactive serial shell
 
-tools/
-└── sign-elf/             # Host-side ELF signing tool (YubiKey or seed)
-
-fuzz/
-├── fuzz_elf_parser.rs        # Adversarial ELF bytes through full parse pipeline
-├── fuzz_binary_verifier.rs   # Synthetic segments vs. verify-before-execute gate
-├── fuzz_buddy_allocator.rs   # Random alloc/free sequences with overlap + double-free detection
-└── fuzz_capability.rs        # Grant/revoke/verify sequences with shadow-model oracle
+tools/sign-elf/              # Host-side ELF signing tool (YubiKey or seed-based)
+fuzz/                        # cargo-fuzz targets with shadow-model oracles
+docs/                        # Design docs, ADRs, manuals
 ```
 
----
-
-## Manuals
-
-Narrative walkthroughs that explain how CambiOS works by following real things through the system:
-
-- [Waking Up](docs/manuals/01-waking-up.md) — The boot sequence as a story: bootstrap paradoxes, dependency chains, and bringing a microkernel to life
-- [The Life of a Message](docs/manuals/02-life-of-a-message.md) — An IPC message from syscall to delivery, through capability checks and identity stamping
-- [The Signature Chain](docs/manuals/03-signature-chain.md) — From YubiKey to boot verification: how the kernel knows code is authentic
-- [Why a Buggy Driver Can't Kill You](docs/manuals/04-driver-isolation.md) — Microkernel isolation told through consequences
-- [From NTP Query to UTC Clock](docs/manuals/05-ntp-query.md) — A UDP packet end-to-end through the full networking stack
-
----
-
-## Design Documents
-
-- [STATUS.md](STATUS.md) — Canonical "what is built" doc: subsystem status, phase markers, v1 roadmap, test counts, known issues
-- [CambiOS.md](docs/CambiOS.md) — Source-of-truth architecture document
-- [PHILOSOPHY.md](docs/PHILOSOPHY.md) — Philosophical foundations: consciousness, creation, and the motivations behind CambiOS
-- [identity.md](docs/identity.md) — Identity architecture: Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation
-- [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) — Phase intent for identity + storage
-- [win-compat.md](docs/win-compat.md) — Windows compatibility layer design (PE loader, AI-translated shims, sandboxed Principal)
-- [SECURITY.md](docs/SECURITY.md) — Zero-trust enforcement map: what's enforced, where, and how
-- [SYSCALLS.md](docs/SYSCALLS.md) — All syscalls: numbers, arguments, behavior, calling conventions
-- [INTERRUPT_ROUTING.md](docs/INTERRUPT_ROUTING.md) — IRQ-to-task wakeup routing system
-- [src/scheduler/SCHEDULER.md](src/scheduler/SCHEDULER.md) — Scheduler internals
-- [CLAUDE.md](CLAUDE.md) — Kernel technical reference and required-reading map by subsystem
-
-### Architecture Decision Records
-
-- [ADR-000](docs/adr/000-zta-and-cap.md) — Zero-trust architecture and capability-based access control
-- [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) — Per-CPU scheduling and SMP task management
-- [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) — Three-layer enforcement pipeline for IPC and syscalls
-- [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) — Content-addressed storage and cryptographic identity
-- [ADR-004](docs/adr/004-cryptographic-integrity.md) — Cryptographic integrity: Blake3 hashing and Ed25519 signatures
-- [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) — IPC primitives: control path (256-byte messages) and bulk path (channels)
-- [ADR-006](docs/adr/006-policy-service.md) — Policy service: externalized policy decisions
-- [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) — Capability revocation and audit telemetry
-- [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) — Boot-time-sized kernel object tables
-- [ADR-009](docs/adr/009-purpose-tiers-scope.md) — Purpose, tiers, scope, and governance
-
----
-
-## Licensing and Enforcement
-
-The CambiOS microkernel, filesystem, and networking stack are MIT licensed. 
-Use them freely. Build on them. Fork them.
-
-The userspace ecosystem — drivers, identity services, hardware compatibility 
-layers — is GPLv3. Contribute back.
-
-The kernel only loads signed modules. Coherent Forge signs GPL-compliant 
-modules for the official distribution. Users control their own trust chain 
-— they can add signing keys, remove ours, or replace it entirely. 
-It's their machine.
-
-Anyone can fork the code. The MIT license allows it. But you can't call 
-it CambiOS unless the security model is intact. 
-
-The code enforcement is technical. The naming enforcement is legal.
+The authoritative list of *what actually builds into the boot image* is the `BOOT_MODULE_ORDER` constant in `src/boot_modules.rs` and the Makefile's per-target module rules. If the tree above and the Makefile disagree, the Makefile wins.
 
 ---
 
 ## Contributing
 
-CambiOS is looking for people who understand what's at stake.
+CambiOS is looking for people who understand what's at stake — OS internals, compiler infrastructure, hardware security, ML systems, formal methods. The foundation is real. The work ahead is larger than any one person should do alone.
 
-If you work on OS internals, compiler infrastructure, hardware security, or ML systems — and you've read this far and feel something — reach out. The foundation is real. The roadmap is clear. The work ahead is large enough that no single person should do it alone.
+**Before you write code:**
+
+1. Read [CLAUDE.md](CLAUDE.md). It is the kernel's technical reference and the contract for how changes get made — conventions, lock ordering, per-subsystem required reading, post-change review protocol. Every non-trivial PR is judged against it.
+2. Read the ADRs for the subsystem you are about to touch. The required-reading map in CLAUDE.md names them.
+3. Check [STATUS.md](STATUS.md) to confirm the work is not already in progress in another phase.
+
+**Working rules:**
+
+- **Tri-architecture regression gate is mandatory.** `make check-all` must pass before any commit — no commit may regress x86_64, aarch64, or riscv64. See [ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline.
+- **Commits are PGP-signed.** The repo enforces signing at the Git level; unsigned commits will not land.
+- **Every `unsafe` block needs a `// SAFETY:` comment** explaining the invariants that make the operation sound.
+- **No panics, unwraps, or expects in kernel code.** Every failure is a typed `Result`.
+- **No dynamic dispatch in kernel hot paths.** Monomorphized generics only — verifiers cannot reason about trait objects.
+- **Design changes warrant an ADR.** A new decision or a divergence from an existing ADR is captured in `docs/adr/` before or alongside the code change, not after. `make check-adrs` verifies cross-references.
+
+The full catalog of conventions (numeric-bound discipline, deferral discipline, unsafe minimization, documentation-sync expectations) lives in [CLAUDE.md § Development Conventions](CLAUDE.md#development-conventions).
+
+---
+
+## Manuals
+
+Narrative walkthroughs that follow a concrete thing through the system, useful if you are new to the codebase and want the *why* before the *what*:
+
+- [01 — Waking Up](docs/manuals/01-waking-up.md): the boot sequence as a story
+- [02 — The Life of a Message](docs/manuals/02-life-of-a-message.md): an IPC message from syscall to delivery
+- [03 — The Signature Chain](docs/manuals/03-signature-chain.md): YubiKey to boot verification
+- [04 — Why a Buggy Driver Can't Kill You](docs/manuals/04-driver-isolation.md): microkernel isolation told through consequences
+- [05 — From NTP Query to UTC Clock](docs/manuals/05-ntp-query.md): a UDP packet end-to-end through the network stack
+
+---
+
+## Design Documents
+
+- [CambiOS.md](docs/CambiOS.md) — source-of-truth architecture
+- [PHILOSOPHY.md](docs/PHILOSOPHY.md) — why this project exists, the AI-watches-not-decides stance
+- [SECURITY.md](docs/SECURITY.md) — zero-trust enforcement map
+- [identity.md](docs/identity.md) — Ed25519 Principals, author/owner model, revocation
+- [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) — identity + storage phase intent
+- [win-compat.md](docs/win-compat.md) — Windows compatibility layer design
+- [ASSUMPTIONS.md](docs/ASSUMPTIONS.md) — catalog of every numeric bound in kernel code
+- [GOVERNANCE.md](docs/GOVERNANCE.md) — project governance, deployment tiers
+
+**Architecture Decision Records** live under [docs/adr/](docs/adr/). The current set, with titles and status, is auto-generated in [docs/adr/INDEX.md](docs/adr/INDEX.md) by `make check-adrs` — treat that as authoritative rather than any enumeration in prose (which drifts).
+
+---
+
+## Licensing
+
+The CambiOS microkernel, filesystem, and networking stack are **MIT licensed**. Use them freely, build on them, fork them.
+
+The user-space ecosystem — drivers, identity services, hardware compatibility layers — is **GPLv3**. Contribute back.
+
+The kernel only loads signed modules. Coherent Forge signs GPL-compliant modules for the official distribution. Users control their own trust chain: add signing keys, remove ours, replace it entirely. It's their machine.
+
+Anyone can fork the code. The MIT license allows it. But the name **CambiOS** belongs to the distribution whose security model is intact. Code enforcement is technical; naming enforcement is legal.
 
 ---
 
 ## References
 
 - [Limine Boot Protocol](https://github.com/limine-bootloader/limine)
-- [OSDev Wiki](https://wiki.osdev.org/)
+- [OpenSBI](https://github.com/riscv-software-src/opensbi) — RISC-V M-mode firmware
 - [seL4 Microkernel](https://sel4.systems/) — verification reference
+- [OSDev Wiki](https://wiki.osdev.org/)
 - [Rust on Baremetal](https://github.com/rust-osdev)
 
 ---
 
 *No telemetry. No analytics. No management engine. No compromises on the things that matter.*
-
-
-### Security Enforcement Layers
-
-```
-ELF binary arrives
-    → BinaryVerifier: W^X, entry point validation, overlap detection, signature check
-    → IPC Interceptor (send path): capability check, interceptor hook, sender_principal stamp
-    → IPC Interceptor (recv path): capability check, interceptor hook
-    → Syscall pre-dispatch: interceptor hook before handler
-    → ObjectStore: ownership enforced on every get/put/delete
-```
-
-### Identity Model
-
-Every process has a Principal — a 32-byte Ed25519 public key. The kernel stamps every IPC message with the sender's Principal. It cannot be forged. User-space services use this to enforce ownership, access control, and audit trails without trusting the sender's claims.
-
-The bootstrap Principal derives from a compiled-in YubiKey public key. No private key lives in kernel memory.
-
-### IPC Model
-
-Two-path IPC with zero-trust enforcement:
-
-**Control path** — capability-based message passing:
-- **Fixed-size messages** (256 bytes) for predictable verification
-- **Capability rights**: Send, Receive, Delegate — fine-grained per-endpoint
-- **Priority levels**: Critical, High, Normal, Low
-- **Three-layer enforcement**: IPC interceptor hooks at IpcManager send/recv, syscall pre-dispatch, and capability delegation
-- **Page-table-walk** for user buffer validation in Write/Read syscalls
-- **Identity-aware receive** (`RecvMsg`): returns `[sender_principal:32][from_endpoint:4][payload:N]`
-
-**Bulk data path** — shared-memory channels:
-- **MMU-enforced roles**: Producer (RW), Consumer (RO), Bidirectional (RW/RW)
-- **Principal-bound**: creator specifies peer by public key; kernel verifies on attach
-- **Full lifecycle management**: create, attach, close, revoke; TLB shootdown on teardown
-- **Requires `CreateChannel` system capability** — no uncontrolled channel creation
-
-### Memory Layout
-
-| Region | x86_64 | AArch64 |
-|--------|--------|---------|
-| HHDM base | `0xFFFF800000000000` | `0xFFFF000000000000` |
-| User code | `0x400000` | `0x400000` |
-| User stack top | `0x800000` (64KB) | `0x800000` (64KB) |
-| Process heap base | `0x800000` | `0x40800000` |
-| Kernel heap | 4MB at HHDM+physical | 4MB at HHDM+physical |
-| Frame allocator | Bitmap, 0-2 GiB | Bitmap, 0-2 GiB |
-
-### Lock Ordering
-
-Strict lock hierarchy prevents deadlock across all kernel subsystems:
-
-```
-SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-CHANNEL_MANAGER(5) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7) →
-INTERRUPT_ROUTER(8) → OBJECT_STORE(9)
-```
-
-`*` = IrqSpinlock (interrupt-disabling). Lower numbers acquired before higher. No exceptions.
-
-Additional lock domains (independent of hierarchy):
-- `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR
-- `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint
-- `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter
-
----
