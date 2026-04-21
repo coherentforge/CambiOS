@@ -51,6 +51,7 @@ docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:191:deferred
 docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:209:deferred
 docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:247:deferred
 docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md:267:deferred
+docs/adr/021-typed-boot-error-propagation.md:269:deferred
 docs/identity.md:210:deferred
 docs/identity.md:329:eventually
 docs/identity.md:337:eventually

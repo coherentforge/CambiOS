@@ -30,3 +30,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Proposed | 2026-04-19 |
 | 019 | [Process Fault Reaping and Peer-Generation Signaling](019-process-fault-reaping-and-peer-generation.md) | Proposed | 2026-04-19 |
 | 020 | [Typed User-Buffer Slices at the Syscall Boundary](020-typed-user-buffer-slices-at-syscall-boundary.md) | Proposed | 2026-04-19 |
+| 021 | [Typed BootError Propagation Through the Init Path](021-typed-boot-error-propagation.md) | Proposed | 2026-04-19 |
