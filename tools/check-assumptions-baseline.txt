@@ -264,5 +264,3 @@ src/process.rs:33:MAX_VMAS
 src/process.rs:37:VMA_ALLOC_BASE
 src/process.rs:217:HEAP_SIZE
 src/process.rs:220:HEAP_PAGES
-src/syscalls/dispatcher.rs:57:USER_SPACE_END
-src/syscalls/dispatcher.rs:59:USER_SPACE_END

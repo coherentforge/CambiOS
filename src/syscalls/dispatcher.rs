@@ -7,6 +7,7 @@
 //! page-table walks through the process's CR3 via HHDM.
 
 use crate::syscalls::{SyscallNumber, SyscallArgs, SyscallResult, SyscallError};
+use crate::syscalls::{UserReadSlice, UserWriteSlice};
 use crate::scheduler::TaskId;
 use crate::ipc::ProcessId;
 // `ObjectStore` trait must be in scope so method calls (`put`/`get`/etc.) on
@@ -50,11 +51,14 @@ const MAX_DEVICE_IRQ: u32 = 224;
 ///      to grow on demand. See docs/ASSUMPTIONS.md.
 pub(super) const MAX_USER_BUFFER: usize = 4096;
 
-/// Canonical user-space address ceiling.
-/// x86_64: lower-half canonical addresses end at bit 47.
-/// AArch64: TTBR0 covers 0..2^48 with T0SZ=16 (48-bit VA).
+/// HARDWARE: canonical user-space address ceiling.
+/// x86_64: lower-half canonical addresses end at bit 47
+/// (Intel SDM Vol 3 §3.3.7.1).
+/// AArch64 / RISC-V: TTBR0 / Sv48 cover 0..2^48 with T0SZ=16;
+/// the 0x0001_0000_0000_0000 value uses the full 48-bit range.
 #[cfg(target_arch = "x86_64")]
 pub(super) const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+/// HARDWARE: see `USER_SPACE_END` above — 48-bit VA variant.
 #[cfg(not(target_arch = "x86_64"))]
 pub(super) const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
 
@@ -544,9 +548,11 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Read user buffer into kernel
+        // Read user buffer into kernel. ADR-020 Phase B: typed
+        // UserReadSlice replaces the raw (addr, len) pair.
+        let slice = UserReadSlice::validate(ctx, user_buf, len)?;
         let mut kbuf = [0u8; 256];
-        read_user_buffer(ctx.cr3, user_buf, len, &mut kbuf)?;
+        slice.read_into(&mut kbuf[..len])?;
 
         // Virtio-blk kernel response endpoint (Phase 4a.iii): writes here
         // skip the capability check and land in SHARDED_IPC. The kernel is
@@ -715,7 +721,11 @@ impl SyscallDispatcher {
                 let payload = msg.payload();
                 let copy_len = core::cmp::min(payload.len(), max_len);
 
-                write_user_buffer(ctx.cr3, user_buf, &payload[..copy_len])?;
+                // ADR-020 Phase B: validate the exact write amount, not
+                // the user-supplied max_len — the slice type represents
+                // "the N bytes we will actually write."
+                let slice = UserWriteSlice::validate(ctx, user_buf, copy_len)?;
+                slice.write_from(&payload[..copy_len])?;
 
                 // Audit: sampled IPC recv event
                 {
@@ -1206,9 +1216,15 @@ impl SyscallDispatcher {
                 }
                 header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
 
-                write_user_buffer(ctx.cr3, user_buf, &header)?;
+                // ADR-020 Phase B: header and payload are two separate
+                // typed slices at adjacent addresses. Each validates its
+                // own (addr, len) independently.
+                let header_slice = UserWriteSlice::validate(ctx, user_buf, 36)?;
+                header_slice.write_from(&header)?;
                 if payload_len > 0 {
-                    write_user_buffer(ctx.cr3, user_buf + 36, &payload[..payload_len])?;
+                    let payload_slice =
+                        UserWriteSlice::validate(ctx, user_buf + 36, payload_len)?;
+                    payload_slice.write_from(&payload[..payload_len])?;
                 }
 
                 return Ok((36 + payload_len) as u64);
@@ -1306,9 +1322,14 @@ impl SyscallDispatcher {
             }
             header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
 
-            write_user_buffer(ctx.cr3, user_buf, &header)?;
+            // ADR-020 Phase B: mirror handle_recv_msg — typed slices
+            // per segment (header + payload).
+            let header_slice = UserWriteSlice::validate(ctx, user_buf, 36)?;
+            header_slice.write_from(&header)?;
             if payload_len > 0 {
-                write_user_buffer(ctx.cr3, user_buf + 36, &payload[..payload_len])?;
+                let payload_slice =
+                    UserWriteSlice::validate(ctx, user_buf + 36, payload_len)?;
+                payload_slice.write_from(&payload[..payload_len])?;
             }
 
             Ok((36 + payload_len) as u64)
