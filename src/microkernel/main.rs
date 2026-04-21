@@ -2064,6 +2064,9 @@ unsafe fn start_application_processors() {
         }
 
         // Own hart id (the BSP) — skip it when dispatching APs.
+        // SAFETY: BSP per-CPU storage is initialized earlier in boot
+        // (before AP dispatch), so `tp` holds a valid `&'static PerCpu`
+        // and `current_percpu()` returns a live reference.
         let bsp_hart_id = unsafe {
             arcos_core::arch::riscv64::percpu::current_percpu().apic_id()
         } as u64;
@@ -2098,6 +2101,12 @@ unsafe fn start_application_processors() {
                 );
                 break;
             }
+            // SAFETY: `hart_id` came from the DTB hart enumeration and
+            // is a valid hart. `ap_start_phys` is the LMA of `_ap_start`
+            // (computed above by subtracting the VMA→LMA offset the
+            // linker script fixes at build time). `next_cpu_idx` is
+            // bounded by `MAX_AP_BOOT_STACKS` (checked immediately
+            // above). SBI HSM accepts these as ecall args.
             let err = unsafe { sbi::sbi_hart_start(hart_id, ap_start_phys, next_cpu_idx) };
             if err == 0 {
                 println!(

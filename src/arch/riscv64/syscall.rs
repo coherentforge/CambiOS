@@ -90,6 +90,11 @@ pub unsafe extern "C" fn ecall_handler_inner(saved_sp: u64) -> u64 {
             // Write error to a0, skip past the ecall, keep the same
             // frame — we never had enough context to dispatch.
             let err = SyscallError::InvalidArg.as_i64() as u64;
+            // SAFETY: `frame` points at the SavedContext built by the trap
+            // vector (same invariant as the gpr reads at line 64). Offsets
+            // 10 (a0) and 32 (sepc) lie within the 33-slot context
+            // (gpr[0..32] + sepc at slot 32), so `frame.add(n)` stays in
+            // bounds.
             unsafe {
                 core::ptr::write_volatile(frame.add(10), err);
                 let sepc = core::ptr::read_volatile(frame.add(32)); // offset 256
