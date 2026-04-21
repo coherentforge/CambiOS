@@ -44,6 +44,8 @@
 // re-exports trip dead-code warnings; muted here.
 #![allow(dead_code)]
 
+use arcos_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT};
+use arcos_libinput_proto::decode_event;
 use arcos_libsys as sys;
 use arcos_libscanout::{
     decode_display_connected, encode_register_compositor, MsgTag,
@@ -77,6 +79,17 @@ pub extern "C" fn _start() -> ! {
         sys::exit(1);
     }
     sys::print(b"[COMPOSITOR] registered endpoint 28\r\n");
+
+    // Register the dedicated input endpoint (ADR-012 Input-1). Every
+    // input driver sends 96-byte raw InputEvents here; we forward to
+    // the focused window. If registration fails we continue — no
+    // graphics clients depend on input, so falling back to "input
+    // silently unavailable" is a survivable degraded mode.
+    if sys::register_endpoint(COMPOSITOR_INPUT_ENDPOINT) < 0 {
+        sys::log_error(b"COMPOSITOR", b"register_endpoint(30) failed");
+    } else {
+        sys::print(b"[COMPOSITOR] registered endpoint 30 (input)\r\n");
+    }
 
     // Boot-gate ordering: do the scanout handshake BEFORE calling
     // `module_ready()`. Downstream modules include hello-window
@@ -126,8 +139,56 @@ pub extern "C" fn _start() -> ! {
         if let DispatchOutcome::ClientFrame(view) = outcome {
             composite_and_present(&mut backend, &view);
         }
+        // Drain any pending input events. Each pump forwards one event
+        // to the focused window; a single scheduler tick may carry
+        // multiple key/pointer events, so drain in a tight inner loop
+        // rather than one-per-yield.
+        while pump_input_once(&window_table) {}
         sys::yield_now();
     }
+}
+
+// ============================================================================
+// Input routing
+// ============================================================================
+
+/// Drain one input event from `COMPOSITOR_INPUT_ENDPOINT` (if any) and
+/// forward it to the focused window. Returns `true` if an event was
+/// dispatched, `false` if the endpoint was empty.
+///
+/// v0 focus model: the focused window is the first live entry in the
+/// window table. Multi-window focus arbitration (last-clicked, Z-order,
+/// explicit focus API) lands with the first multi-window app.
+fn pump_input_once(window_table: &WindowTable) -> bool {
+    let mut buf = [0u8; RECV_HEADER_BYTES + INPUT_EVENT_SIZE];
+    let n = sys::try_recv_msg(COMPOSITOR_INPUT_ENDPOINT, &mut buf);
+    if n <= 0 {
+        return false;
+    }
+    let total = n as usize;
+    if total < RECV_HEADER_BYTES + INPUT_EVENT_SIZE {
+        return true; // malformed; advance so we don't re-read
+    }
+    let event = match decode_event(&buf[RECV_HEADER_BYTES..RECV_HEADER_BYTES + INPUT_EVENT_SIZE])
+    {
+        Some(e) => e,
+        None => return true,
+    };
+
+    // Find the focused window's reply endpoint. v0: first live window.
+    let target = match window_table.iter().next() {
+        Some(w) => w.client_endpoint,
+        None => return true, // no window to route to; drop event
+    };
+
+    // Forward as a tagged libgui-proto InputEvent message.
+    let mut send_buf = [0u8; 4 + INPUT_EVENT_SIZE];
+    let m = match encode_input_event(&mut send_buf, &event) {
+        Some(m) => m,
+        None => return true,
+    };
+    let _ = sys::write(target, &send_buf[..m]);
+    true
 }
 
 // ============================================================================

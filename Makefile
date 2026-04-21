@@ -49,6 +49,8 @@ SCANOUT_LIMINE_DIR := user/scanout-limine
 SCANOUT_LIMINE_ELF := $(SCANOUT_LIMINE_DIR)/target/x86_64-unknown-none/release/arcos-scanout-limine
 SCANOUT_VGPU_DIR := user/scanout-virtio-gpu
 SCANOUT_VGPU_ELF := $(SCANOUT_VGPU_DIR)/target/x86_64-unknown-none/release/arcos-scanout-virtio-gpu
+VIRTIO_INPUT_DIR := user/virtio-input
+VIRTIO_INPUT_ELF := $(VIRTIO_INPUT_DIR)/target/x86_64-unknown-none/release/arcos-virtio-input
 HELLO_WINDOW_DIR := user/hello-window
 HELLO_WINDOW_ELF := $(HELLO_WINDOW_DIR)/target/x86_64-unknown-none/release/arcos-hello-window
 
@@ -98,7 +100,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -194,6 +196,13 @@ scanout-virtio-gpu:
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== scanout-virtio-gpu ready ==="
+
+virtio-input:
+	@echo "=== Building virtio-input (ADR-012 Input-1) ==="
+	cd $(VIRTIO_INPUT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== virtio-input ready ==="
 
 hello-window:
 	@echo "=== Building hello-window (Phase Scanout-3, ADR-011) ==="
@@ -355,7 +364,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo compositor scanout-virtio-gpu hello-window sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu hello-window sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -376,6 +385,7 @@ iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo
 	cp $(FB_DEMO_ELF) iso_root/boot/fb-demo.elf
 	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
 	cp $(SCANOUT_VGPU_ELF) iso_root/boot/scanout-virtio-gpu.elf
+	cp $(VIRTIO_INPUT_ELF) iso_root/boot/virtio-input.elf
 	cp $(HELLO_WINDOW_ELF) iso_root/boot/hello-window.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
@@ -385,6 +395,7 @@ iso: kernel fs-service key-store-service virtio-blk shell policy-service fb-demo
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fb-demo.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-virtio-gpu.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-input.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello-window.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
@@ -457,6 +468,8 @@ run-gui: iso disk-img
 		-device virtio-net-pci \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 		-device virtio-blk-pci,drive=cambios-disk0 \
+		-device virtio-keyboard-pci \
+		-device virtio-mouse-pci \
 		-vga virtio \
 		-no-reboot \
 		-display cocoa

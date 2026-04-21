@@ -11,6 +11,7 @@ description = "CambiOS GUI client library. Wraps the client ↔ compositor proto
 [dependencies]
 arcos-libsys = { path = "../libsys" }
 arcos-libgui-proto = { path = "../libgui-proto" }
+arcos-libinput-proto = { path = "../libinput-proto" }
 
 [lib]
 name = "arcos_libgui"

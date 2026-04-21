@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 description = "Wire-format types and message tags for the CambiOS client ↔ compositor protocol (ADR-011). Shared by user/compositor and every GUI client; will be wrapped by libgui in a friendlier API once it lands."
 
 [dependencies]
+arcos-libinput-proto = { path = "../libinput-proto" }
 
 [lib]
 name = "arcos_libgui_proto"

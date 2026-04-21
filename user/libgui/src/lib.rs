@@ -71,6 +71,14 @@ pub use tile_grid::TileGrid;
 // same shape).
 pub use arcos_libgui_proto::Rect;
 
+// Re-export input types so a client doesn't need a second crate dep
+// for `Client::poll_event()`. When virtio-input land ships, clients
+// write `use arcos_libgui::{InputEvent, EventType, modifier, button}`.
+pub use arcos_libgui_proto::InputEvent;
+pub use arcos_libinput_proto::{
+    button, modifier, DeviceClass, EventType, KeyboardPayload, PointerPayload,
+};
+
 /// XRGB8888 color. `A` byte is always 0 (the top 8 bits of the u32
 /// are unused by the scanout; keeping them zero avoids accidental
 /// alpha semantics leaking in when the format grows).

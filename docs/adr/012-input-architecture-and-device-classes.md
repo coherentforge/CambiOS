@@ -217,4 +217,51 @@ The Hub-to-driver reverse direction (rumble, backlight, caps-lock LED, touch-fee
 
 ## Divergence
 
-*(appended as implementation diverges from the plan)*
+### 2026-04-21 — Input-0 + Input-1 landed via virtio-input (not ps2-kbd / ps2-mouse)
+
+**What changed from the plan.** The Decision section names `ps2-kbd` + `ps2-mouse` as the Input-1 drivers ("Phase GUI-2 of ADR-011"). The first driver actually landed is `user/virtio-input` — a single binary handling both classes over the modern virtio-pci transport already proven by scanout-virtio-gpu (same `SYS_VIRTIO_MODERN_CAPS = 38`, same cap-walk, same queue setup). Reasons:
+
+1. **Dev environment is QEMU-first.** PS/2 works on QEMU but virtio-input is the standard and shares the exact transport pattern we'd just finished for virtio-gpu in Scanout-4.a/4.b — mechanical copy of 150 LoC of transport + a different virtqueue shape (device-writable event pool instead of command+response chain). Writing PS/2 in parallel would have been a second hardware surface for no added capability.
+2. **Bare metal is USB HID, not PS/2.** Dell 3630's actual keyboard/mouse are USB HID (Input-3, post-v1). PS/2 as a bare-metal path would land for a hypothetical hardware we're not targeting. virtio-input fills the dev-environment role cleanly until USB HID lands.
+3. **No capability change.** ADR-012's event format is driver-agnostic; PS/2, virtio-input, USB HID, Bluetooth HID all produce the same 96-byte envelope. Swapping the first driver swaps no structural decisions.
+
+Input-0 (wire format) landed simultaneously as `user/libinput-proto` — a crate, not a libsys addition, because the format is shared between drivers, compositor, clients, and the future Hub. libsys remains a kernel-syscall wrapper; protocol crates live alongside it.
+
+**Compositor routing took an Input-1 shortcut pending the Hub.** ADR-012 § Phased implementation says Input-1 is "driver talks directly to compositor." The concrete implementation:
+
+- Compositor registers a dedicated `COMPOSITOR_INPUT_ENDPOINT = 30`. virtio-input sends 96-byte raw `InputEvent`s there (no wrapping tag — endpoint is dedicated).
+- Compositor forwards each event to the focused window via the existing client endpoint, with a new `libgui-proto::MsgTag::InputEvent = 0x4030` tag (the client endpoint is shared with WelcomeClient / WindowClosed / ErrorResponse traffic).
+- **Focus model is "first live window in the table."** Multi-window focus arbitration (last-clicked, z-order, explicit focus API) deferred until the first multi-window app exists. Single-window apps (hello-window, Tree) are unaffected.
+
+When the Input Hub lands (Input-2), the dedicated endpoint moves from compositor to Hub; compositor subscribes to the Hub as a consumer. The driver side doesn't change.
+
+**Trust tier model instantiated at tier 0.** virtio-input carries no device Principal, so every event is structurally tier 0 (legacy). `signature_block` is zeroed. The wire format preserves it so signed-carrier hardware (Input-5) can populate it without a format revision — the ADR-012 "format must already know about tier-3" commitment held. No tier-gated consumer exists today, so trust-tier policy is latent.
+
+**Libgui got a `Client::poll_event()` method.** Returns `Option<InputEvent>` via `sys::try_recv_msg` on the client's own endpoint, demuxes on `MsgTag`. Non-blocking; callers drain in a tight inner loop and `yield_now` when empty. This is the event-loop shape libgui clients speak. `WindowClosed` and `ErrorResponse` arrive on the same endpoint and are silently dropped in v0 — they get handled when an app actually cares (client-initiated destroy, runtime error surfacing).
+
+**hello-window proves the pipe.** After drawing its initial frame, it enters a poll loop that logs each received event to serial:
+
+```
+[HW] K:down hid=0x04 mod=0x02     # 'A' with LeftShift held
+[HW] K:up   hid=0x04
+[HW] Pmove dx=3 dy=-2
+[HW] Pbtn  buttons=0x01 (left)    # left mouse button pressed
+```
+
+This is the Tree-unblocker — the drawing substrate + event delivery are now both in place.
+
+**QEMU flags.** `make run-gui` adds `-device virtio-keyboard-pci -device virtio-mouse-pci` so QEMU exposes both classes. boot order in `limine.conf` puts `virtio-input` between `compositor` and `hello-window`: compositor registers ep30 first, then virtio-input scans PCI and starts polling, then hello-window opens a window ready to receive routed events.
+
+**aarch64 / riscv64 virtio-input deferred.** Matches scanout-virtio-gpu's x86_64-only landing pattern. Userspace crates don't factor into `make check-all` (which only builds the kernel); libinput-proto + libgui-proto updates are architecture-neutral and build for all three arches transitively through compositor/hello-window (aarch64).
+
+**Phases still deferred with triggers.**
+
+- **Input-2 (Hub)** — revisit when (a) a second input-consuming client appears, OR (b) signed-carrier / USB HID is on the horizon (whichever comes first). Today the compositor *is* the Hub, poorly. Event vocabulary + trust-tier tagging infrastructure land with the Hub; the current `COMPOSITOR_INPUT_ENDPOINT` constant moves to the Hub without driver-side changes.
+- **Input-3 (USB HID)** — post-v1; requires an XHCI driver. virtio-input remains the dev path; USB HID is the bare-metal path.
+- **Input-4 (Bluetooth HID)** — post-v1; requires a Bluetooth stack.
+- **Input-5 (signed-carrier keyboard)** — post-v1 hardware project. Triggers key-store trusted-input-device registry + policy-service tier-gating + passphrase UI.
+- **Input-6 (controller / tablet / touch)** — each its own phase when the first consumer exists.
+- **Capability kinds (`InputReadClass`, `InputReadDevice`, `InputTrustTier`, `InputWriteDevice`)** — reserved in ADR-012 § Capability model, not landed. They land with Input-2's Hub (no grant sites exist today).
+- **IRQ-driven event wake** — virtio-input polls like virtio-blk / scanout-virtio-gpu. Revisit when input latency is actually measured to be a problem (not expected under QEMU's tick granularity; more relevant for a future 1000 Hz gaming mouse on bare metal).
+
+**Open Questions unchanged.** Signature verification placement (driver vs Hub vs dedicated verify-service), trusted-input-device Principal enrollment, remote-session input, haptic output direction — all still deferred to the phase where hardware exists to motivate the answer.

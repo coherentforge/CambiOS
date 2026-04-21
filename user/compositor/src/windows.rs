@@ -162,7 +162,10 @@ pub fn handle_client_payload(
             None
         }
         // 0x40xx tags (compositor → client) must never arrive here.
-        MsgTag::WelcomeClient | MsgTag::WindowClosed | MsgTag::ErrorResponse => {
+        MsgTag::WelcomeClient
+        | MsgTag::WindowClosed
+        | MsgTag::ErrorResponse
+        | MsgTag::InputEvent => {
             send_error(from_endpoint, GuiError::InvalidMessage);
             None
         }

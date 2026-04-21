@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "arcos-libinput-proto"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Wire-format types and message tags for the CambiOS input stack (ADR-012). 96-byte normalized events shared by input drivers (virtio-input first), the compositor, and future Input Hub. Signature_block reserved from day one for signed-carrier input hardware."
+
+[dependencies]
+
+[lib]
+name = "arcos_libinput_proto"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false

@@ -7,12 +7,20 @@ name = "arcos-compositor"
 version = "0.1.0"
 dependencies = [
  "arcos-libgui-proto",
+ "arcos-libinput-proto",
  "arcos-libscanout",
  "arcos-libsys",
 ]
 
 [[package]]
 name = "arcos-libgui-proto"
+version = "0.1.0"
+dependencies = [
+ "arcos-libinput-proto",
+]
+
+[[package]]
+name = "arcos-libinput-proto"
 version = "0.1.0"
 
 [[package]]

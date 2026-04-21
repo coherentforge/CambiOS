@@ -45,18 +45,30 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+pub use arcos_libinput_proto::{InputEvent, EVENT_SIZE as INPUT_EVENT_SIZE};
+
 // ============================================================================
 // Endpoints
 // ============================================================================
 
-/// Compositor's listening IPC endpoint. Must match
-/// `arcos_libscanout::COMPOSITOR_ENDPOINT` — the compositor only
-/// registers one endpoint and dispatches inbound messages by
-/// [`MsgTag`] high byte (0x20xx = scanout-driver, 0x30xx = client).
+/// Compositor's control endpoint — scanout-driver messages (0x20xx),
+/// client messages (0x30xx), and compositor replies (0x40xx) all flow
+/// here.
 ///
-/// Kept duplicated across the two protocol crates rather than
-/// cross-imported so libgui-proto has no dependencies of its own.
+/// Kept duplicated from `arcos_libscanout::COMPOSITOR_ENDPOINT` rather
+/// than cross-imported so libgui-proto keeps its single dependency
+/// (`arcos-libinput-proto`, added for InputEvent forwarding) minimal.
 pub const COMPOSITOR_ENDPOINT: u32 = 28;
+
+/// Compositor's *input* endpoint — ADR-012 Input-1 path. virtio-input
+/// (and any future PS/2 / USB HID / Bluetooth driver) sends
+/// normalised `InputEvent`s here, 96 bytes per message, raw — no
+/// wrapping tag, because this endpoint only carries input events.
+///
+/// When the Input Hub (ADR-012 Input-2) lands this number moves to
+/// the Hub; the compositor connects to the Hub as a consumer and
+/// keeps the same routing code.
+pub const COMPOSITOR_INPUT_ENDPOINT: u32 = 30;
 
 // ============================================================================
 // Bounds
@@ -189,6 +201,10 @@ pub enum MsgTag {
     WelcomeClient = 0x4001,
     WindowClosed = 0x4010,
     ErrorResponse = 0x4020,
+    /// Input event forwarded from the compositor to the focused window.
+    /// Payload is the 96-byte [`InputEvent`] wire format defined by
+    /// `arcos-libinput-proto` (ADR-012).
+    InputEvent = 0x4030,
 }
 
 impl MsgTag {
@@ -200,6 +216,7 @@ impl MsgTag {
             0x4001 => Some(Self::WelcomeClient),
             0x4010 => Some(Self::WindowClosed),
             0x4020 => Some(Self::ErrorResponse),
+            0x4030 => Some(Self::InputEvent),
             _ => None,
         }
     }
@@ -437,6 +454,28 @@ pub fn decode_error_response(buf: &[u8]) -> Option<GuiError> {
     GuiError::from_u8(buf[4])
 }
 
+/// `InputEvent` — compositor → client. Layout:
+/// `[tag:4][event:96]` = 100 bytes total. The 96-byte payload is the
+/// libinput-proto wire format unchanged (ADR-012) — the compositor
+/// forwards driver events verbatim plus the tag.
+pub fn encode_input_event(buf: &mut [u8], event: &InputEvent) -> Option<usize> {
+    if buf.len() < 4 + INPUT_EVENT_SIZE {
+        return None;
+    }
+    buf[..4].copy_from_slice(&MsgTag::InputEvent.as_u32().to_le_bytes());
+    arcos_libinput_proto::encode_event(&mut buf[4..4 + INPUT_EVENT_SIZE], event)?;
+    Some(4 + INPUT_EVENT_SIZE)
+}
+
+pub fn decode_input_event(buf: &[u8]) -> Option<InputEvent> {
+    if buf.len() < 4 + INPUT_EVENT_SIZE
+        || u32::from_le_bytes(buf[0..4].try_into().ok()?) != MsgTag::InputEvent.as_u32()
+    {
+        return None;
+    }
+    arcos_libinput_proto::decode_event(&buf[4..4 + INPUT_EVENT_SIZE])
+}
+
 // ============================================================================
 // Tests — protocol round-trips
 // ============================================================================
@@ -565,9 +604,42 @@ mod tests {
         for tag in [MsgTag::CreateWindow, MsgTag::FrameReady, MsgTag::DestroyWindow] {
             assert_eq!(tag.as_u32() >> 12, 3, "client→compositor tag {:?} wrong direction", tag);
         }
-        for tag in [MsgTag::WelcomeClient, MsgTag::WindowClosed, MsgTag::ErrorResponse] {
+        for tag in [
+            MsgTag::WelcomeClient,
+            MsgTag::WindowClosed,
+            MsgTag::ErrorResponse,
+            MsgTag::InputEvent,
+        ] {
             assert_eq!(tag.as_u32() >> 12, 4, "compositor→client tag {:?} wrong direction", tag);
         }
+    }
+
+    #[test]
+    fn input_event_roundtrip() {
+        use arcos_libinput_proto::{EventType, KeyboardPayload};
+        let ev = InputEvent::key(
+            EventType::KeyDown,
+            /* device_id */ 1,
+            /* seq */ 99,
+            /* ts */ 0x12345,
+            KeyboardPayload {
+                keycode: 0x04,
+                modifiers: 0,
+                unicode: 0,
+            },
+        );
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let n = encode_input_event(&mut buf, &ev).unwrap();
+        assert_eq!(n, 4 + INPUT_EVENT_SIZE);
+        let decoded = decode_input_event(&buf).unwrap();
+        assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn input_event_rejects_wrong_tag() {
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        encode_welcome_client(&mut buf, 1, 1, 1, 1, 4, 32, PixelFormat::Xrgb8888).unwrap();
+        assert!(decode_input_event(&buf).is_none());
     }
 
     #[test]

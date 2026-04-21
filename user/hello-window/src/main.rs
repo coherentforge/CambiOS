@@ -20,7 +20,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{Client, Color, Rect, TileGrid};
+use arcos_libgui::{button, Client, Color, EventType, InputEvent, Rect, TileGrid};
 use arcos_libsys as sys;
 
 const HELLO_WINDOW_ENDPOINT: u32 = 29;
@@ -91,12 +91,119 @@ pub extern "C" fn _start() -> ! {
     }
     sys::print(b"[HELLO-WINDOW] frame submitted -- window visible\r\n");
 
-    // Idle forever — keep the surface channel alive so the
-    // compositor can keep reading it. A real app with an event
-    // loop would redraw on events; v0 drew once.
+    // Event loop — poll for input events from the compositor and
+    // log them to serial. This is the libgui v0 event-loop shape:
+    // drain events in a tight inner loop, yield when idle. A real app
+    // re-draws on events; Tree will.
+    //
+    // Logging format (observable in `make run-gui` serial):
+    //   [HW] K:down hid=0x04 mod=0x02     # 'A' with LeftShift
+    //   [HW] K:up   hid=0x04 mod=0x00
+    //   [HW] Pmove dx=3 dy=-2
+    //   [HW] Pbtn  buttons=0x01            # left button down
+    sys::print(b"[HELLO-WINDOW] entering event loop\r\n");
     loop {
-        sys::yield_now();
+        let mut drained = false;
+        while let Some(ev) = client.poll_event() {
+            drained = true;
+            log_event(&ev);
+        }
+        if !drained {
+            sys::yield_now();
+        }
     }
+}
+
+fn log_event(ev: &InputEvent) {
+    match ev.event_type {
+        EventType::KeyDown => {
+            sys::print(b"[HW] K:down hid=");
+            print_hex(ev.keyboard().keycode as u64);
+            sys::print(b" mod=");
+            print_hex(ev.keyboard().modifiers as u64);
+            sys::print(b"\r\n");
+        }
+        EventType::KeyUp => {
+            sys::print(b"[HW] K:up   hid=");
+            print_hex(ev.keyboard().keycode as u64);
+            sys::print(b"\r\n");
+        }
+        EventType::KeyRepeat => {
+            sys::print(b"[HW] K:rep  hid=");
+            print_hex(ev.keyboard().keycode as u64);
+            sys::print(b"\r\n");
+        }
+        EventType::PointerMove => {
+            let p = ev.pointer();
+            sys::print(b"[HW] Pmove dx=");
+            print_int(p.dx as i64);
+            sys::print(b" dy=");
+            print_int(p.dy as i64);
+            sys::print(b"\r\n");
+        }
+        EventType::PointerButton => {
+            let p = ev.pointer();
+            sys::print(b"[HW] Pbtn  buttons=");
+            print_hex(p.buttons as u64);
+            if p.buttons & button::LEFT != 0 {
+                sys::print(b" (left)");
+            }
+            sys::print(b"\r\n");
+        }
+        EventType::PointerScroll => {
+            let p = ev.pointer();
+            sys::print(b"[HW] Pscroll sy=");
+            print_int(p.scroll_y as i64);
+            sys::print(b"\r\n");
+        }
+        _ => {}
+    }
+}
+
+fn print_hex(v: u64) {
+    sys::print(b"0x");
+    let mut buf = [0u8; 16];
+    let mut n = v;
+    for i in 0..16 {
+        let nib = (n & 0xF) as u8;
+        buf[15 - i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        n >>= 4;
+    }
+    // Trim leading zeros for readability, but keep at least two digits.
+    let mut start = 0;
+    while start < 14 && buf[start] == b'0' {
+        start += 1;
+    }
+    sys::print(&buf[start..]);
+}
+
+fn print_int(v: i64) {
+    if v < 0 {
+        sys::print(b"-");
+        print_u64_dec((-v) as u64);
+    } else {
+        print_u64_dec(v as u64);
+    }
+}
+
+fn print_u64_dec(n: u64) {
+    if n == 0 {
+        sys::print(b"0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut m = n;
+    let mut len = 0;
+    while m > 0 {
+        buf[len] = b'0' + (m % 10) as u8;
+        m /= 10;
+        len += 1;
+    }
+    let mut out = [0u8; 20];
+    for i in 0..len {
+        out[i] = buf[len - 1 - i];
+    }
+    sys::print(&out[..len]);
 }
 
 #[panic_handler]

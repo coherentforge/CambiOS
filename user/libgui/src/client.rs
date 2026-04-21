@@ -15,12 +15,16 @@
 //! don't hide protocol primitives.
 
 use arcos_libgui_proto::{
-    decode_welcome_client, encode_create_window, encode_frame_ready, Rect, COMPOSITOR_ENDPOINT,
-    MAX_MESSAGE_SIZE,
+    decode_input_event, decode_welcome_client, encode_create_window, encode_frame_ready,
+    InputEvent, MsgTag, Rect, COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
 };
 use arcos_libsys as sys;
 
 use crate::Surface;
+
+/// Bytes the kernel prepends to a `recv_msg` / `try_recv_msg` result:
+/// 32-byte sender_principal + 4-byte from_endpoint.
+const RECV_HEADER_BYTES: usize = 36;
 
 /// Reasons `Client::open` can fail. The kernel error code is folded
 /// into the enum where it exists so callers can log root cause.
@@ -186,5 +190,41 @@ impl Client {
     /// for `submit(&[])`.
     pub fn submit_full(&mut self) -> Result<(), ClientError> {
         self.submit(&[])
+    }
+
+    /// Non-blocking poll for a single compositor message. Returns
+    /// `Some(InputEvent)` if a forwarded driver event is waiting;
+    /// `None` on empty queue, malformed header, or any non-input
+    /// compositor message (`WindowClosed`, `ErrorResponse`).
+    ///
+    /// Call this repeatedly from the client's event loop, typically
+    /// interleaved with `sys::yield_now()` between drain cycles so
+    /// the scheduler can run other tasks while input is idle.
+    ///
+    /// v0 does not handle `WindowClosed` — a real app would want to
+    /// learn its window went away. Added when the first app actually
+    /// destroys / re-creates windows at runtime.
+    pub fn poll_event(&mut self) -> Option<InputEvent> {
+        // 36-byte recv header + 4-byte tag + 96-byte event = 136 B.
+        // Round up to 160 for slack against future tag variants.
+        let mut buf = [0u8; 160];
+        let n = sys::try_recv_msg(self.my_endpoint, &mut buf);
+        if n <= 0 {
+            return None;
+        }
+        let total = n as usize;
+        if total < RECV_HEADER_BYTES + 4 {
+            return None;
+        }
+        let payload = &buf[RECV_HEADER_BYTES..total];
+        let tag_bytes: [u8; 4] = payload[0..4].try_into().ok()?;
+        let tag = MsgTag::from_u32(u32::from_le_bytes(tag_bytes))?;
+        match tag {
+            MsgTag::InputEvent => decode_input_event(payload),
+            // WindowClosed / ErrorResponse arrive on the same endpoint;
+            // v0 silently drops them. Future: surface via a separate
+            // `poll_notification()` or a combined `poll_message()`.
+            _ => None,
+        }
     }
 }
