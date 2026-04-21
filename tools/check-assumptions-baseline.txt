@@ -264,11 +264,6 @@ src/memory/mod.rs:76:ENTRIES_PER_TABLE
 src/memory/mod.rs:608:BOOTLOADER_BASE
 src/memory/mod.rs:611:KERNEL_LOAD_ADDR
 src/memory/mod.rs:614:EXTENDED_MEMORY_BASE
-src/microkernel/main.rs:440:GICD_PHYS
-src/microkernel/main.rs:441:GICR_PHYS
-src/microkernel/main.rs:1316:MAX_RESERVED_MAP_SIZE
-src/microkernel/main.rs:1910:GICR_PHYS
-src/microkernel/main.rs:2191:MAX_SPINS
 src/pci/mod.rs:29:MAX_PCI_DEVICES
 src/pci/mod.rs:33:CONFIG_ADDRESS
 src/pci/mod.rs:37:CONFIG_DATA

@@ -231,13 +231,18 @@ unsafe extern "C" fn kmain() -> ! {
     // and never touches `limine::*` types (modulo the AP-wakeup path in
     // `ap_entry`, which depends on Limine's MP active-wake mechanism and is
     // documented in src/boot/limine.rs as a deferred abstraction).
+    // ADR-021 Phase 021.B.1: boot-adapter failures return BootError
+    // rather than panicking. kmain returns `!` so we can't use `?`;
+    // dispatch to boot_failed on error so the halt path is the single
+    // typed boot-failure landing instead of a stack of .expect panics.
     arcos_core::boot::limine::populate(
         &HHDM_REQUEST,
         &MEMORY_MAP_REQUEST,
         &FRAMEBUFFER_REQUEST,
         &RSDP_REQUEST,
         &MODULE_REQUEST,
-    );
+    )
+    .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
 
     let hhdm_offset = arcos_core::hhdm_offset();
     println!("HHDM offset: {:#x}", hhdm_offset);
@@ -437,7 +442,12 @@ unsafe extern "C" fn kmain() -> ! {
 
             // Initialize GIC Distributor (SPI routing, priorities)
             // QEMU virt physical addresses, translated through HHDM
+            /// HARDWARE: ARM GICv3 Distributor base on QEMU `virt`.
+            /// Platform-fixed by QEMU's `virt` machine; real hardware
+            /// discovers this from the device tree or ACPI MADT.
             const GICD_PHYS: u64 = 0x0800_0000;
+            /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`.
+            /// Platform-fixed by QEMU; see `GICD_PHYS` above.
             const GICR_PHYS: u64 = 0x080A_0000;
             let hhdm = arcos_core::hhdm_offset();
             arcos_core::arch::aarch64::gic::init_distributor(GICD_PHYS + hhdm);
@@ -1313,6 +1323,11 @@ fn map_acpi_regions(rsdp_phys: u64) {
     // or Reserved regions (SeaBIOS puts ACPI tables in Reserved memory).
     // Map small Reserved regions (< 1 MB) to safely cover BIOS data and ACPI tables
     // without accidentally mapping huge MMIO ranges.
+    /// TUNING: ceiling on Reserved-region size that still qualifies
+    /// for HHDM remapping. 1 MiB covers typical BIOS/ACPI regions
+    /// while excluding accidental huge MMIO ranges in the same
+    /// memory-map classification. Replace when a platform appears
+    /// with legitimate Reserved-kind ACPI data above 1 MiB.
     const MAX_RESERVED_MAP_SIZE: u64 = 1024 * 1024; // 1 MB
     let mut mapped_pages = 0usize;
     for region in arcos_core::boot::info().memory_regions() {
@@ -1907,6 +1922,10 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
         arcos_core::arch::aarch64::gic::init();
 
         // Step 5: Initialize GIC Redistributor for this AP
+        /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`;
+        /// matches the BSP constant of the same name above. Every
+        /// AP walks its own redistributor at `base + cpu_index*stride`
+        /// inside `init_redistributor`.
         const GICR_PHYS: u64 = 0x080A_0000;
         let hhdm = arcos_core::hhdm_offset();
         arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
@@ -2188,6 +2207,12 @@ unsafe fn start_application_processors() {
     // Wait for all APs to signal ready (with timeout)
     let expected = ap_count as u32;
     let mut spin_count: u64 = 0;
+    /// TUNING: spin-loop ceiling while waiting for all APs to reach
+    /// their ready signal. 100M ≈ a few seconds on modern hardware,
+    /// which is well above any realistic AP wake latency and short
+    /// enough that a failed AP doesn't hang boot indefinitely.
+    /// Replace when a platform with slow AP bring-up (rare) or many
+    /// cores (> ~32) needs a larger budget.
     const MAX_SPINS: u64 = 100_000_000; // ~a few seconds on modern hardware
 
     while AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire) < expected {

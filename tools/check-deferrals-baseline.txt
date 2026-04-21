@@ -77,11 +77,10 @@ src/fs/virtio_blk_device.rs:79:deferred
 src/lib.rs:87:TBD
 src/memory/mod.rs:630:placeholder
 src/memory/mod.rs:639:placeholder
-src/microkernel/main.rs:233:deferred
-src/microkernel/main.rs:819:for-now
-src/microkernel/main.rs:1726:deferred
-src/microkernel/main.rs:1755:deferred
-src/microkernel/main.rs:2052:for-now
+src/microkernel/main.rs:829:for-now
+src/microkernel/main.rs:1741:deferred
+src/microkernel/main.rs:1770:deferred
+src/microkernel/main.rs:2071:for-now
 src/platform/mod.rs:352:for-now
 src/scheduler/mod.rs:260:placeholder
 src/scheduler/mod.rs:261:placeholder

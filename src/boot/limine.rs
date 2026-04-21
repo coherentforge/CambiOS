@@ -24,7 +24,8 @@ use limine::request::{
 };
 
 use crate::boot::{
-    BootInfo, FramebufferInfo, MAX_MODULE_NAME_LEN, MemoryRegion, MemoryRegionKind, ModuleInfo,
+    BootError, BootInfo, FramebufferInfo, MAX_MODULE_NAME_LEN, MemoryRegion, MemoryRegionKind,
+    ModuleInfo,
 };
 use crate::boot_modules::strip_module_name;
 
@@ -38,9 +39,11 @@ use crate::boot_modules::strip_module_name;
 ///
 /// # Behaviour
 ///
-/// - HHDM offset: required. Panics if Limine did not answer the HHDM
-///   request — the kernel cannot proceed without it.
-/// - Memory map: required. Panics if absent.
+/// - HHDM offset: required. Returns [`BootError::LimineHhdmMissing`]
+///   if Limine did not answer the HHDM request — the kernel cannot
+///   proceed without it.
+/// - Memory map: required. Returns [`BootError::LimineMemoryMapMissing`]
+///   if absent.
 /// - Framebuffers: optional; an empty list is acceptable (headless boot).
 /// - RSDP: optional; absent means no ACPI (acceptable on AArch64).
 /// - Modules: optional; an empty list means no boot modules to load.
@@ -53,18 +56,18 @@ pub fn populate(
     framebuffer: &FramebufferRequest,
     rsdp: &RsdpRequest,
     modules: &ModuleRequest,
-) {
+) -> Result<(), BootError> {
     let mut info = BootInfo::empty();
 
     info.hhdm_offset = hhdm
         .get_response()
-        .expect("Limine HHDM response missing")
+        .ok_or(BootError::LimineHhdmMissing)?
         .offset();
     let hhdm_offset = info.hhdm_offset;
 
     let memmap_resp = memmap
         .get_response()
-        .expect("Limine memory map response missing");
+        .ok_or(BootError::LimineMemoryMapMissing)?;
     let mut dropped_regions = 0usize;
     for entry in memmap_resp.entries() {
         let region = MemoryRegion {
@@ -153,6 +156,7 @@ pub fn populate(
     }
 
     crate::boot::install(info);
+    Ok(())
 }
 
 /// Map Limine's `EntryType` into our protocol-agnostic
