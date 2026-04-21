@@ -92,8 +92,16 @@ pub trait ScanoutBackend {
     /// send "full surface dirty" instead.
     fn submit_frame(&mut self, display_id: u32, damage: &[Rect]) -> Result<(), ScanoutError>;
 
-    /// Non-blocking poll for a scanout event (hotplug, ack, mode change).
-    fn poll_event(&mut self) -> Option<ScanoutEvent>;
+    /// Feed a scanout-driver message (already received from the
+    /// compositor endpoint, with the 36-byte IPC header stripped) into
+    /// this backend. Returns a decoded event on success, `None` if the
+    /// payload is malformed or of a tag this backend doesn't consume.
+    ///
+    /// Scanout-3 split this out of the old `poll_event()`: the
+    /// compositor now owns the `try_recv_msg` loop at ep28 (it has to,
+    /// so client messages reach the client dispatch path) and hands
+    /// scanout-direction payloads down.
+    fn handle_scanout_payload(&mut self, payload: &[u8]) -> Option<ScanoutEvent>;
 
     /// Request a mode change for a display (e.g. user resized
     /// resolution). Driver responds asynchronously with
@@ -134,7 +142,7 @@ impl ScanoutBackend for HeadlessBackend {
         Err(ScanoutError::Headless)
     }
 
-    fn poll_event(&mut self) -> Option<ScanoutEvent> {
+    fn handle_scanout_payload(&mut self, _payload: &[u8]) -> Option<ScanoutEvent> {
         None
     }
 
@@ -226,21 +234,10 @@ impl ScanoutBackend for LimineFbBackend {
         Ok(())
     }
 
-    fn poll_event(&mut self) -> Option<ScanoutEvent> {
-        // Non-blocking recv. recv_msg blocks; try_recv_msg returns 0 if
-        // empty. We need the latter to keep the render loop responsive.
-        let mut buf = [0u8; 320];
-        let n = sys::try_recv_msg(COMPOSITOR_ENDPOINT, &mut buf);
-        if n <= 0 {
+    fn handle_scanout_payload(&mut self, payload: &[u8]) -> Option<ScanoutEvent> {
+        if payload.len() < 4 {
             return None;
         }
-        let total = n as usize;
-        if total < 36 + 4 {
-            return None;
-        }
-        // Skip the 36-byte sender_principal + from_endpoint header that
-        // recv_msg prepends; the decoder operates on the payload only.
-        let payload = &buf[36..total];
         let tag_bytes: [u8; 4] = payload[0..4].try_into().ok()?;
         let tag = MsgTag::from_u32(u32::from_le_bytes(tag_bytes))?;
         match tag {
@@ -298,10 +295,10 @@ impl ScanoutBackend for Backend {
         }
     }
 
-    fn poll_event(&mut self) -> Option<ScanoutEvent> {
+    fn handle_scanout_payload(&mut self, payload: &[u8]) -> Option<ScanoutEvent> {
         match self {
-            Self::Headless(b) => b.poll_event(),
-            Self::Limine(b) => b.poll_event(),
+            Self::Headless(b) => b.handle_scanout_payload(payload),
+            Self::Limine(b) => b.handle_scanout_payload(payload),
         }
     }
 

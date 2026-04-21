@@ -3,20 +3,15 @@
 version = 4
 
 [[package]]
-name = "arcos-compositor"
+name = "arcos-hello-window"
 version = "0.1.0"
 dependencies = [
  "arcos-libgui-proto",
- "arcos-libscanout",
  "arcos-libsys",
 ]
 
 [[package]]
 name = "arcos-libgui-proto"
-version = "0.1.0"
-
-[[package]]
-name = "arcos-libscanout"
 version = "0.1.0"
 
 [[package]]

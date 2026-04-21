@@ -1,0 +1,19 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
+[package]
+name = "arcos-libgui-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Wire-format types and message tags for the CambiOS client ↔ compositor protocol (ADR-011). Shared by user/compositor and every GUI client; will be wrapped by libgui in a friendlier API once it lands."
+
+[dependencies]
+
+[lib]
+name = "arcos_libgui_proto"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false

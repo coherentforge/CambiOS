@@ -1,13 +1,13 @@
 # Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
 
 [package]
-name = "arcos-compositor"
+name = "arcos-hello-window"
 version = "0.1.0"
 edition = "2021"
+description = "CambiOS first GUI client — Phase Scanout-3 (ADR-011). Opens one window via the compositor, fills it with a solid color, and idles. Validates the full client → compositor → scanout-driver → framebuffer chain."
 
 [dependencies]
 arcos-libsys = { path = "../libsys" }
-arcos-libscanout = { path = "../libscanout" }
 arcos-libgui-proto = { path = "../libgui-proto" }
 
 [profile.release]
