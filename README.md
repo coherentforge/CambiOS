@@ -70,9 +70,9 @@ The full build / test / lint commands and their rationale live in [CLAUDE.md](CL
 
 ## Architecture
 
-CambiOS is a microkernel. The kernel handles five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Filesystems, networking, device drivers, window management, and every other service run as isolated user-space processes communicating over capability-checked IPC.
+CambiOS starts with a microkernel. This foundation handles five things: scheduling, memory management, IPC, syscall dispatch, and cryptographic identity. Filesystems, networking, device drivers, window management, and every other service run as isolated user-space processes communicating over capability-checked IPC.
 
-This is structural isolation, not policy. A buggy filesystem service cannot corrupt the kernel. A compromised network driver cannot read another process's memory. A malicious module cannot forge the identity of a peer.
+This is structural isolation, rather than policy. A buggy filesystem service cannot corrupt the kernel. A compromised network driver cannot read another process's memory. A malicious module cannot forge the identity of a peer.
 
 ### Enforcement pipeline
 
