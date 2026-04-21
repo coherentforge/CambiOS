@@ -226,13 +226,16 @@ Narrative walkthroughs that follow a concrete thing through the system, useful i
 
 ## Licensing
 
-The CambiOS microkernel, filesystem, and networking stack are **MIT licensed**. Use them freely, build on them, fork them.
+CambiOS is dual-licensed.
 
-The user-space ecosystem — drivers, identity services, hardware compatibility layers — is **GPLv3**. Contribute back.
+- **Kernel, services, host tools, and first-party applications: [AGPLv3-or-later](LICENSE).** Modifications, derivatives, and network-service uses must stay open under AGPL. The "generative, not extractive" posture enforced by a license that keeps the stack visible and the contributions open.
+- **User-space syscall library ([user/libsys/](user/libsys/LICENSE)): [MPL-2.0](user/libsys/LICENSE).** File-level copyleft — modifications to libsys must stay open, but applications that *link* libsys are free to ship under any license the application author chooses. Permits proprietary third-party apps on CambiOS without forcing the kernel or services into permissive territory.
 
-The kernel only loads signed modules. Coherent Forge signs GPL-compliant modules for the official distribution. Users control their own trust chain: add signing keys, remove ours, replace it entirely. It's their machine.
+Every source file carries an `SPDX-License-Identifier:` header. Per-crate `license` fields are set in each `Cargo.toml`. The bucketing is mechanical: files under `user/libsys/` are MPL-2.0; everything else is AGPL-3.0-or-later.
 
-Anyone can fork the code. The MIT license allows it. But the name **CambiOS** belongs to the distribution whose security model is intact. Code enforcement is technical; naming enforcement is legal.
+The kernel only loads signed modules. Users control their own trust chain: add signing keys, remove the default, replace it entirely. It's their machine.
+
+Anyone can fork the code — the license permits it. The name **CambiOS** belongs to the distribution whose security model is intact. Code enforcement is technical; naming enforcement is legal.
 
 ---
 

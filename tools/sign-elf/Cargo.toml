@@ -1,9 +1,11 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
 
 [package]
 name = "sign-elf"
 version = "0.3.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 description = "CambiOS ELF signing tool — Ed25519 via YubiKey or seed"
 
 [dependencies]

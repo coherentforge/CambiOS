@@ -1,4 +1,5 @@
-// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Jason Ricca
 
 //! Kernel audit event infrastructure (Phase 3.3, ADR-007).
 //!

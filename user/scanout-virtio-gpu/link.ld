@@ -1,4 +1,5 @@
-/* Copyright (C) 2024-2026 Jason Ricca. All rights reserved. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2024-2026 Jason Ricca */
 
 /* CambiOS user-space ELF linker script (scanout-virtio-gpu, x86_64) — Phase Scanout-4 (ADR-014). */
 OUTPUT_FORMAT("elf64-x86-64")

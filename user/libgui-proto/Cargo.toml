@@ -1,9 +1,11 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
 
 [package]
 name = "arcos-libgui-proto"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 description = "Wire-format types and message tags for the CambiOS client ↔ compositor protocol (ADR-011). Shared by user/compositor and every GUI client; will be wrapped by libgui in a friendlier API once it lands."
 
 [dependencies]

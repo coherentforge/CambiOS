@@ -45,7 +45,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **AArch64 QEMU MUST use** `-machine virt,gic-version=3` (GICv3 required for ICC system registers).
 - **RISC-V QEMU MUST use** `-machine virt -bios default` (loads OpenSBI as M-mode firmware; the kernel is the S-mode payload). No vendor-specific machine types — generic-first per [ADR-013](docs/adr/013-riscv64-architecture-support.md).
 - **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Use `make check-all` (x86_64 + aarch64 + riscv64) as the permanent gate — R-6 landed 2026-04-19 so all three arches are now buildable at every commit boundary. `make check-stable` (x86_64 + aarch64 only) remains available as an escape hatch for future temporary backend breakage; the discipline is identical either way — no commits regress any *currently buildable* arch.
-- **ALWAYS*** all new files are tagged for copyright: // Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+- **ALWAYS** all new files get an SPDX license header + copyright at the top. Default: `// SPDX-License-Identifier: AGPL-3.0-or-later` then `// Copyright (C) 2024-2026 Jason Ricca` on the next line. Files under `user/libsys/` use `// SPDX-License-Identifier: MPL-2.0` instead. Adapt the comment syntax to file type (`#` for .toml/.py/.sh/Makefile; `/* ... */` for .ld/.S linker scripts and assembly). Do NOT use "All rights reserved" — a license grant supersedes reserved rights, and the SPDX header is the load-bearing declaration.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
 
 ## Stop-and-Ask Gate

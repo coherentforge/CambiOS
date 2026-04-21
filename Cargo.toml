@@ -1,4 +1,5 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
 
 [workspace]
 # User-space crates and tools are built separately (different targets, linker scripts).
@@ -9,6 +10,7 @@ exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user
 name = "arcos"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 authors = ["CambiOS Development Team"]
 
 [dependencies]

@@ -1,4 +1,5 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
 
 # Standalone proof crate for the kernel's BuddyAllocator. Excluded from the
 # kernel workspace (see root Cargo.toml). Builds under Kani's bundled
@@ -12,6 +13,7 @@
 name = "buddy-proofs"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [lib]

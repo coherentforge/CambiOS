@@ -1,9 +1,11 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
 
 [package]
 name = "arcos-libscanout"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 description = "Wire-format types and message tags for the CambiOS compositor ↔ scanout-driver protocol (ADR-014). Shared by user/compositor and every user/scanout-* implementation."
 
 [dependencies]

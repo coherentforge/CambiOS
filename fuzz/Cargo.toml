@@ -1,10 +1,12 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
 
 [package]
 name = "arcos-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [package.metadata]
 cargo-fuzz = true

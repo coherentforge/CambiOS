@@ -1,4 +1,5 @@
-// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Jason Ricca
 
 //! Terminal: composes a [`Backend`] with the [`Parser`] and exposes an
 //! event-polling API that resolves the lone-ESC ambiguity via caller-

@@ -1,4 +1,5 @@
-// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Jason Ricca
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]

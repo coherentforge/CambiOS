@@ -1,4 +1,5 @@
-// Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2024-2026 Jason Ricca
 
 //! CambiOS user-space syscall library
 //!

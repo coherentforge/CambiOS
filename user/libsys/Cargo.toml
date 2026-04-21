@@ -1,6 +1,8 @@
-# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (C) 2024-2026 Jason Ricca
 
 [package]
 name = "arcos-libsys"
 version = "0.1.0"
 edition = "2021"
+license = "MPL-2.0"
