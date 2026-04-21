@@ -10,7 +10,7 @@ description = "CambiOS first GUI client — Phase Scanout-3 (ADR-011). Opens one
 
 [dependencies]
 arcos-libsys = { path = "../libsys" }
-arcos-libgui-proto = { path = "../libgui-proto" }
+arcos-libgui = { path = "../libgui" }
 
 [profile.release]
 opt-level = "s"

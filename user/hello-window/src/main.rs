@@ -1,174 +1,99 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! CambiOS hello-window — Phase Scanout-3 (ADR-011).
+//! CambiOS hello-window — first `arcos-libgui` client (ADR-011).
 //!
-//! First GUI client. Minimum-viable client that proves the end-to-end
-//! pipe from a userspace application through the compositor to pixels
-//! on the display. The contract:
+//! Post-libgui-v0 form: the compositor handshake, channel attach,
+//! pixel fill, and FrameReady submit are all one call each through
+//! `arcos-libgui`. Previously this binary open-coded the protocol
+//! (~100 lines of `sys::write` / `sys::recv_verified` / manual
+//! pointer fill); now it's ~20 lines of libgui calls and exercises
+//! every v0 primitive (rect fill, line, text, tile grid).
 //!
-//! 1. `_start` → register endpoint 29 (so the compositor can reply),
-//!    signal `module_ready`.
-//! 2. Send [`CreateWindow`] to the compositor's well-known endpoint
-//!    (`COMPOSITOR_ENDPOINT = 28`). Request a 640×480 window — small
-//!    enough to not cover the whole QEMU FB so the cyan "first-pixels"
-//!    test frame underneath stays visible (useful debug cue).
-//! 3. Block on [`recv_verified`] for [`WelcomeClient`]. Extract
-//!    `window_id`, `channel_id`, and surface geometry.
-//! 4. [`channel_attach`] the surface channel. Surface is
-//!    `ChannelRole::Consumer` from the compositor's perspective, so
-//!    we're the Producer → map is writable.
-//! 5. Fill the surface with a solid color (bright green 0x00C800 in
-//!    XRGB8888).
-//! 6. Send [`FrameReady`] — no damage rects = "full surface dirty".
-//! 7. Idle loop. Real clients redraw; this one drew once.
-//!
-//! What this binary explicitly does NOT do:
-//!
-//! - No widgets, no layout, no text. libgui wraps this protocol in
-//!   widget-tree semantics later.
-//! - No input handling. Scanout-3 doesn't wire input; nothing drives
-//!   a mouse cursor yet.
-//! - No graceful shutdown. Process stays alive so the window stays
-//!   visible — exiting would close the channel and the compositor
-//!   would tear the window down.
+//! Visible behaviour is unchanged: a 640×480 window filled with
+//! bright green over the compositor's test frame, now with a few
+//! extra visual proof-points (a white border line, an "HELLO LIBGUI"
+//! text label, and a small 4×3 tile grid) so a regression in any
+//! libgui primitive is visible without opening the debugger.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui_proto::{
-    decode_welcome_client, encode_create_window, encode_frame_ready, COMPOSITOR_ENDPOINT,
-};
+use arcos_libgui::{Client, Color, Rect, TileGrid};
 use arcos_libsys as sys;
 
-/// This client's reply endpoint. The kernel's `REPLY_ENDPOINT`
-/// registry records the first endpoint a process registers and uses
-/// it as the `from_endpoint` on outbound messages — so the compositor
-/// gets this number stamped on every CreateWindow / FrameReady we
-/// send, and replies land back here.
-///
-/// SCAFFOLDING: hard-coded endpoint numbers for demo clients are a
-/// v0 shortcut. Real clients will pick an endpoint from a dynamic
-/// pool when the user-space endpoint service lands.
-/// Replace when: first non-boot-module GUI client needs a window.
 const HELLO_WINDOW_ENDPOINT: u32 = 29;
-
-/// Target window dimensions (pixels). 640×480 chosen to fit within
-/// the QEMU default 1280×800 FB with the cyan "first-pixels" cyan
-/// frame still visible around it — a useful visual cue when
-/// debugging.
 const WINDOW_WIDTH: u32 = 640;
 const WINDOW_HEIGHT: u32 = 480;
-
-/// Bright green in XRGB8888: R=0x00, G=0xC8, B=0x00 packed as
-/// `(R << 16) | (G << 8) | B`. Saturated-but-not-neon, easy to pick
-/// out against a cyan or black background.
-const FILL_COLOR: u32 = (0x00 << 16) | (0xC8 << 8) | 0x00;
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[HELLO-WINDOW] Phase Scanout-3 (ADR-011)\r\n");
+    sys::print(b"[HELLO-WINDOW] libgui v0 client\r\n");
 
-    if sys::register_endpoint(HELLO_WINDOW_ENDPOINT) < 0 {
-        sys::log_error(b"HELLO-WINDOW", b"register_endpoint(29) failed");
-        sys::exit(1);
-    }
-    sys::print(b"[HELLO-WINDOW] registered endpoint 29\r\n");
-
-    // Release the boot gate. hello-window is a leaf client — no other
-    // module waits on us — so signalling ready immediately unblocks
-    // the next module in BOOT_MODULE_ORDER.
+    // hello-window is a leaf boot module — release the boot gate
+    // immediately so the next module (shell) can start, in parallel
+    // with our compositor handshake. (`libgui::Client` intentionally
+    // does NOT call `module_ready`; that's a boot-ordering concern
+    // orthogonal to what libgui wraps.)
     sys::module_ready();
 
-    // --- 1. Send CreateWindow ---
-    let mut send_buf = [0u8; 16];
-    let n = match encode_create_window(&mut send_buf, WINDOW_WIDTH, WINDOW_HEIGHT) {
-        Some(n) => n,
-        None => {
-            sys::print(b"[HELLO-WINDOW] encode_create_window failed\r\n");
+    let mut client = match Client::open(WINDOW_WIDTH, WINDOW_HEIGHT, HELLO_WINDOW_ENDPOINT) {
+        Ok(c) => c,
+        Err(_) => {
+            sys::log_error(b"HELLO-WINDOW", b"Client::open failed");
             sys::exit(1);
         }
     };
-    if sys::write(COMPOSITOR_ENDPOINT, &send_buf[..n]) < 0 {
-        sys::print(b"[HELLO-WINDOW] write CreateWindow failed\r\n");
+    sys::print(b"[HELLO-WINDOW] window opened, drawing\r\n");
+
+    let w = client.width();
+    let h = client.height();
+    {
+        let mut surf = client.surface_mut();
+
+        // Fill background bright green (preserves the visual
+        // contract from the open-coded Scanout-3 hello-window).
+        surf.clear(Color::rgb(0x00, 0xC8, 0x00));
+
+        // White border — exercises draw_line on long horizontals
+        // and verticals.
+        surf.draw_line(0, 0, (w - 1) as i32, 0, Color::WHITE);
+        surf.draw_line(0, (h - 1) as i32, (w - 1) as i32, (h - 1) as i32, Color::WHITE);
+        surf.draw_line(0, 0, 0, (h - 1) as i32, Color::WHITE);
+        surf.draw_line((w - 1) as i32, 0, (w - 1) as i32, (h - 1) as i32, Color::WHITE);
+
+        // Inset black panel behind the text so glyphs are readable
+        // against the green.
+        surf.fill_rect(Rect { x: 16, y: 16, w: 120, h: 32 }, Color::BLACK);
+        surf.draw_text_builtin(24, 24, "HELLO LIBGUI", Color::WHITE);
+
+        // A small 4×3 tile grid below — the "I could build Tree on
+        // top of this" canary. Each tile filled red, outlined white.
+        let grid = TileGrid::new(16, 64, 24, 24, 4, 3, 4);
+        for (_col, _row, rect) in grid.iter() {
+            surf.fill_rect(rect, Color::RED);
+            let x0 = rect.x as i32;
+            let y0 = rect.y as i32;
+            let x1 = x0 + rect.w as i32 - 1;
+            let y1 = y0 + rect.h as i32 - 1;
+            surf.draw_line(x0, y0, x1, y0, Color::WHITE);
+            surf.draw_line(x0, y1, x1, y1, Color::WHITE);
+            surf.draw_line(x0, y0, x0, y1, Color::WHITE);
+            surf.draw_line(x1, y0, x1, y1, Color::WHITE);
+        }
+    }
+
+    if client.submit_full().is_err() {
+        sys::log_error(b"HELLO-WINDOW", b"submit_full failed");
         sys::exit(1);
     }
-    sys::print(b"[HELLO-WINDOW] sent CreateWindow 640x480\r\n");
+    sys::print(b"[HELLO-WINDOW] frame submitted -- window visible\r\n");
 
-    // --- 2. Block for WelcomeClient ---
-    let mut recv_buf = [0u8; 128];
-    let welcome = match sys::recv_verified(HELLO_WINDOW_ENDPOINT, &mut recv_buf) {
-        Some(v) => v,
-        None => {
-            sys::print(b"[HELLO-WINDOW] recv_verified failed\r\n");
-            sys::exit(1);
-        }
-    };
-    let msg = match decode_welcome_client(welcome.payload()) {
-        Some(m) => m,
-        None => {
-            sys::print(b"[HELLO-WINDOW] decode_welcome_client failed\r\n");
-            sys::exit(1);
-        }
-    };
-    sys::print(b"[HELLO-WINDOW] received WelcomeClient\r\n");
-
-    // --- 3. Attach to surface channel ---
-    let vaddr_or_err = sys::channel_attach(msg.channel_id);
-    if vaddr_or_err < 0 {
-        sys::print(b"[HELLO-WINDOW] channel_attach failed\r\n");
-        sys::exit(1);
-    }
-    let surface_vaddr = vaddr_or_err as u64;
-    sys::print(b"[HELLO-WINDOW] attached surface channel\r\n");
-
-    // --- 4. Paint the surface solid green ---
-    // SAFETY:
-    // - `surface_vaddr` is this process's mapping of the surface
-    //   channel, returned by `channel_attach`. The peer role
-    //   (compositor created as Consumer, we're the Producer) grants
-    //   us RW access for the full size agreed at create time.
-    // - Pitch × height is the bound the compositor allocated,
-    //   advertised back to us in WelcomeClient. Loops are bounded by
-    //   it.
-    // - `write_volatile` prevents the compiler from eliding the
-    //   fill — the compositor reads this memory from another
-    //   process, and from our POV there's no local observer.
-    let pitch_pixels = (msg.pitch / 4) as usize;
-    let width = msg.width as usize;
-    let height = msg.height as usize;
-    #[allow(unsafe_code)]
-    unsafe {
-        let base = surface_vaddr as *mut u32;
-        for y in 0..height {
-            let row = base.add(y * pitch_pixels);
-            for x in 0..width {
-                row.add(x).write_volatile(FILL_COLOR);
-            }
-        }
-    }
-    sys::print(b"[HELLO-WINDOW] surface painted green\r\n");
-
-    // --- 5. Submit FrameReady (full surface dirty) ---
-    let mut fr_buf = [0u8; 32];
-    let n = match encode_frame_ready(&mut fr_buf, msg.window_id, /* seq */ 0, &[]) {
-        Some(n) => n,
-        None => {
-            sys::print(b"[HELLO-WINDOW] encode_frame_ready failed\r\n");
-            sys::exit(1);
-        }
-    };
-    if sys::write(COMPOSITOR_ENDPOINT, &fr_buf[..n]) < 0 {
-        sys::print(b"[HELLO-WINDOW] write FrameReady failed\r\n");
-        sys::exit(1);
-    }
-    sys::print(b"[HELLO-WINDOW] sent FrameReady -- window should now be visible\r\n");
-
-    // --- 6. Idle forever ---
-    // Keep the channel alive so the surface stays readable by the
-    // compositor. A real client re-draws on events; we drew once.
+    // Idle forever — keep the surface channel alive so the
+    // compositor can keep reading it. A real app with an event
+    // loop would redraw on events; v0 drew once.
     loop {
         sys::yield_now();
     }

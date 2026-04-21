@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "arcos-libgui"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS GUI client library. Wraps the client ↔ compositor protocol (arcos-libgui-proto) with a safe Surface API, drawing primitives (fill_rect, draw_line, draw_text, blit_bitmap), a built-in bitmap font, and a TileGrid helper. Sized for first-party apps (e.g. Tree)."
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
+arcos-libgui-proto = { path = "../libgui-proto" }
+
+[lib]
+name = "arcos_libgui"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false

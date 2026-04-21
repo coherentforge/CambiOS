@@ -3,14 +3,6 @@
 version = 4
 
 [[package]]
-name = "arcos-hello-window"
-version = "0.1.0"
-dependencies = [
- "arcos-libgui",
- "arcos-libsys",
-]
-
-[[package]]
 name = "arcos-libgui"
 version = "0.1.0"
 dependencies = [
