@@ -13,6 +13,7 @@
 use arcos_libgui::{Color, Rect, Surface, TileGrid};
 
 use crate::game::{Board, Cell, State, BOARD_SIZE, MINE_COUNT};
+use crate::sprites;
 
 // --- window / layout geometry (const so the caller can query) ---
 
@@ -36,11 +37,12 @@ const COLOR_BG: Color = Color::rgb(0x1E, 0x2A, 0x14); // deep forest-floor
 const COLOR_STATUS_BG: Color = Color::rgb(0x2B, 0x1C, 0x0E); // darker dirt
 const COLOR_GRASS: Color = Color::rgb(0x5A, 0x8F, 0x3E); // covered tile
 const COLOR_GRASS_DARK: Color = Color::rgb(0x3E, 0x6A, 0x2A); // shade for grass edges
+const COLOR_GRASS_TUFT: Color = Color::rgb(0x78, 0xA8, 0x48); // grass tuft highlight
 const COLOR_GRASS_HOVER: Color = Color::rgb(0xC8, 0xE8, 0xA0); // hovered-tile outline
 const COLOR_DIRT: Color = Color::rgb(0x8B, 0x5A, 0x2B); // revealed non-mine
 const COLOR_DIRT_DARK: Color = Color::rgb(0x5B, 0x3A, 0x1B); // dirt edge
-const COLOR_TREE_GONE: Color = Color::rgb(0x4A, 0x2B, 0x14); // revealed mine (lost)
-const COLOR_FLAG: Color = Color::rgb(0xE8, 0xD8, 0x2E); // flag glyph
+const COLOR_DIRT_SPECK_LIGHT: Color = Color::rgb(0xB0, 0x7C, 0x40); // lighter pebble
+const COLOR_DIRT_SPECK_DARK: Color = Color::rgb(0x6A, 0x3F, 0x1A); // darker pebble
 const COLOR_TEXT: Color = Color::WHITE;
 
 // Classic minesweeper adjacency digit palette.
@@ -141,21 +143,32 @@ fn draw_status_bar(surf: &mut Surface, board: &Board) {
         Rect { x: 0, y: 0, w: WINDOW_W as u16, h: STATUS_BAR_H as u16 },
         COLOR_STATUS_BG,
     );
-    // "FLAGS N/10" — uppercase because the built-in font's lowercase
-    // glyphs are blank placeholders (see libgui::font).
-    let mut buf = [0u8; 16];
-    let n = format_flags(&mut buf, board.flags_placed(), MINE_COUNT);
-    let label = core::str::from_utf8(&buf[..n]).unwrap_or("FLAGS ?");
-    surf.draw_text_builtin(16, 16, label, COLOR_TEXT);
 
-    // "TREE" title on the right as a visual anchor.
-    let title = "TREE";
-    let title_w = title.len() as i32 * 8;
+    // "TREE" title on the left as the app identifier.
+    surf.draw_text_builtin(16, 16, "TREE", Color::rgb(0xB0, 0xE0, 0x90));
+
+    // "FLAGS N/10" on the right. Uppercase because the built-in
+    // font's lowercase glyphs are blank placeholders (see libgui::font).
+    //
+    // On a win, display MINE_COUNT/MINE_COUNT regardless of how many
+    // flags the player actually placed: a win implies every mine was
+    // accounted for (9 dug-around trees + 1 implicitly-identified
+    // last tree). Without the override, a player who solved without
+    // needing to flag the last mine sees "FLAGS 9/10" under the
+    // reforestation banner and it feels incomplete.
+    let displayed_flags = match board.state() {
+        State::Won => MINE_COUNT,
+        _ => board.flags_placed(),
+    };
+    let mut buf = [0u8; 16];
+    let n = format_flags(&mut buf, displayed_flags, MINE_COUNT);
+    let label = core::str::from_utf8(&buf[..n]).unwrap_or("FLAGS ?");
+    let label_w = n as i32 * 8;
     surf.draw_text_builtin(
-        WINDOW_W as i32 - 16 - title_w,
+        WINDOW_W as i32 - 16 - label_w,
         16,
-        title,
-        Color::rgb(0xB0, 0xE0, 0x90),
+        label,
+        COLOR_TEXT,
     );
 }
 
@@ -164,41 +177,124 @@ fn draw_tile(surf: &mut Surface, board: &Board, row: u8, col: u8, rect: Rect) {
     let is_mine = board.is_mine(row, col);
     let state = board.state();
 
+    // End-state overrides for mine tiles. Once the game is over, the
+    // board is a tableau (forest on win, graveyard on loss) rather
+    // than an interactive surface — every mine displays its final
+    // form regardless of whether the player flagged it, revealed it,
+    // or left it covered. Flagged non-mines fall through to the
+    // normal cell-state branch (their seeds just never grew).
+    if is_mine {
+        match state {
+            State::Won => {
+                fill_grass_tile(surf, rect, row, col);
+                sprites::draw_centered(
+                    surf,
+                    rect.x as i32,
+                    rect.y as i32,
+                    TILE_PX,
+                    &sprites::TREE,
+                );
+                return;
+            }
+            State::Lost => {
+                fill_dirt_tile(surf, rect, row, col);
+                sprites::draw_centered(
+                    surf,
+                    rect.x as i32,
+                    rect.y as i32,
+                    TILE_PX,
+                    &sprites::STUMP,
+                );
+                return;
+            }
+            State::Playing => {}
+        }
+    }
+
     match cell {
         Cell::Covered => {
-            // On loss, reveal un-flagged mines so the player sees
-            // where they were. Matches minesweeper convention.
-            if state == State::Lost && is_mine {
-                surf.fill_rect(rect, COLOR_TREE_GONE);
-                outline_rect_inset(surf, rect, COLOR_DIRT_DARK);
-                draw_centered_char(surf, rect, b'T', Color::rgb(0xE0, 0x40, 0x40));
-            } else {
-                surf.fill_rect(rect, COLOR_GRASS);
-                outline_rect_inset(surf, rect, COLOR_GRASS_DARK);
-            }
+            fill_grass_tile(surf, rect, row, col);
         }
         Cell::Flagged => {
-            surf.fill_rect(rect, COLOR_GRASS);
-            outline_rect_inset(surf, rect, COLOR_GRASS_DARK);
-            // On loss, show wrong flags with a different mark — but
-            // for v0 keep it simple: flag is always the F glyph.
-            draw_centered_char(surf, rect, b'F', COLOR_FLAG);
+            fill_grass_tile(surf, rect, row, col);
+            // Planted seed — on win, this gets overridden above to
+            // show a full TREE. Here we render the "waiting to grow"
+            // state.
+            sprites::draw_centered(
+                surf,
+                rect.x as i32,
+                rect.y as i32,
+                TILE_PX,
+                &sprites::SEED,
+            );
         }
         Cell::Revealed => {
-            if is_mine {
-                // The tile the player actually dug up to end the game.
-                surf.fill_rect(rect, COLOR_TREE_GONE);
-                outline_rect_inset(surf, rect, COLOR_DIRT_DARK);
-                draw_centered_char(surf, rect, b'T', Color::rgb(0xFF, 0x30, 0x30));
-            } else {
-                surf.fill_rect(rect, COLOR_DIRT);
-                outline_rect_inset(surf, rect, COLOR_DIRT_DARK);
-                let adj = board.adjacent(row, col);
-                if adj > 0 {
-                    draw_centered_char(surf, rect, b'0' + adj, digit_color(adj));
-                }
+            // is_mine mid-play (the clicked mine that ended the game)
+            // is already handled in the end-state branch above when
+            // state transitions to Lost. Reaching here with
+            // is_mine == true would mean "game in progress AND this
+            // cell holds a revealed mine," which is unreachable in
+            // the current state machine. Silence the warning by
+            // falling through to the dirt branch.
+            fill_dirt_tile(surf, rect, row, col);
+            let adj = board.adjacent(row, col);
+            if adj > 0 {
+                draw_centered_char(surf, rect, b'0' + adj, digit_color(adj));
             }
         }
+    }
+}
+
+// ============================================================================
+// Tile ground textures. Each tile gets a handful of deterministic
+// noise pixels derived from its (row, col) position — so the texture
+// is stable across redraws (no shimmer), varies between adjacent
+// tiles (no visible tiling), and costs nothing to compute. 12 fixed
+// intra-tile offsets, rotated per tile to pick different subsets.
+// ============================================================================
+
+/// Intra-tile (dx, dy) offsets for ground noise. All values in
+/// [2, TILE_PX-2] so noise never bleeds into the edge outline.
+const NOISE_OFFSETS: [(u8, u8); 12] = [
+    (4, 5),  (11, 3),  (19, 7),  (24, 14),
+    (3, 18), (8, 24),  (15, 20), (22, 25),
+    (6, 13), (13, 11), (20, 16), (17, 27),
+];
+
+fn fill_grass_tile(surf: &mut Surface, rect: Rect, row: u8, col: u8) {
+    surf.fill_rect(rect, COLOR_GRASS);
+    outline_rect_inset(surf, rect, COLOR_GRASS_DARK);
+
+    // 4 tufts per tile. Each tuft is a 2px vertical tick in a darker
+    // green, suggesting a blade of grass catching light differently.
+    let base_x = rect.x as i32;
+    let base_y = rect.y as i32;
+    let rot = ((row as usize).wrapping_mul(7).wrapping_add((col as usize).wrapping_mul(13))) % NOISE_OFFSETS.len();
+    for i in 0..4 {
+        let (dx, dy) = NOISE_OFFSETS[(rot + i) % NOISE_OFFSETS.len()];
+        let x = base_x + dx as i32;
+        let y = base_y + dy as i32;
+        surf.set_pixel(x, y, COLOR_GRASS_TUFT);
+        surf.set_pixel(x, y + 1, COLOR_GRASS_TUFT);
+    }
+}
+
+fn fill_dirt_tile(surf: &mut Surface, rect: Rect, row: u8, col: u8) {
+    surf.fill_rect(rect, COLOR_DIRT);
+    outline_rect_inset(surf, rect, COLOR_DIRT_DARK);
+
+    // 6 specks per tile — mix of lighter and darker pebble tones.
+    // Reuses NOISE_OFFSETS rotated by a different stride so grass
+    // and dirt textures don't visually align across reveal events.
+    let base_x = rect.x as i32;
+    let base_y = rect.y as i32;
+    let rot = ((row as usize).wrapping_mul(11).wrapping_add((col as usize).wrapping_mul(5))) % NOISE_OFFSETS.len();
+    for i in 0..6 {
+        let (dx, dy) = NOISE_OFFSETS[(rot + i) % NOISE_OFFSETS.len()];
+        let x = base_x + dx as i32;
+        let y = base_y + dy as i32;
+        let c = if i & 1 == 0 { COLOR_DIRT_SPECK_LIGHT } else { COLOR_DIRT_SPECK_DARK };
+        surf.set_pixel(x, y, c);
     }
 }
 

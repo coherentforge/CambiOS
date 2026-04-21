@@ -42,6 +42,7 @@ use arcos_libsys as sys;
 
 mod game;
 mod render;
+mod sprites;
 
 use game::{Board, RevealOutcome, State};
 
@@ -154,6 +155,17 @@ fn handle_event(
             // clear so we won't re-trigger. If auto-repeat-on-hold
             // becomes a problem we add edge tracking.
             let p = ev.pointer();
+
+            // End-state right-click resets, regardless of cursor
+            // position. No flag / reveal semantics apply to a frozen
+            // board, and right-click is the thumb-reachable button
+            // that pairs naturally with R / Escape for "I'm done
+            // looking, give me a new game."
+            if p.buttons & button::RIGHT != 0 && board.state() != State::Playing {
+                board.reset();
+                return true;
+            }
+
             let hovered = tile_at_cursor(*cursor_x, *cursor_y);
             let (col, row) = match hovered {
                 Some(v) => v,
