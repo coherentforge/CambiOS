@@ -234,6 +234,28 @@ pub enum SyscallNumber {
     /// Arg layout matches RecvMsg: arg1=endpoint, arg2=user_buf, arg3=buf_len.
     /// Returns: bytes received (>=36 for header + payload) or 0 if empty.
     TryRecvMsg = 37,
+
+    /// SYS_VIRTIO_MODERN_CAPS (38): return the kernel-parsed virtio-modern
+    /// PCI capabilities for a given device index (virtio spec §4.1.4).
+    /// Needed by modern virtio-pci drivers (virtio-gpu, future virtio
+    /// devices) to discover the (BAR, offset) locations of the common,
+    /// notify, ISR, and device-specific config regions without touching
+    /// PCI configuration space themselves.
+    ///
+    /// Args: arg1 = device_index (u32), arg2 = out_buf (user ptr),
+    ///       arg3 = buf_len (usize; must equal
+    ///              `size_of::<pci::VirtioModernCaps>()` = 64).
+    ///
+    /// Writes a 64-byte `VirtioModernCaps` structure to `out_buf`.
+    /// `caps.present == 0` means the device is not a virtio-modern
+    /// device (caller must check before using the cap fields).
+    /// Returns 0 on success, negative error on invalid index / buffer.
+    ///
+    /// Identity-required but not capability-gated: same privacy class
+    /// as `DeviceInfo` (information-disclosure only; no MMIO mapping,
+    /// no config-space writes). Built on ADR-020 `UserWriteSlice` from
+    /// day one.
+    VirtioModernCaps = 38,
 }
 
 impl SyscallNumber {
@@ -261,7 +283,8 @@ impl SyscallNumber {
             Self::ChannelCreate | Self::ChannelAttach |
             Self::ChannelClose | Self::ChannelRevoke | Self::ChannelInfo |
             Self::AuditAttach | Self::AuditInfo |
-            Self::MapFramebuffer
+            Self::MapFramebuffer |
+            Self::VirtioModernCaps
         )
     }
 
@@ -306,6 +329,7 @@ impl SyscallNumber {
             35 => Some(Self::MapFramebuffer),
             36 => Some(Self::ModuleReady),
             37 => Some(Self::TryRecvMsg),
+            38 => Some(Self::VirtioModernCaps),
             _ => None,
         }
     }
@@ -479,7 +503,7 @@ mod tests {
             SyscallNumber::ChannelInfo, SyscallNumber::AuditAttach,
             SyscallNumber::AuditInfo,
             SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
-            SyscallNumber::TryRecvMsg,
+            SyscallNumber::TryRecvMsg, SyscallNumber::VirtioModernCaps,
         ];
 
         for &num in &all {
@@ -505,9 +529,9 @@ mod tests {
 
     #[test]
     fn all_syscall_numbers_covered() {
-        // Verify from_u64 round-trips for all defined values (0..=37),
+        // Verify from_u64 round-trips for all defined values (0..=38),
         // ensuring no gap in the requires_identity() match.
-        for i in 0..=37u64 {
+        for i in 0..=38u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             // Just exercise requires_identity to confirm no panic

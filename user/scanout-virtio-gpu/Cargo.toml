@@ -1,0 +1,18 @@
+# Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+
+[package]
+name = "arcos-scanout-virtio-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "CambiOS scanout driver — virtio-gpu (modern virtio-pci) backend (Phase Scanout-4, ADR-014). 4.a: PCI probe + transport init + GET_DISPLAY_INFO; no compositor protocol integration yet (deferred to 4.b)."
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
+arcos-libscanout = { path = "../libscanout" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

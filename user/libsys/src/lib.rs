@@ -569,6 +569,69 @@ pub fn port_write32(port: u16, value: u32) -> Result<(), i64> {
 }
 
 // ============================================================================
+// Virtio-modern PCI capability discovery (ADR-014 Scanout-4.a)
+// ============================================================================
+//
+// Modern virtio-pci drivers (virtio-gpu and future virtio devices) need
+// the (BAR, offset) locations of the common-config, notify, ISR, and
+// device-specific-config register structures. The kernel parses the PCI
+// capability list at boot; this syscall retrieves the parsed result.
+//
+// Byte layout must match `arcos::pci::VirtioModernCaps` exactly.
+
+const SYS_VIRTIO_MODERN_CAPS: u64 = 38;
+
+/// One virtio-pci capability entry (virtio spec §4.1.4.1).
+///
+/// `bar` is the BAR index (0..=5); `offset` and `length` locate the
+/// register structure within that BAR. All zero when the cap type
+/// was not present on the device.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioPciCapEntry {
+    pub bar: u8,
+    pub _pad: [u8; 3],
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Parsed virtio-modern capability set for a PCI device.
+///
+/// `present == 0` means the device is not a virtio-modern device, or its
+/// capability list contained no recognized virtio entries. Drivers MUST
+/// check `present` before using the cap fields.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioModernCaps {
+    pub common_cfg: VirtioPciCapEntry,
+    pub notify_cfg: VirtioPciCapEntry,
+    pub notify_off_multiplier: u32,
+    pub _pad: u32,
+    pub isr_cfg: VirtioPciCapEntry,
+    pub device_cfg: VirtioPciCapEntry,
+    pub present: u8,
+    pub _pad2: [u8; 7],
+}
+
+/// Retrieve the kernel-parsed virtio-modern capabilities for the PCI
+/// device at `index`. Returns `None` on a bad index or if the syscall
+/// otherwise fails. `caps.present == 0` distinguishes "not a virtio
+/// device" from "index out of range" (the latter returns `None`).
+pub fn virtio_modern_caps(index: u32) -> Option<VirtioModernCaps> {
+    let mut caps = VirtioModernCaps::default();
+    let r = syscall_raw3(
+        SYS_VIRTIO_MODERN_CAPS,
+        index as u64,
+        &mut caps as *mut VirtioModernCaps as u64,
+        core::mem::size_of::<VirtioModernCaps>() as u64,
+    );
+    if r < 0 {
+        return None;
+    }
+    Some(caps)
+}
+
+// ============================================================================
 // Shell / interactive syscalls
 // ============================================================================
 

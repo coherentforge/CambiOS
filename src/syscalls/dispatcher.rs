@@ -355,6 +355,9 @@ impl SyscallDispatcher {
             // Phase GUI-0: graphics primitives (ADR-011)
             SyscallNumber::MapFramebuffer => Self::handle_map_framebuffer(args, &ctx),
             SyscallNumber::ModuleReady => Self::handle_module_ready(args, &ctx),
+
+            // Phase Scanout-4.a: virtio-modern PCI capability discovery (ADR-014)
+            SyscallNumber::VirtioModernCaps => Self::handle_virtio_modern_caps(args, &ctx),
         }
     }
 
@@ -1981,6 +1984,51 @@ impl SyscallDispatcher {
     #[cfg(not(target_arch = "x86_64"))]
     fn handle_device_info(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
         Err(SyscallError::Enosys)
+    }
+
+    /// SYS_VIRTIO_MODERN_CAPS: write kernel-parsed virtio-modern caps for a
+    /// PCI device into a user buffer.
+    ///
+    /// Args: arg1 = device_index (u32), arg2 = out_buf (user vaddr),
+    ///       arg3 = buf_len (usize, must equal
+    ///              `size_of::<pci::VirtioModernCaps>()`).
+    ///
+    /// Writes the 64-byte `VirtioModernCaps` struct to `out_buf`. Returns
+    /// 0 on success, `InvalidArg` on bad index or buffer. Uses ADR-020
+    /// `UserWriteSlice` from day one — the `(addr, len)` pair is
+    /// validated into a typed slice before any write.
+    fn handle_virtio_modern_caps(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::syscalls::user_slice::UserWriteSlice;
+
+        let index = args.arg1_u32() as usize;
+        let out_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        const CAPS_SIZE: usize = core::mem::size_of::<crate::pci::VirtioModernCaps>();
+        if buf_len != CAPS_SIZE {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Typed-slice validation (ADR-020): cr3 non-zero, canonical range,
+        // length bounds, no overflow. Consume below with `write_from`.
+        let slice = UserWriteSlice::validate(ctx, out_buf, buf_len)?;
+
+        let dev = crate::pci::get_device(index).ok_or(SyscallError::InvalidArg)?;
+        let caps = dev.virtio_modern;
+
+        // SAFETY: `VirtioModernCaps` is `#[repr(C)]` with plain u8 / u32
+        // fields and fixed-size pad arrays; no padding reads uninitialized
+        // memory, no references, no drop glue. Viewing as a byte slice of
+        // its own size is well-defined. Borrow lifetime bounded by `caps`
+        // on the local stack.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &caps as *const crate::pci::VirtioModernCaps as *const u8,
+                CAPS_SIZE,
+            )
+        };
+        slice.write_from(bytes)?;
+        Ok(0)
     }
 
     /// SYS_PORT_IO: Validated port I/O from user-space.
