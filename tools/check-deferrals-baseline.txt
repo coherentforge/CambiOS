@@ -6,7 +6,6 @@ CLAUDE.md:10:eventually
 CLAUDE.md:250:deferred
 CLAUDE.md:535:deferred
 STATUS.md:13:figure-out
-STATUS.md:161:deferred
 docs/CambiOS.md:226:deferred
 docs/CambiOS.md:365:deferred
 docs/CambiOS.md:446:deferred

@@ -414,16 +414,21 @@ unsafe fn decode_bars(
 // Virtio-modern capability list walk (x86_64 only)
 // ---------------------------------------------------------------------------
 
-/// PCI Status register bit 4 — "Capabilities List" (header type 0 devices).
+/// HARDWARE: PCI Local Bus Spec 3.0 §6.2.3 — Status register bit 4,
+/// "Capabilities List," set when a header-type-0 device advertises a
+/// linked list of extended capabilities starting at byte 0x34.
 pub(crate) const STATUS_CAP_LIST: u16 = 0x0010;
 
-/// PCI config offset of the Status register (upper 16 bits of dword at 0x04).
+/// HARDWARE: PCI Local Bus Spec 3.0 §6.1 — config-space offset of the
+/// 16-bit Status register (upper half of dword at 0x04).
 pub(crate) const STATUS_OFFSET: usize = 0x06;
 
-/// PCI config offset of the Capabilities Pointer (header type 0).
+/// HARDWARE: PCI Local Bus Spec 3.0 §6.2.10 — config-space offset of the
+/// Capabilities Pointer (header type 0; points at the first cap entry).
 pub(crate) const CAPABILITIES_PTR_OFFSET: usize = 0x34;
 
-/// PCI vendor-specific capability ID used by virtio.
+/// HARDWARE: PCI Local Bus Spec 3.0 — vendor-specific capability ID.
+/// Virtio-modern uses this ID with its own layout (virtio spec §4.1.4).
 pub(crate) const CAP_VENDOR_SPECIFIC: u8 = 0x09;
 
 /// SCAFFOLDING: hard bound on capability-list walk iterations.
@@ -436,13 +441,20 @@ pub(crate) const CAP_VENDOR_SPECIFIC: u8 = 0x09;
 /// lands and we need to accommodate longer cap chains.
 pub(crate) const MAX_CAP_WALK_ITERATIONS: usize = 64;
 
-/// Virtio-pci capability `cfg_type` values (virtio spec §4.1.4).
+/// HARDWARE: virtio spec §4.1.4 `cfg_type` values identifying which of
+/// the four virtio-modern capability structures a given PCI cap entry
+/// describes (common cfg, notify cfg, ISR cfg, device-specific cfg).
 pub(crate) const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+/// HARDWARE: virtio spec §4.1.4.4 — notify (doorbell) capability type.
 pub(crate) const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+/// HARDWARE: virtio spec §4.1.4.5 — ISR status capability type.
 pub(crate) const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+/// HARDWARE: virtio spec §4.1.4.6 — device-specific configuration type.
 pub(crate) const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-/// Size of standard (non-PCIe-extended) PCI configuration space.
+/// HARDWARE: PCI Local Bus Spec 3.0 §6.1 — standard (non-PCIe-extended)
+/// configuration space is 256 bytes. PCIe extended config (4 KiB) is
+/// accessed via ECAM and is out of scope until a device needs it.
 pub(crate) const PCI_CONFIG_SPACE_SIZE: usize = 256;
 
 /// Read a byte from a config-space snapshot at `offset`, returning 0 on
@@ -735,14 +747,14 @@ pub fn find_by_vendor_device(vendor: u16, device: u16) -> Option<&'static PciDev
 // same syscall shape — currently riscv64 virtio-mmio, see ADR-013 / R-6)
 // ---------------------------------------------------------------------------
 
-/// Virtio vendor ID used for synthetic virtio-mmio entries, matching the
-/// OASIS virtio-over-PCI convention so user-space service discovery code
-/// (e.g. `find_virtio_blk()`) recognizes the synthetic entries without
-/// special-casing the carrier.
+/// HARDWARE: OASIS virtio-over-PCI convention — the vendor ID every
+/// virtio device carries. Used here for synthetic virtio-mmio entries
+/// so user-space discovery code (e.g. `find_virtio_blk()`) recognizes
+/// them without special-casing the MMIO carrier.
 const SYNTHETIC_VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 
-/// Offset of the `DeviceID` register inside a virtio-mmio v1 register
-/// file (virtio spec §4.2.2).
+/// HARDWARE: virtio spec §4.2.2 — offset of the `DeviceID` register
+/// inside a virtio-mmio v1 register file.
 const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 
 /// Register a virtio-mmio device discovered via the DTB.
@@ -775,9 +787,16 @@ const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 pub unsafe fn register_virtio_mmio(phys_base: u64, size: u64) -> bool {
     // Virtio-mmio v1 layout — mirrors the user-space transport in
     // user/virtio-blk/src/transport.rs and user/virtio-net/src/transport.rs.
+    /// HARDWARE: virtio spec §4.2.2 — `MagicValue` register offset.
     const MAGIC_OFFSET: usize = 0x000;
+    /// HARDWARE: virtio spec §4.2.2 — `Version` register offset.
     const VERSION_OFFSET: usize = 0x004;
+    /// HARDWARE: virtio spec §4.2.2 — `MagicValue` register reads as
+    /// the ASCII string "virt" (little-endian u32) on a live device.
     const EXPECTED_MAGIC: u32 = 0x74726976; // "virt"
+    /// HARDWARE: virtio spec §4.2.2 — legacy (v1) device version.
+    /// Modern (v2) virtio-mmio devices report 2; we reject them here
+    /// because this discovery path only wires legacy MMIO carriers.
     const EXPECTED_VERSION_LEGACY: u32 = 1;
 
     let vbase = (phys_base + crate::hhdm_offset()) as *const u32;

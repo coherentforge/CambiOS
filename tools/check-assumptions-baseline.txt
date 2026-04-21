@@ -151,7 +151,6 @@ src/audit/mod.rs:567:FLAG_SAMPLED
 src/boot/initrd.rs:54:ARCHIVE_VERSION
 src/boot/initrd.rs:57:ARCHIVE_HEADER_SIZE
 src/boot/initrd.rs:60:ENTRY_HEADER_SIZE
-src/boot/mod.rs:102:MAX_MODULE_NAME_LEN
 src/boot/riscv.rs:36:FDT_MAGIC
 src/boot/riscv.rs:39:FDT_BEGIN_NODE
 src/boot/riscv.rs:40:FDT_END_NODE
@@ -273,12 +272,6 @@ src/microkernel/main.rs:2191:MAX_SPINS
 src/pci/mod.rs:29:MAX_PCI_DEVICES
 src/pci/mod.rs:33:CONFIG_ADDRESS
 src/pci/mod.rs:37:CONFIG_DATA
-src/pci/mod.rs:462:SYNTHETIC_VIRTIO_VENDOR_ID
-src/pci/mod.rs:466:VIRTIO_MMIO_DEVICE_ID_OFFSET
-src/pci/mod.rs:498:MAGIC_OFFSET
-src/pci/mod.rs:499:VERSION_OFFSET
-src/pci/mod.rs:500:EXPECTED_MAGIC
-src/pci/mod.rs:501:EXPECTED_VERSION_LEGACY
 src/policy/mod.rs:74:DECISION_NONE
 src/policy/mod.rs:75:DECISION_ALLOW
 src/policy/mod.rs:76:DECISION_DENY
@@ -288,7 +281,3 @@ src/process.rs:217:HEAP_SIZE
 src/process.rs:220:HEAP_PAGES
 src/syscalls/dispatcher.rs:57:USER_SPACE_END
 src/syscalls/dispatcher.rs:59:USER_SPACE_END
-src/syscalls/dispatcher.rs:557:BLK_KERNEL_RESP_ENDPOINT
-src/syscalls/dispatcher.rs:1179:BLK_KERNEL_CMD_ENDPOINT
-src/syscalls/dispatcher.rs:1278:BLK_KERNEL_CMD_ENDPOINT
-src/syscalls/dispatcher.rs:1941:DESCRIPTOR_SIZE

@@ -21,6 +21,11 @@
 //! same BAR. On QEMU's virtio-gpu-pci this is always BAR 4. If a future
 //! device splits them across BARs we'll need to map multiple regions;
 //! for now we refuse to init rather than silently map the wrong memory.
+//!
+//! Revisit when: `InitError::CapsSpanMultipleBars` fires on real
+//! hardware — the surviving driver path is `sys::map_mmio` once per
+//! distinct BAR, which is a straightforward extension but not worth
+//! writing until a real device demands it.
 
 use arcos_libsys as sys;
 use arcos_libsys::VirtioModernCaps;
@@ -85,6 +90,10 @@ pub enum InitError {
     MissingCap,
     /// At least two required caps point at different BARs. Supporting this
     /// needs per-cap MMIO maps; deferred until a real device exhibits it.
+    ///
+    /// Revisit when: this variant is actually returned by `ModernTransport::new`
+    /// against real hardware (not QEMU's virtio-gpu-pci, which always
+    /// groups all four caps on BAR 4). The fix is per-cap MMIO maps.
     CapsSpanMultipleBars,
     /// `sys::map_mmio` returned an error mapping the BAR.
     MapMmioFailed,

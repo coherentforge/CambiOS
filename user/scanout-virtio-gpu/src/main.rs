@@ -25,9 +25,9 @@
 //! (TRANSFER_TO_HOST_2D inside the device model). At 4 MiB × 60 Hz
 //! = 240 MB/s, the copy cost is invisible on QEMU.
 //!
-//! **Zero-copy replacement deferred to 4.c** with the observable
-//! trigger: "compositor frametime exceeds memcpy budget" OR
-//! "first real-hardware port where the copy cost matters." The fix
+//! **Zero-copy replacement deferred to 4.c.**
+//! Revisit when: compositor frametime exceeds the memcpy budget, OR
+//! the first real-hardware port where the copy cost matters. The fix
 //! is a new kernel primitive — either a DMA-backed channel flag on
 //! `SYS_CHANNEL_CREATE`, or a dedicated share-DMA-pages-with-Principal
 //! syscall. Both are nontrivial; the two-copy path lets 4.b ship

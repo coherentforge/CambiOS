@@ -97,8 +97,11 @@ pub const MAX_VIRTIO_MMIO_DEVICES: usize = 16;
 /// Replace when: targeting a RISC-V platform with > 8 cores.
 pub const MAX_HARTS: usize = 8;
 
-/// Maximum bytes captured from a module's path (must match
-/// [`crate::boot_modules::MAX_NAME_LEN`]).
+/// ARCHITECTURAL: maximum bytes captured from a module's path.
+/// Tied to [`crate::boot_modules::MAX_NAME_LEN`]; the two must stay
+/// in sync. 64 bytes accommodates every boot-module name currently
+/// shipped (`scanout-virtio-gpu` at 18 chars is the longest) with
+/// comfortable headroom for future service names.
 pub const MAX_MODULE_NAME_LEN: usize = 64;
 
 // ============================================================================

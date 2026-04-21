@@ -557,6 +557,11 @@ impl SyscallDispatcher {
         // and (empirically) provokes a subtle interaction that stalls the
         // driver's own virtqueue self-test. The blocked kernel task on
         // MessageWait(25) will still resume when its timer slice runs.
+        /// ARCHITECTURAL: endpoint 25 is the virtio-blk kernel→driver
+        /// response slot in the CambiOS IPC number-space. The userspace
+        /// driver recognizes it by number, so changing it is an ABI
+        /// break coordinated across `user/virtio-blk` and every kernel
+        /// callsite that sends to it.
         const BLK_KERNEL_RESP_ENDPOINT: u32 = 25;
         if endpoint_id == BLK_KERNEL_RESP_ENDPOINT {
             let ep = crate::ipc::EndpointId(endpoint_id);
@@ -1179,6 +1184,9 @@ impl SyscallDispatcher {
             // commands land in `SHARDED_IPC` (not `IPC_MANAGER`). Scoped
             // narrowly to endpoint 26 so other recv paths — which have no
             // reason to consult SHARDED_IPC today — are unaffected.
+            /// ARCHITECTURAL: endpoint 26 is the virtio-blk kernel-command
+            /// slot in the CambiOS IPC number-space; see
+            /// `BLK_KERNEL_RESP_ENDPOINT` above for the ABI-break caveat.
             const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
             let msg = if endpoint_id == BLK_KERNEL_CMD_ENDPOINT {
                 msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
@@ -1278,6 +1286,9 @@ impl SyscallDispatcher {
         };
 
         // Virtio-blk kernel-command endpoint (same special case as handle_recv_msg)
+        /// ARCHITECTURAL: endpoint 26 — see handle_recv_msg for the ABI
+        /// caveat. Declared twice because both recv paths need the
+        /// literal for the `if endpoint_id == …` guard.
         const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
         let msg = if endpoint_id == BLK_KERNEL_CMD_ENDPOINT {
             msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
@@ -1941,6 +1952,9 @@ impl SyscallDispatcher {
         let out_buf = args.arg2;
         let buf_len = args.arg_usize(3);
 
+        /// ARCHITECTURAL: on-wire size of the `SYS_DEVICE_INFO` descriptor —
+        /// 12-byte header + 6 × 16-byte BAR records. Every userspace
+        /// consumer hard-codes this length; changing it is an ABI break.
         const DESCRIPTOR_SIZE: usize = 108;
 
         if buf_len < DESCRIPTOR_SIZE {
@@ -2004,6 +2018,11 @@ impl SyscallDispatcher {
         let out_buf = args.arg2;
         let buf_len = args.arg_usize(3);
 
+        /// ARCHITECTURAL: on-wire size of `VirtioModernCaps` as parsed
+        /// by the kernel and consumed by userspace virtio-modern drivers.
+        /// Tied to the layout of `crate::pci::VirtioModernCaps`; size
+        /// changes are ABI breaks that require coordinated updates in
+        /// every virtio-modern user-space transport.
         const CAPS_SIZE: usize = core::mem::size_of::<crate::pci::VirtioModernCaps>();
         if buf_len != CAPS_SIZE {
             return Err(SyscallError::InvalidArg);
