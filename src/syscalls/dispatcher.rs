@@ -48,15 +48,15 @@ const MAX_DEVICE_IRQ: u32 = 224;
 ///      syscall and gets a confusing failure at exactly the boundary. Channels
 ///      (ADR-005) are the long-term answer for bulk data; until then this needs
 ///      to grow on demand. See docs/ASSUMPTIONS.md.
-const MAX_USER_BUFFER: usize = 4096;
+pub(super) const MAX_USER_BUFFER: usize = 4096;
 
 /// Canonical user-space address ceiling.
 /// x86_64: lower-half canonical addresses end at bit 47.
 /// AArch64: TTBR0 covers 0..2^48 with T0SZ=16 (48-bit VA).
 #[cfg(target_arch = "x86_64")]
-const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+pub(super) const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
 #[cfg(not(target_arch = "x86_64"))]
-const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
+pub(super) const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
 
 // ---------------------------------------------------------------------------
 // User-buffer copy: generic worker + production wrapper
@@ -176,7 +176,7 @@ where
 /// # Safety contract
 /// `cr3` must be a valid page table root physical address for the calling
 /// process (PML4 on x86_64, L0 on AArch64) or 0. Called from syscall context.
-fn read_user_buffer(cr3: u64, user_addr: u64, len: usize, dst: &mut [u8]) -> Result<usize, SyscallError> {
+pub(super) fn read_user_buffer(cr3: u64, user_addr: u64, len: usize, dst: &mut [u8]) -> Result<usize, SyscallError> {
     let hhdm = crate::hhdm_offset();
     copy_from_user_pages(
         |vaddr| {
@@ -212,7 +212,7 @@ fn read_user_buffer(cr3: u64, user_addr: u64, len: usize, dst: &mut [u8]) -> Res
 ///
 /// Production wrapper. Mirror of `read_user_buffer`. Target pages must be
 /// mapped writable in the process address space (caller's responsibility).
-fn write_user_buffer(cr3: u64, user_addr: u64, src: &[u8]) -> Result<usize, SyscallError> {
+pub(super) fn write_user_buffer(cr3: u64, user_addr: u64, src: &[u8]) -> Result<usize, SyscallError> {
     let hhdm = crate::hhdm_offset();
     copy_to_user_pages(
         |vaddr| {

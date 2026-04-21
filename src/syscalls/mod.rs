@@ -6,7 +6,10 @@
 //! to request kernel services.
 
 pub mod dispatcher;
+pub mod user_slice;
 pub mod userspace;
+
+pub use user_slice::{UserReadSlice, UserWriteSlice};
 
 
 
