@@ -1843,9 +1843,10 @@ impl SyscallDispatcher {
         drop(fa_guard);
         drop(pt_guard);
 
-        // Write physical address to user buffer
+        // ADR-020 Phase B: write 8-byte physical address via typed slice.
         let paddr_bytes = base_phys.to_le_bytes();
-        write_user_buffer(ctx.cr3, out_paddr_ptr, &paddr_bytes)?;
+        let paddr_slice = UserWriteSlice::validate(ctx, out_paddr_ptr, 8)?;
+        paddr_slice.write_from(&paddr_bytes)?;
 
         Ok(dma_vaddr)
     }
@@ -1969,7 +1970,9 @@ impl SyscallDispatcher {
         desc[27] = fb.blue_mask_shift;
         // desc[28..32] reserved (zeroed)
 
-        write_user_buffer(ctx.cr3, out_desc_ptr, &desc)?;
+        // ADR-020 Phase B: write 32-byte framebuffer descriptor via typed slice.
+        let desc_slice = UserWriteSlice::validate(ctx, out_desc_ptr, FB_DESC_SIZE)?;
+        desc_slice.write_from(&desc)?;
 
         Ok(0)
     }
@@ -2026,7 +2029,9 @@ impl SyscallDispatcher {
             // remaining pad bytes already zero
         }
 
-        write_user_buffer(ctx.cr3, out_buf, &desc)?;
+        // ADR-020 Phase B: write 108-byte device descriptor via typed slice.
+        let desc_slice = UserWriteSlice::validate(ctx, out_buf, DESCRIPTOR_SIZE)?;
+        desc_slice.write_from(&desc)?;
 
         Ok(0)
     }
@@ -2508,9 +2513,10 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // --- Read peer Principal from user buffer ---
+        // --- ADR-020 Phase B: read 32-byte peer Principal via typed slice ---
+        let peer_slice = UserReadSlice::validate(ctx, peer_principal_ptr, 32)?;
         let mut peer_key = [0u8; 32];
-        read_user_buffer(ctx.cr3, peer_principal_ptr, 32, &mut peer_key)?;
+        peer_slice.read_into(&mut peer_key)?;
         let peer_principal = crate::ipc::Principal::from_public_key(peer_key);
 
         // --- Check CreateChannel capability; principal from dispatch() ---
@@ -2605,9 +2611,10 @@ impl SyscallDispatcher {
                 .map_err(|_| SyscallError::OutOfMemory)?
         }; // drop CHANNEL_MANAGER(5)
 
-        // --- Write creator_vaddr to output pointer ---
+        // --- ADR-020 Phase B: write 8-byte creator_vaddr via typed slice ---
         let vaddr_bytes = creator_vaddr.to_le_bytes();
-        write_user_buffer(ctx.cr3, out_vaddr_ptr, &vaddr_bytes)?;
+        let vaddr_slice = UserWriteSlice::validate(ctx, out_vaddr_ptr, 8)?;
+        vaddr_slice.write_from(&vaddr_bytes)?;
 
         crate::audit::emit(crate::audit::RawAuditEvent::channel_created(
             ctx.process_id, channel_id.as_raw(), size_pages, crate::audit::now(), 0,
@@ -2846,7 +2853,9 @@ impl SyscallDispatcher {
             info[38..46].copy_from_slice(&record.created_at_tick.to_le_bytes());
         } // drop CHANNEL_MANAGER(5)
 
-        write_user_buffer(ctx.cr3, out_buf, &info)?;
+        // ADR-020 Phase B: write 46-byte channel info via typed slice.
+        let info_slice = UserWriteSlice::validate(ctx, out_buf, 46)?;
+        info_slice.write_from(&info)?;
 
         Ok(0)
     }
