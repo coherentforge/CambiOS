@@ -25,8 +25,8 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 013 | [RISC-V (riscv64gc) Architecture Support](013-riscv64-architecture-support.md) | Proposed | 2026-04-15 |
 | 014 | [Compositor ↔ Scanout-Driver Protocol](014-compositor-scanout-driver-protocol.md) | Proposed | 2026-04-15 |
 | 015 | [Storage Tiers and the Commitment Ladder](015-storage-tiers-and-commitment-ladder.md) | Proposed | 2026-04-16 |
-| 016 | [Windows Compatibility — The API/AI Boundary](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-13 |
-| 017 | [Catalog: Phase 1 Win32 Surface — Tier Assignments](017-win-compat-phase1-catalog.md) | Proposed | 2026-04-13 |
+| 016 | [Windows Compatibility via Bounded Static Shims](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-21 |
+| 017 | [User-Directed Cloud Inference](017-user-directed-cloud-inference.md) | Proposed | 2026-04-21 |
 | 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Proposed | 2026-04-19 |
 | 019 | [Process Fault Reaping and Peer-Generation Signaling](019-process-fault-reaping-and-peer-generation.md) | Proposed | 2026-04-19 |
 | 020 | [Typed User-Buffer Slices at the Syscall Boundary](020-typed-user-buffer-slices-at-syscall-boundary.md) | Proposed | 2026-04-19 |

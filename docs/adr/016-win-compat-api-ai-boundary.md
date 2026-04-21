@@ -1,279 +1,308 @@
-# ADR-016: Windows Compatibility — The API/AI Boundary
+# ADR-016: Windows Compatibility via Bounded Static Shims
 
 - **Status:** Proposed
-- **Date:** 2026-04-13
-- **Renumbered:** 2026-04-19 — was ADR-010; `make check-adrs` flagged the shared-number collision with [ADR-010 Persistent ObjectStore](010-persistent-object-store-on-disk-format.md), which is wired throughout the storage subsystem and retains 010. The two win-compat ADRs moved to 016 + 017.
+- **Date:** 2026-04-21
+- **Rewritten:** This ADR replaces an earlier decision (2026-04-13) that centered the Win32 compatibility layer on an AI translator producing validated interpretation plans. The AI translation layer has been removed from the compat layer. The ADR-016 slot is reused rather than superseded because the prior direction was withdrawn whole before any code landed — appending a `## Divergence` would have left this ADR as a tangle of stale rationale plus current decision. The prior content is in git history if ever needed.
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-007](007-capability-revocation-and-telemetry.md) (Audit Telemetry), [ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers)
-- **Related:** [win-compat.md](../win-compat.md), [ADR-017](017-win-compat-phase1-catalog.md) (sibling catalog)
+- **Related:** [win-compat.md](../win-compat.md)
 - **Supersedes:** N/A
 
 ## Context
 
-[win-compat.md](../win-compat.md) describes a four-tier translation model for the Windows compatibility layer — Tier 0 static shims, Tier 1 JIT shims, Tier 2 behavioral pattern translation, Tier 3 interactive fallback. It names the tiers but does not define the decision rules that assign a given Win32 API call to a given tier, and it does not specify the mechanics of the boundary between them.
+Windows compatibility in CambiOS runs as a user-space service (endpoint 24) that loads PE/COFF binaries, maps their imports to handler functions, and mediates access to the rest of the system through IPC. This ADR answers *what* the handlers are, *how* they are implemented, and *what scope* the compatibility layer commits to support.
 
-Without those rules, any attempt to scaffold the `user/win-compat/` crate produces code that bakes in tier assignments by implication — the very act of putting `CreateFileW` under `shims/kernel32.rs` implicitly classifies it as Tier 0, whether or not that classification is correct. If the classification is later revisited, every shim file gets rewritten. Worse, the contract between the static shim layer and the AI translator service — who validates what, who signs what, what the audit trail looks like — gets invented ad hoc at implementation time rather than designed deliberately.
+An earlier version of this ADR answered those questions with an AI translation layer: an out-of-process translator service produced validated interpretation plans for Win32 functions that lacked a static handler, plans were cached as CambiObjects, and the dispatcher executed them under the sandbox's capabilities. That direction has been withdrawn. Three reasons, in descending weight:
 
-This ADR draws the boundary. Its job is to make the Tier 0 / Tier 1 cut line explicit, to define the validation pipeline that AI-generated shims must pass before installation, to specify the caching and promotion model, and to fix the audit schema. After this lands, the Phase 0 scaffolding of `user/win-compat/` has concrete targets and the AI translator service (endpoint 25, future) has a contract to implement against.
+1. **Verification story.** AI-generated plans — even validated at the grammar + capability-bound level — cannot be formally verified in the sense the project has committed to. The validation pipeline catches structural violations, but the *semantics* of a plan produced by a learned model remain probabilistic. A microkernel whose stated non-negotiable is future formal verification cannot put AI-generated semantics on the critical path of a user-facing subsystem.
+2. **Generative, not extractive.** A defined, bounded compat surface tells users what works; an AI-translated surface asks users to trust that what worked yesterday will work tomorrow. The first is a product commitment; the second is a promise that decays with every model update.
+3. **Scope honesty.** The AI pipeline carried work the project is not ready to own — model weights, inference infrastructure, signature-of-translator trust, per-model revalidation, plan-grammar evolution. Each of those was a project in itself, defended from scope pressure by the premise that "the AI makes hard things easy." It doesn't; it makes hard things unverifiable.
 
-## Problem
+What remains is the Wine-style approach, narrowed by CambiOS's constraints: a defined set of Win32 functions with hand-written handlers in Rust, a router mechanism for argument-sensitive functions, and an explicit "not supported" outcome for everything outside the set.
 
-The Tier 0/1/2/3 model in win-compat.md answers *what* the tiers do but not *how* assignment works. Five ambiguities have to be resolved before any code is written.
+## Decision
 
-**What granularity carries the tier assignment?** A tier could be assigned per-DLL (all of `ntdll.dll` is Tier 0), per-function (`CreateFileW` is Tier 0, `NtCreateFile` is Tier 1), or per-call-pattern (`CreateFileW` with ordinary flags is Tier 0, `CreateFileW` with `FILE_FLAG_OVERLAPPED` goes to Tier 1 until the translator generates a shim for that pattern). Each choice has different dispatch-table implications. Per-DLL is too coarse to be useful. Per-function is the natural default. Per-call-pattern is needed for a small number of Win32 APIs whose behavior diverges sharply by flag. The ADR has to specify which combination is used.
+**The Windows compatibility layer supports a bounded, enumerated set of Win32 functions. Everything outside the set returns a well-defined error at call time, and applications whose import tables reference unsupported functions either fail to launch cleanly (with a machine-readable list of what's missing) or load with stubbed imports that return `ERROR_CALL_NOT_IMPLEMENTED` when called.**
 
-**What criteria drive the assignment?** "Feels static" is not a criterion. The ADR has to name the observable properties that push a function into one tier or another — otherwise the classification is arbitrary and cannot be extended to Win32 functions we haven't yet surveyed.
+Four pieces give this its shape.
 
-**What does the AI translator actually produce, and how is it trusted?** A Tier 1 call produces a shim. Is that shim code (x86 instructions the translator emits and caches), data (a serialized interpretation plan the dispatcher executes), or an IPC request the translator handles itself every time? Each has very different trust and verification implications. If the translator emits code, every shim is new code entering the system and must be verified. If the translator produces an interpretation plan, the dispatcher is the thing executing user-space code and the translator is a data source. This choice shapes the validation pipeline and the sandbox escape surface.
+### 1. Scope is a published list, not an inferred surface
 
-**When and how does a Tier 1 shim become "warm"?** win-compat.md says shims are cached after first call. It does not say whether the cache is per-sandbox, per-user, or system-wide; it does not say how cache invalidation works when the translator model is updated; it does not say whether cached shims survive reboot; it does not say what happens when two sandboxes want the same shim. Each of these is a real decision with security and performance implications.
+The [Phase 1 Catalog](#phase-1-catalog) below enumerates every Win32 function the compat layer supports. An application importing a function not in the catalog either:
 
-**What does the audit trail look like?** ADR-007 gives us the audit infrastructure. win-compat.md says Windows calls should be audited. Neither specifies the event schema, the sampling strategy (every call vs. summary statistics), or what an operator should be able to answer from the audit record. Without this, the observability story for Windows compat is undefined — and Windows compat has more operational risk than any other subsystem, so the audit story has to be tight.
+- **Stubs the import with a well-defined error handler** (default). The app loads; the missing function returns `ERROR_CALL_NOT_IMPLEMENTED` when invoked. Many Windows apps probe for optional features this way, so refusing to load would be overly strict.
+- **Refuses to load** when the sandbox manifest sets `strict_imports = true`. The refusal carries the list of missing functions so the user knows up front that the app cannot run.
 
-These ambiguities compose. A decision on granularity (per-function) narrows the shape of the dispatch table, which shapes what "a shim" is, which shapes what the translator produces, which shapes the validation pipeline, which shapes the audit schema. Resolving them in sequence produces an inconsistent architecture. Resolving them together is this ADR's job.
+New Win32 functions enter the catalog by the [Adding Functions](#adding-functions) process, not by inference at runtime.
 
-## Decision Summary
+### 2. Handlers are hand-coded Rust, one file per DLL
 
-- **Tier assignment granularity is per-function by default, with per-call-pattern dispatchers for a small enumerated set of argument-sensitive APIs.** The dispatch table is keyed by `(dll_name, function_name)`. Most entries resolve to a single handler. Argument-sensitive entries resolve to a router that inspects arguments and dispatches to sub-handlers, each of which may be at a different tier.
+Every supported function has a handler in `user/win-compat/src/shims/<dll>.rs`. The handler signature is fixed: it takes the sandbox context plus the Win32 call arguments (unmarshaled from the IPC wire format), returns a `Result<Win32Return, Win32Error>`, and executes under the sandbox's capabilities.
 
-- **Assignment criteria are five observable properties: determinism, statefulness, frequency, risk surface, and argument complexity.** A function's tier is the outcome of applying a decision procedure to these five properties. The procedure is deterministic and extensible — a new Win32 function can be classified by a contributor without requiring a judgment call from the maintainers.
+Handlers do not share state with each other except through explicitly-managed sandbox structures (the sandbox handle table, the virtual registry, the virtual filesystem). There is no shared "shim runtime" executing plans or interpretations.
 
-- **AI-generated shims are interpretation plans (data), not emitted code.** The translator produces a bounded-shape plan — a sequence of primitive operations over IPC endpoints, VFS handles, and registry keys — that the dispatcher executes. This makes the validation pipeline tractable: we check plans, not arbitrary code. It eliminates the "new code entering the system" problem. It is slower than emitted code in the worst case, but the dominant cost of a Win32 call is the IPC round-trip, not the plan interpretation overhead.
+### 3. Argument-sensitive functions dispatch through routers
 
-- **Cached shims are content-addressed CambiObjects, system-wide, signed by the AI translator's Principal, revalidated on model updates.** The cache lives in the ObjectStore (ADR-003 gives us the machinery). Caching is system-wide because identical (function, argument-shape) inputs should produce identical plans regardless of which sandbox first triggered the translation. Cross-sandbox sharing is safe because the plan is not arbitrary code and because the interpretation happens per-sandbox under per-sandbox capabilities.
+A small set of Win32 functions have enough semantic variation by argument that one handler would be unwieldy. For these, the dispatch table resolves to a *router* — a hand-coded function that inspects arguments and calls one of several sub-handlers, each fully specified. The router mechanism preserves the "everything is hand-coded Rust" property. Each router publishes the enumerated set of argument combinations it supports and the error code for everything else.
 
-- **Audit events carry tier, DLL/function identity, sandbox ID, and outcome, with per-sandbox summary statistics emitted on a rate-limited schedule.** Per-call audit is available but disabled by default — the overhead is unacceptable for hot-path functions called tens of thousands of times per second. Summary statistics satisfy the common operator questions.
+### 4. Unsupported behavior is specified, not silent
 
-The remainder of the ADR develops these five decisions in detail.
+When a call routes to a stubbed import, an unsupported router branch, or a handler that hits an unsupported feature (e.g., `CreateFileW` with `FILE_FLAG_OVERLAPPED` — async I/O, which CambiOS does not yet support), the call returns a specific Win32 error code documented in the catalog. The compat layer never fakes success, never silently mutates behavior, and never leaves the user to guess whether a call worked.
 
-## Classification Criteria
+The audit trail (§ [Audit](#audit)) records every unsupported-call event with enough detail for an operator to answer: *which function did the app try to call, what was it passed, and why did we refuse*. This is the feedback loop that drives catalog growth.
 
-Five observable properties determine a Win32 function's tier. Each is scored on a three-level scale. The scores combine deterministically into a tier assignment.
+## Scoping Criteria for New Functions
 
-### Determinism
+A Win32 function enters the catalog when a target application needs it and it meets all of these:
 
-Does the Win32 function's semantics map onto CambiOS primitives in a way that can be specified once and re-used?
+- **Determinism.** The Win32 specification (MSDN) and observed real-world behavior give an unambiguous mapping to CambiOS primitives. Functions whose behavior depends on interpretation of intent (`CoCreateInstance` for a novel CLSID, `DeviceIoControl` for a vendor-specific IOCTL) are not candidates — they are left as routers with explicit "not supported" branches for unknown cases.
+- **Statefulness is bounded.** The function touches state scoped to a handle, the sandbox, or process-global structures (heap, TLS) whose shape is known. Functions that reach into cross-sandbox shared state or kernel-equivalent structures are not candidates.
+- **Risk surface is characterized.** A bug in the handler has a documented worst case: wrong return value, functional failure, or sandbox-isolation failure. Functions whose worst case cannot be bounded at design time do not enter the catalog; they stay stubbed.
+- **Argument shape is enumerable.** Either arguments have a single meaningful shape (fixed), or they vary across a small enumerable set that a router can dispatch (bounded). Functions with effectively arbitrary argument shapes (`IDispatch::Invoke` with arbitrary dispatch IDs, `DeviceIoControl` across all IOCTLs) are not candidates — they remain stubbed, and apps that need them are Phase 2+ considerations.
 
-- **High:** 1:1 semantic mapping to a CambiOS syscall or a fixed IPC request. `GetTickCount` → `SYS_GET_TIME`. `VirtualAlloc` → `SYS_ALLOCATE`. `CloseHandle` → handle-table lookup + resource release. No interpretation needed.
-- **Medium:** Mapping is well-defined but has multiple variants by argument. `CreateFileW` with ordinary flags maps to an FS-service IPC; with `FILE_FLAG_OVERLAPPED` or `FILE_ATTRIBUTE_DEVICE`, the mapping diverges. Requires argument inspection, but each variant has a known mapping.
-- **Low:** Mapping depends on application context, COM class hierarchy, or interpretation of intent. `CoCreateInstance` for a novel CLSID cannot be mapped without understanding what the class is expected to do.
+These four criteria gate *inclusion*, not tiering — every supported function is a static handler.
 
-### Statefulness
+## Dispatch Flow
 
-Does the function operate on state that persists beyond the call?
+A Win32 call from a sandboxed PE process reaches its handler via this path:
 
-- **Stateless:** Pure function, no sandbox state touched. `GetTickCount`, `GetCurrentProcessId`.
-- **Handle-scoped:** Operates on state referenced by an argument handle (file, mutex, registry key). State lives in the sandbox's handle table, bounded per-handle.
-- **Sandbox-scoped:** Affects state spanning multiple handles — heap, TLS, process environment, registry hive. Changes here can invalidate assumptions in unrelated calls.
+1. PE process invokes the shim DLL stub linked into its address space. The stub packages the call's arguments into a wire format.
+2. Stub sends an IPC message to the win-compat service on the sandbox's private endpoint (see [ADR-009](009-purpose-tiers-scope.md) tier-policy endpoint pool).
+3. win-compat decodes `(dll_ix, function_ix, args)` and looks up the dispatch table.
+   - **Function present, single handler:** handler invoked directly. Returns a Win32 result; dispatcher packages it and IPC-replies to the PE.
+   - **Function present, router:** router inspects arguments, calls the matching sub-handler, handles "no match" by returning the unsupported-branch error.
+   - **Function absent:** stubbed import handler returns `ERROR_CALL_NOT_IMPLEMENTED`.
+4. Audit event emitted per the schema in § [Audit](#audit).
+5. PE stub receives the reply, returns to the caller.
 
-### Frequency
+The PE process cannot distinguish between "real handler" and "stubbed unsupported import" except by the return value. This is deliberate — a supported function and an unsupported function have the same call interface; only the outcome differs.
 
-Is the function on the hot path?
+## Audit
 
-- **Hot:** Called many times per second in running applications. `ReadFile`, `WriteFile`, `GetMessage`, `DispatchMessage`, `GetLastError`.
-- **Warm:** Called occasionally during steady-state operation. `RegQueryValueEx`, `CreateFile`, `CoCreateInstance`.
-- **Cold:** Called once or a few times per process lifetime. `LoadLibrary` at startup, `GetVersionEx`, shutdown sequences.
-
-### Risk Surface
-
-What happens if the shim has a bug?
-
-- **Low:** Wrong return value in a non-critical path. App displays a wrong timestamp, wrong window title, wrong file count in a listing.
-- **Medium:** Functional failure. App crashes cleanly, data is not written, dialog fails to open. User notices. Sandbox is not compromised.
-- **High:** Sandbox isolation failure. Memory corruption in shared buffers, unintended capability use, registry writes that leak across sandboxes, cross-sandbox object store writes.
-
-### Argument Complexity
-
-How much variety do we see in how the function is called?
-
-- **Fixed:** Arguments have a single meaningful shape. `CloseHandle(HANDLE)` — one argument, one interpretation.
-- **Bounded:** Arguments vary across a small, enumerable set. `CreateFileW` with ~8 practically-occurring flag combinations.
-- **Unbounded:** Arguments are effectively arbitrary. `DeviceIoControl` with arbitrary IOCTL codes. `CoCreateInstance` with arbitrary CLSIDs. `IDispatch::Invoke` with arbitrary dispatch IDs.
-
-### Decision Procedure
-
-Given a function's five scores, assign tier:
-
-- **Tier 0 (static shim):** Determinism = High AND Argument complexity = Fixed or Bounded AND Risk surface ≠ High. Frequency is not a gating criterion — a cold Tier 0 shim is fine, but a Tier 0 function must be specifiable once. Most of kernel32 and ntdll's core surface lands here.
-- **Tier 1 (JIT shim):** Determinism = High or Medium AND Argument complexity = Bounded or Unbounded AND (function is Warm or Cold in frequency). The translator generates a plan on first call, caches it. First-call latency is amortized over the life of the sandbox.
-- **Tier 2 (behavioral):** Determinism = Low AND Statefulness = Sandbox-scoped, OR the function participates in a named multi-call pattern (COM QueryInterface chains, OLE in-place activation, dialog handshakes). Recognized as a sequence, translated once, executed with cached context.
-- **Tier 3 (interactive fallback):** Any function where classification criteria do not produce a usable assignment, or where a Tier 1/2 translation fails validation. The sandboxed process is paused, the user is consulted, the outcome is recorded.
-
-**Per-call-pattern escape hatch.** A small enumerated set of functions — tracked in a `ROUTER_FUNCTIONS` constant list alongside the shim dispatch table — resolve to a router that inspects arguments and dispatches to a tier-appropriate sub-handler. `CreateFileW` with `FILE_ATTRIBUTE_NORMAL` is Tier 0; `CreateFileW` with `FILE_FLAG_OVERLAPPED` (async I/O, not currently supported in CambiOS) dispatches to a Tier 3 handler that asks the user. This mechanism exists so that a function with mostly-easy semantics isn't forced to the highest tier its worst argument combination requires.
-
-**High-risk functions are never Tier 0.** If a function's risk surface is High (sandbox isolation implications), it cannot be a static shim — the validation pipeline must apply to every call. This means every call goes through at least Tier 1's plan validator, even if the plan is cached and identical each time. The overhead is acceptable because high-risk functions are not on the hot path.
-
-## Phase 1 Catalog
-
-The full per-function tier assignment for the ~80 Win32 functions covering Phase 1 (business applications: QuickBooks, Sage 50, tax prep) is in the sibling document [ADR-017](017-win-compat-phase1-catalog.md). Summary:
-
-- **Tier 0 (static):** ~52 functions. The bulk of kernel32 (file I/O, memory, time, process ID), ntdll (heap, TLS basics), advapi32 (core registry operations), user32 (message pump primitives).
-- **Tier 1 (JIT):** ~18 functions. Rare ntdll internals, uncommon advapi32 (security tokens, crypto API stubs), GDI DC/font variants, shell32 folder path resolution.
-- **Tier 2 (behavioral):** ~8 named multi-call patterns. COM `CoCreateInstance` → `QueryInterface` → method dispatch. OLE drag-and-drop protocol. Common dialog handshakes (`GetOpenFileName` + subclassing). Printing pipeline (`StartDoc` → `StartPage` → GDI calls → `EndPage` → `EndDoc`).
-- **Tier 3 (interactive):** Fallback only, no functions assigned by default. Reached when a Tier 1 plan fails validation or a novel argument combination appears.
-- **Routers:** 4 functions flagged as argument-sensitive: `CreateFileW`, `DeviceIoControl`, `NtCreateFile`, `RegCreateKeyExW`.
-
-The catalog is the authoritative per-function classification. This ADR is the rules; the catalog is the rules applied to today's target surface. Adding a Win32 function to the scaffolding requires classifying it using the Decision Procedure and updating the catalog. The ADR itself does not need revision unless the rules change.
-
-## AI-Generated Shims Are Plans, Not Code
-
-When the translator produces a Tier 1 shim, the output is a **plan** — a bounded-shape data structure describing a sequence of primitive operations over a restricted instruction set. The dispatcher executes the plan; the translator never contributes executable code to the sandboxed process or the compatibility service.
-
-The primitive instruction set is intentionally small:
-
-- `IPC_SEND(endpoint, capability, bytes)` — send an IPC message. Endpoint must be in the sandbox's grant list. Capability must be one the sandbox holds.
-- `IPC_RECV(endpoint) -> bytes` — receive a response. Blocks with a bounded timeout.
-- `HANDLE_ALLOC(kind) -> handle` / `HANDLE_FREE(handle)` — allocate/free a slot in the sandbox's Win32 handle table.
-- `HANDLE_GET(handle) -> resource_ref` — dereference a Win32 handle to a CambiOS resource (file object, mutex, registry key).
-- `REG_READ(key, value_name) -> bytes` / `REG_WRITE(key, value_name, bytes)` — virtual registry operations.
-- `VFS_RESOLVE(winpath) -> object_hash` / `VFS_QUERY(tag, filter) -> hash_list` — virtual filesystem operations.
-- `MEM_COPY(src, dst, len)` — bounded memcpy in the sandbox's address space. Bounds checked against the sandbox's VMA tracker.
-- `RETURN(value)` — plan exit with a return value mapped to the Win32 calling convention.
-- `ERROR(code)` — plan exit with a Win32 error code; `GetLastError` sees this.
-
-A plan is a directed acyclic graph of these primitives with bounded depth and bounded fan-out. The translator can conditional on argument values but cannot loop unboundedly. Plans are serialized as a compact binary format and stored in the ObjectStore.
-
-**Why plans, not code.** Three reasons.
-
-First, validation is tractable. We can statically check a plan — does every `IPC_SEND` target an endpoint in the sandbox's grant list? Does every `HANDLE_GET` reference a handle previously allocated in this plan? Is plan depth below the bound? Does the plan terminate? These are decidable questions over a small grammar. The equivalent checks on emitted x86 machine code are undecidable or require verified abstract interpretation.
-
-Second, no new code enters the system. The dispatcher that executes plans is a fixed piece of code, written by humans, reviewed, eventually formally verified. The translator is a data source. This makes the trust story much simpler: if the translator is compromised, it can produce wrong plans (which will fail validation or produce wrong application behavior) but it cannot inject executable code.
-
-Third, plans are portable. A plan produced on an x86_64 CambiOS instance is executable on an AArch64 CambiOS instance without re-translation. This matters for the SSB-shared-shim model in win-compat.md: one translation serves the whole network.
-
-**Cost.** Plan interpretation has higher per-call overhead than emitted machine code — estimated 5-10× for the interpreter dispatch loop. This is swamped by the dominant cost of a Win32 call under the compatibility layer: the IPC round-trip to the FS service, the AI translator, or any other user-space service. For functions that would benefit from code emission (hot Tier 0 functions), hand-coded static shims in `user/win-compat/src/shims/` already bypass the interpreter. The plan machinery is for Tier 1+ only.
-
-## Validation Pipeline
-
-Every plan, whether newly produced by the translator or pulled from the ObjectStore cache, passes through the validation pipeline before the dispatcher executes it. Validation is the same in both cases — cached plans are revalidated — so that a model update or a policy change automatically re-checks existing plans.
-
-The pipeline runs five checks in sequence. A failure at any step rejects the plan; the call falls through to Tier 3 (interactive consent).
-
-1. **Grammar check.** The plan parses as a well-formed plan structure. Primitive opcodes are in the allowed set. Depth is below the per-plan bound. No unbounded iteration. Rejection cause: malformed translator output.
-
-2. **Capability bound check.** Every `IPC_SEND` targets an endpoint in the sandbox's grant list. Every capability referenced is one the sandbox currently holds. This is checked statically against the `SandboxPolicy`. A plan that tries to reach the key-store service (endpoint 17) from a sandbox that hasn't been granted key-store access is rejected here, not at runtime.
-
-3. **Memory bound check.** Every `MEM_COPY` source and destination is within the sandbox's VMA tracker. Plans cannot reach outside the sandbox's address space, into the compatibility service's memory, or into another sandbox.
-
-4. **Resource bound check.** Plan execution is bounded — a plan cannot allocate more than N handles, more than M bytes of heap, or consume more than T units of CPU time during execution. Bounds are per-plan, set by the translator at generation time based on the expected Win32 function's behavior, and enforced by the dispatcher at runtime.
-
-5. **Signature check.** For plans pulled from the cache, the stored signature verifies against the translator's Principal. An unsigned or incorrectly signed plan is treated as absent; the translator is invoked to re-generate.
-
-Plans that pass validation are installed in the dispatch table. Plans that fail are logged to the audit stream with the rejection reason (grammar/capability/memory/resource/signature) so operators can distinguish translator bugs from policy changes from tampering.
-
-## Caching and Promotion
-
-**Storage.** Validated plans are stored in the ObjectStore as CambiObjects. The object's content is the serialized plan. The author is the AI translator's Principal. The owner is the CambiOS system (not any individual user), making plans discoverable across sandboxes. The cache key is a Blake3 hash over `(dll_name, function_name, argument_signature)`, where `argument_signature` is a canonical fingerprint of the argument shape (types and flag values that route execution, excluding data values like file contents or string contents). This is content addressing applied to shims.
-
-**Hit path.** A PE call arrives. The dispatcher computes the cache key, queries the ObjectStore, retrieves the plan, runs it through validation, and executes it if valid. If the ObjectStore does not have the plan or validation fails, the translator is invoked.
-
-**Promotion to warm.** A plan that has been executed N times without revalidation failure can be promoted to a warm cache held in the compatibility service's memory — no ObjectStore round-trip per call. Promotion is a TUNING decision (cache size vs. memory pressure); the initial rule is "promote after 10 successful executions, cap warm cache at 256 plans per sandbox." Adjust with measurements.
-
-**Invalidation on model update.** When the AI translator's model is updated (new weights, new safety rules), the translator emits an invalidation event that drops the warm cache and marks the ObjectStore plans as "revalidate on next use." Old plans are not deleted — they remain available and will revalidate successfully if the new model still considers them valid. Plans that fail revalidation are evicted.
-
-**Cross-sandbox sharing is safe.** A plan generated while translating a call from Sandbox A is usable verbatim by Sandbox B, because (a) the plan does not embed Sandbox A's identity, handles, or memory addresses — those are filled in at dispatch time from Sandbox B's context; (b) the validation pipeline runs per-sandbox using Sandbox B's policy, so a plan that's valid for A but not for B is correctly rejected when B tries to use it.
-
-**Cross-instance sharing via SSB.** Plans signed by a trusted translator Principal can be fetched from the Yggdrasil mesh over the SSB bridge (future work). Trust is per-Principal: a CambiOS operator chooses whose translations to trust by accepting that Principal's key. Validation still runs locally before any plan executes — the remote translator's signature authenticates provenance, not correctness.
-
-## Audit and Observability
-
-Windows compatibility is the subsystem with the largest operational risk surface in CambiOS — arbitrary third-party code, large API surface, AI in the translation loop. The audit story has to be correspondingly tight.
-
-**Schema.** A new audit event kind lands in `src/audit/mod.rs`:
+Every Win32 call emits an audit event using the infrastructure from [ADR-007](007-capability-revocation-and-telemetry.md). The event schema:
 
 ```
 AuditEventKind::WinShimCall {
-    sandbox_id: u32,          // per-sandbox Principal identifier
-    dll_ix: u8,               // index into a fixed DLL enum (8 DLLs initially)
-    function_ix: u16,         // index into per-DLL function table
-    tier: u8,                 // 0=Static, 1=JIT-cached, 2=JIT-first-call, 3=Behavioral, 4=Interactive
-    outcome: u8,              // 0=OK, 1=Win32 error return, 2=plan rejected, 3=user denied
-    duration_us: u16,         // wall-clock time in the shim
+    sandbox_id:   u32,   // per-sandbox Principal identifier
+    dll_ix:       u8,    // index into a fixed DLL table
+    function_ix:  u16,   // index into per-DLL function table
+    outcome:      u8,    // 0=OK, 1=Win32 error return, 2=unsupported import, 3=router-no-match
+    duration_us:  u16,   // wall-clock time in the shim
 }
 ```
 
-Fits in the 64-byte RawAuditEvent wire format from ADR-007 (Phase 3.3). DLL and function indices rather than names because audit events have a fixed size; name strings live in a static table the audit consumer resolves.
+Fits the 64-byte `RawAuditEvent` wire format. DLL and function names live in a static table the audit consumer resolves — names don't travel in the event.
 
-**Sampling.** Per-call audit of hot-path Tier 0 shims (`ReadFile`, `WriteFile`, `GetMessage`) would saturate the audit ring. Default behavior:
+Per-call audit for hot-path handlers (`ReadFile`, `WriteFile`, `GetMessage`, `GetLastError`) would saturate the audit ring. Default sampling:
 
-- **Tier 0:** Summary-only. Per-sandbox, per-function counters emitted every 5 seconds. Per-call events available via a debug flag in the sandbox policy.
-- **Tier 1, cached:** Per-call audit with sampling at 1-in-100 (adjustable).
-- **Tier 1, first-call / Tier 2:** Every call audited. These are inherently rare.
-- **Tier 3 (interactive):** Every call audited. These surface to the user, so there are very few per session.
-- **Rejections:** Every rejected plan audited regardless of tier. A plan rejection is always interesting.
+- **Normal handlers:** summary-only. Per-sandbox, per-function counters emitted every 5 seconds. Per-call events available via a debug flag in the sandbox manifest.
+- **Unsupported calls, router-no-match, error returns:** every event audited. These drive catalog growth; we want every one.
 
-**Questions the audit trail answers.** After a Windows app session, an operator can answer: What fraction of calls ran as static shims vs. through the translator? Which functions are Tier 1 hot-spots (good candidates for promotion to Tier 0 static shims)? Did any call fall through to Tier 3 (user consent)? Were there validation rejections, and if so, which ones and with what reason codes? What did the sandbox try to do that the policy denied?
+## Adding Functions
 
-These questions shape the audit consumer UI (future work — a win-compat dashboard backed by the audit ring). The ADR commits only to the schema.
+A new function enters the catalog by a short, explicit process:
 
-## Call Flow: PE Dispatch to Shim Execution
+1. Observe the gap. An audit event with `outcome = unsupported` or `router-no-match` identifies a function the target app calls.
+2. Apply the [Scoping Criteria](#scoping-criteria-for-new-functions). If all four are met, the function is a candidate. If not, the function stays stubbed and the app is a scope boundary — either the app is out of scope or the criteria need revision (a scope decision, not a classification one).
+3. Write the handler in `user/win-compat/src/shims/<dll>.rs`. Test against observed real-world Win32 behavior.
+4. Add the entry to the Phase 1 catalog (this ADR) with a one-line note on mapping and risk.
 
-Putting the pieces together, a Win32 call from a sandboxed PE process reaches its executing shim via this path:
+The ADR itself does not change unless the scoping criteria change. The catalog grows.
 
-1. PE process in ring 3 invokes a shim DLL's stub function. The stub packages the arguments into a wire format.
-2. Stub sends an IPC message to the win-compat service endpoint (the sandbox's private endpoint — see the endpoint-sizing ADR for why sandboxes get private endpoints).
-3. win-compat service receives, decodes the `(dll_ix, function_ix, args)` tuple.
-4. Dispatch table lookup by `(dll_ix, function_ix)`.
-   - **Static entry:** Hand-coded shim function invoked directly. Returns to the dispatcher, which packages the result and IPC-replies to the PE process. Audit summary counter incremented.
-   - **Router entry:** Router inspects args, picks a sub-handler, which may be static (as above) or one of the plan-based tiers below.
-   - **Tier 1+ entry:** Dispatcher computes the plan cache key from `(dll_name, function_name, argument_signature)`. Warm cache checked first; then ObjectStore. On miss, translator is invoked over IPC (endpoint 25, future), which produces a plan.
-5. Plan passes through the validation pipeline. On rejection, path branches to Tier 3 (user consent via the UI service — future).
-6. Plan is promoted to warm cache if it's been used enough times.
-7. Dispatcher interprets the plan. Each primitive operation executes against the sandbox's capability context — IPC sends go out on the sandbox's behalf, handles allocate in the sandbox's table, memory operations bounds-check against the sandbox's VMA tracker.
-8. Plan returns or errors. Dispatcher packages the Win32-style return value and IPC-replies to the PE process.
-9. Audit event emitted (per sampling rules).
-10. PE process's shim DLL stub receives the response, unpacks it, returns to the caller.
+## Phase 1 Catalog
 
-The PE process cannot tell which tier served its call — from its perspective, every Win32 function is "the kernel32.dll stub I linked against." This is a correctness feature: migration of a function from Tier 1 back to Tier 0 (or forward to Tier 2) is invisible to the application.
+Phase 1 target applications: business accounting software with bounded Win32 surfaces — QuickBooks Desktop, Sage 50, tax preparation (Lacerte, Drake). The catalog below is the authoritative list of supported functions for Phase 1.
 
-## Decision Drivers
+**Support states:**
 
-**Why not pure static (no AI)?** Tier 0-only is Wine's architecture. Wine has been under active development for 30 years and still has incomplete coverage of the Win32 surface. CambiOS does not have 30 years. The AI translator shortens the tail — uncommon APIs get usable-if-not-perfect translations at the cost of some latency on first call — without requiring a human implementer for every function.
+- **✓** — supported, single handler
+- **R** — router with enumerable sub-cases (sub-table follows)
+- **·** — stubbed (not in catalog; returns `ERROR_CALL_NOT_IMPLEMENTED`). Not listed below — by definition this is everything else.
 
-**Why not pure AI (no static shims)?** Routing hot-path functions through an AI-generated plan imposes unnecessary latency and cache pressure. `GetTickCount` called 10,000 times per second does not need a plan interpreter. Static shims for the well-understood, well-bounded core of Win32 are faster, simpler, and easier to audit.
+### kernel32.dll
 
-**Why not emitted code instead of plans?** Emitted code is faster per-call (~5-10×) but much harder to validate. The validation pipeline is the load-bearing security boundary for the AI component — "the translator is untrusted, but its output is constrained to a verifiable shape" is the whole premise. Giving up plan-level validation in exchange for faster interpretation would require verified code generation in the translator, which is far more than the project wants to own.
+| Function | State | Mapping |
+|----------|-------|---------|
+| `CreateFileW` | R | See sub-routing below |
+| `ReadFile` | ✓ | IPC to FS service |
+| `WriteFile` | ✓ | IPC to FS service |
+| `CloseHandle` | ✓ | Handle-table free |
+| `GetLastError` | ✓ | TLS read |
+| `SetLastError` | ✓ | TLS write |
+| `VirtualAlloc` | ✓ | `SYS_ALLOCATE` + protection-flag mapping |
+| `VirtualFree` | ✓ | `SYS_FREE` |
+| `HeapCreate` / `HeapAlloc` / `HeapFree` / `HeapDestroy` | ✓ | Sandbox heap allocator |
+| `CreateThread` / `ExitThread` / `WaitForSingleObject` | ✓ | Maps to CambiOS threads once that subsystem lands; stubbed until then |
+| `GetModuleHandleW` | ✓ | Lookup in sandbox's loaded-module table |
+| `GetProcAddress` | ✓ | Lookup in shim dispatch table |
+| `LoadLibraryW` | ✓ | Returns handle for DLLs in the curated shim set; `NULL` + `ERROR_MOD_NOT_FOUND` otherwise |
+| `FreeLibrary` | ✓ | Refcount decrement |
+| `GetSystemTimeAsFileTime` | ✓ | `SYS_GET_TIME` + Win32 epoch conversion |
+| `QueryPerformanceCounter` / `QueryPerformanceFrequency` | ✓ | `SYS_GET_TIME` + scaling |
+| `GetTickCount` | ✓ | `SYS_GET_TIME` ms |
+| `GetVersionExW` | ✓ | Returns sandbox-configured fake Windows version (default: 10.0.19045) |
+| `GetSystemInfo` | ✓ | Fixed Win32 `SYSTEM_INFO` |
+| `FindFirstFileW` / `FindNextFileW` / `FindClose` | ✓ | VFS query + find-handle management |
+| `GetFileAttributesW` / `GetFileSize` | ✓ | VFS metadata read |
+| `SetFilePointer` | ✓ | Handle-scoped seek |
+| `GetCommandLineW` | ✓ | Sandbox-configured command line |
+| `GetCurrentProcessId` / `GetCurrentThreadId` | ✓ | `SYS_GET_PID` / TLS read |
+| `ExitProcess` | ✓ | `SYS_EXIT`. Always audited per-call |
+| `Sleep` | ✓ | `SYS_YIELD` + deadline |
+| `EnterCriticalSection` / `LeaveCriticalSection` / `InitializeCriticalSection` / `DeleteCriticalSection` | ✓ | User-space spinlock in sandbox heap |
+| `GetEnvironmentVariableW` / `SetEnvironmentVariableW` | ✓ | Sandbox-scoped env |
+| `DeviceIoControl` | R | See sub-routing below |
 
-**Why is the plan grammar so small?** The grammar is the attack surface. A larger instruction set (arithmetic, loops, conditionals on computed values) gives the translator more expressive power at the cost of a harder validation job. The initial grammar covers what Phase 1 business apps need and can grow by ADR supersession when Phase 2 CAD apps require something we cannot express.
+#### `CreateFileW` sub-routing
 
-## Rejected Alternatives
+| Flag combination | State | Handler |
+|------------------|-------|---------|
+| `OPEN_EXISTING` + `FILE_ATTRIBUTE_NORMAL` + GENERIC_READ/WRITE | ✓ | Direct FS-service IPC |
+| `CREATE_NEW` / `CREATE_ALWAYS` + `FILE_ATTRIBUTE_NORMAL` | ✓ | FS-service create + IPC |
+| `FILE_FLAG_OVERLAPPED` (async I/O) | × | `ERROR_NOT_SUPPORTED`. CambiOS does not have async I/O yet |
+| `FILE_FLAG_NO_BUFFERING` / `FILE_FLAG_WRITE_THROUGH` | ✓ | Mapped to FS-service sync hints |
+| `FILE_ATTRIBUTE_DEVICE` / device paths (`\\.\`) | × | `ERROR_ACCESS_DENIED`. No direct device access from sandbox |
+| `FILE_FLAG_OPEN_REPARSE_POINT` | ✓ | VFS symlink/junction read, bounded by VFS grant |
 
-**Per-DLL tier assignment.** Rejected — too coarse. ntdll contains both `RtlAllocateHeap` (clearly Tier 0) and `RtlAddVectoredExceptionHandler` (clearly Tier 2 because SEH is a sandbox-scoped pattern). Forcing them to the same tier makes one of them wrong.
+#### `DeviceIoControl` sub-routing
 
-**Tier assignment by risk only.** Rejected — would push every function with any risk surface to Tier 1+, including easy wins like `VirtualAlloc`. The risk gating is "High risk cannot be Tier 0," not "any risk pushes to Tier 1." Most low-risk functions are Tier 0 because other criteria (determinism, argument shape) allow it.
+| IOCTL class | State | Handler |
+|-------------|-------|---------|
+| `FSCTL_GET_VOLUME_INFORMATION`, common volume queries | ✓ | Hard-coded responses matching the fake volume state |
+| `IOCTL_DISK_*` | × | `ERROR_ACCESS_DENIED`. Direct disk access not permitted |
+| `IOCTL_SERIAL_*` | × | `ERROR_NOT_SUPPORTED`. Deferred to Phase 3 instrumentation |
+| Vendor-specific / unknown IOCTLs | × | `ERROR_NOT_SUPPORTED`. Audit-logged for catalog growth |
 
-**Emitted machine code for Tier 1 shims.** Rejected — validation is intractable. See Decision Drivers.
+### ntdll.dll
 
-**Per-sandbox plan cache with no sharing.** Rejected — means every sandbox re-translates every function on first use, wasting translator capacity. Sandbox isolation is preserved by running plans in the calling sandbox's capability context, not by re-translating the same plan N times.
+| Function | State | Mapping |
+|----------|-------|---------|
+| `RtlAllocateHeap` / `RtlFreeHeap` / `RtlReAllocateHeap` | ✓ | Mirrors `HeapAlloc`/`HeapFree`/`HeapReAlloc` |
+| `RtlCreateHeap` / `RtlDestroyHeap` / `RtlSizeHeap` | ✓ | Heap-table ops |
+| `RtlInitUnicodeString` / `RtlInitAnsiString` | ✓ | Pure memory setup |
+| `RtlUnicodeStringToAnsiString` / `RtlAnsiStringToUnicodeString` | ✓ | UTF-16 ↔ ANSI conversion |
+| `NtQueryInformationProcess` | R | Information class varies; common classes supported (see sub-table) |
+| `NtQuerySystemInformation` | R | Per-class routing; common classes supported, unknown → `STATUS_NOT_IMPLEMENTED` |
+| `RtlAddVectoredExceptionHandler` / `RtlRemoveVectoredExceptionHandler` | × | `STATUS_NOT_IMPLEMENTED`. SEH support is a Phase 2 decision (kernel SEH mechanism required) |
+| `NtSetInformationThread` | R | Priority and affinity classes supported; TLS alternate-base and scheduler-class stubbed |
+| `RtlAcquirePebLock` / `RtlReleasePebLock` | ✓ | Per-sandbox PEB lock |
+| `NtClose` | ✓ | Generic handle close; routes by kind |
+| `NtCreateFile` | R | Lower-level CreateFile; used by .NET and some C runtimes |
+| `NtReadFile` / `NtWriteFile` | ✓ | Lower-level Read/Write; same FS-service mapping |
+| `NtQueryAttributesFile` | ✓ | VFS metadata read |
+| `RtlGetVersion` | ✓ | Same as `GetVersionExW` |
 
-**Tier 3 interactive fallback as default for unclassified functions.** Rejected as default behavior — too much user friction. Unclassified functions go to the translator first; the user is consulted only when translation fails validation or when a plan requests a capability the sandbox hasn't been granted.
+### user32.dll
 
-**AI translator runs inside win-compat service.** Rejected — different resource profile (model weights, inference compute) and different trust boundary. The translator is its own service at endpoint 25, with its own Principal. win-compat is a thin dispatcher.
+| Function | State | Mapping |
+|----------|-------|---------|
+| `CreateWindowExW` | ✓ | Window-table entry; UI service IPC for surface allocation |
+| `DestroyWindow` | ✓ | Window teardown; handle-free |
+| `ShowWindow` / `UpdateWindow` | ✓ | Visibility / invalidation via UI service IPC |
+| `GetMessageW` | ✓ | Hot. Message queue read. Summary-only audit |
+| `TranslateMessage` | ✓ | Pure transformation |
+| `DispatchMessageW` | ✓ | Invoke registered window proc |
+| `DefWindowProcW` | ✓ | Default window proc; handles standard messages |
+| `PostQuitMessage` | ✓ | Sets quit flag in sandbox's message loop |
+| `RegisterClassExW` / `UnregisterClassW` | ✓ | Window class registration / teardown |
+| `SendMessageW` / `PostMessageW` | ✓ | Message delivery within sandbox |
+| `MessageBoxW` | ✓ | Modal dialog via UI service; bounded set of button/icon combinations |
+| `LoadStringW` / `LoadIconW` / `LoadCursorW` | ✓ | PE resource read |
+| `SetWindowTextW` / `GetWindowTextW` | ✓ | Window title |
 
-## Open Questions
+### gdi32.dll
 
-- **Phase 2 grammar expansion.** COM `QueryInterface` chains with type-dependent method dispatch may require adding bounded polymorphism to the plan grammar. Deferred to a Phase 2 ADR that can be written with concrete examples in hand.
-- **DirectX/OpenGL translation.** Is the compat layer the right home for graphics translation, or does it belong in a separate "graphics translator" service that win-compat calls out to? Deferred.
-- **.NET hosting.** .NET runtime runs inside the sandbox, not as a service — that much is clear. How the runtime's JIT is sandboxed (its own plan grammar? emitted code with W^X enforcement?) is a Phase 1 question; may need a separate ADR.
-- **Translator model architecture.** ADR-009 defers "specific model architecture for the AI translator" to a future ADR. This ADR specifies the contract the translator implements (input: function + args, output: plan) without committing to a model.
-- **Plan size and complexity bounds.** Initial bounds picked conservatively (N=16 primitives, bounded depth=4). Will be revised after Phase 1 catalog implementation reveals realistic distributions.
+| Function | State | Mapping |
+|----------|-------|---------|
+| `CreateDCW` | R | Printer / display / memory DCs have different backends |
+| `CreateCompatibleDC` | ✓ | Memory DC |
+| `DeleteDC` | ✓ | DC free |
+| `CreateCompatibleBitmap` | ✓ | Bitmap allocation |
+| `SelectObject` | ✓ | DC state update |
+| `DeleteObject` | ✓ | GDI object free |
+| `TextOutW` / `ExtTextOutW` | ✓ | Font rendering via UI service. Common font configurations supported; exotic configs fall back to bitmap-font substitution |
+| `BitBlt` | ✓ | Pixel transfer |
+| `StretchBlt` | ✓ | Scaling variant via UI service |
+| `CreateSolidBrush` | ✓ | Constant-color brush |
+| `CreateFontIndirectW` | ✓ | Font lookup; substitution table for missing fonts |
+| `GetDeviceCaps` | ✓ | Fixed DC capability table |
+
+### advapi32.dll
+
+| Function | State | Mapping |
+|----------|-------|---------|
+| `RegOpenKeyExW` / `RegCloseKey` | ✓ | Virtual registry |
+| `RegQueryValueExW` | ✓ | Virtual registry read |
+| `RegSetValueExW` | ✓ | Virtual registry write |
+| `RegCreateKeyExW` | R | Most flag combinations supported; security-descriptor variants route to a sub-handler that ignores the SD (sandbox has its own model) |
+| `RegEnumKeyExW` / `RegEnumValueW` | ✓ | Registry iteration |
+| `RegDeleteKeyW` / `RegDeleteValueW` | ✓ | Registry delete |
+| `OpenProcessToken` | ✓ | Returns a synthetic token referencing the sandbox Principal |
+| `GetTokenInformation` | R | `TokenUser`, `TokenGroups`, `TokenElevation` supported; obscure classes error |
+| `LookupAccountSidW` | ✓ | Sandbox-SID-to-Principal mapping |
+| `CryptAcquireContextW` / `CryptCreateHash` / `CryptHashData` / `CryptDestroyHash` | ✓ | Delegates to CambiOS crypto (Blake3 / SHA-2) |
+
+### ole32.dll
+
+Phase 1 target applications use COM lightly. The support here covers the minimum — CLSIDs beyond the enumerated set return `REGDB_E_CLASSNOTREG`, which Phase 1 apps handle gracefully (they have non-COM fallbacks).
+
+| Function | State | Mapping |
+|----------|-------|---------|
+| `CoInitializeEx` / `CoUninitialize` | ✓ | Apartment-model init / teardown |
+| `CoCreateInstance` | R | Enumerated CLSIDs (Phase 1 app-specific: `CLSID_ShellLink`, `CLSID_FileOpenDialog`, a short list) supported; others return `REGDB_E_CLASSNOTREG` |
+| `CoTaskMemAlloc` / `CoTaskMemFree` | ✓ | Task memory allocation |
+| `CoRegisterClassObject` / `CoGetClassObject` | ✓ | Class factory registration/lookup; same CLSID set as `CoCreateInstance` |
+
+### shell32.dll
+
+| Function | State | Mapping |
+|----------|-------|---------|
+| `SHGetFolderPathW` / `SHGetKnownFolderPath` | ✓ | Known-folder CSIDL/KNOWNFOLDERID → VFS path mapping |
+| `SHBrowseForFolderW` | ✓ | UI service folder dialog; BIF flags mapped or ignored |
+| `SHGetPathFromIDListW` | ✓ | PIDL resolution |
+| `ShellExecuteW` | R | `open` / `edit` / `print` verbs on files supported; URLs supported via net-service IPC (when granted); `runas` and other privileged verbs error |
+
+### comctl32.dll
+
+| Function | State | Mapping |
+|----------|-------|---------|
+| `InitCommonControlsEx` | ✓ | Sandbox state update |
+| `ImageList_Create` / `ImageList_Add` / `ImageList_Destroy` | ✓ | Image list allocation / append / free |
+
+### Catalog summary
+
+- Supported: ~85 functions with direct handlers
+- Routers: 8 (`CreateFileW`, `DeviceIoControl`, `CreateDCW`, `NtQueryInformationProcess`, `NtQuerySystemInformation`, `NtCreateFile`, `NtSetInformationThread`, `RegCreateKeyExW`, `GetTokenInformation`, `CoCreateInstance`, `ShellExecuteW`)
+- Stubbed at Phase 1: SEH (`RtlAddVectoredExceptionHandler` etc.), async I/O (`FILE_FLAG_OVERLAPPED`), direct device I/O (`IOCTL_DISK_*`, `IOCTL_SERIAL_*`), most ole32 beyond the enumerated CLSIDs
+
+This surface covers the observed Win32 call patterns of the Phase 1 target apps. Phase 2 (CAD) and Phase 3 (instrumentation) will require substantial additions; those catalogs are future ADRs.
 
 ## Relationship to Other ADRs
 
-- **[ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities).** Plan execution is the sandbox's capability use. Validation pipeline enforces that plans only reference capabilities the sandbox holds. The API/AI boundary is an instance of zero-trust applied to AI-generated content.
-- **[ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage).** Plans are CambiObjects. The ObjectStore is the plan cache. Content addressing makes cross-sandbox sharing correct.
-- **[ADR-004](004-cryptographic-integrity.md) (Cryptographic Integrity).** Plans are signed by the translator's Principal. Signature verification is part of the validation pipeline.
-- **[ADR-007](007-capability-revocation-and-telemetry.md) (Audit Telemetry).** Audit events for Win32 calls use the ADR-007 infrastructure. The new `WinShimCall` event kind fits the 64-byte RawAuditEvent format.
-- **[ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers).** Windows compat runs at Tiers 2 and 3. On Tier 2 (no AI), only Tier 0 static shims are available; Tier 1/2/3 routing returns an error. On Tier 3, all four tiers are active. This ADR's tier-0-only fallback is the mechanism by which ADR-009's "graceful degradation" commitment applies to Windows compat.
-- **Future endpoint-sizing ADR.** Private endpoints per sandboxed PE process are a prerequisite for the per-sandbox capability context that validation depends on. That ADR lands alongside this one.
+- **[ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities).** Handler execution runs under the sandbox's capabilities. Every IPC call a handler makes on the sandbox's behalf passes through the standard capability check.
+- **[ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage).** File access from a sandboxed PE flows through the VFS layer to the ObjectStore; the sandboxed Principal is the author, the parent user is the owner.
+- **[ADR-007](007-capability-revocation-and-telemetry.md) (Audit Telemetry).** The `WinShimCall` audit event kind lands in the existing 64-byte `RawAuditEvent` format.
+- **[ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers).** Windows compatibility is available on Tiers 2 and 3; the hardware floor for running Phase 1 apps is the Tier 2 target. The removal of the AI translator means compat is no longer gated by on-device model capacity.
+
+## Non-Goals
+
+- **Full Win32 coverage.** By design, this layer does not aim to implement all of Win32. It aims to implement a defined, tested subset well.
+- **Behavioral pattern recognition across call sequences.** Without the AI translator, there is no machinery for recognizing a `CoCreateInstance → QueryInterface → method` sequence as a translatable pattern. Each call is a handler; sequences emerge from app behavior, not from translation.
+- **Running Windows drivers, services, DRM, or anti-cheat.** Kernel-mode code cannot run. See [win-compat.md](../win-compat.md) for the broader non-goals list.
+- **x86-on-AArch64 binary translation.** Separate problem, separate eventual ADR.
+
+## Deferred Decisions
+
+- **SEH support.** Structured exception handling is pervasive in Windows apps but requires either a kernel SEH mechanism or a full user-space SEH emulator. Phase 1 stubs; decide when a target app's failure trace names `RtlAddVectoredExceptionHandler`.
+  **Revisit when:** a Phase 1 target app fails with `STATUS_NOT_IMPLEMENTED` from `RtlAddVectoredExceptionHandler` in the audit trail.
+- **Threading model details.** `CreateThread`/`WaitForSingleObject` map cleanly once CambiOS has a user-visible thread primitive. Until then, they stub.
+  **Revisit when:** CambiOS threading lands and the `user/thread-primitives` crate is buildable.
+- **UI service contract.** Several handlers IPC into the "UI service" for window surfaces, dialogs, and font rendering. The UI service contract is not yet written.
+  **Revisit when:** the UI service ADR lands (it will need to predate the first target app that hits a windowing handler).
+- **Phase 2 CAD scope.** The Phase 1 catalog covers business apps. CAD apps (SolidWorks, AutoCAD) require substantial additions (full COM, DirectX or OpenGL, OLE/ActiveX container, .NET interop). Without AI translation, each of these is a significant body of hand-written shim code. Whether Phase 2 is feasible at all in the bounded-static model — vs. deferred indefinitely or re-evaluated against a different translation strategy — is an open question.
+  **Revisit when:** Phase 1 ships and the compat layer's maintenance cost is a known quantity.
 
 ## Cross-References
 
-- [win-compat.md](../win-compat.md) — Updated to reference this ADR as the authoritative source for tier classification rules, plan grammar, validation pipeline, and audit schema. Sections that described these in prose are shortened to a one-line reference.
-- [ADR-017](017-win-compat-phase1-catalog.md) — Sibling document containing the per-function tier assignments for the Phase 1 Win32 surface. Applies this ADR's rules to today's target.
+- [win-compat.md](../win-compat.md) — Design document for the broader compat layer (PE loader, sandbox policy, virtual filesystem/registry, target application phases). This ADR is the shim-layer decision within that design.
 - [STATUS.md](../../STATUS.md) — Windows compatibility remains "Planned (post-v1)." This ADR is a design landing, not an implementation landing.
-- [CLAUDE.md](../../CLAUDE.md) — Required Reading table gets a new row when the scaffolding lands: "Windows compatibility / PE loader / shim layer" pointing to this ADR and its catalog.
-
-## See Also
-
-- Phase 0 scaffolding of `user/win-compat/` is the first consumer of this ADR. The scaffolding cites this ADR in every shim file's module doc comment, tags every shim entry with its assigned tier, and implements the plan interpreter / validation pipeline as specified here.
-- The AI translator service (endpoint 25) is the other consumer. Its specification is "produces plans conforming to this ADR's grammar, signed by its Principal, content-addressed by `(dll, function, argument_signature)` fingerprint." Translator implementation is a separate work stream.
+- [CLAUDE.md](../../CLAUDE.md) — Required Reading map gets a row when the scaffolding lands: "Windows compatibility / PE loader / shim layer" → this ADR.
