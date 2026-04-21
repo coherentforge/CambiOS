@@ -91,14 +91,18 @@ pub fn elapsed_ms() -> u64 {
 /// Reads the counter frequency, computes the reload value for the
 /// requested tick rate, records boot time, and starts the countdown.
 ///
+/// Returns `Err(BootError::TimerFrequencyMissing)` if `CNTFRQ_EL0`
+/// reads as zero (firmware bug) — the caller dispatches to
+/// `boot::boot_failed` for the typed halt path.
+///
 /// # Safety
 /// Must be called during boot with interrupts masked (DAIF.I set).
 /// The GIC must have PPI INTID 30 enabled in the Redistributor for
 /// the interrupt to be delivered.
-pub unsafe fn init(frequency_hz: u32) {
+pub unsafe fn init(frequency_hz: u32) -> Result<(), crate::boot::BootError> {
     let cnt_freq = read_frequency();
     if cnt_freq == 0 {
-        panic!("ARM Generic Timer: CNTFRQ_EL0 is 0 (firmware bug)");
+        return Err(crate::boot::BootError::TimerFrequencyMissing);
     }
 
     COUNTER_FREQ.store(cnt_freq, Ordering::Release);
@@ -135,6 +139,8 @@ pub unsafe fn init(frequency_hz: u32) {
         "  ARM Generic Timer: freq={}Hz reload={} ({}Hz tick)",
         cnt_freq, reload, frequency_hz
     );
+
+    Ok(())
 }
 
 /// Rearm the timer for the next period.
@@ -159,12 +165,17 @@ pub unsafe fn rearm() {
 
 /// Initialize the timer on an AP (same frequency as BSP).
 ///
+/// Returns `Err(BootError::TimerInvariantViolation)` if the BSP
+/// never finished its own `init` (reload value still zero) — an
+/// AP-discovered boot-sequence bug the caller surfaces via
+/// `boot::boot_failed`.
+///
 /// # Safety
 /// Must be called once per AP during startup with interrupts masked.
-pub unsafe fn init_ap() {
+pub unsafe fn init_ap() -> Result<(), crate::boot::BootError> {
     let reload = TIMER_RELOAD.load(Ordering::Acquire) as u64;
     if reload == 0 {
-        panic!("ARM timer: BSP timer not initialized before AP");
+        return Err(crate::boot::BootError::TimerInvariantViolation);
     }
 
     // SAFETY: Writing CNTP_TVAL_EL0 and CNTP_CTL_EL0 from EL1 during AP
@@ -185,6 +196,8 @@ pub unsafe fn init_ap() {
             tmp = out(reg) _,
         );
     }
+
+    Ok(())
 }
 
 /// Stop the timer (disable interrupts).

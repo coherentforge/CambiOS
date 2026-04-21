@@ -463,7 +463,9 @@ unsafe extern "C" fn kmain() -> ! {
             println!("  ✓ GIC Redistributor initialized (CPU 0)");
 
             // Start ARM Generic Timer at 100 Hz
-            arcos_core::arch::aarch64::timer::init(100);
+            // ADR-021 Phase B.3: typed BootError propagation.
+            arcos_core::arch::aarch64::timer::init(100)
+                .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
             println!("  ✓ ARM Generic Timer started (100 Hz)");
         }
         println!("✓ GIC + timer scheduling active\n");
@@ -654,12 +656,13 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
             tb
         );
     } else {
-        println!("⚠ DTB did not report timebase-frequency — timer init will panic");
+        println!("⚠ DTB did not report timebase-frequency — timer init will fail");
     }
 
-    // SAFETY: trap vector just installed; base frequency is present
-    // (we panic in timer::init if not).
-    let reload = unsafe { arcos_core::arch::riscv64::timer::init(100) };
+    // SAFETY: trap vector just installed.
+    // ADR-021 Phase B.3: typed BootError on missing timebase.
+    let reload = unsafe { arcos_core::arch::riscv64::timer::init(100) }
+        .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
     println!("✓ SBI timer armed at 100 Hz (reload = {} ticks)", reload);
 
     // Phase R-3.d: PLIC driver — init from DTB-reported MMIO range,
@@ -676,9 +679,14 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
             // SAFETY: BootInfo was populated from the DTB; the PLIC
             // region is a real MMIO range and we're in single-hart
             // early boot with interrupts masked.
+            // ADR-021 Phase B.3: typed BootError on implausible PLIC range.
             unsafe {
                 arcos_core::arch::riscv64::plic::init(phys_base, size_bytes)
-                    .expect("plic::init failed — DTB reported implausible range");
+                    .unwrap_or_else(|_| {
+                        arcos_core::boot::boot_failed(
+                            arcos_core::boot::BootError::PlicInitFailed,
+                        )
+                    });
             }
             println!("✓ PLIC initialized (hart 0 S-mode, threshold=0, SEIE set)");
 
@@ -1936,7 +1944,9 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
         arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
 
         // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
-        arcos_core::arch::aarch64::timer::init_ap();
+        // ADR-021 Phase B.3: AP discovers if BSP forgot to init the timer.
+        arcos_core::arch::aarch64::timer::init_ap()
+            .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
     }
 
     // Step 7: Initialize per-CPU scheduler and timer

@@ -51,22 +51,21 @@ static RELOAD: AtomicU64 = AtomicU64::new(0);
 /// interrupt. Does **not** set `sstatus.SIE` — that is the caller's
 /// call (see [`super::trap::enable_interrupts`]).
 ///
-/// Returns the effective reload so the caller can log it.
+/// Returns the effective reload on success so the caller can log it,
+/// or [`crate::boot::BootError::TimerFrequencyMissing`] if the DTB
+/// did not report `/cpus/timebase-frequency`.
 ///
 /// # Safety
 /// - [`crate::boot::install`] must have run (so `boot::info()` works).
 /// - Must be called with interrupts globally masked (`sstatus.SIE=0`).
 /// - Must be called once per hart during boot, after the trap vector
 ///   is installed.
-pub unsafe fn init(hz: u32) -> u64 {
+pub unsafe fn init(hz: u32) -> Result<u64, crate::boot::BootError> {
     assert!(hz > 0, "timer::init called with hz=0");
 
     let base = crate::boot::info()
         .timer_base_frequency_hz
-        .expect(
-            "timer::init: DTB did not report /cpus/timebase-frequency — \
-             CambiOS needs this to program the SBI timer",
-        );
+        .ok_or(crate::boot::BootError::TimerFrequencyMissing)?;
 
     let reload = (base as u64) / (hz as u64);
     assert!(
@@ -92,7 +91,7 @@ pub unsafe fn init(hz: u32) -> u64 {
     // it; sbi_set_timer is safe from S-mode.
     unsafe { rearm() };
 
-    reload
+    Ok(reload)
 }
 
 /// Arm the next timer interrupt.
