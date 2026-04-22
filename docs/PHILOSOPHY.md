@@ -1,5 +1,37 @@
 # CambiOS: Philosophical Foundations
 
+## Generative, Not Extractive
+
+Every technical choice in CambiOS answers to one question before any other:
+does this create, or does it take?
+
+The dominant operating systems of the last two decades were built on an
+extractive assumption — that a user's attention, data, and behavior are
+resources to be harvested back to the vendor. Telemetry, ads, behavioral
+profiling, forced account binding, cloud-first defaults that route private
+work through third-party infrastructure. These are not failures of a good
+idea. They are the good idea, executed faithfully. An extractive OS produces
+exactly the system it was designed to produce: one where the user is the
+product.
+
+CambiOS is designed against that frame, and toward something different.
+**The user is not the product.** The user owns their keys, their data,
+their work, their attention, and their machine. The kernel arbitrates
+isolation, not access. AI watches and warns; it does not decide for,
+negotiate with, or report on the user. There is no telemetry, no
+behavioral profiling, no quiet monetization of what the user does here.
+
+Generative is more than the negation of extractive. It is also a stance
+about what an OS is for. CambiOS is built to let people *create* — to
+do work, and to form secure, verifiable connections with people they
+trust. A mesh of such connections becomes community. Community is not
+something the OS imposes or owns, but it is something the OS should never
+stand in the way of, and should make genuinely possible. The user
+experience, across all of this, is meant to be helpful — and genuinely
+better than what is widely available today. Not cleaner-looking. Better.
+
+Everything below this section is an elaboration of that single stance.
+
 ## On Consciousness, Loneliness, and Creation
 
 *Conversation during CambiOS microkernel development, March 31, 2026*
