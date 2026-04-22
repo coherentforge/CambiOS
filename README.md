@@ -184,6 +184,14 @@ CambiOS is looking for people who understand what's at stake — OS internals, c
 2. Read the ADRs for the subsystem you are about to touch. The required-reading map in CLAUDE.md names them.
 3. Check [STATUS.md](STATUS.md) to confirm the work is not already in progress in another phase.
 
+**One-time setup (per clone):**
+
+```bash
+make install-hooks
+```
+
+Points `core.hooksPath` at the tracked `.githooks/` directory so the pre-commit hook fires on every `git commit`. The hook enforces banned-paths (files deleted from git must not reappear on disk) and STATUS.md commit-isolation (structural rewrites commit alone). Updates to the hook propagate via `git pull` — no re-install needed.
+
 **Working rules:**
 
 - **Tri-architecture regression gate is mandatory.** `make check-all` must pass before any commit — no commit may regress x86_64, aarch64, or riscv64. See [ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline.
