@@ -89,31 +89,21 @@ mod keys {
     pub const ESCAPE: u32 = 0x29;
 }
 
-/// Frame-clock tick count at score 0, in kernel ticks. 10 ticks at
-/// 100 Hz = 100 ms = 10 moves/sec, the Nokia-Snake baseline.
+/// Frame-clock tick count, in kernel ticks. 20 ticks at 100 Hz =
+/// 200 ms = 5 moves/sec — the Nokia / classic-arcade Snake baseline.
 ///
-/// TUNING: chosen so a fresh worm is slow enough for the player to
-/// learn the controls. Paired with `MIN_STEP_TICKS` below — the
-/// speedup curve only accelerates; it never decelerates.
-const BASE_STEP_TICKS: u64 = 10;
-
-/// TUNING: floor for the speedup curve. 5 ticks = 50 ms = 20 moves/sec.
-/// Any faster and the player can't visually separate adjacent frames.
-const MIN_STEP_TICKS: u64 = 5;
-
-/// TUNING: score divisor for the speedup curve. Every 5 points eaten
-/// drops step_ticks by 1 (capped at MIN_STEP_TICKS). With the default
-/// window width of 20 cells and starting length 3, a score of 25
-/// means the worm is ~28 cells long — challenging enough that
-/// stopping the speedup there keeps the game playable.
-const SPEEDUP_DIVISOR: u32 = 5;
-
-fn step_ticks_for_score(score: u32) -> u64 {
-    let decrement = (score / SPEEDUP_DIVISOR) as u64;
-    BASE_STEP_TICKS
-        .saturating_sub(decrement)
-        .max(MIN_STEP_TICKS)
-}
+/// TUNING ladder (landed via playtest):
+///   100 ms — "too fast" (initial ship)
+///   120 ms — "full throttle, no curve" (what 8.3/sec felt like)
+///   200 ms — current. 5 moves/sec. Canonical Snake feel.
+///
+/// V0 has no speedup curve. An earlier version scaled tick interval
+/// by score (`step_ticks = max(5, base - score/5)`), but a gentler
+/// start just handed the player the same "too fast" after ~10 food.
+/// The score-progression polish is deferred: Revisit when post-launch
+/// playtesters ask for it AND someone names the target end-game tick
+/// the player wants to reach.
+const STEP_TICKS: u64 = 20;
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
@@ -176,8 +166,7 @@ pub extern "C" fn _start() -> ! {
         // new game.
         if worm.state() == State::Playing {
             let now = sys::get_time();
-            let interval = step_ticks_for_score(worm.score());
-            if now.saturating_sub(last_step_tick) >= interval {
+            if now.saturating_sub(last_step_tick) >= STEP_TICKS {
                 let outcome = worm.step();
                 last_step_tick = now;
                 if !matches!(outcome, StepOutcome::NoOp) {
