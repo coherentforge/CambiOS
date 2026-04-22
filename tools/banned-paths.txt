@@ -1,0 +1,19 @@
+# Paths that must not exist in the working tree.
+# One path per line, relative to the repo root. Exact string match.
+# Blank lines and `#` comments ignored.
+#
+# Enforced by tools/check-banned-paths.py, wired into the pre-commit hook
+# at .githooks/pre-commit and runnable as `make check-banned-paths`.
+#
+# To ban a new path: add it here in the same commit that deletes the file
+# from git. To un-ban (if a deletion is reversed): remove the entry in
+# the same commit that re-adds the file.
+#
+# See CLAUDE.md Prompt-Shaping Changelog for why this mechanism exists.
+
+# afc4b11 (2026-04-19): R-4 scaffolding superseded by R-6 signed boot
+# modules. Deleted from git; the working-tree copies were resurrected
+# (most likely by an incomplete `git rm --cached` or a subsequent merge)
+# and sat untracked until the 2026-04-21 rebase surfaced them.
+user/hello-riscv64.S
+user/user-riscv64.ld

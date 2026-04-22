@@ -752,12 +752,31 @@ check-adrs:
 # Enforce STATUS.md commit-isolation (see tools/check-index-isolation.py).
 # Rejects commits that bundle a structural STATUS.md change (> 20 lines
 # changed) with any *.rs source file. Small Post-Change Review Step 8 row
-# updates are unaffected. Wired into .git/hooks/pre-commit; also runnable
+# updates are unaffected. Wired into .githooks/pre-commit; also runnable
 # manually via `make check-index-isolation`. Rationale: 2026-04-21 Tree v0
 # incident — parallel sessions both touched STATUS.md and one bundled the
 # other's restructure into a feature commit, requiring soft-reset + split.
 check-index-isolation:
 	@python3 tools/check-index-isolation.py
+
+# Enforce that paths deleted from git stay deleted on disk (see
+# tools/check-banned-paths.py and tools/banned-paths.txt). A `git rm
+# --cached`, conflict-resolved merge, or cross-clone cherry-pick can
+# leave a file in the working tree after the deletion commit lands;
+# this lint catches the divergence at the commit boundary. Wired into
+# .githooks/pre-commit; also runnable as `make check-banned-paths`.
+# Rationale: 2026-04-21 third-strike recurrence — user/hello-riscv64.S
+# and user/user-riscv64.ld survived afc4b11's deletion on disk and sat
+# untracked for two days before a rebase surfaced them.
+check-banned-paths:
+	@python3 tools/check-banned-paths.py
+
+# Install the tracked pre-commit hook by pointing core.hooksPath at
+# .githooks/. Run once per clone. Future hook changes propagate via
+# `git pull` — no re-install needed. See .githooks/pre-commit.
+install-hooks:
+	@git config core.hooksPath .githooks
+	@echo "=== core.hooksPath -> .githooks (pre-commit hook active) ==="
 
 # Enforce CLAUDE.md Development Convention 9 (every deferral is a
 # conscious deferral). Scans kernel source + design docs for deferral
