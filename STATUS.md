@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-04-21
+last_synced_to_code: 2026-04-22
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so
@@ -19,7 +19,7 @@ belongs in the linked ADR, not here.
 ## At a glance
 
 - **Tri-arch first-class**: clean release build on `x86_64`, `aarch64`, `riscv64gc`; all three boot in QEMU to an `arcos>` shell prompt. `make check-all` is the permanent regression gate.
-- **538 host unit tests passing** on `x86_64-apple-darwin`. Run `make stats` for current counts — numbers live in code, not prose.
+- **540 host unit tests passing** on `x86_64-apple-darwin`. Run `make stats` for current counts — numbers live in code, not prose.
 - **Security model live end-to-end**: cryptographic identity, signed-ELF verification, capability-gated IPC, content-addressed ObjectStore, audit ring, kernel identity gate, userspace `recv_verified`.
 - **GUI stack live on x86_64**: scanout-virtio-gpu drives QEMU virtio-vga; compositor composites; virtio-input forwards HID keyboard/pointer events into the focused window; first-party app `tree` (9×9 Minesweeper homage) runs as the default GUI boot module and exercises the full drawing + input loop.
 - **Persistent storage live**: virtio-blk + disk-backed ObjectStore + `arcobj` shell CLI; objects survive reboot.
@@ -93,7 +93,6 @@ Chronological, newest first. ~3 week window — older items rotate out; git log 
 | USB boot tooling | Done (`make img-usb` + `make usb DEVICE=...`) | x | `Makefile` | — |
 | Formal verification (Kani) | Started 2026-04-16. Live across 4 proof crates: `BuddyAllocator::free` reserved-prefix (150 checks, ~18s); ELF header parser in `src/loader/elf.rs` (7 harnesses covering `parse_header`, `get_program_header`, `analyze_binary`, `collect_load_segments`; proof authoring found + fixed 6 integer-overflow sites); FrameAllocator in `src/memory/frame_allocator.rs` (9 harnesses covering `allocate`, `free`, `allocate_contiguous`, `free_contiguous`, `add_region` overflow; fixed 2 overflow sites with `saturating_add`; `reserve_region` overflow blew CBMC's budget and is covered by unit tests instead); capability manager in `src/ipc/capability.rs` (12 harnesses — Tier A `ProcessCapabilities` state-machine invariants + Tier B cross-process properties on a 3-slot `Box::leak`'d manager: stale-generation rejection, no-delegate-without-right, no-escalation, `revoke_all` clears endpoint + system caps, non-bootstrap revoke denied). 29 passing harnesses total. Compositor protocol parser deferred until scanout settles past Scanout-4.c. | — | `verification/{buddy,elf,frame,capability}-proofs/` | [ADR-000 § Divergence](docs/adr/000-zta-and-cap.md) |
 | AArch64 SMP timer on AP | **Gap**: PPI 30 not firing on second CPU under QEMU `virt`. Single-CPU works. | a | — | — |
-| AArch64 device IRQ routing | **Gap**: GIC `enable_spi` / `set_spi_trigger` exist but not wired into boot path. No device IRQs on aarch64. | a | — | — |
 | DHCP client | Paused (pre-work in `udp-stack`; waiting on channel architecture consumer) | — | partial in `user/udp-stack/` | — |
 | DNS / TCP / Yggdrasil mesh / TLS / VFS / USB HID / DID resolution / identity revocation | Planned | — | — | [identity.md](docs/identity.md), various ADRs |
 | AI pre-exec analysis / behavioral anomaly detection / Win32 compat | Planned (post-v1) | — | — | [CambiOS.md](docs/CambiOS.md), [ADR-016](docs/adr/016-win-compat-api-ai-boundary.md), [ADR-017](docs/adr/017-user-directed-cloud-inference.md) |
