@@ -711,6 +711,8 @@ verify:
 	cd verification/buddy-proofs && cargo kani
 	@echo "=== Kani proofs: ELF parser ==="
 	cd verification/elf-proofs && cargo kani
+	@echo "=== Kani proofs: CapabilityManager ==="
+	cd verification/capability-proofs && cargo kani
 
 # =============================================================================
 # make stats — derive canonical counts from source code.

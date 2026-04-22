@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Standalone proof crate for the kernel's CapabilityManager. Excluded from
+# the kernel workspace (see root Cargo.toml). Builds under Kani's bundled
+# toolchain via `cargo kani` from this directory.
+#
+# The proven source is the kernel's `src/ipc/capability.rs`, included
+# verbatim via `#[path = ...]` — no copy, no fork. Minimal stubs for the
+# types it imports from `crate::ipc` are provided in `src/lib.rs`, and
+# `build.rs` sets `--cfg fuzzing` so the audit/scheduler call at line 696
+# (which pulls in the full kernel crate graph) is compiled out.
+
+[package]
+name = "capability-proofs"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }
