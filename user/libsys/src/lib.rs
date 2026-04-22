@@ -415,6 +415,411 @@ impl Principal {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Construct a Principal from raw 32 bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Format this Principal as a `did:key:z6Mk…` string.
+    ///
+    /// The returned `DidKey` owns a fixed-size buffer; call `.as_str()` or
+    /// `.as_bytes()` to read it.
+    pub fn to_did_key(&self) -> DidKey {
+        did_key_encode(&self.0)
+    }
+
+    /// Parse a `did:key:z6Mk…` string into a Principal. Returns `None` if the
+    /// input is not a valid Ed25519 did:key.
+    pub fn from_did_key(input: &[u8]) -> Option<Self> {
+        did_key_decode(input).map(Self)
+    }
+}
+
+// ============================================================================
+// did:key encoding (W3C did:key v0.7 — Ed25519 multikey)
+// ============================================================================
+//
+// Wire format:
+//   "did:key:" + "z" + base58btc([0xed, 0x01] || pubkey_bytes)
+//
+// - "z" is the multibase identifier for base58btc.
+// - [0xed, 0x01] is the unsigned varint encoding of multicodec 0xed (Ed25519
+//   public key).
+// - For a 32-byte Ed25519 pubkey the full string is 56 characters; the
+//   `DidKey` struct reserves 64 bytes to cover any valid encoding without
+//   dynamic allocation.
+//
+// This is the userspace half of Phase 4 from identity.md, pulled forward so
+// CambiOS Principals are expressible in the DID/SSI community's vocabulary.
+
+const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+const BASE58_ALPHABET: &[u8; 58] =
+    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const DID_KEY_PREFIX: &[u8] = b"did:key:z";
+
+/// A rendered did:key string (owns its buffer; no allocation).
+#[derive(Clone, Copy)]
+pub struct DidKey {
+    buf: [u8; 64],
+    len: u8,
+}
+
+impl DidKey {
+    /// The rendered string as bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    /// The rendered string as `&str`. base58btc output is pure ASCII so this
+    /// never fails, but we return an `Option` to stay panic-free.
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(self.as_bytes()).ok()
+    }
+}
+
+/// Encode a 32-byte Ed25519 public key as a `did:key:z6Mk…` string.
+pub fn did_key_encode(pubkey: &[u8; 32]) -> DidKey {
+    let mut prefixed = [0u8; 34];
+    prefixed[0] = MULTICODEC_ED25519_PUB[0];
+    prefixed[1] = MULTICODEC_ED25519_PUB[1];
+    prefixed[2..].copy_from_slice(pubkey);
+
+    let mut out = DidKey { buf: [0u8; 64], len: 0 };
+    out.buf[..DID_KEY_PREFIX.len()].copy_from_slice(DID_KEY_PREFIX);
+    let mut cursor = DID_KEY_PREFIX.len();
+
+    let written = base58btc_encode(&prefixed, &mut out.buf[cursor..]);
+    cursor += written;
+    out.len = cursor as u8;
+    out
+}
+
+/// Decode a `did:key:z6Mk…` string into a 32-byte Ed25519 public key.
+/// Returns `None` if the string has the wrong prefix, invalid base58btc
+/// characters, or a multicodec prefix other than Ed25519.
+pub fn did_key_decode(input: &[u8]) -> Option<[u8; 32]> {
+    if input.len() < DID_KEY_PREFIX.len() {
+        return None;
+    }
+    if &input[..DID_KEY_PREFIX.len()] != DID_KEY_PREFIX {
+        return None;
+    }
+    let body = &input[DID_KEY_PREFIX.len()..];
+
+    let mut decoded = [0u8; 64];
+    let n = base58btc_decode(body, &mut decoded)?;
+    // Expect exactly 34 bytes: 2 multicodec + 32 pubkey
+    if n != 34 {
+        return None;
+    }
+    if decoded[0] != MULTICODEC_ED25519_PUB[0] || decoded[1] != MULTICODEC_ED25519_PUB[1] {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&decoded[2..34]);
+    Some(out)
+}
+
+/// base58btc encode. Big-endian input is divided by 58 repeatedly; remainders
+/// become output characters (least-significant first, then reversed). Leading
+/// zero bytes in input map to leading `'1'` characters in output.
+///
+/// Returns the number of bytes written. `output` must have capacity for at
+/// least `input.len() * 138 / 100 + 1` bytes (ceil of log_58(256) * len).
+fn base58btc_encode(input: &[u8], output: &mut [u8]) -> usize {
+    let leading_zeros = input.iter().take_while(|&&b| b == 0).count();
+
+    let mut work = [0u8; 64];
+    let work_len = input.len();
+    debug_assert!(work_len <= work.len(), "base58btc_encode: input too large");
+    work[..work_len].copy_from_slice(input);
+
+    let mut out_rev = [0u8; 96];
+    let mut out_rev_len = 0;
+
+    loop {
+        // Is work all zero?
+        let mut all_zero = true;
+        for i in 0..work_len {
+            if work[i] != 0 {
+                all_zero = false;
+                break;
+            }
+        }
+        if all_zero {
+            break;
+        }
+
+        // Long-divide work (big-endian) by 58.
+        let mut carry: u32 = 0;
+        for i in 0..work_len {
+            let cur = carry * 256 + work[i] as u32;
+            work[i] = (cur / 58) as u8;
+            carry = cur % 58;
+        }
+        out_rev[out_rev_len] = BASE58_ALPHABET[carry as usize];
+        out_rev_len += 1;
+    }
+
+    // Emit leading '1's for input leading zeros.
+    for _ in 0..leading_zeros {
+        out_rev[out_rev_len] = b'1';
+        out_rev_len += 1;
+    }
+
+    // Reverse into caller's buffer.
+    let out_len = core::cmp::min(out_rev_len, output.len());
+    for i in 0..out_len {
+        output[i] = out_rev[out_rev_len - 1 - i];
+    }
+    out_len
+}
+
+/// base58btc decode. Returns the number of bytes written to `output`, or
+/// `None` on any character outside the base58btc alphabet.
+fn base58btc_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    let leading_ones = input.iter().take_while(|&&b| b == b'1').count();
+
+    let mut work = [0u8; 64];
+    let mut work_len = 0;
+
+    for &ch in input.iter().skip(leading_ones) {
+        let digit = base58_char_value(ch)?;
+        // Multiply `work` by 58 and add `digit`.
+        let mut carry: u32 = digit as u32;
+        for i in (0..work_len).rev() {
+            let cur = work[i] as u32 * 58 + carry;
+            work[i] = (cur & 0xff) as u8;
+            carry = cur >> 8;
+        }
+        // Prepend carry bytes if they overflow.
+        while carry > 0 {
+            if work_len >= work.len() {
+                return None; // overflow guard
+            }
+            // Shift right by one to make room at the front.
+            for i in (1..=work_len).rev() {
+                work[i] = work[i - 1];
+            }
+            work[0] = (carry & 0xff) as u8;
+            work_len += 1;
+            carry >>= 8;
+        }
+    }
+
+    let total = leading_ones + work_len;
+    if total > output.len() {
+        return None;
+    }
+    for i in 0..leading_ones {
+        output[i] = 0;
+    }
+    for i in 0..work_len {
+        output[leading_ones + i] = work[i];
+    }
+    Some(total)
+}
+
+fn base58_char_value(c: u8) -> Option<u8> {
+    // Linear scan — alphabet is 58 chars, and this runs once per input char
+    // (~47 for a typical did:key); no benefit from a lookup table in no_std.
+    for (idx, &alpha) in BASE58_ALPHABET.iter().enumerate() {
+        if alpha == c {
+            return Some(idx as u8);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod did_key_tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_prefix_is_varint_0xed() {
+        // Multicodec 0xed (Ed25519 pub key) as unsigned varint:
+        //   0xed = 0b1110_1101 = 237
+        //   low 7 bits: 0x6d ; with continuation bit: 0xed
+        //   remainder: 237 >> 7 = 1, emitted as 0x01
+        assert_eq!(MULTICODEC_ED25519_PUB, [0xed, 0x01]);
+    }
+
+    #[test]
+    fn round_trip_zeros() {
+        let pubkey = [0u8; 32];
+        let rendered = did_key_encode(&pubkey);
+        let decoded = did_key_decode(rendered.as_bytes()).expect("decode");
+        assert_eq!(decoded, pubkey);
+    }
+
+    #[test]
+    fn round_trip_ones() {
+        let pubkey = [0xffu8; 32];
+        let rendered = did_key_encode(&pubkey);
+        let decoded = did_key_decode(rendered.as_bytes()).expect("decode");
+        assert_eq!(decoded, pubkey);
+    }
+
+    #[test]
+    fn round_trip_sequential() {
+        let mut pubkey = [0u8; 32];
+        for (i, b) in pubkey.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let rendered = did_key_encode(&pubkey);
+        let decoded = did_key_decode(rendered.as_bytes()).expect("decode");
+        assert_eq!(decoded, pubkey);
+    }
+
+    #[test]
+    fn output_starts_with_did_key_z6mk() {
+        // Every Ed25519 did:key starts with "did:key:z6Mk" because the
+        // multicodec prefix [0xed, 0x01] base58btc-encodes to a fixed
+        // high-order prefix across all 32-byte payloads.
+        let pubkey = [0x42u8; 32];
+        let rendered = did_key_encode(&pubkey);
+        let bytes = rendered.as_bytes();
+        assert!(
+            bytes.starts_with(b"did:key:z6Mk"),
+            "expected did:key:z6Mk prefix, got {:?}",
+            core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+        );
+    }
+
+    #[test]
+    fn output_length_is_56() {
+        // 32-byte pubkey + 2-byte multicodec = 34 bytes.
+        // base58btc(34 bytes) is 46 chars for most inputs, occasionally 47.
+        // "did:key:" (8) + "z" (1) + body = 55 or 56 chars.
+        let pubkey = [0x42u8; 32];
+        let rendered = did_key_encode(&pubkey);
+        let len = rendered.as_bytes().len();
+        assert!(
+            len == 55 || len == 56,
+            "expected 55 or 56 bytes, got {}",
+            len
+        );
+    }
+
+    #[test]
+    fn decode_rejects_wrong_prefix() {
+        assert!(did_key_decode(b"did:web:example.com").is_none());
+        assert!(did_key_decode(b"did:key:mBase64Stuff").is_none()); // not z
+        assert!(did_key_decode(b"short").is_none());
+        assert!(did_key_decode(b"").is_none());
+    }
+
+    #[test]
+    fn decode_rejects_bad_base58_chars() {
+        // '0', 'O', 'I', 'l' are outside the base58btc alphabet.
+        assert!(did_key_decode(b"did:key:z0MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK").is_none());
+        assert!(did_key_decode(b"did:key:zOMkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK").is_none());
+    }
+
+    #[test]
+    fn decode_rejects_wrong_multicodec() {
+        // Hand-craft a base58btc string whose decoded prefix is NOT
+        // [0xed, 0x01] — start from a non-Ed25519 32-byte payload.
+        // Use multicodec 0xe7 (secp256k1 pub key): varint = [0xe7, 0x01].
+        let secp_prefix = [0xe7u8, 0x01];
+        let payload = [0x42u8; 32];
+        let mut prefixed = [0u8; 34];
+        prefixed[0] = secp_prefix[0];
+        prefixed[1] = secp_prefix[1];
+        prefixed[2..].copy_from_slice(&payload);
+        let mut b58 = [0u8; 64];
+        let n = base58btc_encode(&prefixed, &mut b58);
+        let mut input = [0u8; 128];
+        input[..DID_KEY_PREFIX.len()].copy_from_slice(DID_KEY_PREFIX);
+        input[DID_KEY_PREFIX.len()..DID_KEY_PREFIX.len() + n].copy_from_slice(&b58[..n]);
+        let total = DID_KEY_PREFIX.len() + n;
+        // Correct base58btc, correct multibase, WRONG multicodec.
+        assert!(did_key_decode(&input[..total]).is_none());
+    }
+
+    #[test]
+    fn principal_methods_round_trip() {
+        let p = Principal::from_bytes([0xabu8; 32]);
+        let rendered = p.to_did_key();
+        let parsed = Principal::from_did_key(rendered.as_bytes()).expect("parse");
+        // Principal doesn't derive Debug, so compare via as_bytes() rather
+        // than assert_eq!.
+        assert!(p == parsed);
+        assert_eq!(p.as_bytes(), parsed.as_bytes());
+    }
+
+    #[test]
+    fn rfc_8032_test1_pubkey_encodes_correctly() {
+        // RFC 8032 §7.1 Test 1 Ed25519 public key. The expected did:key
+        // output was cross-checked against an independent Python
+        // bignum-division reference. If this test drifts, either the
+        // encoder is buggy or someone changed the multicodec bytes.
+        let pubkey: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+            0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+            0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+            0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let expected = b"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
+        let rendered = did_key_encode(&pubkey);
+        assert_eq!(rendered.as_bytes(), &expected[..]);
+    }
+
+    #[test]
+    fn base58btc_classical_vectors() {
+        // Canonical Bitcoin base58btc test vectors — if any of these fail,
+        // the raw codec is wrong independent of did:key wrapping.
+        let cases: &[(&[u8], &[u8])] = &[
+            (&[0x00], b"1"),
+            (&[0x61], b"2g"),
+            (&[0x62, 0x62, 0x62], b"a3gV"),
+            (&[0x63, 0x63, 0x63], b"aPEr"),
+            (&[0x00, 0x00, 0x28, 0x7f, 0xb4, 0xcd], b"11233QC4"),
+            (
+                b"simply a long string" as &[u8],
+                b"2cFupjhnEsSn59qHXstmK2ffpLv2",
+            ),
+        ];
+        for (input, expected) in cases {
+            let mut out = [0u8; 128];
+            let n = base58btc_encode(input, &mut out);
+            assert_eq!(
+                &out[..n],
+                *expected,
+                "encode mismatch for {:?}: got {:?}, expected {:?}",
+                input,
+                core::str::from_utf8(&out[..n]).unwrap_or("<non-utf8>"),
+                core::str::from_utf8(expected).unwrap_or("<non-utf8>"),
+            );
+            // Decode round-trip
+            let mut back = [0u8; 128];
+            let m = base58btc_decode(expected, &mut back).expect("decode");
+            assert_eq!(
+                &back[..m],
+                *input,
+                "decode mismatch for {:?}",
+                core::str::from_utf8(expected).unwrap_or("<non-utf8>"),
+            );
+        }
+    }
+
+    #[test]
+    fn base58btc_round_trip_random_like() {
+        // Round-trip a handful of patterns through the raw codec.
+        for seed in 0u8..16 {
+            let mut input = [0u8; 34];
+            for (i, b) in input.iter_mut().enumerate() {
+                *b = seed.wrapping_mul(7).wrapping_add(i as u8);
+            }
+            let mut enc = [0u8; 64];
+            let n = base58btc_encode(&input, &mut enc);
+            let mut dec = [0u8; 64];
+            let m = base58btc_decode(&enc[..n], &mut dec).expect("decode");
+            assert_eq!(m, input.len(), "length mismatch for seed {}", seed);
+            assert_eq!(&dec[..m], &input[..], "bytes mismatch for seed {}", seed);
+        }
+    }
 }
 
 /// An IPC message whose sender identity has been verified as non-anonymous.

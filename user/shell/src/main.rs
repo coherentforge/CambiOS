@@ -121,6 +121,7 @@ fn dispatch_command(line: &[u8]) {
         b"pid" => cmd_pid(),
         b"clear" => cmd_clear(),
         b"arcobj" => cmd_arcobj(args),
+        b"did-key" | b"didkey" => cmd_did_key(args),
         b"exit" => sys::exit(0),
         _ => cmd_spawn(cmd),
     }
@@ -132,13 +133,14 @@ fn dispatch_command(line: &[u8]) {
 
 fn cmd_help() {
     sys::print(b"Built-in commands:\r\n");
-    sys::print(b"  help   - Show this help\r\n");
-    sys::print(b"  echo   - Print text\r\n");
-    sys::print(b"  time   - Show system ticks\r\n");
-    sys::print(b"  pid    - Show shell process ID\r\n");
-    sys::print(b"  clear  - Clear screen\r\n");
-    sys::print(b"  arcobj - CambiObject store operations (put/get/list/delete)\r\n");
-    sys::print(b"  exit   - Exit shell\r\n");
+    sys::print(b"  help    - Show this help\r\n");
+    sys::print(b"  echo    - Print text\r\n");
+    sys::print(b"  time    - Show system ticks\r\n");
+    sys::print(b"  pid     - Show shell process ID\r\n");
+    sys::print(b"  clear   - Clear screen\r\n");
+    sys::print(b"  arcobj  - CambiObject store operations (put/get/list/delete)\r\n");
+    sys::print(b"  did-key - Render this process's Principal as did:key, or encode/decode one\r\n");
+    sys::print(b"  exit    - Exit shell\r\n");
     sys::print(b"\r\nExternal commands (boot modules):\r\n");
     sys::print(b"  hello, key-store-service, fs-service, ...\r\n");
 }
@@ -166,6 +168,63 @@ fn cmd_pid() {
 fn cmd_clear() {
     // ANSI escape: clear screen + move cursor to top-left
     sys::print(b"\x1b[2J\x1b[H");
+}
+
+// ============================================================================
+// `did-key` — render / encode / decode Principals as did:key
+//
+// Modes:
+//   did-key                   this process's Principal as did:key
+//   did-key <64-hex>          encode a raw Ed25519 pubkey as did:key
+//   did-key did:key:z6Mk...   decode a did:key into raw hex bytes
+//
+// This is the userspace half of identity.md Phase 4: CambiOS Principals
+// expressed in the W3C DID Core vocabulary, without changing how the
+// kernel enforces them.
+// ============================================================================
+
+fn cmd_did_key(args: &[u8]) {
+    let trimmed = trim(args);
+
+    if trimmed.is_empty() {
+        // Self mode.
+        let mut pk = [0u8; 32];
+        let n = sys::get_principal(&mut pk);
+        if n != 32 {
+            sys::print(b"did-key: failed to read this process's Principal\r\n");
+            return;
+        }
+        if pk == [0u8; 32] {
+            sys::print(b"did-key: this process has no bound Principal (anonymous)\r\n");
+            return;
+        }
+        let rendered = sys::did_key_encode(&pk);
+        sys::print(rendered.as_bytes());
+        sys::print(b"\r\n");
+        return;
+    }
+
+    // Decode mode: input looks like did:key:z...
+    if trimmed.starts_with(b"did:key:") {
+        match sys::did_key_decode(trimmed) {
+            Some(bytes) => {
+                print_hex32(&bytes);
+                sys::print(b"\r\n");
+            }
+            None => sys::print(b"did-key: not a valid Ed25519 did:key\r\n"),
+        }
+        return;
+    }
+
+    // Encode mode: input is 64 hex chars (raw pubkey).
+    let mut pk = [0u8; 32];
+    if !parse_hex32(trimmed, &mut pk) {
+        sys::print(b"did-key: argument must be 64 hex chars OR a did:key:z... string\r\n");
+        return;
+    }
+    let rendered = sys::did_key_encode(&pk);
+    sys::print(rendered.as_bytes());
+    sys::print(b"\r\n");
 }
 
 // ============================================================================

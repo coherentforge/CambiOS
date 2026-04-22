@@ -30,6 +30,7 @@ belongs in the linked ADR, not here.
 
 Chronological, newest first. ~3 week window — older items rotate out; git log has the full history.
 
+- **2026-04-21** — `did:key` encoder for Principals ([identity.md](docs/identity.md) Phase 4 pull-forward): 32-byte Ed25519 pubkey ↔ `did:key:z6Mk…` via multicodec `0xed` + base58btc, implemented in `user/libsys/` (no new deps, no_std). Shell gains a `did-key` command (self / encode-hex / decode-did:key). Cross-verified against the RFC 8032 Test 1 vector. x/a/r.
 - **2026-04-21** — Tree v0 (first-party app): `user/tree/` — 9×9 Minesweeper homage on libgui + virtio-input, replaces `hello-window` as default GUI boot module; `hello-window` retained as protocol regression test.
 - **2026-04-21** — Input-1 (ADR-012): `user/libinput-proto` 96-byte wire format; `user/virtio-input` driver (modern virtio-pci, device class probed via `VIRTIO_INPUT_CFG_EV_BITS`, evdev→HID translation); compositor forwards events to focused window on `COMPOSITOR_INPUT_ENDPOINT = 30`; libgui `Client::poll_event` drains on a tagged libgui-proto message. `make run-gui` captures Cocoa keyboard/mouse → serial log end-to-end. x86_64 only.
 - **2026-04-21** — `user/libgui` v0: `Client::open`, `Surface` primitives (`fill_rect`, `draw_line` Bresenham, `draw_text_builtin` 8×8 ASCII font, `blit_bitmap` with optional chroma-key), `TileGrid`. hello-window ported to the library; Tree v0 consumes it.
@@ -57,6 +58,7 @@ Chronological, newest first. ~3 week window — older items rotate out; git log 
 | Audit infrastructure | Done (Phase 3.3) | x/a/r | `src/audit/` | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
 | Policy service (syscall allowlisting) | Done (Phase 3.4b, per-process allowlists) | x/a/r | `user/policy-service/` | [ADR-006](docs/adr/006-policy-service.md) |
 | Cryptographic identity | Done (Phase 1C, hardware-backed + load-bearing) | x/a/r | `src/ipc/`, `src/syscalls/`, `user/libsys/`, `bootstrap_pubkey.bin` | [identity.md](docs/identity.md), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
+| `did:key` encoding (Principal ↔ `did:key:z6Mk…`) | Done (encoder + decoder; not full DID resolution) | x/a/r | `user/libsys/src/lib.rs` (`did_key_encode`/`did_key_decode`), `user/shell/src/main.rs` (`did-key` cmd) | [identity.md](docs/identity.md) Phase 4 |
 | Signed ELF loading | Done (ARCSIG trailer, Ed25519) | x/a/r | `src/loader/` | [ADR-004](docs/adr/004-cryptographic-integrity.md) |
 | Content-addressed ObjectStore (RAM) | Done (Phase 1C, fallback) | x/a/r | `src/fs/ram.rs` | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) |
 | Persistent ObjectStore (disk) | Done (Phase 4b) | x (via virtio-blk) | `src/fs/disk.rs`, `src/fs/block.rs`, `src/fs/lazy_disk.rs`, `src/fs/virtio_blk_device.rs` | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) |
