@@ -135,7 +135,7 @@ impl FrameAllocator {
     /// `base` and `length` are physical addresses/sizes.
     pub fn add_region(&mut self, base: u64, length: u64) {
         let start_frame = base.div_ceil(PAGE_SIZE); // Round up
-        let end_frame = (base + length) / PAGE_SIZE; // Round down
+        let end_frame = base.saturating_add(length) / PAGE_SIZE; // Round down
 
         for frame_idx in start_frame..end_frame {
             let idx = frame_idx as usize;
@@ -155,7 +155,7 @@ impl FrameAllocator {
     /// Use this to exclude the kernel image, kernel heap, page tables, etc.
     pub fn reserve_region(&mut self, base: u64, length: u64) {
         let start_frame = base / PAGE_SIZE; // Round down (conservative)
-        let end_frame = (base + length).div_ceil(PAGE_SIZE); // Round up
+        let end_frame = base.saturating_add(length).div_ceil(PAGE_SIZE); // Round up
 
         for frame_idx in start_frame..end_frame {
             let idx = frame_idx as usize;
@@ -571,6 +571,30 @@ mod tests {
         // First allocation should skip reserved frames
         let frame = alloc.allocate().unwrap();
         assert_eq!(frame.addr, 0x110000); // Starts after reserved region
+    }
+
+    #[test]
+    fn test_add_region_wrap_boundary_no_panic() {
+        // base + length wraps u64 — saturating_add at line 138 must
+        // handle this without panic or UB. Frames are all out of the
+        // bitmap range so nothing gets added; just ensure no overflow
+        // in debug builds (complements the add_region Kani proof).
+        let mut fa = FrameAllocator::new();
+        fa.add_region(u64::MAX - PAGE_SIZE, 2 * PAGE_SIZE);
+        assert_eq!(fa.free_count(), 0);
+    }
+
+    #[test]
+    fn test_reserve_region_wrap_boundary_no_panic() {
+        // Same shape as above for reserve_region (line 158 fix).
+        // Dedicated Kani proof is infeasible for reserve_region — CBMC
+        // runs out of memory on the symbolic-bitmap loop — so this unit
+        // test is the regression gate for the wrap-boundary fix.
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x4000);
+        fa.reserve_region(u64::MAX - PAGE_SIZE, 2 * PAGE_SIZE);
+        // Nothing in the target bitmap range got reserved.
+        assert_eq!(fa.free_count(), 4);
     }
 
     #[test]
