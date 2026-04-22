@@ -2306,6 +2306,11 @@ fn microkernel_loop() -> ! {
     // serial output without providing runtime value. Invariant verification
     // stays: it halts on corruption, which is silent and load-bearing.
     let mut last_verify_tick: u64 = 0;
+    // SMP timer-diagnostic snapshot: a single one-shot print 1 s after
+    // APs come online, so any AP whose PPI 30 isn't being delivered
+    // shows up as a zero tick count in the serial log. Keyed off the
+    // global tick count rather than wall-clock for determinism.
+    let mut smp_diag_printed: bool = false;
 
     loop {
         let ticks = Timer::get_ticks();
@@ -2321,6 +2326,24 @@ fn microkernel_loop() -> ! {
                     }
                 }
             }
+        }
+
+        // SMP timer diagnostic: dump per-CPU tick counters once, ~1 s
+        // after boot, so a silent AP timer (GIC PPI 30 on aarch64,
+        // LVT timer on x86_64) surfaces as a zero in the log.
+        if !smp_diag_printed && ticks >= 100 {
+            smp_diag_printed = true;
+            let online = arcos_core::online_cpu_count();
+            let mut buf_tail: [u64; 8] = [0; 8];
+            let report_n = core::cmp::min(online, 8);
+            for i in 0..report_n {
+                buf_tail[i] = arcos_core::PER_CPU_TIMER_TICKS[i]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            }
+            println!(
+                "[SMP] per-CPU timer ticks after ~1s ({} online): {:?}",
+                online, &buf_tail[..report_n],
+            );
         }
 
         // Load balancing: migrate tasks from overloaded to underloaded CPUs

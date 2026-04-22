@@ -223,8 +223,10 @@ const GICD_ICFGR: usize = 0x0C00;       // Interrupt Configuration (2 bits per I
 const GICR_WAKER: usize = 0x0014;       // Redistributor Waker
 // SGI/PPI frame is GICR base + 0x10000
 const GICR_SGI_BASE: usize = 0x10000;
+const GICR_IGROUPR0: usize = GICR_SGI_BASE + 0x0080;    // SGI/PPI group
 const GICR_ISENABLER0: usize = GICR_SGI_BASE + 0x0100;  // SGI/PPI set-enable
 const GICR_IPRIORITYR: usize = GICR_SGI_BASE + 0x0400;  // SGI/PPI priority
+const GICR_IGRPMODR0: usize = GICR_SGI_BASE + 0x0D00;   // SGI/PPI Group Modifier
 
 /// GICD MMIO read (32-bit).
 ///
@@ -343,6 +345,20 @@ pub unsafe fn init_redistributor(gicr_base: u64, cpu_id: u32) {
             core::hint::spin_loop();
         }
 
+        // Put all SGIs/PPIs into Group 1 Non-Secure. GICR_IGROUPR0 is
+        // RES0 on secure-only systems, but on QEMU virt (two-security-
+        // state GICv3) bit N == 0 routes INTID N through Group 0
+        // (secure FIQ), which never reaches ICC_IAR1_EL1 at EL1-NS.
+        // The BSP tends to come up with bits already set by firmware;
+        // APs on QEMU virt do NOT. Explicitly assigning here makes the
+        // AP timer PPI (30) deliverable on every CPU.
+        gicr_write(cpu_id, GICR_IGROUPR0, 0xFFFF_FFFF);
+        // GICR_IGRPMODR0 = 0 keeps the assignment as Group 1 NS (not
+        // Group 1 Secure). 0 is the reset value; written explicitly
+        // for determinism since GICR_IGROUPR0 × GICR_IGRPMODR0 encodes
+        // the final group.
+        gicr_write(cpu_id, GICR_IGRPMODR0, 0x0);
+
         // Set PPI 30 (timer) priority to 0x80 (higher than SPIs)
         let timer_prio_offset = GICR_IPRIORITYR + 30;
         let cpu_base = gicr_base as usize + (cpu_id as usize) * 0x20000;
@@ -351,10 +367,12 @@ pub unsafe fn init_redistributor(gicr_base: u64, cpu_id: u32) {
             0x80,
         );
 
-        // Enable PPI 30 (ARM Generic Timer) in the redistributor
-        // GICR_ISENABLER0 covers INTIDs 0-31 (SGIs and PPIs)
-        let enable = gicr_read(cpu_id, GICR_ISENABLER0);
-        gicr_write(cpu_id, GICR_ISENABLER0, enable | (1 << 30));
+        // Enable PPI 30 (ARM Generic Timer) in the redistributor.
+        // GICR_ISENABLER0 is write-1-to-set — writing a single bit is
+        // sufficient and avoids accidentally re-enabling stale PPIs
+        // that another boot stage left in ISENABLER0 (the previous
+        // read-modify-write was harmless but imprecise).
+        gicr_write(cpu_id, GICR_ISENABLER0, 1 << 30);
     }
 
     crate::println!("  GIC Redistributor: CPU {} woken, PPI 30 enabled", cpu_id);

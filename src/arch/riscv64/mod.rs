@@ -553,6 +553,16 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
         }
     }
 
+    // Per-CPU timer-ISR tick bump. Portable SMP diagnostic — see
+    // `crate::PER_CPU_TIMER_TICKS` doc. SAFETY: tp register points at
+    // this hart's PerCpu block by the time the timer fires (set by
+    // init_ap / init_bsp before interrupts unmask).
+    let cpu = unsafe { percpu::current_percpu().cpu_id() } as usize;
+    if cpu < crate::MAX_CPUS {
+        crate::PER_CPU_TIMER_TICKS[cpu]
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
     new_sp
 }
 

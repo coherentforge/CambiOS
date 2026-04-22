@@ -104,6 +104,15 @@ pub static PER_CPU_SCHEDULER: [IrqSpinlock<Option<Box<Scheduler>>>; MAX_CPUS] =
 pub static PER_CPU_TIMER: [IrqSpinlock<Option<Timer>>; MAX_CPUS] =
     [const { IrqSpinlock::new(None) }; MAX_CPUS];
 
+/// Per-CPU timer-ISR tick counters. Incremented by each arch's
+/// timer ISR path; read from the BSP's idle loop for SMP diagnostics.
+/// Zero entries at `cpu > 0` after `Starting application processors…`
+/// mean APs are not receiving timer interrupts (PPI 30 / LVT
+/// equivalent). Portable counter — x86_64 + aarch64 + riscv64 all
+/// write to it.
+pub static PER_CPU_TIMER_TICKS: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
 /// Per-CPU audit staging buffers. Each CPU writes to PER_CPU_AUDIT_BUFFER[cpu_id]
 /// via `audit::emit()`. The BSP drain task reads from all buffers.
 /// Lock-free SPSC: no lock needed, no entry in the lock hierarchy.

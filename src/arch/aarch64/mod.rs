@@ -903,6 +903,21 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
     // SAFETY: We are in an IRQ handler at EL1.
     let intid = unsafe { gic::acknowledge_irq() };
 
+    // Per-CPU timer-ISR tick bump. The counter is a portable SMP
+    // diagnostic — zero entries at cpu > 0 after BSP has dispatched
+    // APs indicate PPI 30 is not being delivered to that CPU. Only
+    // count real timer firings (PPI 30), not spurious reads.
+    if intid == timer::TIMER_PPI_INTID {
+        // SAFETY: we are in the timer ISR at EL1 with TPIDR_EL1 set to
+        // this CPU's PerCpu block (init_bsp / init_ap ran before IRQs
+        // unmasked). Reading cpu_id is a volatile load from that block.
+        let cpu = unsafe { percpu::current_percpu().cpu_id() } as usize;
+        if cpu < crate::MAX_CPUS {
+            crate::PER_CPU_TIMER_TICKS[cpu]
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // Rearm the timer for the next period (ARM Generic Timer is one-shot countdown)
     // SAFETY: We are in a timer IRQ handler at EL1.
     unsafe {

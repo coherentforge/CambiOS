@@ -430,6 +430,16 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
         }
     }
 
+    // Per-CPU timer-ISR tick bump. Portable SMP diagnostic — see
+    // `crate::PER_CPU_TIMER_TICKS` doc. SAFETY: GS base points at
+    // this CPU's PerCpu block by the time the timer ISR fires (set
+    // by init_ap / init_bsp before APIC is unmasked).
+    let cpu = unsafe { percpu::current_percpu().cpu_id() } as usize;
+    if cpu < crate::MAX_CPUS {
+        crate::PER_CPU_TIMER_TICKS[cpu]
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
     // Send End-of-Interrupt to APIC (MUST happen before iretq)
     // SAFETY: We are in a hardware interrupt handler (vector 32 = timer).
     // SAFETY: APIC is initialized before interrupts are enabled.
