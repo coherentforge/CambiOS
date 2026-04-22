@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "arcos-worm"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS Worm — second first-party app. 1970s-style snake-in-the-dirt on libgui + virtio-input. Worm eats sprouts, grows, dies on self- or wall-collision. Palette deliberately shares Tree's earth tones so the two apps read as one world."
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
+arcos-libgui = { path = "../libgui" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"
