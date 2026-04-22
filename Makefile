@@ -871,7 +871,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 compositor-aarch64 scanout-limine-aarch64 worm-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -890,9 +890,6 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
 	cp $(UDP_STACK_ELF_AARCH64) /tmp/udp-stack-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
-	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
-	cp $(SCANOUT_LIMINE_ELF_AARCH64) /tmp/scanout-limine-signed.elf
-	cp $(WORM_ELF_AARCH64) /tmp/worm-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
@@ -900,9 +897,6 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-limine-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/worm-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
@@ -910,12 +904,9 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
 	mcopy -i $(IMG_AARCH64) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
-	mcopy -i $(IMG_AARCH64) /tmp/scanout-limine-signed.elf ::/boot/scanout-limine.elf
-	mcopy -i $(IMG_AARCH64) /tmp/worm-signed.elf ::/boot/worm.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/compositor-signed.elf /tmp/scanout-limine-signed.elf /tmp/worm-signed.elf
-	mcopy -i $(IMG_AARCH64) limine.conf ::/limine.conf
-	mcopy -i $(IMG_AARCH64) limine.conf ::/boot/limine/limine.conf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf
+	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
+	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
 
 run-aarch64: img-aarch64
