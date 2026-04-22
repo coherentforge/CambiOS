@@ -212,8 +212,16 @@ pub fn get_program_header(
         return Err(ElfError::InvalidPhdrCount);
     }
 
-    let phdr_offset = header.e_phoff as usize + (index * header.e_phentsize as usize);
-    let phdr_end = phdr_offset + mem::size_of::<Elf64ProgramHeader>();
+    let phdr_offset = (header.e_phoff as usize)
+        .checked_add(
+            index
+                .checked_mul(header.e_phentsize as usize)
+                .ok_or(ElfError::InvalidProgramHeaderOffset)?,
+        )
+        .ok_or(ElfError::InvalidProgramHeaderOffset)?;
+    let phdr_end = phdr_offset
+        .checked_add(mem::size_of::<Elf64ProgramHeader>())
+        .ok_or(ElfError::InvalidProgramHeaderOffset)?;
 
     if phdr_end > binary.len() {
         return Err(ElfError::InvalidProgramHeaderOffset);
@@ -248,13 +256,20 @@ pub fn analyze_binary(binary: &[u8]) -> Result<ElfBinary, ElfError> {
                 load_base = phdr.p_vaddr;
             }
 
-            let seg_end = phdr.p_vaddr + phdr.p_memsz;
+            let seg_end = phdr
+                .p_vaddr
+                .checked_add(phdr.p_memsz)
+                .ok_or(ElfError::SegmentOutOfBounds)?;
             if seg_end > load_end {
                 load_end = seg_end;
             }
 
             // Verify segment doesn't exceed binary
-            if phdr.p_offset + phdr.p_filesz > binary.len() as u64 {
+            let file_end = phdr
+                .p_offset
+                .checked_add(phdr.p_filesz)
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            if file_end > binary.len() as u64 {
                 return Err(ElfError::SegmentOutOfBounds);
             }
         }
@@ -301,7 +316,11 @@ pub fn collect_load_segments(
             }
 
             // Validate segment file range
-            if phdr.p_offset + phdr.p_filesz > binary.len() as u64 {
+            let file_end = phdr
+                .p_offset
+                .checked_add(phdr.p_filesz)
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            if file_end > binary.len() as u64 {
                 return Err(ElfError::SegmentOutOfBounds);
             }
 

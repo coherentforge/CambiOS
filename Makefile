@@ -709,6 +709,8 @@ test:
 verify:
 	@echo "=== Kani proofs: BuddyAllocator ==="
 	cd verification/buddy-proofs && cargo kani
+	@echo "=== Kani proofs: ELF parser ==="
+	cd verification/elf-proofs && cargo kani
 
 # =============================================================================
 # make stats — derive canonical counts from source code.

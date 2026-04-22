@@ -24,7 +24,7 @@ belongs in the linked ADR, not here.
 - **GUI stack live on x86_64**: scanout-virtio-gpu drives QEMU virtio-vga; compositor composites; virtio-input forwards HID keyboard/pointer events into the focused window; first-party app `tree` (9×9 Minesweeper homage) runs as the default GUI boot module and exercises the full drawing + input loop.
 - **Persistent storage live**: virtio-blk + disk-backed ObjectStore + `arcobj` shell CLI; objects survive reboot.
 - **Bare metal**: USB boot tooling complete, untested on target hardware (Dell Precision 3630).
-- **Formal verification**: one Kani proof live on BuddyAllocator; ELF parser / frame allocator / capability check queued next.
+- **Formal verification**: Kani proofs live on BuddyAllocator + ELF parser (7 harnesses; fixed 6 overflow sites in `src/loader/elf.rs` during proof authoring); frame allocator / capability check queued next.
 
 ## Recent landings
 
@@ -87,7 +87,7 @@ Chronological, newest first. ~3 week window — older items rotate out; git log 
 | TLB shootdown | Done (x86 vector-IPI / ARM TLBI broadcast / RISC-V SBI IPI) | x/a/r | `src/arch/*/tlb.rs` | — |
 | Process lifecycle cleanup | Done (Phase 3.2d.ii; kernel stack free deferred) | x/a/r | `src/syscalls/dispatcher.rs`, `src/process.rs` | — |
 | USB boot tooling | Done (`make img-usb` + `make usb DEVICE=...`) | x | `Makefile` | — |
-| Formal verification (Kani) | Started 2026-04-16. Live: `BuddyAllocator::free` reserved-prefix (150 checks, ~18s). Next (by leverage): (1) ELF header parser in `src/loader/elf.rs`, (2) frame allocator bitmap ops, (3) capability check. Compositor protocol parser deferred until scanout settles past Scanout-4.c. | — | `verification/buddy-proofs/` | — |
+| Formal verification (Kani) | Started 2026-04-16. Live: `BuddyAllocator::free` reserved-prefix (150 checks, ~18s); ELF header parser in `src/loader/elf.rs` (7 harnesses covering `parse_header`, `get_program_header`, `analyze_binary`, `collect_load_segments`; proof authoring found + fixed 6 integer-overflow sites). Next (by leverage): (2) frame allocator bitmap ops, (3) capability check. Compositor protocol parser deferred until scanout settles past Scanout-4.c. | — | `verification/buddy-proofs/`, `verification/elf-proofs/` | — |
 | AArch64 SMP timer on AP | **Gap**: PPI 30 not firing on second CPU under QEMU `virt`. Single-CPU works. | a | — | — |
 | AArch64 device IRQ routing | **Gap**: GIC `enable_spi` / `set_spi_trigger` exist but not wired into boot path. No device IRQs on aarch64. | a | — | — |
 | DHCP client | Paused (pre-work in `udp-stack`; waiting on channel architecture consumer) | — | partial in `user/udp-stack/` | — |

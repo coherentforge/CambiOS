@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Standalone proof crate for the kernel's ELF parser. Excluded from the
+# kernel workspace (see root Cargo.toml). Builds under Kani's bundled
+# toolchain via `cargo kani` from this directory.
+#
+# The proven source is the kernel's `src/loader/elf.rs`, included verbatim
+# via `#[path = ...]` — no copy, no fork. If the kernel code changes, the
+# proofs here cover the new code automatically.
+
+[package]
+name = "elf-proofs"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

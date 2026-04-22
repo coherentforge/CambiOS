@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Override the parent's `.cargo/config.toml` (which targets the kernel's
+# bare-metal triple). The proof crate runs on the host under Kani.
+[build]
+target = "aarch64-apple-darwin"
+
+# Clear the parent's kernel linker flags. They reference linker.ld /
+# code-model=kernel and don't apply to host builds.
+[target.aarch64-apple-darwin]
+rustflags = []
