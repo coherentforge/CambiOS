@@ -173,6 +173,21 @@ impl VirtQueue {
         (self.base_paddr / 4096) as u32
     }
 
+    /// Physical addresses of the three ring sub-regions within the
+    /// contiguous allocation. Modern virtio transports report these as
+    /// three independent 64-bit addresses via `set_queue_addrs`, unlike
+    /// legacy's single-PFN register.
+    ///
+    /// Returns `(desc_phys, avail_phys, used_phys)`.
+    pub fn ring_addrs(&self) -> (u64, u64, u64) {
+        let qs = self.queue_size as u64;
+        (
+            self.base_paddr,
+            self.base_paddr + qs * 16,
+            self.base_paddr + self.used_offset as u64,
+        )
+    }
+
     /// Whether the device has been killed due to a protocol violation.
     pub fn is_dead(&self) -> bool {
         self.dead

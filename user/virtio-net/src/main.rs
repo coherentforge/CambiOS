@@ -40,7 +40,7 @@ mod transport;
 mod virtqueue;
 
 use arcos_libsys as sys;
-use transport::{LegacyMmioTransport, LegacyPciTransport, Transport};
+use transport::{LegacyMmioTransport, ModernPciTransport, NotifyToken, Transport};
 use virtqueue::{BounceBuffer, VirtQueue};
 
 // ============================================================================
@@ -90,6 +90,11 @@ const TX_QUEUE_IDX: u16 = 1;
 
 struct NetDriver {
     transport: Transport,
+    /// Per-queue notify tokens returned by `Transport::setup_queue`. Modern-pci
+    /// uses them as the per-queue doorbell offset; legacy-mmio ignores the
+    /// value and notifies by queue index alone.
+    rx_notify: NotifyToken,
+    tx_notify: NotifyToken,
     mac: [u8; 6],
     rx_queue: VirtQueue,
     tx_queue: VirtQueue,
@@ -102,20 +107,50 @@ struct NetDriver {
 
 impl NetDriver {
     fn init(transport: Transport) -> Option<Self> {
-        // Step 1: Reset
-        transport.reset();
+        let is_modern = matches!(transport, Transport::ModernPci(_));
 
-        // Step 2: Acknowledge + Driver
+        // Step 1: Reset (virtio §3.1 step 1)
+        transport.reset();
+        for _ in 0..32 {
+            if transport.status() == 0 {
+                break;
+            }
+        }
+
+        // Step 2: Acknowledge + Driver (§3.1 steps 2-3)
         transport.set_status(transport::STATUS_ACKNOWLEDGE);
         transport.set_status(transport::STATUS_DRIVER);
 
-        // Step 3: Negotiate features
+        // Step 3: Negotiate features (§3.1 steps 4-5)
         let device_features = transport.device_features();
-        let mut accepted = 0u32;
+        let mut accepted: u64 = 0;
         if device_features & transport::VIRTIO_NET_F_MAC != 0 {
             accepted |= transport::VIRTIO_NET_F_MAC;
         }
-        transport.set_guest_features(accepted);
+        if is_modern {
+            // Modern-pci requires the driver to declare VIRTIO_F_VERSION_1.
+            // Without it the device may refuse FEATURES_OK or silently fall
+            // back to legacy mode, and our addressing calls use modern-only
+            // registers.
+            if device_features & transport::VIRTIO_F_VERSION_1 == 0 {
+                sys::print(b"[NET] ERROR: modern device lacks VIRTIO_F_VERSION_1\n");
+                transport.set_status(transport::STATUS_FAILED);
+                return None;
+            }
+            accepted |= transport::VIRTIO_F_VERSION_1;
+        }
+        transport.set_driver_features(accepted);
+
+        // Modern-only FEATURES_OK handshake (§3.1 step 6). Legacy MMIO has no
+        // FEATURES_OK bit, so we skip the verification step there.
+        if is_modern {
+            transport.set_status(transport::STATUS_FEATURES_OK);
+            if transport.status() & transport::STATUS_FEATURES_OK == 0 {
+                sys::print(b"[NET] ERROR: device rejected FEATURES_OK\n");
+                transport.set_status(transport::STATUS_FAILED);
+                return None;
+            }
+        }
 
         // Step 4: Set up RX queue (queue 0)
         transport.select_queue(RX_QUEUE);
@@ -124,15 +159,13 @@ impl NetDriver {
             sys::print(b"[NET] ERROR: RX queue size is 0\n");
             return None;
         }
-        // Use smaller of device's max and our max
-        let rx_qsize = core::cmp::min(rx_qsize, 32); // Limit to avoid stack overflow
-
+        // Clamp to our fixed pending-buffer capacity. Modern-pci's
+        // CC_QUEUE_SIZE is writable so the device accepts the negotiated
+        // value; legacy-mmio's QUEUE_NUM is writable for the same reason.
+        let rx_qsize = core::cmp::min(rx_qsize, virtqueue::MAX_QUEUE_SIZE);
         let rx_queue = VirtQueue::new(rx_qsize)?;
-        // Carrier-specific queue setup. No-op on PCI legacy; required on MMIO
-        // legacy (QueueNum + QueueAlign before QueuePFN).
-        transport.set_queue_num(rx_qsize);
-        transport.set_queue_align(4096);
-        transport.set_queue_pfn(rx_queue.pfn());
+        let (rx_desc, rx_avail, rx_used) = rx_queue.ring_addrs();
+        let rx_notify = transport.setup_queue(RX_QUEUE, rx_qsize, rx_desc, rx_avail, rx_used);
 
         // Step 5: Set up TX queue (queue 1)
         transport.select_queue(TX_QUEUE_IDX);
@@ -141,14 +174,12 @@ impl NetDriver {
             sys::print(b"[NET] ERROR: TX queue size is 0\n");
             return None;
         }
-        let tx_qsize = core::cmp::min(tx_qsize, 32); // Limit to avoid stack overflow
-
+        let tx_qsize = core::cmp::min(tx_qsize, virtqueue::MAX_QUEUE_SIZE);
         let tx_queue = VirtQueue::new(tx_qsize)?;
-        transport.set_queue_num(tx_qsize);
-        transport.set_queue_align(4096);
-        transport.set_queue_pfn(tx_queue.pfn());
+        let (tx_desc, tx_avail, tx_used) = tx_queue.ring_addrs();
+        let tx_notify = transport.setup_queue(TX_QUEUE_IDX, tx_qsize, tx_desc, tx_avail, tx_used);
 
-        // Step 6: Mark DRIVER_OK
+        // Step 6: Mark DRIVER_OK (§3.1 step 8)
         transport.set_status(transport::STATUS_DRIVER_OK);
 
         if transport.status() & transport::STATUS_FAILED != 0 {
@@ -168,6 +199,8 @@ impl NetDriver {
 
         let mut driver = NetDriver {
             transport,
+            rx_notify,
+            tx_notify,
             mac,
             rx_queue,
             tx_queue,
@@ -207,7 +240,7 @@ impl NetDriver {
         }
 
         // Notify device that RX buffers are available
-        let _ = self.transport.notify_queue(RX_QUEUE);
+        self.transport.notify(RX_QUEUE, self.rx_notify);
     }
 
     /// Send a packet. Copies data to TX bounce buffer with virtio-net header,
@@ -249,9 +282,7 @@ impl NetDriver {
         // hlt. We use SYS_YIELD to relinquish our time slice — the idle task
         // runs hlt, QEMU completes the TX, and when we're re-scheduled the
         // used ring is updated.
-        if !self.transport.notify_queue(TX_QUEUE_IDX) {
-            return false;
-        }
+        self.transport.notify(TX_QUEUE_IDX, self.tx_notify);
 
         // Quick check in case QEMU completed it synchronously
         if self.tx_queue.pop_used().is_some() {
@@ -315,7 +346,7 @@ impl NetDriver {
                     self.rx_queue.push_buffer(
                         buf.paddr, buf.vaddr, buf.size, true,
                     );
-                    let _ = self.transport.notify_queue(RX_QUEUE);
+                    self.transport.notify(RX_QUEUE, self.rx_notify);
                     return;
                 }
             }
@@ -399,25 +430,51 @@ pub extern "C" fn _start() -> ! {
     };
 
     // Step 2: Build the appropriate transport. BAR 0 classification selects
-    // the carrier: is_io=true → virtio-pci legacy; is_io=false → virtio-mmio
-    // legacy (riscv64 QEMU virt). Kernel-side discovery populates the same
-    // DeviceInfo schema regardless (see ADR-013).
+    // the carrier: is_io=true → virtio-pci (x86_64; we speak modern via
+    // capability walk — legacy PCI's read-only QueueSize is incompatible
+    // with our fixed pending-buffer size); is_io=false → virtio-mmio legacy
+    // (aarch64 / riscv64 QEMU virt). Kernel-side discovery populates the
+    // same DeviceInfo schema regardless (see ADR-013).
     let bar0 = dev.bars[0];
     let transport = if bar0.is_io {
-        let mut io_base: u16 = 0;
-        for b in 0..6 {
-            let addr = dev.bars[b].addr;
-            if addr != 0 && addr < 0x10000 {
-                io_base = addr as u16;
-                break;
+        // Modern virtio-pci: walk the kernel-parsed capability layout and
+        // map the BAR it points at. The kernel rejects an x86_64 virtio-net
+        // device that presents only legacy I/O caps (caps.present == 0);
+        // we bail cleanly in that case rather than speaking a protocol the
+        // device cannot follow safely.
+        let caps = match sys::virtio_modern_caps(dev.index) {
+            Some(c) => c,
+            None => {
+                sys::print(b"[NET] ERROR: virtio_modern_caps syscall failed\n");
+                sys::register_endpoint(NET_ENDPOINT);
+                no_device_loop();
             }
-        }
-        if io_base == 0 {
-            sys::print(b"[NET] ERROR: no I/O BAR found on virtio-net device\n");
+        };
+        if caps.present == 0 {
+            sys::print(b"[NET] ERROR: device lacks modern virtio-pci caps (legacy-only)\n");
             sys::register_endpoint(NET_ENDPOINT);
             no_device_loop();
         }
-        Transport::LegacyPci(LegacyPciTransport::new(io_base))
+        let cap_bar = caps.common_cfg.bar as usize;
+        if cap_bar >= 6 {
+            sys::print(b"[NET] ERROR: caps.common_cfg.bar out of range\n");
+            sys::register_endpoint(NET_ENDPOINT);
+            no_device_loop();
+        }
+        let bar = dev.bars[cap_bar];
+        if bar.addr == 0 || bar.size == 0 || bar.is_io {
+            sys::print(b"[NET] ERROR: modern caps point at missing or I/O BAR\n");
+            sys::register_endpoint(NET_ENDPOINT);
+            no_device_loop();
+        }
+        match ModernPciTransport::new(&caps, bar.addr, bar.size as u64) {
+            Ok(t) => Transport::ModernPci(t),
+            Err(_) => {
+                sys::print(b"[NET] ERROR: ModernPciTransport::new failed\n");
+                sys::register_endpoint(NET_ENDPOINT);
+                no_device_loop();
+            }
+        }
     } else {
         let pages = ((bar0.size as u64 + 0xFFF) / 0x1000).max(1) as u32;
         let mapped = sys::map_mmio(bar0.addr, pages);
@@ -449,6 +506,7 @@ pub extern "C" fn _start() -> ! {
     // Step 4: Register IPC endpoint
     sys::register_endpoint(NET_ENDPOINT);
     sys::print(b"[NET] ready on endpoint 20 (virtio-net)\n");
+    sys::module_ready();
 
     // Step 5: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
@@ -484,6 +542,11 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn no_device_loop() -> ! {
+    // Release the boot gate so the next module can start. Every entry point
+    // into this function has already registered NET_ENDPOINT, so the module
+    // is observably up even though it has no device to serve.
+    sys::module_ready();
+
     let mut recv_buf = [0u8; 256];
     let resp_buf = [STATUS_NO_DEVICE; 1];
 

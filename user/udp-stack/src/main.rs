@@ -933,10 +933,15 @@ pub extern "C" fn _start() -> ! {
     // Step 4: Register service endpoint and enter service loop
     sys::register_endpoint(UDP_ENDPOINT);
     sys::print(b"[UDP] ready on endpoint 21\n");
+    sys::module_ready();
     service_loop(&mut cache, &our_mac)
 }
 
 fn error_loop() -> ! {
+    // Release the boot gate even in the error path — the module is
+    // observably up (endpoint registered) and holding the gate would
+    // deadlock every subsequent boot module.
+    sys::module_ready();
     let mut recv_buf = [0u8; 292];
     let resp = [STATUS_ERROR];
 

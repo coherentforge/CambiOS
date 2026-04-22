@@ -24,6 +24,9 @@ pub struct PciDeviceInfo {
     pub device: u8,
     pub function: u8,
     pub bars: [BarInfo; 6],
+    /// Index used in `sys::device_info(index, ...)` — needed to look up the
+    /// modern-pci capability layout via `sys::virtio_modern_caps(index)`.
+    pub index: u32,
 }
 
 /// A single BAR entry.
@@ -70,6 +73,7 @@ impl PciDeviceInfo {
             device: buf[7],
             function: buf[8],
             bars,
+            index,
         })
     }
 

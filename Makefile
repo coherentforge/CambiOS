@@ -398,7 +398,7 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI
 
-iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu worm sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu worm sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -415,6 +415,8 @@ iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-se
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
 	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
+	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
+	cp $(UDP_STACK_ELF) iso_root/boot/udp-stack.elf
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
 	cp $(FB_DEMO_ELF) iso_root/boot/fb-demo.elf
 	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
@@ -425,6 +427,8 @@ iso: kernel fs-service key-store-service virtio-blk virtio-input shell policy-se
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/udp-stack.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fb-demo.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf

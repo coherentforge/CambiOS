@@ -200,22 +200,20 @@ const SLOT_PROFILES: [Profile; 16] = [
     KEY_STORE_PROFILE,    //  4: key-store-service
     FS_SERVICE_PROFILE,   //  5: fs-service
     BLK_DRIVER_PROFILE,   //  6: virtio-blk
-    SHELL_PROFILE,        //  7: shell
-    DEFAULT_PROFILE,      //  8+: spawned/unknown — conservative default
-    DEFAULT_PROFILE,      //  9
-    DEFAULT_PROFILE,      // 10
-    DEFAULT_PROFILE,      // 11
-    DEFAULT_PROFILE,      // 12
-    DEFAULT_PROFILE,      // 13
-    DEFAULT_PROFILE,      // 14
+    NET_DRIVER_PROFILE,   //  7: virtio-net
+    UDP_STACK_PROFILE,    //  8: udp-stack
+    DEFAULT_PROFILE,      //  9+: scanout-virtio-gpu / compositor / virtio-input
+    DEFAULT_PROFILE,      // 10    / worm / shell — GUI modules and shell
+    DEFAULT_PROFILE,      // 11    run under DEFAULT today (policy allowlist
+    DEFAULT_PROFILE,      // 12    pending; the slot-based mapping is
+    DEFAULT_PROFILE,      // 13    SCAFFOLDING until the init-process manifest
+    DEFAULT_PROFILE,      // 14    lands — see the table's docblock).
     DEFAULT_PROFILE,      // 15
 ];
 
-// Silence "unused" warnings for profiles defined for re-enabling drivers later.
+// Silence "unused" warnings for profiles kept for re-enabling drivers later.
 #[allow(dead_code)]
-const _NET_DRIVER_PROFILE_KEPT: Profile = NET_DRIVER_PROFILE;
-#[allow(dead_code)]
-const _UDP_STACK_PROFILE_KEPT: Profile = UDP_STACK_PROFILE;
+const _SHELL_PROFILE_KEPT: Profile = SHELL_PROFILE;
 #[allow(dead_code)]
 const _SYS_MAP_FRAMEBUFFER_KEPT: u32 = SYS_MAP_FRAMEBUFFER;
 
