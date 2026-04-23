@@ -28,7 +28,11 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{Client, Color, EventType, FrameClock, InputEvent};
+mod level;
+mod render;
+mod sprites;
+
+use arcos_libgui::{Bitmap, Client, EventType, FrameClock, InputEvent};
 use arcos_libsys as sys;
 
 /// Surface dimensions. 480×320 matches pong's court; at 32×32 tiles
@@ -60,10 +64,6 @@ mod keys {
     pub const ESCAPE: u32 = 0x29;
 }
 
-/// Placeholder sky palette. Session 3 locks the earth-tone palette
-/// across Sprouty / ground / weed / seed / goal-tree.
-const SKY: Color = Color::rgb(0x87, 0xCE, 0xEB);
-
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -93,10 +93,12 @@ pub extern "C" fn _start() -> ! {
     };
     sys::print(b"[SPROUTY] window opened\r\n");
 
+    let sheet = sprites::sheet();
+
     let mut clock = FrameClock::new(STEP_TICKS);
     clock.seed(sys::get_time());
 
-    redraw(&mut client);
+    redraw(&mut client, &sheet);
 
     sys::print(b"[SPROUTY] entering event loop\r\n");
     loop {
@@ -109,13 +111,12 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        // Session 1b has no dynamic state; the tick still drives a
-        // redraw each interval so the scanout path sees the intended
-        // 33 FPS workload. From Session 1c onward the tick advances
-        // animation / physics too.
+        // Session 1c redraws every tick; level is static but the 33 FPS
+        // pacing + full-surface submit is the workload the scanout path
+        // needs to see. From Session 2 the tick also advances physics.
         let tick = clock.tick(sys::get_time());
         if tick {
-            redraw(&mut client);
+            redraw(&mut client, &sheet);
         }
 
         if !drained && !tick {
@@ -136,10 +137,10 @@ fn handle_event(ev: &InputEvent) -> bool {
     false
 }
 
-fn redraw(client: &mut Client) {
+fn redraw(client: &mut Client, sheet: &Bitmap) {
     {
         let mut surf = client.surface_mut();
-        surf.clear(SKY);
+        render::draw(&mut surf, sheet);
     }
     if client.submit_full().is_err() {
         sys::log_error(b"SPROUTY", b"submit_full failed");
