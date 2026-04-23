@@ -210,8 +210,20 @@ const _: () = {
     assert!(SHEET_ART.len() == SHEET_PIXELS_LEN);
 };
 
+/// Sentinel for "init() not called yet." Must be non-zero so this
+/// static lands in `.data` rather than `.bss`. A `.bss` landing
+/// introduces a second RW PT_LOAD segment (memsz > filesz), pushing
+/// sprouty to 4 LOAD segments; every other lazy-spawn module in the
+/// tree has 3. Empirically, 4-LOAD lazy-spawn triggers a kernel
+/// iretq GPF — see plan at `~/.claude/plans/sprouty-rodata-workaround.md`
+/// and memory `project_sprouty_rodata_gpf`. `0x1` is obviously
+/// invalid but distinct from null, so `sheet()` can still detect
+/// "before init."
+const UNINIT_SENTINEL: *mut u32 = 1 as *mut u32;
+
 /// Base pointer to the runtime-allocated pixel buffer. Populated by
-/// `init()`; read by `sheet()`. Null before `init()` runs.
+/// `init()`; read by `sheet()`. Holds `UNINIT_SENTINEL` before `init()`
+/// runs.
 ///
 /// Written once at startup, read thereafter — the SAFETY invariant is
 /// "`init()` is called on the single-threaded `_start` path before any
@@ -222,9 +234,9 @@ const _: () = {
 /// - the buffer lives for the process lifetime, so a tracked allocator
 ///   would leak anyway;
 /// - keeping the expanded 12 KB out of `.rodata` is the whole point of
-///   this rework — see `~/.claude/plans/sprouty-rodata-workaround.md`.
+///   this rework.
 #[allow(unsafe_code)]
-static mut SHEET_BASE: *mut u32 = core::ptr::null_mut();
+static mut SHEET_BASE: *mut u32 = UNINIT_SENTINEL;
 
 /// Allocate + populate the sprite pixel buffer via `sys::allocate`.
 /// Must be called exactly once at process startup, before any
@@ -265,15 +277,14 @@ pub fn sheet() -> Bitmap<'static> {
     // SHEET_BASE is either null (caught below) or a live write-once
     // pointer to a process-lifetime buffer — slice lifetime is
     // indistinguishable from 'static for this single-process crate.
-    let (ptr, slice) = unsafe {
+    let slice = unsafe {
         let ptr = SHEET_BASE;
-        if ptr.is_null() {
+        if ptr == UNINIT_SENTINEL || ptr.is_null() {
             arcos_libsys::log_error(b"SPROUTY", b"sheet() before init()");
             arcos_libsys::exit(3);
         }
-        (ptr, core::slice::from_raw_parts(ptr, SHEET_PIXELS_LEN))
+        core::slice::from_raw_parts(ptr, SHEET_PIXELS_LEN)
     };
-    let _ = ptr; // keep ptr in scope for the SAFETY comment audit
     Bitmap::new(SHEET_W, SHEET_H, slice).expect("dims match by construction")
 }
 
