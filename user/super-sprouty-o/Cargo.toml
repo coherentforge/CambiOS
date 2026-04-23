@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "arcos-super-sprouty-o"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS Super Sprouty-O — fourth first-party HN-launch mini-game. Single-level scrolling platformer on a reforested-world theme (gardener, seeds, invasive weeds, flowering-tree goal). Original art / character / level; no Nintendo IP. First game past pong's 20 FPS — runs at 33 FPS to stress-test the scanout path."
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
+arcos-libgui = { path = "../libgui" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

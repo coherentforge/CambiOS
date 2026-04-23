@@ -122,6 +122,7 @@ fn dispatch_command(line: &[u8]) {
         b"clear" => cmd_clear(),
         b"arcobj" => cmd_arcobj(args),
         b"did-key" | b"didkey" => cmd_did_key(args),
+        b"play" => cmd_play(args),
         b"exit" => sys::exit(0),
         _ => cmd_spawn(cmd),
     }
@@ -140,6 +141,7 @@ fn cmd_help() {
     sys::print(b"  clear   - Clear screen\r\n");
     sys::print(b"  arcobj  - CambiObject store operations (put/get/list/delete)\r\n");
     sys::print(b"  did-key - Render this process's Principal as did:key, or encode/decode one\r\n");
+    sys::print(b"  play    - Launch a game; `play` alone lists available games\r\n");
     sys::print(b"  exit    - Exit shell\r\n");
     sys::print(b"\r\nExternal commands (boot modules):\r\n");
     sys::print(b"  hello, key-store-service, fs-service, ...\r\n");
@@ -225,6 +227,40 @@ fn cmd_did_key(args: &[u8]) {
     let rendered = sys::did_key_encode(&pk);
     sys::print(rendered.as_bytes());
     sys::print(b"\r\n");
+}
+
+// ============================================================================
+// `play` — curated game launcher
+//
+// Thin wrapper over `cmd_spawn` that enforces an allowlist of first-party
+// games. Unknown names print a readable error rather than falling through
+// to the generic "Unknown command" path. `play` alone lists the games so
+// the shell self-documents.
+//
+// When a new game lands (e.g. super-sprouty-o), add it to GAMES in the
+// same commit that registers it as a boot module.
+// ============================================================================
+
+const GAMES: &[&[u8]] = &[b"tree", b"worm", b"pong"];
+
+fn cmd_play(args: &[u8]) {
+    let name = trim(args);
+    if name.is_empty() {
+        sys::print(b"Available games:\r\n");
+        for game in GAMES {
+            sys::print(b"  ");
+            sys::print(game);
+            sys::print(b"\r\n");
+        }
+        return;
+    }
+    if !GAMES.iter().any(|g| *g == name) {
+        sys::print(b"play: unknown game '");
+        sys::print(name);
+        sys::print(b"'. Run `play` for the list.\r\n");
+        return;
+    }
+    cmd_spawn(name);
 }
 
 // ============================================================================
