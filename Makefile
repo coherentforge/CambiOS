@@ -984,7 +984,7 @@ claude-preflight:
 # `git pull` — no re-install needed. See .githooks/pre-commit.
 install-hooks:
 	@git config core.hooksPath .githooks
-	@echo "=== core.hooksPath -> .githooks (pre-commit hook active) ==="
+	@echo "=== core.hooksPath -> .githooks (pre-commit + commit-msg hooks active) ==="
 
 # Enforce CLAUDE.md Development Convention 9 (every deferral is a
 # conscious deferral). Scans kernel source + design docs for deferral

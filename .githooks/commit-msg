@@ -1,0 +1,20 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+#
+# Commit-msg hook: enforce Claude-authored commit hygiene (H1).
+#
+# Runs tools/check-claude-staged-files.py, which rejects commits that
+# bear a "Co-Authored-By: Claude" trailer without a matching "Staged
+# files:" section. See the Python script for the failure modes it
+# catches and the escalation ladder behind it.
+#
+# Jason's manual commits (no Claude trailer) pass through untouched.
+#
+# Bypass: `git commit --no-verify` (discouraged).
+
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+python3 tools/check-claude-staged-files.py "$1"
