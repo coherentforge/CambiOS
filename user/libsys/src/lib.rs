@@ -905,10 +905,27 @@ pub fn recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMes
 // Device / DMA syscalls
 // ============================================================================
 
+const SYS_ALLOCATE: u64 = 3;
 const SYS_MAP_MMIO: u64 = 20;
 const SYS_ALLOC_DMA: u64 = 21;
 const SYS_DEVICE_INFO: u64 = 22;
 const SYS_PORT_IO: u64 = 23;
+
+/// Allocate `num_pages` of plain RW user-space virtual memory. Returns
+/// the base virtual address as a positive value on success, or a
+/// negative errno (OOM, invalid size, etc.).
+///
+/// The kernel ABI takes bytes; this wrapper converts pages so callers
+/// keep sizing in the 4 KiB unit they'll actually use. Per-call cap is
+/// 64 MiB (SCAFFOLDING bound per handle_allocate).
+///
+/// Unlike `alloc_dma`, the returned region is not guaranteed physically
+/// contiguous and has no guard pages — suitable for general scratch /
+/// sprite buffers / software render targets, not DMA.
+pub fn allocate(num_pages: u32) -> i64 {
+    let bytes = (num_pages as u64) * 4096;
+    syscall_raw3(SYS_ALLOCATE, bytes, 0, 0)
+}
 
 /// Map device MMIO into this process's address space.
 /// Returns user-space virtual address, or negative error.

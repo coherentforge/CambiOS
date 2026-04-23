@@ -79,6 +79,13 @@ pub extern "C" fn _start() -> ! {
     // Leaf boot module — release the boot gate immediately.
     sys::module_ready();
 
+    // Allocate + populate the sprite sheet OUT of `.rodata`. The
+    // embedded buffer would push our R PT_LOAD segment to 4 pages,
+    // which trips a kernel iretq GPF on lazy-spawn — see
+    // ~/.claude/plans/sprouty-rodata-workaround.md. Allocating at
+    // runtime keeps the R segment under 2 pages.
+    sprites::init();
+
     let mut client = match Client::open(level::SURFACE_W, level::SURFACE_H, SPROUTY_ENDPOINT) {
         Ok(c) => c,
         Err(e) => {

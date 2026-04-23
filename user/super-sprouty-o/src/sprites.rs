@@ -197,33 +197,84 @@ const fn ascii_to_palette(b: u8) -> usize {
     }
 }
 
-/// Expand the ASCII sheet to XRGB8888 pixels at compile time.
-const fn expand(art: &[u8; 32 * 96]) -> [u32; 32 * 96] {
-    let mut out = [0u32; 32 * 96];
-    let mut i = 0;
-    while i < 32 * 96 {
-        out[i] = PALETTE[ascii_to_palette(art[i])];
-        i += 1;
-    }
-    out
-}
-
 const SHEET_ART: [u8; 32 * 96] = combine3(&SPROUTY_ART, &GROUND_ART, &WEED_ART);
 
-/// Expanded sheet: 96×32 XRGB8888 pixels in `.rodata`.
-pub static SHEET_PIXELS: [u32; 32 * 96] = expand(&SHEET_ART);
+/// Total pixel count — derived once and reused by init + sheet.
+const SHEET_PIXELS_LEN: usize = (SHEET_W * SHEET_H) as usize;
 
-// Belt-and-braces: catch any future drift between CELL / SHEET_W /
-// SHEET_H and the actual buffer size at compile time, before it can
-// fool the `.expect()` in `sheet()` below into running.
+// Belt-and-braces: if CELL / SHEET_W / SHEET_H ever drift out of step
+// with the ASCII art, this fails at compile time — cheaper than an
+// init-time assertion.
 const _: () = {
-    assert!(SHEET_PIXELS.len() == (SHEET_W * SHEET_H) as usize);
+    assert!(SHEET_PIXELS_LEN == 32 * 96);
+    assert!(SHEET_ART.len() == SHEET_PIXELS_LEN);
 };
 
-/// Borrow the shared sprite sheet as a Bitmap.
+/// Base pointer to the runtime-allocated pixel buffer. Populated by
+/// `init()`; read by `sheet()`. Null before `init()` runs.
+///
+/// Written once at startup, read thereafter — the SAFETY invariant is
+/// "`init()` is called on the single-threaded `_start` path before any
+/// `sheet()` reader." The crate has no threads, so this is sound.
+///
+/// Placed in `static mut` rather than a heap `Box` because:
+/// - the sprouty crate has no global allocator (no user crate does);
+/// - the buffer lives for the process lifetime, so a tracked allocator
+///   would leak anyway;
+/// - keeping the expanded 12 KB out of `.rodata` is the whole point of
+///   this rework — see `~/.claude/plans/sprouty-rodata-workaround.md`.
+#[allow(unsafe_code)]
+static mut SHEET_BASE: *mut u32 = core::ptr::null_mut();
+
+/// Allocate + populate the sprite pixel buffer via `sys::allocate`.
+/// Must be called exactly once at process startup, before any
+/// `sheet()` call.
+///
+/// Exits the process with code 2 on allocator failure (no way to
+/// continue — every frame render needs the sheet).
+#[allow(unsafe_code)]
+pub fn init() {
+    let pages_needed =
+        ((SHEET_PIXELS_LEN * core::mem::size_of::<u32>()) + 4095) / 4096;
+    let vaddr = arcos_libsys::allocate(pages_needed as u32);
+    if vaddr <= 0 {
+        arcos_libsys::log_error(b"SPROUTY", b"sheet allocate failed");
+        arcos_libsys::exit(2);
+    }
+    let ptr = vaddr as usize as *mut u32;
+    // SAFETY: `vaddr` is a freshly allocated, RW-mapped region of
+    // `pages_needed * 4096 ≥ SHEET_PIXELS_LEN * 4` bytes. The ptr is
+    // aligned to a page (and therefore to u32). Single-threaded write
+    // path; no aliasing. `ascii_to_palette` is total over u8 and the
+    // index is bounded by `PALETTE.len() = 16`.
+    unsafe {
+        let mut i = 0;
+        while i < SHEET_PIXELS_LEN {
+            *ptr.add(i) = PALETTE[ascii_to_palette(SHEET_ART[i])];
+            i += 1;
+        }
+        SHEET_BASE = ptr;
+    }
+}
+
+/// Borrow the shared sprite sheet as a Bitmap. Panics at ABORT if
+/// `init()` hasn't run yet.
+#[allow(unsafe_code)]
 pub fn sheet() -> Bitmap<'static> {
-    // Unreachable: dimensions checked by the `const _` assertion above.
-    Bitmap::new(SHEET_W, SHEET_H, &SHEET_PIXELS).expect("sheet dims match buffer")
+    // SAFETY: callers only reach here after `_start` called `init()`.
+    // SHEET_BASE is either null (caught below) or a live write-once
+    // pointer to a process-lifetime buffer — slice lifetime is
+    // indistinguishable from 'static for this single-process crate.
+    let (ptr, slice) = unsafe {
+        let ptr = SHEET_BASE;
+        if ptr.is_null() {
+            arcos_libsys::log_error(b"SPROUTY", b"sheet() before init()");
+            arcos_libsys::exit(3);
+        }
+        (ptr, core::slice::from_raw_parts(ptr, SHEET_PIXELS_LEN))
+    };
+    let _ = ptr; // keep ptr in scope for the SAFETY comment audit
+    Bitmap::new(SHEET_W, SHEET_H, slice).expect("dims match by construction")
 }
 
 /// Sub-rect for Sprouty idle (sheet cell 0).
