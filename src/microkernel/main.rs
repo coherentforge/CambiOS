@@ -1580,6 +1580,28 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
             continue;
         }
 
+        // Deferred: hardcoded name list couples the kernel boot loop to
+        // the user-space app registry. Cleaner shapes would be a limine
+        // per-module cmdline flag, a `game-` filename prefix convention,
+        // or a manifest file read at boot.
+        // Why: the shell `play` launcher UX needs "load-but-don't-start"
+        // semantics so boot lands at `arcos>` rather than in a game;
+        // the cleaner mechanisms are larger scope than the HN launcher
+        // arc.
+        // Revisit when: the super-sprouty-o launcher arc closes within
+        // this session — followup scheduled to replace this list with a
+        // config-driven mechanism.
+        const SPAWN_ONLY_MODULES: &[&[u8]] =
+            &[b"tree", b"worm", b"pong", b"super-sprouty-o"];
+
+        if SPAWN_ONLY_MODULES.iter().any(|name| *name == short_name) {
+            BOOT_MODULE_REGISTRY
+                .lock()
+                .register(short_name, addr, size as usize);
+            println!("    ✓ Registered as spawn-only (not auto-started)");
+            continue;
+        }
+
         let mut pt_guard = PROCESS_TABLE.lock();
         let mut fa_guard = FRAME_ALLOCATOR.lock();
         let pt = match pt_guard.as_mut() {
