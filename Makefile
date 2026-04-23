@@ -545,7 +545,7 @@ $(LIMINE_DIR)/limine: $(LIMINE_DIR)/BOOTX64.EFI
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine
 
-iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu pong super-sprouty-o sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree worm pong super-sprouty-o sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -571,6 +571,8 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	cp $(VIRTIO_INPUT_ELF) iso_root/boot/virtio-input.elf
 	cp $(PONG_ELF) iso_root/boot/pong.elf
 	cp $(SPROUTY_ELF) iso_root/boot/super-sprouty-o.elf
+	cp $(TREE_ELF) iso_root/boot/tree.elf
+	cp $(WORM_ELF) iso_root/boot/worm.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
@@ -584,6 +586,8 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-input.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/pong.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/super-sprouty-o.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/tree.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/worm.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -1038,7 +1042,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 worm-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1059,7 +1063,10 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(SCANOUT_VGPU_ELF_AARCH64) /tmp/scanout-virtio-gpu-signed.elf
 	cp $(VIRTIO_INPUT_ELF_AARCH64) /tmp/virtio-input-signed.elf
 	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
+	cp $(TREE_ELF_AARCH64) /tmp/tree-signed.elf
 	cp $(WORM_ELF_AARCH64) /tmp/worm-signed.elf
+	cp $(PONG_ELF_AARCH64) /tmp/pong-signed.elf
+	cp $(SPROUTY_ELF_AARCH64) /tmp/super-sprouty-o-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
@@ -1070,7 +1077,10 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-virtio-gpu-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-input-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/tree-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/worm-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/pong-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/super-sprouty-o-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
@@ -1081,9 +1091,12 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/scanout-virtio-gpu-signed.elf ::/boot/scanout-virtio-gpu.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-input-signed.elf ::/boot/virtio-input.elf
 	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
+	mcopy -i $(IMG_AARCH64) /tmp/tree-signed.elf ::/boot/tree.elf
 	mcopy -i $(IMG_AARCH64) /tmp/worm-signed.elf ::/boot/worm.elf
+	mcopy -i $(IMG_AARCH64) /tmp/pong-signed.elf ::/boot/pong.elf
+	mcopy -i $(IMG_AARCH64) /tmp/super-sprouty-o-signed.elf ::/boot/super-sprouty-o.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/worm-signed.elf /tmp/shell-signed.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/pong-signed.elf /tmp/super-sprouty-o-signed.elf /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
