@@ -241,7 +241,7 @@ fn cmd_did_key(args: &[u8]) {
 // same commit that registers it as a boot module.
 // ============================================================================
 
-const GAMES: &[&[u8]] = &[b"tree", b"worm", b"pong"];
+const GAMES: &[&[u8]] = &[b"tree", b"worm", b"pong", b"super-sprouty-o"];
 
 fn cmd_play(args: &[u8]) {
     let name = trim(args);
