@@ -222,6 +222,56 @@ impl<'a> Surface<'a> {
             }
         }
     }
+
+    /// Blit a sub-rectangle of a bitmap (sprite-sheet cell) onto the
+    /// surface at `(dst_x, dst_y)`. The `(src_x, src_y, src_w, src_h)`
+    /// tuple selects the cell within `bitmap`. Source is clipped to
+    /// bitmap bounds; destination is clipped to surface bounds. Color-key
+    /// transparency matches [`blit_bitmap`]: if `transparent` is
+    /// `Some(c)`, source pixels equal to `c` are skipped.
+    pub fn blit_bitmap_sub(
+        &mut self,
+        dst_x: i32,
+        dst_y: i32,
+        bitmap: &crate::Bitmap,
+        src_x: u32,
+        src_y: u32,
+        src_w: u32,
+        src_h: u32,
+        transparent: Option<Color>,
+    ) {
+        let t = transparent.map(|c| c.as_u32());
+        // Clip source rect to bitmap bounds (saturating_add avoids
+        // overflow when a caller passes u32::MAX-ish src_w/src_h).
+        let sx_end = src_x.saturating_add(src_w).min(bitmap.width);
+        let sy_end = src_y.saturating_add(src_h).min(bitmap.height);
+        if src_x >= sx_end || src_y >= sy_end {
+            return;
+        }
+        for by in src_y..sy_end {
+            let dy = dst_y + (by - src_y) as i32;
+            if dy < 0 || (dy as u32) >= self.height {
+                continue;
+            }
+            for bx in src_x..sx_end {
+                let dx = dst_x + (bx - src_x) as i32;
+                if dx < 0 || (dx as u32) >= self.width {
+                    continue;
+                }
+                let src = bitmap.pixel(bx, by);
+                if let Some(tc) = t {
+                    if src == tc {
+                        continue;
+                    }
+                }
+                // SAFETY: bounds checked above.
+                unsafe {
+                    let off = (dy as usize) * self.pitch_pixels + (dx as usize);
+                    self.base.add(off).write_volatile(src);
+                }
+            }
+        }
+    }
 }
 
 /// Clip `rect` to `[0, width) × [0, height)`. Returns the clipped
@@ -409,6 +459,149 @@ mod tests {
             for x in 0..pitch {
                 let expected = if x < w as usize { Color::WHITE.as_u32() } else { 0 };
                 assert_eq!(buf[y * pitch + x], expected, "pixel ({},{})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn blit_bitmap_sub_happy_path() {
+        // Sheet with four distinct 2x2 cells packed into a 4x4 bitmap:
+        //   cell (0,0) = 1s, cell (1,0) = 2s, cell (0,1) = 3s, cell (1,1) = 4s.
+        let sheet_data: [u32; 16] = [
+            1, 1, 2, 2,
+            1, 1, 2, 2,
+            3, 3, 4, 4,
+            3, 3, 4, 4,
+        ];
+        let sheet = crate::Bitmap::new(4, 4, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        // Extract cell (1,1) — the 4s — and stamp at (0,0).
+        s.blit_bitmap_sub(0, 0, &sheet, 2, 2, 2, 2, None);
+        assert_eq!(buf[0], 4);
+        assert_eq!(buf[1], 4);
+        assert_eq!(buf[w as usize], 4);
+        assert_eq!(buf[w as usize + 1], 4);
+        // Rest untouched.
+        for (i, &p) in buf.iter().enumerate() {
+            if !matches!(i, 0 | 1 | 4 | 5) {
+                assert_eq!(p, 0, "pixel idx {} should be 0", i);
+            }
+        }
+    }
+
+    #[test]
+    fn blit_bitmap_sub_transparency_color_key() {
+        // 2x2 bitmap: two opaque pixels and two magenta (transparent) pixels.
+        let magenta = Color::rgb(0xFF, 0x00, 0xFF).as_u32();
+        let white = Color::WHITE.as_u32();
+        let sheet_data = [white, magenta, magenta, white];
+        let sheet = crate::Bitmap::new(2, 2, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(2, 2);
+        // Pre-fill so we can tell "skipped" from "written".
+        for p in buf.iter_mut() {
+            *p = 0xDEADBEEF;
+        }
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        s.blit_bitmap_sub(0, 0, &sheet, 0, 0, 2, 2, Some(Color::rgb(0xFF, 0x00, 0xFF)));
+        assert_eq!(buf[0], white);
+        assert_eq!(buf[1], 0xDEADBEEF, "magenta skipped");
+        assert_eq!(buf[2], 0xDEADBEEF, "magenta skipped");
+        assert_eq!(buf[3], white);
+    }
+
+    #[test]
+    fn blit_bitmap_sub_clips_dst_right_and_bottom() {
+        let sheet_data = [1u32; 16]; // 4x4 of 1s
+        let sheet = crate::Bitmap::new(4, 4, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        // Blit 4x4 at (2,2) on a 4x4 surface — only bottom-right 2x2 lands.
+        s.blit_bitmap_sub(2, 2, &sheet, 0, 0, 4, 4, None);
+        for y in 0..h {
+            for x in 0..w {
+                let expected = if x >= 2 && y >= 2 { 1 } else { 0 };
+                assert_eq!(buf[(y * w + x) as usize], expected, "({},{})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn blit_bitmap_sub_clips_dst_left_and_top() {
+        let sheet_data = [1u32; 16];
+        let sheet = crate::Bitmap::new(4, 4, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        // Blit 4x4 at (-2,-2) — only top-left 2x2 lands.
+        s.blit_bitmap_sub(-2, -2, &sheet, 0, 0, 4, 4, None);
+        for y in 0..h {
+            for x in 0..w {
+                let expected = if x < 2 && y < 2 { 1 } else { 0 };
+                assert_eq!(buf[(y * w + x) as usize], expected, "({},{})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn blit_bitmap_sub_clips_src_to_bitmap_bounds() {
+        // 3x3 bitmap, caller asks for a 5x5 sub-rect from (0,0).
+        // Only the 3x3 inside the bitmap is read; result is that full
+        // 3x3 lands at (0,0).
+        let sheet_data = [7u32; 9];
+        let sheet = crate::Bitmap::new(3, 3, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        s.blit_bitmap_sub(0, 0, &sheet, 0, 0, 5, 5, None);
+        for y in 0..h {
+            for x in 0..w {
+                let expected = if x < 3 && y < 3 { 7 } else { 0 };
+                assert_eq!(buf[(y * w + x) as usize], expected, "({},{})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn blit_bitmap_sub_src_origin_outside_bitmap_noop() {
+        let sheet_data = [1u32; 4];
+        let sheet = crate::Bitmap::new(2, 2, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        // Source origin (5,5) is past the 2x2 bitmap — nothing reads, nothing writes.
+        s.blit_bitmap_sub(0, 0, &sheet, 5, 5, 2, 2, None);
+        assert!(buf.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn blit_bitmap_sub_zero_size_noop() {
+        let sheet_data = [1u32; 4];
+        let sheet = crate::Bitmap::new(2, 2, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        s.blit_bitmap_sub(0, 0, &sheet, 0, 0, 0, 2, None);
+        s.blit_bitmap_sub(0, 0, &sheet, 0, 0, 2, 0, None);
+        assert!(buf.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn blit_bitmap_sub_partial_src_near_bitmap_edge() {
+        // 4x4 bitmap, ask for a 3x3 sub-rect starting at (2,2).
+        // Only the bottom-right 2x2 of the bitmap exists; it lands
+        // at dst (0,0) as a 2x2 patch, the "missing" third row/col
+        // writes nothing.
+        let sheet_data: [u32; 16] = [
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 9, 9,
+            0, 0, 9, 9,
+        ];
+        let sheet = crate::Bitmap::new(4, 4, &sheet_data).unwrap();
+        let (mut buf, w, h) = make_surface(4, 4);
+        let mut s = Surface::from_slice(&mut buf, w as usize, w, h);
+        s.blit_bitmap_sub(0, 0, &sheet, 2, 2, 3, 3, None);
+        for y in 0..h {
+            for x in 0..w {
+                let expected = if x < 2 && y < 2 { 9 } else { 0 };
+                assert_eq!(buf[(y * w + x) as usize], expected, "({},{})", x, y);
             }
         }
     }
