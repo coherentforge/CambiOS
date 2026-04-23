@@ -124,7 +124,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -589,6 +589,27 @@ run: iso disk-img
 		-vga virtio \
 		-no-reboot
 
+# Filtered `run`: streams kernel output through tools/qemu-run-quiet.py,
+# suppressing memory-map / Limine noise and exiting with a status code
+# that reflects outcome (0 = success sentinel seen, 1 = panic/exception,
+# 2 = hang). Default success sentinel is `arcos> ` (full boot to shell);
+# override for pre-shell testing:  make run-quiet SUCCESS="virtio-net ready"
+# Keep this QEMU command in sync with `run:` above.
+run-quiet: iso disk-img
+	python3 tools/qemu-run-quiet.py \
+		$(if $(TIMEOUT),--timeout $(TIMEOUT),) \
+		$(if $(SUCCESS),--success "$(SUCCESS)",) \
+		-- qemu-system-x86_64 \
+			-cdrom $(ISO) \
+			-serial mon:stdio \
+			-smp 2 \
+			-m 4G \
+			-device virtio-net-pci \
+			-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
+			-device virtio-blk-pci,drive=cambios-disk0 \
+			-vga virtio \
+			-no-reboot
+
 # Same as `run`, plus a graphical QEMU window (macOS Cocoa backend) so
 # compositor / scanout output is visible. Use for Scanout-3+ visual
 # verification; `run` stays headless (serial-only) for CI / text-mode
@@ -952,7 +973,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 worm-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -970,6 +991,10 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(BLK_DRIVER_ELF_AARCH64) /tmp/virtio-blk-signed.elf
 	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
 	cp $(UDP_STACK_ELF_AARCH64) /tmp/udp-stack-signed.elf
+	cp $(SCANOUT_VGPU_ELF_AARCH64) /tmp/scanout-virtio-gpu-signed.elf
+	cp $(VIRTIO_INPUT_ELF_AARCH64) /tmp/virtio-input-signed.elf
+	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
+	cp $(WORM_ELF_AARCH64) /tmp/worm-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
@@ -977,6 +1002,10 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-virtio-gpu-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-input-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/worm-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
@@ -984,12 +1013,20 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
 	mcopy -i $(IMG_AARCH64) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
+	mcopy -i $(IMG_AARCH64) /tmp/scanout-virtio-gpu-signed.elf ::/boot/scanout-virtio-gpu.elf
+	mcopy -i $(IMG_AARCH64) /tmp/virtio-input-signed.elf ::/boot/virtio-input.elf
+	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
+	mcopy -i $(IMG_AARCH64) /tmp/worm-signed.elf ::/boot/worm.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/worm-signed.elf /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
 
+# Serial-only run (no virtio-gpu device attached). Matches the pre-GUI
+# aarch64 flow; the kernel + shell still boot, just with no scanout
+# device for the compositor to bind to — compositor's handshake blocks
+# indefinitely, which is expected in this mode.
 run-aarch64: img-aarch64
 	qemu-system-aarch64 \
 		-machine virt,gic-version=3 \
@@ -998,6 +1035,25 @@ run-aarch64: img-aarch64
 		-m 4G \
 		-serial mon:stdio \
 		-display none \
+		-no-reboot \
+		-bios $(EFI_FW_AARCH64) \
+		-drive file=$(IMG_AARCH64),format=raw
+
+# GUI-on-aarch64 run: attaches virtio-gpu-pci as the scanout carrier and
+# virtio-keyboard-pci as an input carrier. The kernel's ECAM enumerator
+# (src/pci/mod.rs `mod ecam`) discovers both; scanout-virtio-gpu +
+# virtio-input + compositor + worm bind through them. `-display cocoa`
+# opens a macOS window; on Linux swap for `-display gtk` or `sdl`.
+run-aarch64-gui: img-aarch64
+	qemu-system-aarch64 \
+		-machine virt,gic-version=3 \
+		-cpu cortex-a72 \
+		-smp 2 \
+		-m 4G \
+		-serial mon:stdio \
+		-display cocoa \
+		-device virtio-gpu-pci \
+		-device virtio-keyboard-pci \
 		-no-reboot \
 		-bios $(EFI_FW_AARCH64) \
 		-drive file=$(IMG_AARCH64),format=raw

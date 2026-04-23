@@ -4,38 +4,36 @@
 //! PCI (and PCI-shaped) device table
 //!
 //! Holds a kernel-global table of devices surfaced through the
-//! `SYS_DEVICE_INFO` syscall. On x86_64 the table is populated by the
-//! Configuration Space mechanism 1 scan ([`scan`]). On riscv64 it is
-//! populated from DTB-discovered virtio-mmio regions via
-//! [`register_virtio_mmio`] — the syscall shape is the same either way,
-//! so user-space drivers use unchanged discovery code.
+//! `SYS_DEVICE_INFO` syscall. All config-space access flows through a
+//! single [`config`] shim:
 //!
-//! # Port I/O (x86_64 only)
+//! - On **x86_64** the shim routes to 32-bit port I/O at
+//!   `0x0CF8` (CONFIG_ADDRESS) / `0x0CFC` (CONFIG_DATA), the legacy
+//!   mechanism 1 protocol.
+//! - On **aarch64 + riscv64** the shim routes to ECAM — MMIO at
+//!   `ECAM_VIRT + (bus << 20) + (device << 15) + (function << 12) + off`
+//!   per PCIe r5.0 § 7.2.2. The caller installs the kernel VA of the
+//!   ECAM window by calling [`init_ecam`] during boot.
 //!
-//! PCI configuration space access uses 32-bit port I/O at:
-//! - `0x0CF8` — CONFIG_ADDRESS (write bus/device/function/offset)
-//! - `0x0CFC` — CONFIG_DATA (read/write the selected dword)
+//! [`scan`] walks bus 0 devices 0..32 × functions 0..8 through the
+//! shim, so the same scan code drives every architecture. riscv64 also
+//! has a parallel [`register_virtio_mmio`] path (see ADR-013 / R-6) that
+//! synthesizes PCI-shaped entries for virtio-mmio carriers — those
+//! coexist with anything `scan` discovers via ECAM.
 //!
 //! # Safety
 //!
-//! `scan()` (x86_64) is unsafe because it performs raw port I/O and
-//! writes to PCI config space (BAR size detection). It must be called
-//! exactly once, during BSP boot, before any driver tries to claim a
-//! device. `register_virtio_mmio` (riscv64) has an analogous
-//! single-writer-at-boot invariant.
+//! [`scan`] is unsafe because it performs raw config-space I/O and
+//! temporarily writes all-ones to each BAR for size detection. It must
+//! be called exactly once during BSP boot, before any driver tries to
+//! claim a device. [`init_ecam`] has the same single-writer-at-boot
+//! invariant and must run first on arches that need it.
+//! [`register_virtio_mmio`] (riscv64) has the same shape.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Maximum number of PCI devices we can track.
 pub const MAX_PCI_DEVICES: usize = 32;
-
-/// CONFIG_ADDRESS port (0x0CF8).
-#[cfg(target_arch = "x86_64")]
-const CONFIG_ADDRESS: u16 = 0x0CF8;
-
-/// CONFIG_DATA port (0x0CFC).
-#[cfg(target_arch = "x86_64")]
-const CONFIG_DATA: u16 = 0x0CFC;
 
 // ---------------------------------------------------------------------------
 // Virtio-modern PCI capability descriptors (virtio spec §4.1.4)
@@ -183,106 +181,331 @@ static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [PciDevice::EMPTY; MAX_PCI_DE
 static DEVICE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
-// 32-bit port I/O helpers (x86_64 only)
+// Config-space access — arch shim
 // ---------------------------------------------------------------------------
+//
+// Every code path that needs to read or write PCI config space (the scan
+// loop, BAR size detection, capability-list walking) goes through
+// `config::read32` / `config::write32`. That lets the cross-cutting
+// logic — which is 90% of this file — stay arch-agnostic while the
+// bottom half picks port I/O on x86_64 or ECAM MMIO everywhere else.
 
-/// Write a 32-bit value to an x86 I/O port.
-///
-/// # Safety
-/// The caller must ensure `port` is a valid I/O port and that the write is
-/// appropriate in the current hardware state.
+/// x86_64 mechanism 1: CONFIG_ADDRESS / CONFIG_DATA port pair.
 #[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn outl(port: u16, value: u32) {
-    // SAFETY: Caller guarantees port validity. 32-bit OUT instruction.
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") port,
-            in("eax") value,
-            options(nomem, nostack, preserves_flags),
-        );
+mod port_io {
+    /// HARDWARE: PCI Local Bus Spec r3.0 §3.2.2.3.2 — CONFIG_ADDRESS port.
+    const CONFIG_ADDRESS: u16 = 0x0CF8;
+    /// HARDWARE: PCI Local Bus Spec r3.0 §3.2.2.3.2 — CONFIG_DATA port.
+    const CONFIG_DATA: u16 = 0x0CFC;
+
+    /// # Safety: 32-bit OUT to a valid I/O port.
+    #[inline]
+    unsafe fn outl(port: u16, value: u32) {
+        // SAFETY: Caller guarantees port validity.
+        unsafe {
+            core::arch::asm!(
+                "out dx, eax",
+                in("dx") port,
+                in("eax") value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// # Safety: 32-bit IN from a valid I/O port.
+    #[inline]
+    unsafe fn inl(port: u16) -> u32 {
+        let value: u32;
+        // SAFETY: Caller guarantees port validity.
+        unsafe {
+            core::arch::asm!(
+                "in eax, dx",
+                in("dx") port,
+                out("eax") value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        value
+    }
+
+    /// Mechanism-1 CONFIG_ADDRESS layout (PCI spec r3.0 §3.2.2.3.2):
+    /// ```text
+    /// 31      24 23    16 15   11 10    8 7       2 1 0
+    /// | Enable | Reserved|  Bus  | Device| Function| Offset | 00 |
+    /// ```
+    #[inline]
+    const fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        0x8000_0000
+            | ((bus as u32) << 16)
+            | ((device as u32 & 0x1F) << 11)
+            | ((function as u32 & 0x07) << 8)
+            | ((offset as u32) & 0xFC)
+    }
+
+    /// # Safety: interrupts must be in a safe state (boot or IRQs disabled)
+    /// and `offset` must be dword-aligned.
+    pub(super) unsafe fn read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        let addr = config_address(bus, device, function, offset);
+        // SAFETY: Selecting a standard PCI config register via CONFIG_ADDRESS.
+        unsafe { outl(CONFIG_ADDRESS, addr) };
+        // SAFETY: Reading the selected register via CONFIG_DATA.
+        unsafe { inl(CONFIG_DATA) }
+    }
+
+    /// # Safety: same as [`read32`]; BAR reprogramming side effects apply.
+    pub(super) unsafe fn write32(
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u8,
+        value: u32,
+    ) {
+        let addr = config_address(bus, device, function, offset);
+        // SAFETY: Standard PCI config register selection.
+        unsafe { outl(CONFIG_ADDRESS, addr) };
+        // SAFETY: Standard PCI config register write.
+        unsafe { outl(CONFIG_DATA, value) };
     }
 }
 
-/// Read a 32-bit value from an x86 I/O port.
+/// PCIe ECAM — MMIO window, one 4 KiB page per (bus, device, function).
 ///
-/// # Safety
-/// The caller must ensure `port` is a valid I/O port and that the read is
-/// appropriate in the current hardware state.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let value: u32;
-    // SAFETY: Caller guarantees port validity. 32-bit IN instruction.
-    unsafe {
-        core::arch::asm!(
-            "in eax, dx",
-            in("dx") port,
-            out("eax") value,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    value
-}
-
-// ---------------------------------------------------------------------------
-// PCI configuration space access (x86_64 only)
-// ---------------------------------------------------------------------------
-
-/// Build a CONFIG_ADDRESS value for the given BDF + register offset.
-///
-/// Layout of CONFIG_ADDRESS (bit 31 = enable):
+/// Layout per PCIe r5.0 §7.2.2:
 /// ```text
-/// 31      24 23    16 15   11 10    8 7       2 1 0
-/// | Enable | Reserved|  Bus  | Device| Function| Offset | 00 |
+/// config_space_addr = ECAM_BASE
+///                   + (bus      << 20)
+///                   + (device   << 15)
+///                   + (function << 12)
+///                   + register_offset
 /// ```
-#[cfg(target_arch = "x86_64")]
-#[inline]
-const fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    // Bit 31: enable configuration space mapping
-    0x8000_0000
-        | ((bus as u32) << 16)
-        | ((device as u32 & 0x1F) << 11)
-        | ((function as u32 & 0x07) << 8)
-        | ((offset as u32) & 0xFC) // bits 1:0 must be zero (dword-aligned)
+#[cfg(not(target_arch = "x86_64"))]
+mod ecam {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Kernel virtual address of the ECAM window, installed by
+    /// [`super::init_ecam`]. Zero means "not configured" — reads then
+    /// return `0xFFFF_FFFF` (the PCI-spec "no device" sentinel).
+    static ECAM_VIRT: AtomicU64 = AtomicU64::new(0);
+
+    /// Install the kernel-side virtual base of the ECAM window. Must be
+    /// called after the region is mapped into the kernel page table.
+    ///
+    /// # Safety
+    /// - `virt` must be a valid kernel VA for at least one bus's worth
+    ///   of ECAM space (1 MiB).
+    /// - Single-writer at boot.
+    pub(super) unsafe fn set_virt_base(virt: u64) {
+        ECAM_VIRT.store(virt, Ordering::Release);
+    }
+
+    #[inline]
+    pub(super) fn is_initialized() -> bool {
+        ECAM_VIRT.load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    fn slot_addr(bus: u8, device: u8, function: u8, offset: u8) -> u64 {
+        ECAM_VIRT.load(Ordering::Acquire)
+            + ((bus as u64) << 20)
+            + (((device as u64) & 0x1F) << 15)
+            + (((function as u64) & 0x07) << 12)
+            + ((offset as u64) & 0xFC)
+    }
+
+    /// # Safety: `set_virt_base` must have been called with a VA that
+    /// still names a live ECAM mapping. Offsets are dword-aligned.
+    pub(super) unsafe fn read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        if !is_initialized() {
+            return 0xFFFF_FFFF;
+        }
+        let va = slot_addr(bus, device, function, offset);
+        // SAFETY: `va` lies within the kernel-mapped ECAM window; a
+        // volatile 32-bit MMIO read is the spec-defined access width.
+        unsafe { core::ptr::read_volatile(va as *const u32) }
+    }
+
+    /// # Safety: same as [`read32`]; the caller must be aware of PCI
+    /// side effects (BAR sizing, command-register writes, etc.).
+    pub(super) unsafe fn write32(
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u8,
+        value: u32,
+    ) {
+        if !is_initialized() {
+            return;
+        }
+        let va = slot_addr(bus, device, function, offset);
+        // SAFETY: Same as `read32`; 32-bit volatile MMIO store.
+        unsafe { core::ptr::write_volatile(va as *mut u32, value) };
+    }
 }
 
-/// Read a 32-bit dword from PCI configuration space.
-///
-/// # Safety
-/// Must be called with interrupts in a safe state (boot or IRQs disabled).
-/// `offset` must be dword-aligned (bits 1:0 = 0).
-#[cfg(target_arch = "x86_64")]
-unsafe fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    let addr = config_address(bus, device, function, offset);
-    // SAFETY: CONFIG_ADDRESS (0xCF8) is a standard PCI port. Selecting the config register.
-    unsafe { outl(CONFIG_ADDRESS, addr) };
-    // SAFETY: CONFIG_DATA (0xCFC) is a standard PCI port. Reading the selected register.
-    unsafe { inl(CONFIG_DATA) }
-}
+/// Arch-agnostic config-space shim used by the scan, BAR-decode, and
+/// capability-walk code below. Each arch plugs in via a private module.
+mod config {
+    /// # Safety: caller must satisfy the active backend's preconditions
+    /// (interrupts-quiet on x86_64; ECAM mapped on everything else) and
+    /// pass a dword-aligned `offset`.
+    #[inline]
+    pub(super) unsafe fn read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: forwarded to port-I/O backend; same preconditions.
+            unsafe { super::port_io::read32(bus, device, function, offset) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // SAFETY: forwarded to ECAM backend; same preconditions.
+            unsafe { super::ecam::read32(bus, device, function, offset) }
+        }
+    }
 
-/// Write a 32-bit dword to PCI configuration space.
-///
-/// # Safety
-/// Must be called with interrupts in a safe state. Writing to PCI config
-/// space can have side effects (e.g., BAR reprogramming). The caller must
-/// know what they are doing.
-#[cfg(target_arch = "x86_64")]
-unsafe fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
-    let addr = config_address(bus, device, function, offset);
-    // SAFETY: CONFIG_ADDRESS (0xCF8) is a standard PCI port. Selecting the config register.
-    unsafe { outl(CONFIG_ADDRESS, addr) };
-    // SAFETY: CONFIG_DATA (0xCFC) is a standard PCI port. Writing the selected register.
-    unsafe { outl(CONFIG_DATA, value) };
+    /// # Safety: same as [`read32`]; see backend docs for side effects.
+    #[inline]
+    pub(super) unsafe fn write32(
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u8,
+        value: u32,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: forwarded to port-I/O backend.
+            unsafe { super::port_io::write32(bus, device, function, offset, value) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // SAFETY: forwarded to ECAM backend.
+            unsafe { super::ecam::write32(bus, device, function, offset, value) }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// BAR decoding (x86_64 only)
+// ECAM bring-up — aarch64 maps the window via the frame allocator;
+// riscv64 already has MMIO < 4 GiB inside the boot-HHDM gigapages.
 // ---------------------------------------------------------------------------
+
+/// SCAFFOLDING: ECAM window mapped at boot — bus 0 only (1 MiB =
+/// 256 BDFs × 4 KiB slots). QEMU virt exposes a single root-complex bus.
+/// Why: keeps aarch64 init cost at 2 intermediate page-table frames
+///      (L2 + L3); the full 256 MiB advertised by QEMU would need 128
+///      L3 tables for no discovery benefit today.
+/// Replace when: a multi-bus topology boots (second PCIe bridge
+///      visible, or an MCFG/DTB parser surfaces more than one
+///      `bus_start..bus_end` range). See docs/ASSUMPTIONS.md.
+#[cfg(not(target_arch = "x86_64"))]
+const ECAM_MAP_BYTES: u64 = 1 * 1024 * 1024;
+
+/// Map the ECAM window for PCIe config space and install the kernel VA
+/// so [`scan`] (and subsequent BAR / capability-list reads) can hit it.
+///
+/// On **aarch64**, Limine's HHDM does not cover high-memory device MMIO,
+/// so the ECAM region is explicitly mapped into TTBR1 via
+/// [`crate::memory::paging::map_range`] against the kernel page-table
+/// root. This must run **after** [`crate::memory::init`] and
+/// [`crate::FRAME_ALLOCATOR`] are live.
+///
+/// On **riscv64**, the S-mode boot trampoline already publishes four
+/// 1 GiB gigapages covering `[0, 4 GiB)` through the HHDM, which spans
+/// every MMIO base QEMU `virt` emits (PLIC, virtio-mmio, and the PCIe
+/// ECAM at `0x3000_0000`). No mapping work is needed — just publish
+/// the HHDM VA so the scan and BAR code use the right window.
+///
+/// The function is idempotent: a second call with the same
+/// `(phys_base, size)` is a no-op, matching the discipline the GIC
+/// bring-up follows.
+///
+/// # Safety
+/// - HHDM offset must be set; `crate::FRAME_ALLOCATOR` must be online
+///   (aarch64).
+/// - `phys_base` must be the physical base of a real PCIe ECAM window.
+/// - Single-writer at boot.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn init_ecam(phys_base: u64, size: u64) -> Result<(), &'static str> {
+    if phys_base & 0xFFF != 0 {
+        return Err("init_ecam: phys_base must be page-aligned");
+    }
+    if size == 0 {
+        return Err("init_ecam: size must be non-zero");
+    }
+
+    let hhdm = crate::hhdm_offset();
+    let virt_base = phys_base.checked_add(hhdm).ok_or("init_ecam: HHDM overflow")?;
+
+    // Cap the actual mapping to ECAM_MAP_BYTES (bus 0). QEMU virt
+    // advertises up to 256 MiB, but the scanner only touches bus 0
+    // today — see ECAM_MAP_BYTES rationale.
+    let map_len = core::cmp::min(size, ECAM_MAP_BYTES);
+    let map_pages = (map_len + 0xFFF) / 0x1000;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: Reading TTBR1_EL1 in EL1 is unconditionally valid;
+        // `kernel_root_phys` returns the physical base of the kernel
+        // page table. `map_range` walks/installs intermediate tables via
+        // the frame allocator, then writes device-memory leaf descriptors.
+        unsafe {
+            let root_phys = crate::arch::aarch64::paging::kernel_root_phys();
+            let mut pt = crate::memory::paging::page_table_from_cr3(root_phys);
+
+            let mut fa = crate::FRAME_ALLOCATOR.lock();
+            for page in 0..map_pages {
+                let off = page * 0x1000;
+                // Idempotent: if a prior call already mapped this page,
+                // `map_range` would report AlreadyMapped — tolerate it
+                // and continue. Any other error is a hard failure.
+                match crate::memory::paging::map_page(
+                    &mut pt,
+                    virt_base + off,
+                    phys_base + off,
+                    crate::memory::paging::flags::kernel_rw(),
+                    &mut fa,
+                ) {
+                    Ok(()) => {}
+                    Err(crate::memory::paging::PagingError::AlreadyMapped) => {}
+                    Err(_) => {
+                        return Err(
+                            "init_ecam: map_page failed — frame allocator \
+                             exhausted or invalid VA",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        // HHDM gigapages at `[0, 4 GiB)` already cover ECAM on QEMU virt
+        // (0x3000_0000). Sanity-check the range fits, then publish the
+        // VA. The 4 GiB constant here is not a new SCAFFOLDING bound —
+        // it mirrors `HHDM_GIGAPAGE_COVERAGE` in
+        // src/arch/riscv64/paging.rs, which owns the canonical bound.
+        if phys_base
+            .checked_add(map_len)
+            .map(|end| end > 4 * 1024 * 1024 * 1024)
+            .unwrap_or(true)
+        {
+            return Err(
+                "init_ecam: ECAM window exceeds boot-HHDM gigapage coverage \
+                 (>4 GiB) — extend src/arch/riscv64/entry.rs",
+            );
+        }
+        let _ = map_pages; // silence "unused" on riscv64
+    }
+
+    // SAFETY: mapping is in place (aarch64) or pre-existing (riscv64);
+    // the publish ordering is Release → Acquire in `ecam::read32`.
+    unsafe { ecam::set_virt_base(virt_base) };
+    Ok(())
+}
 
 /// BAR register offsets in PCI config space (0x10 .. 0x24, six BARs).
-#[cfg(target_arch = "x86_64")]
+/// Arch-agnostic — PCI Local Bus Spec r3.0 §6.2.5.
 const BAR_OFFSETS: [u8; 6] = [0x10, 0x14, 0x18, 0x1C, 0x20, 0x24];
 
 /// Decode BARs for a device, including BAR size detection.
@@ -291,7 +514,6 @@ const BAR_OFFSETS: [u8; 6] = [0x10, 0x14, 0x18, 0x1C, 0x20, 0x24];
 /// Temporarily writes 0xFFFF_FFFF to each BAR (standard size-detection
 /// protocol) and restores the original value. Must not be called while
 /// any driver is actively using the device.
-#[cfg(target_arch = "x86_64")]
 unsafe fn decode_bars(
     bus: u8,
     device: u8,
@@ -305,7 +527,7 @@ unsafe fn decode_bars(
         let offset = BAR_OFFSETS[i];
 
         // SAFETY: Standard PCI config read — device was already validated.
-        let raw = unsafe { pci_config_read32(bus, device, function, offset) };
+        let raw = unsafe { config::read32(bus, device, function, offset) };
 
         if raw == 0 {
             // BAR not implemented
@@ -316,7 +538,11 @@ unsafe fn decode_bars(
         let is_io = (raw & 0x1) != 0;
 
         if is_io {
-            // I/O BAR — mask bit 0 (I/O indicator) and bit 1 (reserved)
+            // I/O BAR — mask bit 0 (I/O indicator) and bit 1 (reserved).
+            // On ECAM-only arches (aarch64 / riscv64) QEMU still allows
+            // reading the BAR through config space, but the I/O window
+            // itself has no CPU instruction backing it — the kernel
+            // never lets a driver claim an I/O-BAR range there.
             let addr = (raw & 0xFFFF_FFFC) as u64;
             bars[i] = addr;
             bar_is_io[i] = true;
@@ -324,11 +550,11 @@ unsafe fn decode_bars(
             // Size detection: standard BAR sizing protocol — save, write
             // all-ones, read back, restore.
             // SAFETY: Standard PCI BAR sizing — writes all-ones to the BAR.
-            unsafe { pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF) };
+            unsafe { config::write32(bus, device, function, offset, 0xFFFF_FFFF) };
             // SAFETY: Read back the size mask.
-            let size_raw = unsafe { pci_config_read32(bus, device, function, offset) };
+            let size_raw = unsafe { config::read32(bus, device, function, offset) };
             // SAFETY: Restore the original BAR value.
-            unsafe { pci_config_write32(bus, device, function, offset, raw) };
+            unsafe { config::write32(bus, device, function, offset, raw) };
             let size_mask = size_raw & 0xFFFF_FFFC;
             if size_mask != 0 {
                 bar_sizes[i] = (!size_mask).wrapping_add(1);
@@ -343,7 +569,7 @@ unsafe fn decode_bars(
                 // 64-bit BAR — spans this register and the next
                 // SAFETY: Reading the next BAR register for the high 32 bits.
                 let raw_hi = unsafe {
-                    pci_config_read32(bus, device, function, BAR_OFFSETS[i + 1])
+                    config::read32(bus, device, function, BAR_OFFSETS[i + 1])
                 };
                 let addr_lo = (raw & 0xFFFF_FFF0) as u64;
                 let addr_hi = raw_hi as u64;
@@ -352,27 +578,27 @@ unsafe fn decode_bars(
                 // Size detection for 64-bit BAR: write all-ones to both
                 // halves, read back, restore both.
                 // SAFETY: Standard BAR sizing — write all-ones to low BAR.
-                unsafe { pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF) };
+                unsafe { config::write32(bus, device, function, offset, 0xFFFF_FFFF) };
                 // SAFETY: Write all-ones to high BAR.
                 unsafe {
-                    pci_config_write32(
+                    config::write32(
                         bus, device, function, BAR_OFFSETS[i + 1], 0xFFFF_FFFF,
                     )
                 };
                 // SAFETY: Read back low size mask.
                 let size_lo =
-                    unsafe { pci_config_read32(bus, device, function, offset) };
+                    unsafe { config::read32(bus, device, function, offset) };
                 // SAFETY: Read back high size mask.
                 let _size_hi = unsafe {
-                    pci_config_read32(
+                    config::read32(
                         bus, device, function, BAR_OFFSETS[i + 1],
                     )
                 };
                 // SAFETY: Restore original low BAR value.
-                unsafe { pci_config_write32(bus, device, function, offset, raw) };
+                unsafe { config::write32(bus, device, function, offset, raw) };
                 // SAFETY: Restore original high BAR value.
                 unsafe {
-                    pci_config_write32(
+                    config::write32(
                         bus, device, function, BAR_OFFSETS[i + 1], raw_hi,
                     )
                 };
@@ -394,12 +620,12 @@ unsafe fn decode_bars(
 
                 // Size detection: standard BAR sizing protocol.
                 // SAFETY: Write all-ones to the BAR.
-                unsafe { pci_config_write32(bus, device, function, offset, 0xFFFF_FFFF) };
+                unsafe { config::write32(bus, device, function, offset, 0xFFFF_FFFF) };
                 // SAFETY: Read back the size mask.
                 let size_raw =
-                    unsafe { pci_config_read32(bus, device, function, offset) };
+                    unsafe { config::read32(bus, device, function, offset) };
                 // SAFETY: Restore the original BAR value.
-                unsafe { pci_config_write32(bus, device, function, offset, raw) };
+                unsafe { config::write32(bus, device, function, offset, raw) };
                 let size_mask = size_raw & 0xFFFF_FFF0;
                 if size_mask != 0 {
                     bar_sizes[i] = (!size_mask).wrapping_add(1);
@@ -589,18 +815,18 @@ pub fn parse_virtio_modern_caps(cfg: &[u8]) -> VirtioModernCaps {
 ///
 /// # Safety
 /// - Must be called at boot with exclusive access to PCI config space
-///   (no other CPU is using 0xCF8/0xCFC).
+///   (no other CPU is using 0xCF8/0xCFC on x86_64 or the ECAM window
+///   elsewhere).
 /// - The `(bus, device, function)` triple must name a device that was
 ///   confirmed present (vendor ID != 0xFFFF) by the caller.
-#[cfg(target_arch = "x86_64")]
 unsafe fn walk_virtio_modern_caps(bus: u8, device: u8, function: u8) -> VirtioModernCaps {
     let mut cfg = [0u8; PCI_CONFIG_SPACE_SIZE];
     // Walk standard config space dword-by-dword (64 reads).
     let mut off = 0usize;
     while off < PCI_CONFIG_SPACE_SIZE {
-        // SAFETY: caller confirmed device presence; port I/O is safe at
-        // boot (single-writer at this phase).
-        let dword = unsafe { pci_config_read32(bus, device, function, off as u8) };
+        // SAFETY: caller confirmed device presence; config-space I/O is
+        // safe at boot (single-writer at this phase).
+        let dword = unsafe { config::read32(bus, device, function, off as u8) };
         cfg[off..off + 4].copy_from_slice(&dword.to_le_bytes());
         off += 4;
     }
@@ -616,19 +842,25 @@ unsafe fn walk_virtio_modern_caps(bus: u8, device: u8, function: u8) -> VirtioMo
 /// Discovered devices are stored in the global `DEVICES` table. This must be
 /// called exactly once during BSP boot, before any PCI driver initialization.
 ///
+/// On aarch64 / riscv64, [`init_ecam`] must run first so the MMIO window
+/// that backs `config::read32` / `config::write32` is live. A `scan()`
+/// call before ECAM init is safe but finds nothing (ECAM reads return
+/// 0xFFFF_FFFF, which `vendor_id == 0xFFFF` filters out).
+///
 /// # Safety
 ///
 /// - Must be called at boot before drivers access PCI devices.
-/// - Performs port I/O and temporarily writes to PCI BARs for size detection.
+/// - Performs config-space I/O and temporarily writes to PCI BARs for
+///   size detection. On x86_64 this means port I/O at 0xCF8/0xCFC; on
+///   aarch64/riscv64 it means MMIO into the ECAM window.
 /// - Not reentrant and not thread-safe (single-writer at boot).
-#[cfg(target_arch = "x86_64")]
 pub unsafe fn scan() {
-    let mut count = 0usize;
+    let mut count = DEVICE_COUNT.load(Ordering::Acquire);
 
     for dev in 0u8..32 {
         for func in 0u8..8 {
             // SAFETY: Standard PCI config read to probe vendor ID.
-            let id_reg = unsafe { pci_config_read32(0, dev, func, 0x00) };
+            let id_reg = unsafe { config::read32(0, dev, func, 0x00) };
             let vendor_id = (id_reg & 0xFFFF) as u16;
 
             if vendor_id == 0xFFFF {
@@ -646,7 +878,7 @@ pub unsafe fn scan() {
 
             // Class / subclass at offset 0x08 (bits 31:16 = class:subclass)
             // SAFETY: Device confirmed present by vendor ID check.
-            let class_reg = unsafe { pci_config_read32(0, dev, func, 0x08) };
+            let class_reg = unsafe { config::read32(0, dev, func, 0x08) };
             let class = ((class_reg >> 24) & 0xFF) as u8;
             let subclass = ((class_reg >> 16) & 0xFF) as u8;
 

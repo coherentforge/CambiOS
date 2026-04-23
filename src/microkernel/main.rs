@@ -470,6 +470,80 @@ unsafe extern "C" fn kmain() -> ! {
             println!("  ✓ ARM Generic Timer started (100 Hz)");
         }
         println!("✓ GIC + timer scheduling active\n");
+
+        // PCIe ECAM bring-up + PCI bus scan.
+        //
+        // QEMU `virt` (aarch64) publishes the high PCIe ECAM window at
+        // phys 0x40_1000_0000 (256 GiB + 256 MiB). We map the first
+        // 1 MiB — bus 0, the only bus QEMU populates — into TTBR1 via
+        // the kernel frame allocator, then run the same arch-agnostic
+        // `pci::scan` used on x86_64 (which walks the window through
+        // the `config::read32` ECAM backend).
+        //
+        // After this call `SYS_DEVICE_INFO` surfaces real device
+        // records; virtio-gpu-pci / virtio-keyboard-pci drivers'
+        // discovery paths now find their devices without falling into
+        // passive idle (which was the reason the aarch64 GUI boot chain
+        // stalled at the compositor handshake).
+        //
+        // SCAFFOLDING: ECAM base hard-coded for QEMU `virt`. Real
+        // hardware discovers this from ACPI MCFG (aarch64) or the
+        // `/soc/pci` DTB node. See `docs/ASSUMPTIONS.md`; replace when
+        // a non-QEMU aarch64 target boots or ADR-021 Phase C lands an
+        // MCFG/DTB parser.
+        /// SCAFFOLDING: QEMU `virt` aarch64 high PCIe ECAM base.
+        /// Why: QEMU's `extended_memmap[VIRT_HIGH_PCIE_ECAM]` lands the
+        ///      256 MiB ECAM window at 0x40_1000_0000 after the high
+        ///      GIC redistributor. Matches the existing `GICD_PHYS` /
+        ///      `GICR_PHYS` precedent — platform-fixed by QEMU.
+        /// Replace when: an MCFG/DTB parser lands (ADR-021 Phase C) or a
+        ///      non-QEMU aarch64 target boots. See docs/ASSUMPTIONS.md.
+        const ECAM_PHYS_AARCH64: u64 = 0x40_1000_0000;
+        /// SCAFFOLDING: QEMU publishes a 256 MiB ECAM window on aarch64.
+        /// `pci::init_ecam` caps the actual mapping to bus 0 (1 MiB);
+        /// passing the full advertised size keeps a future multi-bus
+        /// change a single-line edit. Replace when: same trigger as
+        /// `ECAM_PHYS_AARCH64`.
+        const ECAM_SIZE_AARCH64: u64 = 256 * 1024 * 1024;
+        // SAFETY: HHDM offset is set; FRAME_ALLOCATOR is live (init
+        // ran above); kernel page table is active; single-threaded boot.
+        unsafe {
+            arcos_core::pci::init_ecam(ECAM_PHYS_AARCH64, ECAM_SIZE_AARCH64)
+                .unwrap_or_else(|e| {
+                    println!("✗ pci::init_ecam failed: {}", e);
+                    arcos_core::halt();
+                });
+        }
+        println!(
+            "✓ PCIe ECAM mapped ({:#x}, bus 0 = 1 MiB)",
+            ECAM_PHYS_AARCH64,
+        );
+
+        // SAFETY: single-threaded BSP boot, no PCI driver is running,
+        // BAR sizing writes are safe before user space comes up.
+        unsafe { arcos_core::pci::scan() };
+        let pci_count = arcos_core::pci::device_count();
+        println!("✓ PCI: {} device(s) discovered", pci_count);
+        for i in 0..pci_count {
+            if let Some(dev) = arcos_core::pci::get_device(i) {
+                println!(
+                    "  PCI {:02x}:{:02x}.{} — {:04x}:{:04x} class {:02x}:{:02x}",
+                    dev.bus, dev.device, dev.function,
+                    dev.vendor_id, dev.device_id,
+                    dev.class, dev.subclass,
+                );
+                for b in 0..6 {
+                    if dev.bars[b] != 0 {
+                        println!(
+                            "    BAR{}: {:#x} size={} {}",
+                            b, dev.bars[b], dev.bar_sizes[b],
+                            if dev.bar_is_io[b] { "I/O" } else { "MMIO" },
+                        );
+                    }
+                }
+            }
+        }
+        println!();
     }
 
     // ================================================================

@@ -1789,7 +1789,11 @@ impl SyscallDispatcher {
     ///   [function:1][pad:1][bar_count:1][pad:1]
     ///   [bar0_addr:8][bar0_size:4][pad:4] × 6
     /// Total: 12 + 6×16 = 108 bytes
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Arch-agnostic: reads [`crate::pci::get_device`], which is populated
+    /// from port-I/O mechanism 1 on x86_64 (`scan`), ECAM on aarch64, and
+    /// either ECAM or virtio-mmio on riscv64 depending on what the boot
+    /// path discovered.
     fn handle_device_info(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         let index = args.arg1_u32() as usize;
         let out_buf = args.arg2;
@@ -1837,12 +1841,6 @@ impl SyscallDispatcher {
         desc_slice.write_from(&desc)?;
 
         Ok(0)
-    }
-
-    /// SYS_DEVICE_INFO stub for non-x86_64 targets (PCI not yet supported).
-    #[cfg(not(target_arch = "x86_64"))]
-    fn handle_device_info(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
-        Err(SyscallError::Enosys)
     }
 
     /// SYS_VIRTIO_MODERN_CAPS: write kernel-parsed virtio-modern caps for a
