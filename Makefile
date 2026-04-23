@@ -87,9 +87,25 @@ POLICY_SERVICE_ELF_AARCH64 := $(POLICY_SERVICE_DIR)/target/aarch64-unknown-none/
 FB_DEMO_ELF_AARCH64 := $(FB_DEMO_DIR)/target/aarch64-unknown-none/release/arcos-fb-demo
 COMPOSITOR_ELF_AARCH64 := $(COMPOSITOR_DIR)/target/aarch64-unknown-none/release/arcos-compositor
 SCANOUT_LIMINE_ELF_AARCH64 := $(SCANOUT_LIMINE_DIR)/target/aarch64-unknown-none/release/arcos-scanout-limine
+SCANOUT_VGPU_ELF_AARCH64 := $(SCANOUT_VGPU_DIR)/target/aarch64-unknown-none/release/arcos-scanout-virtio-gpu
+VIRTIO_INPUT_ELF_AARCH64 := $(VIRTIO_INPUT_DIR)/target/aarch64-unknown-none/release/arcos-virtio-input
 HELLO_WINDOW_ELF_AARCH64 := $(HELLO_WINDOW_DIR)/target/aarch64-unknown-none/release/arcos-hello-window
 TREE_ELF_AARCH64 := $(TREE_DIR)/target/aarch64-unknown-none/release/arcos-tree
 WORM_ELF_AARCH64 := $(WORM_DIR)/target/aarch64-unknown-none/release/arcos-worm
+
+# User-space ELF binaries (RISC-V) — scanout + input extension for Scanout-4.c
+SCANOUT_VGPU_ELF_RISCV64 := $(SCANOUT_VGPU_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-scanout-virtio-gpu
+VIRTIO_INPUT_ELF_RISCV64 := $(VIRTIO_INPUT_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-virtio-input
+
+# User-space ELF binaries (RISC-V) — GUI stack (ADR-011). libgui is
+# arch-agnostic; each app ships a link-riscv64.ld matching the
+# virtio-net riscv64 shape. Runtime requires kernel ECAM PCI + a
+# virtio-gpu-pci QEMU device; build infra lands first so the cross-
+# arch port is unblocked.
+COMPOSITOR_ELF_RISCV64 := $(COMPOSITOR_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-compositor
+HELLO_WINDOW_ELF_RISCV64 := $(HELLO_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-hello-window
+TREE_ELF_RISCV64 := $(TREE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-tree
+WORM_ELF_RISCV64 := $(WORM_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-worm
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -108,7 +124,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -317,6 +333,20 @@ scanout-limine-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== scanout-limine (AArch64) ready ==="
 
+scanout-virtio-gpu-aarch64:
+	@echo "=== Building scanout-virtio-gpu (AArch64, Scanout-4.c ADR-014) ==="
+	cd $(SCANOUT_VGPU_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== scanout-virtio-gpu (AArch64) ready ==="
+
+virtio-input-aarch64:
+	@echo "=== Building virtio-input (AArch64, ADR-012 Input-1) ==="
+	cd $(VIRTIO_INPUT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== virtio-input (AArch64) ready ==="
+
 hello-window-aarch64:
 	@echo "=== Building hello-window (AArch64) ==="
 	cd $(HELLO_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -389,6 +419,48 @@ policy-service-riscv64:
 		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
 	@echo "=== Policy service (RISC-V) ready ==="
+
+scanout-virtio-gpu-riscv64:
+	@echo "=== Building scanout-virtio-gpu (RISC-V, Scanout-4.c ADR-014) ==="
+	cd $(SCANOUT_VGPU_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== scanout-virtio-gpu (RISC-V) ready ==="
+
+virtio-input-riscv64:
+	@echo "=== Building virtio-input (RISC-V, ADR-012 Input-1) ==="
+	cd $(VIRTIO_INPUT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== virtio-input (RISC-V) ready ==="
+
+compositor-riscv64:
+	@echo "=== Building compositor (RISC-V, ADR-014) ==="
+	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== compositor (RISC-V) ready ==="
+
+hello-window-riscv64:
+	@echo "=== Building hello-window (RISC-V, ADR-011) ==="
+	cd $(HELLO_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== hello-window (RISC-V) ready ==="
+
+tree-riscv64:
+	@echo "=== Building tree (RISC-V, ADR-011/012) ==="
+	cd $(TREE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== tree (RISC-V) ready ==="
+
+worm-riscv64:
+	@echo "=== Building worm (RISC-V, ADR-011/012) ==="
+	cd $(WORM_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== worm (RISC-V) ready ==="
 
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
