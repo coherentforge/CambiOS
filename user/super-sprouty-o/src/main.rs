@@ -11,34 +11,31 @@
 //! (per HN launch plan: Nintendo IP is unusable and pattern-matching to
 //! Mario is the whole launch risk).
 //!
-//! ## Session 1b scope (this commit)
+//! ## Session 2 state (this commit)
 //!
-//! - Crate scaffold matching pong template (Cargo.toml + 3-arch linker
-//!   scripts + lib.rs stub).
-//! - Endpoint 22 registration, 33 FPS FrameClock (3 kernel ticks).
-//! - Empty sky-blue window; ESC exits. No sprites, no physics, no
-//!   input beyond ESC.
+//! - 64-wide scrolling level with three pits.
+//! - Player physics: horizontal accel + friction, gravity, jump.
+//! - AABB-vs-tilemap collision (axis-separated sweep; standing / walls
+//!   / ceilings / walking-off-ledge all handled).
+//! - Camera follows player, clamped to level bounds.
+//! - Held-key left / right, SPACE to jump, ESC to quit.
 //!
-//! Follow-on sessions add: sprite sheet + static render (1c);
-//! physics + AABB tile collision + camera + weeds (Session 2); seeds
-//! + sprout-seed power-up + goal tree + animations + live FPS counter
-//! (Session 3).
+//! Still to land in Session 2: weed-walker enemy (2d), pit death +
+//! lose overlay + R-restart (2e). After those: Session 3 polish.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
 
-mod level;
 mod render;
 mod sprites;
 
 use arcos_libgui::{Bitmap, Client, EventType, FrameClock, InputEvent};
 use arcos_libsys as sys;
-
-/// Surface dimensions. 480×320 matches pong's court; at 32×32 tiles
-/// this gives a 15-tile-wide × 10-tile-tall viewport for Session 1c+.
-const WINDOW_W: u32 = 480;
-const WINDOW_H: u32 = 320;
+use arcos_super_sprouty_o::{
+    game::{Game, Input},
+    level,
+};
 
 /// IPC endpoint. `MAX_ENDPOINTS` is a SCAFFOLDING bound of 32 in
 /// [src/ipc/mod.rs], so valid IDs are 0..=31. 22 is free under the
@@ -61,6 +58,14 @@ const STEP_TICKS: u64 = 3;
 /// `user/virtio-input/src/evdev.rs`; redeclared here for the codes
 /// this game cares about, same locality discipline as tree/worm/pong.
 mod keys {
+    pub const LEFT: u32 = 0x50;
+    pub const RIGHT: u32 = 0x4F;
+    pub const A: u32 = 0x04;
+    pub const D: u32 = 0x07;
+    pub const SPACE: u32 = 0x2C;
+    pub const UP: u32 = 0x52;
+    pub const W: u32 = 0x1A;
+    pub const R: u32 = 0x15;
     pub const ESCAPE: u32 = 0x29;
 }
 
@@ -69,12 +74,10 @@ mod keys {
 pub extern "C" fn _start() -> ! {
     sys::print(b"[SPROUTY] booting\r\n");
 
-    // Leaf boot module — release the boot gate immediately so anything
-    // after super-sprouty-o in the manifest (shell) doesn't block on
-    // the compositor round-trip.
+    // Leaf boot module — release the boot gate immediately.
     sys::module_ready();
 
-    let mut client = match Client::open(WINDOW_W, WINDOW_H, SPROUTY_ENDPOINT) {
+    let mut client = match Client::open(level::SURFACE_W, level::SURFACE_H, SPROUTY_ENDPOINT) {
         Ok(c) => c,
         Err(e) => {
             let tag: &[u8] = match e {
@@ -94,29 +97,36 @@ pub extern "C" fn _start() -> ! {
     sys::print(b"[SPROUTY] window opened\r\n");
 
     let sheet = sprites::sheet();
+    let mut game = Game::new();
+    let mut input = Input::default();
 
     let mut clock = FrameClock::new(STEP_TICKS);
     clock.seed(sys::get_time());
 
-    redraw(&mut client, &sheet);
+    redraw(&mut client, &sheet, &game);
 
     sys::print(b"[SPROUTY] entering event loop\r\n");
     loop {
         let mut drained = false;
         while let Some(ev) = client.poll_event() {
             drained = true;
-            if handle_event(&ev) {
-                sys::print(b"[SPROUTY] exiting\r\n");
-                sys::exit(0);
+            match handle_event(&ev, &mut input) {
+                EventResult::Quit => {
+                    sys::print(b"[SPROUTY] exiting\r\n");
+                    sys::exit(0);
+                }
+                EventResult::Restart => {
+                    game.reset();
+                    clock.seed(sys::get_time());
+                }
+                EventResult::Continue => {}
             }
         }
 
-        // Session 1c redraws every tick; level is static but the 33 FPS
-        // pacing + full-surface submit is the workload the scanout path
-        // needs to see. From Session 2 the tick also advances physics.
         let tick = clock.tick(sys::get_time());
         if tick {
-            redraw(&mut client, &sheet);
+            game.tick(&mut input);
+            redraw(&mut client, &sheet, &game);
         }
 
         if !drained && !tick {
@@ -125,27 +135,65 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-/// Apply one input event. Returns `true` iff the event should
-/// terminate the program (Session 1b: ESC only).
-fn handle_event(ev: &InputEvent) -> bool {
-    if matches!(ev.event_type, EventType::KeyDown) {
-        let k = ev.keyboard();
-        if k.keycode == keys::ESCAPE {
-            return true;
-        }
-    }
-    false
+/// Outcome of consuming one input event.
+enum EventResult {
+    Continue,
+    Restart,
+    Quit,
 }
 
-fn redraw(client: &mut Client, sheet: &Bitmap) {
+/// Apply one input event + decide whether it triggers quit / restart.
+fn handle_event(ev: &InputEvent, input: &mut Input) -> EventResult {
+    match ev.event_type {
+        EventType::KeyDown | EventType::KeyRepeat => {
+            let k = ev.keyboard();
+            match k.keycode {
+                keys::LEFT | keys::A => {
+                    input.left_held = true;
+                    EventResult::Continue
+                }
+                keys::RIGHT | keys::D => {
+                    input.right_held = true;
+                    EventResult::Continue
+                }
+                keys::SPACE | keys::UP | keys::W => {
+                    // Edge trigger: set once on KeyDown; OS KeyRepeat
+                    // also sets it, but tick consumes it and the
+                    // on-ground guard in game prevents airborne
+                    // double-jumps.
+                    input.jump_pressed = true;
+                    EventResult::Continue
+                }
+                keys::R => EventResult::Restart,
+                keys::ESCAPE => EventResult::Quit,
+                _ => EventResult::Continue,
+            }
+        }
+        EventType::KeyUp => {
+            let k = ev.keyboard();
+            match k.keycode {
+                keys::LEFT | keys::A => {
+                    input.left_held = false;
+                }
+                keys::RIGHT | keys::D => {
+                    input.right_held = false;
+                }
+                _ => {}
+            }
+            EventResult::Continue
+        }
+        _ => EventResult::Continue,
+    }
+}
+
+fn redraw(client: &mut Client, sheet: &Bitmap, game: &Game) {
     {
         let mut surf = client.surface_mut();
-        render::draw(&mut surf, sheet);
+        render::draw(&mut surf, sheet, game);
     }
     if client.submit_full().is_err() {
         sys::log_error(b"SPROUTY", b"submit_full failed");
-        // Recoverable on the next frame; exit only on unrecoverable
-        // handshake failure.
+        // Recoverable on the next frame.
     }
 }
 
