@@ -484,7 +484,16 @@ $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 	@echo "=== Cloning Limine $(LIMINE_BRANCH) ==="
 	git clone $(LIMINE_REPO) --branch=$(LIMINE_BRANCH) --depth=1 $(LIMINE_DIR)
 
-limine: $(LIMINE_DIR)/BOOTX64.EFI
+# Upstream's `limine-binary` branch ships the pre-built EFI stages but
+# NOT the compiled macOS host tool `limine` (the `xxx bios-install $(ISO)`
+# call at the bottom of `iso:`). The clone includes the single-file
+# `limine.c` source; compile it in-place. Depends on BOOTX64.EFI to
+# guarantee the clone has run.
+$(LIMINE_DIR)/limine: $(LIMINE_DIR)/BOOTX64.EFI
+	@echo "=== Building Limine host tool ==="
+	$(MAKE) -C $(LIMINE_DIR)
+
+limine: $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine
 
 iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu worm sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
