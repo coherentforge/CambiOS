@@ -30,15 +30,19 @@ pub const LEVEL_COLS: usize = 64;
 /// in v0; the whole column height is always visible.
 pub const LEVEL_ROWS: usize = 10;
 
-/// Tile IDs. Session 2a ships two (AIR, GROUND); Session 3 extends
-/// with seed / goal-tree markers.
+/// Tile IDs.
 pub const AIR: u8 = 0;
 pub const GROUND: u8 = 1;
+/// Marks the young-flowering-tree goal cell. Walking into it wins the
+/// level. Only one is expected per level; the row index comes from
+/// `goal_tile()` so render + collision agree.
+pub const GOAL: u8 = 2;
 
 // Short aliases for the level-data table below — table readability
 // collapses hard without them.
 const A: u8 = AIR;
 const G: u8 = GROUND;
+const T: u8 = GOAL;
 
 /// Static level geometry. Row 0 is the top (sky). Row 9 is the ground
 /// row, broken by three pits at [15..17], [30..32], [47..50].
@@ -51,7 +55,14 @@ pub static LEVEL: [[u8; LEVEL_COLS]; LEVEL_ROWS] = [
     [A; LEVEL_COLS],
     [A; LEVEL_COLS],
     [A; LEVEL_COLS],
-    [A; LEVEL_COLS], // row 8
+    [
+        // Row 8 — mostly sky. GOAL tile at col 62 (last ground strip)
+        // so Sprouty can walk up to it and touch it. 64 cells total.
+        A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, //  0..19
+        A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, // 20..39
+        A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, // 40..59
+        A, A, T, A,                                                  // 60..63
+    ],
     [
         // cols  0..14 — flat ground (15 tiles)
         G, G, G, G, G, G, G, G, G, G, G, G, G, G, G,
@@ -72,12 +83,32 @@ pub static LEVEL: [[u8; LEVEL_COLS]; LEVEL_ROWS] = [
 
 /// Weed-walker spawn positions (world pixels, top-left). One per
 /// ground strip except the final one (kept weed-free as breathing room
-/// before Session 3's goal tree).
+/// before the goal tree).
 pub static WEED_SPAWNS: &[(i32, i32)] = &[
     (8 * TILE_SIZE as i32, 8 * TILE_SIZE as i32),  // mid-strip 0 (cols 0..14)
     (23 * TILE_SIZE as i32, 8 * TILE_SIZE as i32), // mid-strip 1 (cols 17..29)
     (39 * TILE_SIZE as i32, 8 * TILE_SIZE as i32), // mid-strip 2 (cols 32..46)
 ];
+
+/// Seed pickup positions (world pixels, top-left). Sprinkled one per
+/// ground strip, with an extra above the last pit as a risk-reward
+/// dangler. Collecting all seven grants visual completion; the
+/// sprout-seed power-up is a separate mechanic (player inventory).
+pub static SEED_SPAWNS: &[(i32, i32)] = &[
+    (3 * TILE_SIZE as i32, 8 * TILE_SIZE as i32),
+    (12 * TILE_SIZE as i32, 7 * TILE_SIZE as i32),
+    (20 * TILE_SIZE as i32, 8 * TILE_SIZE as i32),
+    (27 * TILE_SIZE as i32, 7 * TILE_SIZE as i32),
+    (35 * TILE_SIZE as i32, 8 * TILE_SIZE as i32),
+    (44 * TILE_SIZE as i32, 7 * TILE_SIZE as i32),
+    (55 * TILE_SIZE as i32, 8 * TILE_SIZE as i32),
+];
+
+/// World-pixel (col, row) of the goal tree — the only `GOAL` tile in
+/// the level. Hoisted for the Won-transition check so game.rs doesn't
+/// have to scan.
+pub const GOAL_COL: i32 = 62;
+pub const GOAL_ROW: i32 = 8;
 
 /// Tile at `(col, row)`. Out-of-range coords return AIR — outside the
 /// authored level is treated as open sky / fall-into-pit, not error.
@@ -141,11 +172,25 @@ mod tests {
     }
 
     #[test]
-    fn other_rows_are_all_air() {
-        for r in 0..9 {
+    fn upper_rows_are_all_air() {
+        // Rows 0..8 are open sky. Row 8 has a single GOAL tile at col
+        // 62 (covered by `goal_tile_present`), so exclude it here.
+        for r in 0..8 {
             for c in 0..LEVEL_COLS {
                 assert_eq!(LEVEL[r][c], AIR, "expected AIR at ({},{})", c, r);
             }
+        }
+    }
+
+    #[test]
+    fn goal_tile_present() {
+        assert_eq!(LEVEL[GOAL_ROW as usize][GOAL_COL as usize], GOAL);
+        // Row 8 is otherwise AIR.
+        for c in 0..LEVEL_COLS {
+            if c == GOAL_COL as usize {
+                continue;
+            }
+            assert_eq!(LEVEL[GOAL_ROW as usize][c], AIR, "row 8 col {}", c);
         }
     }
 

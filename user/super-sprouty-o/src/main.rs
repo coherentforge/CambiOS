@@ -60,8 +60,10 @@ const STEP_TICKS: u64 = 3;
 mod keys {
     pub const LEFT: u32 = 0x50;
     pub const RIGHT: u32 = 0x4F;
+    pub const DOWN: u32 = 0x51;
     pub const A: u32 = 0x04;
     pub const D: u32 = 0x07;
+    pub const S: u32 = 0x16;
     pub const SPACE: u32 = 0x2C;
     pub const UP: u32 = 0x52;
     pub const W: u32 = 0x1A;
@@ -100,10 +102,12 @@ pub extern "C" fn _start() -> ! {
     let mut game = Game::new();
     let mut input = Input::default();
 
+    let now = sys::get_time();
     let mut clock = FrameClock::new(STEP_TICKS);
-    clock.seed(sys::get_time());
+    clock.seed(now);
+    game.fps.seed(now);
 
-    redraw(&mut client, &sheet, &game);
+    redraw(&mut client, &sheet, &mut game);
 
     sys::print(b"[SPROUTY] entering event loop\r\n");
     loop {
@@ -117,7 +121,9 @@ pub extern "C" fn _start() -> ! {
                 }
                 EventResult::Restart => {
                     game.reset();
-                    clock.seed(sys::get_time());
+                    let now = sys::get_time();
+                    clock.seed(now);
+                    game.fps.seed(now);
                 }
                 EventResult::Continue => {}
             }
@@ -126,7 +132,7 @@ pub extern "C" fn _start() -> ! {
         let tick = clock.tick(sys::get_time());
         if tick {
             game.tick(&mut input);
-            redraw(&mut client, &sheet, &game);
+            redraw(&mut client, &sheet, &mut game);
         }
 
         if !drained && !tick {
@@ -164,6 +170,13 @@ fn handle_event(ev: &InputEvent, input: &mut Input) -> EventResult {
                     input.jump_pressed = true;
                     EventResult::Continue
                 }
+                keys::DOWN | keys::S => {
+                    // Edge trigger for sprout-seed plant. Guard rails
+                    // (on-ground + has-seed + no existing platform) all
+                    // live in `Game::apply_plant_input`.
+                    input.down_pressed = true;
+                    EventResult::Continue
+                }
                 keys::R => EventResult::Restart,
                 keys::ESCAPE => EventResult::Quit,
                 _ => EventResult::Continue,
@@ -186,7 +199,9 @@ fn handle_event(ev: &InputEvent, input: &mut Input) -> EventResult {
     }
 }
 
-fn redraw(client: &mut Client, sheet: &Bitmap, game: &Game) {
+fn redraw(client: &mut Client, sheet: &Bitmap, game: &mut Game) {
+    // Live FPS counter — feed the same clock source FrameClock uses.
+    game.fps.on_frame(sys::get_time());
     {
         let mut surf = client.surface_mut();
         render::draw(&mut surf, sheet, game);

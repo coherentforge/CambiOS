@@ -20,7 +20,10 @@
 //! - Gravity is positive; falling is positive vel_y.
 //! - Collision box is half-open `[x, x + w) × [y, y + h)`.
 
-use crate::level::{self, tile_at, LEVEL_COLS, SURFACE_H, SURFACE_W, TILE_SIZE, WEED_SPAWNS};
+use crate::level::{
+    self, tile_at, GOAL_COL, GOAL_ROW, LEVEL_COLS, SEED_SPAWNS, SURFACE_H, SURFACE_W, TILE_SIZE,
+    WEED_SPAWNS,
+};
 
 /// TUNING: horizontal acceleration (px per tick squared).
 const ACCEL_X: i32 = 2;
@@ -67,12 +70,29 @@ const STOMP_BAND: i32 = 10;
 /// Maximum simultaneous weeds. Fixed-array to stay off the allocator.
 pub const MAX_WEEDS: usize = 8;
 
+/// Maximum seed pickups.
+pub const MAX_SEEDS: usize = 16;
+
+/// Seed pickup AABB. Matches the 32×32 cell for simplicity.
+pub const SEED_W: u32 = 32;
+pub const SEED_H: u32 = 32;
+
+/// TUNING: planted-platform lifetime in ticks. 66 ticks × 30 ms ≈ 2 s.
+const PLANTED_LIFETIME_TICKS: u64 = 66;
+
+/// TUNING: sample window for the live FPS counter (kernel ticks).
+/// 100 ticks at 100 Hz kernel = 1 second.
+const FPS_SAMPLE_TICKS: u64 = 100;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Playing,
     /// Killed by a weed side-hit or a pit fall. Tick is suspended;
     /// `Game::reset` returns to `Playing`.
     Dead,
+    /// Touched the goal tree. Tick is suspended; `Game::reset` returns
+    /// to `Playing`.
+    Won,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +110,60 @@ impl Weed {
 }
 
 #[derive(Clone, Copy)]
+pub struct Seed {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Temporary solid tile placed under Sprouty by the sprout-seed
+/// power-up. Exactly one at a time. Expires at `expire_tick`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlantedPlatform {
+    pub col: i32,
+    pub row: i32,
+    pub expire_tick: u64,
+}
+
+/// Frames-per-second sampler. Snapshots the count every
+/// `FPS_SAMPLE_TICKS` of monotonic time. Unit-agnostic on the time
+/// source so host tests can feed fixed values.
+#[derive(Default, Clone, Copy)]
+pub struct FpsCounter {
+    frames_since_sample: u32,
+    last_sample_time: u64,
+    fps: u32,
+}
+
+impl FpsCounter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Anchor the sampling window to a known time. Call after `new()`
+    /// with the current time to avoid a bogus first sample.
+    pub fn seed(&mut self, now: u64) {
+        self.last_sample_time = now;
+        self.frames_since_sample = 0;
+        self.fps = 0;
+    }
+
+    /// Record one rendered frame and roll the sample over if the
+    /// window has elapsed.
+    pub fn on_frame(&mut self, now: u64) {
+        self.frames_since_sample = self.frames_since_sample.saturating_add(1);
+        if now.saturating_sub(self.last_sample_time) >= FPS_SAMPLE_TICKS {
+            self.fps = self.frames_since_sample;
+            self.frames_since_sample = 0;
+            self.last_sample_time = now;
+        }
+    }
+
+    pub fn fps(&self) -> u32 {
+        self.fps
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct Player {
     pub x: i32,
     pub y: i32,
@@ -97,6 +171,10 @@ pub struct Player {
     pub vel_y: i32,
     pub on_ground: bool,
     pub facing_right: bool,
+    /// True iff the player has picked up a seed and hasn't planted it
+    /// yet. Shown as a HUD indicator. Consumed by `input.down_pressed`
+    /// on the ground.
+    pub has_sprout_seed: bool,
 }
 
 impl Player {
@@ -108,6 +186,7 @@ impl Player {
             vel_y: 0,
             on_ground: true,
             facing_right: true,
+            has_sprout_seed: false,
         }
     }
 }
@@ -118,14 +197,23 @@ pub struct Input {
     pub right_held: bool,
     /// Edge-triggered: set on KeyDown, cleared by `Game::tick` after use.
     pub jump_pressed: bool,
+    /// Edge-triggered DOWN — plants the sprout-seed when held + on ground.
+    pub down_pressed: bool,
 }
 
 /// Single source of truth consumed by the renderer.
 pub struct Game {
     pub player: Player,
     pub weeds: [Option<Weed>; MAX_WEEDS],
+    pub seeds: [Option<Seed>; MAX_SEEDS],
+    pub planted: Option<PlantedPlatform>,
     pub camera_x: i32,
     pub status: Status,
+    /// Count of seeds Sprouty has picked up over the current run.
+    pub seeds_collected: u32,
+    /// Monotonic tick counter for expire-after-N-ticks mechanics.
+    pub tick_count: u64,
+    pub fps: FpsCounter,
 }
 
 impl Game {
@@ -133,37 +221,68 @@ impl Game {
         Self {
             player: Player::spawn(),
             weeds: spawn_weeds(),
+            seeds: spawn_seeds(),
+            planted: None,
             camera_x: 0,
             status: Status::Playing,
+            seeds_collected: 0,
+            tick_count: 0,
+            fps: FpsCounter::new(),
         }
     }
 
-    /// Reset to the spawn state — called on R-press after death.
+    /// Reset to the spawn state — called on R-press after death or win.
     pub fn reset(&mut self) {
         self.player = Player::spawn();
         self.weeds = spawn_weeds();
+        self.seeds = spawn_seeds();
+        self.planted = None;
         self.camera_x = 0;
         self.status = Status::Playing;
+        self.seeds_collected = 0;
+        self.tick_count = 0;
+        // FPS counter is preserved — it's a render-side meter, not
+        // game state.
     }
 
-    /// Advance one physics tick. Mutates `input.jump_pressed` to
-    /// clear the edge bit — caller sees it consumed on return.
+    /// Advance one physics tick. Mutates `input.jump_pressed` /
+    /// `input.down_pressed` to clear the edge bits — caller sees them
+    /// consumed on return.
     pub fn tick(&mut self, input: &mut Input) {
         if self.status != Status::Playing {
-            // Drain the jump edge so it doesn't fire on the first
-            // post-reset tick.
             input.jump_pressed = false;
+            input.down_pressed = false;
             return;
         }
         self.apply_horizontal_input(input);
         self.apply_vertical_input(input);
+        self.apply_plant_input(input);
         self.apply_gravity();
         self.resolve_horizontal_motion();
         self.resolve_vertical_motion();
         self.tick_weeds();
         self.check_player_weed_collisions();
+        self.check_seed_pickups();
+        self.check_goal();
         self.check_pit();
+        self.tick_planted();
         self.follow_camera();
+        self.tick_count = self.tick_count.saturating_add(1);
+    }
+
+    /// Ground + planted-platform solid-tile test. Collision resolvers
+    /// use this instead of `tile_at` directly so the temporary platform
+    /// participates in the same axis-separated sweep as authored ground.
+    fn is_solid(&self, col: i32, row: i32) -> bool {
+        if tile_at(col, row) == level::GROUND {
+            return true;
+        }
+        if let Some(p) = self.planted {
+            if p.col == col && p.row == row {
+                return true;
+            }
+        }
+        false
     }
 
     fn apply_horizontal_input(&mut self, input: &Input) {
@@ -265,7 +384,7 @@ impl Game {
         let row = below_y / TILE_SIZE as i32;
         let mut c = left_col;
         while c <= right_col {
-            if tile_at(c, row) == level::GROUND {
+            if self.is_solid(c, row) {
                 return true;
             }
             c += 1;
@@ -290,7 +409,7 @@ impl Game {
         };
         let mut r = top_row;
         while r <= bot_row {
-            if tile_at(test_col, r) == level::GROUND {
+            if self.is_solid(test_col, r) {
                 return Some((test_col, dir));
             }
             r += 1;
@@ -314,7 +433,7 @@ impl Game {
         };
         let mut c = left_col;
         while c <= right_col {
-            if tile_at(c, test_row) == level::GROUND {
+            if self.is_solid(c, test_row) {
                 return Some((test_row, dir));
             }
             c += 1;
@@ -338,8 +457,8 @@ impl Game {
                 } else {
                     next_x / TILE_SIZE as i32
                 };
-                let wall = tile_at(leading_col, body_row) == level::GROUND;
-                let ledge = tile_at(leading_col, support_row) != level::GROUND;
+                let wall = self.is_solid(leading_col, body_row);
+                let ledge = !self.is_solid(leading_col, support_row);
                 if wall || ledge {
                     w.vel_x = -w.vel_x;
                 } else {
@@ -392,6 +511,91 @@ impl Game {
         }
     }
 
+    /// Collect any seed AABBs the player is overlapping. First seed
+    /// picked up grants the sprout-seed power-up (if not already held);
+    /// subsequent seeds increment the counter only.
+    fn check_seed_pickups(&mut self) {
+        let px0 = self.player.x;
+        let py0 = self.player.y;
+        let px1 = px0 + PLAYER_W as i32;
+        let py1 = py0 + PLAYER_H as i32;
+        let mut i = 0;
+        while i < MAX_SEEDS {
+            if let Some(s) = self.seeds[i] {
+                let sx1 = s.x + SEED_W as i32;
+                let sy1 = s.y + SEED_H as i32;
+                let overlap = px0 < sx1 && px1 > s.x && py0 < sy1 && py1 > s.y;
+                if overlap {
+                    self.seeds[i] = None;
+                    self.seeds_collected = self.seeds_collected.saturating_add(1);
+                    if !self.player.has_sprout_seed {
+                        self.player.has_sprout_seed = true;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Flip to `Status::Won` if the player's AABB overlaps the goal
+    /// tile. Single tile, single check — no entity list.
+    fn check_goal(&mut self) {
+        let goal_x0 = GOAL_COL * TILE_SIZE as i32;
+        let goal_y0 = GOAL_ROW * TILE_SIZE as i32;
+        let goal_x1 = goal_x0 + TILE_SIZE as i32;
+        let goal_y1 = goal_y0 + TILE_SIZE as i32;
+        let px1 = self.player.x + PLAYER_W as i32;
+        let py1 = self.player.y + PLAYER_H as i32;
+        let overlap = self.player.x < goal_x1
+            && px1 > goal_x0
+            && self.player.y < goal_y1
+            && py1 > goal_y0;
+        if overlap {
+            self.status = Status::Won;
+        }
+    }
+
+    /// Handle the DOWN edge: if the player has a sprout-seed and is on
+    /// the ground, plant a temporary platform at the tile directly
+    /// under their feet. Only one platform can be live at a time;
+    /// pressing DOWN again while one is live is a no-op.
+    fn apply_plant_input(&mut self, input: &mut Input) {
+        let consumed = input.down_pressed;
+        input.down_pressed = false;
+        if !consumed {
+            return;
+        }
+        if !self.player.has_sprout_seed || !self.player.on_ground {
+            return;
+        }
+        if self.planted.is_some() {
+            return;
+        }
+        // Tile directly below the player's feet.
+        let feet_center_x = self.player.x + PLAYER_W as i32 / 2;
+        let col = feet_center_x / TILE_SIZE as i32;
+        let row = (self.player.y + PLAYER_H as i32) / TILE_SIZE as i32;
+        // Don't plant over authored ground (wasteful and visually confusing).
+        if tile_at(col, row) == level::GROUND {
+            return;
+        }
+        self.planted = Some(PlantedPlatform {
+            col,
+            row,
+            expire_tick: self.tick_count.saturating_add(PLANTED_LIFETIME_TICKS),
+        });
+        self.player.has_sprout_seed = false;
+    }
+
+    /// Clear the planted platform once its lifetime expires.
+    fn tick_planted(&mut self) {
+        if let Some(p) = self.planted {
+            if self.tick_count >= p.expire_tick {
+                self.planted = None;
+            }
+        }
+    }
+
     fn follow_camera(&mut self) {
         let target = self.player.x + PLAYER_W as i32 / 2 - SURFACE_W as i32 / 2;
         self.camera_x = target;
@@ -429,12 +633,29 @@ fn spawn_weeds() -> [Option<Weed>; MAX_WEEDS] {
     out
 }
 
+/// Build the initial seed array from `SEED_SPAWNS`.
+fn spawn_seeds() -> [Option<Seed>; MAX_SEEDS] {
+    let mut out: [Option<Seed>; MAX_SEEDS] = [None; MAX_SEEDS];
+    let mut i = 0;
+    while i < MAX_SEEDS && i < SEED_SPAWNS.len() {
+        let (x, y) = SEED_SPAWNS[i];
+        out[i] = Some(Seed { x, y });
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn held(left: bool, right: bool, jump: bool) -> Input {
-        Input { left_held: left, right_held: right, jump_pressed: jump }
+        Input {
+            left_held: left,
+            right_held: right,
+            jump_pressed: jump,
+            down_pressed: false,
+        }
     }
 
     #[test]
@@ -698,12 +919,213 @@ mod tests {
         let mut g = Game::new();
         g.status = Status::Dead;
         let before = (g.player.x, g.player.y, g.weeds[0].unwrap().x);
-        let mut input = Input { left_held: false, right_held: true, jump_pressed: true };
+        let mut input = Input {
+            left_held: false,
+            right_held: true,
+            jump_pressed: true,
+            down_pressed: true,
+        };
         g.tick(&mut input);
         g.tick(&mut input);
         let after = (g.player.x, g.player.y, g.weeds[0].unwrap().x);
         assert_eq!(before, after);
-        // Jump edge drained on Dead path too.
+        // All edges drained on Dead path.
         assert!(!input.jump_pressed);
+        assert!(!input.down_pressed);
+    }
+
+    #[test]
+    fn spawn_seeds_populates_from_list() {
+        let g = Game::new();
+        let live: usize = g.seeds.iter().filter(|s| s.is_some()).count();
+        assert_eq!(live, SEED_SPAWNS.len());
+    }
+
+    #[test]
+    fn seed_pickup_increments_counter_and_grants_sprout_seed() {
+        let mut g = Game::new();
+        let s = g.seeds[0].unwrap();
+        g.player.x = s.x;
+        g.player.y = s.y;
+        assert!(!g.player.has_sprout_seed);
+        g.check_seed_pickups();
+        assert_eq!(g.seeds_collected, 1);
+        assert!(g.player.has_sprout_seed);
+        assert!(g.seeds[0].is_none());
+    }
+
+    #[test]
+    fn seed_pickup_without_overlap_is_noop() {
+        let mut g = Game::new();
+        g.player.x = 10_000;
+        g.player.y = 10_000;
+        g.check_seed_pickups();
+        assert_eq!(g.seeds_collected, 0);
+        assert!(!g.player.has_sprout_seed);
+    }
+
+    #[test]
+    fn goal_touch_transitions_to_won() {
+        let mut g = Game::new();
+        g.player.x = GOAL_COL * TILE_SIZE as i32;
+        g.player.y = GOAL_ROW * TILE_SIZE as i32;
+        g.check_goal();
+        assert_eq!(g.status, Status::Won);
+    }
+
+    #[test]
+    fn goal_non_overlap_stays_playing() {
+        let mut g = Game::new();
+        g.player.x = 100;
+        g.player.y = 100;
+        g.check_goal();
+        assert_eq!(g.status, Status::Playing);
+    }
+
+    #[test]
+    fn tick_does_nothing_when_won() {
+        let mut g = Game::new();
+        g.status = Status::Won;
+        let before = (g.player.x, g.player.y, g.tick_count);
+        let mut input = held(false, true, true);
+        g.tick(&mut input);
+        assert_eq!((g.player.x, g.player.y, g.tick_count), before);
+    }
+
+    #[test]
+    fn plant_sprout_seed_creates_platform_over_pit() {
+        let mut g = Game::new();
+        // Park player over the first pit (col 15, row 8) so the tile
+        // directly below is AIR (pit) → plant succeeds.
+        g.player.x = 15 * TILE_SIZE as i32;
+        g.player.y = 8 * TILE_SIZE as i32;
+        g.player.on_ground = true;
+        g.player.has_sprout_seed = true;
+        let mut input = Input {
+            left_held: false, right_held: false,
+            jump_pressed: false, down_pressed: true,
+        };
+        g.apply_plant_input(&mut input);
+        assert!(g.planted.is_some());
+        assert!(!g.player.has_sprout_seed);
+        assert!(!input.down_pressed);
+        let p = g.planted.unwrap();
+        assert_eq!(p.col, 15);
+        assert_eq!(p.row, 9);
+    }
+
+    #[test]
+    fn plant_blocked_without_seed() {
+        let mut g = Game::new();
+        g.player.has_sprout_seed = false;
+        let mut input = Input { down_pressed: true, ..Default::default() };
+        g.apply_plant_input(&mut input);
+        assert!(g.planted.is_none());
+    }
+
+    #[test]
+    fn plant_blocked_airborne() {
+        let mut g = Game::new();
+        g.player.has_sprout_seed = true;
+        g.player.on_ground = false;
+        let mut input = Input { down_pressed: true, ..Default::default() };
+        g.apply_plant_input(&mut input);
+        assert!(g.planted.is_none());
+    }
+
+    #[test]
+    fn plant_blocked_over_authored_ground() {
+        // Spawn position has GROUND directly below; planting would be
+        // useless, so the engine refuses and preserves the seed.
+        let mut g = Game::new();
+        g.player.has_sprout_seed = true;
+        g.player.on_ground = true;
+        let mut input = Input { down_pressed: true, ..Default::default() };
+        g.apply_plant_input(&mut input);
+        assert!(g.planted.is_none());
+        assert!(g.player.has_sprout_seed);
+    }
+
+    #[test]
+    fn plant_blocked_when_one_live() {
+        let mut g = Game::new();
+        g.player.x = 15 * TILE_SIZE as i32;
+        g.player.y = 8 * TILE_SIZE as i32;
+        g.player.on_ground = true;
+        g.player.has_sprout_seed = true;
+        g.planted = Some(PlantedPlatform { col: 30, row: 9, expire_tick: 1000 });
+        let mut input = Input { down_pressed: true, ..Default::default() };
+        g.apply_plant_input(&mut input);
+        assert_eq!(g.planted.unwrap().col, 30);
+        assert!(g.player.has_sprout_seed);
+    }
+
+    #[test]
+    fn planted_tile_is_solid_for_collision() {
+        let mut g = Game::new();
+        g.planted = Some(PlantedPlatform { col: 15, row: 9, expire_tick: 1000 });
+        // Col 15 row 9 is AIR in the authored level (first pit).
+        assert!(g.is_solid(15, 9));
+        assert!(!g.is_solid(16, 9));
+    }
+
+    #[test]
+    fn planted_expires_at_deadline() {
+        let mut g = Game::new();
+        g.planted = Some(PlantedPlatform { col: 15, row: 9, expire_tick: 10 });
+        g.tick_count = 9;
+        g.tick_planted();
+        assert!(g.planted.is_some());
+        g.tick_count = 10;
+        g.tick_planted();
+        assert!(g.planted.is_none());
+    }
+
+    #[test]
+    fn reset_clears_seed_state_and_planted() {
+        let mut g = Game::new();
+        g.seeds_collected = 5;
+        g.player.has_sprout_seed = true;
+        g.planted = Some(PlantedPlatform { col: 15, row: 9, expire_tick: 100 });
+        g.status = Status::Won;
+        g.tick_count = 1234;
+        g.reset();
+        assert_eq!(g.seeds_collected, 0);
+        assert!(!g.player.has_sprout_seed);
+        assert!(g.planted.is_none());
+        assert_eq!(g.status, Status::Playing);
+        assert_eq!(g.tick_count, 0);
+        let live: usize = g.seeds.iter().filter(|s| s.is_some()).count();
+        assert_eq!(live, SEED_SPAWNS.len());
+    }
+
+    #[test]
+    fn fps_counter_starts_zero() {
+        let f = FpsCounter::new();
+        assert_eq!(f.fps(), 0);
+    }
+
+    #[test]
+    fn fps_counter_rolls_over_after_sample_window() {
+        let mut f = FpsCounter::new();
+        f.seed(1000);
+        for _ in 0..33 {
+            f.on_frame(1050); // still within window (50 < 100)
+        }
+        assert_eq!(f.fps(), 0);
+        f.on_frame(1100); // now == FPS_SAMPLE_TICKS → snapshot
+        assert_eq!(f.fps(), 34);
+    }
+
+    #[test]
+    fn fps_counter_seed_resets_state() {
+        let mut f = FpsCounter::new();
+        f.seed(0);
+        for _ in 0..10 {
+            f.on_frame(200);
+        }
+        assert!(f.fps() > 0);
+        f.seed(1000);
+        assert_eq!(f.fps(), 0);
     }
 }
