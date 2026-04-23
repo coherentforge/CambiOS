@@ -15,14 +15,13 @@
 //! one. If game 3 (Pong) reaches for the same tones, that is the
 //! extraction moment.
 //!
-//! ## The new primitive: self-driven tick
+//! ## Self-driven tick
 //!
-//! Tree only redraws on input events. Worm is the first app that
-//! needs a **frame clock** — the worm advances every ~100 ms whether
-//! or not the player has pressed a key. The pattern is ad-hoc in this
-//! file, not extracted to libgui, because it has exactly one consumer
-//! and the launch plan calls out Pong (game 3) as the second-consumer
-//! trigger for any libgui-level tick abstraction.
+//! Tree only redraws on input events. Worm advances every ~200 ms
+//! whether or not the player has pressed a key, via
+//! `libgui::FrameClock` — the same fixed-interval gate Pong uses.
+//! The pattern was ad-hoc here through Worm's launch and extracted
+//! to libgui when Pong became the second consumer (Convention 9).
 //!
 //! The kernel's `SYS_GET_TIME` returns ticks, and the scheduler runs
 //! at 100 Hz, so 1 tick = 10 ms. All pacing here is in ticks.
@@ -51,7 +50,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{button, Client, EventType, InputEvent};
+use arcos_libgui::{button, Client, EventType, FrameClock, InputEvent};
 use arcos_libsys as sys;
 use arcos_worm::game::{Direction, State, StepOutcome, Worm};
 
@@ -145,7 +144,8 @@ pub extern "C" fn _start() -> ! {
     let mut worm = Worm::new(seed);
 
     redraw(&mut client, &worm);
-    let mut last_step_tick = sys::get_time();
+    let mut clock = FrameClock::new(STEP_TICKS);
+    clock.seed(sys::get_time());
 
     sys::print(b"[WORM] entering event loop\r\n");
     loop {
@@ -158,20 +158,13 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        // Frame clock. Only ticks in Playing state; in Dead state the
-        // worm is a tableau and ticking is wasted work (and would
-        // also mask the death moment under a re-submitted identical
-        // frame). A fresh reset resets `last_step_tick` so the
-        // player gets a full grace interval on the first move of a
-        // new game.
-        if worm.state() == State::Playing {
-            let now = sys::get_time();
-            if now.saturating_sub(last_step_tick) >= STEP_TICKS {
-                let outcome = worm.step();
-                last_step_tick = now;
-                if !matches!(outcome, StepOutcome::NoOp) {
-                    dirty = true;
-                }
+        // Only tick in Playing state; in Dead state the worm is a
+        // tableau and ticking is wasted work (and would also mask
+        // the death moment under a re-submitted identical frame).
+        if worm.state() == State::Playing && clock.tick(sys::get_time()) {
+            let outcome = worm.step();
+            if !matches!(outcome, StepOutcome::NoOp) {
+                dirty = true;
             }
         }
 
