@@ -50,7 +50,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{button, Client, EventType, FrameClock, InputEvent};
+use arcos_libgui::{button, modifier, Client, EventType, FrameClock, InputEvent};
 use arcos_libsys as sys;
 use arcos_worm::game::{Direction, State, StepOutcome, Worm};
 
@@ -86,6 +86,8 @@ mod keys {
     // Reset.
     pub const R: u32 = 0x15;
     pub const ESCAPE: u32 = 0x29;
+    // Exit: Ctrl+Q returns control to the shell that spawned us.
+    pub const Q: u32 = 0x14;
 }
 
 /// Frame-clock tick count, in kernel ticks. 20 ticks at 100 Hz =
@@ -196,6 +198,11 @@ fn handle_event(ev: &InputEvent, worm: &mut Worm) -> bool {
         }
         EventType::KeyDown | EventType::KeyRepeat => {
             let k = ev.keyboard();
+            if k.keycode == keys::Q
+                && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
+            {
+                sys::exit(0);
+            }
             match k.keycode {
                 keys::LEFT | keys::A => {
                     worm.set_pending_direction(Direction::Left);

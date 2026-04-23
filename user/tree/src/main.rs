@@ -37,7 +37,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{button, Client, EventType, InputEvent};
+use arcos_libgui::{button, modifier, Client, EventType, InputEvent};
 use arcos_libsys as sys;
 
 mod game;
@@ -54,6 +54,8 @@ const TREE_ENDPOINT: u32 = 31;
 mod keys {
     pub const R: u32 = 0x15;
     pub const ESCAPE: u32 = 0x29;
+    // Exit: Ctrl+Q returns control to the shell that spawned us.
+    pub const Q: u32 = 0x14;
 }
 
 #[allow(unsafe_code)]
@@ -187,6 +189,11 @@ fn handle_event(
         }
         EventType::KeyDown | EventType::KeyRepeat => {
             let k = ev.keyboard();
+            if k.keycode == keys::Q
+                && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
+            {
+                sys::exit(0);
+            }
             if k.keycode == keys::R || k.keycode == keys::ESCAPE {
                 // Reset in every state — including mid-game. No
                 // confirmation prompt; R is cheap to re-press.

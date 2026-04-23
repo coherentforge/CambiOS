@@ -41,7 +41,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{Client, EventType, FrameClock, InputEvent};
+use arcos_libgui::{modifier, Client, EventType, FrameClock, InputEvent};
 use arcos_libsys as sys;
 use arcos_pong::game::{PaddleMotion, Pong, State};
 
@@ -72,6 +72,8 @@ mod keys {
     pub const DOWN: u32 = 0x51;
     pub const W: u32 = 0x1A;
     pub const S: u32 = 0x16;
+    // Exit: Ctrl+Q returns control to the shell that spawned us.
+    pub const Q: u32 = 0x14;
     // Reset.
     pub const R: u32 = 0x15;
     pub const ESCAPE: u32 = 0x29;
@@ -196,6 +198,11 @@ fn handle_event(
     match ev.event_type {
         EventType::KeyDown | EventType::KeyRepeat => {
             let k = ev.keyboard();
+            if k.keycode == keys::Q
+                && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
+            {
+                sys::exit(0);
+            }
             match k.keycode {
                 keys::W | keys::UP => {
                     input.up_held = true;
