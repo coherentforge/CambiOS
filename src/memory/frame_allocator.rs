@@ -206,8 +206,21 @@ impl FrameAllocator {
             self.free_frames -= 1;
             self.search_hint = word_idx; // Start next search here
 
+            let phys = frame_idx as u64 * PAGE_SIZE;
+            // DIAGNOSTIC TRIPWIRE (stomper hunt): task 9's kstack at
+            // phys 0x2c3000..0x2cc000 must never be returned by alloc
+            // (it's inside the reserved kernel heap). If this fires,
+            // the bitmap has a hole or the reservation is wrong.
+            // REMOVE when root cause found.
+            if phys >= 0x2c3000 && phys < 0x2cc000 {
+                let _ = crate::println!(
+                    "[FA-TRIPWIRE] allocate returned phys={:#x} in task-9 kstack range",
+                    phys
+                );
+            }
+
             return Ok(PhysFrame {
-                addr: frame_idx as u64 * PAGE_SIZE,
+                addr: phys,
             });
         }
 

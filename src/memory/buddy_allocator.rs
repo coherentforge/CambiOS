@@ -134,6 +134,51 @@ impl BuddyAllocator {
         allocator
     }
 
+    /// In-place variant of [`new_with_reserved_prefix`] for placement-new
+    /// contexts where materializing the full struct on the caller's stack
+    /// would overflow it. The struct is ~20 KB (4 KB `allocations` + 16 KB
+    /// `orders`), and `ptr::write(dst, new_with_reserved_prefix(...))`
+    /// forces the compiler to build a temporary of that size on the stack
+    /// before copying to `dst`. In the kernel's 32 KB per-task kstack,
+    /// that temporary pushes RSP into the next task's kstack below,
+    /// silently stomping saved SavedContext frames there. Observable
+    /// symptom prior to this fix: every `sys::spawn` zeroed the
+    /// previously-adjacent task's saved_rsp region, triggering a #GP on
+    /// the next iretq into that task (worked around by the BYPASS in
+    /// src/arch/x86_64/mod.rs::yield_inner).
+    ///
+    /// # Safety
+    /// - `dst` must point to `size_of::<BuddyAllocator>()` bytes of
+    ///   writable memory.
+    /// - `dst` must be aligned to at least 8 bytes (u64 in `allocations`).
+    /// - Caller must treat `dst` as the sole owner of a fresh
+    ///   `BuddyAllocator` after return.
+    pub unsafe fn init_at(dst: *mut BuddyAllocator, reserved_bytes: usize) {
+        // Zero the whole struct in-place. Equivalent to `Self::new()`'s
+        // field-by-field zero init, but without materializing the struct
+        // on the caller's stack.
+        // SAFETY: dst points at size_of::<Self>() writable bytes by
+        // caller contract.
+        unsafe {
+            core::ptr::write_bytes(
+                dst as *mut u8,
+                0,
+                core::mem::size_of::<BuddyAllocator>(),
+            );
+        }
+        if reserved_bytes == 0 {
+            return;
+        }
+        let slots = reserved_bytes.div_ceil(MIN_SIZE);
+        let total_slots = MAX_SIZE / MIN_SIZE;
+        let slots = slots.min(total_slots);
+        // SAFETY: the struct was just zero-initialized in-place; &mut
+        // access is valid for the caller's 'place' lifetime.
+        let allocator = unsafe { &mut *dst };
+        allocator.mark_range(0, slots, true);
+        allocator.reserved_slots = slots as u32;
+    }
+
     /// Allocate a block of the requested size
     ///
     /// Returns `Some(Allocation)` with the byte offset and order, or `None`

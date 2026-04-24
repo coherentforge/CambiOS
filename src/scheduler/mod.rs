@@ -481,6 +481,19 @@ impl Scheduler {
             if let Some(task) = self.get_task_mut(task_id) {
                 if task.state == TaskState::Running {
                     task.saved_rsp = current_rsp;
+                    // DIAGNOSTIC (temporary — stomper hunt). Read back
+                    // rflags at the just-pushed SavedContext so a
+                    // later BYPASS fire can tell "save wrote zeros"
+                    // from "save was valid, something zeroed later".
+                    // SAFETY: current_rsp is the just-computed RSP of
+                    // the pushed SavedContext on this CPU; the 40-byte
+                    // iretq frame at +120 is inside the 160-byte frame
+                    // we just saved.
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        task.rflags_snapshot =
+                            *((current_rsp + 136) as *const u64);
+                    }
                 }
                 task.tick();
             }
@@ -526,6 +539,17 @@ impl Scheduler {
         if let Some(task_id) = self.current_task {
             if let Some(task) = self.get_task_mut(task_id) {
                 task.saved_rsp = current_rsp;
+                // DIAGNOSTIC (temporary — stomper hunt). See matching
+                // snapshot in isr_tick_and_schedule above.
+                // SAFETY: current_rsp is the synthetic SavedContext
+                // RSP built by yield_save_and_switch on this task's
+                // kernel stack; +136 (rflags) is within the 160-byte
+                // frame we just pushed.
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    task.rflags_snapshot =
+                        *((current_rsp + 136) as *const u64);
+                }
             }
         }
 

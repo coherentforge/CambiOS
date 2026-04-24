@@ -369,6 +369,35 @@ pub struct LoadedProcess {
 /// The caller is responsible for lock ordering if calling from a context
 /// where the global spinlocks are in play. During boot init (single-threaded),
 /// pass the raw references directly.
+/// DIAGNOSTIC (stomper hunt): print any task with rflags_snapshot != 0
+/// but memory at saved_rsp+136 == 0 (i.e., frame was valid but is now
+/// zeroed). Called at checkpoints inside load_elf_process to bisect
+/// which step is writing zeros to task 9's kstack. REMOVE when the
+/// root cause is found.
+#[cfg(target_arch = "x86_64")]
+fn stomp_scan(label: &str, scheduler: &Scheduler) {
+    for i in 0..256u32 {
+        let tid = crate::scheduler::TaskId(i);
+        if let Some(t) = scheduler.get_task_pub(tid) {
+            if t.saved_rsp != 0
+                && t.rflags_snapshot != 0
+                && (t.state == crate::scheduler::TaskState::Ready
+                    || t.state == crate::scheduler::TaskState::Blocked)
+            {
+                // SAFETY: saved_rsp is the task's kstack; +136 is inside.
+                let now = unsafe { *((t.saved_rsp + 136) as *const u64) };
+                if now == 0 {
+                    crate::println!(
+                        "[STOMP-{}] tid={} saved_rsp={:#x} snapshot={:#x}",
+                        label, i, t.saved_rsp, t.rflags_snapshot
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
 pub fn load_elf_process(
     binary: &[u8],
     priority: Priority,
@@ -429,6 +458,10 @@ pub fn load_elf_process(
         return Err(LoaderError::ProcessCreationFailed);
     }
 
+    // DIAGNOSTIC (stomper hunt): scan after step 4 (create_process).
+    #[cfg(target_arch = "x86_64")]
+    stomp_scan("AFTER-STEP-4", scheduler);
+
     // --- Step 5: Map LOAD segments ---
     let hhdm = crate::hhdm_offset();
 
@@ -466,6 +499,15 @@ pub fn load_elf_process(
                 let frame = frame_alloc
                     .allocate()
                     .map_err(|_| LoaderError::FrameAllocationFailed)?;
+
+                // DIAGNOSTIC (stomper hunt): print the phys addr of each
+                // allocated frame so we can match against task 9's kstack
+                // range (0x2c33a0..0x2cb3a0). REMOVE when root cause found.
+                #[cfg(target_arch = "x86_64")]
+                crate::println!(
+                    "[SEG-ALLOC] frame.addr={:#x} vaddr={:#x}",
+                    frame.addr, page_vaddr
+                );
 
                 // Zero the frame via HHDM before copying data
                 // SAFETY: frame.addr is a freshly allocated physical frame. HHDM maps
@@ -527,12 +569,23 @@ pub fn load_elf_process(
         }
     }
 
+    // DIAGNOSTIC (stomper hunt): scan after step 5 (segment mapping).
+    #[cfg(target_arch = "x86_64")]
+    stomp_scan("AFTER-STEP-5", scheduler);
+
     // --- Step 6: Allocate and map user stack ---
     let stack_base = DEFAULT_STACK_TOP - (DEFAULT_STACK_PAGES as u64 * PAGE_SIZE);
     for i in 0..DEFAULT_STACK_PAGES {
         let frame = frame_alloc
             .allocate()
             .map_err(|_| LoaderError::FrameAllocationFailed)?;
+
+        // DIAGNOSTIC (stomper hunt): each user-stack frame.
+        #[cfg(target_arch = "x86_64")]
+        crate::println!(
+            "[STK-ALLOC] frame.addr={:#x} i={}",
+            frame.addr, i
+        );
 
         // Zero the stack frame
         // SAFETY: Freshly allocated frame, HHDM-mapped.
@@ -563,6 +616,10 @@ pub fn load_elf_process(
         return Err(LoaderError::ProcessCreationFailed);
     }
 
+    // DIAGNOSTIC (stomper hunt): scan after step 6 (user stack).
+    #[cfg(target_arch = "x86_64")]
+    stomp_scan("AFTER-STEP-6", scheduler);
+
     // --- Step 7: Allocate kernel stack + SavedContext ---
     let kstack_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 16)
         .map_err(|_| LoaderError::KernelStackAllocationFailed)?;
@@ -573,6 +630,15 @@ pub fn load_elf_process(
         return Err(LoaderError::KernelStackAllocationFailed);
     }
     let kstack_top = kstack_base as u64 + KERNEL_STACK_SIZE as u64;
+
+    // DIAGNOSTIC (stomper hunt): print kstack range. If this overlaps
+    // task 9's kstack at virt 0xffff8000002c33a0..0xffff8000002cb3a0,
+    // the kernel heap allocator has handed out overlapping memory.
+    #[cfg(target_arch = "x86_64")]
+    crate::println!(
+        "[KSTK-ALLOC] kstack_base={:#x} kstack_top={:#x}",
+        kstack_base as u64, kstack_top
+    );
 
     // Set up SavedContext at the top of the kernel stack.
     // On AArch64, the timer ISR stub uses a 288-byte frame (272-byte SavedContext

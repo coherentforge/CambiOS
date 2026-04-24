@@ -875,12 +875,27 @@ extern "C" fn yield_inner(current_rsp: u64) -> u64 {
             // Task::new_with_stack — nothing writes task.context after
             // construction (verified 2026-04-23), so it's a stable
             // source for the restart target.
-            let (task_id, entry_point) = {
+            let (task_id, entry_point, rflags_snapshot, sched_cnt) = {
                 let g = crate::local_scheduler().lock();
                 g.as_ref()
-                    .and_then(|s| s.current_task_ref().map(|t| (t.id.0, t.context.rip)))
-                    .unwrap_or((u32::MAX, 0))
+                    .and_then(|s| {
+                        s.current_task_ref().map(|t| {
+                            (t.id.0, t.context.rip, t.rflags_snapshot, t.schedule_count)
+                        })
+                    })
+                    .unwrap_or((u32::MAX, 0, 0, 0))
             };
+            // DIAGNOSTIC (stomper hunt). rflags_snapshot is read back
+            // at each saved_rsp write. If it's non-zero and the
+            // current *(new_rsp+136) is zero, the save was valid and
+            // the stomp happened between write and now. If it's zero,
+            // either the save wrote zeros itself or we never saved
+            // for this task.
+            let current_rflags = unsafe { *((new_rsp + 136) as *const u64) };
+            crate::println!(
+                "[STOMP-DIAG] tid={} sched_cnt={} rflags_at_save={:#x} rflags_now={:#x}",
+                task_id, sched_cnt, rflags_snapshot, current_rflags
+            );
             if entry_point != 0 {
                 crate::println!(
                     "[BYPASS] zero iretq frame at new_rsp={:#x} tid={} — restart @ entry={:#x}",
