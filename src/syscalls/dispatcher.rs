@@ -2169,6 +2169,15 @@ impl SyscallDispatcher {
             new_task_id.0, process_id.slot(), ctx.task_id.0
         );
 
+        // DIAGNOSTIC (temporary — lazy-spawn iretq GPF investigation).
+        // Arm 8 YIELD traces so we capture the full spawn→first-run
+        // chain (shell blocking on wait_task → any intermediate
+        // switches → the fatal iretq into the new task).
+        // REMOVE once the bug is fixed.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::TRACE_SPAWN_YIELD
+            .store(8, core::sync::atomic::Ordering::Relaxed);
+
         Ok(new_task_id.0 as u64)
     }
 

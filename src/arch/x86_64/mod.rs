@@ -652,9 +652,298 @@ mod fuzz_asm_stubs {
 /// SavedContext RSP. Performs platform-specific post-switch (TSS, CR3).
 ///
 /// Does NOT send APIC EOI — this is a voluntary switch, not a hardware interrupt.
+/// DIAGNOSTIC (temporary — lazy-spawn iretq GPF investigation).
+/// Armed by `handle_spawn` with a countdown; each voluntary yield that
+/// actually switches tasks decrements and dumps the iretq frame + the
+/// task we just resumed to. Bounded so we see the full spawn→first-run
+/// chain without flooding forever. REMOVE once the bug is fixed.
+pub(crate) static TRACE_SPAWN_YIELD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 #[unsafe(no_mangle)]
 extern "C" fn yield_inner(current_rsp: u64) -> u64 {
-    let (new_rsp, hint) = crate::scheduler::on_voluntary_yield(current_rsp);
+    let (mut new_rsp, mut hint) = crate::scheduler::on_voluntary_yield(current_rsp);
+
+    // DIAGNOSTIC (temporary — lazy-spawn iretq GPF investigation).
+    // Dumps the iretq frame values the new task is about to pop when a
+    // real switch happens AND the trace counter is non-zero. REMOVE
+    // once the bug is fixed.
+    if new_rsp != current_rsp && new_rsp != 0 {
+        let prev = TRACE_SPAWN_YIELD
+            .fetch_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |v| if v > 0 { Some(v - 1) } else { None },
+            )
+            .unwrap_or(0);
+        if prev > 0 {
+            // Peek current_task + its table state from the scheduler
+            // (lock was released by on_voluntary_yield). May race on
+            // SMP but good enough for diagnostic identification.
+            let (
+                resumed_task_id,
+                task_state,
+                task_saved_rsp,
+                task_kstack_top,
+                task_in_rq,
+                task_proc,
+                task_home_cpu,
+            ) = {
+                let g = crate::local_scheduler().lock();
+                let sched = g.as_ref();
+                let tid = sched.and_then(|s| s.current_task());
+                let task = tid.and_then(|t| sched.and_then(|s| s.get_task_pub(t)));
+                (
+                    tid.map(|t| t.0 as i32).unwrap_or(-1),
+                    task.map(|t| t.state),
+                    task.map(|t| t.saved_rsp).unwrap_or(0),
+                    task.map(|t| t.kernel_stack_top).unwrap_or(0),
+                    task.map(|t| t.in_ready_queue).unwrap_or(false),
+                    task.and_then(|t| t.process_id).map(|p| p.slot() as i32).unwrap_or(-1),
+                    task.map(|t| t.home_cpu as i32).unwrap_or(-1),
+                )
+            };
+            // SAFETY: GS base points at this CPU's PerCpu block once
+            // init_bsp/init_ap has run, which is well before any yield
+            // can occur.
+            let current_cpu = unsafe { percpu::current_percpu().cpu_id() as i32 };
+            crate::println!(
+                "[YIELD #{}] cur_rsp={:#x} new_rsp={:#x} resumed_task={} proc={} home_cpu={} cur_cpu={}",
+                prev, current_rsp, new_rsp,
+                resumed_task_id, task_proc, task_home_cpu, current_cpu
+            );
+            crate::println!(
+                "[YIELD #{}] task: state={:?} saved_rsp={:#x} kstack_top={:#x} in_rq={}",
+                prev, task_state, task_saved_rsp, task_kstack_top, task_in_rq
+            );
+            // Peek GPRs (first 4 u64s of SavedContext: r15, r14, r13, r12)
+            // and top-of-stack (4 u64s just below kstack_top) to tell
+            // "whole stack zeroed" from "only iretq frame zeroed".
+            // SAFETY: saved_rsp and kstack_top are within the new task's
+            // kernel-heap-backed stack allocation.
+            unsafe {
+                let p = new_rsp as *const u64;
+                crate::println!(
+                    "[YIELD #{}] gprs@saved_rsp: r15={:#x} r14={:#x} r13={:#x} r12={:#x}",
+                    prev, *p, *p.add(1), *p.add(2), *p.add(3)
+                );
+                let top = (task_kstack_top.saturating_sub(32)) as *const u64;
+                if task_kstack_top != 0 {
+                    crate::println!(
+                        "[YIELD #{}] ktop-32..ktop: {:#x} {:#x} {:#x} {:#x}",
+                        prev, *top, *top.add(1), *top.add(2), *top.add(3)
+                    );
+                }
+            }
+            // Scan the resumed task's full 32 KB kernel stack per u64
+            // (no stride). KERNEL_STACK_SIZE = 32 * 1024. First 32
+            // non-zero u64s printed; total count reported.
+            if task_kstack_top != 0 {
+                const KSTACK_BYTES: usize = 32 * 1024;
+                let kbase = task_kstack_top.saturating_sub(KSTACK_BYTES as u64);
+                // SAFETY: kbase..kstack_top spans the task's kernel-stack
+                // allocation, HHDM-mapped and readable.
+                unsafe {
+                    crate::println!("[YIELD #{}] kstack scan (every non-zero u64):", prev);
+                    let mut reported = 0usize;
+                    let mut total_nonzero = 0usize;
+                    for off in (0..KSTACK_BYTES).step_by(8) {
+                        let p = (kbase + off as u64) as *const u64;
+                        let v = *p;
+                        if v != 0 {
+                            total_nonzero += 1;
+                            if reported < 32 {
+                                crate::println!(
+                                    "  offset {:>5}: {:#018x}",
+                                    off, v
+                                );
+                                reported += 1;
+                            }
+                        }
+                    }
+                    if total_nonzero == 0 {
+                        crate::println!("  (entire 32 KB is zero)");
+                    } else if total_nonzero > reported {
+                        crate::println!(
+                            "  ... and {} more non-zero (total {})",
+                            total_nonzero - reported, total_nonzero
+                        );
+                    }
+                }
+            }
+            // Dump ALL tasks' kstack_top + saved_rsp + state + schedule_count.
+            {
+                let g = crate::local_scheduler().lock();
+                if let Some(sched) = g.as_ref() {
+                    crate::println!("[YIELD #{}] all tasks:", prev);
+                    for tid_raw in 0..16u32 {
+                        let tid = crate::scheduler::TaskId(tid_raw);
+                        if let Some(t) = sched.get_task_pub(tid) {
+                            let proc = t.process_id.map(|p| p.slot() as i32).unwrap_or(-1);
+                            crate::println!(
+                                "  tid={} proc={} state={:?} sched_cnt={} saved_rsp={:#x} kstack_top={:#x}",
+                                tid_raw, proc, t.state, t.schedule_count,
+                                t.saved_rsp, t.kernel_stack_top
+                            );
+                        }
+                    }
+                }
+            }
+            // Raw 256-byte hex window starting 32 bytes BELOW saved_rsp.
+            // Spans: [saved_rsp-32 .. saved_rsp+224), covering the
+            // 160-byte SavedContext and 32 bytes on either side.
+            // SAFETY: addresses are within task's kernel-stack allocation.
+            unsafe {
+                let base = new_rsp.saturating_sub(32);
+                crate::println!(
+                    "[YIELD #{}] raw window @ saved_rsp-32 = {:#x}:",
+                    prev, base
+                );
+                for line in 0..8 {
+                    let off = line * 32;
+                    let p = (base + off as u64) as *const u64;
+                    crate::println!(
+                        "  +{:>3}: {:#018x} {:#018x} {:#018x} {:#018x}",
+                        off, *p, *p.add(1), *p.add(2), *p.add(3)
+                    );
+                }
+            }
+            // Also dump the just-spawned task's (most recent slot) state
+            // so we can compare kernel-stack extents for overlap.
+            let (peer_id, peer_state, peer_saved_rsp, peer_kstack_top, peer_proc) = {
+                let g = crate::local_scheduler().lock();
+                let sched = g.as_ref();
+                // Scan task table for the highest-numbered non-idle task
+                // (most recently allocated slot).
+                let mut best: Option<(u32, crate::scheduler::TaskState, u64, u64, i32)> = None;
+                if let Some(s) = sched {
+                    for tid_raw in 1..256u32 {
+                        let tid = crate::scheduler::TaskId(tid_raw);
+                        if let Some(t) = s.get_task_pub(tid) {
+                            let p = t.process_id.map(|p| p.slot() as i32).unwrap_or(-1);
+                            best = Some((tid_raw, t.state, t.saved_rsp, t.kernel_stack_top, p));
+                        }
+                    }
+                }
+                match best {
+                    Some((i, s, r, k, p)) => (i as i32, Some(s), r, k, p),
+                    None => (-1, None, 0, 0, -1),
+                }
+            };
+            crate::println!(
+                "[YIELD #{}] latest_task: id={} proc={} state={:?} saved_rsp={:#x} kstack_top={:#x}",
+                prev, peer_id, peer_proc, peer_state, peer_saved_rsp, peer_kstack_top
+            );
+            if let Some(ref h) = hint {
+                crate::println!(
+                    "[YIELD #{}] hint: kstack_top={:#x} cr3={:#x}",
+                    prev, h.kernel_stack_top, h.page_table_root
+                );
+            }
+            // Peek the iretq frame sitting at new_rsp + 120 (5 u64s).
+            // SAFETY: new_rsp is inside a kernel-stack allocation;
+            // 40 bytes at +120 are inside it.
+            unsafe {
+                let p = (new_rsp + 120) as *const u64;
+                crate::println!(
+                    "[YIELD #{}] iretq frame: rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
+                    prev, *p, *p.add(1), *p.add(2), *p.add(3), *p.add(4)
+                );
+            }
+        }
+    }
+
+    // BYPASS (temporary — lazy-spawn iretq GPF investigation).
+    // Always-on safety net: if the task we're about to iretq into has
+    // a zeroed iretq frame (null selector CS=0 = guaranteed #GP),
+    // rewrite its SavedContext with a fresh initial frame so it resumes
+    // at its user-space entry point rather than #GP'ing the kernel.
+    // Mirrors the SavedContext that load_elf_process writes at process
+    // load (src/loader/mod.rs:594-608). The task restarts from _start,
+    // losing in-flight state but keeping the service alive (virtio-input
+    // re-handshakes and keyboard input continues working). REMOVE once
+    // the underlying memory-stomper is found and fixed.
+    if new_rsp != current_rsp && new_rsp != 0 {
+        let frame_is_zero = unsafe {
+            let p = (new_rsp + 120) as *const u64;
+            // CS=0 is the definitive null-selector test; RIP=0 alone could
+            // theoretically (but not really) be valid.
+            *p.add(1) == 0 && *p == 0
+        };
+        if frame_is_zero {
+            // task.context.rip preserves the entry_point passed at
+            // Task::new_with_stack — nothing writes task.context after
+            // construction (verified 2026-04-23), so it's a stable
+            // source for the restart target.
+            let (task_id, entry_point) = {
+                let g = crate::local_scheduler().lock();
+                g.as_ref()
+                    .and_then(|s| s.current_task_ref().map(|t| (t.id.0, t.context.rip)))
+                    .unwrap_or((u32::MAX, 0))
+            };
+            if entry_point != 0 {
+                crate::println!(
+                    "[BYPASS] zero iretq frame at new_rsp={:#x} tid={} — restart @ entry={:#x}",
+                    new_rsp, task_id, entry_point
+                );
+                // SAFETY: new_rsp is the resumed task's saved_rsp, which
+                // points at a 160-byte SavedContext region within its
+                // kernel stack. The current iretq frame there is zeroed
+                // (by the still-unknown stomper); writing a fresh initial
+                // SavedContext is strictly safer than letting iretq run.
+                // hint still carries the task's kernel_stack_top + cr3
+                // from on_voluntary_yield, so ring-3 entry finds the
+                // right address space.
+                unsafe {
+                    core::ptr::write(
+                        new_rsp as *mut SavedContext,
+                        SavedContext {
+                            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0,
+                            r9: 0, r8: 0, rbp: 0, rdi: 0, rsi: 0, rdx: 0,
+                            rcx: 0, rbx: 0, rax: 0,
+                            rip: entry_point,
+                            cs: gdt::USER_CS as u64,
+                            rflags: 0x202, // IF set
+                            rsp: 0x80_0000, // DEFAULT_STACK_TOP from loader
+                            ss: gdt::USER_SS as u64,
+                        },
+                    );
+                }
+            } else {
+                // entry_point should never be zero for a loaded task —
+                // fall back to the old block-and-reschedule behavior so
+                // the kernel doesn't iretq into a null frame.
+                crate::println!(
+                    "[BYPASS] zero iretq frame at new_rsp={:#x} tid={} entry=0 — blocking",
+                    new_rsp, task_id
+                );
+                let mut g = crate::local_scheduler().lock();
+                if let Some(sched) = g.as_mut() {
+                    if let Some(tid) = sched.current_task() {
+                        if let Some(task) = sched.get_task_mut_pub(tid) {
+                            task.state = crate::scheduler::TaskState::Blocked;
+                            task.block_reason =
+                                Some(crate::scheduler::BlockReason::BootGate);
+                        }
+                    }
+                    if let Ok(_) = sched.schedule() {
+                        if let Some(task) = sched.current_task_ref() {
+                            let cr3 = if task.cr3 != 0 {
+                                task.cr3
+                            } else {
+                                crate::kernel_cr3()
+                            };
+                            new_rsp = task.saved_rsp;
+                            hint = Some(crate::scheduler::ContextSwitchHint {
+                                kernel_stack_top: task.kernel_stack_top,
+                                page_table_root: cr3,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Platform-specific post-switch: update TSS.RSP0 and CR3
     // (same as timer_isr_inner, minus EOI)
