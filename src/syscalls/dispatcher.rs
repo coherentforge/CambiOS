@@ -225,11 +225,35 @@ impl SyscallDispatcher {
         let revoked_count = {
             let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
             if let Some(cap_mgr) = cap_guard.as_mut() {
-                cap_mgr.revoke_all_for_process(ctx.process_id).unwrap_or(0)
+                let count = cap_mgr.revoke_all_for_process(ctx.process_id).unwrap_or(0);
+                // Drop the ProcessCapabilities table entry. Without this,
+                // the next spawn into the same pid slot sees
+                // register_process fail (slot already Some), grant_capability
+                // fails (caller's ProcessId generation doesn't match the
+                // stale entry's), and the new process boots with no caps.
+                // Observable symptom before this fix: second `play <game>`
+                // logged "ERROR: register_endpoint" and exit(1).
+                let _ = cap_mgr.unregister_process(ctx.process_id);
+                count
             } else {
                 0
             }
         };
+
+        // Clear this pid slot's reply-endpoint registration. REPLY_ENDPOINT
+        // is set by register_endpoint via compare_exchange(0, ep), which
+        // silently fails if a stale non-zero remains from a previous
+        // process in this slot. The new process then has handle_write
+        // stamp outgoing messages with the OLD process's reply endpoint,
+        // so replies route to a queue nobody reads -- the new process
+        // blocks forever on recv. Observable symptom before this fix:
+        // game B after game A in the same pid slot rendered nothing and
+        // was completely unresponsive (Ctrl+Q dead) because Client::open
+        // never received Welcome.
+        let slot = ctx.process_id.slot() as usize;
+        if slot < crate::REPLY_ENDPOINT.len() {
+            crate::REPLY_ENDPOINT[slot].store(0, core::sync::atomic::Ordering::Release);
+        }
 
 
         // Phase 3.2d.iii: revoke all channels the exiting process is
