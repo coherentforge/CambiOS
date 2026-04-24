@@ -134,11 +134,25 @@ pub extern "C" fn _start() -> ! {
     // scanout buffer and forward FrameReady to the scanout-driver.
     // v0 is single-window, no z-order, no damage tracking — full
     // surface copy every frame.
+    // Tracks whether the previous tick had at least one live window.
+    // Edge from true -> false means the last client just exited (or
+    // sent DestroyWindow), so we paint a blank scanout to clear the
+    // stale frame the previous game left in the framebuffer. Without
+    // this, the user sees the prior game's last drawn frame until the
+    // next game submits its first FrameReady — bad demo experience.
+    let mut had_windows = false;
     loop {
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
         if let DispatchOutcome::ClientFrame(view) = outcome {
             composite_and_present(&mut backend, &view);
         }
+
+        let has_windows = window_table.iter().next().is_some();
+        if had_windows && !has_windows {
+            composite_blank_and_present(&mut backend);
+        }
+        had_windows = has_windows;
+
         // Drain any pending input events. Each pump forwards one event
         // to the focused window; a single scheduler tick may carry
         // multiple key/pointer events, so drain in a tight inner loop
@@ -278,6 +292,36 @@ fn composite_and_present(backend: &mut Backend, view: &WindowView) {
         return;
     }
     sys::print(b"[COMPOSITOR] composited client frame\r\n");
+}
+
+/// Blank the scanout buffer to black and present it. Called when the
+/// last live client window goes away (DestroyWindow on the only
+/// remaining window, or that client exits). Without this, the
+/// framebuffer holds the previous game's last frame indefinitely, so
+/// after Ctrl+Q the user sees a stale image until the next game runs.
+///
+/// XRGB8888 zero = black with the alpha-strip bit zeroed (matches the
+/// compositor's pixel format invariant — same blit path as
+/// composite_and_present, just with a synthetic all-zeros source).
+fn composite_blank_and_present(backend: &mut Backend) {
+    let scanout = match backend {
+        Backend::Limine(b) => b.scanout,
+        Backend::Headless(_) => return,
+    };
+    // SAFETY: scanout.vaddr was obtained from channel_attach on the
+    // scanout channel (compositor peer, RW). Valid for
+    // height × pitch bytes. Bounded write.
+    let total_bytes =
+        (scanout.geometry.height as usize) * (scanout.geometry.pitch as usize);
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::write_bytes(scanout.vaddr as *mut u8, 0, total_bytes);
+    }
+    if backend.submit_frame(scanout.display_id, &[]).is_err() {
+        sys::print(b"[COMPOSITOR] submit_frame (blank) failed\r\n");
+        return;
+    }
+    sys::print(b"[COMPOSITOR] blanked scanout (last window gone)\r\n");
 }
 
 /// Copy a window surface (XRGB8888, pitch bytes per row) into the
