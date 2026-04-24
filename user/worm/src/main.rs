@@ -155,7 +155,7 @@ pub extern "C" fn _start() -> ! {
         let mut drained = false;
         while let Some(ev) = client.poll_event() {
             drained = true;
-            if handle_event(&ev, &mut worm) {
+            if handle_event(&ev, &mut worm, &client) {
                 dirty = true;
             }
         }
@@ -184,7 +184,7 @@ pub extern "C" fn _start() -> ! {
 /// visibly changed (reset fired, or a direction was queued — the
 /// latter doesn't repaint until the next step, but queuing it is
 /// input-layer work we don't want to retry later).
-fn handle_event(ev: &InputEvent, worm: &mut Worm) -> bool {
+fn handle_event(ev: &InputEvent, worm: &mut Worm, client: &Client) -> bool {
     match ev.event_type {
         EventType::PointerButton => {
             // End-state right-click resets. During play, pointer has
@@ -201,6 +201,7 @@ fn handle_event(ev: &InputEvent, worm: &mut Worm) -> bool {
             if k.keycode == keys::Q
                 && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
             {
+                client.close();
                 sys::exit(0);
             }
             match k.keycode {

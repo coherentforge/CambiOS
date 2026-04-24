@@ -106,7 +106,7 @@ pub extern "C" fn _start() -> ! {
         let mut drained = false;
         while let Some(ev) = client.poll_event() {
             drained = true;
-            if handle_event(&ev, &mut board, &mut cursor_x, &mut cursor_y) {
+            if handle_event(&ev, &mut board, &mut cursor_x, &mut cursor_y, &client) {
                 changed = true;
             }
         }
@@ -137,6 +137,7 @@ fn handle_event(
     board: &mut Board,
     cursor_x: &mut i32,
     cursor_y: &mut i32,
+    client: &Client,
 ) -> bool {
     match ev.event_type {
         EventType::PointerMove => {
@@ -192,6 +193,7 @@ fn handle_event(
             if k.keycode == keys::Q
                 && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
             {
+                client.close();
                 sys::exit(0);
             }
             if k.keycode == keys::R || k.keycode == keys::ESCAPE {

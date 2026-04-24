@@ -15,8 +15,8 @@
 //! don't hide protocol primitives.
 
 use arcos_libgui_proto::{
-    decode_input_event, decode_welcome_client, encode_create_window, encode_frame_ready,
-    InputEvent, MsgTag, Rect, COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
+    decode_input_event, decode_welcome_client, encode_create_window, encode_destroy_window,
+    encode_frame_ready, InputEvent, MsgTag, Rect, COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
 };
 use arcos_libsys as sys;
 
@@ -120,6 +120,30 @@ impl Client {
             pitch: msg.pitch,
             next_seq: 0,
         })
+    }
+
+    /// Tell the compositor we're done with this window so it can drop
+    /// our Window entry and stop routing input to our endpoint.
+    /// Compositor's DestroyWindow handler (handle_destroy_window in
+    /// user/compositor/src/windows.rs) closes the surface channel and
+    /// clears the table slot; after that, "first live window" focus
+    /// transfers to whoever's next on screen.
+    ///
+    /// Best-effort fire-and-forget. Callers are typically about to
+    /// sys::exit, so we don't wait for an ACK and don't surface
+    /// encode/write failures. If the send is dropped (contention,
+    /// encode failure), the compositor holds a stale window entry
+    /// until some later cleanup -- not fatal, but the next game
+    /// won't get focus until the compositor learns we're gone.
+    ///
+    /// Takes &self rather than self so callers can invoke it from
+    /// inside a poll_event borrow; the Client is normally dropped
+    /// immediately afterward via sys::exit anyway.
+    pub fn close(&self) {
+        let mut buf = [0u8; 16];
+        if let Some(n) = encode_destroy_window(&mut buf, self.window_id) {
+            let _ = sys::write(COMPOSITOR_ENDPOINT, &buf[..n]);
+        }
     }
 
     pub fn window_id(&self) -> u32 {

@@ -161,7 +161,7 @@ pub extern "C" fn _start() -> ! {
         let mut drained = false;
         while let Some(ev) = client.poll_event() {
             drained = true;
-            if handle_event(&ev, &mut pong, &mut input, &mut clock) {
+            if handle_event(&ev, &mut pong, &mut input, &mut clock, &client) {
                 dirty = true;
             }
         }
@@ -194,6 +194,7 @@ fn handle_event(
     pong: &mut Pong,
     input: &mut Input,
     clock: &mut FrameClock,
+    client: &Client,
 ) -> bool {
     match ev.event_type {
         EventType::KeyDown | EventType::KeyRepeat => {
@@ -201,6 +202,7 @@ fn handle_event(
             if k.keycode == keys::Q
                 && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
             {
+                client.close();
                 sys::exit(0);
             }
             match k.keycode {

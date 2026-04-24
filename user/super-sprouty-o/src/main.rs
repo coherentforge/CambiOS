@@ -133,6 +133,7 @@ pub extern "C" fn _start() -> ! {
             match handle_event(&ev, &mut input) {
                 EventResult::Quit => {
                     sys::print(b"[SPROUTY] exiting\r\n");
+                    client.close();
                     sys::exit(0);
                 }
                 EventResult::Restart => {
