@@ -45,7 +45,16 @@ use arcos_super_sprouty_o::{
 ///
 /// Revisit when: MAX_ENDPOINTS is raised — super-sprouty-o moves to
 /// its class-grouped slot (34) alongside Tree=31 / Worm=32 / Pong=33.
-const SPROUTY_ENDPOINT: u32 = 22;
+// Was 22, which collides with `POLICY_QUERY_ENDPOINT` (the policy
+// service's registered endpoint — boot module loaded first in
+// limine.conf). When sprouty registered 22 as a second waiter,
+// compositor's Welcome reply woke whichever of us the scheduler
+// picked; if policy-service won the race, it dropped the message
+// as a non-PolicyQuery and sprouty blocked forever on recv.
+// 23 sits in the udp-stack(21) .. virtio-blk(24) gap.
+// Revisit when: a name-server / registry lands (Phase 3.4+) so
+// games don't need to hand-pick endpoint numbers.
+const SPROUTY_ENDPOINT: u32 = 23;
 
 /// TUNING: physics tick interval in kernel ticks (1 tick = 10 ms at
 /// 100 Hz). 3 → 30 ms → 33 FPS — first game past pong's 20 FPS, first
