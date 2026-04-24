@@ -342,6 +342,28 @@ impl<'ctx> UserReadSlice<'ctx> {
     /// Returns `Ok(())` on success. Returns `Err(SyscallError::InvalidArg)`
     /// on length mismatch or if any page in the user range is unmapped
     /// at copy time.
+    ///
+    /// # Not a point-in-time snapshot across pages
+    ///
+    /// Reads spanning more than one page are **not atomic** with respect
+    /// to the caller's other threads. `read_into` walks the caller's page
+    /// table one page at a time; between iterations, another thread in
+    /// the same process may `munmap` + remap a page that has not yet
+    /// been copied. The resulting `dst` may mix bytes from two different
+    /// timelines of the caller's memory.
+    ///
+    /// Consequence for handler authors: treat `dst` as "something the
+    /// caller produced," not "a faithful snapshot of the caller's
+    /// memory." In particular, **do not make a security decision based
+    /// on a pointer or length field inside `dst` and then re-validate
+    /// against that pointer** — that reintroduces the classic double-
+    /// fetch hazard at page granularity. Copy everything you will act on
+    /// into the kernel buffer in one `read_into`, then make all
+    /// downstream decisions from the kernel buffer.
+    ///
+    /// See docs/threat-model.md F1 + T-6 for the full argument. The
+    /// hazard is currently latent (no handler acts on derived pointers),
+    /// but the invariant above is the one any new handler must preserve.
     pub fn read_into(&self, dst: &mut [u8]) -> Result<(), SyscallError> {
         if dst.len() != self.len {
             return Err(SyscallError::InvalidArg);

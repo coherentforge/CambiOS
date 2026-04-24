@@ -418,6 +418,16 @@ pub static BOOTSTRAP_PRINCIPAL: BootstrapPrincipal = BootstrapPrincipal::new();
 /// Used by the kernel to sign CambiObjects on behalf of processes bound to the
 /// bootstrap Principal. Written once during boot, read-only after.
 /// 64 bytes: seed (32) || public_key (32), per Ed25519 convention.
+///
+/// Deferred: Frame-A vestige. `store()` is unreferenced in the current tree,
+/// so the key remains all-zero and `SYS_CLAIM_BOOTSTRAP_KEY` always takes the
+/// `None` branch. Slot preserved intentionally — Frame-B identity (kernel as
+/// arbiter, not Principal-holder) will reuse it for the user-held-key handoff
+/// during bootstrap bind, so deleting the type and syscall number would cost
+/// more than it saves.
+/// Why: see docs/threat-model.md F2 and the `frame_b_identity` project memory.
+/// Revisit when: the Frame-B identity rewrite lands and decides whether to
+/// keep this shape or replace it with a different handoff primitive.
 pub static BOOTSTRAP_SECRET_KEY: BootstrapSecretKey = BootstrapSecretKey::new();
 
 /// Atomic-like wrapper for the bootstrap Principal.
