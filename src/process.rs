@@ -310,17 +310,6 @@ impl ProcessDescriptor {
         let phys_base = frame.addr;
         let virt_base = phys_base + hhdm_offset;
 
-        // DIAGNOSTIC (stomper hunt): print process-heap phys range.
-        // A 4 MiB contiguous region; if it overlaps task 9's kstack
-        // (phys 0x2c33a0..0x2cb3a0), the BuddyAllocator placement-new
-        // below would stomp ~20 KB of it. REMOVE when root cause found.
-        #[cfg(target_arch = "x86_64")]
-        crate::println!(
-            "[PROC-HEAP] phys_base={:#x} phys_end={:#x}",
-            phys_base,
-            phys_base + HEAP_SIZE
-        );
-
         // Placement-new the buddy allocator at the start of the heap.
         // The reserved prefix equals the allocator's own struct size
         // so the allocator can never hand out a range that overlaps
@@ -614,28 +603,9 @@ impl ProcessTable {
         frame_alloc: &mut FrameAllocator,
         create_page_table: bool,
     ) -> Result<ProcessId, &'static str> {
-        // DIAGNOSTIC (stomper hunt): hardcoded check of task 9's
-        // saved_rsp+136 (rflags slot). The address is stable within
-        // a boot. Prints which sub-step of create_process zeros it.
-        // REMOVE when root cause found.
-        #[cfg(target_arch = "x86_64")]
-        const STOMP_TARGET: u64 = 0xffff8000002cb198 + 136;
-        #[cfg(target_arch = "x86_64")]
-        let check = |label: &str| {
-            let v = unsafe { *(STOMP_TARGET as *const u64) };
-            if v == 0 {
-                crate::println!("[STOMP-{}] target={:#x} val=0x0", label, STOMP_TARGET);
-            }
-        };
-        #[cfg(target_arch = "x86_64")]
-        check("CP-ENTRY");
-
         let idx = self.find_free_slot().ok_or("No free process slots")?;
         let generation = self.generations[idx];
         let process_id = ProcessId::new(idx as u32, generation);
-
-        #[cfg(target_arch = "x86_64")]
-        check("CP-PRE-PROCDESC");
 
         let mut desc = match ProcessDescriptor::new(process_id, self.hhdm_offset, frame_alloc) {
             Ok(d) => d,
@@ -644,16 +614,11 @@ impl ProcessTable {
             }
         };
 
-        #[cfg(target_arch = "x86_64")]
-        check("CP-POST-PROCDESC");
-
         // Optionally create a per-process page table
         if create_page_table {
             match paging::create_process_page_table(frame_alloc) {
                 Ok(cr3) => {
                     desc.cr3 = cr3;
-                    #[cfg(target_arch = "x86_64")]
-                    check("CP-POST-PAGETABLE");
                     // Kernel access to the process heap is already available
                     // via the cloned HHDM mappings in the kernel half (entries 256..512).
                     // User-space mappings at low addresses are set up separately.

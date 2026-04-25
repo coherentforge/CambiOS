@@ -2131,44 +2131,6 @@ impl SyscallDispatcher {
         let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
         let verifier = SignedBinaryVerifier::with_key(bootstrap.public_key);
 
-        // DIAGNOSTIC (stomper hunt): scan for already-stomped tasks
-        // BEFORE load_elf_process. If any appear, stomp was earlier;
-        // if they only appear on the post-load scan, stomp is in
-        // load_elf_process. REMOVE with TRACE_SPAWN_YIELD block.
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut found = 0u32;
-            let g = crate::local_scheduler().lock();
-            if let Some(s) = g.as_ref() {
-                for i in 0..256u32 {
-                    let tid = crate::scheduler::TaskId(i);
-                    if let Some(t) = s.get_task_pub(tid) {
-                        if t.saved_rsp != 0
-                            && t.rflags_snapshot != 0
-                            && (t.state == crate::scheduler::TaskState::Ready
-                                || t.state == crate::scheduler::TaskState::Blocked)
-                        {
-                            // SAFETY: saved_rsp is the task's kstack;
-                            // +136 is within its SavedContext region.
-                            let now = unsafe { *((t.saved_rsp + 136) as *const u64) };
-                            if now == 0 {
-                                crate::println!(
-                                    "[STOMP-PRE-LOAD] tid={} proc={} saved_rsp={:#x} snapshot={:#x}",
-                                    i,
-                                    t.process_id.map(|p| p.slot() as i32).unwrap_or(-1),
-                                    t.saved_rsp,
-                                    t.rflags_snapshot
-                                );
-                                found += 1;
-                                if found >= 4 {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Lock ordering: SCHEDULER(1) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
         let mut sched_guard = crate::local_scheduler().lock();
@@ -2188,44 +2150,6 @@ impl SyscallDispatcher {
             &mut fa_guard,
             sched,
         ).map_err(|_| SyscallError::OutOfMemory)?;
-
-        // DIAGNOSTIC (stomper hunt): scan for stomped tasks right
-        // after load_elf_process returns. sched_guard is still held,
-        // so scan inline here before dropping it below. If a task
-        // that was clean at "pre-load" shows up stomped here, the
-        // stomp happened inside load_elf_process.
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut found = 0u32;
-            for i in 0..256u32 {
-                let tid = crate::scheduler::TaskId(i);
-                if let Some(t) = sched.get_task_pub(tid) {
-                    if t.saved_rsp != 0
-                        && t.rflags_snapshot != 0
-                        && (t.state == crate::scheduler::TaskState::Ready
-                            || t.state == crate::scheduler::TaskState::Blocked)
-                    {
-                        // SAFETY: saved_rsp is this task's kstack;
-                        // +136 is within its SavedContext region.
-                        let now = unsafe { *((t.saved_rsp + 136) as *const u64) };
-                        if now == 0 {
-                            crate::println!(
-                                "[STOMP-POST-LOAD] tid={} proc={} saved_rsp={:#x} snapshot={:#x} now=0x0",
-                                i,
-                                t.process_id.map(|p| p.slot() as i32).unwrap_or(-1),
-                                t.saved_rsp,
-                                t.rflags_snapshot
-                            );
-                            found += 1;
-                            if found >= 4 {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let process_id = result.process_id;
 
         let new_task_id = result.task_id;
@@ -2297,15 +2221,6 @@ impl SyscallDispatcher {
             core::str::from_utf8(name).unwrap_or("?"),
             new_task_id.0, process_id.slot(), ctx.task_id.0
         );
-
-        // DIAGNOSTIC (temporary). Trace-arming disabled now that the
-        // stomper has been root-caused (BuddyAllocator stack-temp
-        // overflow into the adjacent task's kstack). Leaving the
-        // statement here as a one-liner enable point if we want to
-        // re-arm. STOMP-* scans and BYPASS still fire on demand.
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::TRACE_SPAWN_YIELD
-            .store(0, core::sync::atomic::Ordering::Relaxed);
 
         Ok(new_task_id.0 as u64)
     }

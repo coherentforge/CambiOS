@@ -35,7 +35,7 @@ pub extern "C" fn _start() -> ! {
     sys::print(b"Type 'help' for available commands.\r\n");
 
     loop {
-        sys::print(b"arcos> ");
+        sys::print(b"cambios> ");
 
         let mut line_buf = [0u8; 128];
         let len = read_line(&mut line_buf);

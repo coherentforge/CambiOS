@@ -30,7 +30,7 @@
 mod render;
 mod sprites;
 
-use arcos_libgui::{Bitmap, Client, EventType, FrameClock, InputEvent};
+use arcos_libgui::{modifier, Bitmap, Client, EventType, FrameClock, InputEvent};
 use arcos_libsys as sys;
 use arcos_super_sprouty_o::{
     game::{Game, Input},
@@ -81,6 +81,9 @@ mod keys {
     pub const W: u32 = 0x1A;
     pub const R: u32 = 0x15;
     pub const ESCAPE: u32 = 0x29;
+    /// Ctrl+Q exits to shell (matches pong/tree/worm). ESCAPE also
+    /// quits per sprouty's own UX, kept for keyboard-only setups.
+    pub const Q: u32 = 0x14;
 }
 
 #[allow(unsafe_code)]
@@ -173,6 +176,12 @@ fn handle_event(ev: &InputEvent, input: &mut Input) -> EventResult {
     match ev.event_type {
         EventType::KeyDown | EventType::KeyRepeat => {
             let k = ev.keyboard();
+            // Ctrl+Q to shell (consistent with the other three games).
+            if k.keycode == keys::Q
+                && k.modifiers & (modifier::LEFT_CTRL | modifier::RIGHT_CTRL) != 0
+            {
+                return EventResult::Quit;
+            }
             match k.keycode {
                 keys::LEFT | keys::A => {
                     input.left_held = true;

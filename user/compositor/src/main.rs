@@ -44,6 +44,8 @@
 // re-exports trip dead-code warnings; muted here.
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use arcos_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT};
 use arcos_libinput_proto::decode_event;
 use arcos_libsys as sys;
@@ -291,7 +293,18 @@ fn composite_and_present(backend: &mut Backend, view: &WindowView) {
         sys::print(b"[COMPOSITOR] submit_frame (client) failed\r\n");
         return;
     }
-    sys::print(b"[COMPOSITOR] composited client frame\r\n");
+    // Print the first few client frames (proof-of-life during boot /
+    // first launch), then go silent. A 60 fps game would otherwise
+    // flood the serial console with hundreds of lines per second.
+    static FRAME_LOG_BUDGET: AtomicU8 = AtomicU8::new(3);
+    let prev = FRAME_LOG_BUDGET.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |v| if v > 0 { Some(v - 1) } else { None },
+    );
+    if prev.is_ok() {
+        sys::print(b"[COMPOSITOR] composited client frame\r\n");
+    }
 }
 
 /// Blank the scanout buffer to black and present it. Called when the

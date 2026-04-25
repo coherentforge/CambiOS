@@ -455,16 +455,6 @@ pub struct Task {
     pub parent_task: Option<TaskId>,
     /// Exit code stored when the task terminates (for WaitTask to collect).
     pub exit_code: u32,
-    /// DIAGNOSTIC (temporary — lazy-spawn saved_rsp stomper hunt).
-    /// Snapshot of the iretq-frame rflags read back immediately after
-    /// saved_rsp is set. 0 before the first write. Architecture: x86_64
-    /// rflags bit 1 is a hardware-enforced reserved 1, so any
-    /// legitimately pushed rflags is non-zero. If this field is
-    /// non-zero but the current *(saved_rsp+136) is zero at BYPASS
-    /// time, the stomper wrote zeros AFTER a valid save — rules out
-    /// "the save path wrote zeros itself". REMOVE with the BYPASS /
-    /// TRACE_SPAWN_YIELD block when the stomper is fixed.
-    pub rflags_snapshot: u64,
 }
 
 impl Task {
@@ -488,7 +478,6 @@ impl Task {
             in_ready_queue: false,
             parent_task: None,
             exit_code: 0,
-            rflags_snapshot: 0,
         }
     }
 
@@ -518,7 +507,6 @@ impl Task {
             in_ready_queue: false,
             parent_task: None,
             exit_code: 0,
-            rflags_snapshot: 0,
         }
     }
 
