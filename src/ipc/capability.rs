@@ -53,6 +53,12 @@ pub enum CapabilityKind {
     /// Reserved for future tier-aware policy enforcement; not yet checked.
     /// Today every process may allocate up to `MAX_CHANNEL_PAGES` (256 MiB).
     LargeChannel,
+    /// Right to call `SYS_AUDIT_EMIT_INPUT_FOCUS` (T-7 Phase A,
+    /// docs/threat-model.md). Lets the holder write `InputFocusChange`
+    /// events into the kernel audit ring on behalf of the input router.
+    /// Granted to the compositor at spawn time; required because audit
+    /// `emit()` is otherwise kernel-only.
+    EmitInputAudit,
 }
 
 /// Errors from capability operations
@@ -128,6 +134,10 @@ pub struct ProcessCapabilities {
     /// standard per-call envelope?
     /// Phase GUI-0+ (ADR-011). Reserved for future tier-aware policy.
     large_channel: bool,
+    /// System capability: can this process write `InputFocusChange`
+    /// events into the kernel audit ring via `SYS_AUDIT_EMIT_INPUT_FOCUS`?
+    /// T-7 Phase A. Granted to the compositor (sole emitter today).
+    emit_input_audit: bool,
 }
 
 impl ProcessCapabilities {
@@ -143,6 +153,7 @@ impl ProcessCapabilities {
             legacy_port_io: false,
             map_framebuffer: false,
             large_channel: false,
+            emit_input_audit: false,
         }
     }
 
@@ -283,6 +294,7 @@ impl ProcessCapabilities {
             CapabilityKind::LegacyPortIo => self.legacy_port_io = true,
             CapabilityKind::MapFramebuffer => self.map_framebuffer = true,
             CapabilityKind::LargeChannel => self.large_channel = true,
+            CapabilityKind::EmitInputAudit => self.emit_input_audit = true,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -295,6 +307,7 @@ impl ProcessCapabilities {
             CapabilityKind::LegacyPortIo => self.legacy_port_io,
             CapabilityKind::MapFramebuffer => self.map_framebuffer,
             CapabilityKind::LargeChannel => self.large_channel,
+            CapabilityKind::EmitInputAudit => self.emit_input_audit,
             CapabilityKind::Endpoint => false,
         }
     }
@@ -307,6 +320,7 @@ impl ProcessCapabilities {
             CapabilityKind::LegacyPortIo => self.legacy_port_io = false,
             CapabilityKind::MapFramebuffer => self.map_framebuffer = false,
             CapabilityKind::LargeChannel => self.large_channel = false,
+            CapabilityKind::EmitInputAudit => self.emit_input_audit = false,
             CapabilityKind::Endpoint => {}
         }
     }

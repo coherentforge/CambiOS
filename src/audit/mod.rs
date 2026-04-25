@@ -62,6 +62,12 @@ pub enum AuditEventKind {
     AnomalyHook = 14,
     /// Synthetic: reports accumulated drops from a staging buffer.
     AuditDropped = 15,
+    /// Compositor reports a window-focus transition (T-7 Phase A,
+    /// docs/threat-model.md). Emitted by the compositor via
+    /// `SYS_AUDIT_EMIT_INPUT_FOCUS` whenever the focused window
+    /// changes — including initial focus and focus loss when the
+    /// last live window exits.
+    InputFocusChange = 16,
 }
 
 /// ARCHITECTURAL: size of one serialized audit event in bytes.
@@ -539,6 +545,41 @@ impl RawAuditEvent {
         )
     }
 
+    /// `INPUT_FOCUS_CHANGE`: compositor reports a window-focus transition
+    /// (T-7 Phase A, docs/threat-model.md).
+    ///
+    /// - `subject_pid`: compositor PID (caller of SYS_AUDIT_EMIT_INPUT_FOCUS)
+    /// - `object_id`: new window_id (0 = focus lost, no current window)
+    /// - `arg0`: old window_id (0 = no prior focus, e.g. first window)
+    /// - `arg1..arg3`: first 24 bytes of the new owner Principal (zero
+    ///   when focus was lost). Mirrors `binary_loaded`'s 24-byte hash
+    ///   prefix — enough to disambiguate any Principal in practice
+    ///   (Ed25519 public keys collide at random rates of 2^-96).
+    pub fn input_focus_change(
+        compositor: ProcessId,
+        new_window_id: u32,
+        old_window_id: u32,
+        new_owner_principal: [u8; 32],
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        let arg1 = u64::from_le_bytes(new_owner_principal[0..8].try_into().unwrap());
+        let arg2 = u64::from_le_bytes(new_owner_principal[8..16].try_into().unwrap());
+        let arg3 = u64::from_le_bytes(new_owner_principal[16..24].try_into().unwrap());
+        Self::build(
+            AuditEventKind::InputFocusChange,
+            0,
+            sequence,
+            timestamp,
+            compositor.as_raw(),
+            new_window_id as u64,
+            old_window_id as u64,
+            arg1,
+            arg2,
+            arg3,
+        )
+    }
+
     /// `AUDIT_DROPPED`: synthetic event reporting accumulated drops.
     ///
     /// - `arg0`: number of events dropped
@@ -666,6 +707,7 @@ mod tests {
         assert_eq!(AuditEventKind::CapabilityGranted as u8, 0);
         assert_eq!(AuditEventKind::AuditDropped as u8, 15);
         assert_eq!(AuditEventKind::ProcessTerminated as u8, 12);
+        assert_eq!(AuditEventKind::InputFocusChange as u8, 16);
     }
 
     #[test]
@@ -818,6 +860,53 @@ mod tests {
         assert_eq!(e.flags() & FLAG_SAMPLED, FLAG_SAMPLED);
         assert_eq!(e.arg0(), 1); // syscall number
         assert_eq!(u64::from_le_bytes(e.data[40..48].try_into().unwrap()), 1); // allowed
+    }
+
+    #[test]
+    fn input_focus_change_builder() {
+        let compositor = ProcessId::new(7, 0);
+        let mut owner = [0u8; 32];
+        // First 24 bytes encode three u64s; high 8 bytes are dropped.
+        owner[0..8].copy_from_slice(&0xAAAA_BBBB_CCCC_DDDDu64.to_le_bytes());
+        owner[8..16].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        owner[16..24].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        owner[24..32].fill(0xFF); // tail not encoded
+
+        let e = RawAuditEvent::input_focus_change(compositor, 42, 17, owner, 1234, 5);
+
+        assert_eq!(e.kind(), AuditEventKind::InputFocusChange as u8);
+        assert_eq!(e.flags(), 0);
+        assert_eq!(e.sequence(), 5);
+        assert_eq!(e.timestamp(), 1234);
+        assert_eq!(e.subject_pid(), compositor.as_raw());
+        assert_eq!(e.object_id(), 42); // new window_id
+        assert_eq!(e.arg0(), 17); // old window_id
+        // arg1..arg3 carry the first 24 bytes of the principal.
+        assert_eq!(
+            u64::from_le_bytes(e.data[40..48].try_into().unwrap()),
+            0xAAAA_BBBB_CCCC_DDDDu64,
+        );
+        assert_eq!(
+            u64::from_le_bytes(e.data[48..56].try_into().unwrap()),
+            0x1111_2222_3333_4444u64,
+        );
+        assert_eq!(
+            u64::from_le_bytes(e.data[56..64].try_into().unwrap()),
+            0x5555_6666_7777_8888u64,
+        );
+    }
+
+    #[test]
+    fn input_focus_change_initial_and_loss_encode_zero() {
+        // Initial focus: old_window_id == 0.
+        let e1 = RawAuditEvent::input_focus_change(ProcessId::new(7, 0), 1, 0, [0u8; 32], 0, 0);
+        assert_eq!(e1.object_id(), 1);
+        assert_eq!(e1.arg0(), 0);
+
+        // Focus loss: new_window_id == 0, owner_principal all zeros.
+        let e2 = RawAuditEvent::input_focus_change(ProcessId::new(7, 0), 0, 1, [0u8; 32], 0, 0);
+        assert_eq!(e2.object_id(), 0);
+        assert_eq!(e2.arg0(), 1);
     }
 
     #[test]

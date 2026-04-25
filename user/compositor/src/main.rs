@@ -146,6 +146,11 @@ pub extern "C" fn _start() -> ! {
     // this, the user sees the prior game's last drawn frame until the
     // next game submits its first FrameReady — bad demo experience.
     let mut had_windows = false;
+    // T-7 Phase A: track the currently focused (window_id, owner_principal)
+    // so we can emit an InputFocusChange audit event whenever the focus
+    // moves. v0 focus is "first live window in the table" (see
+    // pump_input_once); transitions happen on window create/destroy.
+    let mut last_focus: Option<(u32, [u8; 32])> = None;
     loop {
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
         if let DispatchOutcome::ClientFrame(view) = outcome {
@@ -157,6 +162,29 @@ pub extern "C" fn _start() -> ! {
             composite_blank_and_present(&mut backend);
         }
         had_windows = has_windows;
+
+        // T-7 Phase A: detect focus transitions and report them to the
+        // audit ring. The current focus is `window_table.iter().next()`
+        // (matches pump_input_once's routing decision). On transition,
+        // emit an InputFocusChange event with the old and new
+        // (window_id, owner_principal) pair. Initial focus is encoded
+        // as old_id=0; focus loss as new_id=0 + zero principal.
+        let current_focus = window_table
+            .iter()
+            .next()
+            .map(|w| (w.window_id, w.owner_principal));
+        if current_focus != last_focus {
+            let (old_id, _old_principal) = match last_focus {
+                Some((id, p)) => (id, p),
+                None => (0, [0u8; 32]),
+            };
+            let (new_id, new_principal) = match current_focus {
+                Some((id, p)) => (id, p),
+                None => (0, [0u8; 32]),
+            };
+            let _ = sys::audit_emit_input_focus(new_id, old_id, &new_principal);
+            last_focus = current_focus;
+        }
 
         // Drain any pending input events. Each pump forwards one event
         // to the focused window; a single scheduler tick may carry

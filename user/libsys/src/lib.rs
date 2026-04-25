@@ -1184,6 +1184,32 @@ pub fn audit_info(out_buf: &mut [u8]) -> i64 {
     )
 }
 
+const SYS_AUDIT_EMIT_INPUT_FOCUS: u64 = 41;
+
+/// Emit a window-focus-change event into the kernel audit ring
+/// (T-7 Phase A, docs/threat-model.md).
+///
+/// `new_window_id` is 0 when focus is lost (the last live window
+/// just exited); `old_window_id` is 0 on the initial focus
+/// transition (no prior focused window). `owner_principal` carries
+/// the new window's owner Principal — pass an all-zero array when
+/// focus is being lost.
+///
+/// Capability-gated on `EmitInputAudit`. Returns 0 on success or
+/// `PermissionDenied` without the capability.
+pub fn audit_emit_input_focus(
+    new_window_id: u32,
+    old_window_id: u32,
+    owner_principal: &[u8; 32],
+) -> i64 {
+    syscall_raw3(
+        SYS_AUDIT_EMIT_INPUT_FOCUS,
+        new_window_id as u64,
+        old_window_id as u64,
+        owner_principal.as_ptr() as u64,
+    )
+}
+
 // ============================================================================
 // Hardware-IRQ wait + framebuffer mapping (Phase GUI-0, ADR-011)
 // ============================================================================

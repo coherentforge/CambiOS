@@ -257,6 +257,31 @@ pub enum SyscallNumber {
     /// no config-space writes). Built on ADR-020 `UserWriteSlice` from
     /// day one.
     VirtioModernCaps = 38,
+
+    // 39 SetWallclock and 40 GetWallclock are reserved by ADR-022
+    // (wall-clock time + path to decentralized time). The handlers
+    // are not yet implemented; numbers held to keep the ABI stable
+    // when the implementation lands.
+
+    /// SYS_AUDIT_EMIT_INPUT_FOCUS (41): compositor reports a window-focus
+    /// transition into the kernel audit ring (T-7 Phase A,
+    /// docs/threat-model.md). Lets the audit consumer observe focus
+    /// changes — including initial focus and focus loss — so a
+    /// focus-hijack attack ("malicious app spawned before key-store
+    /// passphrase prompt") leaves a trail.
+    ///
+    /// Args: arg1 = new_window_id (u32), arg2 = old_window_id (u32; 0
+    ///       if no prior focus), arg3 = user vaddr of 32-byte new owner
+    ///       Principal (zero bytes when focus was lost).
+    ///
+    /// Capability-gated on `CapabilityKind::EmitInputAudit`. Granted to
+    /// all spawned boot modules today (parallel CreateProcess /
+    /// CreateChannel pattern); narrows to compositor-only when an
+    /// identity-aware grant flow lands.
+    ///
+    /// Returns 0 on success, `PermissionDenied` without the capability,
+    /// `InvalidArg` on a bad user pointer.
+    AuditEmitInputFocus = 41,
 }
 
 impl SyscallNumber {
@@ -285,7 +310,8 @@ impl SyscallNumber {
             Self::ChannelClose | Self::ChannelRevoke | Self::ChannelInfo |
             Self::AuditAttach | Self::AuditInfo |
             Self::MapFramebuffer |
-            Self::VirtioModernCaps
+            Self::VirtioModernCaps |
+            Self::AuditEmitInputFocus
         )
     }
 
@@ -331,6 +357,9 @@ impl SyscallNumber {
             36 => Some(Self::ModuleReady),
             37 => Some(Self::TryRecvMsg),
             38 => Some(Self::VirtioModernCaps),
+            // 39 SetWallclock + 40 GetWallclock reserved by ADR-022;
+            // not yet wired through dispatch.
+            41 => Some(Self::AuditEmitInputFocus),
             _ => None,
         }
     }
@@ -505,6 +534,7 @@ mod tests {
             SyscallNumber::AuditInfo,
             SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
             SyscallNumber::TryRecvMsg, SyscallNumber::VirtioModernCaps,
+            SyscallNumber::AuditEmitInputFocus,
         ];
 
         for &num in &all {
@@ -530,13 +560,21 @@ mod tests {
 
     #[test]
     fn all_syscall_numbers_covered() {
-        // Verify from_u64 round-trips for all defined values (0..=38),
-        // ensuring no gap in the requires_identity() match.
+        // Verify from_u64 round-trips for all defined values, ensuring
+        // no gap in the requires_identity() match. ADR-022 reserves
+        // 39 (SetWallclock) and 40 (GetWallclock) but they are not yet
+        // wired through dispatch, so from_u64 returns None for them
+        // today; assert that explicitly so this test catches the day
+        // they land but isn't broken until then.
         for i in 0..=38u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
-            // Just exercise requires_identity to confirm no panic
             let _ = num.unwrap().requires_identity();
         }
+        assert!(SyscallNumber::from_u64(39).is_none(), "ADR-022 SetWallclock not yet wired");
+        assert!(SyscallNumber::from_u64(40).is_none(), "ADR-022 GetWallclock not yet wired");
+        let aef = SyscallNumber::from_u64(41);
+        assert_eq!(aef, Some(SyscallNumber::AuditEmitInputFocus));
+        let _ = aef.unwrap().requires_identity();
     }
 }

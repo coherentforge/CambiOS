@@ -165,6 +165,11 @@ impl SyscallDispatcher {
 
             // Phase Scanout-4.a: virtio-modern PCI capability discovery (ADR-014)
             SyscallNumber::VirtioModernCaps => Self::handle_virtio_modern_caps(args, &ctx),
+
+            // T-7 Phase A (docs/threat-model.md): compositor reports
+            // window-focus transitions into the audit ring.
+            SyscallNumber::AuditEmitInputFocus =>
+                Self::handle_audit_emit_input_focus(args, &ctx),
         }
     }
 
@@ -2205,6 +2210,17 @@ impl SyscallDispatcher {
                     process_id,
                     CapabilityKind::CreateChannel,
                 );
+                // T-7 Phase A (docs/threat-model.md): spawned processes may
+                // emit InputFocusChange events. Compositor is the only
+                // caller today; ungated grant matches CreateProcess /
+                // CreateChannel ("trusted boot modules only").
+                // Deferred: narrow to compositor-only when an identity-
+                // aware grant flow lands. Revisit when: Frame-B identity
+                // rewrite or a non-compositor focus router appears.
+                let _ = cap_mgr.grant_system_capability(
+                    process_id,
+                    CapabilityKind::EmitInputAudit,
+                );
                 // Bind bootstrap Principal
                 if !bootstrap.is_zero() {
                     let _ = cap_mgr.bind_principal(process_id, bootstrap);
@@ -2953,6 +2969,61 @@ impl SyscallDispatcher {
         // 48-byte audit stats via typed slice.
         let stats_slice = UserWriteSlice::validate(ctx, out_buf, 48)?;
         stats_slice.write_from(&stats)?;
+
+        Ok(0)
+    }
+
+    /// SYS_AUDIT_EMIT_INPUT_FOCUS: compositor reports a window-focus
+    /// transition into the kernel audit ring (T-7 Phase A,
+    /// docs/threat-model.md).
+    ///
+    /// Args: arg1 = new_window_id (u32), arg2 = old_window_id (u32; 0
+    ///       if no prior focus), arg3 = user vaddr of 32-byte new owner
+    ///       Principal (zero bytes when focus was lost).
+    ///
+    /// Capability-gated on `CapabilityKind::EmitInputAudit`. Without
+    /// the capability, returns `PermissionDenied`. Reads the 32-byte
+    /// Principal via ADR-020 `UserReadSlice`.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) only — released before
+    /// `audit::emit()` (lock-free per-CPU SPSC).
+    fn handle_audit_emit_input_focus(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::capability::CapabilityKind;
+
+        let new_window_id = args.arg1_u32();
+        let old_window_id = args.arg2_u32();
+        let owner_principal_ptr = args.arg3;
+
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Capability check: caller must hold EmitInputAudit. Granted
+        // to spawned boot modules at handle_spawn time.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(ctx.process_id, CapabilityKind::EmitInputAudit)
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
+        } // drop CAPABILITY_MANAGER(4)
+
+        // ADR-020: read 32-byte Principal via typed slice.
+        let principal_slice = UserReadSlice::validate(ctx, owner_principal_ptr, 32)?;
+        let mut owner_principal = [0u8; 32];
+        principal_slice.read_into(&mut owner_principal)?;
+
+        crate::audit::emit(crate::audit::RawAuditEvent::input_focus_change(
+            ctx.process_id,
+            new_window_id,
+            old_window_id,
+            owner_principal,
+            crate::audit::now(),
+            0,
+        ));
 
         Ok(0)
     }
