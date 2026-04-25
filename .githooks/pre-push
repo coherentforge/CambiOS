@@ -1,0 +1,26 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+#
+# Pre-push hook: pre-push edit-window gate (plan item (b),
+# 2026-04-25). Rejects pushes containing Claude-authored commits
+# whose modified files were never observed in any Claude session's
+# edit log under `.git/claude-edit-log/`.
+#
+# Defense-in-depth on top of the commit-msg sticky-preflight gate
+# (a). (a) catches sweeps at commit time; (b) catches anything that
+# slipped past (a) — including bypass-via-`--no-verify` — at push
+# time, before bad attribution leaves the local clone.
+#
+# Jason's manual pushes (commits without `Co-Authored-By: Claude`)
+# pass through untouched. Pushes from machines without the
+# PostToolUse log hook installed yet warn-but-pass — see the
+# Python script for the gradual-rollout policy.
+#
+# Bypass: `git push --no-verify` (discouraged).
+
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+python3 tools/check-edit-window.py "$@"
