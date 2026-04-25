@@ -37,17 +37,18 @@
 //!
 //! ## Fixed dimensions
 //!
-//! SCAFFOLDING: 128×96 at 8×8 glyphs fills a 1024×768 window — full
-//! scanout on the QEMU virtio-vga default. Picking grid dimensions
-//! that exactly match the scanout means the compositor's blit covers
-//! every pixel; nothing is left over to expose stale frames underneath.
-//! Why: HN-launch demo runs against 1024×768 QEMU; matching the grid
-//! to the scanout is the cheapest way to get a clean full-screen
-//! terminal without coordinating cyan-fill + window-position with the
-//! compositor (Option B work).
+//! SCAFFOLDING: 128×48 cells fill a 1024×768 window using an 8×16
+//! cell stride (`render::CELL_H`) over an 8×8 glyph (`render::GLYPH_H`)
+//! — the IBM-VGA-text-mode trick that gives every classic terminal its
+//! built-in vertical breathing room. The grid is "what's stored", the
+//! cell-stride is "how it's laid out"; they're decoupled.
+//! Why: an 8×8 grid filling 1024×768 (96 rows) makes lines visually
+//! squished because there's no leading. Doubling the cell stride
+//! restores the terminal-typical look without redrawing glyphs.
 //! Replace when: variable window sizing lands (multi-window, runtime
-//! resize), or the scanout dimensions are queryable through libgui at
-//! CreateWindow time so the client can size to fit.
+//! resize), the scanout dimensions are queryable at CreateWindow time,
+//! or a richer 8×16 face replaces the built-in 8×8 (at which point
+//! `CELL_H` and `GLYPH_H` collapse back to a single value).
 
 /// SCAFFOLDING: columns in a terminal-window grid. 128 @ 8×8 = 1024 px,
 /// matching the QEMU virtio-vga default scanout width. Wider than the
@@ -57,12 +58,13 @@
 /// or window decorations / multi-window layouts arrive.
 pub const COLS: usize = 128;
 
-/// SCAFFOLDING: visible rows. 96 @ 8×8 = 768 px, matching the QEMU
-/// virtio-vga default scanout height. Sized for full-scanout coverage
-/// rather than a small terminal — see `COLS` for the same rationale.
-/// Replace when the scanout height is queryable or window layouts let
-/// the terminal claim a deliberately smaller region.
-pub const VISIBLE_ROWS: usize = 96;
+/// SCAFFOLDING: visible rows. 48 rows × `render::CELL_H` (16 px) = 768 px,
+/// matching the QEMU virtio-vga default scanout height. Sized for
+/// full-scanout coverage with terminal-typical line spacing.
+/// Replace when the scanout height is queryable, the cell stride
+/// changes (e.g. font upgrade), or window layouts let the terminal
+/// claim a deliberately smaller region.
+pub const VISIBLE_ROWS: usize = 48;
 
 /// Tab stop interval.
 pub const TAB_WIDTH: usize = 8;

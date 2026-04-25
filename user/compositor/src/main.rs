@@ -47,7 +47,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use arcos_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT};
-use arcos_libinput_proto::decode_event;
+use arcos_libinput_proto::{decode_event, DeviceClass};
 use arcos_libsys as sys;
 use arcos_libscanout::{
     decode_display_connected, encode_register_compositor, MsgTag,
@@ -193,6 +193,18 @@ fn pump_input_once(window_table: &WindowTable) -> bool {
         Some(e) => e,
         None => return true,
     };
+
+    // v0 input policy: only forward keyboard events. Pointer move/button,
+    // scroll, gamepad, axis, and touch are dropped here without ever
+    // crossing the IPC boundary into the focused window. terminal-window
+    // is keyboard-only, the games shipping today are keyboard-only, and
+    // mouse-jiggle PointerMove was generating ~50 events/sec of
+    // never-consumed traffic during run-gui sessions. A real
+    // per-window subscription protocol (clients announce which device
+    // classes they want) lands when the first pointer-using app does.
+    if event.device_class != DeviceClass::Keyboard {
+        return true;
+    }
 
     // Find the focused window's reply endpoint. v0: first live window.
     let target = match window_table.iter().next() {

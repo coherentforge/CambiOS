@@ -12,10 +12,21 @@ use arcos_libgui::{Color, Rect, Surface};
 
 use crate::grid::{Grid, COLS, VISIBLE_ROWS};
 
-/// Glyph cell width in pixels — fixed by the builtin 8×8 font.
+/// Glyph width in pixels — fixed by the builtin 8×8 font.
 pub const GLYPH_W: u16 = 8;
-/// Glyph cell height in pixels — fixed by the builtin 8×8 font.
+/// Glyph data height in pixels — fixed by the builtin 8×8 font.
 pub const GLYPH_H: u16 = 8;
+/// Cell height in pixels. Larger than `GLYPH_H` so the 8×8 glyph data
+/// gets vertical breathing room above and below — this is the trick
+/// every classic terminal uses (IBM VGA text mode draws into 8×14 of
+/// an 8×16 cell). 16 px gives a clean 4 px above + 4 px below; the
+/// grid is 768 / 16 = 48 visible rows in the 1024×768 scanout. Pure
+/// integer math so glyph placement is pixel-aligned.
+pub const CELL_H: u16 = 16;
+/// Top-of-cell padding before the glyph rows start. `(CELL_H - GLYPH_H)
+/// / 2`, hand-evaluated so the const is `pub` for any caller doing
+/// pixel math against the rendered grid.
+pub const GLYPH_TOP_PAD: u16 = (CELL_H - GLYPH_H) / 2;
 
 /// Background color (filled before each row's text is drawn).
 const BG: Color = Color(0x00_00_00_00);
@@ -78,17 +89,18 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
     state.last_cursor_row = cy;
 }
 
-/// Re-render row `row` as a single horizontal strip: fill BG, then
-/// blit the entire row of cells through the builtin 8×8 font.
+/// Re-render row `row` as a single horizontal strip: fill BG over the
+/// full cell height, then blit the row's glyphs into the cell's
+/// glyph-data band (`GLYPH_TOP_PAD` px below the cell top).
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
-    let y = (row as u16) * GLYPH_H;
+    let cell_y = (row as u16) * CELL_H;
 
     surf.fill_rect(
         Rect {
             x: 0,
-            y,
+            y: cell_y,
             w: (COLS as u16) * GLYPH_W,
-            h: GLYPH_H,
+            h: CELL_H,
         },
         BG,
     );
@@ -104,19 +116,22 @@ fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     }
     // SAFETY: every byte is in 0x20..=0x7E, which is valid UTF-8.
     let text = unsafe { core::str::from_utf8_unchecked(&buf) };
-    surf.draw_text_builtin(0, y as i32, text, FG);
+    let glyph_y = cell_y + GLYPH_TOP_PAD;
+    surf.draw_text_builtin(0, glyph_y as i32, text, FG);
 }
 
-/// Stamp a block caret over the cell at `(col, row)`.
+/// Stamp a block caret over the cell at `(col, row)`. Caret covers the
+/// full cell height (not just the glyph band) so it reads as a
+/// contiguous block cursor without a horizontal stripe through it.
 fn draw_caret(surf: &mut Surface, col: u16, row: u16) {
     let x = col * GLYPH_W;
-    let y = row * GLYPH_H;
+    let y = row * CELL_H;
     surf.fill_rect(
         Rect {
             x,
             y,
             w: GLYPH_W,
-            h: GLYPH_H,
+            h: CELL_H,
         },
         CARET,
     );
