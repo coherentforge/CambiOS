@@ -113,14 +113,17 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Throwaway first-pixels test: only fires for the LimineFbBackend
-    // path. Validates the entire compositor → channel → driver memcpy →
-    // FB → FrameDisplayed ack chain end-to-end. Headless skips it
-    // (nothing to draw to).
+    // Note: the throwaway first-pixels cyan test that originally lived
+    // here has been retired. terminal-window now claims the full
+    // scanout (1024×768) on boot and submits a real client frame
+    // immediately, so the end-to-end compositor → channel → driver
+    // chain is exercised by production traffic — the cyan flash was
+    // only ever visible briefly before terminal-window's first paint
+    // and confused first-time HN viewers about what they were seeing.
+    // [`run_first_pixels_test`] is preserved at the bottom of this file
+    // for use as a manual diagnostic when adding a new scanout-driver
+    // backend; not invoked from the boot path.
     let mut window_table = WindowTable::new();
-    if let Backend::Limine(ref mut limine) = backend {
-        run_first_pixels_test(limine);
-    }
 
     // Release the boot gate now. hello-window and any other clients
     // can start sending CreateWindow messages; the dispatch loop is
@@ -465,6 +468,7 @@ fn is_tagged(payload: &[u8], expected: MsgTag) -> bool {
 /// verification requires a QEMU display backend (`-display gtk` or
 /// VNC); the default `-display none` configuration validates the
 /// memcpy + ack but doesn't show pixels.
+#[allow(dead_code)] // diagnostic helper; no boot-path caller after the cyan-test retirement.
 fn run_first_pixels_test(backend: &mut LimineFbBackend) {
     sys::print(b"[COMPOSITOR] painting test frame (cyan)\r\n");
 

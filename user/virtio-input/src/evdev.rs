@@ -179,6 +179,69 @@ pub fn evdev_to_hid(code: u16) -> u32 {
     }
 }
 
+/// Translate a USB HID usage code + modifier mask into a single Unicode
+/// codepoint for the US QWERTY layout — the InputEvent.keyboard.unicode
+/// field consumers like [`encode_key_event`] in terminal-window's encoder
+/// fall back to when no named-key path matches.
+///
+/// Returns `0` for keys that are not printable in this layout (function
+/// keys, navigation, modifiers themselves), matching the
+/// "no-text-here" sentinel callers expect.
+///
+/// SCAFFOLDING: hard-codes the US QWERTY layout. Replace when a layout
+/// negotiation protocol lands (boot-time setting, runtime selector, or
+/// server-driven layout via the future Input Hub). Until then every
+/// keyboard the driver binds is treated as US QWERTY — fine for the
+/// QEMU virtio-keyboard demo target and the Dell 3630 development
+/// machine, both physically US-layout.
+///
+/// CapsLock is intentionally ignored in v0: the modifier bit isn't
+/// tracked in `dev.modifiers` (only Shift/Ctrl/Alt/Meta are), so even if
+/// the user toggles CapsLock the encoder behaves as if it were off.
+/// Adding it requires extending `handle_keyboard_key`'s modifier-tracking
+/// branch — out of scope for the GUI-bring-up fix this lives behind.
+pub fn hid_to_ascii_us(hid: u32, modifiers: u16) -> u32 {
+    use arcos_libinput_proto::modifier;
+    let shift = (modifiers & (modifier::LEFT_SHIFT | modifier::RIGHT_SHIFT)) != 0;
+
+    // Letters: 0x04..=0x1D map to a..z. Shift uppercases.
+    if (0x04..=0x1D).contains(&hid) {
+        let base = (hid - 0x04) as u32;
+        return if shift { b'A' as u32 + base } else { b'a' as u32 + base };
+    }
+
+    // Top-row numbers and their shift symbols. US QWERTY: 1!2@3#4$5%6^7&8*9(0)
+    let unshifted = b"1234567890";
+    let shifted = b"!@#$%^&*()";
+    if (0x1E..=0x26).contains(&hid) {
+        let i = (hid - 0x1E) as usize;
+        return if shift { shifted[i] as u32 } else { unshifted[i] as u32 };
+    }
+    if hid == 0x27 {
+        return if shift { b')' as u32 } else { b'0' as u32 };
+    }
+
+    // Punctuation / space.
+    match hid {
+        0x2C => b' ' as u32, // Space (shift-space is still space)
+        0x2D => if shift { b'_' as u32 } else { b'-' as u32 },
+        0x2E => if shift { b'+' as u32 } else { b'=' as u32 },
+        0x2F => if shift { b'{' as u32 } else { b'[' as u32 },
+        0x30 => if shift { b'}' as u32 } else { b']' as u32 },
+        0x31 => if shift { b'|' as u32 } else { b'\\' as u32 },
+        0x33 => if shift { b':' as u32 } else { b';' as u32 },
+        0x34 => if shift { b'"' as u32 } else { b'\'' as u32 },
+        0x35 => if shift { b'~' as u32 } else { b'`' as u32 },
+        0x36 => if shift { b'<' as u32 } else { b',' as u32 },
+        0x37 => if shift { b'>' as u32 } else { b'.' as u32 },
+        0x38 => if shift { b'?' as u32 } else { b'/' as u32 },
+        // Everything else (Enter/Tab/Esc/Backspace, named navigation,
+        // modifiers, function keys) is handled by the encoder's
+        // named-key path off the HID code; no Unicode contribution.
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +258,46 @@ mod tests {
     #[test]
     fn unmapped_passes_through() {
         assert_eq!(evdev_to_hid(0x9999), 0x9999);
+    }
+
+    use arcos_libinput_proto::modifier;
+
+    #[test]
+    fn hid_to_ascii_letters_unshifted() {
+        assert_eq!(hid_to_ascii_us(0x04, 0), b'a' as u32);
+        assert_eq!(hid_to_ascii_us(0x1D, 0), b'z' as u32);
+    }
+
+    #[test]
+    fn hid_to_ascii_letters_shifted() {
+        assert_eq!(hid_to_ascii_us(0x04, modifier::LEFT_SHIFT), b'A' as u32);
+        assert_eq!(hid_to_ascii_us(0x1D, modifier::RIGHT_SHIFT), b'Z' as u32);
+    }
+
+    #[test]
+    fn hid_to_ascii_digits_and_symbols() {
+        assert_eq!(hid_to_ascii_us(0x1E, 0), b'1' as u32);
+        assert_eq!(hid_to_ascii_us(0x1E, modifier::LEFT_SHIFT), b'!' as u32);
+        assert_eq!(hid_to_ascii_us(0x27, 0), b'0' as u32);
+        assert_eq!(hid_to_ascii_us(0x27, modifier::LEFT_SHIFT), b')' as u32);
+    }
+
+    #[test]
+    fn hid_to_ascii_punctuation() {
+        assert_eq!(hid_to_ascii_us(0x36, 0), b',' as u32);
+        assert_eq!(hid_to_ascii_us(0x36, modifier::LEFT_SHIFT), b'<' as u32);
+        assert_eq!(hid_to_ascii_us(0x2C, 0), b' ' as u32);
+        assert_eq!(hid_to_ascii_us(0x2C, modifier::LEFT_SHIFT), b' ' as u32);
+    }
+
+    #[test]
+    fn hid_to_ascii_named_keys_return_zero() {
+        // Enter, Tab, Escape, Backspace, arrows — encoder handles these
+        // off the HID code; no Unicode contribution from this layer.
+        assert_eq!(hid_to_ascii_us(0x28, 0), 0); // Enter
+        assert_eq!(hid_to_ascii_us(0x29, 0), 0); // Escape
+        assert_eq!(hid_to_ascii_us(0x2A, 0), 0); // Backspace
+        assert_eq!(hid_to_ascii_us(0x2B, 0), 0); // Tab
+        assert_eq!(hid_to_ascii_us(0x52, 0), 0); // Up arrow
     }
 }

@@ -570,7 +570,7 @@ $(LIMINE_DIR)/limine: $(LIMINE_DIR)/BOOTX64.EFI
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine
 
-iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree worm pong super-sprouty-o sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree worm pong super-sprouty-o terminal-window sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -594,6 +594,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
 	cp $(SCANOUT_VGPU_ELF) iso_root/boot/scanout-virtio-gpu.elf
 	cp $(VIRTIO_INPUT_ELF) iso_root/boot/virtio-input.elf
+	cp $(TERMINAL_WINDOW_ELF) iso_root/boot/terminal-window.elf
 	cp $(PONG_ELF) iso_root/boot/pong.elf
 	cp $(SPROUTY_ELF) iso_root/boot/super-sprouty-o.elf
 	cp $(TREE_ELF) iso_root/boot/tree.elf
@@ -609,6 +610,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-virtio-gpu.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-input.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/terminal-window.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/pong.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/super-sprouty-o.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/tree.elf
@@ -1067,7 +1069,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1088,6 +1090,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(SCANOUT_VGPU_ELF_AARCH64) /tmp/scanout-virtio-gpu-signed.elf
 	cp $(VIRTIO_INPUT_ELF_AARCH64) /tmp/virtio-input-signed.elf
 	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
+	cp $(TERMINAL_WINDOW_ELF_AARCH64) /tmp/terminal-window-signed.elf
 	cp $(TREE_ELF_AARCH64) /tmp/tree-signed.elf
 	cp $(WORM_ELF_AARCH64) /tmp/worm-signed.elf
 	cp $(PONG_ELF_AARCH64) /tmp/pong-signed.elf
@@ -1102,6 +1105,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-virtio-gpu-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-input-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/terminal-window-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/tree-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/worm-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/pong-signed.elf
@@ -1116,12 +1120,13 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/scanout-virtio-gpu-signed.elf ::/boot/scanout-virtio-gpu.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-input-signed.elf ::/boot/virtio-input.elf
 	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
+	mcopy -i $(IMG_AARCH64) /tmp/terminal-window-signed.elf ::/boot/terminal-window.elf
 	mcopy -i $(IMG_AARCH64) /tmp/tree-signed.elf ::/boot/tree.elf
 	mcopy -i $(IMG_AARCH64) /tmp/worm-signed.elf ::/boot/worm.elf
 	mcopy -i $(IMG_AARCH64) /tmp/pong-signed.elf ::/boot/pong.elf
 	mcopy -i $(IMG_AARCH64) /tmp/super-sprouty-o-signed.elf ::/boot/super-sprouty-o.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/pong-signed.elf /tmp/super-sprouty-o-signed.elf /tmp/shell-signed.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/pong-signed.elf /tmp/super-sprouty-o-signed.elf /tmp/shell-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
@@ -1182,6 +1187,23 @@ kernel-riscv64:
 # kernel parses at boot (see src/boot/initrd.rs + src/boot/riscv.rs
 # /chosen walker). Produces $(INITRD_RISCV64) in the repo root; QEMU
 # passes this via `-initrd`.
+#
+# Deferred: terminal-window (the GUI shell host) is intentionally NOT in
+# the riscv64 initrd. It calls `GuiBackend::open()` before
+# `sys::module_ready()`, which would block indefinitely on RISC-V because
+# the riscv64 initrd ships no compositor / scanout-virtio-gpu /
+# virtio-input — the boot-module release chain would stall and `shell`
+# (downstream) would never start. The crate itself builds cleanly via
+# `terminal-window-riscv64` so `make check-all` stays green.
+# Why: HN demo target is x86_64 + aarch64 only (per plan
+# `~/.claude/plans/hi-let-s-talk-about-scalable-sketch.md` § Verification:
+# "RISC-V GUI parity is post-HN").
+# Revisit when: compositor + scanout-virtio-gpu + virtio-input are
+# shipping in the riscv64 initrd (i.e., when GUI parity for riscv64
+# becomes a goal). At that point: add terminal-window-riscv64 to the
+# img-riscv64 deps, copy + sign + --module here, and pick the right
+# slot in BOOT_MODULE_ORDER (between compositor's last GUI dep and
+# shell, mirroring x86_64).
 img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 sign-tool mkinitrd
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64

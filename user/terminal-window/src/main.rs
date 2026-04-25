@@ -46,10 +46,16 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 /// so it never collides with any boot-module service or game.
 const TERMINAL_WINDOW_ENDPOINT: u32 = 14;
 
-/// Window dimensions. 640×240 lines up exactly with 80×30 cells at
-/// 8×8 glyphs — no wasted pixels and matches the grid's geometry.
-const WINDOW_WIDTH: u32 = 640;
-const WINDOW_HEIGHT: u32 = 240;
+/// Window dimensions. 1024×768 lines up exactly with the 128×96 cell
+/// grid (`grid::COLS` × `grid::VISIBLE_ROWS`) at 8×8 glyphs — no wasted
+/// pixels — and exactly matches the QEMU virtio-vga default scanout, so
+/// the compositor blits the whole framebuffer and nothing of the prior
+/// frame's contents (e.g. the boot-time cyan test fill) survives around
+/// the edges. Replace when the scanout dimensions are queryable through
+/// libgui at CreateWindow time, or when window decorations / tiling
+/// give us a deliberate sub-scanout region.
+const WINDOW_WIDTH: u32 = 1024;
+const WINDOW_HEIGHT: u32 = 768;
 
 const PROMPT: &[u8] = b"cambios> ";
 

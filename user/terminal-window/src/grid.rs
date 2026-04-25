@@ -37,22 +37,32 @@
 //!
 //! ## Fixed dimensions
 //!
-//! SCAFFOLDING: 80×30 at 8×8 glyphs fills a 640×240 window. The host
-//! target is 640×480, so rendering adds 240 px of bottom padding (or
-//! we pick 80×60 later when scrollback wants more rows visible).
-//! Why: matches de-facto terminal defaults and lets the glyph blit
-//! stay pure 8×8 (no scaling).
-//! Replace when: framebuffer-backend font upgrade (8×16 ROM) lands,
-//! or when variable window size arrives.
+//! SCAFFOLDING: 128×96 at 8×8 glyphs fills a 1024×768 window — full
+//! scanout on the QEMU virtio-vga default. Picking grid dimensions
+//! that exactly match the scanout means the compositor's blit covers
+//! every pixel; nothing is left over to expose stale frames underneath.
+//! Why: HN-launch demo runs against 1024×768 QEMU; matching the grid
+//! to the scanout is the cheapest way to get a clean full-screen
+//! terminal without coordinating cyan-fill + window-position with the
+//! compositor (Option B work).
+//! Replace when: variable window sizing lands (multi-window, runtime
+//! resize), or the scanout dimensions are queryable through libgui at
+//! CreateWindow time so the client can size to fit.
 
-/// ARCHITECTURAL: columns in a terminal-window grid. Fixed by the
-/// 80-column de-facto terminal convention.
-pub const COLS: usize = 80;
+/// SCAFFOLDING: columns in a terminal-window grid. 128 @ 8×8 = 1024 px,
+/// matching the QEMU virtio-vga default scanout width. Wider than the
+/// 80-column UNIX convention; full-scanout terminal looks intentional
+/// even when the user hasn't resized.
+/// Replace when: the scanout width is queryable at CreateWindow time
+/// or window decorations / multi-window layouts arrive.
+pub const COLS: usize = 128;
 
-/// SCAFFOLDING: visible rows. 30 @ 8×8 = 240 px; target window is
-/// 640×480 so we have 30 rows for UI + room at bottom for a status
-/// bar later. Replace when the status bar lands or the font upgrades.
-pub const VISIBLE_ROWS: usize = 30;
+/// SCAFFOLDING: visible rows. 96 @ 8×8 = 768 px, matching the QEMU
+/// virtio-vga default scanout height. Sized for full-scanout coverage
+/// rather than a small terminal — see `COLS` for the same rationale.
+/// Replace when the scanout height is queryable or window layouts let
+/// the terminal claim a deliberately smaller region.
+pub const VISIBLE_ROWS: usize = 96;
 
 /// Tab stop interval.
 pub const TAB_WIDTH: usize = 8;
@@ -337,7 +347,7 @@ impl Grid {
 
     fn advance_cursor(&mut self) {
         self.cursor_col += 1;
-        // Don't line-feed on exact column-80 — wait until the next
+        // Don't line-feed on the exact rightmost column — wait until the next
         // non-control byte actually needs to write. Matches most
         // terminals' "last-column quirk" closely enough for a shell.
         if (self.cursor_col as usize) > COLS {

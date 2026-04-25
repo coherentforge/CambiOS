@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -78,6 +79,17 @@ def main() -> int:
     if not qemu_cmd:
         print("error: no QEMU command after '--'", file=sys.stderr)
         return 3
+
+    # Force stdout to blocking mode. Some launching shells (notably the
+    # Claude Code agent harness) inherit non-blocking stdout, which causes
+    # `print(line)` to raise BlockingIOError mid-stream when the pipe
+    # buffer fills. Make doesn't survive that — the script dies, returning
+    # exit 1 from an uncaught exception, and the run looks like a failure
+    # when QEMU was actually fine.
+    try:
+        os.set_blocking(sys.stdout.fileno(), True)
+    except (OSError, AttributeError):
+        pass
 
     success_re = re.compile(re.escape(args.success))
     start = time.monotonic()

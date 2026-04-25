@@ -50,9 +50,9 @@ use arcos_libinput_proto::{
 use arcos_libsys as sys;
 
 use evdev::{
-    evdev_to_hid, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY, EV_REL, EV_SYN,
-    KEY_A, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_RIGHTCTRL,
-    KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_SPACE, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y,
+    evdev_to_hid, hid_to_ascii_us, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY,
+    EV_REL, EV_SYN, KEY_A, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT,
+    KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_SPACE, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y,
 };
 use transport::{
     InitError, ModernTransport, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK,
@@ -387,10 +387,14 @@ fn handle_keyboard_key(dev: &mut InputDevice, code: u16, value: u32) {
         _ => return, // unknown value — drop
     };
 
+    let hid = evdev_to_hid(code);
     let payload = KeyboardPayload {
-        keycode: evdev_to_hid(code),
+        keycode: hid,
         modifiers: dev.modifiers,
-        unicode: 0, // no layout translation in v0; client handles text
+        // US QWERTY layout translation. Returns 0 for keys whose Unicode
+        // contribution doesn't apply (Enter/Tab/arrows/modifiers etc) —
+        // the encoder's named-key path handles those off `keycode`.
+        unicode: hid_to_ascii_us(hid, dev.modifiers),
     };
     let seq = dev.next_seq();
     let event = InputEvent::key(event_type, dev.device_id, seq, sys::get_time(), payload);
