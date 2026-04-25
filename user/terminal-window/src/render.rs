@@ -2,31 +2,55 @@
 // Copyright (C) 2024-2026 Jason Ricca
 
 //! Render path: blit dirty grid rows into the libgui [`Surface`] using
-//! the 8×8 builtin font, plus a block caret at the cursor position.
+//! the 8×8 builtin font pixel-doubled to 16×16, plus a block caret at
+//! the cursor position.
 //!
 //! Free function form rather than a method on a stateful struct so the
 //! caller can split its `&mut self` borrows across `Client`, `Grid`,
 //! and the small render state without fighting the borrow checker.
+//!
+//! ## Scaling
+//!
+//! libgui's `BUILTIN_FONT_8X8` is hand-drawn at 8×8. Rendered at native
+//! resolution against a 1024×768 scanout, the resulting 128×96 grid
+//! looks like a low-res framebuffer rather than a terminal — every
+//! character occupies a tiny corner of an enormous window. Real
+//! terminals at this window size land near 80×24 with substantial
+//! glyph weight. We split the difference: render each 8×8 glyph as a
+//! 16×16 block (each font pixel becomes a 2×2 destination square),
+//! sit it inside a 16×32 cell, and drop to a 64×24 grid. That's 2×
+//! integer scale — pixel-aligned, no anti-aliasing, exact font shape
+//! preserved — and the result reads as the iconic 80×25 mode the
+//! glyphs were originally drawn for.
 
-use arcos_libgui::{Color, Rect, Surface};
+use arcos_libgui::{font::BUILTIN_FONT_8X8, Color, Rect, Surface};
 
 use crate::grid::{Grid, COLS, VISIBLE_ROWS};
 
-/// Glyph width in pixels — fixed by the builtin 8×8 font.
+/// Integer pixel-scale factor applied to the source 8×8 font when
+/// blitting. Each font pixel becomes a `SCALE × SCALE` destination
+/// block. 2 is the smallest value that meaningfully enlarges the
+/// glyphs; the next step (3) overshoots the 1024×768 scanout when
+/// combined with the 64-column grid.
+pub const SCALE: u16 = 2;
+/// Source font glyph width — fixed by `BUILTIN_FONT_8X8`.
 pub const GLYPH_W: u16 = 8;
-/// Glyph data height in pixels — fixed by the builtin 8×8 font.
+/// Source font glyph height — fixed by `BUILTIN_FONT_8X8`.
 pub const GLYPH_H: u16 = 8;
-/// Cell height in pixels. Larger than `GLYPH_H` so the 8×8 glyph data
-/// gets vertical breathing room above and below — this is the trick
-/// every classic terminal uses (IBM VGA text mode draws into 8×14 of
-/// an 8×16 cell). 16 px gives a clean 4 px above + 4 px below; the
-/// grid is 768 / 16 = 48 visible rows in the 1024×768 scanout. Pure
-/// integer math so glyph placement is pixel-aligned.
-pub const CELL_H: u16 = 16;
-/// Top-of-cell padding before the glyph rows start. `(CELL_H - GLYPH_H)
-/// / 2`, hand-evaluated so the const is `pub` for any caller doing
-/// pixel math against the rendered grid.
-pub const GLYPH_TOP_PAD: u16 = (CELL_H - GLYPH_H) / 2;
+/// Visible glyph extent on the destination surface, after 2× scale.
+pub const SCALED_GLYPH_W: u16 = GLYPH_W * SCALE; // 16
+pub const SCALED_GLYPH_H: u16 = GLYPH_H * SCALE; // 16
+/// Cell width = scaled glyph width. No horizontal padding between
+/// columns; characters sit flush, like every classic terminal.
+pub const CELL_W: u16 = SCALED_GLYPH_W; // 16
+/// Cell height with leading above + below the glyph. 32 = 16 px glyph
+/// in the middle, 8 px above, 8 px below. 1024×768 / (16×32) =
+/// 64 cols × 24 rows — the classic terminal aspect.
+pub const CELL_H: u16 = 32;
+/// Top-of-cell padding before the scaled glyph starts. `(CELL_H -
+/// SCALED_GLYPH_H) / 2`, hand-evaluated so the const is `pub` for
+/// any caller doing pixel math against the rendered grid.
+pub const GLYPH_TOP_PAD: u16 = (CELL_H - SCALED_GLYPH_H) / 2; // 8
 
 /// Background color (filled before each row's text is drawn).
 const BG: Color = Color(0x00_00_00_00);
@@ -90,8 +114,8 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
 }
 
 /// Re-render row `row` as a single horizontal strip: fill BG over the
-/// full cell height, then blit the row's glyphs into the cell's
-/// glyph-data band (`GLYPH_TOP_PAD` px below the cell top).
+/// full cell height, then blit the row's glyphs at 2× scale into the
+/// cell's glyph-data band (`GLYPH_TOP_PAD` px below the cell top).
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     let cell_y = (row as u16) * CELL_H;
 
@@ -99,38 +123,59 @@ fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
         Rect {
             x: 0,
             y: cell_y,
-            w: (COLS as u16) * GLYPH_W,
+            w: (COLS as u16) * CELL_W,
             h: CELL_H,
         },
         BG,
     );
 
-    // Build a contiguous &str of the row's printable bytes for
-    // `draw_text_builtin`. The grid only ever stores ASCII (we
-    // sanitise non-printable on write_byte) but defensively replace
-    // any rogue byte with a space so `from_utf8_unchecked` is sound.
-    let mut buf = [b' '; COLS];
+    let glyph_y = (cell_y + GLYPH_TOP_PAD) as i32;
     for c in 0..COLS {
         let b = grid.cell(c, row);
-        buf[c] = if (0x20..=0x7E).contains(&b) { b } else { b' ' };
+        let ch = if (0x20..=0x7E).contains(&b) { b } else { b' ' };
+        let glyph_x = (c as i32) * (CELL_W as i32);
+        draw_glyph_scaled(surf, glyph_x, glyph_y, ch, FG);
     }
-    // SAFETY: every byte is in 0x20..=0x7E, which is valid UTF-8.
-    let text = unsafe { core::str::from_utf8_unchecked(&buf) };
-    let glyph_y = cell_y + GLYPH_TOP_PAD;
-    surf.draw_text_builtin(0, glyph_y as i32, text, FG);
+}
+
+/// Blit a single 8×8 font glyph at `SCALE` integer scale: each set
+/// font pixel becomes a `SCALE × SCALE` square in the destination
+/// surface. Background is left untouched — `draw_row` is responsible
+/// for the BG fill that happens before this is called.
+fn draw_glyph_scaled(surf: &mut Surface, x: i32, y: i32, ch: u8, color: Color) {
+    let rows = match BUILTIN_FONT_8X8.glyph(ch) {
+        Some(r) => r,
+        None => return,
+    };
+    let scale = SCALE as i32;
+    for (row_i, &byte) in rows.iter().enumerate() {
+        let py = y + (row_i as i32) * scale;
+        for col in 0..(GLYPH_W as i32) {
+            let bit = 7 - col;
+            if (byte >> bit) & 1 == 1 {
+                let px = x + col * scale;
+                // Pixel-double in both axes.
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        surf.set_pixel(px + dx, py + dy, color);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Stamp a block caret over the cell at `(col, row)`. Caret covers the
-/// full cell height (not just the glyph band) so it reads as a
-/// contiguous block cursor without a horizontal stripe through it.
+/// full cell (CELL_W × CELL_H) so it reads as a contiguous block
+/// cursor without a horizontal stripe through it.
 fn draw_caret(surf: &mut Surface, col: u16, row: u16) {
-    let x = col * GLYPH_W;
+    let x = col * CELL_W;
     let y = row * CELL_H;
     surf.fill_rect(
         Rect {
             x,
             y,
-            w: GLYPH_W,
+            w: CELL_W,
             h: CELL_H,
         },
         CARET,
