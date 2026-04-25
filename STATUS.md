@@ -72,7 +72,7 @@ Chronological, newest first. ~3 week window — older items rotate out; git log 
 | FS service | Done (endpoint 16, ObjectStore gateway) | x/a/r | `user/fs-service/` | — |
 | Key-store service | Done (endpoint 17, degraded mode — no runtime YubiKey yet) | x/a/r | `user/key-store-service/` | — |
 | Virtio-blk driver | Done (Phase 4b, dual-endpoint user/kernel) | x/a/r | `user/virtio-blk/` | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) |
-| Virtio-net driver | Built but disabled in boot (legacy queue-size clamp bug) | x/a | `user/virtio-net/` | — |
+| Virtio-net driver | Done (Phase 4c, modern virtio-pci on x86_64; legacy MMIO on aarch64+riscv64; live in boot, drives udp-stack NTP demo) | x/a/r | `user/virtio-net/` | — |
 | Intel I219-LM driver | Scaffolded, untested on hardware | x | `user/i219-net/` | — |
 | UDP/IP stack (ARP/IPv4/UDP + NTP demo) | Done | x/a | `user/udp-stack/` | — |
 | Shell (`arcobj` CLI incl.) | Done | x/a/r | `user/shell/` | — |
@@ -190,11 +190,10 @@ Major categories (approximate; breakdown drifts faster than the total):
 
 - **AArch64 SMP timer on AP**: PPI 30 not firing on second CPU under QEMU `virt`. Single-CPU works fully. Likely QEMU config or missing GIC redistributor step on the AP path. Investigation pending.
 - **AArch64 device IRQ routing**: GIC `enable_spi` / `set_spi_trigger` exist but are not called from the boot path or `handle_wait_irq`. No device IRQs on aarch64 today. **Revisit when:** first aarch64 path needs device IRQs (likely a polling→IRQ-driven transition in virtio-blk, or resolution of the AP-timer gap enabling PL011 RX to drive a consumer).
-- **Legacy-virtio queue-size clamp (virtio-net)**: `user/virtio-net` caps virtqueue at 32 entries; QEMU device advertises 256, and legacy virtio's Queue Size register is read-only — driver MUST use device-reported size. Fix: bump `MAX_QUEUE_SIZE` and drop the clamp (virtio-blk already does). Virtio-net disabled in boot manifest until fixed.
 - **ELF loader overlapping-segment permissions**: If two PT_LOAD segments share a page with different permissions, the first segment's permissions win. Worked around in user-space linker scripts via `ALIGN(4096)` before `.data`.
 - **Kernel stack not freed on process exit**: `handle_exit` now performs full lifecycle cleanup (Phase 3.2d.ii), but the 32 KiB kernel stack per task remains a bounded leak — can't free the stack you're running on. Requires scheduler-level deferred-dealloc. Bounded by `num_slots × 32 KiB` (~6.4 MiB worst case).
 - **Clippy warnings** (~125): ~67 `multiple_unsafe_ops_per_block` in arch code, ~25 missing `// SAFETY:`, ~12 `static_mut_refs` (Rust 2024 migration — IDT/GDT/TSS patterns need `UnsafeCell` or `addr_of!`), ~20 `new_without_default`. Dedicated pass scheduled before `static_mut` deprecation becomes a hard error.
-- **Pre-existing driver warnings** in `user/virtio-net/` and `user/i219-net/`: `dead_code` / `unused_imports` from scaffolded state. Not correctness issues; clean up on next real-hardware bring-up.
+- **Pre-existing driver warnings** in `user/i219-net/`: `dead_code` / `unused_imports` from scaffolded state. Not correctness issues; clean up on next real-hardware bring-up.
 - **Virtio-net TX on QEMU TCG**: QEMU defers virtio TX to its event loop, which runs during guest `hlt`. The UDP stack's ARP retry/timeout logic doesn't yet exploit this fully.
 
 ## Cross-references
