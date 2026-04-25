@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "arcos-terminal-window"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+arcos-libsys = { path = "../libsys" }
+arcos-libterm = { path = "../libterm" }
+arcos-libgui = { path = "../libgui" }
+arcos-libgui-proto = { path = "../libgui-proto" }
+arcos-libinput-proto = { path = "../libinput-proto" }
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

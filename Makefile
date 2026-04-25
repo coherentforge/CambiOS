@@ -61,6 +61,8 @@ PONG_DIR := user/pong
 PONG_ELF := $(PONG_DIR)/target/x86_64-unknown-none/release/arcos-pong
 SPROUTY_DIR := user/super-sprouty-o
 SPROUTY_ELF := $(SPROUTY_DIR)/target/x86_64-unknown-none/release/arcos-super-sprouty-o
+TERMINAL_WINDOW_DIR := user/terminal-window
+TERMINAL_WINDOW_ELF := $(TERMINAL_WINDOW_DIR)/target/x86_64-unknown-none/release/arcos-terminal-window
 
 # User-space ELF binaries (RISC-V)
 FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-fs-service
@@ -98,6 +100,7 @@ TREE_ELF_AARCH64 := $(TREE_DIR)/target/aarch64-unknown-none/release/arcos-tree
 WORM_ELF_AARCH64 := $(WORM_DIR)/target/aarch64-unknown-none/release/arcos-worm
 PONG_ELF_AARCH64 := $(PONG_DIR)/target/aarch64-unknown-none/release/arcos-pong
 SPROUTY_ELF_AARCH64 := $(SPROUTY_DIR)/target/aarch64-unknown-none/release/arcos-super-sprouty-o
+TERMINAL_WINDOW_ELF_AARCH64 := $(TERMINAL_WINDOW_DIR)/target/aarch64-unknown-none/release/arcos-terminal-window
 
 # User-space ELF binaries (RISC-V) — scanout + input extension for Scanout-4.c
 SCANOUT_VGPU_ELF_RISCV64 := $(SCANOUT_VGPU_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-scanout-virtio-gpu
@@ -114,6 +117,7 @@ TREE_ELF_RISCV64 := $(TREE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-
 WORM_ELF_RISCV64 := $(WORM_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-worm
 PONG_ELF_RISCV64 := $(PONG_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-pong
 SPROUTY_ELF_RISCV64 := $(SPROUTY_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-super-sprouty-o
+TERMINAL_WINDOW_ELF_RISCV64 := $(TERMINAL_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-terminal-window
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -132,7 +136,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 sign-tool mkinitrd export-pubkey
 
 all: iso
 
@@ -271,6 +275,13 @@ super-sprouty-o:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== super-sprouty-o ready ==="
 
+terminal-window:
+	@echo "=== Building terminal-window (GUI shell host) ==="
+	cd $(TERMINAL_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== terminal-window ready ==="
+
 # AArch64 user-space build targets
 user-elf-aarch64:
 	@echo "=== Building user-space ELF (AArch64) ==="
@@ -404,6 +415,13 @@ super-sprouty-o-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== super-sprouty-o (AArch64) ready ==="
 
+terminal-window-aarch64:
+	@echo "=== Building terminal-window (AArch64) ==="
+	cd $(TERMINAL_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== terminal-window (AArch64) ready ==="
+
 # RISC-V user-space build targets (R-6 / ADR-013)
 # Services build with the same CARGO_ENCODED_RUSTFLAGS shape as x86_64/aarch64;
 # only the linker script and target triple differ.
@@ -511,6 +529,13 @@ super-sprouty-o-riscv64:
 		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
 	@echo "=== super-sprouty-o (RISC-V) ready ==="
+
+terminal-window-riscv64:
+	@echo "=== Building terminal-window (RISC-V) ==="
+	cd $(TERMINAL_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== terminal-window (RISC-V) ready ==="
 
 sign-tool:
 	@echo "=== Building ELF signing tool ==="

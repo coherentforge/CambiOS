@@ -122,6 +122,54 @@ impl Client {
         })
     }
 
+    /// Re-open a window after a prior [`Client::close`].
+    ///
+    /// Same as [`Client::open`] except `register_endpoint` is skipped:
+    /// the kernel-side endpoint stays registered for the lifetime of
+    /// the process, so a single `register_endpoint` at startup covers
+    /// any number of close/reopen cycles. Used by `terminal-window`'s
+    /// `/play` flow: close window before spawning a game (so the game
+    /// can claim "first live window" focus), then reopen when control
+    /// returns from `wait_task`.
+    pub fn reopen(
+        window_width: u32,
+        window_height: u32,
+        my_endpoint: u32,
+    ) -> Result<Self, ClientError> {
+        // Send CreateWindow.
+        let mut send_buf = [0u8; 16];
+        let n = encode_create_window(&mut send_buf, window_width, window_height)
+            .ok_or(ClientError::EncodeCreateWindow)?;
+        let rc = sys::write(COMPOSITOR_ENDPOINT, &send_buf[..n]);
+        if rc < 0 {
+            return Err(ClientError::CreateWindowWriteFailed(rc));
+        }
+
+        // Block for WelcomeClient.
+        let mut recv_buf = [0u8; MAX_MESSAGE_SIZE + 36];
+        let welcome = sys::recv_verified(my_endpoint, &mut recv_buf)
+            .ok_or(ClientError::RecvVerifiedFailed)?;
+        let msg = decode_welcome_client(welcome.payload()).ok_or(ClientError::DecodeWelcome)?;
+
+        // Attach the new surface channel.
+        let rc = sys::channel_attach(msg.channel_id);
+        if rc < 0 {
+            return Err(ClientError::ChannelAttachFailed(rc));
+        }
+        let surface_vaddr = rc as u64;
+
+        Ok(Self {
+            my_endpoint,
+            window_id: msg.window_id,
+            channel_id: msg.channel_id,
+            surface_vaddr,
+            width: msg.width,
+            height: msg.height,
+            pitch: msg.pitch,
+            next_seq: 0,
+        })
+    }
+
     /// Tell the compositor we're done with this window so it can drop
     /// our Window entry and stop routing input to our endpoint.
     /// Compositor's DestroyWindow handler (handle_destroy_window in
