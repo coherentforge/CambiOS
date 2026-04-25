@@ -136,7 +136,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 sign-tool mkinitrd export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 sign-tool mkinitrd bake-font export-pubkey
 
 all: iso
 
@@ -546,6 +546,23 @@ mkinitrd:
 	@echo "=== Building mkinitrd host tool ==="
 	cd $(MKINITRD_DIR) && cargo build --release
 	@echo "=== mkinitrd ready ==="
+
+# Re-bake the JetBrains Mono Regular TTF in assets/fonts/ into the
+# antialiased glyph table consumed by user/libgui at compile time. Run
+# only when the font, target cell size, or pixel height changes — the
+# generated file is checked in. Bake parameters live here as the source
+# of truth (the tool's CLI lets you override at the command line).
+JBM_PX_HEIGHT := 24
+JBM_CELL := 16x32
+bake-font:
+	@echo "=== Building bake-font host tool ==="
+	cd tools/bake-font && cargo build --release
+	@echo "=== Re-baking JetBrains Mono into user/libgui/src/font_jbmono_data.rs ==="
+	./tools/bake-font/target/aarch64-apple-darwin/release/bake-font \
+	    assets/fonts/JetBrainsMono-Regular.ttf \
+	    user/libgui/src/font_jbmono_data.rs \
+	    --px $(JBM_PX_HEIGHT) --cell $(JBM_CELL) --const-prefix JBM
+	@echo "=== bake-font ready ==="
 
 # Export the bootstrap public key from the signing source.
 # Run this once after setting up your YubiKey to generate bootstrap_pubkey.bin.

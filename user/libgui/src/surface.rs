@@ -126,6 +126,46 @@ impl<'a> Surface<'a> {
         }
     }
 
+    /// Blend `color` onto the pixel at `(x, y)` with `alpha` (0 = no
+    /// change, 255 = fully replace). Reads the existing pixel,
+    /// linear-interpolates each XRGB8888 channel, writes the result.
+    /// Out-of-bounds silently dropped.
+    ///
+    /// Used by the antialiased font path
+    /// ([`crate::font_aa::AntialiasedFont`]). Slower than `set_pixel`
+    /// because it requires a destination read; callers should fast-path
+    /// alpha == 0 (skip) and alpha == 255 (use `set_pixel`) before
+    /// invoking this.
+    #[inline]
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
+        if x < 0 || y < 0 {
+            return;
+        }
+        let ux = x as u32;
+        let uy = y as u32;
+        if ux >= self.width || uy >= self.height {
+            return;
+        }
+        // SAFETY: bounds checked above; `pitch_pixels >= width` is the
+        // module-level invariant. Volatile read+write to keep the
+        // compositor's view of shared memory coherent.
+        unsafe {
+            let off = (uy as usize) * self.pitch_pixels + (ux as usize);
+            let p = self.base.add(off);
+            let bg = p.read_volatile();
+            let a = alpha as u32;
+            let inv = 255 - a;
+            let fg = color.as_u32();
+            // Per-channel lerp, XRGB8888 layout. The X channel stays 0
+            // (Color::as_u32 keeps the high byte clear).
+            let br = (((fg >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * inv) / 255;
+            let bg_g = (((fg >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * inv) / 255;
+            let bb = ((fg & 0xFF) * a + (bg & 0xFF) * inv) / 255;
+            let blended = (br << 16) | (bg_g << 8) | bb;
+            p.write_volatile(blended);
+        }
+    }
+
     /// Fill the entire surface with one color.
     pub fn clear(&mut self, color: Color) {
         self.fill_rect(

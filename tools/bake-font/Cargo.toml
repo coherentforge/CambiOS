@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[workspace]
+
+[package]
+name = "bake-font"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Rasterize a TTF into a fixed-cell antialiased bitmap table for libgui"
+
+[dependencies]
+fontdue = "0.9"

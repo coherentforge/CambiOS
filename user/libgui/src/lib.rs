@@ -57,6 +57,7 @@
 pub mod bitmap;
 pub mod client;
 pub mod font;
+pub mod font_aa;
 pub mod frame_clock;
 pub mod surface;
 pub mod tile_grid;
@@ -64,6 +65,7 @@ pub mod tile_grid;
 pub use bitmap::Bitmap;
 pub use client::{Client, ClientError};
 pub use font::{Font, BUILTIN_FONT_8X8};
+pub use font_aa::{AntialiasedFont, BUILTIN_FONT_JBM};
 pub use frame_clock::FrameClock;
 pub use surface::Surface;
 pub use tile_grid::TileGrid;

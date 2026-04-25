@@ -2,55 +2,40 @@
 // Copyright (C) 2024-2026 Jason Ricca
 
 //! Render path: blit dirty grid rows into the libgui [`Surface`] using
-//! the 8×8 builtin font pixel-doubled to 16×16, plus a block caret at
-//! the cursor position.
+//! the antialiased JetBrains Mono font, plus a block caret at the
+//! cursor position.
 //!
 //! Free function form rather than a method on a stateful struct so the
 //! caller can split its `&mut self` borrows across `Client`, `Grid`,
 //! and the small render state without fighting the borrow checker.
 //!
-//! ## Scaling
+//! ## Why JetBrains Mono
 //!
-//! libgui's `BUILTIN_FONT_8X8` is hand-drawn at 8×8. Rendered at native
-//! resolution against a 1024×768 scanout, the resulting 128×96 grid
-//! looks like a low-res framebuffer rather than a terminal — every
-//! character occupies a tiny corner of an enormous window. Real
-//! terminals at this window size land near 80×24 with substantial
-//! glyph weight. We split the difference: render each 8×8 glyph as a
-//! 16×16 block (each font pixel becomes a 2×2 destination square),
-//! sit it inside a 16×32 cell, and drop to a 64×24 grid. That's 2×
-//! integer scale — pixel-aligned, no anti-aliasing, exact font shape
-//! preserved — and the result reads as the iconic 80×25 mode the
-//! glyphs were originally drawn for.
+//! Earlier passes of this file rendered through libgui's hand-drawn
+//! `BUILTIN_FONT_8X8` — first at native scale (squished), then at 2×
+//! integer scale (readable but visibly retro). Both are 1-bit-per-pixel
+//! masks; a "modern terminal" look needs antialiased glyphs, which
+//! means a real font.
+//!
+//! `BUILTIN_FONT_JBM` is JetBrains Mono Regular pre-rasterized into a
+//! 16×32 cell at host build time by `tools/bake-font` (the TTF lives
+//! under `assets/fonts/`, never enters the kernel image). Each glyph
+//! pixel is an alpha 0..=255; the renderer alpha-blends each opaque-ish
+//! pixel against the surface background. Cell layout is the same 16×32
+//! we already had for the 2× scaled bitmap — so the grid stays at
+//! 64×24 and the rest of the world doesn't notice the swap.
 
-use arcos_libgui::{font::BUILTIN_FONT_8X8, Color, Rect, Surface};
+use arcos_libgui::{font_aa::BUILTIN_FONT_JBM, Color, Rect, Surface};
 
 use crate::grid::{Grid, COLS, VISIBLE_ROWS};
 
-/// Integer pixel-scale factor applied to the source 8×8 font when
-/// blitting. Each font pixel becomes a `SCALE × SCALE` destination
-/// block. 2 is the smallest value that meaningfully enlarges the
-/// glyphs; the next step (3) overshoots the 1024×768 scanout when
-/// combined with the 64-column grid.
-pub const SCALE: u16 = 2;
-/// Source font glyph width — fixed by `BUILTIN_FONT_8X8`.
-pub const GLYPH_W: u16 = 8;
-/// Source font glyph height — fixed by `BUILTIN_FONT_8X8`.
-pub const GLYPH_H: u16 = 8;
-/// Visible glyph extent on the destination surface, after 2× scale.
-pub const SCALED_GLYPH_W: u16 = GLYPH_W * SCALE; // 16
-pub const SCALED_GLYPH_H: u16 = GLYPH_H * SCALE; // 16
-/// Cell width = scaled glyph width. No horizontal padding between
-/// columns; characters sit flush, like every classic terminal.
-pub const CELL_W: u16 = SCALED_GLYPH_W; // 16
-/// Cell height with leading above + below the glyph. 32 = 16 px glyph
-/// in the middle, 8 px above, 8 px below. 1024×768 / (16×32) =
-/// 64 cols × 24 rows — the classic terminal aspect.
-pub const CELL_H: u16 = 32;
-/// Top-of-cell padding before the scaled glyph starts. `(CELL_H -
-/// SCALED_GLYPH_H) / 2`, hand-evaluated so the const is `pub` for
-/// any caller doing pixel math against the rendered grid.
-pub const GLYPH_TOP_PAD: u16 = (CELL_H - SCALED_GLYPH_H) / 2; // 8
+/// Cell width = font cell width (advance is monospace in JBM, baked
+/// into a 16-px slot). Pinned to the const baked into the font data so
+/// any future re-bake at a different cell size lights this up at
+/// compile time rather than silently mis-rendering.
+pub const CELL_W: u16 = BUILTIN_FONT_JBM.cell_w;
+/// Cell height = font cell height. 32 px in the current bake.
+pub const CELL_H: u16 = BUILTIN_FONT_JBM.cell_h;
 
 /// Background color (filled before each row's text is drawn).
 const BG: Color = Color(0x00_00_00_00);
@@ -114,8 +99,7 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
 }
 
 /// Re-render row `row` as a single horizontal strip: fill BG over the
-/// full cell height, then blit the row's glyphs at 2× scale into the
-/// cell's glyph-data band (`GLYPH_TOP_PAD` px below the cell top).
+/// full cell band, then blit each cell's glyph through the AA font.
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     let cell_y = (row as u16) * CELL_H;
 
@@ -129,39 +113,19 @@ fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
         BG,
     );
 
-    let glyph_y = (cell_y + GLYPH_TOP_PAD) as i32;
+    // The glyph cell already includes built-in vertical leading from
+    // the bake step (ascent + descent + balanced top/bottom margin),
+    // so we draw the glyph at the cell origin — no extra
+    // GLYPH_TOP_PAD shift here.
+    let glyph_y = cell_y as i32;
     for c in 0..COLS {
         let b = grid.cell(c, row);
         let ch = if (0x20..=0x7E).contains(&b) { b } else { b' ' };
         let glyph_x = (c as i32) * (CELL_W as i32);
-        draw_glyph_scaled(surf, glyph_x, glyph_y, ch, FG);
-    }
-}
-
-/// Blit a single 8×8 font glyph at `SCALE` integer scale: each set
-/// font pixel becomes a `SCALE × SCALE` square in the destination
-/// surface. Background is left untouched — `draw_row` is responsible
-/// for the BG fill that happens before this is called.
-fn draw_glyph_scaled(surf: &mut Surface, x: i32, y: i32, ch: u8, color: Color) {
-    let rows = match BUILTIN_FONT_8X8.glyph(ch) {
-        Some(r) => r,
-        None => return,
-    };
-    let scale = SCALE as i32;
-    for (row_i, &byte) in rows.iter().enumerate() {
-        let py = y + (row_i as i32) * scale;
-        for col in 0..(GLYPH_W as i32) {
-            let bit = 7 - col;
-            if (byte >> bit) & 1 == 1 {
-                let px = x + col * scale;
-                // Pixel-double in both axes.
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        surf.set_pixel(px + dx, py + dy, color);
-                    }
-                }
-            }
-        }
+        // Single-glyph blit through draw_text_aa with a 1-byte slice.
+        // SAFETY: `ch` is in 0x20..=0x7E, guaranteed valid UTF-8.
+        let s = unsafe { core::str::from_utf8_unchecked(core::slice::from_ref(&ch)) };
+        surf.draw_text_aa(glyph_x, glyph_y, s, FG, &BUILTIN_FONT_JBM);
     }
 }
 

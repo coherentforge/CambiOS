@@ -38,20 +38,20 @@
 //! ## Fixed dimensions
 //!
 //! SCAFFOLDING: 64×24 cells fill a 1024×768 window using a 16×32
-//! cell stride (`render::CELL_W` × `render::CELL_H`) wrapped around
-//! the 8×8 source glyph blitted at 2× integer scale. The grid is
-//! "what's stored", the cell-stride is "how it's laid out", and the
-//! 2× scale is the bridge — keeping the hand-drawn 8×8 font intact
-//! while giving the on-screen cell the proportions of a real
-//! terminal.
-//! Why: 128×48 at 8×16 cells (the prior pass) was correctly
-//! laid-out but visually small — characters lived in tiny corners
-//! of an enormous window. 64×24 at 16×32 reads as the iconic 80×25
-//! terminal mode the glyphs were originally drawn for.
+//! cell stride (`render::CELL_W` × `render::CELL_H`). Both consts now
+//! flow from `BUILTIN_FONT_JBM`'s baked cell metrics — the grid is
+//! "what's stored", the font's cell is "how big each one is on
+//! screen". 64 × 16 = 1024, 24 × 32 = 768; perfect fit on the QEMU
+//! virtio-vga default scanout, and a tiny bit narrower / taller than
+//! the iconic 80×25 mode but reads the same on screen.
+//! Why: terminal-window now renders through libgui's antialiased
+//! JetBrains Mono path, so the cell stride is whatever the bake step
+//! produced. We tracked the cell-size through the SCAFFOLDING bound
+//! rather than re-deriving from a separate font-size const here.
 //! Replace when: variable window sizing lands (multi-window, runtime
-//! resize), the scanout dimensions are queryable at CreateWindow time,
-//! or a richer native 8×16 face replaces the built-in 8×8 (at which
-//! point `SCALE` drops back to 1 and the grid grows accordingly).
+//! resize), the scanout dimensions are queryable at CreateWindow
+//! time, or the JBM bake re-runs at a different cell size (in which
+//! case the constants below need a matching bump).
 
 /// SCAFFOLDING: columns in a terminal-window grid. 64 cells ×
 /// `render::CELL_W` (16 px = 8 px glyph × 2× scale) = 1024 px, exactly
