@@ -1,6 +1,6 @@
 # CambiOS: Philosophical Foundations
 
-## Generative, Not Extractive
+## Sovereign & Generative for Digital Wellbeing
 
 Every technical choice in CambiOS answers to one question before any other:
 does this create, or does it take?
@@ -29,6 +29,8 @@ something the OS imposes or owns, but it is something the OS should never
 stand in the way of, and should make genuinely possible. The user
 experience, across all of this, is meant to be helpful — and genuinely
 better than what is widely available today. Not cleaner-looking. Better.
+Eliminating the silent tax of extraction to promote digital (and overall)
+well being.
 
 Everything below this section is an elaboration of that single stance.
 
