@@ -45,16 +45,19 @@ use arcos_super_sprouty_o::{
 ///
 /// Revisit when: MAX_ENDPOINTS is raised — super-sprouty-o moves to
 /// its class-grouped slot (34) alongside Tree=31 / Worm=32 / Pong=33.
-// Was 22, which collides with `POLICY_QUERY_ENDPOINT` (the policy
-// service's registered endpoint — boot module loaded first in
-// limine.conf). When sprouty registered 22 as a second waiter,
-// compositor's Welcome reply woke whichever of us the scheduler
-// picked; if policy-service won the race, it dropped the message
-// as a non-PolicyQuery and sprouty blocked forever on recv.
-// 23 sits in the udp-stack(21) .. virtio-blk(24) gap.
-// Revisit when: a name-server / registry lands (Phase 3.4+) so
-// games don't need to hand-pick endpoint numbers.
-const SPROUTY_ENDPOINT: u32 = 23;
+// Was 22 (POLICY_QUERY_ENDPOINT collision). Then 23, which silently
+// collides with `POLICY_RESP_ENDPOINT` -- the kernel hardcodes a
+// "only the policy service may write to ep 23" check in
+// handle_write (src/syscalls/dispatcher.rs:417), so the compositor's
+// Welcome reply to sprouty got -EPERM at the kernel level and
+// sprouty blocked forever on recv_verified.
+// 15 is in the kernel-task grant range (0..16 per
+// capability_manager_init) but no service registers there, and
+// the kernel has no hardcoded intercept on it. After Phase 3.4
+// MAX_ENDPOINTS bump + name-server lands, games will stop hand-
+// picking and this comment can be retired.
+// Revisit when: name-server lands or MAX_ENDPOINTS > 32.
+const SPROUTY_ENDPOINT: u32 = 15;
 
 /// TUNING: physics tick interval in kernel ticks (1 tick = 10 ms at
 /// 100 Hz). 3 → 30 ms → 33 FPS — first game past pong's 20 FPS, first
