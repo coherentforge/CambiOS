@@ -2,14 +2,23 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2024-2026 Jason Ricca
 #
-# Commit-msg hook: enforce Claude-authored commit hygiene (H1).
+# Commit-msg hook: enforce Claude-authored commit hygiene.
 #
-# Runs tools/check-claude-staged-files.py, which rejects commits that
-# bear a "Co-Authored-By: Claude" trailer without a matching "Staged
-# files:" section. See the Python script for the failure modes it
-# catches and the escalation ladder behind it.
+# Runs two Python checks in order; either one's failure rejects:
+#   1. tools/check-claude-staged-files.py (H1, 2026-04-23)
+#      Rejects commits that bear a "Co-Authored-By: Claude" trailer
+#      without a matching "Staged files:" section. Catches file-list
+#      sweeps where the body drifted from `git diff --cached`.
+#   2. tools/check-preflight-discipline.py (sticky preflight, 2026-04-25)
+#      Rejects commits that stage a file which was already dirty at the
+#      start of the current Claude session AND was never preflighted
+#      by this session. Catches within-file sweeps that H1 misses
+#      because H1 only checks file-list correspondence, not per-hunk
+#      authorship — the 6th-recurrence shape (commit 4d4a4ab).
 #
-# Jason's manual commits (no Claude trailer) pass through untouched.
+# Jason's manual commits (no Claude trailer) pass through both checks
+# untouched. Sticky-preflight gate is also bypassed when
+# CLAUDE_PREFLIGHT_SESSION is unset (gradual rollout).
 #
 # Bypass: `git commit --no-verify` (discouraged).
 
@@ -18,3 +27,4 @@ set -e
 cd "$(git rev-parse --show-toplevel)"
 
 python3 tools/check-claude-staged-files.py "$1"
+python3 tools/check-preflight-discipline.py "$1"

@@ -21,23 +21,37 @@ Fourth recurrence of the working-tree-sweep family, after:
 
 Per CLAUDE.md's Prompt-Shaping Changelog convention — ship tooling on
 recurrence rather than tightening prose — this script is the mechanism.
-It doesn't block anything; it surfaces state so the caller (Claude or
-a human) can distinguish "mine" (proceed) from "parallel session"
-(stop, ask the user to commit first).
+
+# Sticky behavior (2026-04-25, post-6th recurrence)
+
+If the env var `CLAUDE_PREFLIGHT_SESSION` is set, this script ALSO
+records each invocation in a per-session state file under
+`.git/claude-preflight/<session_id>.json`. The first call in a session
+snapshots `git status --porcelain` (tracked files only) into
+`initial_dirty_files`; subsequent calls add to `preflighted`.
+
+The companion `tools/check-preflight-discipline.py` runs in the
+commit-msg phase and rejects Claude-authored commits whose staged set
+contains any file from `initial_dirty_files` that was never
+preflighted by the current session — the exact shape of the 6th
+recurrence (`4d4a4ab` swept session A's uncommitted F2/F3 hunks into
+session B's STOMP fix because A skipped preflight on a dirty file).
+
+Without the env var, the script's behavior is unchanged: informational
+NOTICE only, exit 0. Gradual rollout: hooks warn-but-pass when
+CLAUDE_PREFLIGHT_SESSION is unset, so Jason's manual commits and
+sessions that haven't adopted the env var yet are not blocked.
 
 Usage:
   python3 tools/claude-preflight.py <path>
   make claude-preflight FILE=<path>
+  CLAUDE_PREFLIGHT_SESSION=<id> make claude-preflight FILE=<path>
 
 Exit codes:
   0 — always (informational; NOTICE footer signals dirty state)
   1 — usage error
 
-The script is informational, not a gate: running `make claude-preflight`
-never fails. If you want to script on clean/dirty, grep stdout for
-"NOTICE:" or shell out to `git diff --exit-code -- <path>` directly.
-
-Output format on exit 2:
+Output format on dirty file:
   === preflight: <path> ===
   --- HEAD ---
   <hash> <subject> (<age>)
@@ -52,8 +66,12 @@ Output format on exit 2:
 The NOTICE footer is the editorial prompt: mine → proceed; parallel-
 session → stop.
 """
+import datetime
+import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def run(cmd: list[str]) -> tuple[int, str]:
@@ -64,12 +82,86 @@ def run(cmd: list[str]) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
+def repo_root() -> Path:
+    rc, out = run(["git", "rev-parse", "--show-toplevel"])
+    if rc != 0:
+        raise RuntimeError("not inside a git working tree")
+    return Path(out.strip())
+
+
+def session_state_path(session_id: str) -> Path:
+    return repo_root() / ".git" / "claude-preflight" / f"{session_id}.json"
+
+
+def init_session_state(session_id: str) -> dict:
+    """First preflight in a session: snapshot HEAD + tracked-file dirty
+    set so the commit-msg gate can later reject sweeps. Untracked (`??`)
+    files are excluded — they have no HEAD baseline and are not the
+    sweep shape we're guarding against."""
+    rc_head, head = run(["git", "rev-parse", "HEAD"])
+    head = head.strip() if rc_head == 0 else ""
+
+    _, status_out = run(["git", "status", "--porcelain"])
+    initial_dirty: list[str] = []
+    for line in status_out.splitlines():
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        if code == "??":
+            continue
+        # `git status --porcelain` format: XY <space> path. Path may
+        # contain a rename arrow ("orig -> new"); take the post-arrow
+        # form when present so the file we'll diff later matches.
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        initial_dirty.append(path)
+
+    return {
+        "session_id": session_id,
+        "session_start_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "head_at_start": head,
+        "initial_dirty_files": sorted(set(initial_dirty)),
+        "preflighted": {},
+    }
+
+
+def record_preflight(session_id: str, file_path: str) -> None:
+    """Append `file_path` to the session's `preflighted` set. Initializes
+    the state file on first call. Best-effort: any IO error is logged
+    to stderr and swallowed — a broken state file MUST NOT prevent
+    Claude from running preflight, since that would block all editing."""
+    try:
+        state_path = session_state_path(session_id)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+        else:
+            state = init_session_state(session_id)
+        state.setdefault("preflighted", {})[file_path] = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        state_path.write_text(json.dumps(state, indent=2) + "\n")
+    except Exception as e:
+        print(
+            f"NOTICE: could not record preflight for session {session_id}: {e}",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: claude-preflight.py <path>", file=sys.stderr)
         return 1
 
     path = sys.argv[1]
+
+    # Record this preflight for the current session, if one is declared.
+    # Backward-compatible: when CLAUDE_PREFLIGHT_SESSION is unset, this
+    # is a no-op and the script behaves exactly as before.
+    session = os.environ.get("CLAUDE_PREFLIGHT_SESSION")
+    if session:
+        record_preflight(session, path)
 
     print(f"=== preflight: {path} ===")
 
