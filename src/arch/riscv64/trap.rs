@@ -291,6 +291,158 @@ const IRQ_EXTERNAL: u64 = 9;
 /// Interrupt cause code — supervisor software (IPI, wired in R-5).
 const IRQ_SOFTWARE: u64 = 1;
 
+// ============================================================================
+// TrapError — typed boundary for unrecoverable S-mode traps
+// ============================================================================
+
+/// Classes of S-mode trap the dispatcher can hit but can't recover from.
+///
+/// Per `riscv-privileged` § "Supervisor Cause Register" — synchronous
+/// exception codes (`scause` low bits, `INTERRUPT` bit clear) plus the
+/// "interrupt arrived with an unexpected cause code" tail. Each variant
+/// carries the SEPC + STVAL captured at trap entry so [`report_and_halt`]
+/// can produce a structured fault dump without re-reading the CSRs.
+///
+/// Replaces the `panic!()` chain that used to live in
+/// [`_riscv_rust_trap_handler`]. CLAUDE.md's no-panic-in-kernel rule
+/// applies here even though the terminal action is identical (print +
+/// halt) — a typed boundary lets a future audit hook, host-style test
+/// harness, or per-process kill-rather-than-halt path attach without
+/// touching every fault arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrapError {
+    InstructionMisaligned { sepc: u64 },
+    InstructionAccessFault { sepc: u64 },
+    IllegalInstruction { sepc: u64, stval: u64 },
+    Breakpoint { sepc: u64 },
+    LoadMisaligned { sepc: u64, stval: u64 },
+    LoadAccessFault { sepc: u64, stval: u64 },
+    StoreMisaligned { sepc: u64, stval: u64 },
+    StoreAccessFault { sepc: u64, stval: u64 },
+    /// `ECALL` from S-mode — kernel ecalls must go through the `sbi::*`
+    /// wrappers, never raw `ecall` in Rust code. If we see this it's
+    /// almost certainly a bug in a wrapper or hand-rolled assembly.
+    SModeEcall { sepc: u64 },
+    InstructionPageFault { sepc: u64, stval: u64 },
+    LoadPageFault { sepc: u64, stval: u64 },
+    StorePageFault { sepc: u64, stval: u64 },
+    /// Synchronous exception with a `scause` code we don't model
+    /// (reserved or future RISC-V revision). Carries the raw code so the
+    /// fault dump can name it even though we have no structural handler.
+    UnknownException { code: u64, sepc: u64, stval: u64 },
+    /// Interrupt with a cause code we don't model (the IRQ_TIMER /
+    /// IRQ_EXTERNAL / IRQ_SOFTWARE arms above didn't claim it). Code is
+    /// the low 63 bits of `scause`.
+    UnexpectedInterrupt { code: u64 },
+}
+
+/// Classify a synchronous exception (scause's INTERRUPT bit clear) into
+/// a [`TrapError`]. Pure function over the trap-time CSR snapshot — host-
+/// testable and free of side effects, so the typed boundary above can be
+/// exercised without spinning up a RISC-V kernel.
+///
+/// Returns `Some(TrapError::SModeEcall)` for code 9 (the only S-mode
+/// ecall the kernel ever sees in this dispatcher; ECALL-from-U is the
+/// syscall path and is handled separately upstream of this function).
+/// Returns `Some(UnknownException { ... })` for any reserved/unmodeled
+/// code.
+pub(super) fn classify_sync_fault(code: u64, sepc: u64, stval: u64) -> TrapError {
+    match code {
+        0 => TrapError::InstructionMisaligned { sepc },
+        1 => TrapError::InstructionAccessFault { sepc },
+        2 => TrapError::IllegalInstruction { sepc, stval },
+        3 => TrapError::Breakpoint { sepc },
+        4 => TrapError::LoadMisaligned { sepc, stval },
+        5 => TrapError::LoadAccessFault { sepc, stval },
+        6 => TrapError::StoreMisaligned { sepc, stval },
+        7 => TrapError::StoreAccessFault { sepc, stval },
+        9 => TrapError::SModeEcall { sepc },
+        12 => TrapError::InstructionPageFault { sepc, stval },
+        13 => TrapError::LoadPageFault { sepc, stval },
+        15 => TrapError::StorePageFault { sepc, stval },
+        other => TrapError::UnknownException { code: other, sepc, stval },
+    }
+}
+
+/// Print a structured fault dump on the serial console and halt the
+/// hart. Replaces the previous `panic!()` chain — same observable
+/// behavior (operator sees a fault report and the system stops), but
+/// the variant is typed and the call site is a single function the
+/// audit / debug / test layer can hook later.
+fn report_and_halt(err: TrapError) -> ! {
+    crate::println!("\n!! RISC-V S-MODE TRAP — KERNEL FAULT !!");
+    match err {
+        TrapError::InstructionMisaligned { sepc } => {
+            crate::println!("  cause: instruction address misaligned");
+            crate::println!("  sepc:  {:#x}", sepc);
+        }
+        TrapError::InstructionAccessFault { sepc } => {
+            crate::println!("  cause: instruction access fault");
+            crate::println!("  sepc:  {:#x}", sepc);
+        }
+        TrapError::IllegalInstruction { sepc, stval } => {
+            crate::println!("  cause: illegal instruction");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (offending instruction word)", stval);
+        }
+        TrapError::Breakpoint { sepc } => {
+            crate::println!("  cause: breakpoint (ebreak)");
+            crate::println!("  sepc:  {:#x}", sepc);
+        }
+        TrapError::LoadMisaligned { sepc, stval } => {
+            crate::println!("  cause: load address misaligned");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting load address)", stval);
+        }
+        TrapError::LoadAccessFault { sepc, stval } => {
+            crate::println!("  cause: load access fault");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting load address)", stval);
+        }
+        TrapError::StoreMisaligned { sepc, stval } => {
+            crate::println!("  cause: store/AMO address misaligned");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting store address)", stval);
+        }
+        TrapError::StoreAccessFault { sepc, stval } => {
+            crate::println!("  cause: store/AMO access fault");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting store address)", stval);
+        }
+        TrapError::SModeEcall { sepc } => {
+            crate::println!(
+                "  cause: ECALL from S-mode \
+                 — kernel ecalls must go through sbi::* wrappers"
+            );
+            crate::println!("  sepc:  {:#x}", sepc);
+        }
+        TrapError::InstructionPageFault { sepc, stval } => {
+            crate::println!("  cause: instruction page fault");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting fetch address)", stval);
+        }
+        TrapError::LoadPageFault { sepc, stval } => {
+            crate::println!("  cause: load page fault");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting load address)", stval);
+        }
+        TrapError::StorePageFault { sepc, stval } => {
+            crate::println!("  cause: store/AMO page fault");
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}  (faulting store address)", stval);
+        }
+        TrapError::UnknownException { code, sepc, stval } => {
+            crate::println!("  cause: unknown synchronous exception code {}", code);
+            crate::println!("  sepc:  {:#x}", sepc);
+            crate::println!("  stval: {:#x}", stval);
+        }
+        TrapError::UnexpectedInterrupt { code } => {
+            crate::println!("  cause: unexpected S-mode interrupt code {}", code);
+        }
+    }
+    crate::halt();
+}
+
 /// Rust-level trap dispatcher. Called from `_riscv_trap_vector` with a
 /// populated [`SavedContext`] on the kernel stack.
 ///
@@ -359,47 +511,41 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
                 // additional arms, discriminated by a payload tag.
                 unsafe { super::tlb::handle_ipi(); }
             }
-            other => panic!("riscv64: unexpected S-mode interrupt cause={}", other),
+            other => report_and_halt(TrapError::UnexpectedInterrupt { code: other }),
         }
     } else {
-        // Synchronous exception. Everything listed below is a kernel
-        // bug at this stage (R-3.b+c milestone): user code isn't
-        // running yet, so ECALL-from-U is impossible, and any page
-        // fault or illegal instruction signals a kernel problem.
-        // SAFETY: `saved` was populated by the trap vector before
-        // this function was called; the pointer is valid for the
-        // duration of the handler and the memory is not aliased.
+        // Synchronous exception. Everything listed below — except the
+        // ECALL-from-U syscall path — is a kernel bug at this stage
+        // (R-3.b+c milestone): user code isn't running yet for most
+        // arms, so ECALL-from-U is the only legitimate user-originated
+        // entry, and any page fault / illegal instruction in S-mode
+        // signals a kernel problem.
+        //
+        // SAFETY: `saved` was populated by the trap vector before this
+        // function was called; the pointer is valid for the duration
+        // of the handler and the memory is not aliased.
         let sepc = unsafe { (*saved).sepc };
-        match code {
-            0 => panic!("riscv64 fault: instruction address misaligned @ sepc={:#x}", sepc),
-            1 => panic!("riscv64 fault: instruction access fault @ sepc={:#x}", sepc),
-            2 => panic!("riscv64 fault: illegal instruction @ sepc={:#x} stval={:#x}", sepc, stval),
-            3 => panic!("riscv64 fault: breakpoint @ sepc={:#x}", sepc),
-            4 => panic!("riscv64 fault: load address misaligned @ sepc={:#x} stval={:#x}", sepc, stval),
-            5 => panic!("riscv64 fault: load access fault @ sepc={:#x} stval={:#x}", sepc, stval),
-            6 => panic!("riscv64 fault: store/AMO address misaligned @ sepc={:#x} stval={:#x}", sepc, stval),
-            7 => panic!("riscv64 fault: store/AMO access fault @ sepc={:#x} stval={:#x}", sepc, stval),
-            8 => {
-                // ECALL from U-mode — the R-4 syscall entry point.
-                // The Rust-side handler extracts a7/a0..a5 from the
-                // SavedContext, dispatches, writes the return value
-                // back to a0, and bumps sepc past the 4-byte ecall
-                // so sret resumes at the next user instruction.
-                // SAFETY: ISR context; `saved` was populated by the
-                // trap vector's U→S entry path.
-                return unsafe { super::syscall::ecall_handler_inner(saved as u64) };
-            }
-            9 => panic!("riscv64 fault: ECALL from S-mode — kernel ecalls must go through sbi wrappers"),
-            12 => panic!("riscv64 fault: instruction page fault @ sepc={:#x} stval={:#x}", sepc, stval),
-            13 => panic!("riscv64 fault: load page fault @ sepc={:#x} stval={:#x}", sepc, stval),
-            15 => panic!("riscv64 fault: store/AMO page fault @ sepc={:#x} stval={:#x}", sepc, stval),
-            other => panic!("riscv64 fault: unknown exception code {} @ sepc={:#x} stval={:#x}", other, sepc, stval),
+        // ECALL from U-mode is the only recoverable arm — handle it
+        // before classify_sync_fault, which would otherwise have to
+        // model the syscall path.
+        if code == 8 {
+            // ECALL from U-mode — the R-4 syscall entry point.
+            // The Rust-side handler extracts a7/a0..a5 from the
+            // SavedContext, dispatches, writes the return value back
+            // to a0, and bumps sepc past the 4-byte ecall so sret
+            // resumes at the next user instruction.
+            // SAFETY: ISR context; `saved` was populated by the
+            // trap vector's U→S entry path.
+            return unsafe { super::syscall::ecall_handler_inner(saved as u64) };
         }
+        report_and_halt(classify_sync_fault(code, sepc, stval));
     }
 
     // External IRQs fall through to here after `dispatch_pending` —
     // no context swap, restore from the same frame we arrived on.
-    // (Every exception arm panics; the IRQ_TIMER arm returned early.)
+    // (Every exception arm either tail-returns from
+    // `ecall_handler_inner` or diverges through `report_and_halt`;
+    // the IRQ_TIMER arm returned early.)
     saved as u64
 }
 
