@@ -37,10 +37,12 @@ This table maps every enforcement point to its code location and *what* it does.
 | ObjPut Ed25519 signature verification | **Enforced** | `PermissionDenied` | `syscalls/dispatcher.rs` (`ObjPutSigned`) |
 | ObjDelete ownership enforcement | **Enforced** | `PermissionDenied` | `syscalls/dispatcher.rs` |
 | FS service principal-based access | **Enforced** | Error response to caller | `user/fs-service/src/main.rs` |
-| Bulk-data channel capability checks | **Designed in [ADR-005](adr/005-ipc-primitives-control-and-bulk.md)**, not implemented | — | — |
-| Capability revocation (`SYS_REVOKE_CAPABILITY`) | **Designed in [ADR-007](adr/007-capability-revocation-and-telemetry.md)**, not implemented | — | — |
-| Audit telemetry channel | **Designed in [ADR-007](adr/007-capability-revocation-and-telemetry.md)**, not implemented | — | — |
-| Externalized policy service | **Designed in [ADR-006](adr/006-policy-service.md)**, not implemented | — | — |
+| Bulk-data channel capability checks | **Enforced** (creator + peer-Principal match at attach) | `ChannelError::*` | `ipc/channel.rs` |
+| Capability revocation (`SYS_REVOKE_CAPABILITY`) | **Enforced** (bootstrap-only authority for now per ADR-007 Phase 3.1) | `PermissionDenied` | `syscalls/dispatcher.rs`, `ipc/capability.rs::revoke` |
+| Audit telemetry channel | **Enforced** (per-CPU SPSC buffers → BSP drain → `AUDIT_RING`; consumer reads via `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO`) | N/A (best-effort, drops counted) | `audit/{mod,buffer,drain}.rs`, `syscalls/dispatcher.rs` |
+| Audit on input focus transition (T-7 Phase A) | **Enforced** (compositor emits `InputFocusChange` via `SYS_AUDIT_EMIT_INPUT_FOCUS`; capability narrowed to compositor only) | `PermissionDenied` if non-compositor | `syscalls/dispatcher.rs::handle_audit_emit_input_focus`, `microkernel/main.rs::register_process_capabilities` |
+| Audit drain-skip counter (T-8) | **Enforced** (lock-free `AUDIT_DRAIN_SKIPS` atomic; surfaced through `SYS_AUDIT_INFO` offset 44..48) | N/A (visibility primitive) | `audit/drain.rs`, `syscalls/dispatcher.rs::handle_audit_info` |
+| Externalized policy service | **Scaffolding** (boot-module identified at `POLICY_SERVICE_PID`; `on_syscall` hook still permissive — see [ADR-006](adr/006-policy-service.md)) | Always allows | `microkernel/main.rs`, `ipc/interceptor.rs` |
 | Per-process syscall allowlists | **Designed in [ADR-006](adr/006-policy-service.md)**, not implemented | — | — |
 | Runtime behavioral AI (advisory only) | **Designed in [ADR-007](adr/007-capability-revocation-and-telemetry.md)**, not implemented | — | — |
 | Cryptographic capabilities (cross-node) | Planned (post-v1) | — | — |
@@ -311,14 +313,14 @@ A process that attempts a syscall outside its profile gets `PermissionDenied` be
 
 ### Substituting a Custom Interceptor
 
-The interceptor is a trait object (`Box<dyn IpcInterceptor>`). At boot, `main.rs` installs the `DefaultInterceptor`. A production deployment could install a stricter interceptor that:
+The interceptor is held as `IpcInterceptorBackend` — an enum-dispatch shim ([ADR-002 § Divergence](adr/002-three-layer-enforcement-pipeline.md#divergence)) chosen over `Box<dyn IpcInterceptor>` so dispatch monomorphizes (no dynamic dispatch in the kernel hot path; same precedent as ADR-003 for `OBJECT_STORE`). At boot, `main.rs` installs the `DefaultInterceptor` variant. Adding a new interceptor implementation today means adding a variant to the enum and an arm to the impl; the swap site is still a single line: `ipc.set_interceptor(IpcInterceptorBackend::MyInterceptor(MyInterceptor::new()))`.
 
-- Reads per-process syscall profiles from a policy table
-- Logs all capability exercises to an audit buffer
-- Connects to the AI security engine for behavioral analysis
-- Enforces rate limits on IPC send frequency
+A production deployment's interceptor could:
 
-The swap is a single line: `ipc.set_interceptor(Box::new(MyInterceptor::new()))`.
+- Read per-process syscall profiles from a policy table
+- Log all capability exercises to an audit buffer
+- Connect to the AI security engine for behavioral analysis
+- Enforce rate limits on IPC send frequency
 
 ---
 
@@ -338,15 +340,15 @@ What channels do *not* change: the verification stance for control-path messages
 
 ---
 
-## Externalized Policy and Audit Telemetry (Phase 3 — Designed)
+## Externalized Policy and Audit Telemetry (Phase 3)
 
-Two architectural moves currently in design phase shift how security policy is decided and observed without changing what the kernel enforces:
+Three architectural moves shift how security policy is decided and observed without changing what the kernel enforces. Two have shipped; one remains in design:
 
-**Policy externalization ([ADR-006](adr/006-policy-service.md)).** The `IpcInterceptor::on_syscall` hook is currently scaffolding inside the kernel. The plan is to move the *decision* into a user-space `policy-service` while keeping the *enforcement* in the kernel. The kernel asks "is process P allowed to call syscall N with these args?" via a fast per-CPU cache; the policy service answers and the kernel acts. Cache invalidation, fail-open semantics on policy-service crash, and a bootstrap order that allows the policy service to load *before* it gates other services are all spelled out in the ADR. Critically: the AI is never the policy service. The policy service is deterministic Rust code; the AI is an *advisor* that can recommend changes to policy-service rules through its own audit channel. The AI watches, the policy service decides, the kernel enforces.
+**Capability revocation ([ADR-007](adr/007-capability-revocation-and-telemetry.md)) — shipped.** `SYS_REVOKE_CAPABILITY` lives in `syscalls/dispatcher.rs`, backed by `CapabilityManager::revoke` with audit emission. Authority is bootstrap-only in Phase 3.1; the broader authority surface called for in ADR-007 (original grantor, holders of the new `revoke` right, the policy service) is queued for Phase 3.4. Atomic teardown of in-flight references is in place via the existing channel close path + capability table mutation. This was the prerequisite for everything else in Phase 3 — without revocation, the AI's recommendations would have no teeth and the policy service could only deny *new* operations, never undo prior grants.
 
-**Audit telemetry ([ADR-007](adr/007-capability-revocation-and-telemetry.md)).** Every capability grant, revocation, IPC denial, channel create/attach/close, identity bind, and ObjectStore mutation produces an audit event. Events flow through a kernel→userspace channel (using the channel primitive from ADR-005) to a user-space audit consumer. Per-CPU lock-free staging buffers keep the kernel hot path off the audit path. Best-effort delivery: dropped events are counted, never block the producer. The audit channel is the *only* way the AI security service learns what's happening on the system — there is no kernel hook the AI can call directly, no capability the AI holds to suspend a process, no out-of-band introspection. The AI is a user-space process that reads an event stream and emits recommendations into the policy service's input queue.
+**Audit telemetry ([ADR-007](adr/007-capability-revocation-and-telemetry.md)) — shipped.** Capability grant / revocation / denial, IPC send/recv (sampled), channel create/attach/close, syscall denial, binary load/reject, process create/exit, and (T-7 Phase A, 2026-04-25) input focus transitions all produce audit events. Events flow through per-CPU lock-free SPSC staging buffers → BSP-driven `drain_tick` → a global `AUDIT_RING`. User-space consumers attach via `SYS_AUDIT_ATTACH` (bootstrap-only) and read offsets via `SYS_AUDIT_INFO`. Best-effort delivery: dropped events are counted both per-buffer (`AuditDropped` synthetic event) and at drain time (T-8 `AUDIT_DRAIN_SKIPS` lock-free counter, `SYS_AUDIT_INFO` offset 44..48). The audit channel is the *only* way the AI security service learns what's happening on the system — there is no kernel hook the AI can call directly, no capability the AI holds to suspend a process, no out-of-band introspection. The AI is a user-space process that reads an event stream and emits recommendations into the policy service's input queue.
 
-**Capability revocation ([ADR-007](adr/007-capability-revocation-and-telemetry.md)).** Currently a capability granted in error cannot be taken back. The revocation primitive adds `SYS_REVOKE_CAPABILITY` and atomic teardown of all references (in-flight messages, blocked receivers, channel mappings). Three authorities can revoke: the original grantor, any process holding the new `revoke` right on the capability, and the bootstrap Principal (which the policy service can be granted). This is the prerequisite for everything else in Phase 3 — without revocation, the AI's recommendations have no teeth and the policy service can only deny *new* operations, never undo prior grants.
+**Policy externalization ([ADR-006](adr/006-policy-service.md)) — still scaffolding.** The `IpcInterceptor::on_syscall` hook is wired into the kernel and the policy service boot module is identified at `POLICY_SERVICE_PID`, but the decision path is still permissive (`POLICY_SERVICE_READY` enables enforcement only after the service registers; the default decision today is `Allow`). The plan is to move the *decision* into the user-space `policy-service` while keeping the *enforcement* in the kernel. The kernel asks "is process P allowed to call syscall N with these args?" via a fast per-CPU cache; the policy service answers and the kernel acts. Cache invalidation, fail-open semantics on policy-service crash, and the bootstrap order that allows the policy service to load *before* it gates other services are all spelled out in the ADR. Critically: the AI is never the policy service. The policy service is deterministic Rust code; the AI is an *advisor* that can recommend changes to policy-service rules through its own audit channel. The AI watches, the policy service decides, the kernel enforces.
 
 ---
 
@@ -358,12 +360,11 @@ The gaps below are organized by whether they have a design (ADR drafted) or are 
 
 | Gap | Impact | Where It's Designed |
 |---|---|---|
-| **Capability revocation** | A capability granted in error cannot be taken back; driver updates can't reclaim the old driver's authority | [ADR-007](adr/007-capability-revocation-and-telemetry.md) |
-| **Audit logging / telemetry channel** | No forensic trail; the AI security service has no input stream | [ADR-007](adr/007-capability-revocation-and-telemetry.md) |
 | **Per-process syscall allowlists** | A compromised process can invoke any syscall it has arguments for | [ADR-006](adr/006-policy-service.md) — `on_syscall` hook routed through policy service |
 | **Externalized policy decisions** | All policy lives inside the kernel; cannot be updated without a kernel rebuild | [ADR-006](adr/006-policy-service.md) |
-| **Bulk-data IPC path** | 256-byte control IPC blocks workloads like video, file I/O, LLM streaming; today's drivers paper over with chunking | [ADR-005](adr/005-ipc-primitives-control-and-bulk.md) |
+| **Capability revocation — broader authority** | Today only the bootstrap Principal can call `SYS_REVOKE_CAPABILITY`. ADR-007 calls for the original grantor, any process holding the new `revoke` right, and the policy service to also be able to revoke; that authority surface is queued for Phase 3.4. | [ADR-007](adr/007-capability-revocation-and-telemetry.md) |
 | **Runtime behavioral AI (advisory)** | No detection of anomalous capability usage patterns | [ADR-007](adr/007-capability-revocation-and-telemetry.md) — AI consumes the audit channel, recommends to policy service, never decides directly |
+| **Privileged audit consumer** | The audit ring + drain-skip counter ship today, but no kernel-side actor polls them and escalates on rising skip counts. T-7 / T-8 in [threat-model.md](threat-model.md) document the gap. | TBD — likely a small `audit-health` boot module or a policy-service responsibility |
 
 ### Open / Not Yet Designed
 
@@ -379,16 +380,21 @@ The gaps below are organized by whether they have a design (ADR drafted) or are 
 - ~~**Bootstrap Principal hardening**~~ — Hardware-backed YubiKey root of trust. Secret key never enters kernel memory. Boot modules signed at build time, verified at load time.
 - ~~**ELF signature verification**~~ — `SignedBinaryVerifier` enforces Ed25519 signatures (ARCSIG trailer) on all boot modules.
 - ~~**IPC sender_principal stamping**~~ — Kernel stamps unforgeable identity on every control-IPC message.
+- ~~**Capability revocation primitive**~~ — `SYS_REVOKE_CAPABILITY` lives at `syscalls/dispatcher.rs`; backed by `CapabilityManager::revoke` with audit emission. Authority is bootstrap-only for Phase 3.1 (broader authority queued — see Gap Analysis above).
+- ~~**Audit telemetry channel**~~ — Per-CPU lock-free SPSC staging buffers + BSP-driven `drain_tick` → `AUDIT_RING` consumer. 17 event kinds wired (see [threat-model.md T-7 / T-8](threat-model.md#t-7--virtio-input-focus-hijack)). Best-effort delivery: drops are counted (per-buffer staging-drop counter + `AUDIT_DRAIN_SKIPS` lock-free leading-indicator counter, surfaced through `SYS_AUDIT_INFO`).
+- ~~**Bulk-data shared-memory channels (control-path)**~~ — `SYS_CHANNEL_CREATE` / `SYS_CHANNEL_ATTACH` / `SYS_CHANNEL_REVOKE` ship per [ADR-005](adr/005-ipc-primitives-control-and-bulk.md). Kernel-mediated creation, capability-gated allocation, peer-Principal match at attach. The pages flow user-to-user; the create/attach/close events flow through the audit ring.
+- ~~**ELF page-permission conflict rejection (T-5)**~~ — `DefaultVerifier` rejects any pair of `PT_LOAD` segments whose page-aligned ranges overlap with conflicting permissions (`DenyReason::PagePermConflict`). Closes the build-time hygiene gap that signed binaries could otherwise sneak through.
 
 ### Priority Order for Phase 3
 
-The Phase 3 items have a forced ordering, captured in [STATUS.md § Phase markers](../STATUS.md#phase-markers):
+Items 1–3 below have shipped (see "Done (Historical)"); items 4–6 are what's left, in dependency order. Tracked alongside the project-wide phase markers in [STATUS.md § Phase markers](../STATUS.md#phase-markers).
 
-1. **Capability revocation** — every other Phase 3 item depends on this. Channels need it (to tear down a compromised attach), policy service needs it (so its decisions can have effect on existing capabilities), audit telemetry doesn't strictly need it but is useless without it.
-2. **Audit telemetry channel** — precedes the AI work because the AI consumes this stream.
-3. **Channels** — bulk-data path. Unblocks DHCP, real video/audio, LLM serving.
-4. **Policy service** — externalizes `on_syscall` once revocation exists to give policy decisions their teeth.
-5. **Behavioral AI** — sits on top of all four. Watches the audit channel, emits recommendations into the policy service's input.
+1. ~~**Capability revocation** — every other Phase 3 item depended on this.~~ Shipped (bootstrap-only authority in Phase 3.1; broader authority surface tracked under Gap Analysis).
+2. ~~**Audit telemetry channel**~~ — shipped (per-CPU buffers + drain + ring + `SYS_AUDIT_*` consumer surface).
+3. ~~**Channels** — bulk-data path.~~ Shipped (control-path: create/attach/close/revoke through capabilities; bulk pages flow user-to-user).
+4. **Policy service** — boot-module shipped and identified at `POLICY_SERVICE_PID`; the `on_syscall` decision path is still permissive scaffolding. Externalizing the actual decisions is what's left.
+5. **Privileged audit consumer** — the audit ring + drain-skip counter are observable but nothing kernel-side polls them and escalates. Required for T-7 / T-8 to graduate from "visibility" to "structural defense."
+6. **Behavioral AI** — sits on top of policy + audit consumer. Watches the audit channel, emits recommendations into the policy service's input.
 
 For test coverage of the currently-enforced security points, see [STATUS.md § Test coverage](../STATUS.md#test-coverage).
 
