@@ -770,12 +770,20 @@ impl CapabilityManager {
         }
         caps.count = 0;
 
-        // Clear system capabilities (Phase 3.2b, 3.2d.iii, Phase GUI-0+).
+        // Clear system capabilities (Phase 3.2b, 3.2d.iii, Phase GUI-0+,
+        // T-7 Phase A). Every flag in `ProcessCapabilities` must reset
+        // here — security-review 2026-04-25 caught `emit_input_audit`
+        // missing on the original T-7 Phase A landing. Dead today
+        // (handle_exit pairs revoke_all with unregister_process which
+        // rebuilds the slot via ProcessCapabilities::new) but a
+        // landmine for any future "soft-revoke without unregister" path
+        // (Phase 3.4 +).
         caps.create_process = false;
         caps.create_channel = false;
         caps.legacy_port_io = false;
         caps.map_framebuffer = false;
         caps.large_channel = false;
+        caps.emit_input_audit = false;
 
         Ok(count)
     }
@@ -1205,6 +1213,51 @@ mod tests {
         // And the process entry is still registered (revoke_all is scoped to
         // caps, not the table entry — unregister_process is the separate path).
         assert!(mgr.get_capabilities(proc_id).is_ok());
+    }
+
+    #[test]
+    fn test_revoke_all_clears_every_system_capability() {
+        // Regression for security-review 2026-04-25 (F2): every variant of
+        // CapabilityKind that is_system() must be cleared by
+        // revoke_all_for_process. Originally `emit_input_audit` was missing
+        // from the reset block — dead today (handle_exit pairs revoke_all
+        // with unregister_process which rebuilds the slot fresh) but a
+        // landmine for any future soft-revoke path. Walk every variant
+        // exhaustively to catch the next time someone adds a system cap
+        // and forgets the reset.
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        let system_kinds = [
+            CapabilityKind::CreateProcess,
+            CapabilityKind::CreateChannel,
+            CapabilityKind::LegacyPortIo,
+            CapabilityKind::MapFramebuffer,
+            CapabilityKind::LargeChannel,
+            CapabilityKind::EmitInputAudit,
+        ];
+
+        for kind in system_kinds {
+            mgr.grant_system_capability(proc_id, kind).unwrap();
+            assert_eq!(
+                mgr.has_system_capability(proc_id, kind).unwrap(),
+                true,
+                "grant did not stick for {:?}",
+                kind,
+            );
+        }
+
+        mgr.revoke_all_for_process(proc_id).unwrap();
+
+        for kind in system_kinds {
+            assert_eq!(
+                mgr.has_system_capability(proc_id, kind).unwrap(),
+                false,
+                "revoke_all left {:?} set",
+                kind,
+            );
+        }
     }
 
     #[test]

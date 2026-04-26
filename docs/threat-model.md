@@ -165,13 +165,13 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 **Why it matters for CambiOS.** The compositor trusts the first-window-wins policy. There is no trust tier on input routing — every focused window is equally trusted with every input event. ADR-012 Input-5 (trust tiers / signed carrier) is explicitly deferred.
 
-**Current mitigation.** None beyond "first wins." Input Hub is not deployed. Signed-carrier hardware does not yet exist.
+**Current mitigation.** Phase A landed 2026-04-25 (`95389de`): every focus transition the compositor performs is recorded in the kernel audit ring as an `InputFocusChange` event (`SYS_AUDIT_EMIT_INPUT_FOCUS = 41`, `CapabilityKind::EmitInputAudit`). The capability is granted **only** to the compositor at spawn time — the original landing over-granted to every spawned boot module, which the 2026-04-25 self-review caught (F1) and a follow-up commit narrowed to `name == b"compositor"` in `handle_spawn`. The structural first-live-window focus model is unchanged; what's new is that a snoop-by-focus-race no longer happens silently — every focus transition leaves an audit trail with the new owner Principal, observable by any consumer holding `SYS_AUDIT_ATTACH`.
 
-**Gap.** Anti-spoofing on focus transitions. User-visible indicator of which process holds focus. Trust-tier-per-event routing.
+**Gap.** Audit observability is a Phase A mitigation, not a structural defense — the underlying first-live-window focus model still routes keystrokes to whoever wins the slot-0 race. Phase B (trust-tier filtering at routing time) is blocked on ADR-012 Input-Hub. Phase C (focus-display UI) is blocked on `SYS_SLEEP`. No automatic alarm or anomaly detector consumes the audit stream yet; the trail exists but nothing reads it on a schedule.
 
-**Severity.** Medium (elevation of one app to snoop another's input). **Status.** Live.
+**Severity.** Medium (elevation of one app to snoop another's input). **Status.** Mitigated (Phase A — observability shipped; structural defense Phase B/C still queued).
 
-**Revisit when:** a second input consumer appears (triggers Input Hub per ADR-012 Divergence); or any window class gains a higher-trust tier in the compositor.
+**Revisit when:** a second input consumer appears (triggers Input Hub per ADR-012 Divergence) for Phase B; `SYS_SLEEP` lands and a Principal-name registry exists for Phase C; or a privileged audit consumer (init, policy service, dedicated audit-health task) starts polling the ring and acting on focus-transition anomalies.
 
 ---
 

@@ -2210,17 +2210,23 @@ impl SyscallDispatcher {
                     process_id,
                     CapabilityKind::CreateChannel,
                 );
-                // T-7 Phase A (docs/threat-model.md): spawned processes may
-                // emit InputFocusChange events. Compositor is the only
-                // caller today; ungated grant matches CreateProcess /
-                // CreateChannel ("trusted boot modules only").
-                // Deferred: narrow to compositor-only when an identity-
-                // aware grant flow lands. Revisit when: Frame-B identity
-                // rewrite or a non-compositor focus router appears.
-                let _ = cap_mgr.grant_system_capability(
-                    process_id,
-                    CapabilityKind::EmitInputAudit,
-                );
+                // T-7 Phase A (docs/threat-model.md): only the compositor
+                // gets EmitInputAudit. The cap was over-granted to every
+                // spawned module in the original landing (mirroring
+                // CreateProcess / CreateChannel) — security-review
+                // 2026-04-25 caught the forgery surface that creates: any
+                // shell-spawned app (games, terminal-window) holding the
+                // cap could call SYS_AUDIT_EMIT_INPUT_FOCUS with an
+                // arbitrary owner_principal, fabricating focus-transition
+                // audit entries that look like legitimate compositor
+                // emissions. Narrowing to name == "compositor" closes the
+                // forgery vector now without waiting for Frame-B.
+                if name == b"compositor" {
+                    let _ = cap_mgr.grant_system_capability(
+                        process_id,
+                        CapabilityKind::EmitInputAudit,
+                    );
+                }
                 // Bind bootstrap Principal
                 if !bootstrap.is_zero() {
                     let _ = cap_mgr.bind_principal(process_id, bootstrap);
