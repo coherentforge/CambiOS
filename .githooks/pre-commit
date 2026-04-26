@@ -12,13 +12,18 @@
 # land. Any nonzero exit fails the commit.
 #
 # Lints in order:
-#   check-banned-paths:    Paths deleted from git must not reappear on
-#                          disk. See tools/banned-paths.txt and
-#                          tools/check-banned-paths.py.
-#   check-index-isolation: STATUS.md structural changes must commit alone
-#                          (or with docs-only siblings), never bundled
-#                          with *.rs source files. See
-#                          tools/check-index-isolation.py for rationale.
+#   check-banned-paths:        Paths deleted from git must not reappear on
+#                              disk. See tools/banned-paths.txt and
+#                              tools/check-banned-paths.py.
+#   check-index-isolation:     STATUS.md structural changes must commit
+#                              alone (or with docs-only siblings), never
+#                              bundled with *.rs source files. See
+#                              tools/check-index-isolation.py for rationale.
+#   check-lockfile-additions:  When Cargo.lock is staged, surface every
+#                              new (crate, version) pair so the human
+#                              reviews supply-chain deltas before they
+#                              land. Advisory only — exit 0 unconditional.
+#                              T-1 in docs/threat-model.md.
 #
 # Bypass: `git commit --no-verify` (discouraged; use for emergencies only).
 
@@ -28,3 +33,4 @@ cd "$(git rev-parse --show-toplevel)"
 
 python3 tools/check-banned-paths.py
 python3 tools/check-index-isolation.py
+python3 tools/check-lockfile-additions.py

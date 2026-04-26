@@ -39,13 +39,13 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 **Why it matters for CambiOS.** The verification story ends at the Rust source. Build scripts are not sandboxed by the kernel target triple — they run as the developer's user on the developer's macOS host, with full FS access. The YubiKey signs hashes, not intent; the signed-ELF chain of trust is only as strong as the host that produced the hash.
 
-**Current mitigation.** Solo author with an auditable tree. No known poisoned deps. Formal verification (future) would not catch this — it verifies the written source, not the built artifact.
+**Current mitigation.** Solo author with an auditable tree. No known poisoned deps. Formal verification (future) would not catch this — it verifies the written source, not the built artifact. **2026-04-25:** added `tools/check-lockfile-additions.py` + `.githooks/pre-commit` invocation + `make check-lockfile` (advisory, exit 0 always). Every commit that stages `Cargo.lock` prints added/removed `(crate, version)` pairs to stderr so the committer sees the supply-chain delta at the moment it enters the tree. This is *visibility*, not enforcement — legitimate `cargo update` and intentional new deps still flow.
 
-**Gap.** No lockfile audit gate. No reproducible-build check. No `cargo-vet` / `cargo-crev`. No host hardening discipline documented.
+**Gap.** Visibility gate doesn't block — a fast-moving solo author can still merge a poisoned PR without reading the stderr. No reproducible-build check. No `cargo-vet` / `cargo-crev` per-(crate, version) audit state. No host hardening discipline documented.
 
-**Severity.** Critical. **Status.** Live.
+**Severity.** Critical. **Status.** Live (now with visibility advisory; structural mitigation deferred).
 
-**Revisit when:** first external contributor lands a PR that touches `Cargo.toml` or `Cargo.lock`; or when CI infrastructure (GitHub Actions, etc.) gains the ability to run `cargo build` on fork PRs.
+**Revisit when:** first external contributor lands a PR that touches `Cargo.toml` or `Cargo.lock`; or when CI infrastructure (GitHub Actions, etc.) gains the ability to run `cargo build` on fork PRs. At that trigger, layer in `cargo-vet` initialization (seed `supply-chain/audits.toml` from the current lockfile) and tighten the lint to a hard block on un-vetted additions.
 
 ---
 

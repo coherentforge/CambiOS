@@ -1010,6 +1010,16 @@ check-index-isolation:
 check-banned-paths:
 	@python3 tools/check-banned-paths.py
 
+# Surface every new (crate, version) pair pulled into Cargo.lock by this
+# commit (or, when run between commits, since HEAD). Advisory — does not
+# block. The point is visibility: build.rs and proc macros run with full
+# host privileges before any signature is checked, so a poisoned
+# transitive dep is the highest-yield supply-chain attack on a Rust
+# project. T-1 in docs/threat-model.md. Wired into .githooks/pre-commit;
+# also runnable as `make check-lockfile`.
+check-lockfile:
+	@python3 tools/check-lockfile-additions.py
+
 # Pre-edit audit for a file. Run before the first Edit on any file per
 # session — especially under parallel-thread development. Surfaces
 # uncommitted changes (HEAD commit, status, full diff) so the caller
