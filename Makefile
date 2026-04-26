@@ -1313,6 +1313,28 @@ check-aarch64:
 check-riscv64:
 	cargo build --target riscv64gc-unknown-none-elf --release
 
+# ---------------------------------------------------------------------------
+# Fuzzing — Tier 1 step B (~/.claude/plans/scope-tier-2-also-prancy-manatee.md)
+#
+# x86_64-apple-darwin matches `cargo test --lib`'s host triple and avoids
+# the aarch64 backend's inline asm that references labels in
+# `cfg(not(any(test, fuzzing)))` global_asm blocks. Switching to an
+# aarch64 host (default on Apple Silicon) requires `fuzz_asm_stubs` for
+# the aarch64 backend — currently only the x86_64 backend has those.
+#
+# `make fuzz-syscall-dispatcher` smoke-runs for 60 s; pass extra
+# libfuzzer args via FUZZ_ARGS, e.g.
+#   make fuzz-syscall-dispatcher FUZZ_ARGS="-max_total_time=86400"
+# for a 24 h run.
+.PHONY: fuzz-build fuzz-syscall-dispatcher
+FUZZ_ARGS ?= -max_total_time=60 -print_final_stats=1
+fuzz-build:
+	cargo +nightly fuzz build --fuzz-dir fuzz --target x86_64-apple-darwin
+
+fuzz-syscall-dispatcher:
+	cargo +nightly fuzz run --fuzz-dir fuzz --target x86_64-apple-darwin \
+		fuzz_syscall_dispatcher -- $(FUZZ_ARGS)
+
 clean:
 	cargo clean
 	rm -f $(ISO) $(IMG_X86) $(IMG_AARCH64) $(INITRD_RISCV64)

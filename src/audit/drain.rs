@@ -372,6 +372,14 @@ pub fn drain_tick() {
     // Lock contended or ring not initialized — skip this tick.
 }
 
+/// No-op under `cfg(test)` and `cfg(fuzzing)`: the audit ring is not
+/// initialized in those modes (no `BootInfo`, no frame allocator).
+/// The arch-specific timer-ISR call sites in `src/scheduler/mod.rs`
+/// reach this path under fuzzing because they are gated only by
+/// `#[cfg(all(not(test), target_arch = "..."))]`.
+#[cfg(any(test, fuzzing))]
+pub fn drain_tick() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,6 +6,13 @@
 # Exclude them from the kernel workspace to prevent accidental cross-compilation.
 exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user/virtio-blk", "user/virtio-input", "user/i219-net", "user/udp-stack", "user/shell", "user/policy-service", "user/libsys", "user/libterm", "user/libflag", "user/libfs", "user/libfs-proto", "user/libscanout", "user/libgui-proto", "user/libgui", "user/libinput-proto", "user/fb-demo", "user/hello-window", "user/compositor", "user/scanout-limine", "user/scanout-virtio-gpu", "user/tree", "user/worm", "user/pong", "user/super-sprouty-o", "user/terminal-window", "tools/sign-elf", "tools/mkinitrd", "verification/buddy-proofs", "verification/elf-proofs", "verification/frame-proofs", "verification/capability-proofs"]
 
+[lints.rust]
+# `cfg(fuzzing)` is set by cargo-fuzz when building under libfuzzer-sys; the
+# kernel uses it (parallel to `cfg(test)`) to gate host-runnable shims for
+# bare-metal-only paths (asm stubs, audit emit, etc.). Register here so
+# rustc's `unexpected_cfgs` lint doesn't warn at every site.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [package]
 name = "arcos"
 version = "0.1.0"

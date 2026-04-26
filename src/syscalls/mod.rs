@@ -10,6 +10,9 @@ pub mod dispatcher;
 pub mod user_slice;
 pub mod userspace;
 
+#[cfg(fuzzing)]
+pub mod fuzz_fixture;
+
 pub use user_slice::{UserReadSlice, UserWriteSlice};
 
 

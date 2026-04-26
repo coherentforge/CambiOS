@@ -366,14 +366,14 @@ impl CapabilityManager {
 
     /// Test-only constructor that allocates a host-side `Vec` of the
     /// given size and leaks it into a `'static` slice. Only usable in
-    /// host unit tests; the kernel path always goes through
-    /// [`from_object_slice`].
-    #[cfg(test)]
+    /// host unit tests and fuzz harnesses; the kernel path always goes
+    /// through [`from_object_slice`].
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn new_for_test() -> Box<Self> {
         Self::new_for_test_with_capacity(32)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn new_for_test_with_capacity(num_slots: usize) -> Box<Self> {
         let mut v: alloc::vec::Vec<Option<ProcessCapabilities>> =
             alloc::vec::Vec::with_capacity(num_slots);
