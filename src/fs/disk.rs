@@ -200,6 +200,50 @@ struct SuperblockFields {
     created_at: u64,
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Fixed-size little-endian readers.
+//
+// The on-disk format places multi-byte fields at constant offsets within
+// a `Block` (`[u8; 4096]`). The natural Rust idiom is
+// `slice.try_into().unwrap()` to convert a `&[u8]` slice into a fixed
+// `[u8; N]` for `from_le_bytes` — but the unwrap is a panic the
+// compiler cannot statically eliminate from the slice path. These
+// helpers use literal byte indexing into the array, which monomorphizes
+// to constant-folded bounds checks at every call site (every offset
+// here is a `const usize` well below `BLOCK_SIZE = 4096`), and so are
+// provably panic-free per CLAUDE.md's "no panics in non-test kernel
+// code" rule.
+// ────────────────────────────────────────────────────────────────────────
+
+#[inline]
+const fn read_u16_le(buf: &Block, offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+#[inline]
+const fn read_u32_le(buf: &Block, offset: usize) -> u32 {
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
+}
+
+#[inline]
+const fn read_u64_le(buf: &Block, offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuperblockState {
     Blank,
@@ -228,15 +272,9 @@ fn classify_superblock(buf: &Block) -> SuperblockState {
     if on_disk_cs != expected_cs {
         return SuperblockState::Corrupt;
     }
-    let version = u32::from_le_bytes(
-        buf[SB_OFF_VERSION..SB_OFF_VERSION + 4].try_into().unwrap(),
-    );
-    let capacity_slots = u64::from_le_bytes(
-        buf[SB_OFF_CAPACITY..SB_OFF_CAPACITY + 8].try_into().unwrap(),
-    );
-    let generation = u64::from_le_bytes(
-        buf[SB_OFF_GENERATION..SB_OFF_GENERATION + 8].try_into().unwrap(),
-    );
+    let version = read_u32_le(buf, SB_OFF_VERSION);
+    let capacity_slots = read_u64_le(buf, SB_OFF_CAPACITY);
+    let generation = read_u64_le(buf, SB_OFF_GENERATION);
     SuperblockState::Valid(SuperblockSnapshot {
         capacity_slots,
         generation,
@@ -328,11 +366,7 @@ fn decode_record_header(buf: &Block) -> Result<Option<HeaderDecoded>, StoreError
         return Ok(None);
     }
 
-    let content_len = u32::from_le_bytes(
-        buf[HDR_OFF_CONTENT_LEN..HDR_OFF_CONTENT_LEN + 4]
-            .try_into()
-            .unwrap(),
-    );
+    let content_len = read_u32_le(buf, HDR_OFF_CONTENT_LEN);
     if content_len as usize > MAX_CONTENT_BYTES_ON_DISK {
         return Err(StoreError::InvalidObject);
     }
@@ -356,19 +390,11 @@ fn decode_record_header(buf: &Block) -> Result<Option<HeaderDecoded>, StoreError
     } else {
         None
     };
-    let cap_count = u16::from_le_bytes(
-        buf[HDR_OFF_CAP_COUNT..HDR_OFF_CAP_COUNT + 2]
-            .try_into()
-            .unwrap(),
-    );
+    let cap_count = read_u16_le(buf, HDR_OFF_CAP_COUNT);
     if cap_count as usize > MAX_OBJECT_CAPS {
         return Err(StoreError::InvalidObject);
     }
-    let created_at = u64::from_le_bytes(
-        buf[HDR_OFF_CREATED_AT..HDR_OFF_CREATED_AT + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let created_at = read_u64_le(buf, HDR_OFF_CREATED_AT);
 
     let mut signature = SignatureBytes::EMPTY;
     signature
@@ -380,11 +406,7 @@ fn decode_record_header(buf: &Block) -> Result<Option<HeaderDecoded>, StoreError
         let base = HDR_OFF_CAPS + i * CAP_ENTRY_SIZE;
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&buf[base + CAP_OFF_PRINCIPAL..base + CAP_OFF_PRINCIPAL + 32]);
-        let expiry_raw = u64::from_le_bytes(
-            buf[base + CAP_OFF_EXPIRY..base + CAP_OFF_EXPIRY + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let expiry_raw = read_u64_le(buf, base + CAP_OFF_EXPIRY);
         let expiry = if expiry_raw == 0 { None } else { Some(expiry_raw) };
         let rights_bits = buf[base + CAP_OFF_RIGHTS];
         let rights = ObjectRights {
@@ -582,11 +604,7 @@ impl<B: BlockDevice> DiskObjectStore<B> {
         device
             .read_block(SUPERBLOCK_LBA, &mut sb_buf)
             .map_err(block_err_to_store)?;
-        let created_at = u64::from_le_bytes(
-            sb_buf[SB_OFF_CREATED_AT..SB_OFF_CREATED_AT + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let created_at = read_u64_le(&sb_buf, SB_OFF_CREATED_AT);
         encode_superblock(&mut sb_buf, capacity_slots, next_generation, created_at);
         device
             .write_block(SUPERBLOCK_LBA, &sb_buf)

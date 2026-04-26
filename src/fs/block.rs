@@ -28,7 +28,12 @@
 //! Phase 4a.iii when the IPC-capable backend arrives.
 
 extern crate alloc;
+// `Vec` and `vec!` are only used by the test-gated `MemBlockDevice`
+// below; gate the imports to match so release builds don't carry
+// unused-import warnings.
+#[cfg(test)]
 use alloc::vec;
+#[cfg(test)]
 use alloc::vec::Vec;
 
 /// HARDWARE: on-disk sector size for the persistent ObjectStore.
@@ -107,11 +112,18 @@ pub trait BlockDevice: Send {
 /// `DiskObjectStore` code path that will eventually talk to virtio-blk runs
 /// against a `MemBlockDevice` in `cargo test`, so the on-disk format is
 /// exercised on every test run with zero hardware dependency.
+///
+/// Test-only: gated under `#[cfg(test)]` so the `expect()` in `new()`
+/// stays inside test code per CLAUDE.md's "no panics in non-test
+/// kernel code" rule. The struct + impls are never linked into a
+/// release kernel build.
+#[cfg(test)]
 pub struct MemBlockDevice {
     data: Vec<u8>,
     capacity_blocks: u64,
 }
 
+#[cfg(test)]
 impl MemBlockDevice {
     /// Create a zero-initialized in-memory device with the given capacity in
     /// blocks. Total backing memory = `capacity_blocks * BLOCK_SIZE` bytes.
@@ -138,6 +150,7 @@ impl MemBlockDevice {
     }
 }
 
+#[cfg(test)]
 impl BlockDevice for MemBlockDevice {
     fn capacity_blocks(&self) -> u64 {
         self.capacity_blocks

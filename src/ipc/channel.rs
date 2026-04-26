@@ -225,6 +225,12 @@ pub enum ChannelError {
     AlreadyAttached,
     /// Permission denied (wrong authority for close/revoke).
     PermissionDenied,
+    /// Internal invariant violation (e.g. a slot the manager just
+    /// confirmed populated turned out to be `None`). This should never
+    /// occur if the channel-manager bookkeeping is correct; surfacing
+    /// it as a typed error rather than `expect()` keeps the kernel
+    /// panic-free even if a future invariant break slips through.
+    InternalInvariant,
 }
 
 impl core::fmt::Display for ChannelError {
@@ -239,6 +245,7 @@ impl core::fmt::Display for ChannelError {
             Self::InvalidSize => write!(f, "Invalid channel size"),
             Self::AlreadyAttached => write!(f, "Channel already attached"),
             Self::PermissionDenied => write!(f, "Permission denied"),
+            Self::InternalInvariant => write!(f, "Channel manager internal invariant violation"),
         }
     }
 }
@@ -465,10 +472,13 @@ impl ChannelManager {
 
         // Re-borrow as shared (the mutable borrow above is consumed by
         // the state mutation; this re-borrow is valid because we return
-        // a shared reference).
-        Ok(self.channels[channel_id.index() as usize]
+        // a shared reference). The slot was just populated above, so
+        // `as_ref()` returning `None` would be an internal invariant
+        // break — surface it as `InternalInvariant` rather than
+        // panicking, per CLAUDE.md's no-panic kernel rule.
+        self.channels[channel_id.index() as usize]
             .as_ref()
-            .expect("channel was just set to Some"))
+            .ok_or(ChannelError::InternalInvariant)
     }
 
     /// Close a channel gracefully.
@@ -504,7 +514,7 @@ impl ChannelManager {
         let idx = channel_id.index() as usize;
         let mut taken = self.channels[idx]
             .take()
-            .expect("lookup_mut succeeded, so slot is Some");
+            .ok_or(ChannelError::InternalInvariant)?;
         taken.state = ChannelState::Closed;
         self.count -= 1;
         self.generations[idx] = self.generations[idx].wrapping_add(1);
@@ -531,7 +541,7 @@ impl ChannelManager {
         let idx = channel_id.index() as usize;
         let mut taken = self.channels[idx]
             .take()
-            .expect("lookup succeeded, so slot is Some");
+            .ok_or(ChannelError::InternalInvariant)?;
 
         match taken.state {
             ChannelState::Closed | ChannelState::Revoked => {

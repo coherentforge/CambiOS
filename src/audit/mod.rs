@@ -104,6 +104,30 @@ pub struct RawAuditEvent {
     pub data: [u8; RAW_AUDIT_EVENT_SIZE],
 }
 
+/// Read a little-endian `u64` from a fixed 8-byte window of a borrowed
+/// fixed-size array. Pure literal indexing — provably panic-free in
+/// monomorphized code because the eight bounds checks
+/// `offset + i < N` are constant-folded at every call site (every
+/// caller in this module passes a literal offset against a known
+/// `const N`).
+///
+/// Used by [`RawAuditEvent`]'s u64-field accessors and by the
+/// builder constructors that splat 24- or 32-byte hash/principal
+/// prefixes into the `arg1..arg3` slots.
+#[inline]
+const fn read_u64_le<const N: usize>(arr: &[u8; N], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        arr[offset],
+        arr[offset + 1],
+        arr[offset + 2],
+        arr[offset + 3],
+        arr[offset + 4],
+        arr[offset + 5],
+        arr[offset + 6],
+        arr[offset + 7],
+    ])
+}
+
 impl RawAuditEvent {
     /// All-zero event (used for array initialization in tests and drain buffers).
     pub const ZERO: Self = Self { data: [0u8; RAW_AUDIT_EVENT_SIZE] };
@@ -131,25 +155,25 @@ impl RawAuditEvent {
     /// The timestamp in ticks (bytes 8..16).
     #[inline]
     pub fn timestamp(&self) -> u64 {
-        u64::from_le_bytes(self.data[8..16].try_into().unwrap())
+        read_u64_le(&self.data, 8)
     }
 
     /// The subject ProcessId raw value (bytes 16..24).
     #[inline]
     pub fn subject_pid(&self) -> u64 {
-        u64::from_le_bytes(self.data[16..24].try_into().unwrap())
+        read_u64_le(&self.data, 16)
     }
 
     /// The object identifier (bytes 24..32).
     #[inline]
     pub fn object_id(&self) -> u64 {
-        u64::from_le_bytes(self.data[24..32].try_into().unwrap())
+        read_u64_le(&self.data, 24)
     }
 
     /// Event-specific argument 0 (bytes 32..40).
     #[inline]
     pub fn arg0(&self) -> u64 {
-        u64::from_le_bytes(self.data[32..40].try_into().unwrap())
+        read_u64_le(&self.data, 32)
     }
 
     // ── Typed builder constructors ──
@@ -430,9 +454,9 @@ impl RawAuditEvent {
         timestamp: u64,
         sequence: u32,
     ) -> Self {
-        let arg1 = u64::from_le_bytes(hash_prefix[0..8].try_into().unwrap());
-        let arg2 = u64::from_le_bytes(hash_prefix[8..16].try_into().unwrap());
-        let arg3 = u64::from_le_bytes(hash_prefix[16..24].try_into().unwrap());
+        let arg1 = read_u64_le(&hash_prefix, 0);
+        let arg2 = read_u64_le(&hash_prefix, 8);
+        let arg3 = read_u64_le(&hash_prefix, 16);
         Self::build(
             AuditEventKind::BinaryLoaded,
             0,
@@ -553,8 +577,17 @@ impl RawAuditEvent {
     /// - `arg0`: old window_id (0 = no prior focus, e.g. first window)
     /// - `arg1..arg3`: first 24 bytes of the new owner Principal (zero
     ///   when focus was lost). Mirrors `binary_loaded`'s 24-byte hash
-    ///   prefix — enough to disambiguate any Principal in practice
-    ///   (Ed25519 public keys collide at random rates of 2^-96).
+    ///   prefix — sufficient to disambiguate Principals at random
+    ///   collision rates of 2^-96, which is the relevant property for
+    ///   an audit log human or pattern-detector reading the stream.
+    ///
+    /// **Not a security-decision input.** A motivated attacker can grind
+    /// a Principal whose first 24 bytes match a target's at ~2^96 work,
+    /// far below the full-Principal collision floor. Any kernel or
+    /// service code making an authorization decision based on
+    /// "the focused window belongs to Principal X" MUST resolve the
+    /// full 32-byte Principal via the process table — never reconstruct
+    /// it from the audit-event prefix.
     pub fn input_focus_change(
         compositor: ProcessId,
         new_window_id: u32,
@@ -563,9 +596,9 @@ impl RawAuditEvent {
         timestamp: u64,
         sequence: u32,
     ) -> Self {
-        let arg1 = u64::from_le_bytes(new_owner_principal[0..8].try_into().unwrap());
-        let arg2 = u64::from_le_bytes(new_owner_principal[8..16].try_into().unwrap());
-        let arg3 = u64::from_le_bytes(new_owner_principal[16..24].try_into().unwrap());
+        let arg1 = read_u64_le(&new_owner_principal, 0);
+        let arg2 = read_u64_le(&new_owner_principal, 8);
+        let arg3 = read_u64_le(&new_owner_principal, 16);
         Self::build(
             AuditEventKind::InputFocusChange,
             0,
