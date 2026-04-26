@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Override the parent's `.cargo/config.toml` (which targets the kernel's
+# bare-metal triple `x86_64-unknown-none`). The proof crate runs on the
+# host under Kani.
+#
+# Matches the buddy-/elf-/frame-/capability-proofs convention. The
+# crate's `crate::memory::paging` stub provides arch-agnostic types
+# (a unit-struct OffsetPageTable), so the include of
+# `src/syscalls/user_slice.rs` compiles under either host arch.
+# `USER_SPACE_END` inside user_slice.rs is `cfg(target_arch =
+# "x86_64")`-conditional; the matching constant in `mod proofs` carries
+# the same `cfg` so it tracks whichever arch Kani picks.
+[build]
+target = "aarch64-apple-darwin"
+
+# Clear the parent's kernel linker flags. They reference linker.ld /
+# code-model=kernel and don't apply to host builds.
+[target.aarch64-apple-darwin]
+rustflags = []

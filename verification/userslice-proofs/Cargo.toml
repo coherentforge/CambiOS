@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Standalone proof crate for the kernel's typed user-buffer slices
+# (UserReadSlice / UserWriteSlice — ADR-020, src/syscalls/user_slice.rs).
+# Excluded from the kernel workspace (see root Cargo.toml). Builds under
+# Kani's bundled toolchain via `cargo kani` from this directory.
+#
+# The proven source is the kernel's `src/syscalls/user_slice.rs`, included
+# verbatim via `#[path = ...]` — no copy, no fork. The file imports
+# `super::SyscallError` and `super::dispatcher::SyscallContext`; this
+# crate's `src/lib.rs` provides minimal stubs under `crate::syscalls::*`
+# so the include resolves. The page-walk helpers further down the file
+# (`read_user_buffer` / `write_user_buffer`) reference `crate::hhdm_offset`
+# and `crate::memory::paging::*`; those are also stubbed at the crate root
+# since the proofs only exercise `validate()` and never call the helpers.
+#
+# `build.rs` sets `--cfg fuzzing` to mirror the capability-proofs crate's
+# convention. `user_slice.rs` itself doesn't use `cfg(fuzzing)` today, so
+# the flag is currently inert here; landing it now keeps the convention
+# uniform across proof crates as user_slice grows new audit / scheduler
+# dependencies.
+
+[package]
+name = "userslice-proofs"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }

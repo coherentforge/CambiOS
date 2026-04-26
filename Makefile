@@ -1335,6 +1335,30 @@ fuzz-syscall-dispatcher:
 	cargo +nightly fuzz run --fuzz-dir fuzz --target x86_64-apple-darwin \
 		fuzz_syscall_dispatcher -- $(FUZZ_ARGS)
 
+# ---------------------------------------------------------------------------
+# Kani proofs — Tier 1 step D (UserSlice invariants) plus the four prior
+# proof crates. Each proof crate is workspace-excluded; cargo-kani uses its
+# own pinned nightly toolchain. Run individual proof crates from this
+# wrapper rather than `cd`-ing into each one.
+.PHONY: verify-userslice verify-capability verify-elf verify-frame verify-buddy verify-all
+verify-userslice:
+	cd verification/userslice-proofs && cargo kani
+
+verify-capability:
+	cd verification/capability-proofs && cargo kani
+
+verify-elf:
+	cd verification/elf-proofs && cargo kani
+
+verify-frame:
+	cd verification/frame-proofs && cargo kani
+
+verify-buddy:
+	cd verification/buddy-proofs && cargo kani
+
+verify-all: verify-buddy verify-elf verify-frame verify-capability verify-userslice
+	@echo "=== All proof crates verified ==="
+
 clean:
 	cargo clean
 	rm -f $(ISO) $(IMG_X86) $(IMG_AARCH64) $(INITRD_RISCV64)
