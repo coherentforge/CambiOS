@@ -306,6 +306,23 @@ const FS_CMD_PUT: u8 = 1;
 const FS_CMD_GET: u8 = 2;
 const FS_CMD_DELETE: u8 = 3;
 const FS_CMD_LIST: u8 = 4;
+const FS_CMD_PUT_BY_NAME: u8 = 6;
+const FS_CMD_STAT: u8 = 7;
+const FS_CMD_LIST_NAMED: u8 = 8;
+
+const FS_MAX_NAME_LEN: usize = 64;
+
+// STAT reply byte offsets (mirror libfs-proto::STAT_OFF_*; the shell mirrors
+// them locally rather than pulling libfs-proto as a dependency to keep the
+// shell's build graph small).
+const STAT_OFF_HASH: usize = 1;
+const STAT_OFF_AUTHOR: usize = 33;
+const STAT_OFF_OWNER: usize = 65;
+// STAT_OFF_NAME_LEN (136) intentionally omitted — the shell only reads
+// hash / author / owner. Name comes back too but we don't surface it
+// (we already know what we asked for). STAT_OFF_NAME below is the floor
+// the reply must reach to contain all three of our fields.
+const STAT_OFF_NAME: usize = 137;
 
 const FS_STATUS_OK: u8 = 0;
 const FS_STATUS_NOT_FOUND: u8 = 1;
@@ -319,6 +336,8 @@ fn cmd_arcobj(args: &[u8]) {
         b"put" => arcobj_put(rest),
         b"get" => arcobj_get(rest),
         b"list" => arcobj_list(),
+        b"name" => arcobj_name(rest),
+        b"names" => arcobj_names(),
         b"delete" | b"del" | b"rm" => arcobj_delete(rest),
         b"" => arcobj_usage(),
         _ => {
@@ -331,11 +350,13 @@ fn cmd_arcobj(args: &[u8]) {
 }
 
 fn arcobj_usage() {
-    sys::print(b"Usage: arcobj <put|get|list|delete> [args]\r\n");
-    sys::print(b"  arcobj put <text>          store bytes, print hash\r\n");
-    sys::print(b"  arcobj get <hex-hash>      retrieve by hash\r\n");
-    sys::print(b"  arcobj list                list all hashes\r\n");
-    sys::print(b"  arcobj delete <hex-hash>   delete by hash\r\n");
+    sys::print(b"Usage: arcobj <put|get|list|name|names|delete> [args]\r\n");
+    sys::print(b"  arcobj put <text>            store bytes, print hash\r\n");
+    sys::print(b"  arcobj get <hex-hash>        retrieve by hash\r\n");
+    sys::print(b"  arcobj list                  list all hashes\r\n");
+    sys::print(b"  arcobj name <name> <text>    store + bind a human name\r\n");
+    sys::print(b"  arcobj names                 list named objects with author+owner did:keys\r\n");
+    sys::print(b"  arcobj delete <hex-hash>     delete by hash\r\n");
 }
 
 fn arcobj_put(content: &[u8]) {
@@ -467,6 +488,230 @@ fn arcobj_delete(hex: &[u8]) {
         FS_STATUS_INVALID => sys::print(b"arcobj delete: invalid request\r\n"),
         _ => print_unknown_status("delete", status),
     }
+}
+
+// ----------------------------------------------------------------------------
+// `arcobj name` / `arcobj names` — name-bound objects with did:key principals
+//
+// `arcobj name` is one-shot put-by-name: stores content + binds a name in a
+// single fs-service round trip. `arcobj names` walks the name table and
+// surfaces each entry's hash, author Principal, and owner Principal — both
+// principals rendered as `did:key:z6Mk…` via the libsys encoder.
+//
+// The author/owner fields land on every CambiObject at write time via the
+// kernel's identity gate ([identity.md](docs/identity.md), Architectural
+// Invariant 2). This view makes that stamping observable.
+// ----------------------------------------------------------------------------
+
+fn arcobj_name(args: &[u8]) {
+    let (name, content) = split_first_space(args);
+    if name.is_empty() {
+        sys::print(b"arcobj name: missing name\r\n");
+        return;
+    }
+    if name.len() > FS_MAX_NAME_LEN {
+        sys::print(b"arcobj name: name exceeds 64-byte limit\r\n");
+        return;
+    }
+    if content.is_empty() {
+        sys::print(b"arcobj name: missing content\r\n");
+        return;
+    }
+    if content.len() > 200 {
+        sys::print(b"arcobj name: content exceeds 200-byte limit\r\n");
+        return;
+    }
+
+    // Request layout (matches user/libfs/src/lib.rs:271-287):
+    //   [CMD:1][name_len:1][has_parent:1=0][parent:32=0][content_type:1=0]
+    //   [content_len:4 LE][name:N][content:M]
+    // Header = 40 bytes; fits well inside the 256-byte IPC frame for any
+    // (name ≤ 64) + (content ≤ 200).
+    let mut req = [0u8; 256];
+    req[0] = FS_CMD_PUT_BY_NAME;
+    req[1] = name.len() as u8;
+    // bytes 2..40 stay zeroed: has_parent=0, parent=0…0, content_type=0.
+    let content_len = content.len() as u32;
+    req[36..40].copy_from_slice(&content_len.to_le_bytes());
+    let header_len = 40;
+    req[header_len..header_len + name.len()].copy_from_slice(name);
+    let content_start = header_len + name.len();
+    req[content_start..content_start + content.len()].copy_from_slice(content);
+    let req_len = content_start + content.len();
+
+    let reply = match fs_call(&req[..req_len]) {
+        Some(r) => r,
+        None => return,
+    };
+    let (status, payload) = reply.split();
+
+    match status {
+        FS_STATUS_OK => {
+            if payload.len() < 32 {
+                sys::print(b"arcobj name: short OK reply\r\n");
+                return;
+            }
+            sys::print(b"named: ");
+            sys::print(name);
+            sys::print(b" -> ");
+            print_hex32(&payload[..32]);
+            sys::print(b"\r\n");
+        }
+        FS_STATUS_FULL => sys::print(b"arcobj name: store full\r\n"),
+        FS_STATUS_DENIED => sys::print(b"arcobj name: denied (key-store unavailable)\r\n"),
+        FS_STATUS_INVALID => sys::print(b"arcobj name: invalid request\r\n"),
+        _ => print_unknown_status("name", status),
+    }
+}
+
+fn arcobj_names() {
+    let mut cursor: u32 = 0;
+    let mut total: u64 = 0;
+    let mut printed_header = false;
+
+    loop {
+        // LIST_NAMED request: [CMD][cursor:4 LE][prefix_len:1=0]
+        let mut req = [0u8; 6];
+        req[0] = FS_CMD_LIST_NAMED;
+        req[1..5].copy_from_slice(&cursor.to_le_bytes());
+        // req[5] = prefix_len = 0 (already zero-initialized)
+
+        let reply = match fs_call(&req) {
+            Some(r) => r,
+            None => return,
+        };
+        let (status, payload) = reply.split();
+
+        if status != FS_STATUS_OK {
+            print_unknown_status("names", status);
+            return;
+        }
+        // Reply layout (matches fs-service handle_list_named):
+        //   [count:1][next_cursor:4 LE][[name_len:1][name:N]]…
+        if payload.len() < 5 {
+            sys::print(b"arcobj names: short OK reply\r\n");
+            return;
+        }
+        let count = payload[0] as usize;
+        let next_cursor =
+            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+
+        if !printed_header {
+            sys::print(b"named objects:\r\n");
+            printed_header = true;
+        }
+
+        // Walk entries in this page and STAT each one.
+        let mut off = 5;
+        for _ in 0..count {
+            if off >= payload.len() {
+                sys::print(b"arcobj names: truncated entry\r\n");
+                return;
+            }
+            let nlen = payload[off] as usize;
+            off += 1;
+            if off + nlen > payload.len() || nlen == 0 || nlen > FS_MAX_NAME_LEN {
+                sys::print(b"arcobj names: bad name length\r\n");
+                return;
+            }
+            // Copy the name out so the borrow on `payload` ends before we
+            // issue the STAT call (which reuses the underlying recv buffer).
+            let mut name_buf = [0u8; FS_MAX_NAME_LEN];
+            name_buf[..nlen].copy_from_slice(&payload[off..off + nlen]);
+            off += nlen;
+            print_named_entry(&name_buf[..nlen]);
+            total += 1;
+        }
+
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    if total == 0 {
+        sys::print(b"  (none)\r\n");
+    } else {
+        sys::print(b"  (");
+        print_u64(total);
+        sys::print(b" total)\r\n");
+    }
+}
+
+/// Send a STAT for `name` and print one formatted line. Silently skips
+/// (with a single line of error context) if the STAT fails — `arcobj names`
+/// is a survey command, not a transaction.
+fn print_named_entry(name: &[u8]) {
+    let mut req = [0u8; 256];
+    req[0] = FS_CMD_STAT;
+    req[1] = name.len() as u8;
+    req[2..2 + name.len()].copy_from_slice(name);
+    let req_len = 2 + name.len();
+
+    let reply = match fs_call(&req[..req_len]) {
+        Some(r) => r,
+        None => return,
+    };
+    let (status, _) = reply.split();
+    if status != FS_STATUS_OK {
+        sys::print(b"  ");
+        sys::print(name);
+        sys::print(b"  (stat failed: status ");
+        print_u64(status as u64);
+        sys::print(b")\r\n");
+        return;
+    }
+    // STAT reply layout: STATUS at 0, then (at absolute offsets matching
+    // libfs-proto::STAT_OFF_*): hash@1, author@33, owner@65, … name_len@136,
+    // name@137. We need hash + author + owner.
+    if reply.len < STAT_OFF_NAME {
+        sys::print(b"  ");
+        sys::print(name);
+        sys::print(b"  (stat reply truncated)\r\n");
+        return;
+    }
+    let hash = &reply.buf[STAT_OFF_HASH..STAT_OFF_HASH + 32];
+    let mut author = [0u8; 32];
+    author.copy_from_slice(&reply.buf[STAT_OFF_AUTHOR..STAT_OFF_AUTHOR + 32]);
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(&reply.buf[STAT_OFF_OWNER..STAT_OFF_OWNER + 32]);
+
+    sys::print(b"  ");
+    sys::print(name);
+    sys::print(b"  hash=");
+    print_hex_short(hash);
+    sys::print(b"  author=");
+    print_principal_did_key(&author);
+    sys::print(b"  owner=");
+    print_principal_did_key(&owner);
+    sys::print(b"\r\n");
+}
+
+/// Print the first 8 bytes of a hash as 16 hex chars + ellipsis. Keeps each
+/// `arcobj names` row scannable on a 100-col terminal alongside two
+/// did:keys.
+fn print_hex_short(bytes: &[u8]) {
+    let n = core::cmp::min(bytes.len(), 8);
+    let mut buf = [0u8; 16];
+    for i in 0..n {
+        let hi = bytes[i] >> 4;
+        let lo = bytes[i] & 0xF;
+        buf[i * 2] = hex_nibble(hi);
+        buf[i * 2 + 1] = hex_nibble(lo);
+    }
+    sys::print(&buf[..n * 2]);
+    sys::print(b"...");
+}
+
+/// Render a 32-byte principal as did:key:z6Mk…, or the literal string
+/// `(anonymous)` if it's the zero Principal.
+fn print_principal_did_key(pk: &[u8; 32]) {
+    if *pk == [0u8; 32] {
+        sys::print(b"(anonymous)");
+        return;
+    }
+    let did = sys::did_key_encode(pk);
+    sys::print(did.as_bytes());
 }
 
 fn print_unknown_status(op: &str, status: u8) {
