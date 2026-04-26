@@ -2965,6 +2965,19 @@ impl SyscallDispatcher {
             stats[offset..offset + 4].copy_from_slice(&len.to_le_bytes());
         }
 
+        // T-8 (docs/threat-model.md): drain-skip counter at offset 44..48.
+        // Saturating u32 view of the AUDIT_DRAIN_SKIPS u64 — saturation at
+        // u32::MAX is itself a loud signal ("drain has been contended at
+        // least 4B times"). Lock-free atomic load, no AUDIT_RING needed.
+        let skips_u64 = crate::AUDIT_DRAIN_SKIPS
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let skips_u32 = if skips_u64 > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            skips_u64 as u32
+        };
+        stats[44..48].copy_from_slice(&skips_u32.to_le_bytes());
+
         // ADR-020 Phase B straggler caught during Phase C relocation:
         // 48-byte audit stats via typed slice.
         let stats_slice = UserWriteSlice::validate(ctx, out_buf, 48)?;

@@ -543,6 +543,19 @@ pub static INTERRUPT_ROUTER: Spinlock<InterruptRoutingTable> = Spinlock::new(Int
 /// `audit::emit()` never touches this — it writes to PER_CPU_AUDIT_BUFFER only.
 pub static AUDIT_RING: Spinlock<Option<audit::drain::AuditRing>> = Spinlock::new(None);
 
+/// Count of `drain_tick` invocations that found `AUDIT_RING` contended
+/// and skipped the drain. Lock-free atomic so `drain_tick` itself can
+/// update it without a second lock acquisition. Surfaced via
+/// `SYS_AUDIT_INFO` (offset 44..48, u32 saturating). T-8 in
+/// docs/threat-model.md: a sustained contender on `AUDIT_RING`
+/// (e.g. tight-loop `SYS_AUDIT_INFO` calls) prevents drains, lets
+/// per-CPU staging buffers fill, and silently drops events. The
+/// staging-drop counter catches the *consequence* once the lock is
+/// released; this counter catches the *leading indicator* — rising
+/// skips before any event is actually lost.
+pub static AUDIT_DRAIN_SKIPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Object store — content-addressed signed object storage (lock position 9).
 ///
 /// Initialized at boot after all other subsystems. Held as `ObjectStoreBackend`

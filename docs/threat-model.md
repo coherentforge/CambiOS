@@ -181,13 +181,13 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 **Why it matters for CambiOS.** Audit is the only observable below-the-policy-service telemetry path. Denial-of-audit is a prerequisite for any multi-step attack that would otherwise trip a behavioral anomaly detector. Silent audit failure is strictly worse than loud audit failure.
 
-**Current mitigation.** Per-CPU SPSC buffers reduce contention; `try_lock` on BSP prevents deadlock; drop counter exists. Two-phase protocol in `SYS_AUDIT_ATTACH` avoids lock-ordering violations.
+**Current mitigation.** Per-CPU SPSC buffers reduce contention; `try_lock` on BSP prevents deadlock; staging-buffer drop counter exists and is reported via synthetic `AuditDropped` events on the next successful drain (already wired in `drain_all_staging`). Two-phase protocol in `SYS_AUDIT_ATTACH` avoids lock-ordering violations. **2026-04-25:** added `AUDIT_DRAIN_SKIPS` lock-free atomic counter — incremented every time `drain_tick` finds `AUDIT_RING` contended and skips. Surfaced via `SYS_AUDIT_INFO` at offset 44..48 (u32 saturating at `u32::MAX`). This is the *leading indicator* — sustained contention shows up as rising skips before any actual event is lost, where the staging-drop counter only fires after events are already gone.
 
-**Gap.** No loud-failure path when drop counter increments. No alarm is raised to a privileged observer. The counter is readable but no subsystem checks it on a schedule.
+**Gap.** No automatic alarm: the counter is readable, but nothing in the kernel proactively escalates when it crosses a threshold. A privileged observer (init process, policy service, or dedicated audit-health task) needs to poll `SYS_AUDIT_INFO` and react to rising skip counts. That observer doesn't exist yet.
 
-**Severity.** Medium. **Status.** Live.
+**Severity.** Medium. **Status.** Live (visibility now in place; automatic escalation deferred).
 
-**Revisit when:** a privileged observer (init process, policy service, or dedicated audit-health task) starts checking `drop_counter > 0` on a schedule; or a loud-path alarm is added to the kernel when the counter first becomes non-zero.
+**Revisit when:** a policy-service consumer or dedicated audit-health task starts polling `SYS_AUDIT_INFO` and acting on rising skip counts; or kernel-side escalation lands (e.g. unconditional `println!` after N consecutive contended drains).
 
 ---
 

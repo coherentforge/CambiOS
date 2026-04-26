@@ -1175,6 +1175,22 @@ pub fn audit_attach() -> i64 {
 /// Read audit ring statistics into `out_buf`.
 ///
 /// `out_buf` must be at least 48 bytes. Returns 0 on success.
+///
+/// # Wire format
+/// ```text
+///   0..8   total_produced     (u64)
+///   8..16  total_dropped      (u64) — staging-buffer overflow count
+///  16..20  capacity           (u32) — ring slot count
+///     20   consumer_attached  (u8)  — 0 = no consumer, 1 = attached
+///  21..24  reserved
+///  24..28  online_cpus        (u32)
+///  28..44  staging[0..4]      (u32 × 4) — per-CPU staging-buffer length
+///  44..48  drain_skips        (u32 saturating) — T-8: count of
+///          drain_tick invocations that found AUDIT_RING contended
+///          and skipped. Leading indicator of denial-of-audit
+///          attempts (sustained contention precedes staging-buffer
+///          overflow). u32::MAX means "≥ 4B skips, very bad."
+/// ```
 pub fn audit_info(out_buf: &mut [u8]) -> i64 {
     syscall_raw3(
         SYS_AUDIT_INFO,

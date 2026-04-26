@@ -342,12 +342,16 @@ impl AuditRing {
 ///
 /// This function try-locks the global `AUDIT_RING`. If the lock is
 /// contended (e.g., `SYS_AUDIT_ATTACH` is in progress), the drain
-/// is skipped for this tick — staging buffers absorb the backlog.
+/// is skipped for this tick — staging buffers absorb the backlog,
+/// and `AUDIT_DRAIN_SKIPS` is incremented so `SYS_AUDIT_INFO`
+/// surfaces the leading indicator before any event is lost (T-8 in
+/// docs/threat-model.md).
 ///
 /// # ISR safety
 ///
 /// Uses `try_lock()` — never blocks. Holds no other lock while
-/// AUDIT_RING is held.
+/// AUDIT_RING is held. `AUDIT_DRAIN_SKIPS` is a lock-free atomic
+/// so the contention path doesn't need a second lock acquisition.
 #[cfg(not(any(test, fuzzing)))]
 pub fn drain_tick() {
     if let Some(mut ring_guard) = crate::AUDIT_RING.try_lock() {
@@ -357,6 +361,13 @@ pub fn drain_tick() {
             let online_cpus = crate::online_cpu_count();
             ring.drain_all_staging(&crate::PER_CPU_AUDIT_BUFFER, online_cpus);
         }
+    } else {
+        // Lock contended — bump the skip counter so SYS_AUDIT_INFO
+        // surfaces sustained contention as a leading indicator.
+        crate::AUDIT_DRAIN_SKIPS.fetch_add(
+            1,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
     // Lock contended or ring not initialized — skip this tick.
 }
