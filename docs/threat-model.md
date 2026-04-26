@@ -103,13 +103,13 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 **Why it matters for CambiOS.** The signature covers the bytes, not the layout semantics. A self-signed binary that crafts a tail-sharing layout defeats the W^X invariant the rest of the system assumes. Attacker then has a legitimate code-signing primitive via ordinary `ObjPutSigned` flows.
 
-**Current mitigation.** User-space linker scripts use `ALIGN(4096)` before `.data` to avoid tail-sharing in first-party code. The issue is documented in `CLAUDE.md` "Platform Gotchas." Signed-binary verification still catches arbitrary unsigned code.
+**Current mitigation.** Loader-side rejection landed 2026-04-25: `DefaultVerifier` now rejects any pair of `PT_LOAD` segments whose page-aligned ranges overlap with conflicting permissions (`DenyReason::PagePermConflict`). A signed binary that tail-shares a 4 KiB page across an RX and RW segment fails verification before any frame is allocated. User-space linker scripts continue to use `ALIGN(4096)` before `.data` as build-time hygiene; the loader check is the structural backstop signed binaries can't bypass.
 
-**Gap.** Loader-side enforcement missing. A malicious-but-signed binary (e.g., after F2 in T-3 is closed) bypasses the W^X invariant regardless of the linker script.
+**Gap.** None known.
 
-**Severity.** High. **Status.** Live against any signed binary whose author controls the layout.
+**Severity.** High. **Status.** Mitigated.
 
-**Revisit when:** loader grows either strictest-perm merging for shared pages, or rejection of overlapping PT_LOAD segments. See `STATUS.md` loader row.
+**Revisit when:** a signed-binary toolchain ever needs to legitimately tail-share a page across different perms (extremely unlikely — would defeat W^X by design).
 
 ---
 

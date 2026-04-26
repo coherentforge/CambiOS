@@ -115,6 +115,11 @@ pub enum DenyReason {
     WritableAndExecutable,
     /// Two LOAD segments overlap in virtual memory
     OverlappingSegments,
+    /// Two LOAD segments share a 4 KiB page in virtual memory but disagree
+    /// on permissions (e.g. one RX and one RW). The first segment's perms
+    /// would silently win at map time, producing a W^X violation that
+    /// survives signature verification. T-5 in docs/threat-model.md.
+    PagePermConflict,
     /// Total memory footprint exceeds allowed limit
     ExcessiveMemory,
     /// Custom policy rejection (for extended verifiers)
@@ -158,7 +163,10 @@ pub trait BinaryVerifier {
 /// 1. Entry point falls within a LOAD segment
 /// 2. All segments are in user space (below canonical hole)
 /// 3. W^X: no segment is both writable and executable
-/// 4. No overlapping segments
+/// 4. No overlapping segments (byte-level intersection)
+/// 4a. No page-level permission conflict between segments (two segments
+///     sharing a 4 KiB page with different perms — T-5 in
+///     docs/threat-model.md)
 /// 5. Total memory footprint within limit
 pub struct DefaultVerifier {
     /// Maximum allowed total memory (bytes)
@@ -213,7 +221,8 @@ impl BinaryVerifier for DefaultVerifier {
             total_memory = total_memory.saturating_add(seg.memsz);
         }
 
-        // 4. No overlapping segments
+        // 4. No overlapping segments (byte-level intersection — catches
+        //    duplicate / aliased mappings).
         for i in 0..segments.len() {
             for j in (i + 1)..segments.len() {
                 let a = &segments[i];
@@ -222,6 +231,35 @@ impl BinaryVerifier for DefaultVerifier {
                 let b_end = b.vaddr.saturating_add(b.memsz);
                 if a.vaddr < b_end && b.vaddr < a_end {
                     return VerifyResult::Deny(DenyReason::OverlappingSegments);
+                }
+            }
+        }
+
+        // 4a. T-5 (docs/threat-model.md): no page-level permission conflict.
+        //     Distinct from #4 — two segments may not byte-overlap but still
+        //     share a 4 KiB page (e.g. .text RX ending at vaddr+0x800 plus
+        //     .data RW starting at vaddr+0x800; same page 0x000 with
+        //     conflicting perms). The mapping path picks the first segment's
+        //     perms for the shared page, silently downgrading W^X. Reject
+        //     loud rather than recovering quietly — first-party linker
+        //     scripts already use ALIGN(4096) before .data; this turns the
+        //     discipline into a structural invariant signed binaries can't
+        //     bypass.
+        for i in 0..segments.len() {
+            for j in (i + 1)..segments.len() {
+                let a = &segments[i];
+                let b = &segments[j];
+                let a_end = a.vaddr.saturating_add(a.memsz);
+                let b_end = b.vaddr.saturating_add(b.memsz);
+                let a_page_start = a.vaddr & !(PAGE_SIZE - 1);
+                let a_page_end = a_end.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let b_page_start = b.vaddr & !(PAGE_SIZE - 1);
+                let b_page_end = b_end.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let pages_overlap = a_page_start < b_page_end && b_page_start < a_page_end;
+                let perms_differ =
+                    a.writable != b.writable || a.executable != b.executable;
+                if pages_overlap && perms_differ {
+                    return VerifyResult::Deny(DenyReason::PagePermConflict);
                 }
             }
         }
@@ -409,6 +447,7 @@ pub fn load_elf_process(
                 DenyReason::PolicyViolation => 5,
                 DenyReason::MissingSignature => 6,
                 DenyReason::InvalidSignature => 7,
+                DenyReason::PagePermConflict => 8,
             };
             crate::audit::emit(crate::audit::RawAuditEvent::binary_rejected(
                 reason_code, crate::audit::now(), 0,
@@ -922,6 +961,68 @@ mod tests {
         assert_eq!(
             verifier.verify(&binary, &metadata, &segs[..count]),
             VerifyResult::Deny(DenyReason::OverlappingSegments),
+        );
+    }
+
+    #[test]
+    fn test_verifier_denies_page_perm_conflict_tail_share() {
+        let verifier = DefaultVerifier::new();
+        // T-5: two adjacent segments, each fully within page 0x400000,
+        // with different perms. No byte-overlap (existing check passes),
+        // but they share page 0x400000 — first segment's RX would silently
+        // win at map time, downgrading the W^X invariant the second
+        // segment expected.
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x800, 0x800, phdr_flags::PF_R | phdr_flags::PF_X),
+            (0x400800, 0x800, 0x800, phdr_flags::PF_R | phdr_flags::PF_W),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::PagePermConflict),
+        );
+    }
+
+    #[test]
+    fn test_verifier_denies_page_perm_conflict_cross_page() {
+        let verifier = DefaultVerifier::new();
+        // T-5 variant: .text spans 0x400000..0x401800 (RX, two pages),
+        // .data spans 0x401800..0x402000 (RW, tail of page 0x401000).
+        // Page 0x401000 is shared with conflicting perms.
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x1800, 0x1800, phdr_flags::PF_R | phdr_flags::PF_X),
+            (0x401800, 0x800, 0x800, phdr_flags::PF_R | phdr_flags::PF_W),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Deny(DenyReason::PagePermConflict),
+        );
+    }
+
+    #[test]
+    fn test_verifier_allows_same_perm_page_share() {
+        let verifier = DefaultVerifier::new();
+        // Two segments sharing a page IS allowed when perms match — this
+        // is the harmless case (toolchain quirk, not a security issue).
+        // The byte-overlap check still covers literal byte aliasing.
+        let binary = build_test_elf(0x400000, &[
+            (0x400000, 0x800, 0x800, phdr_flags::PF_R | phdr_flags::PF_X),
+            (0x400800, 0x800, 0x800, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+
+        let metadata = elf::analyze_binary(&binary).unwrap();
+        let (segs, count) = elf::collect_load_segments(&binary).unwrap();
+
+        assert_eq!(
+            verifier.verify(&binary, &metadata, &segs[..count]),
+            VerifyResult::Allow,
         );
     }
 
