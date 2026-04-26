@@ -59,6 +59,14 @@ pub enum CapabilityKind {
     /// Granted to the compositor at spawn time; required because audit
     /// `emit()` is otherwise kernel-only.
     EmitInputAudit,
+    /// Right to attach as the audit ring consumer (gates `SYS_AUDIT_ATTACH`
+    /// — replaces the bootstrap-Principal-only check inherited from
+    /// [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) §
+    /// "Audit channel boot sequence") and to call `SYS_GET_PROCESS_PRINCIPAL`
+    /// for `did:key` resolution of audit-event `subject_pid` fields. Granted
+    /// to the `audit-tail` boot module; future kernelvisor / AI-watcher
+    /// consumers will hold this cap.
+    AuditConsumer,
 }
 
 /// Errors from capability operations
@@ -138,6 +146,11 @@ pub struct ProcessCapabilities {
     /// events into the kernel audit ring via `SYS_AUDIT_EMIT_INPUT_FOCUS`?
     /// T-7 Phase A. Granted to the compositor (sole emitter today).
     emit_input_audit: bool,
+    /// System capability: can this process attach as the audit ring
+    /// consumer and resolve `subject_pid`s to Principals? Granted to the
+    /// `audit-tail` boot module; gates `SYS_AUDIT_ATTACH` and
+    /// `SYS_GET_PROCESS_PRINCIPAL`.
+    audit_consumer: bool,
 }
 
 impl ProcessCapabilities {
@@ -154,6 +167,7 @@ impl ProcessCapabilities {
             map_framebuffer: false,
             large_channel: false,
             emit_input_audit: false,
+            audit_consumer: false,
         }
     }
 
@@ -295,6 +309,7 @@ impl ProcessCapabilities {
             CapabilityKind::MapFramebuffer => self.map_framebuffer = true,
             CapabilityKind::LargeChannel => self.large_channel = true,
             CapabilityKind::EmitInputAudit => self.emit_input_audit = true,
+            CapabilityKind::AuditConsumer => self.audit_consumer = true,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -308,6 +323,7 @@ impl ProcessCapabilities {
             CapabilityKind::MapFramebuffer => self.map_framebuffer,
             CapabilityKind::LargeChannel => self.large_channel,
             CapabilityKind::EmitInputAudit => self.emit_input_audit,
+            CapabilityKind::AuditConsumer => self.audit_consumer,
             CapabilityKind::Endpoint => false,
         }
     }
@@ -321,6 +337,7 @@ impl ProcessCapabilities {
             CapabilityKind::MapFramebuffer => self.map_framebuffer = false,
             CapabilityKind::LargeChannel => self.large_channel = false,
             CapabilityKind::EmitInputAudit => self.emit_input_audit = false,
+            CapabilityKind::AuditConsumer => self.audit_consumer = false,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -784,6 +801,7 @@ impl CapabilityManager {
         caps.map_framebuffer = false;
         caps.large_channel = false;
         caps.emit_input_audit = false;
+        caps.audit_consumer = false;
 
         Ok(count)
     }
@@ -1236,6 +1254,7 @@ mod tests {
             CapabilityKind::MapFramebuffer,
             CapabilityKind::LargeChannel,
             CapabilityKind::EmitInputAudit,
+            CapabilityKind::AuditConsumer,
         ];
 
         for kind in system_kinds {
@@ -1465,6 +1484,48 @@ mod tests {
         mgr.grant_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap();
 
         assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateChannel).unwrap(), true);
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
+    }
+
+    // ========================================================================
+    // AuditConsumer system capability tests. The cap is added in this commit;
+    // the syscalls it gates (SYS_AUDIT_ATTACH cap-check + SYS_GET_PROCESS_PRINCIPAL)
+    // land in the next commit of this chain.
+    // ========================================================================
+
+    #[test]
+    fn test_grant_and_check_audit_consumer() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap(), false);
+        mgr.grant_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap();
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap(), true);
+    }
+
+    #[test]
+    fn test_revoke_audit_consumer() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        mgr.grant_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap();
+        mgr.revoke_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap();
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap(), false);
+    }
+
+    #[test]
+    fn test_audit_consumer_independent_of_other_system_caps() {
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+
+        // Grant AuditConsumer alone.
+        mgr.grant_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap();
+
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::AuditConsumer).unwrap(), true);
+        assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::EmitInputAudit).unwrap(), false);
         assert_eq!(mgr.has_system_capability(proc_id, CapabilityKind::CreateProcess).unwrap(), false);
     }
 
