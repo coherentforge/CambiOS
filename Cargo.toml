@@ -13,6 +13,15 @@ exclude = ["user/fs-service", "user/key-store-service", "user/virtio-net", "user
 # rustc's `unexpected_cfgs` lint doesn't warn at every site.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
+[lints.clippy]
+# CLAUDE.md Development Convention 1 (path a, prancy-manatee Tier 1 E2):
+# every `pub unsafe fn` must carry a `# Safety:` rustdoc section
+# documenting the contract the caller must uphold. `check-unsafe-coverage`
+# enforces the same rule on `unsafe { ... }` blocks; this clippy lint
+# extends it to function signatures. The expected steady state is `deny`;
+# we run at `warn` only while a known-incomplete back-fill is in flight.
+missing_safety_doc = "deny"
+
 [package]
 name = "arcos"
 version = "0.1.0"
