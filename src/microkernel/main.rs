@@ -1669,6 +1669,29 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                     }
                 }
 
+                // ADR-023: grant `AuditConsumer` to the audit-tail boot
+                // module. AuditConsumer gates SYS_AUDIT_ATTACH (replacing
+                // the bootstrap-Principal-only check from ADR-007 §"Audit
+                // channel boot sequence") and SYS_GET_PROCESS_PRINCIPAL.
+                // Name-based grant matches the MapFramebuffer pattern —
+                // narrow capability, single trusted holder, no need for a
+                // dynamic policy until a second consumer (kernelvisor)
+                // appears.
+                if short_name == b"audit-tail" {
+                    use arcos_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = arcos_core::CAPABILITY_MANAGER.lock();
+                    if let Some(cap_mgr) = cap_guard.as_mut() {
+                        let _ = cap_mgr.grant_system_capability(
+                            process_id,
+                            CapabilityKind::AuditConsumer,
+                        );
+                        println!(
+                            "    ✓ Granted AuditConsumer to audit-tail (process {})",
+                            process_id.slot(),
+                        );
+                    }
+                }
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.0, result.process_id.slot(), result.entry_point

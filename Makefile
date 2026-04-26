@@ -63,6 +63,8 @@ SPROUTY_DIR := user/super-sprouty-o
 SPROUTY_ELF := $(SPROUTY_DIR)/target/x86_64-unknown-none/release/arcos-super-sprouty-o
 TERMINAL_WINDOW_DIR := user/terminal-window
 TERMINAL_WINDOW_ELF := $(TERMINAL_WINDOW_DIR)/target/x86_64-unknown-none/release/arcos-terminal-window
+AUDIT_TAIL_DIR := user/audit-tail
+AUDIT_TAIL_ELF := $(AUDIT_TAIL_DIR)/target/x86_64-unknown-none/release/arcos-audit-tail
 
 # User-space ELF binaries (RISC-V)
 FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-fs-service
@@ -101,6 +103,7 @@ WORM_ELF_AARCH64 := $(WORM_DIR)/target/aarch64-unknown-none/release/arcos-worm
 PONG_ELF_AARCH64 := $(PONG_DIR)/target/aarch64-unknown-none/release/arcos-pong
 SPROUTY_ELF_AARCH64 := $(SPROUTY_DIR)/target/aarch64-unknown-none/release/arcos-super-sprouty-o
 TERMINAL_WINDOW_ELF_AARCH64 := $(TERMINAL_WINDOW_DIR)/target/aarch64-unknown-none/release/arcos-terminal-window
+AUDIT_TAIL_ELF_AARCH64 := $(AUDIT_TAIL_DIR)/target/aarch64-unknown-none/release/arcos-audit-tail
 
 # User-space ELF binaries (RISC-V) — scanout + input extension for Scanout-4.c
 SCANOUT_VGPU_ELF_RISCV64 := $(SCANOUT_VGPU_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-scanout-virtio-gpu
@@ -118,6 +121,7 @@ WORM_ELF_RISCV64 := $(WORM_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-
 PONG_ELF_RISCV64 := $(PONG_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-pong
 SPROUTY_ELF_RISCV64 := $(SPROUTY_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-super-sprouty-o
 TERMINAL_WINDOW_ELF_RISCV64 := $(TERMINAL_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-terminal-window
+AUDIT_TAIL_ELF_RISCV64 := $(AUDIT_TAIL_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-audit-tail
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -136,7 +140,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 sign-tool mkinitrd bake-font export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window audit-tail user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 audit-tail-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 audit-tail-riscv64 sign-tool mkinitrd bake-font export-pubkey
 
 all: iso
 
@@ -211,6 +215,13 @@ fb-demo:
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== fb-demo ready ==="
+
+audit-tail:
+	@echo "=== Building audit-tail (ADR-023) ==="
+	cd $(AUDIT_TAIL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== audit-tail ready ==="
 
 compositor:
 	@echo "=== Building compositor (Phase Scanout-1, ADR-014) ==="
@@ -352,6 +363,13 @@ fb-demo-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== fb-demo (AArch64) ready ==="
 
+audit-tail-aarch64:
+	@echo "=== Building audit-tail (AArch64) ==="
+	cd $(AUDIT_TAIL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== audit-tail (AArch64) ready ==="
+
 compositor-aarch64:
 	@echo "=== Building compositor (AArch64) ==="
 	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -474,6 +492,13 @@ policy-service-riscv64:
 		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
 	@echo "=== Policy service (RISC-V) ready ==="
 
+audit-tail-riscv64:
+	@echo "=== Building audit-tail (RISC-V) ==="
+	cd $(AUDIT_TAIL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== audit-tail (RISC-V) ready ==="
+
 scanout-virtio-gpu-riscv64:
 	@echo "=== Building scanout-virtio-gpu (RISC-V, Scanout-4.c ADR-014) ==="
 	cd $(SCANOUT_VGPU_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -587,7 +612,7 @@ $(LIMINE_DIR)/limine: $(LIMINE_DIR)/BOOTX64.EFI
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine
 
-iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree worm pong super-sprouty-o terminal-window sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree worm pong super-sprouty-o terminal-window audit-tail sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -616,6 +641,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	cp $(SPROUTY_ELF) iso_root/boot/super-sprouty-o.elf
 	cp $(TREE_ELF) iso_root/boot/tree.elf
 	cp $(WORM_ELF) iso_root/boot/worm.elf
+	cp $(AUDIT_TAIL_ELF) iso_root/boot/audit-tail.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
@@ -632,6 +658,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/super-sprouty-o.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/tree.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/worm.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/audit-tail.elf
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -744,7 +771,7 @@ run-uefi: iso
 # Usage: make img-x86 && sudo dd if=cambios-x86.img of=/dev/diskN bs=1M
 IMG_X86 := cambios-x86.img
 
-img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service virtio-blk compositor sign-tool limine
+img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service virtio-blk compositor audit-tail sign-tool limine
 	@echo "=== Building x86_64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_X86)
 	dd if=/dev/zero of=$(IMG_X86) bs=1M count=64
@@ -766,6 +793,7 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	cp $(POLICY_SERVICE_ELF) /tmp/policy-service-signed.elf
 	cp $(BLK_DRIVER_ELF) /tmp/virtio-blk-signed.elf
 	cp $(COMPOSITOR_ELF) /tmp/compositor-signed.elf
+	cp $(AUDIT_TAIL_ELF) /tmp/audit-tail-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
@@ -776,6 +804,7 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_X86) /tmp/hello-signed.elf ::/boot/hello.elf
 	mcopy -i $(IMG_X86) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_X86) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
@@ -786,7 +815,8 @@ img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-st
 	mcopy -i $(IMG_X86) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_X86) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
 	mcopy -i $(IMG_X86) /tmp/compositor-signed.elf ::/boot/compositor.elf
-	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/policy-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/compositor-signed.elf
+	mcopy -i $(IMG_X86) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
+	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/policy-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/compositor-signed.elf /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_X86) limine.conf ::/limine.conf
 	mcopy -i $(IMG_X86) limine.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_X86) ready ==="
@@ -1111,7 +1141,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1138,6 +1168,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(PONG_ELF_AARCH64) /tmp/pong-signed.elf
 	cp $(SPROUTY_ELF_AARCH64) /tmp/super-sprouty-o-signed.elf
 	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
+	cp $(AUDIT_TAIL_ELF_AARCH64) /tmp/audit-tail-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
@@ -1153,6 +1184,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/pong-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/super-sprouty-o-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
@@ -1168,7 +1200,8 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/pong-signed.elf ::/boot/pong.elf
 	mcopy -i $(IMG_AARCH64) /tmp/super-sprouty-o-signed.elf ::/boot/super-sprouty-o.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/pong-signed.elf /tmp/super-sprouty-o-signed.elf /tmp/shell-signed.elf
+	mcopy -i $(IMG_AARCH64) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/pong-signed.elf /tmp/super-sprouty-o-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
@@ -1246,7 +1279,7 @@ kernel-riscv64:
 # img-riscv64 deps, copy + sign + --module here, and pick the right
 # slot in BOOT_MODULE_ORDER (between compositor's last GUI dep and
 # shell, mirroring x86_64).
-img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 sign-tool mkinitrd
+img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64
 	mkdir -p initrd_root_riscv64
@@ -1257,6 +1290,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	cp $(NET_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-net.elf
 	cp $(UDP_STACK_ELF_RISCV64)      initrd_root_riscv64/udp-stack.elf
 	cp $(SHELL_ELF_RISCV64)          initrd_root_riscv64/shell.elf
+	cp $(AUDIT_TAIL_ELF_RISCV64)     initrd_root_riscv64/audit-tail.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fs-service.elf
@@ -1264,6 +1298,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-net.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/udp-stack.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/shell.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/audit-tail.elf
 	# Module order matches limine.conf on x86_64/aarch64 — the kernel's
 	# BOOT_MODULE_ORDER release chain is positional, so the service
 	# roster must be identical across arches (future ADR-018 manifest
@@ -1275,6 +1310,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 		--module virtio-blk=initrd_root_riscv64/virtio-blk.elf \
 		--module virtio-net=initrd_root_riscv64/virtio-net.elf \
 		--module udp-stack=initrd_root_riscv64/udp-stack.elf \
+		--module audit-tail=initrd_root_riscv64/audit-tail.elf \
 		--module shell=initrd_root_riscv64/shell.elf
 	rm -rf initrd_root_riscv64
 	@echo "=== $(INITRD_RISCV64) ready ==="

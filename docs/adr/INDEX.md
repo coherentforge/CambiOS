@@ -32,3 +32,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 020 | [Typed User-Buffer Slices at the Syscall Boundary](020-typed-user-buffer-slices-at-syscall-boundary.md) | Proposed | 2026-04-19 |
 | 021 | [Typed BootError Propagation Through the Init Path](021-typed-boot-error-propagation.md) | Proposed | 2026-04-19 |
 | 022 | [Wall-Clock Time and the Path to Decentralized Time](022-wall-clock-time.md) | Accepted | 2026-04-25 |
+| 023 | [Audit Consumer Capability and Principal Resolution](023-audit-consumer-capability.md) | Proposed | 2026-04-26 |
