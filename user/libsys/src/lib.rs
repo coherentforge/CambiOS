@@ -1167,7 +1167,9 @@ const SYS_AUDIT_INFO: u64 = 34;
 /// address space. Returns the user-space virtual address on success,
 /// or a negative error code.
 ///
-/// Restricted to the bootstrap Principal.
+/// Capability-gated on `AuditConsumer` system capability. Granted to
+/// the `audit-tail` boot module; future kernelvisor / AI-watcher
+/// consumers hold this cap.
 pub fn audit_attach() -> i64 {
     syscall_raw3(SYS_AUDIT_ATTACH, 0, 0, 0)
 }
@@ -1223,6 +1225,30 @@ pub fn audit_emit_input_focus(
         new_window_id as u64,
         old_window_id as u64,
         owner_principal.as_ptr() as u64,
+    )
+}
+
+const SYS_GET_PROCESS_PRINCIPAL: u64 = 42;
+
+/// Resolve a `ProcessId` (raw u64; encodes slot + generation per
+/// ADR-008) to its bound 32-byte Principal. Lets an audit consumer
+/// render `subject_pid` fields from buffered audit events as
+/// `did:key:z6Mk…` without widening the 64-byte event format.
+///
+/// Capability-gated on `AuditConsumer`. The kernel first looks up the
+/// principal in the live process table; on miss, falls back to a
+/// recent-exits ring on the process table for principals of processes
+/// that have already exited.
+///
+/// Returns 32 on success (bytes written to `out`), `PermissionDenied`
+/// without the capability, or `InvalidArg` on bad pointer or unknown
+/// target (no live binding and no recent-exits entry).
+pub fn get_process_principal(target_pid_raw: u64, out: &mut [u8; 32]) -> i64 {
+    syscall_raw3(
+        SYS_GET_PROCESS_PRINCIPAL,
+        target_pid_raw,
+        out.as_mut_ptr() as u64,
+        32,
     )
 }
 

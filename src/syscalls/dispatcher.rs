@@ -170,6 +170,12 @@ impl SyscallDispatcher {
             // window-focus transitions into the audit ring.
             SyscallNumber::AuditEmitInputFocus =>
                 Self::handle_audit_emit_input_focus(args, &ctx),
+
+            // Audit consumer principal lookup. Resolves a `subject_pid`
+            // from a buffered audit event to the bound 32-byte Principal
+            // for did:key rendering. Capability-gated on AuditConsumer.
+            SyscallNumber::GetProcessPrincipal =>
+                Self::handle_get_process_principal(args, &ctx),
         }
     }
 
@@ -297,6 +303,16 @@ impl SyscallDispatcher {
             let mut pt_guard = crate::PROCESS_TABLE.lock();
             if let Some(pt) = pt_guard.as_mut() {
                 if pt.slot_occupied(ctx.process_id) {
+                    // Record the exiting process's Principal in the
+                    // recent-exits ring before destroy_process bumps the
+                    // generation. SYS_GET_PROCESS_PRINCIPAL falls back
+                    // to this ring when an audit consumer queries a
+                    // subject_pid whose process has already exited.
+                    // Skipped when caller_principal is None (process
+                    // never bound an identity — nothing to resolve).
+                    if let Some(p) = ctx.caller_principal {
+                        pt.record_exit(ctx.process_id, p);
+                    }
                     let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
                     pt.destroy_process(ctx.process_id, &mut fa_guard);
                     true
@@ -2831,7 +2847,13 @@ impl SyscallDispatcher {
     /// Maps the kernel's audit ring pages read-only into the caller's
     /// address space. Returns the user-space virtual address.
     ///
-    /// Restricted to bootstrap Principal (Phase 3.3).
+    /// Capability-gated on `CapabilityKind::AuditConsumer`. Replaces the
+    /// original bootstrap-Principal-only equality check (ADR-007 §"Audit
+    /// channel boot sequence") with a delegated capability check, so a
+    /// signed boot module like `audit-tail` (or a future kernelvisor)
+    /// can hold its own Principal and still attach. The bootstrap path
+    /// continues to work whenever the bootstrap-bound process is granted
+    /// `AuditConsumer` at boot.
     ///
     /// Lock protocol (two-phase to avoid AUDIT_RING → PROCESS_TABLE):
     /// 1. CAPABILITY_MANAGER(4) → verify authority → release
@@ -2843,12 +2865,17 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // --- Phase 1: verify bootstrap Principal authority ---
-        // caller_principal already resolved by dispatch()
-        let caller_principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        if *caller_principal != bootstrap {
-            return Err(SyscallError::PermissionDenied);
+        // --- Phase 1: verify AuditConsumer system capability ---
+        {
+            use crate::ipc::capability::CapabilityKind;
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(ctx.process_id, CapabilityKind::AuditConsumer)
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
         }
 
         // --- Phase 2: read ring metadata ---
@@ -2916,6 +2943,62 @@ impl SyscallDispatcher {
         );
 
         Ok(consumer_vaddr)
+    }
+
+    /// SYS_GET_PROCESS_PRINCIPAL: resolve a `ProcessId` to its bound
+    /// 32-byte Principal. See `SyscallNumber::GetProcessPrincipal` for
+    /// the wire ABI.
+    ///
+    /// Lock protocol:
+    /// 1. CAPABILITY_MANAGER(4) → cap check on caller → release
+    /// 2. CAPABILITY_MANAGER(4) → live principal lookup → release
+    /// 3. PROCESS_TABLE(6) → recent-exits ring lookup (only on miss) → release
+    /// 4. Write to user buffer
+    ///
+    /// Step 1 and 2 acquire the same lock at different times rather than
+    /// holding it across the dispatch — the cap check needs `ctx.process_id`,
+    /// the live lookup needs the target `ProcessId` from arg1; both are
+    /// table lookups so the cost is one atomic acquire each.
+    fn handle_get_process_principal(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        let target_pid_raw = args.arg1;
+        let out_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        if buf_len != 32 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // --- Step 1: cap check on the caller ---
+        {
+            use crate::ipc::capability::CapabilityKind;
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(ctx.process_id, CapabilityKind::AuditConsumer)
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
+        // --- Steps 2-3: principal lookup, live then recent-exits ---
+        let target = crate::ipc::ProcessId::from_raw(target_pid_raw);
+
+        let principal = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            cap_guard.as_ref().and_then(|cm| cm.get_principal(target).ok())
+        }
+        .or_else(|| {
+            let pt_guard = crate::PROCESS_TABLE.lock();
+            pt_guard.as_ref().and_then(|pt| pt.lookup_recent_exit(target))
+        })
+        .ok_or(SyscallError::InvalidArg)?;
+
+        // --- Step 4: write principal bytes to user buffer ---
+        let out_slice = UserWriteSlice::validate(ctx, out_buf, 32)?;
+        out_slice.write_from(&principal.public_key)?;
+
+        Ok(32)
     }
 
     /// SYS_AUDIT_INFO: Read audit ring statistics.

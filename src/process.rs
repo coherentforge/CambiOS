@@ -522,6 +522,73 @@ impl ProcessDescriptor {
 /// Phase 3.2a: storage is a `&'static mut [Option<ProcessDescriptor>]`
 /// slice handed in from `memory::object_table::init()`. The slice
 /// length equals `config::num_slots()`, computed at boot from the
+/// SCAFFOLDING: number of recent process exits to remember for
+/// principal-after-exit lookup.
+/// Why: an audit consumer reading buffered events may encounter a
+/// `subject_pid` whose process has already exited and whose slot may
+/// have been reused. Without a recent-exits ring, the consumer cannot
+/// resolve the original Principal — a non-issue for short-lived
+/// consumers but a correctness gap for batch readers and the
+/// kernelvisor. At ~10 process exits/min in steady state and audit
+/// consumers reading at ≥1/sec, 64 entries covers ~6 minutes of exit
+/// history. 25%-utilization rule: typical workload uses ~16 entries.
+/// Replace when: kernelvisor stress test shows >64 distinct exits
+/// within any 10-second consumer-lag window, or a per-Principal
+/// resolution table replaces the ring entirely.
+pub const RECENT_EXITS_RING_SIZE: usize = 64;
+
+/// One recorded exit: maps a (slot, generation) pair to the Principal
+/// that was bound at exit time.
+#[derive(Clone, Copy)]
+struct RecentExit {
+    slot: u32,
+    generation: u32,
+    principal: crate::ipc::Principal,
+}
+
+/// Bounded circular buffer of recently-exited processes.
+///
+/// Used by `SYS_GET_PROCESS_PRINCIPAL` to resolve a `subject_pid` whose
+/// process slot has already been reused. The ring is FIFO-overwriting:
+/// when full, the oldest entry is silently displaced. A consumer that
+/// hasn't read in long enough to span the ring's span will see `Enoent`
+/// for old `subject_pid`s — that's the cost of a fixed-size ring, and
+/// the bound exists to be verifiable per CLAUDE.md's "bounded iteration"
+/// rule.
+pub struct RecentExitsRing {
+    entries: [Option<RecentExit>; RECENT_EXITS_RING_SIZE],
+    write_idx: usize,
+}
+
+impl RecentExitsRing {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; RECENT_EXITS_RING_SIZE],
+            write_idx: 0,
+        }
+    }
+
+    /// Record an exit. Overwrites the oldest entry on wraparound.
+    pub fn push(&mut self, slot: u32, generation: u32, principal: crate::ipc::Principal) {
+        self.entries[self.write_idx] = Some(RecentExit { slot, generation, principal });
+        self.write_idx = (self.write_idx + 1) % RECENT_EXITS_RING_SIZE;
+    }
+
+    /// Look up an exit by (slot, generation). Returns the Principal that
+    /// was bound at exit time, or `None` if the (slot, generation) pair
+    /// is not in the ring (either never recorded or already overwritten).
+    pub fn lookup(&self, slot: u32, generation: u32) -> Option<crate::ipc::Principal> {
+        for entry in self.entries.iter() {
+            if let Some(rx) = entry {
+                if rx.slot == slot && rx.generation == generation {
+                    return Some(rx.principal);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// active tier policy and available RAM. See ADR-008.
 ///
 /// Phase 3.2c: per-slot generation counters prevent stale `ProcessId`
@@ -540,6 +607,10 @@ pub struct ProcessTable {
     /// `create_process`, so stale references (whose generation no
     /// longer matches) are rejected by every lookup.
     generations: Box<[u32]>,
+    /// Recent-exits ring for `SYS_GET_PROCESS_PRINCIPAL` lookups when
+    /// the target process has already exited. Populated by callers via
+    /// `record_exit` before `destroy_process` increments the generation.
+    recent_exits: RecentExitsRing,
 }
 
 impl ProcessTable {
@@ -564,8 +635,22 @@ impl ProcessTable {
             processes,
             hhdm_offset,
             generations,
+            recent_exits: RecentExitsRing::new(),
         };
         Some(Box::new(table))
+    }
+
+    /// Record an exit in the recent-exits ring before the slot is reused.
+    /// Caller (`handle_exit`) reads the principal from the capability
+    /// manager and passes it in here, then calls `destroy_process`.
+    pub fn record_exit(&mut self, process_id: ProcessId, principal: crate::ipc::Principal) {
+        self.recent_exits.push(process_id.slot(), process_id.generation(), principal);
+    }
+
+    /// Look up the principal that was bound to a process at exit time.
+    /// Returns `None` if the (slot, generation) pair is not in the ring.
+    pub fn lookup_recent_exit(&self, process_id: ProcessId) -> Option<crate::ipc::Principal> {
+        self.recent_exits.lookup(process_id.slot(), process_id.generation())
     }
 
     /// Find a free slot by linear scan. Returns the slot index, or
@@ -976,5 +1061,65 @@ mod tests {
         // (in the real kernel; in test mode the stub always drains).
         // The test verifies the function returns without error.
         assert_eq!(desc.reclaim_user_vmas(&mut fa), 0);
+    }
+
+    // ========================================================================
+    // RecentExitsRing tests — bounded-buffer principal lookup for exited
+    // processes. Used by SYS_GET_PROCESS_PRINCIPAL.
+    // ========================================================================
+
+    #[test]
+    fn recent_exits_ring_empty_lookup_returns_none() {
+        let ring = RecentExitsRing::new();
+        assert!(ring.lookup(0, 0).is_none());
+        assert!(ring.lookup(5, 3).is_none());
+    }
+
+    #[test]
+    fn recent_exits_ring_round_trips_one_entry() {
+        let mut ring = RecentExitsRing::new();
+        let p = crate::ipc::Principal::from_public_key([0xAA; 32]);
+        ring.push(7, 2, p);
+        assert_eq!(ring.lookup(7, 2), Some(p));
+        // Wrong slot or wrong generation → None.
+        assert!(ring.lookup(7, 3).is_none());
+        assert!(ring.lookup(8, 2).is_none());
+    }
+
+    #[test]
+    fn recent_exits_ring_keeps_distinct_entries() {
+        let mut ring = RecentExitsRing::new();
+        let p1 = crate::ipc::Principal::from_public_key([0x11; 32]);
+        let p2 = crate::ipc::Principal::from_public_key([0x22; 32]);
+        ring.push(1, 0, p1);
+        ring.push(2, 0, p2);
+        assert_eq!(ring.lookup(1, 0), Some(p1));
+        assert_eq!(ring.lookup(2, 0), Some(p2));
+    }
+
+    #[test]
+    fn recent_exits_ring_overwrites_oldest_on_wrap() {
+        let mut ring = RecentExitsRing::new();
+        // Fill the ring to capacity + 1 so the first entry is evicted.
+        let first = crate::ipc::Principal::from_public_key([0x01; 32]);
+        ring.push(0, 0, first);
+        for i in 1..=RECENT_EXITS_RING_SIZE as u32 {
+            ring.push(i, 0, crate::ipc::Principal::from_public_key([(i & 0xFF) as u8; 32]));
+        }
+        // First entry was at index 0; one extra push wrapped and overwrote it.
+        assert!(ring.lookup(0, 0).is_none(), "first entry should have been evicted");
+        // Last-pushed entries are still present.
+        assert!(ring.lookup(RECENT_EXITS_RING_SIZE as u32, 0).is_some());
+    }
+
+    #[test]
+    fn recent_exits_ring_distinguishes_generations_at_same_slot() {
+        let mut ring = RecentExitsRing::new();
+        let p_gen0 = crate::ipc::Principal::from_public_key([0xA0; 32]);
+        let p_gen1 = crate::ipc::Principal::from_public_key([0xA1; 32]);
+        ring.push(3, 0, p_gen0);
+        ring.push(3, 1, p_gen1);
+        assert_eq!(ring.lookup(3, 0), Some(p_gen0));
+        assert_eq!(ring.lookup(3, 1), Some(p_gen1));
     }
 }

@@ -285,6 +285,32 @@ pub enum SyscallNumber {
     /// Returns 0 on success, `PermissionDenied` without the capability,
     /// `InvalidArg` on a bad user pointer.
     AuditEmitInputFocus = 41,
+
+    /// SYS_GET_PROCESS_PRINCIPAL (42): resolve a `ProcessId` to its bound
+    /// 32-byte Principal. Lets an audit consumer render `subject_pid`
+    /// fields from `RawAuditEvent` as `did:key:z6Mk…` without widening
+    /// the 64-byte event format.
+    ///
+    /// Args: arg1 = target ProcessId raw (u64; encodes slot + generation
+    ///       per ADR-008), arg2 = out_buf (user ptr to 32-byte buffer),
+    ///       arg3 = buf_len (must equal 32).
+    ///
+    /// Capability-gated on `CapabilityKind::AuditConsumer`. Same gating
+    /// posture as `SYS_AUDIT_ATTACH`: if you can read events you can
+    /// resolve the principals they reference. Future `ProcessIntrospect`
+    /// cap may decouple if a non-audit consumer (GUI window-owner
+    /// labeling, win-compat) needs principal lookup without ring access.
+    ///
+    /// Lookup chain: live process table first (`CapabilityManager::
+    /// get_principal`), falls back to a recent-exits ring on the process
+    /// table for principals of processes that have already exited but
+    /// whose `subject_pid` may still be referenced by buffered events.
+    ///
+    /// Returns 32 on success (bytes written), `PermissionDenied` without
+    /// the capability, or `InvalidArg` on bad user pointer / buf_len /
+    /// unknown target (no principal bound to the live process and no
+    /// matching entry in the recent-exits ring).
+    GetProcessPrincipal = 42,
 }
 
 impl SyscallNumber {
@@ -314,7 +340,8 @@ impl SyscallNumber {
             Self::AuditAttach | Self::AuditInfo |
             Self::MapFramebuffer |
             Self::VirtioModernCaps |
-            Self::AuditEmitInputFocus
+            Self::AuditEmitInputFocus |
+            Self::GetProcessPrincipal
         )
     }
 
@@ -363,6 +390,7 @@ impl SyscallNumber {
             // 39 SetWallclock + 40 GetWallclock reserved by ADR-022;
             // not yet wired through dispatch.
             41 => Some(Self::AuditEmitInputFocus),
+            42 => Some(Self::GetProcessPrincipal),
             _ => None,
         }
     }
@@ -538,6 +566,7 @@ mod tests {
             SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
             SyscallNumber::TryRecvMsg, SyscallNumber::VirtioModernCaps,
             SyscallNumber::AuditEmitInputFocus,
+            SyscallNumber::GetProcessPrincipal,
         ];
 
         for &num in &all {
@@ -579,5 +608,8 @@ mod tests {
         let aef = SyscallNumber::from_u64(41);
         assert_eq!(aef, Some(SyscallNumber::AuditEmitInputFocus));
         let _ = aef.unwrap().requires_identity();
+        let gpp = SyscallNumber::from_u64(42);
+        assert_eq!(gpp, Some(SyscallNumber::GetProcessPrincipal));
+        let _ = gpp.unwrap().requires_identity();
     }
 }
