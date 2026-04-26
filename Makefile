@@ -1088,6 +1088,21 @@ check-boot-panics:
 update-boot-panics-baseline:
 	python3 tools/check-boot-panics.py --update-baseline
 
+# Enforce CLAUDE.md Development Convention 1: every `unsafe { ... }`
+# block must carry a `// SAFETY:` comment in its preceding comment
+# block. Comment-block-aware scanner; cluster + assignment-continuation
+# + attribute-line aware. Baseline at
+# tools/check-unsafe-coverage-baseline.txt; expected empty after E1
+# (prancy-manatee Tier 1 E1 + E3). Exits nonzero on any new site.
+check-unsafe-coverage:
+	python3 tools/check-unsafe-coverage.py
+
+# Regenerate the unsafe-coverage baseline. Use only to acknowledge a
+# regression you're intentionally accepting — review the diff and
+# the justification before committing.
+update-unsafe-coverage-baseline:
+	python3 tools/check-unsafe-coverage.py --update-baseline
+
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
 IMG_AARCH64 := cambios-aarch64.img

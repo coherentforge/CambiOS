@@ -801,6 +801,9 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     {
         let mut registered = 0usize;
         for region in arcos_core::boot::info().virtio_mmio_devices() {
+            // SAFETY: per-region invocation of the same precondition
+            // asserted for the loop above; each `region` was supplied
+            // by the boot-info adapter from the DTB-published list.
             unsafe {
                 if arcos_core::pci::register_virtio_mmio(region.phys_base, region.size) {
                     registered += 1;

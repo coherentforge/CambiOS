@@ -24,6 +24,11 @@
 #                              reviews supply-chain deltas before they
 #                              land. Advisory only — exit 0 unconditional.
 #                              T-1 in docs/threat-model.md.
+#   check-unsafe-coverage:     Every `unsafe { ... }` block must carry a
+#                              `// SAFETY:` comment in its preceding
+#                              comment block (CLAUDE.md Development
+#                              Convention 1). Don't-grow-the-baseline
+#                              gate. Tier 1 E3 (prancy-manatee plan).
 #
 # Bypass: `git commit --no-verify` (discouraged; use for emergencies only).
 
@@ -34,3 +39,4 @@ cd "$(git rev-parse --show-toplevel)"
 python3 tools/check-banned-paths.py
 python3 tools/check-index-isolation.py
 python3 tools/check-lockfile-additions.py
+python3 tools/check-unsafe-coverage.py

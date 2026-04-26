@@ -205,6 +205,9 @@ pub unsafe fn init(phys_base: u64, size_bytes: u64) -> Result<(), &'static str> 
     // real MMIO region and HHDM is live.
     let pages = size_bytes.div_ceil(4096);
     for page in 0..pages {
+        // SAFETY: per-page invocation of the same precondition asserted
+        // for the loop above; `phys_base + page * 4096` stays inside
+        // the MMIO region the caller described.
         unsafe {
             crate::memory::paging::early_map_mmio(phys_base + page * 4096)?;
         }

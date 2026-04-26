@@ -214,8 +214,10 @@ pub mod paging {
     /// L0 table (i.e. paging must be enabled and configured).
     #[cfg(target_os = "none")]
     pub unsafe fn active_page_table() -> PageTableRef {
-        // SAFETY: delegated to arch; valid in bare-metal.
         PageTableRef {
+            // SAFETY: delegated to the arch-specific `active_root`
+            // helper; valid because the caller of `active_page_table`
+            // already promised paging is enabled and configured.
             root_phys: unsafe { ap::active_root() },
         }
     }

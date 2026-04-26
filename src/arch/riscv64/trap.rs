@@ -496,6 +496,8 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
                 // (its only lock — `crate::INTERRUPT_ROUTER` — is
                 // acquired via try_lock).
                 let _ = stval; // stval is zero for external IRQs.
+                // SAFETY: see the SAFETY block above — restated here so
+                // the comment is contiguous with the unsafe call site.
                 unsafe { super::plic::dispatch_pending(); }
             }
             IRQ_SOFTWARE => {
