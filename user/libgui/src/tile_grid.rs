@@ -12,7 +12,7 @@
 //! for input lands in the virtio-input session. When it does, the
 //! natural place for `hit_test` is here.
 
-use arcos_libgui_proto::Rect;
+use cambios_libgui_proto::Rect;
 
 /// Layout of an equally-spaced grid of tiles on a surface.
 ///

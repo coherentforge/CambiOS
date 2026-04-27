@@ -18,7 +18,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use arcos_core::memory::buddy_allocator::{BuddyAllocator, MIN_SIZE};
+use cambios_core::memory::buddy_allocator::{BuddyAllocator, MIN_SIZE};
 
 /// Operations the fuzzer can invoke.
 #[derive(Arbitrary, Debug)]

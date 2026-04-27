@@ -3,7 +3,7 @@
 
 //! PCI device discovery helpers for virtio-net.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// Virtio vendor ID.
 pub const VIRTIO_VENDOR_ID: u16 = 0x1AF4;

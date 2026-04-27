@@ -10,9 +10,9 @@
 //! for now — the sheet grows to cover them in a follow-up when the
 //! kernel `iretq` GPF for larger .rodata is resolved.
 
-use arcos_libgui::{Bitmap, Color, Rect, Surface};
-use arcos_super_sprouty_o::game::{Game, Status};
-use arcos_super_sprouty_o::level::{self, GOAL_COL, GOAL_ROW, LEVEL, SURFACE_H, SURFACE_W, TILE_SIZE};
+use cambios_libgui::{Bitmap, Color, Rect, Surface};
+use cambios_super_sprouty_o::game::{Game, Status};
+use cambios_super_sprouty_o::level::{self, GOAL_COL, GOAL_ROW, LEVEL, SURFACE_H, SURFACE_W, TILE_SIZE};
 
 use crate::sprites::{GROUND, SPROUTY_IDLE, TRANSPARENT, WEED};
 

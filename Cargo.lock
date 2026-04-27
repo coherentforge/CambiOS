@@ -3,23 +3,6 @@
 version = 4
 
 [[package]]
-name = "arcos"
-version = "0.1.0"
-dependencies = [
- "arcos-abi",
- "bitflags 2.11.0",
- "blake3",
- "ed25519-compact",
- "limine",
- "uart_16550",
- "x86_64",
-]
-
-[[package]]
-name = "arcos-abi"
-version = "0.1.0"
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -62,6 +45,23 @@ dependencies = [
  "constant_time_eq",
  "cpufeatures",
 ]
+
+[[package]]
+name = "cambios"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "blake3",
+ "cambios-abi",
+ "ed25519-compact",
+ "limine",
+ "uart_16550",
+ "x86_64",
+]
+
+[[package]]
+name = "cambios-abi"
+version = "0.1.0"
 
 [[package]]
 name = "cc"

@@ -46,10 +46,10 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use arcos_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT};
-use arcos_libinput_proto::{decode_event, DeviceClass};
-use arcos_libsys as sys;
-use arcos_libscanout::{
+use cambios_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT};
+use cambios_libinput_proto::{decode_event, DeviceClass};
+use cambios_libsys as sys;
+use cambios_libscanout::{
     decode_display_connected, encode_register_compositor, MsgTag,
     COMPOSITOR_ENDPOINT, SCANOUT_DRIVER_ENDPOINT,
 };

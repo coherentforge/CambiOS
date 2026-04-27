@@ -17,8 +17,8 @@
 //! Both transports expose the same methods so the driver is oblivious to the
 //! discovery path.
 
-use arcos_libsys as sys;
-use arcos_libsys::VirtioModernCaps;
+use cambios_libsys as sys;
+use cambios_libsys::VirtioModernCaps;
 
 // ============================================================================
 // Shared wire-protocol constants

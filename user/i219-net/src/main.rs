@@ -43,7 +43,7 @@ mod regs;
 #[allow(unsafe_code)]
 mod ring;
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 use mmio::{spin_delay, Mmio};
 use regs::*;
 use ring::{DmaBuf, Ring, BUF_SIZE, RING_SIZE};

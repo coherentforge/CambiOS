@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "arcos-abi"
+name = "cambios-abi"
 version = "0.1.0"

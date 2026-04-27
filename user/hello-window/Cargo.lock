@@ -3,33 +3,33 @@
 version = 4
 
 [[package]]
-name = "arcos-hello-window"
+name = "cambios-hello-window"
 version = "0.1.0"
 dependencies = [
- "arcos-libgui",
- "arcos-libsys",
+ "cambios-libgui",
+ "cambios-libsys",
 ]
 
 [[package]]
-name = "arcos-libgui"
+name = "cambios-libgui"
 version = "0.1.0"
 dependencies = [
- "arcos-libgui-proto",
- "arcos-libinput-proto",
- "arcos-libsys",
+ "cambios-libgui-proto",
+ "cambios-libinput-proto",
+ "cambios-libsys",
 ]
 
 [[package]]
-name = "arcos-libgui-proto"
+name = "cambios-libgui-proto"
 version = "0.1.0"
 dependencies = [
- "arcos-libinput-proto",
+ "cambios-libinput-proto",
 ]
 
 [[package]]
-name = "arcos-libinput-proto"
+name = "cambios-libinput-proto"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"

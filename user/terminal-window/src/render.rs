@@ -25,7 +25,7 @@
 //! we already had for the 2× scaled bitmap — so the grid stays at
 //! 64×24 and the rest of the world doesn't notice the swap.
 
-use arcos_libgui::{font_aa::BUILTIN_FONT_JBM, Color, Rect, Surface};
+use cambios_libgui::{font_aa::BUILTIN_FONT_JBM, Color, Rect, Surface};
 
 use crate::grid::{Grid, COLS, VISIBLE_ROWS};
 

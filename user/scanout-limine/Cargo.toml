@@ -2,15 +2,15 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-scanout-limine"
+name = "cambios-scanout-limine"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "CambiOS scanout driver — Limine linear-framebuffer fallback (Phase Scanout-2, ADR-014). Maps the Limine FB and copies compositor scanout regions into it on FrameReady. No hardware MMIO, no DMA, no IRQs."
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
-arcos-libscanout = { path = "../libscanout" }
+cambios-libsys = { path = "../libsys" }
+cambios-libscanout = { path = "../libscanout" }
 
 [profile.release]
 opt-level = "s"

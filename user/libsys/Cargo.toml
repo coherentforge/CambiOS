@@ -2,10 +2,10 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 
 [dependencies]
-arcos-abi = { path = "../../arcos-abi" }
+cambios-abi = { path = "../../cambios-abi" }

@@ -9,7 +9,7 @@
 //! (the abstract 6-arg shape that arch-specific entry stubs decode
 //! into), and `SyscallResult` (the kernel-side handler return type).
 //!
-//! Both the kernel (`arcos`) and userspace libsys (`arcos-libsys`)
+//! Both the kernel (`cambios`) and userspace libsys (`cambios-libsys`)
 //! depend on this crate so there is exactly one source of truth for
 //! syscall numbering. Drift between userspace and kernel ABI tables
 //! is the failure mode this crate exists to remove.

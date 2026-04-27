@@ -331,7 +331,7 @@ CAMBIOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
 
 # QEMU
 make run                         # x86_64 (ISO, rebuilds kernel + modules)
-make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default `arcos> `), 1 = panic/exception, 2 = hang. Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
+make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default `cambios> `), 1 = panic/exception, 2 = hang. Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
 make run-aarch64                 # AArch64 (FAT image)
 make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only

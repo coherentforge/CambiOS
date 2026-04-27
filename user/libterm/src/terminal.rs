@@ -5,7 +5,7 @@
 //! event-polling API that resolves the lone-ESC ambiguity via caller-
 //! supplied deadlines.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 use crate::backend::Backend;
 use crate::events::Event;
@@ -25,7 +25,7 @@ pub const fn ms_to_ticks(ms: u64) -> u64 {
     (ms * TICKS_PER_SEC + 999) / 1000
 }
 
-/// Current monotonic tick count (wraps `arcos_libsys::get_time`).
+/// Current monotonic tick count (wraps `cambios_libsys::get_time`).
 #[inline]
 pub fn now_ticks() -> u64 {
     sys::get_time()

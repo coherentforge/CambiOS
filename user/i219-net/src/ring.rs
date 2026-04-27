@@ -14,7 +14,7 @@
 //! errors) are validated before use. The driver never trusts a length
 //! larger than the bounce buffer size.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 use crate::regs::{RxDesc, TxDesc};
 

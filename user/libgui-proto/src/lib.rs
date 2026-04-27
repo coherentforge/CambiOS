@@ -33,7 +33,7 @@
 //!   things).
 //! - Widget / layout / text-rendering APIs — those belong in the
 //!   future `user/libgui`, built on top of this protocol.
-//! - IPC transport — both sides talk via `arcos-libsys`'s
+//! - IPC transport — both sides talk via `cambios-libsys`'s
 //!   `write` / `recv_msg` primitives; this crate just defines what
 //!   the payloads look like.
 //! - `user/libscanout`'s scanout-side types — that's the compositor's
@@ -45,7 +45,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
-pub use arcos_libinput_proto::{InputEvent, EVENT_SIZE as INPUT_EVENT_SIZE};
+pub use cambios_libinput_proto::{InputEvent, EVENT_SIZE as INPUT_EVENT_SIZE};
 
 // ============================================================================
 // Endpoints
@@ -55,9 +55,9 @@ pub use arcos_libinput_proto::{InputEvent, EVENT_SIZE as INPUT_EVENT_SIZE};
 /// client messages (0x30xx), and compositor replies (0x40xx) all flow
 /// here.
 ///
-/// Kept duplicated from `arcos_libscanout::COMPOSITOR_ENDPOINT` rather
+/// Kept duplicated from `cambios_libscanout::COMPOSITOR_ENDPOINT` rather
 /// than cross-imported so libgui-proto keeps its single dependency
-/// (`arcos-libinput-proto`, added for InputEvent forwarding) minimal.
+/// (`cambios-libinput-proto`, added for InputEvent forwarding) minimal.
 pub const COMPOSITOR_ENDPOINT: u32 = 28;
 
 /// Compositor's *input* endpoint — ADR-012 Input-1 path. virtio-input
@@ -85,7 +85,7 @@ pub const COMPOSITOR_INPUT_ENDPOINT: u32 = 30;
 pub const MAX_WINDOWS: usize = 32;
 
 /// SCAFFOLDING: max damage rects per client FrameReady. Matches
-/// `arcos_libscanout::MAX_DAMAGE_RECTS_PER_FRAME` so a compositor-side
+/// `cambios_libscanout::MAX_DAMAGE_RECTS_PER_FRAME` so a compositor-side
 /// rect list can proxy straight through to the scanout-driver's
 /// FrameReady without re-sizing. Replace when: the scanout-side bound
 /// changes.
@@ -110,7 +110,7 @@ pub const MAX_WINDOW_DIMENSION: u32 = 8192;
 // ============================================================================
 
 /// Damage rectangle in window-local pixel coordinates. Identical
-/// shape to `arcos_libscanout::Rect` but intentionally re-declared
+/// shape to `cambios_libscanout::Rect` but intentionally re-declared
 /// (see module docstring).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -122,7 +122,7 @@ pub struct Rect {
 }
 
 /// Pixel format for a client surface. Values chosen to match
-/// `arcos_libscanout::PixelFormat` discriminants so the compositor
+/// `cambios_libscanout::PixelFormat` discriminants so the compositor
 /// can pass a client's format through to the scanout-driver without
 /// a lookup table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +203,7 @@ pub enum MsgTag {
     ErrorResponse = 0x4020,
     /// Input event forwarded from the compositor to the focused window.
     /// Payload is the 96-byte [`InputEvent`] wire format defined by
-    /// `arcos-libinput-proto` (ADR-012).
+    /// `cambios-libinput-proto` (ADR-012).
     InputEvent = 0x4030,
 }
 
@@ -327,7 +327,7 @@ pub fn decode_welcome_client(buf: &[u8]) -> Option<WelcomeClientMsg> {
 /// `FrameReady` — client → compositor.
 /// Layout: `[tag:4][window_id:4][seq:4][damage_count:4][rects: N × 8]`.
 /// `damage_count == 0` means "full surface dirty" (no rects follow).
-/// Same shape as `arcos_libscanout::encode_frame_ready` but the 4-byte
+/// Same shape as `cambios_libscanout::encode_frame_ready` but the 4-byte
 /// id field is the `window_id`, not a `display_id`.
 pub fn encode_frame_ready(
     buf: &mut [u8],
@@ -463,7 +463,7 @@ pub fn encode_input_event(buf: &mut [u8], event: &InputEvent) -> Option<usize> {
         return None;
     }
     buf[..4].copy_from_slice(&MsgTag::InputEvent.as_u32().to_le_bytes());
-    arcos_libinput_proto::encode_event(&mut buf[4..4 + INPUT_EVENT_SIZE], event)?;
+    cambios_libinput_proto::encode_event(&mut buf[4..4 + INPUT_EVENT_SIZE], event)?;
     Some(4 + INPUT_EVENT_SIZE)
 }
 
@@ -473,7 +473,7 @@ pub fn decode_input_event(buf: &[u8]) -> Option<InputEvent> {
     {
         return None;
     }
-    arcos_libinput_proto::decode_event(&buf[4..4 + INPUT_EVENT_SIZE])
+    cambios_libinput_proto::decode_event(&buf[4..4 + INPUT_EVENT_SIZE])
 }
 
 // ============================================================================
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn input_event_roundtrip() {
-        use arcos_libinput_proto::{EventType, KeyboardPayload};
+        use cambios_libinput_proto::{EventType, KeyboardPayload};
         let ev = InputEvent::key(
             EventType::KeyDown,
             /* device_id */ 1,

@@ -19,10 +19,10 @@
 //! - Physical memory map
 //! - Framebuffer (optional)
 
-extern crate arcos_core;
+extern crate cambios_core;
 extern crate alloc;
 
-// Lock hierarchy: canonical definition lives in `arcos_core::lib.rs`.
+// Lock hierarchy: canonical definition lives in `cambios_core::lib.rs`.
 // CLAUDE.md § Lock Ordering documents the rule. Do not duplicate the
 // hierarchy here — duplicates drift, and CLAUDE.md's Post-Change Review §3
 // explicitly forbids it.
@@ -35,13 +35,13 @@ use limine::request::{
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::hlt;
-use arcos_core::println;
-use arcos_core::BOOT_MODULE_REGISTRY;
-use arcos_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, TaskId};
-use arcos_core::ipc::{EndpointId, IpcManager, ProcessId, CapabilityRights};
+use cambios_core::println;
+use cambios_core::BOOT_MODULE_REGISTRY;
+use cambios_core::scheduler::{Scheduler, Timer, TimerConfig, Priority, TaskId};
+use cambios_core::ipc::{EndpointId, IpcManager, ProcessId, CapabilityRights};
 
 // Use the global statics from the library crate
-use arcos_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, BOOTSTRAP_PRINCIPAL, OBJECT_STORE};
+use cambios_core::{PER_CPU_SCHEDULER, PER_CPU_TIMER, IPC_MANAGER, CAPABILITY_MANAGER, PROCESS_TABLE, BOOTSTRAP_PRINCIPAL, OBJECT_STORE};
 
 
 
@@ -127,7 +127,7 @@ unsafe extern "C" fn kmain() -> ! {
     // up — and the HHDM offset there is read from the same Limine response
     // for consistency. See `src/boot/mod.rs` for the abstraction rationale.
     if let Some(hhdm_response) = HHDM_REQUEST.get_response() {
-        arcos_core::set_hhdm_offset(hhdm_response.offset());
+        cambios_core::set_hhdm_offset(hhdm_response.offset());
     }
 
     // AArch64: Diagnose and map MMIO devices before any I/O.
@@ -167,7 +167,7 @@ unsafe extern "C" fn kmain() -> ! {
             }
         }
 
-        use arcos_core::memory::paging::early_map_mmio;
+        use cambios_core::memory::paging::early_map_mmio;
 
         // PL011 UART0 at 0x0900_0000 (QEMU virt). Failure is fatal: serial
         // is the only console, and we have no way to report why we failed.
@@ -205,7 +205,7 @@ unsafe extern "C" fn kmain() -> ! {
     // Early diagnostic on AArch64: write to PL011 via HHDM to confirm entry.
     #[cfg(target_arch = "aarch64")]
     {
-        let hhdm = arcos_core::hhdm_offset();
+        let hhdm = cambios_core::hhdm_offset();
         let uart = (0x0900_0000u64 + hhdm) as *mut u8;
         // SAFETY: PL011 UART0 data register was mapped into HHDM by the
         // early_map_mmio call above, single-threaded boot, no concurrent
@@ -215,20 +215,20 @@ unsafe extern "C" fn kmain() -> ! {
 
     // Initialize serial output FIRST so panic messages are visible
     // SAFETY: Called once as the first init step. No other code accesses SERIAL1 yet.
-    unsafe { arcos_core::io::init(); }
+    unsafe { cambios_core::io::init(); }
 
     // Verify Limine protocol is supported (panics with a message if not)
     if !BASE_REVISION.is_supported() {
         // Serial is up; print a named diagnostic before halting.
         println!("✗ Limine base revision not supported by this kernel — halting");
-        arcos_core::halt();
+        cambios_core::halt();
     }
 
     println!("=== CambiOS Microkernel [v0.2.0] ===");
     println!("Booted via Limine\n");
 
     // Populate kernel-owned BootInfo from the Limine response statics.
-    // After this call, the rest of the kernel reads `arcos_core::boot::info()`
+    // After this call, the rest of the kernel reads `cambios_core::boot::info()`
     // and never touches `limine::*` types (modulo the AP-wakeup path in
     // `ap_entry`, which depends on Limine's MP active-wake mechanism and is
     // documented in src/boot/limine.rs as a deferred abstraction).
@@ -236,20 +236,20 @@ unsafe extern "C" fn kmain() -> ! {
     // rather than panicking. kmain returns `!` so we can't use `?`;
     // dispatch to boot_failed on error so the halt path is the single
     // typed boot-failure landing instead of a stack of .expect panics.
-    arcos_core::boot::limine::populate(
+    cambios_core::boot::limine::populate(
         &HHDM_REQUEST,
         &MEMORY_MAP_REQUEST,
         &FRAMEBUFFER_REQUEST,
         &RSDP_REQUEST,
         &MODULE_REQUEST,
     )
-    .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
+    .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
 
-    let hhdm_offset = arcos_core::hhdm_offset();
+    let hhdm_offset = cambios_core::hhdm_offset();
     println!("HHDM offset: {:#x}", hhdm_offset);
 
     // Report memory map (read from kernel-owned BootInfo, not Limine).
-    let info = arcos_core::boot::info();
+    let info = cambios_core::boot::info();
     let regions = info.memory_regions();
     println!("Memory map: {} entries", regions.len());
     for (i, region) in regions.iter().enumerate() {
@@ -307,10 +307,10 @@ unsafe extern "C" fn kmain() -> ! {
     // Load our GDT (replaces Limine's) — must be before IDT and syscall init
     // On AArch64: no-op (EL1/EL0 managed via exception levels).
     // SAFETY: Single-threaded boot, interrupts disabled.
-    unsafe { arcos_core::arch::gdt::init(); }
+    unsafe { cambios_core::arch::gdt::init(); }
     println!("✓ GDT loaded (kernel CS={:#x}, SS={:#x})",
-        arcos_core::arch::gdt::KERNEL_CS,
-        arcos_core::arch::gdt::KERNEL_SS,
+        cambios_core::arch::gdt::KERNEL_CS,
+        cambios_core::arch::gdt::KERNEL_SS,
     );
 
     // Save the kernel page table root for restoring address space after user tasks
@@ -320,14 +320,14 @@ unsafe extern "C" fn kmain() -> ! {
             let cr3: u64;
             // SAFETY: Reading CR3 is safe at ring 0. Returns the PML4 physical address.
             unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)); }
-            arcos_core::set_kernel_cr3(cr3);
+            cambios_core::set_kernel_cr3(cr3);
         }
         #[cfg(target_arch = "aarch64")]
         {
             let ttbr1: u64;
             // SAFETY: Reading TTBR1_EL1 is safe at EL1. This is the kernel page table.
             unsafe { core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1, options(nostack, nomem)); }
-            arcos_core::set_kernel_cr3(ttbr1);
+            cambios_core::set_kernel_cr3(ttbr1);
         }
     }
 
@@ -335,13 +335,13 @@ unsafe extern "C" fn kmain() -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: Single-threaded boot, GDT already loaded. Sets up exception handlers.
-        unsafe { arcos_core::interrupts::init(); }
+        unsafe { cambios_core::interrupts::init(); }
         println!("✓ IDT loaded");
     }
 
     // Initialize SYSCALL/SYSRET MSRs (x86_64) or VBAR_EL1 exception vectors (AArch64)
     // SAFETY: GDT loaded, single-threaded boot.
-    unsafe { arcos_core::arch::syscall::init(); }
+    unsafe { cambios_core::arch::syscall::init(); }
     #[cfg(target_arch = "x86_64")]
     println!("✓ SYSCALL/SYSRET configured");
     #[cfg(target_arch = "aarch64")]
@@ -380,7 +380,7 @@ unsafe extern "C" fn kmain() -> ! {
         // x86_64: APIC timer + I/O APIC + device IRQs
         // Disables PIC, enables Local APIC, parses ACPI for I/O APIC,
         // calibrates APIC timer at 100Hz, routes device IRQs.
-        let rsdp_phys = arcos_core::boot::info().rsdp_phys.unwrap_or(0);
+        let rsdp_phys = cambios_core::boot::info().rsdp_phys.unwrap_or(0);
 
         // Map ACPI physical memory into the HHDM before parsing.
         map_acpi_regions(rsdp_phys);
@@ -391,18 +391,18 @@ unsafe extern "C" fn kmain() -> ! {
         // calibration). kmain returns `!` so no `?`; dispatch to
         // boot_failed for the single typed halt path.
         unsafe {
-            arcos_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
-                .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
+            cambios_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
+                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
         }
         println!("✓ APIC-driven scheduling active");
 
         // PCI bus scan — discover devices for user-space drivers
         // SAFETY: Single-threaded boot, interrupts just enabled but no PCI drivers yet.
-        unsafe { arcos_core::pci::scan() };
-        let pci_count = arcos_core::pci::device_count();
+        unsafe { cambios_core::pci::scan() };
+        let pci_count = cambios_core::pci::device_count();
         println!("✓ PCI: {} device(s) discovered", pci_count);
         for i in 0..pci_count {
-            if let Some(dev) = arcos_core::pci::get_device(i) {
+            if let Some(dev) = cambios_core::pci::get_device(i) {
                 println!("  PCI {:02x}:{:02x}.{} — {:04x}:{:04x} class {:02x}:{:02x}",
                     dev.bus, dev.device, dev.function,
                     dev.vendor_id, dev.device_id,
@@ -428,7 +428,7 @@ unsafe extern "C" fn kmain() -> ! {
             let bsp_mpidr: u64;
             core::arch::asm!("mrs {}, mpidr_el1", out(reg) bsp_mpidr, options(nostack, nomem));
             // Initialize per-CPU data (TPIDR_EL1) for BSP
-            arcos_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
+            cambios_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
             println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
 
             // Enable FP/NEON for EL0 and EL1 (CPACR_EL1.FPEN = 0b11).
@@ -443,7 +443,7 @@ unsafe extern "C" fn kmain() -> ! {
             );
 
             // Initialize GIC CPU interface (ICC system registers)
-            arcos_core::arch::aarch64::gic::init();
+            cambios_core::arch::aarch64::gic::init();
             println!("  ✓ GIC CPU interface enabled");
 
             // Initialize GIC Distributor (SPI routing, priorities)
@@ -455,18 +455,18 @@ unsafe extern "C" fn kmain() -> ! {
             /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`.
             /// Platform-fixed by QEMU; see `GICD_PHYS` above.
             const GICR_PHYS: u64 = 0x080A_0000;
-            let hhdm = arcos_core::hhdm_offset();
-            arcos_core::arch::aarch64::gic::init_distributor(GICD_PHYS + hhdm);
+            let hhdm = cambios_core::hhdm_offset();
+            cambios_core::arch::aarch64::gic::init_distributor(GICD_PHYS + hhdm);
             println!("  ✓ GIC Distributor initialized");
 
             // Initialize GIC Redistributor for BSP (PPI 30 = timer)
-            arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, 0);
+            cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, 0);
             println!("  ✓ GIC Redistributor initialized (CPU 0)");
 
             // Start ARM Generic Timer at 100 Hz
             // ADR-021 Phase B.3: typed BootError propagation.
-            arcos_core::arch::aarch64::timer::init(100)
-                .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
+            cambios_core::arch::aarch64::timer::init(100)
+                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
             println!("  ✓ ARM Generic Timer started (100 Hz)");
         }
         println!("✓ GIC + timer scheduling active\n");
@@ -508,10 +508,10 @@ unsafe extern "C" fn kmain() -> ! {
         // SAFETY: HHDM offset is set; FRAME_ALLOCATOR is live (init
         // ran above); kernel page table is active; single-threaded boot.
         unsafe {
-            arcos_core::pci::init_ecam(ECAM_PHYS_AARCH64, ECAM_SIZE_AARCH64)
+            cambios_core::pci::init_ecam(ECAM_PHYS_AARCH64, ECAM_SIZE_AARCH64)
                 .unwrap_or_else(|e| {
                     println!("✗ pci::init_ecam failed: {}", e);
-                    arcos_core::halt();
+                    cambios_core::halt();
                 });
         }
         println!(
@@ -521,11 +521,11 @@ unsafe extern "C" fn kmain() -> ! {
 
         // SAFETY: single-threaded BSP boot, no PCI driver is running,
         // BAR sizing writes are safe before user space comes up.
-        unsafe { arcos_core::pci::scan() };
-        let pci_count = arcos_core::pci::device_count();
+        unsafe { cambios_core::pci::scan() };
+        let pci_count = cambios_core::pci::device_count();
         println!("✓ PCI: {} device(s) discovered", pci_count);
         for i in 0..pci_count {
-            if let Some(dev) = arcos_core::pci::get_device(i) {
+            if let Some(dev) = cambios_core::pci::get_device(i) {
                 println!(
                     "  PCI {:02x}:{:02x}.{} — {:04x}:{:04x} class {:02x}:{:02x}",
                     dev.bus, dev.device, dev.function,
@@ -567,14 +567,14 @@ unsafe extern "C" fn kmain() -> ! {
         let guard = PER_CPU_SCHEDULER[0].lock();
         if let Some(sched) = guard.as_ref() {
             // Find the first Ready task with a non-zero kernel_stack_top
-            for slot in 1..arcos_core::MAX_TASKS as u32 {
+            for slot in 1..cambios_core::MAX_TASKS as u32 {
                 if let Some(task) = sched.get_task_pub(TaskId(slot)) {
                     if task.kernel_stack_top != 0 {
                         // SAFETY: BSP percpu is initialized, interrupts may be
                         // enabled but we're the only code path accessing kernel_rsp0
                         // before the first context switch.
                         unsafe {
-                            arcos_core::arch::x86_64::gdt::set_kernel_stack(task.kernel_stack_top);
+                            cambios_core::arch::x86_64::gdt::set_kernel_stack(task.kernel_stack_top);
                         }
                         break;
                     }
@@ -622,7 +622,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // HHDM offset set by the Sv48 boot trampoline in entry.rs. This
     // must match the `HHDM_OFFSET` constant there (and the L3[256]
     // index the boot table uses).
-    arcos_core::set_hhdm_offset(arcos_core::arch::riscv64::entry::HHDM_OFFSET);
+    cambios_core::set_hhdm_offset(cambios_core::arch::riscv64::entry::HHDM_OFFSET);
 
     // Bring up serial BEFORE boot::riscv::populate so any diagnostic
     // prints inside the DTB walker (warnings, overflow markers) land
@@ -631,12 +631,12 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     //
     // SAFETY: Called once as the first init step on this hart. No
     // other code accesses SERIAL1 yet.
-    unsafe { arcos_core::io::init(); }
+    unsafe { cambios_core::io::init(); }
 
     // SAFETY: First-time install of BootInfo from the riscv boot
     // adapter. Walks the DTB OpenSBI handed us and populates memory
     // regions + reservations.
-    unsafe { arcos_core::boot::riscv::populate(dtb_phys); }
+    unsafe { cambios_core::boot::riscv::populate(dtb_phys); }
 
     println!("=== CambiOS Microkernel [v0.2.0] (RISC-V Phase R-2) ===");
     println!(
@@ -644,7 +644,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         hart_id, dtb_phys
     );
     println!("Sv48 paging: kernel @ higher-half, HHDM @ {:#x}",
-        arcos_core::arch::riscv64::entry::HHDM_OFFSET);
+        cambios_core::arch::riscv64::entry::HHDM_OFFSET);
 
     // Quick sanity check that we're really at the higher-half VMA.
     // `kmain_riscv64 as u64` gives this function's virtual address; it
@@ -658,7 +658,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
 
     println!();
     println!("Memory map from DTB:");
-    for (i, region) in arcos_core::boot::info().memory_regions().iter().enumerate() {
+    for (i, region) in cambios_core::boot::info().memory_regions().iter().enumerate() {
         println!(
             "  [{}] {:#018x} - {:#018x} ({} KiB) {}",
             i,
@@ -672,7 +672,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
 
     // Phase R-2.c: memory subsystem bring-up.
     // SAFETY: called once, single-hart, immediately after DTB populate.
-    unsafe { arcos_core::memory::init(); }
+    unsafe { cambios_core::memory::init(); }
     init_kernel_heap();
     init_frame_allocator();
 
@@ -707,7 +707,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // SAFETY: single-hart boot, paging is active, no prior per-hart
     // code has run.
     unsafe {
-        arcos_core::arch::riscv64::percpu::init_bsp(hart_id);
+        cambios_core::arch::riscv64::percpu::init_bsp(hart_id);
     }
 
     // Phase R-3.b+c: trap vector + SBI timer.
@@ -722,10 +722,10 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // is set up; we're single-hart during boot; interrupts are still
     // masked on entry (we explicitly enable them below).
     unsafe {
-        arcos_core::arch::riscv64::trap::install();
+        cambios_core::arch::riscv64::trap::install();
     }
 
-    if let Some(tb) = arcos_core::boot::info().timer_base_frequency_hz {
+    if let Some(tb) = cambios_core::boot::info().timer_base_frequency_hz {
         println!(
             "✓ DTB /cpus/timebase-frequency = {} Hz (from DTB)",
             tb
@@ -736,14 +736,14 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
 
     // SAFETY: trap vector just installed.
     // ADR-021 Phase B.3: typed BootError on missing timebase.
-    let reload = unsafe { arcos_core::arch::riscv64::timer::init(100) }
-        .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
+    let reload = unsafe { cambios_core::arch::riscv64::timer::init(100) }
+        .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
     println!("✓ SBI timer armed at 100 Hz (reload = {} ticks)", reload);
 
     // Phase R-3.d: PLIC driver — init from DTB-reported MMIO range,
     // enable the console UART source, and record its IRQ number so
     // the trap handler's R-3.d inline RX diagnostic can match it.
-    match arcos_core::boot::info().plic_mmio {
+    match cambios_core::boot::info().plic_mmio {
         Some((phys_base, size_bytes)) => {
             println!(
                 "✓ DTB /soc/plic reg = {:#x}..{:#x} ({} KiB)",
@@ -756,23 +756,23 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
             // early boot with interrupts masked.
             // ADR-021 Phase B.3: typed BootError on implausible PLIC range.
             unsafe {
-                arcos_core::arch::riscv64::plic::init(phys_base, size_bytes)
+                cambios_core::arch::riscv64::plic::init(phys_base, size_bytes)
                     .unwrap_or_else(|_| {
-                        arcos_core::boot::boot_failed(
-                            arcos_core::boot::BootError::PlicInitFailed,
+                        cambios_core::boot::boot_failed(
+                            cambios_core::boot::BootError::PlicInitFailed,
                         )
                     });
             }
             println!("✓ PLIC initialized (hart 0 S-mode, threshold=0, SEIE set)");
 
-            if let Some(irq) = arcos_core::boot::info().console_irq {
+            if let Some(irq) = cambios_core::boot::info().console_irq {
                 // SAFETY: PLIC init has published MMIO base; enable is
                 // idempotent; source range bounded by MAX_SOURCES.
-                unsafe { arcos_core::arch::riscv64::plic::enable_irq(irq); }
-                arcos_core::arch::riscv64::plic::set_console_irq(irq);
+                unsafe { cambios_core::arch::riscv64::plic::enable_irq(irq); }
+                cambios_core::arch::riscv64::plic::set_console_irq(irq);
                 // SAFETY: UART MMIO was mapped by io::init; IER write
                 // is single-byte at a fixed offset.
-                unsafe { arcos_core::io::enable_console_rx_irq(); }
+                unsafe { cambios_core::io::enable_console_rx_irq(); }
                 println!(
                     "✓ Console IRQ {} armed (DTB /soc/serial/interrupts); \
                      NS16550 IER.ERBFI set",
@@ -800,12 +800,12 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // running yet, no other writer touches the pci table.
     {
         let mut registered = 0usize;
-        for region in arcos_core::boot::info().virtio_mmio_devices() {
+        for region in cambios_core::boot::info().virtio_mmio_devices() {
             // SAFETY: per-region invocation of the same precondition
             // asserted for the loop above; each `region` was supplied
             // by the boot-info adapter from the DTB-published list.
             unsafe {
-                if arcos_core::pci::register_virtio_mmio(region.phys_base, region.size) {
+                if cambios_core::pci::register_virtio_mmio(region.phys_base, region.size) {
                     registered += 1;
                 }
             }
@@ -813,10 +813,10 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         println!(
             "✓ Virtio-MMIO: {} device(s) registered (DTB advertised {})",
             registered,
-            arcos_core::boot::info().virtio_mmio_devices().count(),
+            cambios_core::boot::info().virtio_mmio_devices().count(),
         );
-        for i in 0..arcos_core::pci::device_count() {
-            if let Some(dev) = arcos_core::pci::get_device(i) {
+        for i in 0..cambios_core::pci::device_count() {
+            if let Some(dev) = cambios_core::pci::get_device(i) {
                 println!(
                     "  virtio-mmio {:04x}:{:04x} BAR0={:#x} size={}",
                     dev.vendor_id,
@@ -850,15 +850,15 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // Phase R-5.b: mark BSP online in the TLB-shootdown mask and
     // probe the SBI IPI extension (warn-only if absent — single-
     // hart boots never fire a cross-hart shootdown).
-    arcos_core::arch::riscv64::tlb::mark_self_online(hart_id);
-    let _ = arcos_core::arch::riscv64::tlb::probe_ipi_extension();
+    cambios_core::arch::riscv64::tlb::mark_self_online(hart_id);
+    let _ = cambios_core::arch::riscv64::tlb::probe_ipi_extension();
 
     // SAFETY: trap handler is live, per-hart state is initialized,
     // the timer is armed, the scheduler holds the idle task, and (if
     // the DTB reported them) PLIC + console IRQ are wired. Safe to
     // take interrupts now.
     unsafe {
-        arcos_core::arch::riscv64::trap::enable_interrupts();
+        cambios_core::arch::riscv64::trap::enable_interrupts();
     }
 
     // Phase R-5.a: wake secondary harts via SBI HSM. Each AP runs
@@ -906,10 +906,10 @@ fn scheduler_init_riscv64() {
     let mut scheduler = Scheduler::new_boxed();
     if let Err(e) = scheduler.init() {
         println!("✗ Scheduler init failed: {:?}", e);
-        arcos_core::halt();
+        cambios_core::halt();
     }
     // Register idle task (slot 0) in the global task→CPU map.
-    arcos_core::set_task_cpu(0, 0);
+    cambios_core::set_task_cpu(0, 0);
 
     // Load signed boot modules from the initrd (BootInfo.modules).
     // `load_boot_modules` is arch-independent: same SignedBinaryVerifier,
@@ -918,9 +918,9 @@ fn scheduler_init_riscv64() {
 
     // Register every freshly-loaded task in the global task→CPU map
     // (everything on hart 0 for now; later passes migrate).
-    for slot in 0..arcos_core::MAX_TASKS as u32 {
+    for slot in 0..cambios_core::MAX_TASKS as u32 {
         if scheduler.get_task_pub(TaskId(slot)).is_some() {
-            arcos_core::set_task_cpu(slot, 0);
+            cambios_core::set_task_cpu(slot, 0);
         }
     }
 
@@ -930,12 +930,12 @@ fn scheduler_init_riscv64() {
         Ok(t) => t,
         Err(e) => {
             println!("✗ Timer creation failed: {}", e);
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
     if let Err(e) = timer.init() {
         println!("✗ Timer init failed: {}", e);
-        arcos_core::halt();
+        cambios_core::halt();
     }
     *PER_CPU_TIMER[0].lock() = Some(timer);
 
@@ -960,27 +960,27 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
     // stvec, sie.STIE) or installs a per-hart scheduler instance.
     unsafe {
         // Step 1: per-hart data (writes tp + clears sscratch).
-        arcos_core::arch::riscv64::percpu::init_ap(cpu_idx, hart_id);
+        cambios_core::arch::riscv64::percpu::init_ap(cpu_idx, hart_id);
 
         // Step 2: trap vector (per-hart stvec).
-        arcos_core::arch::riscv64::trap::install();
+        cambios_core::arch::riscv64::trap::install();
 
         // Step 3: SBI timer — reads BootInfo for timebase, enables
         // sie.STIE, arms first tick.
-        let _reload = arcos_core::arch::riscv64::timer::init(100);
+        let _reload = cambios_core::arch::riscv64::timer::init(100);
     }
 
     // Step 4: per-hart scheduler + Timer. `local_scheduler()` /
     // `local_timer()` index PER_CPU_SCHEDULER / PER_CPU_TIMER by
     // `current_percpu().cpu_id()` — which we just set in init_ap.
     {
-        use arcos_core::scheduler::{Scheduler, Timer, TimerConfig};
+        use cambios_core::scheduler::{Scheduler, Timer, TimerConfig};
 
         let mut scheduler = Scheduler::new_boxed();
         if scheduler.init().is_err() {
             println!("⚠ AP cpu_idx={} hart={}: scheduler.init() failed", cpu_idx, hart_id);
         } else {
-            arcos_core::set_task_cpu(0, cpu_idx as u16);
+            cambios_core::set_task_cpu(0, cpu_idx as u16);
             *PER_CPU_SCHEDULER[cpu_idx].lock() = Some(scheduler);
         }
 
@@ -1000,11 +1000,11 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
     // happen before `enable_interrupts` so a shootdown IPI fired by
     // the BSP (mid-boot) lands on a ready handler — though in
     // practice shootdowns are rare during bring-up.
-    arcos_core::arch::riscv64::tlb::mark_self_online(hart_id);
+    cambios_core::arch::riscv64::tlb::mark_self_online(hart_id);
 
     // Step 6: signal BSP that this AP has fully initialized.
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+    cambios_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     println!("  ✓ AP hart={} cpu_idx={} online", hart_id, cpu_idx);
 
@@ -1012,7 +1012,7 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
     // sits with just its idle task for R-5.a/b; R-6 + task migration
     // will fill it.
     // SAFETY: trap vector installed; PerCpu/timer/scheduler all live.
-    unsafe { arcos_core::arch::riscv64::trap::enable_interrupts(); }
+    unsafe { cambios_core::arch::riscv64::trap::enable_interrupts(); }
     loop {
         // SAFETY: wfi is always legal in S-mode with SIE set.
         unsafe { core::arch::asm!("wfi", options(nostack, nomem, preserves_flags)); }
@@ -1042,9 +1042,9 @@ static KERNEL_HEAP_PHYS_BASE: core::sync::atomic::AtomicU64 =
 /// Finds a large Usable physical region, converts it to a virtual address via
 /// the HHDM offset, and hands it to the global allocator.
 fn init_kernel_heap() {
-    use arcos_core::boot::MemoryRegionKind;
+    use cambios_core::boot::MemoryRegionKind;
 
-    let info = arcos_core::boot::info();
+    let info = cambios_core::boot::info();
     let hhdm_offset = info.hhdm_offset;
 
     // Find the largest Usable region that can hold our heap
@@ -1062,7 +1062,7 @@ fn init_kernel_heap() {
         Some(pair) => pair,
         None => {
             println!("✗ No usable memory region large enough for kernel heap — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
     // On boot protocols that deliver "full RAM as one Usable region +
@@ -1133,7 +1133,7 @@ fn init_kernel_heap() {
              ({:#x} < {:#x}) — halting",
             region_len, KERNEL_HEAP_SIZE,
         );
-        arcos_core::halt();
+        cambios_core::halt();
     }
 
     // Use only what we need from this region
@@ -1146,10 +1146,10 @@ fn init_kernel_heap() {
     // SAFETY: virt_base is a valid writable address in the HHDM region, covering
     // heap_size bytes of usable physical memory reported by Limine. Called once.
     unsafe {
-        arcos_core::KERNEL_HEAP.init(virt_base, heap_size);
+        cambios_core::KERNEL_HEAP.init(virt_base, heap_size);
     }
 
-    let (used, free) = arcos_core::KERNEL_HEAP.stats();
+    let (used, free) = cambios_core::KERNEL_HEAP.stats();
     println!(
         "✓ Kernel heap: {} KB at virt {:#x} (phys {:#x}, region {} KB)",
         heap_size / 1024,
@@ -1165,11 +1165,11 @@ fn init_kernel_heap() {
 /// Marks all Usable regions as available, then reserves the kernel heap
 /// and process heap regions so they can't be double-allocated.
 fn init_frame_allocator() {
-    use arcos_core::boot::MemoryRegionKind;
-    use arcos_core::FRAME_ALLOCATOR;
-    use arcos_core::memory::frame_allocator::PAGE_SIZE;
+    use cambios_core::boot::MemoryRegionKind;
+    use cambios_core::FRAME_ALLOCATOR;
+    use cambios_core::memory::frame_allocator::PAGE_SIZE;
 
-    let info = arcos_core::boot::info();
+    let info = cambios_core::boot::info();
 
     let mut fa = FRAME_ALLOCATOR.lock();
 
@@ -1239,12 +1239,12 @@ fn init_frame_allocator() {
 /// but empty — the first three kernel tasks are populated later in
 /// `process_table_init` and `capability_manager_init`, respectively.
 fn init_kernel_object_tables() {
-    use arcos_core::config;
-    use arcos_core::ipc::capability::CapabilityManager;
-    use arcos_core::memory::frame_allocator::PAGE_SIZE;
-    use arcos_core::memory::object_table;
-    use arcos_core::process::ProcessTable;
-    use arcos_core::{CAPABILITY_MANAGER, CHANNEL_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
+    use cambios_core::config;
+    use cambios_core::ipc::capability::CapabilityManager;
+    use cambios_core::memory::frame_allocator::PAGE_SIZE;
+    use cambios_core::memory::object_table;
+    use cambios_core::process::ProcessTable;
+    use cambios_core::{CAPABILITY_MANAGER, CHANNEL_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
 
     // Available memory figure: the *free* frame count at this point
     // in boot, times the page size. This is what's actually allocatable
@@ -1288,7 +1288,7 @@ fn init_kernel_object_tables() {
 
     // Allocate the contiguous region from the frame allocator and
     // carve out the two page-aligned subregions.
-    let hhdm = arcos_core::hhdm_offset();
+    let hhdm = cambios_core::hhdm_offset();
     let table = {
         let mut fa = FRAME_ALLOCATOR.lock();
         match object_table::init(&mut fa, num_slots, hhdm, binding) {
@@ -1300,7 +1300,7 @@ fn init_kernel_object_tables() {
                     num_slots,
                     binding.as_str(),
                 );
-                arcos_core::halt();
+                cambios_core::halt();
             }
         }
     };
@@ -1314,8 +1314,8 @@ fn init_kernel_object_tables() {
         "✓ Kernel object tables: {} slots × ({} + {}) bytes = {} KiB, \
          tier={}, binding={}, phys={:#x}",
         table.num_slots,
-        core::mem::size_of::<Option<arcos_core::process::ProcessDescriptor>>(),
-        core::mem::size_of::<Option<arcos_core::ipc::capability::ProcessCapabilities>>(),
+        core::mem::size_of::<Option<cambios_core::process::ProcessDescriptor>>(),
+        core::mem::size_of::<Option<cambios_core::ipc::capability::ProcessCapabilities>>(),
         table.region_bytes / 1024,
         config::ACTIVE_TIER_NAME,
         table.binding.as_str(),
@@ -1330,14 +1330,14 @@ fn init_kernel_object_tables() {
         Some(pt) => pt,
         None => {
             println!("✗ Failed to wrap ProcessTable around object table slice — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
     let capability_manager = match CapabilityManager::from_object_slice(table.capability_slots) {
         Some(cm) => cm,
         None => {
             println!("✗ Failed to wrap CapabilityManager around object table slice — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
 
@@ -1346,7 +1346,7 @@ fn init_kernel_object_tables() {
 
     // Phase 3.2d.iii: initialize the channel manager (lock position 5).
     *CHANNEL_MANAGER.lock() = Some(Box::new(
-        arcos_core::ipc::channel::ChannelManager::new(),
+        cambios_core::ipc::channel::ChannelManager::new(),
     ));
 }
 
@@ -1356,10 +1356,10 @@ fn init_kernel_object_tables() {
 /// Must be called after `init_frame_allocator()` and before any process
 /// is created so early boot events are captured.
 fn audit_init() {
-    use arcos_core::audit::drain::AuditRing;
-    use arcos_core::FRAME_ALLOCATOR;
+    use cambios_core::audit::drain::AuditRing;
+    use cambios_core::FRAME_ALLOCATOR;
 
-    let hhdm = arcos_core::hhdm_offset();
+    let hhdm = cambios_core::hhdm_offset();
     let ring = {
         let mut fa = FRAME_ALLOCATOR.lock();
         match AuditRing::init(&mut fa, hhdm) {
@@ -1374,7 +1374,7 @@ fn audit_init() {
 
     let capacity = ring.capacity();
     let pages = ring.page_count();
-    *arcos_core::AUDIT_RING.lock() = Some(ring);
+    *cambios_core::AUDIT_RING.lock() = Some(ring);
 
     println!("✓ Audit: initialized ({} pages, {} event slots)",
         pages, capacity);
@@ -1389,12 +1389,12 @@ fn audit_init() {
 /// so `parse_acpi()` can read them via the standard `phys + hhdm` path.
 #[cfg(target_arch = "x86_64")]
 fn map_acpi_regions(rsdp_phys: u64) {
-    use arcos_core::boot::MemoryRegionKind;
-    use arcos_core::FRAME_ALLOCATOR;
-    use arcos_core::memory::paging;
+    use cambios_core::boot::MemoryRegionKind;
+    use cambios_core::FRAME_ALLOCATOR;
+    use cambios_core::memory::paging;
     use x86_64::structures::paging::PageTableFlags;
 
-    let hhdm = arcos_core::hhdm_offset();
+    let hhdm = cambios_core::hhdm_offset();
     let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
 
     let mut fa_guard = FRAME_ALLOCATOR.lock();
@@ -1421,7 +1421,7 @@ fn map_acpi_regions(rsdp_phys: u64) {
     /// with legitimate Reserved-kind ACPI data above 1 MiB.
     const MAX_RESERVED_MAP_SIZE: u64 = 1024 * 1024; // 1 MB
     let mut mapped_pages = 0usize;
-    for region in arcos_core::boot::info().memory_regions() {
+    for region in cambios_core::boot::info().memory_regions() {
         let should_map = match region.kind {
             MemoryRegionKind::AcpiReclaimable | MemoryRegionKind::AcpiNvs => true,
             MemoryRegionKind::Reserved if region.length <= MAX_RESERVED_MAP_SIZE => true,
@@ -1453,7 +1453,7 @@ fn scheduler_init() {
     let mut scheduler = Scheduler::new_boxed();
     if let Err(e) = scheduler.init() {
         println!("✗ Scheduler init failed: {:?}", e);
-        arcos_core::halt();
+        cambios_core::halt();
     }
 
     // Idle task (Task 0) uses the Limine boot stack (256KB). Its saved_rsp
@@ -1463,9 +1463,9 @@ fn scheduler_init() {
     load_boot_modules(&mut scheduler);
 
     // Register all initial tasks in the global task→CPU map (all on CPU 0)
-    for slot in 0..arcos_core::MAX_TASKS as u32 {
+    for slot in 0..cambios_core::MAX_TASKS as u32 {
         if scheduler.get_task_pub(TaskId(slot)).is_some() {
-            arcos_core::set_task_cpu(slot, 0);
+            cambios_core::set_task_cpu(slot, 0);
         }
     }
 
@@ -1477,13 +1477,13 @@ fn scheduler_init() {
         Ok(t) => t,
         Err(e) => {
             println!("✗ Timer creation failed: {}", e);
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
 
     if let Err(e) = timer.init() {
         println!("✗ Timer init failed: {}", e);
-        arcos_core::halt();
+        cambios_core::halt();
     }
 
     *PER_CPU_TIMER[0].lock() = Some(timer);
@@ -1501,7 +1501,7 @@ fn scheduler_init() {
 /// Grants send/receive on endpoints 0-31 (full range) and binds the
 /// bootstrap Principal to the process (boot modules are trusted).
 fn register_process_capabilities(process_id: ProcessId) {
-    use arcos_core::ipc::capability::CapabilityKind;
+    use cambios_core::ipc::capability::CapabilityKind;
 
     let mut guard = CAPABILITY_MANAGER.lock();
     let cap_mgr = match guard.as_mut() {
@@ -1513,7 +1513,7 @@ fn register_process_capabilities(process_id: ProcessId) {
         return;
     }
     // Grant send/receive on all endpoints (boot modules are trusted)
-    for endpoint_id in 0..arcos_core::ipc::MAX_ENDPOINTS as u32 {
+    for endpoint_id in 0..cambios_core::ipc::MAX_ENDPOINTS as u32 {
         let _ = cap_mgr.grant_capability(
             process_id,
             EndpointId(endpoint_id),
@@ -1541,10 +1541,10 @@ fn register_process_capabilities(process_id: ProcessId) {
 /// Process IDs are assigned starting at 5 (0-4 are used by kernel tasks
 /// and the existing hand-built user tasks).
 fn load_boot_modules(scheduler: &mut Scheduler) {
-    use arcos_core::loader::{self, SignedBinaryVerifier};
-    use arcos_core::FRAME_ALLOCATOR;
+    use cambios_core::loader::{self, SignedBinaryVerifier};
+    use cambios_core::FRAME_ALLOCATOR;
 
-    let info = arcos_core::boot::info();
+    let info = cambios_core::boot::info();
     if info.module_count() == 0 {
         println!("  No boot modules found");
         return;
@@ -1588,7 +1588,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         // per-module cmdline flag, a `game-` filename prefix convention,
         // or a manifest file read at boot.
         // Why: the shell `play` launcher UX needs "load-but-don't-start"
-        // semantics so boot lands at `arcos>` rather than in a game;
+        // semantics so boot lands at `cambios>` rather than in a game;
         // the cleaner mechanisms are larger scope than the HN launcher
         // arc.
         // Revisit when: the super-sprouty-o launcher arc closes within
@@ -1636,7 +1636,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
                 // Phase 3.4: identify the policy service by module name
                 if short_name == b"policy-service" {
-                    arcos_core::POLICY_SERVICE_PID.store(
+                    cambios_core::POLICY_SERVICE_PID.store(
                         process_id.as_raw(),
                         core::sync::atomic::Ordering::Release,
                     );
@@ -1654,8 +1654,8 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 // is a hardware-access capability, narrower than the
                 // default send/receive + CreateProcess grant.
                 if short_name == b"fb-demo" || short_name == b"scanout-limine" {
-                    use arcos_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = arcos_core::CAPABILITY_MANAGER.lock();
+                    use cambios_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
                     if let Some(cap_mgr) = cap_guard.as_mut() {
                         let _ = cap_mgr.grant_system_capability(
                             process_id,
@@ -1678,8 +1678,8 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 // dynamic policy until a second consumer (kernelvisor)
                 // appears.
                 if short_name == b"audit-tail" {
-                    use arcos_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = arcos_core::CAPABILITY_MANAGER.lock();
+                    use cambios_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
                     if let Some(cap_mgr) = cap_guard.as_mut() {
                         let _ = cap_mgr.grant_system_capability(
                             process_id,
@@ -1707,11 +1707,11 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 // Ready as before. This preserves the invariant the
                 // scheduler already relies on: at least one task
                 // (besides idle) is runnable at boot.
-                arcos_core::BOOT_MODULE_ORDER.lock().push(result.task_id);
+                cambios_core::BOOT_MODULE_ORDER.lock().push(result.task_id);
                 if loaded_count > 0 {
                     let _ = scheduler.block_task(
                         result.task_id,
-                        arcos_core::scheduler::BlockReason::BootGate,
+                        cambios_core::scheduler::BlockReason::BootGate,
                     );
                 }
 
@@ -1728,8 +1728,8 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         // Phase 3.4: Enable policy enforcement if the policy service was loaded.
         // The fail-open timeout handles the startup window before the policy
         // service processes its first query.
-        if arcos_core::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire) != u64::MAX {
-            arcos_core::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
+        if cambios_core::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire) != u64::MAX {
+            cambios_core::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
             println!("✓ Policy enforcement enabled (fail-open until service starts)");
         }
     }
@@ -1744,19 +1744,19 @@ fn ipc_init() {
         Some(ipc) => ipc,
         None => {
             println!("✗ Failed to allocate IpcManager — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
 
     // Install zero-trust IPC interceptor on legacy IPC_MANAGER
-    use arcos_core::ipc::interceptor::{DefaultInterceptor, IpcInterceptorBackend};
+    use cambios_core::ipc::interceptor::{DefaultInterceptor, IpcInterceptorBackend};
     // Enum-dispatch shim per ADR-002 § Divergence — no `dyn` trait object.
     ipc.set_interceptor(IpcInterceptorBackend::Default(DefaultInterceptor::new()));
 
     *IPC_MANAGER.lock() = Some(ipc);
 
     // Also install interceptor on the sharded IPC manager.
-    arcos_core::SHARDED_IPC
+    cambios_core::SHARDED_IPC
         .set_interceptor(IpcInterceptorBackend::Default(DefaultInterceptor::new()));
 
     println!("✓ IPC manager ready [interceptor active, per-endpoint sharding enabled]");
@@ -1772,14 +1772,14 @@ fn ipc_init() {
 /// calls register_process_capabilities after their process table
 /// entries exist.
 fn capability_manager_init() {
-    use arcos_core::ipc::capability::CapabilityKind;
+    use cambios_core::ipc::capability::CapabilityKind;
 
     let mut guard = CAPABILITY_MANAGER.lock();
     let cap_mgr = match guard.as_mut() {
         Some(m) => m,
         None => {
             println!("✗ CAPABILITY_MANAGER not initialized before capability_manager_init — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
 
@@ -1841,7 +1841,7 @@ fn capability_manager_init() {
 /// never enters kernel memory. Runtime object signing is delegated to
 /// user-space services with their own operational keys.
 fn bootstrap_identity_init() {
-    use arcos_core::ipc::Principal;
+    use cambios_core::ipc::Principal;
 
     // Bootstrap public key compiled in from bootstrap_pubkey.bin.
     // Generated by: sign-elf --yubikey --export-pubkey bootstrap_pubkey.bin
@@ -1883,8 +1883,8 @@ fn bootstrap_identity_init() {
 /// and `PER_CPU_SCHEDULER` (per-CPU, no cycle with OBJECT_STORE since
 /// scheduler / ISR code never acquires OBJECT_STORE).
 fn object_store_init() {
-    use arcos_core::fs::ram::RamObjectStore;
-    use arcos_core::fs::ObjectStoreBackend;
+    use cambios_core::fs::ram::RamObjectStore;
+    use cambios_core::fs::ObjectStoreBackend;
 
     // Boot with RamObjectStore — fast, no IPC, no driver dependency.
     // The first SYS_OBJ_* syscall calls ensure_disk_store() (outside any
@@ -1898,7 +1898,7 @@ fn object_store_init() {
         Some(s) => s,
         None => {
             println!("✗ RamObjectStore allocation failed — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
     *OBJECT_STORE.lock() = Some(ObjectStoreBackend::Ram(store));
@@ -1913,7 +1913,7 @@ fn object_store_init() {
 /// only creates the first three `ProcessDescriptor`s, allocating each
 /// one's heap via the frame allocator.
 fn process_table_init() {
-    use arcos_core::FRAME_ALLOCATOR;
+    use cambios_core::FRAME_ALLOCATOR;
 
     // Lock order: PROCESS_TABLE (5) -> FRAME_ALLOCATOR (6). Valid.
     let mut pt_guard = PROCESS_TABLE.lock();
@@ -1921,7 +1921,7 @@ fn process_table_init() {
         Some(pt) => pt,
         None => {
             println!("✗ PROCESS_TABLE not initialized before process_table_init — halting");
-            arcos_core::halt();
+            cambios_core::halt();
         }
     };
 
@@ -1971,33 +1971,33 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
     // Step 1: Load this AP's GDT + TSS (replaces Limine's)
     // SAFETY: Interrupts disabled, called once per AP.
-    unsafe { arcos_core::arch::gdt::init_for_cpu(cpu_index) };
+    unsafe { cambios_core::arch::gdt::init_for_cpu(cpu_index) };
 
     // Step 2: Initialize per-CPU data (writes GS base MSR)
     // SAFETY: GDT loaded (GS base will be overwritten by percpu init). One-time per AP.
-    unsafe { arcos_core::arch::x86_64::percpu::init_ap(cpu_index, apic_id) };
+    unsafe { cambios_core::arch::x86_64::percpu::init_ap(cpu_index, apic_id) };
 
     // Step 3: Load the shared IDT (configured by BSP)
     // SAFETY: BSP has fully configured and loaded the IDT.
-    unsafe { arcos_core::interrupts::load_idt_ap() };
+    unsafe { cambios_core::interrupts::load_idt_ap() };
 
     // Step 4: Initialize SYSCALL/SYSRET MSRs (per-CPU)
     // SAFETY: GDT loaded, per-CPU init done.
-    unsafe { arcos_core::arch::syscall::init() };
+    unsafe { cambios_core::arch::syscall::init() };
 
     // Step 5: Enable this AP's Local APIC
     // SAFETY: BSP already mapped the APIC MMIO page (shared page tables).
-    unsafe { arcos_core::arch::x86_64::apic::init_ap() };
+    unsafe { cambios_core::arch::x86_64::apic::init_ap() };
 
     // Step 6: Configure APIC timer using BSP's calibration values
     // SAFETY: BSP has completed configure_timer() and stored the initial count.
-    unsafe { arcos_core::arch::x86_64::apic::configure_timer_ap() };
+    unsafe { cambios_core::arch::x86_64::apic::configure_timer_ap() };
 
     // Step 7: Initialize per-CPU scheduler and timer
     // Each AP needs its own Scheduler (with idle task) so migrated tasks
     // can be dispatched, and its own Timer for tick accounting.
     {
-        use arcos_core::scheduler::{Scheduler, Timer, TimerConfig};
+        use cambios_core::scheduler::{Scheduler, Timer, TimerConfig};
 
         let mut scheduler = Scheduler::new_boxed();
         if scheduler.init().is_err() {
@@ -2014,7 +2014,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
     // Step 8: Signal BSP that this AP is ready
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+    cambios_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Step 9: Enable interrupts and enter idle loop
     // SAFETY: All AP-local hardware is initialized.
@@ -2046,16 +2046,16 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // state (TPIDR_EL1, VBAR_EL1, GIC CPU interface, GICR, timer).
     unsafe {
         // Step 1: Per-CPU EL1 config (no-op on AArch64)
-        arcos_core::arch::gdt::init_for_cpu(cpu_index);
+        cambios_core::arch::gdt::init_for_cpu(cpu_index);
 
         // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
-        arcos_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
+        cambios_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
 
         // Step 3: Install exception vector table (per-CPU VBAR_EL1)
-        arcos_core::arch::syscall::init();
+        cambios_core::arch::syscall::init();
 
         // Step 4: Initialize GIC CPU interface for this AP
-        arcos_core::arch::aarch64::gic::init();
+        cambios_core::arch::aarch64::gic::init();
 
         // Step 5: Initialize GIC Redistributor for this AP
         /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`;
@@ -2063,18 +2063,18 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
         /// AP walks its own redistributor at `base + cpu_index*stride`
         /// inside `init_redistributor`.
         const GICR_PHYS: u64 = 0x080A_0000;
-        let hhdm = arcos_core::hhdm_offset();
-        arcos_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
+        let hhdm = cambios_core::hhdm_offset();
+        cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
 
         // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
         // ADR-021 Phase B.3: AP discovers if BSP forgot to init the timer.
-        arcos_core::arch::aarch64::timer::init_ap()
-            .unwrap_or_else(|err| arcos_core::boot::boot_failed(err));
+        cambios_core::arch::aarch64::timer::init_ap()
+            .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
     }
 
     // Step 7: Initialize per-CPU scheduler and timer
     {
-        use arcos_core::scheduler::{Scheduler, Timer, TimerConfig};
+        use cambios_core::scheduler::{Scheduler, Timer, TimerConfig};
 
         let mut scheduler = Scheduler::new_boxed();
         if scheduler.init().is_err() {
@@ -2091,7 +2091,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
     // Step 8: Signal BSP that this AP is ready
     AP_READY_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    arcos_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+    cambios_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Step 9: Set SP_EL1 and enable IRQs
     // SAFETY: All AP-local hardware is initialized.
@@ -2110,7 +2110,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     }
 
     loop {
-        arcos_core::wfi();
+        cambios_core::wfi();
     }
 }
 
@@ -2120,7 +2120,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 /// Migrates a subset of tasks from the BSP's run queue to available APs
 /// in round-robin fashion. Only Ready/Blocked tasks are migrated.
 fn distribute_tasks_to_aps() {
-    use arcos_core::scheduler::{TaskId, migrate_task};
+    use cambios_core::scheduler::{TaskId, migrate_task};
 
     // Count online APs by checking which per-CPU schedulers are initialized
     let ap_count = AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize;
@@ -2137,10 +2137,10 @@ fn distribute_tasks_to_aps() {
         let guard = PER_CPU_SCHEDULER[0].lock();
         if let Some(sched) = guard.as_ref() {
             // Tasks 1..N that are Ready (not Running or Blocked on hardware)
-            for slot in 1..arcos_core::MAX_TASKS as u32 {
+            for slot in 1..cambios_core::MAX_TASKS as u32 {
                 let tid = TaskId(slot);
                 if let Some(task) = sched.get_task_pub(tid) {
-                    if task.state == arcos_core::scheduler::TaskState::Ready {
+                    if task.state == cambios_core::scheduler::TaskState::Ready {
                         migratable[count] = Some(tid);
                         count += 1;
                     }
@@ -2210,10 +2210,10 @@ unsafe fn start_application_processors() {
     // arch-gated branches live here.
     #[cfg(target_arch = "riscv64")]
     {
-        use arcos_core::arch::riscv64::entry::MAX_AP_BOOT_STACKS;
-        use arcos_core::arch::riscv64::sbi;
+        use cambios_core::arch::riscv64::entry::MAX_AP_BOOT_STACKS;
+        use cambios_core::arch::riscv64::sbi;
 
-        let info = arcos_core::boot::info();
+        let info = cambios_core::boot::info();
         let hart_count = info.hart_count();
         if hart_count <= 1 {
             println!("  Single-hart (DTB reported {} hart(s))", hart_count);
@@ -2225,7 +2225,7 @@ unsafe fn start_application_processors() {
         // (before AP dispatch), so `tp` holds a valid `&'static PerCpu`
         // and `current_percpu()` returns a live reference.
         let bsp_hart_id = unsafe {
-            arcos_core::arch::riscv64::percpu::current_percpu().apic_id()
+            cambios_core::arch::riscv64::percpu::current_percpu().apic_id()
         } as u64;
 
         // `_ap_start` is linked at a higher-half VMA; SBI needs the
@@ -2395,14 +2395,14 @@ fn microkernel_loop() -> ! {
         // operations valid at EL1. Loop terminates when INTID >= 1020 (spurious).
         unsafe {
             loop {
-                let intid = arcos_core::arch::aarch64::gic::acknowledge_irq();
+                let intid = cambios_core::arch::aarch64::gic::acknowledge_irq();
                 if intid >= 1020 { break; }
-                arcos_core::arch::aarch64::gic::write_eoi();
+                cambios_core::arch::aarch64::gic::write_eoi();
             }
         }
         // Rearm the timer so the first tick fires cleanly.
         // SAFETY: Timer is initialized; writing CNTP_TVAL_EL0 is valid at EL1.
-        unsafe { arcos_core::arch::aarch64::timer::rearm(); }
+        unsafe { cambios_core::arch::aarch64::timer::rearm(); }
         // Set SP_EL1 = current kernel stack so the first timer ISR has a
         // valid stack. Exception entry forces SPSel=1 → SP = SP_EL1.
         // Uses SPSel toggle because QEMU traps `msr sp_el1`.
@@ -2440,11 +2440,11 @@ fn microkernel_loop() -> ! {
         // Periodic invariant verification (every ~60 seconds)
         if ticks >= last_verify_tick + 6000 {
             last_verify_tick = ticks;
-            if let Some(scheduler) = arcos_core::local_scheduler().try_lock() {
+            if let Some(scheduler) = cambios_core::local_scheduler().try_lock() {
                 if let Some(sched) = scheduler.as_ref() {
                     if let Err(e) = sched.verify_invariants() {
                         println!("✗ Scheduler invariant violated: {}", e);
-                        arcos_core::halt();
+                        cambios_core::halt();
                     }
                 }
             }
@@ -2455,11 +2455,11 @@ fn microkernel_loop() -> ! {
         // LVT timer on x86_64) surfaces as a zero in the log.
         if !smp_diag_printed && ticks >= 100 {
             smp_diag_printed = true;
-            let online = arcos_core::online_cpu_count();
+            let online = cambios_core::online_cpu_count();
             let mut buf_tail: [u64; 8] = [0; 8];
             let report_n = core::cmp::min(online, 8);
             for i in 0..report_n {
-                buf_tail[i] = arcos_core::PER_CPU_TIMER_TICKS[i]
+                buf_tail[i] = cambios_core::PER_CPU_TIMER_TICKS[i]
                     .load(core::sync::atomic::Ordering::Relaxed);
             }
             println!(
@@ -2470,13 +2470,13 @@ fn microkernel_loop() -> ! {
 
         // Load balancing: migrate tasks from overloaded to underloaded CPUs
         // (internally throttled to once per BALANCE_INTERVAL_TICKS)
-        arcos_core::try_load_balance();
+        cambios_core::try_load_balance();
 
         // Halt/wait CPU until next interrupt (timer, keyboard, etc.)
         #[cfg(target_arch = "x86_64")]
         hlt();
         #[cfg(target_arch = "aarch64")]
-        arcos_core::wfi();
+        cambios_core::wfi();
     }
 }
 
@@ -2486,5 +2486,5 @@ fn microkernel_loop() -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("\nMICROKERNEL PANIC: {:?}", info);
-    arcos_core::halt();
+    cambios_core::halt();
 }

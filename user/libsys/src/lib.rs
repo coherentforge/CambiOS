@@ -18,12 +18,12 @@
 
 #![no_std]
 
-// Syscall numbers come from the standalone `arcos-abi` crate so the
+// Syscall numbers come from the standalone `cambios-abi` crate so the
 // kernel and userspace share one source of truth (was previously a
 // hand-maintained mirror of the kernel enum). Re-exported `pub` so
-// downstream consumers like policy-service can `use arcos_libsys::
-// SyscallNumber` without depending on arcos-abi directly.
-pub use arcos_abi::SyscallNumber;
+// downstream consumers like policy-service can `use cambios_libsys::
+// SyscallNumber` without depending on cambios-abi directly.
+pub use cambios_abi::SyscallNumber;
 
 
 // ============================================================================
@@ -294,7 +294,7 @@ pub fn register_endpoint(endpoint_id: u32) -> i64 {
 /// `module_ready()` call advances the cursor and wakes the next module,
 /// guaranteeing deterministic boot ordering — each service's
 /// "[X] ready on endpoint N\n" print appears in strict limine.conf
-/// order, and the shell's `arcos>` prompt arrives only after everything
+/// order, and the shell's `cambios>` prompt arrives only after everything
 /// it depends on is up.
 ///
 /// Identity-exempt (does not require a bound Principal). Safe to call
@@ -985,7 +985,7 @@ pub fn port_write32(port: u16, value: u32) -> Result<(), i64> {
 // device-specific-config register structures. The kernel parses the PCI
 // capability list at boot; this syscall retrieves the parsed result.
 //
-// Byte layout must match `arcos::pci::VirtioModernCaps` exactly.
+// Byte layout must match `cambios::pci::VirtioModernCaps` exactly.
 
 
 /// One virtio-pci capability entry (virtio spec §4.1.4.1).

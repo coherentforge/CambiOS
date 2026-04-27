@@ -19,8 +19,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use arcos_core::loader::elf::{ElfBinary, SegmentLoad};
-use arcos_core::loader::{BinaryVerifier, DefaultVerifier, VerifyResult};
+use cambios_core::loader::elf::{ElfBinary, SegmentLoad};
+use cambios_core::loader::{BinaryVerifier, DefaultVerifier, VerifyResult};
 
 /// Fuzzer-generated segment with constrained ranges to increase
 /// coverage of the verifier's logic branches.

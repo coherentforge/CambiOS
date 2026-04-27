@@ -11,7 +11,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use arcos_core::loader::elf;
+use cambios_core::loader::elf;
 
 fuzz_target!(|data: &[u8]| {
     // Phase 1: header parsing — must not panic on any input

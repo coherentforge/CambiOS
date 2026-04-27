@@ -3,19 +3,19 @@
 version = 4
 
 [[package]]
-name = "arcos-abi"
+name = "cambios-abi"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
- "arcos-abi",
+ "cambios-abi",
 ]
 
 [[package]]
-name = "arcos-udp-stack"
+name = "cambios-udp-stack"
 version = "0.1.0"
 dependencies = [
- "arcos-libsys",
+ "cambios-libsys",
 ]

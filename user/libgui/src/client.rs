@@ -14,11 +14,11 @@
 //! gate. Same rationale as libsys: single-responsibility wrappers
 //! don't hide protocol primitives.
 
-use arcos_libgui_proto::{
+use cambios_libgui_proto::{
     decode_input_event, decode_welcome_client, encode_create_window, encode_destroy_window,
     encode_frame_ready, InputEvent, MsgTag, Rect, COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
 };
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 use crate::Surface;
 

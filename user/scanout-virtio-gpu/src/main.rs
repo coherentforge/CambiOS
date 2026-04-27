@@ -62,12 +62,12 @@ mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
-use arcos_libscanout::{DisplayInfo, DisplayState, Geometry, MsgTag, PixelFormat,
+use cambios_libscanout::{DisplayInfo, DisplayState, Geometry, MsgTag, PixelFormat,
     SCANOUT_DRIVER_ENDPOINT,
     decode_frame_ready_header, encode_display_connected, encode_frame_displayed,
     encode_welcome_compositor};
-use arcos_libsys as sys;
-use arcos_libsys::VerifiedMessage;
+use cambios_libsys as sys;
+use cambios_libsys::VerifiedMessage;
 
 use gpu::{
     VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, VIRTIO_GPU_MAX_SCANOUTS,

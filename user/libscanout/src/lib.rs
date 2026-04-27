@@ -19,7 +19,7 @@
 //!   the *consumer side* (compositor only) and live in `user/compositor`.
 //! - Compositor-internal types like `ScanoutBuffer` (which holds a
 //!   process-local vaddr) — also compositor-only.
-//! - IPC transport — both sides talk through `arcos-libsys`'s
+//! - IPC transport — both sides talk through `cambios-libsys`'s
 //!   `write` / `recv_msg` primitives; this crate just defines what the
 //!   payloads look like.
 

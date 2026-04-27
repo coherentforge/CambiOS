@@ -2,19 +2,19 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-libgui"
+name = "cambios-libgui"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "CambiOS GUI client library. Wraps the client ↔ compositor protocol (arcos-libgui-proto) with a safe Surface API, drawing primitives (fill_rect, draw_line, draw_text, blit_bitmap), a built-in bitmap font, and a TileGrid helper. Sized for first-party apps (e.g. Tree)."
+description = "CambiOS GUI client library. Wraps the client ↔ compositor protocol (cambios-libgui-proto) with a safe Surface API, drawing primitives (fill_rect, draw_line, draw_text, blit_bitmap), a built-in bitmap font, and a TileGrid helper. Sized for first-party apps (e.g. Tree)."
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
-arcos-libgui-proto = { path = "../libgui-proto" }
-arcos-libinput-proto = { path = "../libinput-proto" }
+cambios-libsys = { path = "../libsys" }
+cambios-libgui-proto = { path = "../libgui-proto" }
+cambios-libinput-proto = { path = "../libinput-proto" }
 
 [lib]
-name = "arcos_libgui"
+name = "cambios_libgui"
 path = "src/lib.rs"
 
 [profile.release]

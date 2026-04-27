@@ -3,17 +3,17 @@
 version = 4
 
 [[package]]
-name = "arcos-libfs"
+name = "cambios-libfs"
 version = "0.1.0"
 dependencies = [
- "arcos-libfs-proto",
- "arcos-libsys",
+ "cambios-libfs-proto",
+ "cambios-libsys",
 ]
 
 [[package]]
-name = "arcos-libfs-proto"
+name = "cambios-libfs-proto"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"

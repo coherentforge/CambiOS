@@ -7,7 +7,7 @@
 //! chipsets paired with the Lewisville PHY. Several stepping IDs exist;
 //! we probe a table of known IDs and accept any match.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// Intel PCI vendor ID.
 pub const INTEL_VENDOR_ID: u16 = 0x8086;

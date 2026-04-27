@@ -18,7 +18,7 @@
 //! | TRANSFER_TO_HOST_2D        | 0x0105 | 56            | 24             |
 //! | RESOURCE_FLUSH             | 0x0104 | 48            | 24             |
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 use crate::transport::ModernTransport;
 use crate::virtqueue::{DmaBuffer, ModernVirtQueue, Segment};

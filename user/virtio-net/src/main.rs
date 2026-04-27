@@ -39,7 +39,7 @@ mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 use transport::{LegacyMmioTransport, ModernPciTransport, NotifyToken, Transport};
 use virtqueue::{BounceBuffer, VirtQueue};
 

@@ -24,8 +24,8 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libsys as sys;
-use arcos_libsys::SyscallNumber;
+use cambios_libsys as sys;
+use cambios_libsys::SyscallNumber;
 
 // ============================================================================
 // Panic handler (required for no_std)
@@ -51,8 +51,8 @@ const POLICY_RESP_ENDPOINT: u32 = 23;
 /// IPC header (36 bytes) + query payload (48 bytes) = 84 bytes total.
 const MIN_QUERY_SIZE: usize = 36 + 48;
 
-// Syscall numbers come from `arcos-libsys::SyscallNumber` (re-exported from
-// the standalone `arcos-abi` crate so kernel + userspace share one source
+// Syscall numbers come from `cambios-libsys::SyscallNumber` (re-exported from
+// the standalone `cambios-abi` crate so kernel + userspace share one source
 // of truth). Profiles below use the enum directly; `fn profile()` casts
 // each variant to its `repr(u64)` discriminant for the bitmap shift.
 

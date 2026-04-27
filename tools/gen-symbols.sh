@@ -3,7 +3,7 @@
 # Copyright (C) 2024-2026 Jason Ricca
 #
 # gen-symbols.sh — generate a machine-readable symbol index of the
-# ArcOS kernel crate for AI-assisted development.
+# CambiOS kernel crate for AI-assisted development.
 #
 # Output: .symbols file at the repo root, one line per symbol.
 # Format: KIND:NAME:FILE:LINE[:EXTRA]
@@ -18,7 +18,7 @@
 #   make symbols                    # same, via Makefile target
 #
 # This is a grep-based extractor, not a full parser. It works because
-# ArcOS follows consistent naming conventions (pub struct, pub const,
+# CambiOS follows consistent naming conventions (pub struct, pub const,
 # pub fn, etc.). It will miss:
 # - Symbols inside macro expansions
 # - Trait implementations (impl Foo for Bar)

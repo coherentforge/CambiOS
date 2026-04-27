@@ -28,8 +28,8 @@
 //! distinct BAR, which is a straightforward extension but not worth
 //! writing until a real device demands it.
 
-use arcos_libsys as sys;
-use arcos_libsys::VirtioModernCaps;
+use cambios_libsys as sys;
+use cambios_libsys::VirtioModernCaps;
 
 /// Device status bits (virtio spec §2.1).
 pub const STATUS_ACKNOWLEDGE: u8 = 1;

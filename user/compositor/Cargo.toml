@@ -2,16 +2,16 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-compositor"
+name = "cambios-compositor"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
-arcos-libscanout = { path = "../libscanout" }
-arcos-libgui-proto = { path = "../libgui-proto" }
-arcos-libinput-proto = { path = "../libinput-proto" }
+cambios-libsys = { path = "../libsys" }
+cambios-libscanout = { path = "../libscanout" }
+cambios-libgui-proto = { path = "../libgui-proto" }
+cambios-libinput-proto = { path = "../libinput-proto" }
 
 [profile.release]
 opt-level = "s"

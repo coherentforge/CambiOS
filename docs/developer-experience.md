@@ -46,7 +46,7 @@ unsafe {
 
 **With `archos-sys` (safe, typed, documented):**
 ```rust
-use arcos_sys::{obj_put, obj_get, register_endpoint, recv_msg, write_msg};
+use cambios_sys::{obj_put, obj_get, register_endpoint, recv_msg, write_msg};
 
 let hash = obj_put(b"hello world")?;
 let data = obj_get(&hash)?;
@@ -70,14 +70,14 @@ println!("from: {:?}, payload: {:?}", msg.sender_principal, msg.payload);
 
 ---
 
-## Layer 2: Service Framework (`arcos-service`)
+## Layer 2: Service Framework (`cambios-service`)
 
-A higher-level crate that makes writing IPC services ergonomic. Depends on `arcos-sys` and a `no_std`-compatible allocator (the kernel already provides one via `SYS_ALLOCATE`).
+A higher-level crate that makes writing IPC services ergonomic. Depends on `cambios-sys` and a `no_std`-compatible allocator (the kernel already provides one via `SYS_ALLOCATE`).
 
 **Goal: a service is a struct with methods.**
 
 ```rust
-use arcos_service::{Service, IpcHandler, Request, Response};
+use cambios_service::{Service, IpcHandler, Request, Response};
 
 struct FileService {
     // service state
@@ -88,14 +88,14 @@ impl IpcHandler for FileService {
         match req.command() {
             b"GET" => {
                 let hash = req.payload_as::<[u8; 32]>();
-                match arcos_sys::obj_get(hash) {
+                match cambios_sys::obj_get(hash) {
                     Ok(data) => Response::ok(&data),
                     Err(e) => Response::err(e),
                 }
             }
             b"PUT" => {
                 let data = req.payload();
-                match arcos_sys::obj_put(data) {
+                match cambios_sys::obj_put(data) {
                     Ok(hash) => Response::ok(&hash),
                     Err(e) => Response::err(e),
                 }
@@ -132,7 +132,7 @@ fn main() {
 
 This is intentionally minimal. Structured serialization comes in Layer 3 for services that need it.
 
-**Prerequisites:** Stable `arcos-sys`. User-space heap allocator working reliably.
+**Prerequisites:** Stable `cambios-sys`. User-space heap allocator working reliably.
 
 ---
 
@@ -145,7 +145,7 @@ Once Layers 1-2 exist, invest in developer productivity.
 Proc macros that generate the `IpcHandler` boilerplate:
 
 ```rust
-use arcos_service::ipc;
+use cambios_service::ipc;
 
 struct MyService { /* ... */ }
 
@@ -200,7 +200,7 @@ This makes service-to-service calls feel like function calls. The IPC mechanics 
 Rich, contextual errors — not numeric codes:
 
 ```rust
-pub enum ArcosError {
+pub enum CambiosError {
     CapabilityDenied {
         principal: Principal,
         endpoint: u32,
@@ -216,7 +216,7 @@ pub enum ArcosError {
     // ...
 }
 
-impl core::fmt::Display for ArcosError {
+impl core::fmt::Display for CambiosError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             Self::CapabilityDenied { principal, endpoint, operation } => {
@@ -246,7 +246,7 @@ Test services on host without QEMU:
 ```rust
 #[cfg(test)]
 mod tests {
-    use arcos_test::{MockEndpoint, TestPrincipal};
+    use cambios_test::{MockEndpoint, TestPrincipal};
 
     #[test]
     fn test_get_enforces_ownership() {
@@ -300,7 +300,7 @@ This is real work — a custom `no_std` async runtime built on CambiOS primitive
 
 Once building services is pleasant, distribution matters.
 
-### Package Manifest (`Arcos.toml`)
+### Package Manifest (`Cambios.toml`)
 
 ```toml
 [service]
@@ -346,9 +346,9 @@ A crate registry for CambiOS services. Leverages the existing Rust/Cargo ecosyst
 | Signed ELF loading | Done | Already the distribution primitive |
 | IPC with principal stamping | Done | Wrap in safe API |
 | Content-addressed storage | Done | Wrap in safe API |
-| `arcos-sys` (syscall wrappers) | Not started | **Start here** |
-| `arcos-service` (framework) | Not started | After `arcos-sys` |
-| Derive macros | Not started | After `arcos-service` |
+| `cambios-sys` (syscall wrappers) | Not started | **Start here** |
+| `cambios-service` (framework) | Not started | After `cambios-sys` |
+| Derive macros | Not started | After `cambios-service` |
 | Serialization integration | Not started | After framework stabilizes |
 | Async runtime | Not started | After Layers 1-3 |
 | Package registry | Not started | After real adoption |
@@ -360,7 +360,7 @@ The kernel-side work is largely done. The developer experience gap is in the use
 ## Success Criteria
 
 1. A new service can be written in <50 lines of Rust
-2. Services build with `cargo build --target <arcos-target>` — standard Rust tooling
+2. Services build with `cargo build --target <cambios-target>` — standard Rust tooling
 3. Tests run on host with `cargo test` — no QEMU for unit tests
 4. Error messages tell developers what went wrong and how to fix it
 5. Documentation covers every public API with runnable examples

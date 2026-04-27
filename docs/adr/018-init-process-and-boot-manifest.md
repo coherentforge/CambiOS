@@ -361,7 +361,7 @@ This matches CLAUDE.md's verification posture: kernel code is verification-targe
 
 Sequenced to be landable in bounded commits with no regressions between them. The tri-arch regression gate applies at every step.
 
-1. **Define the manifest wire format** as a Rust module (`arcos_core::manifest`) shared between kernel, init, and the build tooling. Pure data structures + parsing logic, no side effects. Unit tests on host for every structural error case.
+1. **Define the manifest wire format** as a Rust module (`cambios_core::manifest`) shared between kernel, init, and the build tooling. Pure data structures + parsing logic, no side effects. Unit tests on host for every structural error case.
 2. **Add the bootstrap-side build tool** (`tools/build-manifest/`) that takes a TOML or Rust-defined source and emits a signed manifest blob. Sign with the same YubiKey path as `tools/sign-elf/`.
 3. **Add the endpoint reservation table** to the kernel (`src/ipc/endpoint_reservation.rs`). Initially empty, initially no caller — just the data structure and its check in `SYS_REGISTER_ENDPOINT`. Behavior is unchanged (empty table ⇒ all endpoints unreserved).
 4. **Add `SyscallNumber::InstallEndpointReservations`** (new variant, new handler). Gated by a new `InstallEndpointReservations` capability kind, no one holds it yet. No caller.

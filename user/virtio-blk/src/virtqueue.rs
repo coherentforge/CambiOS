@@ -24,7 +24,7 @@
 //! Protocol violations kill the device — no recovery attempted.
 
 use crate::device::DeviceValue;
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// Virtqueue descriptor (16 bytes, virtio spec §2.7.5).
 #[repr(C)]

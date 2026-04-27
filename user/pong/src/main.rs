@@ -41,9 +41,9 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{modifier, Client, EventType, FrameClock, InputEvent};
-use arcos_libsys as sys;
-use arcos_pong::game::{PaddleMotion, Pong, State};
+use cambios_libgui::{modifier, Client, EventType, FrameClock, InputEvent};
+use cambios_libsys as sys;
+use cambios_pong::game::{PaddleMotion, Pong, State};
 
 mod render;
 
@@ -129,14 +129,14 @@ pub extern "C" fn _start() -> ! {
         Ok(c) => c,
         Err(e) => {
             let tag: &[u8] = match e {
-                arcos_libgui::ClientError::RegisterEndpointFailed(_) => b"register_endpoint",
-                arcos_libgui::ClientError::EncodeCreateWindow => b"encode_create_window",
-                arcos_libgui::ClientError::CreateWindowWriteFailed(_) => b"create_window_write",
-                arcos_libgui::ClientError::RecvVerifiedFailed => b"recv_verified",
-                arcos_libgui::ClientError::DecodeWelcome => b"decode_welcome",
-                arcos_libgui::ClientError::ChannelAttachFailed(_) => b"channel_attach",
-                arcos_libgui::ClientError::EncodeFrameReady => b"encode_frame_ready",
-                arcos_libgui::ClientError::FrameReadyWriteFailed(_) => b"frame_ready_write",
+                cambios_libgui::ClientError::RegisterEndpointFailed(_) => b"register_endpoint",
+                cambios_libgui::ClientError::EncodeCreateWindow => b"encode_create_window",
+                cambios_libgui::ClientError::CreateWindowWriteFailed(_) => b"create_window_write",
+                cambios_libgui::ClientError::RecvVerifiedFailed => b"recv_verified",
+                cambios_libgui::ClientError::DecodeWelcome => b"decode_welcome",
+                cambios_libgui::ClientError::ChannelAttachFailed(_) => b"channel_attach",
+                cambios_libgui::ClientError::EncodeFrameReady => b"encode_frame_ready",
+                cambios_libgui::ClientError::FrameReadyWriteFailed(_) => b"frame_ready_write",
             };
             sys::log_error(b"PONG", tag);
             sys::exit(1);

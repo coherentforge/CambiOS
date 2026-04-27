@@ -15,7 +15,7 @@
 //! here rather than sharing a virtqueue module. Each descriptor is a
 //! single 8-byte writable buffer (`virtio_input_event` per spec §5.8).
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 use crate::transport::ModernTransport;
 

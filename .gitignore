@@ -3,7 +3,7 @@ user/*/target/
 tools/*/target/
 verification/*/target/
 fuzz/target/
-arcos-abi/target/
+cambios-abi/target/
 fuzz/artifacts/
 fuzz/corpus/
 *.iso

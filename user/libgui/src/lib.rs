@@ -2,7 +2,7 @@
 
 //! CambiOS GUI client library — v0 (ADR-011 / ADR-014 client side).
 //!
-//! Wraps `arcos-libgui-proto`'s wire format in a thin, opinionated API
+//! Wraps `cambios-libgui-proto`'s wire format in a thin, opinionated API
 //! that does the handshake, hands back a safe `Surface`, and submits
 //! `FrameReady` when the caller is done drawing. Scope matches the
 //! scanout protocol's v0: no input events, no widget tree, no layout,
@@ -13,7 +13,7 @@
 //! ## Shape
 //!
 //! ```ignore
-//! use arcos_libgui::{Client, Color, Rect, TileGrid};
+//! use cambios_libgui::{Client, Color, Rect, TileGrid};
 //!
 //! let mut client = Client::open(640, 480, MY_ENDPOINT).unwrap();
 //! let surf = client.surface_mut();
@@ -29,12 +29,12 @@
 //! ┌──────────────────────────────────────────────┐
 //! │ application                                   │
 //! ├──────────────────────────────────────────────┤
-//! │ arcos-libgui     (this crate — Surface,       │
+//! │ cambios-libgui     (this crate — Surface,       │
 //! │                   primitives, Client, font)   │
 //! ├──────────────────────────────────────────────┤
-//! │ arcos-libgui-proto (wire format, endpoints)   │
+//! │ cambios-libgui-proto (wire format, endpoints)   │
 //! ├──────────────────────────────────────────────┤
-//! │ arcos-libsys     (raw syscalls)               │
+//! │ cambios-libsys     (raw syscalls)               │
 //! └──────────────────────────────────────────────┘
 //! ```
 //!
@@ -73,13 +73,13 @@ pub use tile_grid::TileGrid;
 // Re-export Rect from libgui-proto so callers have one Rect type to
 // work with (damage lists on `Client::submit` take `&[Rect]` of the
 // same shape).
-pub use arcos_libgui_proto::Rect;
+pub use cambios_libgui_proto::Rect;
 
 // Re-export input types so a client doesn't need a second crate dep
 // for `Client::poll_event()`. When virtio-input land ships, clients
-// write `use arcos_libgui::{InputEvent, EventType, modifier, button}`.
-pub use arcos_libgui_proto::InputEvent;
-pub use arcos_libinput_proto::{
+// write `use cambios_libgui::{InputEvent, EventType, modifier, button}`.
+pub use cambios_libgui_proto::InputEvent;
+pub use cambios_libinput_proto::{
     button, modifier, DeviceClass, EventType, KeyboardPayload, PointerPayload,
 };
 

@@ -19,8 +19,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use arcos_core::ipc::capability::{CapabilityError, ProcessCapabilities};
-use arcos_core::ipc::{CapabilityRights, EndpointId, ProcessId};
+use cambios_core::ipc::capability::{CapabilityError, ProcessCapabilities};
+use cambios_core::ipc::{CapabilityRights, EndpointId, ProcessId};
 
 /// Capability operations the fuzzer can invoke.
 #[derive(Arbitrary, Debug)]

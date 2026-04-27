@@ -7,7 +7,7 @@
 //! All values returned from device memory should be treated as
 //! untrusted (the device is hostile under our threat model).
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// Mapped MMIO region for the device's BAR0.
 pub struct Mmio {

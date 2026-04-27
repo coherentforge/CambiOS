@@ -4,7 +4,7 @@
 //! Compositor-internal window management — Phase Scanout-3 (ADR-011).
 //!
 //! Wire-format types for the client ↔ compositor protocol live in
-//! `arcos-libgui-proto`; this module is the compositor's *server-side*
+//! `cambios-libgui-proto`; this module is the compositor's *server-side*
 //! state — the `WindowTable` of live windows, surface-channel
 //! ownership, and the message dispatch the main loop calls into.
 //!
@@ -25,11 +25,11 @@
 //! this module never talks to a `ScanoutBackend` — the render-loop glue
 //! in `main.rs` is what ties front and back together each frame.
 
-use arcos_libgui_proto::{
+use cambios_libgui_proto::{
     decode_create_window, decode_destroy_window, decode_frame_ready_header, encode_error_response,
     encode_welcome_client, GuiError, MsgTag, PixelFormat, MAX_WINDOWS, MAX_WINDOW_DIMENSION,
 };
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// Role discriminant accepted by `SYS_CHANNEL_CREATE`. Consumer =
 /// creator reads (compositor), peer writes (client). Numeric constant

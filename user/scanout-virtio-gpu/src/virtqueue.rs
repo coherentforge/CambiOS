@@ -16,7 +16,7 @@
 //! or replace it with a shared library if a third modern virtio driver
 //! materializes.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// SCAFFOLDING: hard-coded queue size for 4.a. 16 descriptors is enough
 /// for GET_DISPLAY_INFO (one command buffer + one response buffer =

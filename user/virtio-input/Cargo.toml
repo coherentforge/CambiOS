@@ -2,15 +2,15 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-virtio-input"
+name = "cambios-virtio-input"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "CambiOS virtio-input driver (ADR-012 Input-1 via virtio instead of PS/2). Modern virtio-pci transport (vendor=0x1AF4, device=0x1052) — keyboard + pointer classes; tablet/touch deferred. Translates evdev events into ADR-012's 96-byte normalized format and forwards to the compositor's input endpoint."
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
-arcos-libinput-proto = { path = "../libinput-proto" }
+cambios-libsys = { path = "../libsys" }
+cambios-libinput-proto = { path = "../libinput-proto" }
 
 [profile.release]
 opt-level = "s"

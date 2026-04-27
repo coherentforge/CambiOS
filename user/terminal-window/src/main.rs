@@ -14,10 +14,10 @@
 
 extern crate alloc;
 
-use arcos_libsys as sys;
-use arcos_libterm::line_editor::{LineEditor, LineResult};
-use arcos_libterm::Terminal;
-use arcos_terminal_window::gui_backend::GuiBackend;
+use cambios_libsys as sys;
+use cambios_libterm::line_editor::{LineEditor, LineResult};
+use cambios_libterm::Terminal;
+use cambios_terminal_window::gui_backend::GuiBackend;
 use linked_list_allocator::LockedHeap;
 
 // ============================================================================

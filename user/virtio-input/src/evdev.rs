@@ -201,7 +201,7 @@ pub fn evdev_to_hid(code: u16) -> u32 {
 /// Adding it requires extending `handle_keyboard_key`'s modifier-tracking
 /// branch — out of scope for the GUI-bring-up fix this lives behind.
 pub fn hid_to_ascii_us(hid: u32, modifiers: u16) -> u32 {
-    use arcos_libinput_proto::modifier;
+    use cambios_libinput_proto::modifier;
     let shift = (modifiers & (modifier::LEFT_SHIFT | modifier::RIGHT_SHIFT)) != 0;
 
     // Letters: 0x04..=0x1D map to a..z. Shift uppercases.
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(evdev_to_hid(0x9999), 0x9999);
     }
 
-    use arcos_libinput_proto::modifier;
+    use cambios_libinput_proto::modifier;
 
     #[test]
     fn hid_to_ascii_letters_unshifted() {

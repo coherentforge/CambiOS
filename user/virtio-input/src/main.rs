@@ -43,11 +43,11 @@ mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
-use arcos_libinput_proto::{
+use cambios_libinput_proto::{
     button, encode_event, modifier, DeviceClass, EventType, InputEvent, KeyboardPayload,
     PointerPayload, EVENT_SIZE,
 };
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 use evdev::{
     evdev_to_hid, hid_to_ascii_us, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY,

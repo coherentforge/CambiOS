@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-fuzz"
+name = "cambios-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -15,8 +15,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
-[dependencies.arcos_core]
-package = "arcos"
+[dependencies.cambios_core]
+package = "cambios"
 path = ".."
 
 # --- Fuzz targets ---

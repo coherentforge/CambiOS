@@ -3,22 +3,22 @@
 version = 4
 
 [[package]]
-name = "arcos-abi"
+name = "cambios-abi"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-key-store-service"
+name = "cambios-key-store-service"
 version = "0.1.0"
 dependencies = [
- "arcos-libsys",
+ "cambios-libsys",
  "ed25519-compact",
 ]
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
- "arcos-abi",
+ "cambios-abi",
 ]
 
 [[package]]

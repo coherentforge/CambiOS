@@ -9,7 +9,7 @@ dump, Limine banner, per-framebuffer enumeration), exits with a status code
 reflecting what actually happened.
 
 Exit codes:
-  0 — success sentinel seen (default: ``arcos> ``)
+  0 — success sentinel seen (default: ``cambios> ``)
   1 — kernel panic, CPU exception, or Limine bailout
   2 — no sentinel within --timeout, or QEMU exited before one
 
@@ -72,8 +72,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="qemu-run-quiet.py")
     parser.add_argument("--timeout", type=int, default=60,
                         help="seconds before declaring a hang (default: 60)")
-    parser.add_argument("--success", default="arcos> ",
-                        help="success sentinel substring (default: 'arcos> ')")
+    parser.add_argument("--success", default="cambios> ",
+                        help="success sentinel substring (default: 'cambios> ')")
     args = parser.parse_args(sys.argv[1:sep])
     qemu_cmd = sys.argv[sep + 1:]
     if not qemu_cmd:

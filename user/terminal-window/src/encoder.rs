@@ -3,7 +3,7 @@
 
 //! Keystroke → byte encoder for the GUI terminal backend.
 //!
-//! Translates `arcos-libinput-proto::InputEvent`s (as delivered by the
+//! Translates `cambios-libinput-proto::InputEvent`s (as delivered by the
 //! compositor via `libgui::Client::poll_event`) into the byte stream
 //! that `libterm`'s parser already knows how to decode. This is the
 //! **ENCODE** direction — libterm's parser is the DECODE direction.
@@ -43,7 +43,7 @@
 //! no allocation, bounded output (<= 16 bytes). Suitable for formal
 //! verification. Host-testable.
 
-use arcos_libinput_proto::{modifier, DeviceClass, EventType, InputEvent};
+use cambios_libinput_proto::{modifier, DeviceClass, EventType, InputEvent};
 
 /// Output of a single encode. Fixed-capacity byte buffer.
 ///
@@ -234,9 +234,9 @@ fn printable_ascii(codepoint: u32) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arcos_libinput_proto::{KeyboardPayload, EVENT_SIZE, SIGNATURE_BLOCK_SIZE};
-    use arcos_libterm::parser::Parser;
-    use arcos_libterm::Key;
+    use cambios_libinput_proto::{KeyboardPayload, EVENT_SIZE, SIGNATURE_BLOCK_SIZE};
+    use cambios_libterm::parser::Parser;
+    use cambios_libterm::Key;
 
     fn keydown(keycode: u32, modifiers: u16, unicode: u32) -> InputEvent {
         InputEvent::key(

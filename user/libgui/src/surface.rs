@@ -32,7 +32,7 @@
 use core::marker::PhantomData;
 
 use crate::Color;
-use arcos_libgui_proto::Rect;
+use cambios_libgui_proto::Rect;
 
 /// A mutable view over a XRGB8888 pixel buffer.
 ///

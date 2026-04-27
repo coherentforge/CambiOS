@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! CambiOS hello-window — first `arcos-libgui` client (ADR-011).
+//! CambiOS hello-window — first `cambios-libgui` client (ADR-011).
 //!
 //! Post-libgui-v0 form: the compositor handshake, channel attach,
 //! pixel fill, and FrameReady submit are all one call each through
-//! `arcos-libgui`. Previously this binary open-coded the protocol
+//! `cambios-libgui`. Previously this binary open-coded the protocol
 //! (~100 lines of `sys::write` / `sys::recv_verified` / manual
 //! pointer fill); now it's ~20 lines of libgui calls and exercises
 //! every v0 primitive (rect fill, line, text, tile grid).
@@ -20,8 +20,8 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{button, Client, Color, EventType, InputEvent, Rect, TileGrid};
-use arcos_libsys as sys;
+use cambios_libgui::{button, Client, Color, EventType, InputEvent, Rect, TileGrid};
+use cambios_libsys as sys;
 
 const HELLO_WINDOW_ENDPOINT: u32 = 29;
 const WINDOW_WIDTH: u32 = 640;

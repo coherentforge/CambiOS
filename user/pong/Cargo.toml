@@ -2,15 +2,15 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-pong"
+name = "cambios-pong"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "CambiOS Pong — third first-party app. Single-player vs AI on the Tree/Worm shared garden palette (paddles = logs, ball = acorn, field = grass). First libgui::FrameClock consumer alongside worm; first first-party app with continuous-motion physics."
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
-arcos-libgui = { path = "../libgui" }
+cambios-libsys = { path = "../libsys" }
+cambios-libgui = { path = "../libgui" }
 
 [profile.release]
 opt-level = "s"

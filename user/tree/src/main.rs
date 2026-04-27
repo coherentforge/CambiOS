@@ -37,8 +37,8 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libgui::{button, modifier, Client, EventType, InputEvent};
-use arcos_libsys as sys;
+use cambios_libgui::{button, modifier, Client, EventType, InputEvent};
+use cambios_libsys as sys;
 
 mod game;
 mod render;

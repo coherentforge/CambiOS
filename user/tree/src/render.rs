@@ -10,7 +10,7 @@
 //! Revisit when: compositor profiling shows frame build as a cost, OR
 //! a second app with a larger surface ships.
 
-use arcos_libgui::{Color, Rect, Surface, TileGrid};
+use cambios_libgui::{Color, Rect, Surface, TileGrid};
 
 use crate::game::{Board, Cell, State, BOARD_SIZE, MINE_COUNT};
 use crate::sprites;

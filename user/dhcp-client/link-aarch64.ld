@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2024-2026 Jason Ricca */
 
-/* ArcOS user-space ELF linker script (dhcp-client, AArch64) */
+/* CambiOS user-space ELF linker script (dhcp-client, AArch64) */
 OUTPUT_FORMAT("elf64-littleaarch64")
 ENTRY(_start)
 

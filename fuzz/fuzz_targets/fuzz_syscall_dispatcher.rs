@@ -29,9 +29,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use arcos_core::syscalls::dispatcher::SyscallDispatcher;
-use arcos_core::syscalls::fuzz_fixture::KernelFixture;
-use arcos_core::syscalls::SyscallArgs;
+use cambios_core::syscalls::dispatcher::SyscallDispatcher;
+use cambios_core::syscalls::fuzz_fixture::KernelFixture;
+use cambios_core::syscalls::SyscallArgs;
 
 const INPUT_LEN: usize = 56;
 

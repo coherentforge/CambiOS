@@ -8,8 +8,8 @@
 //! - An ANSI input parser implemented as a pure state-machine ([`parser`])
 //!   — byte-in, event-out, no I/O, suitable for formal verification.
 //! - A [`Backend`] trait that abstracts the byte-level transport. Today the
-//!   only backend is [`SerialBackend`] (wraps `arcos_libsys::console_read`
-//!   and `arcos_libsys::print`). A `FbBackend` can replace it post-Scanout-2
+//!   only backend is [`SerialBackend`] (wraps `cambios_libsys::console_read`
+//!   and `cambios_libsys::print`). A `FbBackend` can replace it post-Scanout-2
 //!   without changing consumer code.
 //! - A [`Terminal`] that composes a backend with the parser and exposes
 //!   `next_event(deadline_ticks)` — the lone-ESC ambiguity is resolved via

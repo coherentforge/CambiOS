@@ -9,9 +9,9 @@
 //! surface regardless of FrameReady damage list, per libgui-proto).
 //! Revisit when: compositor profiling shows frame build as a cost.
 
-use arcos_libgui::{Color, Rect, Surface, TileGrid};
+use cambios_libgui::{Color, Rect, Surface, TileGrid};
 
-use arcos_worm::game::{Direction, State, Worm, COLS, ROWS};
+use cambios_worm::game::{Direction, State, Worm, COLS, ROWS};
 
 // --- window / grid geometry ---
 //

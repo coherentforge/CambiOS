@@ -26,54 +26,54 @@ USER_ELF := user/hello.elf
 USER_SRC := user/hello.S
 USER_LD  := user/user.ld
 FS_SERVICE_DIR := user/fs-service
-FS_SERVICE_ELF := $(FS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-fs-service
+FS_SERVICE_ELF := $(FS_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-fs-service
 KS_SERVICE_DIR := user/key-store-service
-KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-key-store-service
+KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-key-store-service
 NET_DRIVER_DIR := user/virtio-net
-NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-net
+NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-net
 BLK_DRIVER_DIR := user/virtio-blk
-BLK_DRIVER_ELF := $(BLK_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-virtio-blk
+BLK_DRIVER_ELF := $(BLK_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-blk
 I219_DRIVER_DIR := user/i219-net
-I219_DRIVER_ELF := $(I219_DRIVER_DIR)/target/x86_64-unknown-none/release/arcos-i219-net
+I219_DRIVER_ELF := $(I219_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-i219-net
 UDP_STACK_DIR := user/udp-stack
-UDP_STACK_ELF := $(UDP_STACK_DIR)/target/x86_64-unknown-none/release/arcos-udp-stack
+UDP_STACK_ELF := $(UDP_STACK_DIR)/target/x86_64-unknown-none/release/cambios-udp-stack
 SHELL_DIR := user/shell
-SHELL_ELF := $(SHELL_DIR)/target/x86_64-unknown-none/release/arcos-shell
+SHELL_ELF := $(SHELL_DIR)/target/x86_64-unknown-none/release/cambios-shell
 POLICY_SERVICE_DIR := user/policy-service
-POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/arcos-policy-service
+POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-policy-service
 FB_DEMO_DIR := user/fb-demo
-FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/arcos-fb-demo
+FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/cambios-fb-demo
 COMPOSITOR_DIR := user/compositor
-COMPOSITOR_ELF := $(COMPOSITOR_DIR)/target/x86_64-unknown-none/release/arcos-compositor
+COMPOSITOR_ELF := $(COMPOSITOR_DIR)/target/x86_64-unknown-none/release/cambios-compositor
 SCANOUT_LIMINE_DIR := user/scanout-limine
-SCANOUT_LIMINE_ELF := $(SCANOUT_LIMINE_DIR)/target/x86_64-unknown-none/release/arcos-scanout-limine
+SCANOUT_LIMINE_ELF := $(SCANOUT_LIMINE_DIR)/target/x86_64-unknown-none/release/cambios-scanout-limine
 SCANOUT_VGPU_DIR := user/scanout-virtio-gpu
-SCANOUT_VGPU_ELF := $(SCANOUT_VGPU_DIR)/target/x86_64-unknown-none/release/arcos-scanout-virtio-gpu
+SCANOUT_VGPU_ELF := $(SCANOUT_VGPU_DIR)/target/x86_64-unknown-none/release/cambios-scanout-virtio-gpu
 VIRTIO_INPUT_DIR := user/virtio-input
-VIRTIO_INPUT_ELF := $(VIRTIO_INPUT_DIR)/target/x86_64-unknown-none/release/arcos-virtio-input
+VIRTIO_INPUT_ELF := $(VIRTIO_INPUT_DIR)/target/x86_64-unknown-none/release/cambios-virtio-input
 HELLO_WINDOW_DIR := user/hello-window
-HELLO_WINDOW_ELF := $(HELLO_WINDOW_DIR)/target/x86_64-unknown-none/release/arcos-hello-window
+HELLO_WINDOW_ELF := $(HELLO_WINDOW_DIR)/target/x86_64-unknown-none/release/cambios-hello-window
 TREE_DIR := user/tree
-TREE_ELF := $(TREE_DIR)/target/x86_64-unknown-none/release/arcos-tree
+TREE_ELF := $(TREE_DIR)/target/x86_64-unknown-none/release/cambios-tree
 WORM_DIR := user/worm
-WORM_ELF := $(WORM_DIR)/target/x86_64-unknown-none/release/arcos-worm
+WORM_ELF := $(WORM_DIR)/target/x86_64-unknown-none/release/cambios-worm
 PONG_DIR := user/pong
-PONG_ELF := $(PONG_DIR)/target/x86_64-unknown-none/release/arcos-pong
+PONG_ELF := $(PONG_DIR)/target/x86_64-unknown-none/release/cambios-pong
 SPROUTY_DIR := user/super-sprouty-o
-SPROUTY_ELF := $(SPROUTY_DIR)/target/x86_64-unknown-none/release/arcos-super-sprouty-o
+SPROUTY_ELF := $(SPROUTY_DIR)/target/x86_64-unknown-none/release/cambios-super-sprouty-o
 TERMINAL_WINDOW_DIR := user/terminal-window
-TERMINAL_WINDOW_ELF := $(TERMINAL_WINDOW_DIR)/target/x86_64-unknown-none/release/arcos-terminal-window
+TERMINAL_WINDOW_ELF := $(TERMINAL_WINDOW_DIR)/target/x86_64-unknown-none/release/cambios-terminal-window
 AUDIT_TAIL_DIR := user/audit-tail
-AUDIT_TAIL_ELF := $(AUDIT_TAIL_DIR)/target/x86_64-unknown-none/release/arcos-audit-tail
+AUDIT_TAIL_ELF := $(AUDIT_TAIL_DIR)/target/x86_64-unknown-none/release/cambios-audit-tail
 
 # User-space ELF binaries (RISC-V)
-FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-fs-service
-KS_SERVICE_ELF_RISCV64 := $(KS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-key-store-service
-BLK_DRIVER_ELF_RISCV64 := $(BLK_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-virtio-blk
-NET_DRIVER_ELF_RISCV64 := $(NET_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-virtio-net
-UDP_STACK_ELF_RISCV64 := $(UDP_STACK_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-udp-stack
-SHELL_ELF_RISCV64 := $(SHELL_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-shell
-POLICY_SERVICE_ELF_RISCV64 := $(POLICY_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-policy-service
+FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-fs-service
+KS_SERVICE_ELF_RISCV64 := $(KS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-key-store-service
+BLK_DRIVER_ELF_RISCV64 := $(BLK_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-blk
+NET_DRIVER_ELF_RISCV64 := $(NET_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-net
+UDP_STACK_ELF_RISCV64 := $(UDP_STACK_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-udp-stack
+SHELL_ELF_RISCV64 := $(SHELL_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-shell
+POLICY_SERVICE_ELF_RISCV64 := $(POLICY_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-policy-service
 
 # RISC-V initrd artifacts
 INITRD_RISCV64 := initrd-riscv64.img
@@ -84,44 +84,44 @@ MKINITRD := $(MKINITRD_DIR)/target/aarch64-apple-darwin/release/mkinitrd
 USER_ELF_AARCH64 := user/hello-aarch64.elf
 USER_SRC_AARCH64 := user/hello-aarch64.S
 USER_LD_AARCH64  := user/user-aarch64.ld
-FS_SERVICE_ELF_AARCH64 := $(FS_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-fs-service
-KS_SERVICE_ELF_AARCH64 := $(KS_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-key-store-service
-NET_DRIVER_ELF_AARCH64 := $(NET_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-virtio-net
-BLK_DRIVER_ELF_AARCH64 := $(BLK_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-virtio-blk
-I219_DRIVER_ELF_AARCH64 := $(I219_DRIVER_DIR)/target/aarch64-unknown-none/release/arcos-i219-net
-UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/arcos-udp-stack
-SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/arcos-shell
-POLICY_SERVICE_ELF_AARCH64 := $(POLICY_SERVICE_DIR)/target/aarch64-unknown-none/release/arcos-policy-service
-FB_DEMO_ELF_AARCH64 := $(FB_DEMO_DIR)/target/aarch64-unknown-none/release/arcos-fb-demo
-COMPOSITOR_ELF_AARCH64 := $(COMPOSITOR_DIR)/target/aarch64-unknown-none/release/arcos-compositor
-SCANOUT_LIMINE_ELF_AARCH64 := $(SCANOUT_LIMINE_DIR)/target/aarch64-unknown-none/release/arcos-scanout-limine
-SCANOUT_VGPU_ELF_AARCH64 := $(SCANOUT_VGPU_DIR)/target/aarch64-unknown-none/release/arcos-scanout-virtio-gpu
-VIRTIO_INPUT_ELF_AARCH64 := $(VIRTIO_INPUT_DIR)/target/aarch64-unknown-none/release/arcos-virtio-input
-HELLO_WINDOW_ELF_AARCH64 := $(HELLO_WINDOW_DIR)/target/aarch64-unknown-none/release/arcos-hello-window
-TREE_ELF_AARCH64 := $(TREE_DIR)/target/aarch64-unknown-none/release/arcos-tree
-WORM_ELF_AARCH64 := $(WORM_DIR)/target/aarch64-unknown-none/release/arcos-worm
-PONG_ELF_AARCH64 := $(PONG_DIR)/target/aarch64-unknown-none/release/arcos-pong
-SPROUTY_ELF_AARCH64 := $(SPROUTY_DIR)/target/aarch64-unknown-none/release/arcos-super-sprouty-o
-TERMINAL_WINDOW_ELF_AARCH64 := $(TERMINAL_WINDOW_DIR)/target/aarch64-unknown-none/release/arcos-terminal-window
-AUDIT_TAIL_ELF_AARCH64 := $(AUDIT_TAIL_DIR)/target/aarch64-unknown-none/release/arcos-audit-tail
+FS_SERVICE_ELF_AARCH64 := $(FS_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-fs-service
+KS_SERVICE_ELF_AARCH64 := $(KS_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-key-store-service
+NET_DRIVER_ELF_AARCH64 := $(NET_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-virtio-net
+BLK_DRIVER_ELF_AARCH64 := $(BLK_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-virtio-blk
+I219_DRIVER_ELF_AARCH64 := $(I219_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-i219-net
+UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/cambios-udp-stack
+SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/cambios-shell
+POLICY_SERVICE_ELF_AARCH64 := $(POLICY_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-policy-service
+FB_DEMO_ELF_AARCH64 := $(FB_DEMO_DIR)/target/aarch64-unknown-none/release/cambios-fb-demo
+COMPOSITOR_ELF_AARCH64 := $(COMPOSITOR_DIR)/target/aarch64-unknown-none/release/cambios-compositor
+SCANOUT_LIMINE_ELF_AARCH64 := $(SCANOUT_LIMINE_DIR)/target/aarch64-unknown-none/release/cambios-scanout-limine
+SCANOUT_VGPU_ELF_AARCH64 := $(SCANOUT_VGPU_DIR)/target/aarch64-unknown-none/release/cambios-scanout-virtio-gpu
+VIRTIO_INPUT_ELF_AARCH64 := $(VIRTIO_INPUT_DIR)/target/aarch64-unknown-none/release/cambios-virtio-input
+HELLO_WINDOW_ELF_AARCH64 := $(HELLO_WINDOW_DIR)/target/aarch64-unknown-none/release/cambios-hello-window
+TREE_ELF_AARCH64 := $(TREE_DIR)/target/aarch64-unknown-none/release/cambios-tree
+WORM_ELF_AARCH64 := $(WORM_DIR)/target/aarch64-unknown-none/release/cambios-worm
+PONG_ELF_AARCH64 := $(PONG_DIR)/target/aarch64-unknown-none/release/cambios-pong
+SPROUTY_ELF_AARCH64 := $(SPROUTY_DIR)/target/aarch64-unknown-none/release/cambios-super-sprouty-o
+TERMINAL_WINDOW_ELF_AARCH64 := $(TERMINAL_WINDOW_DIR)/target/aarch64-unknown-none/release/cambios-terminal-window
+AUDIT_TAIL_ELF_AARCH64 := $(AUDIT_TAIL_DIR)/target/aarch64-unknown-none/release/cambios-audit-tail
 
 # User-space ELF binaries (RISC-V) — scanout + input extension for Scanout-4.c
-SCANOUT_VGPU_ELF_RISCV64 := $(SCANOUT_VGPU_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-scanout-virtio-gpu
-VIRTIO_INPUT_ELF_RISCV64 := $(VIRTIO_INPUT_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-virtio-input
+SCANOUT_VGPU_ELF_RISCV64 := $(SCANOUT_VGPU_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-scanout-virtio-gpu
+VIRTIO_INPUT_ELF_RISCV64 := $(VIRTIO_INPUT_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-input
 
 # User-space ELF binaries (RISC-V) — GUI stack (ADR-011). libgui is
 # arch-agnostic; each app ships a link-riscv64.ld matching the
 # virtio-net riscv64 shape. Runtime requires kernel ECAM PCI + a
 # virtio-gpu-pci QEMU device; build infra lands first so the cross-
 # arch port is unblocked.
-COMPOSITOR_ELF_RISCV64 := $(COMPOSITOR_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-compositor
-HELLO_WINDOW_ELF_RISCV64 := $(HELLO_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-hello-window
-TREE_ELF_RISCV64 := $(TREE_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-tree
-WORM_ELF_RISCV64 := $(WORM_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-worm
-PONG_ELF_RISCV64 := $(PONG_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-pong
-SPROUTY_ELF_RISCV64 := $(SPROUTY_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-super-sprouty-o
-TERMINAL_WINDOW_ELF_RISCV64 := $(TERMINAL_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-terminal-window
-AUDIT_TAIL_ELF_RISCV64 := $(AUDIT_TAIL_DIR)/target/riscv64gc-unknown-none-elf/release/arcos-audit-tail
+COMPOSITOR_ELF_RISCV64 := $(COMPOSITOR_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-compositor
+HELLO_WINDOW_ELF_RISCV64 := $(HELLO_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-hello-window
+TREE_ELF_RISCV64 := $(TREE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-tree
+WORM_ELF_RISCV64 := $(WORM_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-worm
+PONG_ELF_RISCV64 := $(PONG_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-pong
+SPROUTY_ELF_RISCV64 := $(SPROUTY_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-super-sprouty-o
+TERMINAL_WINDOW_ELF_RISCV64 := $(TERMINAL_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-terminal-window
+AUDIT_TAIL_ELF_RISCV64 := $(AUDIT_TAIL_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-audit-tail
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
@@ -719,7 +719,7 @@ run: iso disk-img
 # Filtered `run`: streams kernel output through tools/qemu-run-quiet.py,
 # suppressing memory-map / Limine noise and exiting with a status code
 # that reflects outcome (0 = success sentinel seen, 1 = panic/exception,
-# 2 = hang). Default success sentinel is `arcos> ` (full boot to shell);
+# 2 = hang). Default success sentinel is `cambios> ` (full boot to shell);
 # override for pre-shell testing:  make run-quiet SUCCESS="virtio-net ready"
 # Keep this QEMU command in sync with `run:` above.
 run-quiet: iso disk-img
@@ -998,7 +998,7 @@ verify:
 stats:
 	@echo "=== CambiOS stats (derived from source) ==="
 	@printf "Syscalls:        "
-	@sed -n '/^pub enum SyscallNumber/,/^}/p' arcos-abi/src/lib.rs | grep -Ec '^[[:space:]]+[A-Z][A-Za-z]+ = [0-9]+,'
+	@sed -n '/^pub enum SyscallNumber/,/^}/p' cambios-abi/src/lib.rs | grep -Ec '^[[:space:]]+[A-Z][A-Za-z]+ = [0-9]+,'
 	@printf "Kernel .rs:      "
 	@find src -name '*.rs' | wc -l | tr -d ' '
 	@printf "Userspace .rs:   "

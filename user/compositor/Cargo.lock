@@ -3,37 +3,37 @@
 version = 4
 
 [[package]]
-name = "arcos-abi"
+name = "cambios-abi"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-compositor"
+name = "cambios-compositor"
 version = "0.1.0"
 dependencies = [
- "arcos-libgui-proto",
- "arcos-libinput-proto",
- "arcos-libscanout",
- "arcos-libsys",
+ "cambios-libgui-proto",
+ "cambios-libinput-proto",
+ "cambios-libscanout",
+ "cambios-libsys",
 ]
 
 [[package]]
-name = "arcos-libgui-proto"
+name = "cambios-libgui-proto"
 version = "0.1.0"
 dependencies = [
- "arcos-libinput-proto",
+ "cambios-libinput-proto",
 ]
 
 [[package]]
-name = "arcos-libinput-proto"
+name = "cambios-libinput-proto"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libscanout"
+name = "cambios-libscanout"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
- "arcos-abi",
+ "cambios-abi",
 ]

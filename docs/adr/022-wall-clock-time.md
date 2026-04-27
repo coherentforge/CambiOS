@@ -137,7 +137,7 @@ The kernel **does not enforce** trust-tier minimums today. Consumers query `WALL
 
 ### 6. Shell prompt — first consumer
 
-`user/shell` renders the prompt as `arcos@HH:MM> ` from `sys::get_wallclock()`. If `get_wallclock()` returns 0, prompt remains `arcos> ` (today's behavior). This is the visible verification signal: boot lands at `arcos> `, then within seconds (after udp-stack's first NTP response) the next render becomes `arcos@HH:MM> `. The GUI clock widget is a future consumer that lives inside the libgui / compositor work and does not block this ADR.
+`user/shell` renders the prompt as `cambios@HH:MM> ` from `sys::get_wallclock()`. If `get_wallclock()` returns 0, prompt remains `cambios> ` (today's behavior). This is the visible verification signal: boot lands at `cambios> `, then within seconds (after udp-stack's first NTP response) the next render becomes `cambios@HH:MM> `. The GUI clock widget is a future consumer that lives inside the libgui / compositor work and does not block this ADR.
 
 **`unix_to_datetime` migrates to `user/libsys`.** The Unix-secs → `(year, month, day, hour, minute, second)` math currently lives as `#[allow(dead_code)]` in [user/udp-stack/src/main.rs:650-694](../../user/udp-stack/src/main.rs#L650-L694). It is a pure function on a `u64`, used by every consumer that wants to render time, and belongs in the shared userspace library so it does not get duplicated as more consumers land. Move it to a new `user/libsys/src/time.rs` module; udp-stack and shell both depend on libsys already, no new edge in the dep graph.
 
@@ -154,7 +154,7 @@ The kernel **does not enforce** trust-tier minimums today. Consumers query `WALL
 ### Negative
 - Day-1 trust source is unauthenticated NTP from a US-government IP. Network-position attackers can lie. Documented as accepted risk; mitigated by the forward path that lets us migrate without an ABI break.
 - Adds two syscalls (39, 40) and one new capability (`SetWallclock`) to the audit surface.
-- Wall-clock does not survive reboot (no persistent baseline). Boot shows `arcos> ` until NTP responds (~seconds in QEMU, longer on metal). Acceptable; persistence belongs to a future RTC-driver ADR.
+- Wall-clock does not survive reboot (no persistent baseline). Boot shows `cambios> ` until NTP responds (~seconds in QEMU, longer on metal). Acceptable; persistence belongs to a future RTC-driver ADR.
 
 ### Neutral
 - One more `name == "udp-stack"` match in `load_boot_modules`. The pattern is already established for `fb-demo` and `scanout-limine`.
@@ -179,7 +179,7 @@ The kernel **does not enforce** trust-tier minimums today. Consumers query `WALL
 - Confirmed at draft time: highest existing `SyscallNumber` variant is `VirtioModernCaps = 38`, so `SetWallclock = 39` and `GetWallclock = 40` are free. Implementer must re-confirm against `make stats` at land time in case another ADR has consumed the slots first.
 - `cargo test --lib` covers `wallclock::get` returning `0` before set, returning `baseline + tick-derived offset` after.
 - `make check-all` builds tri-arch (`set` / `get` are arch-agnostic; only `Timer::get_ticks` is arch-specific and already abstracted).
-- Boot smoke test: `make run-quiet` lands at `arcos> ` then transitions to `arcos@HH:MM> ` within ~10s of boot (NTP RTT in QEMU).
+- Boot smoke test: `make run-quiet` lands at `cambios> ` then transitions to `cambios@HH:MM> ` within ~10s of boot (NTP RTT in QEMU).
 - Capability test: a non-bootstrap, non-`SetWallclock`-holding process calling `SetWallclock` is rejected with `Eperm`.
 
 ## Open Questions / Deferred
@@ -192,4 +192,4 @@ The kernel **does not enforce** trust-tier minimums today. Consumers query `WALL
 
 > **Deferred decision.** Persistent wall-clock across reboots (RTC driver, ObjectStore checkpoint). **Revisit when:** the bare-metal Dell boot stabilizes and "boot is silent for ~30s while NTP retries" becomes observably annoying.
 
-> **Deferred decision.** Staleness signal — how does a consumer distinguish "fresh time" from "udp-stack crashed five days ago and the displayed clock has drifted"? Today `get()` returns the same shape regardless of how long ago `set()` last ran. Options: (a) a fourth atomic `WALL_LAST_SET_TICKS` plus a `GetWallclockAge() -> u64` syscall returning seconds since last set; (b) shell renders `arcos@HH:MM*>` (asterisk) when the baseline is older than N hours; (c) `get()` returns `0` (sentinel-unset) once the baseline ages past a hard threshold. **Revisit when:** the first non-display consumer of wall-clock lands (audit timestamp, signed-stamp issuer, TLS validity check) — display can tolerate stale-but-plausible time; security-sensitive consumers cannot. For a security-oriented OS this matters; for the day-1 shell-prompt use case it does not, which is why it is deferred and not in the v1 ABI.
+> **Deferred decision.** Staleness signal — how does a consumer distinguish "fresh time" from "udp-stack crashed five days ago and the displayed clock has drifted"? Today `get()` returns the same shape regardless of how long ago `set()` last ran. Options: (a) a fourth atomic `WALL_LAST_SET_TICKS` plus a `GetWallclockAge() -> u64` syscall returning seconds since last set; (b) shell renders `cambios@HH:MM*>` (asterisk) when the baseline is older than N hours; (c) `get()` returns `0` (sentinel-unset) once the baseline ages past a hard threshold. **Revisit when:** the first non-display consumer of wall-clock lands (audit timestamp, signed-stamp issuer, TLS validity check) — display can tolerate stale-but-plausible time; security-sensitive consumers cannot. For a security-oriented OS this matters; for the day-1 shell-prompt use case it does not, which is why it is deferred and not in the v1 ABI.

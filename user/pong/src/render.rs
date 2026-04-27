@@ -24,9 +24,9 @@
 //! picks up the same tones the extraction trigger fires and the
 //! colours move into a shared module.
 
-use arcos_libgui::{Color, Rect, Surface};
+use cambios_libgui::{Color, Rect, Surface};
 
-use arcos_pong::game::{
+use cambios_pong::game::{
     Ball, Paddle, Pong, Side, State, BALL_SIZE, COURT_H, COURT_W, LEFT_PADDLE_X, PADDLE_H,
     PADDLE_W, RIGHT_PADDLE_X, WIN_SCORE,
 };

@@ -600,27 +600,27 @@ mod tests {
         // smear on screen.
         let mut g = Grid::new();
 
-        // Initial render:   \r + "arcos> " + "hel" + \x1b[K
-        g.write_bytes(b"\rarcos> hel\x1b[K");
-        assert_eq!(&row_as_str(&g, 0), "arcos> hel");
+        // Initial render:   \r + "cambios> " + "hel" + \x1b[K
+        g.write_bytes(b"\rcambios> hel\x1b[K");
+        assert_eq!(&row_as_str(&g, 0), "cambios> hel");
         assert_eq!(g.cursor(), (10, 0));
 
         // User types 'l': editor re-emits full line and cursor stays at end.
-        g.write_bytes(b"\rarcos> hell\x1b[K");
-        assert_eq!(&row_as_str(&g, 0), "arcos> hell");
+        g.write_bytes(b"\rcambios> hell\x1b[K");
+        assert_eq!(&row_as_str(&g, 0), "cambios> hell");
 
         // User presses Left arrow: editor re-emits line and seeks left 1.
-        g.write_bytes(b"\rarcos> hell\x1b[K\x1b[1D");
+        g.write_bytes(b"\rcambios> hell\x1b[K\x1b[1D");
         assert_eq!(g.cursor(), (10, 0));
 
         // User hits Backspace: buffer now "hel", editor re-emits + Ctrl-seek.
         // Wait — nope, Backspace removes one char. Buffer = "hel", cursor
         // at col 3 in buffer = col 10 on screen... but we are already at
-        // col 10. Editor redraws "\rarcos> hel\x1b[K\x1b[0D" — the \x1b[0D
+        // col 10. Editor redraws "\rcambios> hel\x1b[K\x1b[0D" — the \x1b[0D
         // is emitted only if cursor_from_end > 0. For this case cursor
-        // is at end, so just "\rarcos> hel\x1b[K".
-        g.write_bytes(b"\rarcos> hel\x1b[K");
-        assert_eq!(&row_as_str(&g, 0), "arcos> hel");
+        // is at end, so just "\rcambios> hel\x1b[K".
+        g.write_bytes(b"\rcambios> hel\x1b[K");
+        assert_eq!(&row_as_str(&g, 0), "cambios> hel");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //!
 //! A [`Backend`] is the seam between libterm's parser/terminal layer and
 //! whatever actually carries bytes in and out. Today that is the serial
-//! console via `arcos_libsys`. A future framebuffer backend (post-Scanout-2)
+//! console via `cambios_libsys`. A future framebuffer backend (post-Scanout-2)
 //! implements the same trait using glyph blits and the input-hub event
 //! stream — consumer code (shell, editor, man) does not change.
 //!
@@ -13,7 +13,7 @@
 //! [`crate::Terminal`]. Dynamic dispatch is avoided to keep future
 //! verification tractable — see CLAUDE.md's Formal-Verification rule.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// Byte-level terminal transport.
 ///
@@ -34,8 +34,8 @@ pub trait Backend {
 
 /// Serial-console backend for v1.
 ///
-/// Wraps `arcos_libsys::console_read` (non-blocking 1-byte poll) and
-/// `arcos_libsys::print`. Reports a fixed `(80, 24)` geometry — QEMU's
+/// Wraps `cambios_libsys::console_read` (non-blocking 1-byte poll) and
+/// `cambios_libsys::print`. Reports a fixed `(80, 24)` geometry — QEMU's
 /// serial console has no real size query, and every downstream tool
 /// (shell, nano-style editor, man pager) already wraps/paginates defensively.
 pub struct SerialBackend;

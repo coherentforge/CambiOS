@@ -14,7 +14,7 @@
 //! Both implement the same set of methods so the driver is oblivious to the
 //! discovery path.
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 // ============================================================================
 // Shared constants (wire-protocol, not register-layout)

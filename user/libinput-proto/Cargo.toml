@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-libinput-proto"
+name = "cambios-libinput-proto"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
@@ -11,7 +11,7 @@ description = "Wire-format types and message tags for the CambiOS input stack (A
 [dependencies]
 
 [lib]
-name = "arcos_libinput_proto"
+name = "cambios_libinput_proto"
 path = "src/lib.rs"
 
 [profile.release]

@@ -17,8 +17,8 @@
 #![no_std]
 #![no_main]
 
-use arcos_libsys as sys;
-use arcos_libsys::Principal;
+use cambios_libsys as sys;
+use cambios_libsys::Principal;
 
 /// Ring header magic ("ARCAUDIT" little-endian, see `src/audit/drain.rs`).
 const RING_HEADER_MAGIC: u64 = 0x5449_4455_4143_5241;

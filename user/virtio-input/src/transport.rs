@@ -16,8 +16,8 @@
 //! (which forces per-cap MMIO maps anyway and makes a shared
 //! library worth the effort).
 
-use arcos_libsys as sys;
-use arcos_libsys::VirtioModernCaps;
+use cambios_libsys as sys;
+use cambios_libsys::VirtioModernCaps;
 
 pub const STATUS_ACKNOWLEDGE: u8 = 1;
 pub const STATUS_DRIVER: u8 = 2;

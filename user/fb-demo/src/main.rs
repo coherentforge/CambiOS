@@ -22,8 +22,8 @@
 #![no_std]
 #![no_main]
 
-use arcos_libsys as sys;
-use arcos_libsys::FramebufferDescriptor;
+use cambios_libsys as sys;
+use cambios_libsys::FramebufferDescriptor;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {

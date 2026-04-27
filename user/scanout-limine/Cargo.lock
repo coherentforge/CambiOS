@@ -3,17 +3,17 @@
 version = 4
 
 [[package]]
-name = "arcos-libscanout"
+name = "cambios-libscanout"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-scanout-limine"
+name = "cambios-scanout-limine"
 version = "0.1.0"
 dependencies = [
- "arcos-libscanout",
- "arcos-libsys",
+ "cambios-libscanout",
+ "cambios-libsys",
 ]

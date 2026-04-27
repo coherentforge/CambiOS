@@ -184,7 +184,7 @@ ADR-007 audit drain pointers, recognition records (enrolled pubkeys from the enr
 
 ### Rename: arcobj → cambiobj
 
-The shell utility that exposes ObjectStore operations is renamed to `cambiobj` as part of the ArcOS → CambiOS rebrand debt. Tier-aware subcommands added in the same pass: `cambiobj list [--tier=private|public|all]`, `cambiobj history <name>`, `cambiobj share <name> <recipient>` (presence-gated).
+The shell utility that exposes ObjectStore operations is renamed to `cambiobj` as part of the CambiOS → CambiOS rebrand debt. Tier-aware subcommands added in the same pass: `cambiobj list [--tier=private|public|all]`, `cambiobj history <name>`, `cambiobj share <name> <recipient>` (presence-gated).
 
 ## Rationale
 

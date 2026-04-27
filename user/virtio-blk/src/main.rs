@@ -65,7 +65,7 @@ mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 use transport::{LegacyMmioTransport, LegacyPciTransport, Transport};
 use virtqueue::{BounceBuffer, ChainSegment, VirtQueue};
 

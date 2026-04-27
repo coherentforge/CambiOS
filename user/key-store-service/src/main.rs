@@ -26,7 +26,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 // ============================================================================
 // Panic handler

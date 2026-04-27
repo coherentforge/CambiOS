@@ -4,7 +4,7 @@
 //! Compositor-internal scanout abstraction — Phase Scanout-1 (ADR-014).
 //!
 //! Wire-format types, message tags, and bound constants live in
-//! `arcos-libscanout` (shared with every `user/scanout-*` implementation).
+//! `cambios-libscanout` (shared with every `user/scanout-*` implementation).
 //! This module owns:
 //!
 //! - The `ScanoutBackend` trait — the compositor's *consumer-side*
@@ -16,7 +16,7 @@
 //!
 //! Per ADR-014, future implementors (`VirtioGpuBackend`, `IntelGpuBackend`,
 //! `LimineFbBackend`) live alongside but each is a thin IPC client over
-//! `arcos-libscanout`'s wire encoders. Compositor uses `Box<dyn
+//! `cambios-libscanout`'s wire encoders. Compositor uses `Box<dyn
 //! ScanoutBackend>` chosen at startup probe — userspace dyn dispatch
 //! explicitly allowed (verification scope is the kernel, not userspace).
 
@@ -27,7 +27,7 @@
 // HeadlessBackend); they exist as the consumer-facing surface for the
 // LimineFbBackend impl that lands next.
 #[allow(unused_imports)]
-pub use arcos_libscanout::{
+pub use cambios_libscanout::{
     DisplayInfo, DisplayState, Geometry, MAX_DAMAGE_RECTS_PER_FRAME, MAX_DISPLAYS_PER_DRIVER,
     Mode, MsgTag, PixelFormat, Rect, SCANOUT_DRIVER_ENDPOINT, SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS,
     ScanoutError,
@@ -156,10 +156,10 @@ impl ScanoutBackend for HeadlessBackend {
 // LimineFbBackend — Phase Scanout-2 fallback (talks to user/scanout-limine)
 // ============================================================================
 
-use arcos_libscanout::{
+use cambios_libscanout::{
     decode_frame_displayed, encode_frame_ready,
 };
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 /// IPC client for `user/scanout-limine`.
 ///
@@ -214,7 +214,7 @@ impl ScanoutBackend for LimineFbBackend {
         if display_id != self.scanout.display_id {
             return Err(ScanoutError::NoSuchDisplay);
         }
-        let mut buf = [0u8; arcos_libscanout::MAX_MESSAGE_SIZE];
+        let mut buf = [0u8; cambios_libscanout::MAX_MESSAGE_SIZE];
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
 

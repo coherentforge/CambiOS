@@ -2,15 +2,15 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-hello-window"
+name = "cambios-hello-window"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "CambiOS first GUI client — Phase Scanout-3 (ADR-011). Opens one window via the compositor, fills it with a solid color, and idles. Validates the full client → compositor → scanout-driver → framebuffer chain."
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
-arcos-libgui = { path = "../libgui" }
+cambios-libsys = { path = "../libsys" }
+cambios-libgui = { path = "../libgui" }
 
 [profile.release]
 opt-level = "s"

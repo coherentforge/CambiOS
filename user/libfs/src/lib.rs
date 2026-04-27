@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 /// Re-export the wire-format module so libfs clients have a single
 /// import path (`libfs::proto`). Server processes that want only the
 /// constants (without libfs's alloc dependency) can depend on the
-/// `arcos-libfs-proto` crate directly.
-pub use arcos_libfs_proto as proto;
+/// `cambios-libfs-proto` crate directly.
+pub use cambios_libfs_proto as proto;
 
 pub use proto::ContentType;
 
@@ -138,7 +138,7 @@ fn status_to_error(status: u8) -> FsError {
 // ============================================================================
 
 #[cfg(not(test))]
-use arcos_libsys as sys;
+use cambios_libsys as sys;
 
 #[cfg(not(test))]
 use core::sync::atomic::{AtomicU32, Ordering};

@@ -34,9 +34,9 @@
 // emit). They're API for future scanout backends.
 #![allow(dead_code)]
 
-use arcos_libsys as sys;
-use arcos_libsys::{FramebufferDescriptor, VerifiedMessage};
-use arcos_libscanout::{
+use cambios_libsys as sys;
+use cambios_libsys::{FramebufferDescriptor, VerifiedMessage};
+use cambios_libscanout::{
     DisplayInfo, DisplayState, Geometry, MsgTag, PixelFormat,
     SCANOUT_DRIVER_ENDPOINT,
     decode_frame_ready_header, encode_display_connected, encode_frame_displayed,

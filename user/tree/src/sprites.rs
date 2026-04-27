@@ -22,7 +22,7 @@
 //! which reads cleanly as an icon on a textured background without
 //! touching the tile's edge lines.
 
-use arcos_libgui::{Color, Surface};
+use cambios_libgui::{Color, Surface};
 
 /// 16 pixels per edge — sized to fit centered in a 32-px tile with
 /// room for the grass/dirt ground showing through.

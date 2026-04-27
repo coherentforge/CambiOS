@@ -17,13 +17,13 @@
 //!   names. This is the forward contract; persistence, ACLs, and
 //!   ownership-transfer join later without changing the wire format.
 //!
-//! See `arcos-libfs::proto` for the wire constants.
+//! See `cambios-libfs::proto` for the wire constants.
 
 #![no_std]
 #![no_main]
 
-use arcos_libfs_proto as proto;
-use arcos_libsys as sys;
+use cambios_libfs_proto as proto;
+use cambios_libsys as sys;
 
 // ============================================================================
 // Panic handler (required for no_std)

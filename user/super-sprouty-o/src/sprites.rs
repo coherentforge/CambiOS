@@ -15,7 +15,7 @@
 //! index per char — and expanded to u32 at compile time. Keeps the
 //! sprite source readable/editable without a separate asset pipeline.
 
-use arcos_libgui::{Bitmap, Color};
+use cambios_libgui::{Bitmap, Color};
 
 /// Cell size. Each sheet cell is a square of this side, in pixels.
 pub const CELL: u32 = 32;
@@ -248,10 +248,10 @@ static mut SHEET_BASE: *mut u32 = UNINIT_SENTINEL;
 pub fn init() {
     let pages_needed =
         ((SHEET_PIXELS_LEN * core::mem::size_of::<u32>()) + 4095) / 4096;
-    let vaddr = arcos_libsys::allocate(pages_needed as u32);
+    let vaddr = cambios_libsys::allocate(pages_needed as u32);
     if vaddr <= 0 {
-        arcos_libsys::log_error(b"SPROUTY", b"sheet allocate failed");
-        arcos_libsys::exit(2);
+        cambios_libsys::log_error(b"SPROUTY", b"sheet allocate failed");
+        cambios_libsys::exit(2);
     }
     let ptr = vaddr as usize as *mut u32;
     // SAFETY: `vaddr` is a freshly allocated, RW-mapped region of
@@ -280,8 +280,8 @@ pub fn sheet() -> Bitmap<'static> {
     let slice = unsafe {
         let ptr = SHEET_BASE;
         if ptr == UNINIT_SENTINEL || ptr.is_null() {
-            arcos_libsys::log_error(b"SPROUTY", b"sheet() before init()");
-            arcos_libsys::exit(3);
+            cambios_libsys::log_error(b"SPROUTY", b"sheet() before init()");
+            cambios_libsys::exit(3);
         }
         core::slice::from_raw_parts(ptr, SHEET_PIXELS_LEN)
     };

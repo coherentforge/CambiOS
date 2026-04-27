@@ -3,52 +3,52 @@
 version = 4
 
 [[package]]
-name = "arcos-abi"
+name = "cambios-abi"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libgui"
+name = "cambios-libgui"
 version = "0.1.0"
 dependencies = [
- "arcos-libgui-proto",
- "arcos-libinput-proto",
- "arcos-libsys",
+ "cambios-libgui-proto",
+ "cambios-libinput-proto",
+ "cambios-libsys",
 ]
 
 [[package]]
-name = "arcos-libgui-proto"
+name = "cambios-libgui-proto"
 version = "0.1.0"
 dependencies = [
- "arcos-libinput-proto",
+ "cambios-libinput-proto",
 ]
 
 [[package]]
-name = "arcos-libinput-proto"
+name = "cambios-libinput-proto"
 version = "0.1.0"
 
 [[package]]
-name = "arcos-libsys"
+name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
- "arcos-abi",
+ "cambios-abi",
 ]
 
 [[package]]
-name = "arcos-libterm"
+name = "cambios-libterm"
 version = "0.1.0"
 dependencies = [
- "arcos-libsys",
+ "cambios-libsys",
 ]
 
 [[package]]
-name = "arcos-terminal-window"
+name = "cambios-terminal-window"
 version = "0.1.0"
 dependencies = [
- "arcos-libgui",
- "arcos-libgui-proto",
- "arcos-libinput-proto",
- "arcos-libsys",
- "arcos-libterm",
+ "cambios-libgui",
+ "cambios-libgui-proto",
+ "cambios-libinput-proto",
+ "cambios-libsys",
+ "cambios-libterm",
  "linked_list_allocator",
 ]
 

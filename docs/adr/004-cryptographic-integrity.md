@@ -95,7 +95,7 @@ The bootstrap Principal becomes a real Ed25519 keypair. The private key is store
 
 Extend `BinaryVerifier` with a signature check:
 
-1. **Host-side signing tool:** A build-time utility that signs ELF binaries with a specified Ed25519 private key. The signature is appended as an ELF note section (`.note.arcos.sig`) or stored as a detached signature alongside the binary.
+1. **Host-side signing tool:** A build-time utility that signs ELF binaries with a specified Ed25519 private key. The signature is appended as an ELF note section (`.note.cambios.sig`) or stored as a detached signature alongside the binary.
 
 2. **Loader verification:** `BinaryVerifier::verify()` gains an additional check: extract the signature from the ELF, verify it against the ELF content using the signer's public key, and confirm the signer's Principal is in the trusted set.
 
@@ -109,7 +109,7 @@ ELF loading pipeline (updated):
       ▼
   BinaryVerifier::verify()
       ├── Structural checks (existing: W^X, entry, overlap, bounds)
-      ├── Signature extraction (new: .note.arcos.sig or detached)
+      ├── Signature extraction (new: .note.cambios.sig or detached)
       ├── Ed25519 verification (new: sig over ELF content by signer)
       └── Trust check (new: signer's Principal in trusted set)
       │

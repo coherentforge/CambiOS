@@ -20,14 +20,14 @@
 //!    re-submit unchanged frames.
 //!
 //! Dependency layering: this module sits in the `terminal-window` crate
-//! and depends on `arcos-libterm` (Backend trait), `arcos-libgui`
-//! (Client + Surface), `arcos-libinput-proto` (InputEvent), and the
+//! and depends on `cambios-libterm` (Backend trait), `cambios-libgui`
+//! (Client + Surface), `cambios-libinput-proto` (InputEvent), and the
 //! sibling `encoder`, `grid`, and `render` modules. libterm itself does
 //! NOT depend on libgui — keeping it that way preserves libterm's
 //! reusability for non-GUI consumers (the original SerialBackend).
 
-use arcos_libgui::{Client, ClientError};
-use arcos_libterm::Backend;
+use cambios_libgui::{Client, ClientError};
+use cambios_libterm::Backend;
 
 use crate::encoder::{encode_key_event, EncodedBytes};
 use crate::grid::{Grid, VISIBLE_ROWS};

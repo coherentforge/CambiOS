@@ -2,13 +2,13 @@
 # Copyright (C) 2024-2026 Jason Ricca
 
 [package]
-name = "arcos-key-store-service"
+name = "cambios-key-store-service"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-arcos-libsys = { path = "../libsys" }
+cambios-libsys = { path = "../libsys" }
 ed25519-compact = { version = "2.2", default-features = false }
 
 [profile.release]
