@@ -25,6 +25,7 @@
 #![deny(unsafe_code)]
 
 use arcos_libsys as sys;
+use arcos_libsys::SyscallNumber;
 
 // ============================================================================
 // Panic handler (required for no_std)
@@ -50,63 +51,28 @@ const POLICY_RESP_ENDPOINT: u32 = 23;
 /// IPC header (36 bytes) + query payload (48 bytes) = 84 bytes total.
 const MIN_QUERY_SIZE: usize = 36 + 48;
 
-// ============================================================================
-// Syscall numbers (must match src/syscalls/mod.rs)
-// ============================================================================
-
-const SYS_EXIT: u32 = 0;
-const SYS_WRITE: u32 = 1;
-const SYS_READ: u32 = 2;
-const SYS_ALLOCATE: u32 = 3;
-const SYS_FREE: u32 = 4;
-const SYS_WAIT_IRQ: u32 = 5;
-const SYS_REGISTER_ENDPOINT: u32 = 6;
-const SYS_YIELD: u32 = 7;
-const SYS_GET_PID: u32 = 8;
-const SYS_GET_TIME: u32 = 9;
-const SYS_PRINT: u32 = 10;
-const SYS_BIND_PRINCIPAL: u32 = 11;
-const SYS_GET_PRINCIPAL: u32 = 12;
-const SYS_RECV_MSG: u32 = 13;
-const SYS_OBJ_PUT: u32 = 14;
-const SYS_OBJ_GET: u32 = 15;
-const SYS_OBJ_DELETE: u32 = 16;
-const SYS_OBJ_LIST: u32 = 17;
-const SYS_CLAIM_BOOTSTRAP_KEY: u32 = 18;
-const SYS_OBJ_PUT_SIGNED: u32 = 19;
-const SYS_MAP_MMIO: u32 = 20;
-const SYS_ALLOC_DMA: u32 = 21;
-const SYS_DEVICE_INFO: u32 = 22;
-const SYS_PORT_IO: u32 = 23;
-const SYS_CONSOLE_READ: u32 = 24;
-const SYS_SPAWN: u32 = 25;
-const SYS_WAIT_TASK: u32 = 26;
-const SYS_REVOKE_CAPABILITY: u32 = 27;
-const SYS_CHANNEL_CREATE: u32 = 28;
-const SYS_CHANNEL_ATTACH: u32 = 29;
-const SYS_CHANNEL_CLOSE: u32 = 30;
-const SYS_CHANNEL_REVOKE: u32 = 31;
-const SYS_CHANNEL_INFO: u32 = 32;
-const SYS_AUDIT_ATTACH: u32 = 33;
-const SYS_AUDIT_INFO: u32 = 34;
-const SYS_MAP_FRAMEBUFFER: u32 = 35;
-const SYS_MODULE_READY: u32 = 36;
-const SYS_TRY_RECV_MSG: u32 = 37;
+// Syscall numbers come from `arcos-libsys::SyscallNumber` (re-exported from
+// the standalone `arcos-abi` crate so kernel + userspace share one source
+// of truth). Profiles below use the enum directly; `fn profile()` casts
+// each variant to its `repr(u64)` discriminant for the bitmap shift.
 
 // ============================================================================
 // Syscall profiles (bitmap of allowed syscall numbers)
 // ============================================================================
 
 /// A syscall profile is a u64 bitmap — bit N is set if syscall number N
-/// is allowed. Fits all 35 current syscalls in a single word. O(1) check.
+/// is allowed. Fits the current syscall surface (max 42) in a single
+/// word. O(1) check. Outgrowing 64 means rethinking the
+/// representation; the kernel's `SyscallNumber` enum is the source of
+/// truth for the high-water mark.
 type Profile = u64;
 
 /// Build a profile by OR-ing together syscall bits.
-const fn profile(syscalls: &[u32]) -> Profile {
+const fn profile(syscalls: &[SyscallNumber]) -> Profile {
     let mut bits: u64 = 0;
     let mut i = 0;
     while i < syscalls.len() {
-        bits |= 1u64 << syscalls[i];
+        bits |= 1u64 << (syscalls[i] as u64);
         i += 1;
     }
     bits
@@ -117,8 +83,8 @@ const fn profile(syscalls: &[u32]) -> Profile {
 /// GetTime), diagnostic output (Print), and the boot-chain release call
 /// (ModuleReady). Nothing that touches shared state or hardware.
 const DEFAULT_PROFILE: Profile = profile(&[
-    SYS_EXIT, SYS_YIELD, SYS_GET_PID, SYS_GET_TIME, SYS_PRINT, SYS_GET_PRINCIPAL,
-    SYS_MODULE_READY,
+    SyscallNumber::Exit, SyscallNumber::Yield, SyscallNumber::GetPid, SyscallNumber::GetTime, SyscallNumber::Print, SyscallNumber::GetPrincipal,
+    SyscallNumber::ModuleReady,
 ]);
 
 /// Hello test module — minimal profile (print and exit). Removed from
@@ -129,45 +95,45 @@ const HELLO_PROFILE: Profile = DEFAULT_PROFILE;
 /// Key-store service — claims bootstrap key, signs object puts over IPC.
 const KEY_STORE_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
-        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
-        SYS_CLAIM_BOOTSTRAP_KEY, SYS_BIND_PRINCIPAL,
+        SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg,
+        SyscallNumber::ClaimBootstrapKey, SyscallNumber::BindPrincipal,
     ]);
 
 /// FS service — ObjectStore gateway.
 const FS_SERVICE_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
-        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
-        SYS_OBJ_PUT, SYS_OBJ_GET, SYS_OBJ_DELETE, SYS_OBJ_LIST, SYS_OBJ_PUT_SIGNED,
+        SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg,
+        SyscallNumber::ObjPut, SyscallNumber::ObjGet, SyscallNumber::ObjDelete, SyscallNumber::ObjList, SyscallNumber::ObjPutSigned,
     ]);
 
 /// Network driver (virtio-net / i219-net) — hardware I/O, DMA, IRQs.
 const NET_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
-        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
-        SYS_WAIT_IRQ, SYS_MAP_MMIO, SYS_ALLOC_DMA, SYS_DEVICE_INFO, SYS_PORT_IO,
+        SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg,
+        SyscallNumber::WaitIrq, SyscallNumber::MapMmio, SyscallNumber::AllocDma, SyscallNumber::DeviceInfo, SyscallNumber::PortIo,
     ]);
 
 /// Block driver (virtio-blk) — same shape as the NIC drivers today:
 /// PCI discovery via DeviceInfo, legacy I/O-BAR programming via PortIo,
 /// DMA allocation via AllocDma. No MMIO or IRQ wait path yet (polled).
-/// Needs SYS_TRY_RECV_MSG because virtio-blk listens on two endpoints
+/// Needs SyscallNumber::TryRecvMsg because virtio-blk listens on two endpoints
 /// (user ep24, kernel ep26) and must poll both non-blockingly.
 const BLK_DRIVER_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
-        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG, SYS_TRY_RECV_MSG,
-        SYS_DEVICE_INFO, SYS_ALLOC_DMA, SYS_PORT_IO,
+        SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg, SyscallNumber::TryRecvMsg,
+        SyscallNumber::DeviceInfo, SyscallNumber::AllocDma, SyscallNumber::PortIo,
     ]);
 
 /// UDP stack — network protocol service over IPC.
 const UDP_STACK_PROFILE: Profile = DEFAULT_PROFILE
-    | profile(&[SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG]);
+    | profile(&[SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg]);
 
 /// Shell — user interface, can spawn children and drain audit ring.
 const SHELL_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
-        SYS_WRITE, SYS_REGISTER_ENDPOINT, SYS_RECV_MSG,
-        SYS_CONSOLE_READ, SYS_SPAWN, SYS_WAIT_TASK,
-        SYS_AUDIT_ATTACH, SYS_AUDIT_INFO,
+        SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg,
+        SyscallNumber::ConsoleRead, SyscallNumber::Spawn, SyscallNumber::WaitTask,
+        SyscallNumber::AuditAttach, SyscallNumber::AuditInfo,
     ]);
 
 // ============================================================================
@@ -214,8 +180,10 @@ const SLOT_PROFILES: [Profile; 16] = [
 // Silence "unused" warnings for profiles kept for re-enabling drivers later.
 #[allow(dead_code)]
 const _SHELL_PROFILE_KEPT: Profile = SHELL_PROFILE;
-#[allow(dead_code)]
-const _SYS_MAP_FRAMEBUFFER_KEPT: u32 = SYS_MAP_FRAMEBUFFER;
+// Note: the previous `_SYS_MAP_FRAMEBUFFER_KEPT` hack existed to keep the
+// `SyscallNumber::MapFramebuffer` const referenced. After the migration to
+// `SyscallNumber`, unused enum variants don't generate dead-code warnings
+// (only unused consts do), so the hack is no longer needed.
 
 /// Return the syscall profile for a given process slot.
 fn profile_for(caller_pid: u32) -> Profile {
