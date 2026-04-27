@@ -27,7 +27,7 @@
 
 use cambios_libgui::{font_aa::BUILTIN_FONT_JBM, Color, Rect, Surface};
 
-use crate::grid::{Grid, COLS, VISIBLE_ROWS};
+use crate::grid::{Cell, Grid, ATTR_BOLD, ATTR_DIM, COLS, FG_DEFAULT, VISIBLE_ROWS};
 
 /// Cell width = font cell width (advance is monospace in JBM, baked
 /// into a 16-px slot). Pinned to the const baked into the font data so
@@ -39,10 +39,84 @@ pub const CELL_H: u16 = BUILTIN_FONT_JBM.cell_h;
 
 /// Background color (filled before each row's text is drawn).
 const BG: Color = Color(0x00_00_00_00);
-/// Foreground color (text glyph color).
-const FG: Color = Color(0x00_CC_CC_CC);
+
+/// Default foreground (the unstyled prompt color).
+const FG_PLAIN: Color = Color(0x00_CC_CC_CC);
+
 /// Caret color — block-style; covers the cell at the cursor.
 const CARET: Color = Color(0x00_FF_FF_FF);
+
+// ─── ANSI 8-color palette ────────────────────────────────────────
+//
+// Standard VGA-compatible 8-color values; readable on a black
+// background. The `cambios-style` crate only emits red / green /
+// yellow / cyan + default + dim/bold on top, but the full table is
+// here so unhandled SGR codes still resolve cleanly.
+
+const PALETTE_BLACK:   Color = Color(0x00_00_00_00);
+const PALETTE_RED:     Color = Color(0x00_CC_00_00);
+const PALETTE_GREEN:   Color = Color(0x00_00_CC_00);
+const PALETTE_YELLOW:  Color = Color(0x00_CC_CC_00);
+const PALETTE_BLUE:    Color = Color(0x00_44_88_FF); // softened — pure blue is unreadable on black
+const PALETTE_MAGENTA: Color = Color(0x00_CC_00_CC);
+const PALETTE_CYAN:    Color = Color(0x00_00_CC_CC);
+const PALETTE_WHITE:   Color = Color(0x00_CC_CC_CC);
+
+/// Resolve a `(fg_idx, attrs)` pair into the RGBA color the renderer
+/// will pass to `draw_text_aa`. `dim` halves brightness; `bold`
+/// brightens to the high-intensity variant. Both attributes can apply
+/// at once; bold then dim cancels the bold step (matches xterm).
+fn resolve_color(fg: u8, attrs: u8) -> Color {
+    let base = match fg {
+        30 => PALETTE_BLACK,
+        31 => PALETTE_RED,
+        32 => PALETTE_GREEN,
+        33 => PALETTE_YELLOW,
+        34 => PALETTE_BLUE,
+        35 => PALETTE_MAGENTA,
+        36 => PALETTE_CYAN,
+        37 => PALETTE_WHITE,
+        FG_DEFAULT => FG_PLAIN,
+        _ => FG_PLAIN, // unknown — fail soft to default
+    };
+
+    let dim_only = (attrs & ATTR_DIM) != 0;
+    let bold_only = (attrs & ATTR_BOLD) != 0 && !dim_only;
+
+    if dim_only {
+        scale_brightness(base, 1, 2) // 50%
+    } else if bold_only {
+        scale_brightness(base, 5, 4).clamp_8bit() // 125%, clamped
+    } else {
+        base
+    }
+}
+
+/// Scale every channel of a Color by `num/den` (saturating). Pure
+/// integer math; no floating point.
+fn scale_brightness(c: Color, num: u32, den: u32) -> Color {
+    let raw = c.0;
+    let r = ((raw >> 16) & 0xFF) as u32;
+    let g = ((raw >> 8) & 0xFF) as u32;
+    let b = (raw & 0xFF) as u32;
+    let r2 = (r * num / den).min(0xFF);
+    let g2 = (g * num / den).min(0xFF);
+    let b2 = (b * num / den).min(0xFF);
+    Color((r2 << 16) | (g2 << 8) | b2)
+}
+
+/// Identity helper that lets the bold path read more naturally
+/// (`scale_brightness(...).clamp_8bit()`); `scale_brightness` already
+/// clamps internally, so this is just a fluent no-op for readability.
+trait ColorClamp {
+    fn clamp_8bit(self) -> Self;
+}
+
+impl ColorClamp for Color {
+    fn clamp_8bit(self) -> Self {
+        self
+    }
+}
 
 /// Per-frame state retained between renders so the prior caret cell
 /// can be wiped on cursor moves.
@@ -99,7 +173,8 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
 }
 
 /// Re-render row `row` as a single horizontal strip: fill BG over the
-/// full cell band, then blit each cell's glyph through the AA font.
+/// full cell band, then blit each cell's glyph through the AA font
+/// using a color resolved from the cell's `(fg, attrs)` pair.
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     let cell_y = (row as u16) * CELL_H;
 
@@ -119,13 +194,18 @@ fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     // GLYPH_TOP_PAD shift here.
     let glyph_y = cell_y as i32;
     for c in 0..COLS {
-        let b = grid.cell(c, row);
-        let ch = if (0x20..=0x7E).contains(&b) { b } else { b' ' };
+        let cell: Cell = grid.cell(c, row);
+        let glyph = if (0x20..=0x7E).contains(&cell.glyph) {
+            cell.glyph
+        } else {
+            b' '
+        };
         let glyph_x = (c as i32) * (CELL_W as i32);
         // Single-glyph blit through draw_text_aa with a 1-byte slice.
-        // SAFETY: `ch` is in 0x20..=0x7E, guaranteed valid UTF-8.
-        let s = unsafe { core::str::from_utf8_unchecked(core::slice::from_ref(&ch)) };
-        surf.draw_text_aa(glyph_x, glyph_y, s, FG, &BUILTIN_FONT_JBM);
+        // SAFETY: `glyph` is in 0x20..=0x7E, guaranteed valid UTF-8.
+        let s = unsafe { core::str::from_utf8_unchecked(core::slice::from_ref(&glyph)) };
+        let color = resolve_color(cell.fg, cell.attrs);
+        surf.draw_text_aa(glyph_x, glyph_y, s, color, &BUILTIN_FONT_JBM);
     }
 }
 

@@ -73,13 +73,44 @@ pub const VISIBLE_ROWS: usize = 24;
 /// Tab stop interval.
 pub const TAB_WIDTH: usize = 8;
 
-/// One character cell. Byte for the glyph; colors/attrs reserved for
-/// the next revision (store as a struct then — keep the `set_cell`
-/// API stable now).
-pub type Cell = u8;
+/// One character cell.
+///
+/// `glyph` is the ASCII byte to render (today's font bake is ASCII-only;
+/// multi-byte UTF-8 decode + Unicode glyph fallback are a follow-up).
+/// `fg` is an ANSI palette index — 0..=7 standard colors, with `FG_DEFAULT`
+/// as the sentinel for "use the surface's foreground." `attrs` is a
+/// small bitmap of SGR attributes (bold, dim) that the render path
+/// folds into the resolved color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cell {
+    pub glyph: u8,
+    pub fg: u8,
+    pub attrs: u8,
+}
 
-/// Blank cell byte.
-pub const BLANK: Cell = b' ';
+/// Sentinel for "no explicit color set" — render as the surface's
+/// default foreground. Picked at the top of the u8 range so it never
+/// collides with the standard 30..=37 / bright 90..=97 ANSI palette
+/// values and a future palette-extension lands without renumbering.
+pub const FG_DEFAULT: u8 = 0xFF;
+
+/// SGR attribute bitmap.
+pub const ATTR_BOLD: u8 = 1 << 0;
+pub const ATTR_DIM: u8 = 1 << 1;
+
+impl Cell {
+    /// Blank cell — space glyph, default fg, no attributes.
+    pub const fn blank() -> Self {
+        Self {
+            glyph: b' ',
+            fg: FG_DEFAULT,
+            attrs: 0,
+        }
+    }
+}
+
+/// Blank cell. Const used pervasively for clears / scroll fill / init.
+pub const BLANK: Cell = Cell::blank();
 
 /// Internal state of the write-direction ANSI parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,12 +151,30 @@ impl OutParser {
     }
 }
 
+/// Current SGR (style) state. Updated by `\x1b[<n>m` sequences; every
+/// subsequent `put_cell` stamps cells with this color/attribute pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SgrState {
+    fg: u8,
+    attrs: u8,
+}
+
+impl SgrState {
+    const fn default() -> Self {
+        Self {
+            fg: FG_DEFAULT,
+            attrs: 0,
+        }
+    }
+}
+
 pub struct Grid {
     cells: [[Cell; COLS]; VISIBLE_ROWS],
     dirty: [bool; VISIBLE_ROWS],
     cursor_col: u16,
     cursor_row: u16,
     parser: OutParser,
+    sgr: SgrState,
 }
 
 impl Grid {
@@ -136,6 +185,7 @@ impl Grid {
             cursor_col: 0,
             cursor_row: 0,
             parser: OutParser::new(),
+            sgr: SgrState::default(),
         }
     }
 
@@ -328,9 +378,47 @@ impl Grid {
             b'K' => self.erase_in_line(p0),
             // Erase in display: 0 = cursor→end, 1 = start→cursor, 2 = full.
             b'J' => self.erase_in_display(p0),
-            // SGR (colors / attributes) — v1 strips without applying.
-            b'm' => {}
+            // SGR — colors and attributes (`\x1b[<n>;<n>;…m`). Every
+            // subsequent `put_cell` stamps cells with the resulting
+            // (fg, attrs) pair until a new SGR sequence updates it.
+            b'm' => self.apply_sgr(),
             _ => {}
+        }
+    }
+
+    /// Apply the SGR parameters in `self.parser.params` to `self.sgr`.
+    /// The handled subset matches what `cambios-style` emits + the
+    /// classics every terminal supports:
+    ///
+    /// - `0`         → reset (default fg, no attrs)
+    /// - `1`         → bold
+    /// - `2`         → dim
+    /// - `22`        → normal intensity (clear bold + dim)
+    /// - `30..=37`   → set foreground to the standard 8-color palette
+    /// - `39`        → reset foreground to default
+    ///
+    /// Unknown codes are silently ignored — better to lose styling than
+    /// to garble subsequent rendering. A truly empty `\x1b[m` is
+    /// equivalent to `\x1b[0m` per the ECMA-48 spec; we match that
+    /// convention.
+    fn apply_sgr(&mut self) {
+        let n = if self.parser.nparams == 0 { 1 } else { self.parser.nparams as usize };
+        if self.parser.nparams == 0 {
+            // Empty `\x1b[m` → reset.
+            self.sgr = SgrState::default();
+            return;
+        }
+        for i in 0..n.min(4) {
+            let code = self.parser.params[i];
+            match code {
+                0 => self.sgr = SgrState::default(),
+                1 => self.sgr.attrs |= ATTR_BOLD,
+                2 => self.sgr.attrs |= ATTR_DIM,
+                22 => self.sgr.attrs &= !(ATTR_BOLD | ATTR_DIM),
+                30..=37 => self.sgr.fg = code as u8,
+                39 => self.sgr.fg = FG_DEFAULT,
+                _ => {} // bright (90..=97), bg (40..=47), and underlines/inverse not supported yet
+            }
         }
     }
 
@@ -346,7 +434,11 @@ impl Grid {
         }
         let (col, row) = (self.cursor_col as usize, self.cursor_row as usize);
         if row < VISIBLE_ROWS {
-            self.cells[row][col] = b;
+            self.cells[row][col] = Cell {
+                glyph: b,
+                fg: self.sgr.fg,
+                attrs: self.sgr.attrs,
+            };
             self.dirty[row] = true;
         }
     }
@@ -442,7 +534,7 @@ mod tests {
     fn row_as_str(g: &Grid, row: usize) -> alloc::string::String {
         let mut s = alloc::string::String::new();
         for c in 0..COLS {
-            s.push(g.cell(c, row) as char);
+            s.push(g.cell(c, row).glyph as char);
         }
         s.trim_end().to_string()
     }
@@ -452,7 +544,7 @@ mod tests {
         let g = Grid::new();
         for r in 0..VISIBLE_ROWS {
             for c in 0..COLS {
-                assert_eq!(g.cell(c, r), b' ');
+                assert_eq!(g.cell(c, r), BLANK);
             }
         }
     }
@@ -495,8 +587,8 @@ mod tests {
         let mut g = Grid::new();
         g.write_bytes(b"a\tb");
         // 'a' at 0; tab moves to col 8; 'b' at col 8.
-        assert_eq!(g.cell(0, 0), b'a');
-        assert_eq!(g.cell(8, 0), b'b');
+        assert_eq!(g.cell(0, 0).glyph, b'a');
+        assert_eq!(g.cell(8, 0).glyph, b'b');
     }
 
     #[test]
@@ -568,10 +660,65 @@ mod tests {
     }
 
     #[test]
-    fn sgr_is_stripped_silently() {
+    fn sgr_text_content_passes_through_unchanged() {
+        // SGR sequences themselves never reach the cell content — they
+        // mutate the parser's style state and stamp into subsequent
+        // cells' (fg, attrs). The visible glyph stream is the same as
+        // before this commit went in.
         let mut g = Grid::new();
         g.write_bytes(b"\x1b[1;31mred\x1b[0m.");
         assert_eq!(&row_as_str(&g, 0), "red.");
+    }
+
+    #[test]
+    fn sgr_applies_fg_to_subsequent_cells() {
+        let mut g = Grid::new();
+        g.write_bytes(b"\x1b[31mhi\x1b[0m.");
+        assert_eq!(g.cell(0, 0).glyph, b'h');
+        assert_eq!(g.cell(0, 0).fg, 31);
+        assert_eq!(g.cell(1, 0).glyph, b'i');
+        assert_eq!(g.cell(1, 0).fg, 31);
+        // Reset before `.` — back to default fg.
+        assert_eq!(g.cell(2, 0).glyph, b'.');
+        assert_eq!(g.cell(2, 0).fg, FG_DEFAULT);
+    }
+
+    #[test]
+    fn sgr_layers_fg_and_dim() {
+        // `cambios-style` emits `\x1b[36;2m` (cyan + dim) for principal
+        // surfaces. Confirm both halves land on the same cell.
+        let mut g = Grid::new();
+        g.write_bytes(b"\x1b[36;2mz\x1b[0m");
+        let c = g.cell(0, 0);
+        assert_eq!(c.glyph, b'z');
+        assert_eq!(c.fg, 36);
+        assert_eq!(c.attrs & ATTR_DIM, ATTR_DIM);
+        assert_eq!(c.attrs & ATTR_BOLD, 0);
+    }
+
+    #[test]
+    fn sgr_bold_then_normal_intensity_clears() {
+        let mut g = Grid::new();
+        g.write_bytes(b"\x1b[1mB\x1b[22mN");
+        assert_eq!(g.cell(0, 0).attrs & ATTR_BOLD, ATTR_BOLD);
+        assert_eq!(g.cell(1, 0).attrs & ATTR_BOLD, 0);
+    }
+
+    #[test]
+    fn sgr_unknown_code_is_silently_ignored() {
+        // `\x1b[99m` is unallocated in our subset; subsequent text
+        // should still render.
+        let mut g = Grid::new();
+        g.write_bytes(b"\x1b[99mok");
+        assert_eq!(&row_as_str(&g, 0), "ok");
+    }
+
+    #[test]
+    fn sgr_empty_resets_to_default() {
+        let mut g = Grid::new();
+        g.write_bytes(b"\x1b[31mR\x1b[mD");
+        assert_eq!(g.cell(0, 0).fg, 31);
+        assert_eq!(g.cell(1, 0).fg, FG_DEFAULT);
     }
 
     #[test]
@@ -598,29 +745,31 @@ mod tests {
         // Simulate the sequence the libterm LineEditor emits on each
         // keystroke. If this test drifts, the editor will visibly
         // smear on screen.
+        //
+        // Prompt is `cambios> ` (9 chars wide: c-a-m-b-i-o-s-> + space),
+        // so cursor after `cambios> hel` is at col 12, after
+        // `cambios> hell` at col 13.
         let mut g = Grid::new();
 
         // Initial render:   \r + "cambios> " + "hel" + \x1b[K
         g.write_bytes(b"\rcambios> hel\x1b[K");
         assert_eq!(&row_as_str(&g, 0), "cambios> hel");
-        assert_eq!(g.cursor(), (10, 0));
+        assert_eq!(g.cursor(), (12, 0));
 
         // User types 'l': editor re-emits full line and cursor stays at end.
         g.write_bytes(b"\rcambios> hell\x1b[K");
         assert_eq!(&row_as_str(&g, 0), "cambios> hell");
+        assert_eq!(g.cursor(), (13, 0));
 
         // User presses Left arrow: editor re-emits line and seeks left 1.
         g.write_bytes(b"\rcambios> hell\x1b[K\x1b[1D");
-        assert_eq!(g.cursor(), (10, 0));
+        assert_eq!(g.cursor(), (12, 0));
 
-        // User hits Backspace: buffer now "hel", editor re-emits + Ctrl-seek.
-        // Wait — nope, Backspace removes one char. Buffer = "hel", cursor
-        // at col 3 in buffer = col 10 on screen... but we are already at
-        // col 10. Editor redraws "\rcambios> hel\x1b[K\x1b[0D" — the \x1b[0D
-        // is emitted only if cursor_from_end > 0. For this case cursor
-        // is at end, so just "\rcambios> hel\x1b[K".
+        // User hits Backspace: buffer becomes "hel", editor re-emits +
+        // clear-to-EOL. Cursor lands at the end of "cambios> hel".
         g.write_bytes(b"\rcambios> hel\x1b[K");
         assert_eq!(&row_as_str(&g, 0), "cambios> hel");
+        assert_eq!(g.cursor(), (12, 0));
     }
 
     #[test]
