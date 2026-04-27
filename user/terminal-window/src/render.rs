@@ -38,12 +38,19 @@ pub const CELL_W: u16 = BUILTIN_FONT_JBM.cell_w;
 pub const CELL_H: u16 = BUILTIN_FONT_JBM.cell_h;
 
 /// Background color (filled before each row's text is drawn).
-const BG: Color = Color(0x00_00_00_00);
+/// Matches `--bg-0` from `coherentforge.com/cambios/css/style.css` so
+/// the terminal's body shares the visual identity of the splash and
+/// the published site — a deliberate dark blue-black, not pure black.
+const BG: Color = Color(0x00_0c_0e_11);
 
-/// Default foreground (the unstyled prompt color).
-const FG_PLAIN: Color = Color(0x00_CC_CC_CC);
+/// Default foreground (the unstyled prompt color). Matches `--fg-0`
+/// from the site's stylesheet — slightly cool off-white. Resolved by
+/// `resolve_color` as the `FG_DEFAULT` base before dim/bold modifiers.
+const FG_PLAIN: Color = Color(0x00_e2_e4_e8);
 
-/// Caret color — block-style; covers the cell at the cursor.
+/// Caret color — block-style; covers the cell at the cursor. Pure
+/// white reads against `BG` more cleanly than `FG_PLAIN` would,
+/// signaling "this cell is active" rather than "this cell has text."
 const CARET: Color = Color(0x00_FF_FF_FF);
 
 // ─── ANSI 8-color palette ────────────────────────────────────────
