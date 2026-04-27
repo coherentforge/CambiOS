@@ -94,7 +94,8 @@ pub extern "C" fn _start() -> ! {
         ALLOCATOR.lock().init(ptr, HEAP_SIZE);
     }
 
-    let backend = match GuiBackend::open(WINDOW_WIDTH, WINDOW_HEIGHT, TERMINAL_WINDOW_ENDPOINT) {
+    let mut backend = match GuiBackend::open(WINDOW_WIDTH, WINDOW_HEIGHT, TERMINAL_WINDOW_ENDPOINT)
+    {
         Ok(b) => b,
         Err(_) => {
             sys::print(b"[terminal-window] failed to open compositor window\n");
@@ -104,6 +105,11 @@ pub extern "C" fn _start() -> ! {
 
     sys::print(b"[terminal-window] window open\n");
     sys::module_ready();
+
+    // Boot splash — centered "CambiOS" title, ~1.6 s total. Bypasses
+    // the Grid layer to render at 4× scale; clears to black before
+    // returning so the terminal banner takes over a clean surface.
+    cambios_terminal_window::splash::show(&mut backend);
 
     let mut terminal = Terminal::new(backend);
     let mut editor = LineEditor::new(64);

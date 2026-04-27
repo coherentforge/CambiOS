@@ -20,10 +20,13 @@
 //! - [`gui_backend`] — adapter implementing `libterm::Backend` over a
 //!   live `libgui::Client` and `Grid`.
 //! - [`render`] — 8x8 glyph blit per dirty row + cursor caret.
+//! - [`splash`] — boot splash sequence (centered "CambiOS" title,
+//!   hold-in / highlight / wipe) shown once at startup before the
+//!   REPL takes over.
 //!
-//! `gui_backend` and `render` are bare-metal-only (use libgui/libsys
-//! syscalls). The host test target compiles only the pure modules
-//! (`encoder`, `grid`).
+//! `gui_backend`, `render`, and `splash` are bare-metal-only (use
+//! libgui/libsys syscalls). The host test target compiles only the
+//! pure modules (`encoder`, `grid`).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -36,3 +39,5 @@ pub mod grid;
 pub mod render;
 #[cfg(not(test))]
 pub mod gui_backend;
+#[cfg(not(test))]
+pub mod splash;
