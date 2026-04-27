@@ -25,9 +25,12 @@
 //! we already had for the 2× scaled bitmap — so the grid stays at
 //! 64×24 and the rest of the world doesn't notice the swap.
 
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
 use cambios_libgui::{font_aa::BUILTIN_FONT_JBM, Color, Rect, Surface};
 
 use crate::grid::{Cell, Grid, ATTR_BOLD, ATTR_DIM, COLS, FG_DEFAULT, VISIBLE_ROWS};
+use crate::splash::{blend_toward, draw_text_scaled, ACCENT, BG_0, FG_0, WATERMARK_ALPHA};
 
 /// Cell width = font cell width (advance is monospace in JBM, baked
 /// into a 16-px slot). Pinned to the const baked into the font data so
@@ -52,6 +55,96 @@ const FG_PLAIN: Color = Color(0x00_e2_e4_e8);
 /// white reads against `BG` more cleanly than `FG_PLAIN` would,
 /// signaling "this cell is active" rather than "this cell has text."
 const CARET: Color = Color(0x00_FF_FF_FF);
+
+// ─── Watermark layer ─────────────────────────────────────────────
+//
+// The splash module hands the render path a watermark — small,
+// dim-tinted "CambiOS" parked in the bottom-right corner — once its
+// recede animation completes. The watermark's role is to keep the
+// brand mark visible behind the live terminal grid as a permanent
+// background presence. Each dirty row that intersects the
+// watermark's y range re-stamps the watermark slice into its BG
+// band before drawing cell glyphs; cells without text leave the
+// watermark visible, cells with text composite on top.
+//
+// Conceptually a z-index — watermark below, cell glyphs above. See
+// the `splash` module's doc comment for why this implementation
+// sits at the per-row scale rather than as a true compositor layer.
+
+const WATERMARK_CAMBI: &[u8] = b"Cambi";
+const WATERMARK_OS: &[u8] = b"OS";
+
+static WATERMARK_ENABLED: AtomicBool = AtomicBool::new(false);
+static WATERMARK_X: AtomicI32 = AtomicI32::new(0);
+static WATERMARK_Y: AtomicI32 = AtomicI32::new(0);
+
+/// Hand watermark geometry to the render path. Called by the splash
+/// module when its recede animation reaches the watermark frame.
+/// Subsequent calls to [`render`] redraw the watermark slice on every
+/// dirty row that intersects the watermark's y range.
+pub fn enable_watermark(x: i32, y: i32) {
+    WATERMARK_X.store(x, Ordering::Relaxed);
+    WATERMARK_Y.store(y, Ordering::Relaxed);
+    // Release on the flag publishes the x/y stores to readers.
+    WATERMARK_ENABLED.store(true, Ordering::Release);
+}
+
+/// True if the splash has handed the watermark over and the row-fill
+/// path should preserve it. Acquired before reading the position
+/// atomics so the flag's release pairing publishes them coherently.
+fn watermark_active() -> bool {
+    WATERMARK_ENABLED.load(Ordering::Acquire)
+}
+
+/// Re-stamp the watermark text into the row's BG band if and only if
+/// the row's pixel y range overlaps the watermark. Must run AFTER
+/// `fill_rect(BG)` (which would otherwise erase the watermark) and
+/// BEFORE the per-cell glyph blits (so cell text composites on top).
+///
+/// Cell-glyph overwrites in the watermark zone (an opaque 'W' lands on
+/// part of the watermark) are corrected on the next dirty redraw of
+/// the same row — `draw_row` always re-stamps. Net effect: watermark
+/// stays intact through scrolls, command output, prompt redraws.
+fn stamp_watermark_band(surf: &mut Surface, row_y_start: i32, row_h: i32) {
+    if !watermark_active() {
+        return;
+    }
+    let wm_x = WATERMARK_X.load(Ordering::Relaxed);
+    let wm_y = WATERMARK_Y.load(Ordering::Relaxed);
+    let wm_h = BUILTIN_FONT_JBM.cell_h as i32;
+    let wm_y_end = wm_y + wm_h;
+    let row_y_end = row_y_start + row_h;
+    // Skip rows that don't overlap the watermark band.
+    if row_y_start >= wm_y_end || row_y_end <= wm_y {
+        return;
+    }
+    // The full watermark stamps regardless of partial-row overlap; the
+    // pixels outside the row's y range will be erased on whichever
+    // adjacent row's `fill_rect` runs next, then re-stamped when that
+    // row also calls into here. Net cost: ~3.5 KB of glyph pixels per
+    // dirty row in the watermark band, which is in the noise.
+    let cambi_dim = blend_toward(FG_0, BG_0, WATERMARK_ALPHA);
+    let accent_dim = blend_toward(ACCENT, BG_0, WATERMARK_ALPHA);
+    let cambi_w = (WATERMARK_CAMBI.len() as i32) * (BUILTIN_FONT_JBM.cell_w as i32);
+    draw_text_scaled(
+        surf,
+        wm_x,
+        wm_y,
+        WATERMARK_CAMBI,
+        1,
+        cambi_dim,
+        &BUILTIN_FONT_JBM,
+    );
+    draw_text_scaled(
+        surf,
+        wm_x + cambi_w,
+        wm_y,
+        WATERMARK_OS,
+        1,
+        accent_dim,
+        &BUILTIN_FONT_JBM,
+    );
+}
 
 // ─── ANSI 8-color palette ────────────────────────────────────────
 //
@@ -180,8 +273,10 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
 }
 
 /// Re-render row `row` as a single horizontal strip: fill BG over the
-/// full cell band, then blit each cell's glyph through the AA font
-/// using a color resolved from the cell's `(fg, attrs)` pair.
+/// full cell band, restamp the watermark slice (if the row intersects
+/// it), then blit each cell's glyph through the AA font using a color
+/// resolved from the cell's `(fg, attrs)` pair. Watermark sits below
+/// glyphs so cells without text leave the brand mark visible.
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     let cell_y = (row as u16) * CELL_H;
 
@@ -194,6 +289,10 @@ fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
         },
         BG,
     );
+
+    // Watermark redraw — fill_rect just erased anything in this row's
+    // band, including any prior watermark pixels there. Re-stamp.
+    stamp_watermark_band(surf, cell_y as i32, CELL_H as i32);
 
     // The glyph cell already includes built-in vertical leading from
     // the bake step (ascent + descent + balanced top/bottom margin),
