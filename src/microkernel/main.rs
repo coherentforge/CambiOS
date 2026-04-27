@@ -1692,6 +1692,27 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                     }
                 }
 
+                // ADR-022: grant `SetWallclock` to udp-stack so it can
+                // republish the kernel's Unix-seconds baseline after
+                // each NTP refresh. udp-stack is the day-1 setter; future
+                // signed-time / Roughtime / peer-attestation collectors
+                // will land alongside this grant. Name-based pattern
+                // matches MapFramebuffer / AuditConsumer above.
+                if short_name == b"udp-stack" {
+                    use cambios_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
+                    if let Some(cap_mgr) = cap_guard.as_mut() {
+                        let _ = cap_mgr.grant_system_capability(
+                            process_id,
+                            CapabilityKind::SetWallclock,
+                        );
+                        println!(
+                            "    ✓ Granted SetWallclock to udp-stack (process {})",
+                            process_id.slot(),
+                        );
+                    }
+                }
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.0, result.process_id.slot(), result.entry_point

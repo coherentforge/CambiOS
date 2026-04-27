@@ -41,6 +41,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cambios-style"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
+]
+
+[[package]]
 name = "cambios-terminal-window"
 version = "0.1.0"
 dependencies = [
@@ -49,6 +56,7 @@ dependencies = [
  "cambios-libinput-proto",
  "cambios-libsys",
  "cambios-libterm",
+ "cambios-style",
  "linked_list_allocator",
 ]
 

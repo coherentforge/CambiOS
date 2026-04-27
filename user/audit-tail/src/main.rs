@@ -18,7 +18,8 @@
 #![no_main]
 
 use cambios_libsys as sys;
-use cambios_libsys::Principal;
+use cambios_style::{format as fmt_style, style};
+use core::fmt::Write;
 
 /// Ring header magic ("ARCAUDIT" little-endian, see `src/audit/drain.rs`).
 const RING_HEADER_MAGIC: u64 = 0x5449_4455_4143_5241;
@@ -92,25 +93,103 @@ fn print_event(event_base: usize) {
     let kind = unsafe { p.read_volatile() };
     let subject_pid = read_u64(p, 16);
 
-    sys::print(b"[AUDIT-TAIL] ");
-    sys::print(kind_name(kind));
-    sys::print(b" pid=");
-    print_u64_dec(subject_pid);
+    // Compose the styled line into a stack buffer in three segments:
+    //
+    //   <dim "[AUDIT-TAIL]"> <emph kind> <dim "pid=">N <dim "as"> <principal did>
+    //
+    // The dim treatment on the bracketed prefix and the `pid=` /
+    // `as` glue keeps the eye on the two semantic anchors: the
+    // event kind (what happened) and the principal (who).
+    let mut buf = [0u8; 192];
+    let mut w = StackWriter::new(&mut buf);
+
+    let _ = write!(
+        w,
+        "{} {} {}",
+        style::dim("[AUDIT-TAIL]"),
+        style::emphasis(core::str::from_utf8(kind_name(kind)).unwrap_or("?")),
+        style::dim("pid="),
+    );
+    let mut pid_buf = [0u8; 20];
+    let pid_str = u64_to_decimal(&mut pid_buf, subject_pid);
+    let _ = write!(w, "{}", pid_str);
 
     // subject_pid == 0 is the kernel-context sentinel (BinaryLoaded /
     // BinaryRejected / AuditDropped). No principal to resolve.
     if subject_pid != 0 {
-        let mut buf = [0u8; 32];
-        let rc = sys::get_process_principal(subject_pid, &mut buf);
+        let mut pk = [0u8; 32];
+        let rc = sys::get_process_principal(subject_pid, &mut pk);
         if rc == 32 {
-            sys::print(b" ");
-            let did = Principal::from_bytes(buf).to_did_key();
-            sys::print(did.as_bytes());
+            let short = fmt_style::principal_short(&pk);
+            let _ = write!(
+                w,
+                " {} {}",
+                style::dim("as"),
+                style::principal(short.as_str()),
+            );
         } else {
-            sys::print(b" (principal unresolved)");
+            // Principal unresolved — render in a low-key dim so it
+            // doesn't compete with the rest of the line.
+            let _ = write!(w, " {}", style::dim("(principal unresolved)"));
         }
     }
-    sys::print(b"\r\n");
+    let _ = write!(w, "\r\n");
+
+    sys::print(w.into_slice());
+}
+
+/// Format a u64 into the buffer as ASCII decimal; return the populated
+/// slice as `&str`. Bounded to 20 chars (max u64).
+fn u64_to_decimal(buf: &mut [u8; 20], mut n: u64) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut tmp = [0u8; 20];
+    let mut len = 0;
+    while n > 0 && len < tmp.len() {
+        tmp[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    for i in 0..len {
+        buf[i] = tmp[len - 1 - i];
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+}
+
+/// Stack `core::fmt::Write` adapter used so the styled audit line is
+/// composed without allocation. Truncates on overflow rather than
+/// panicking — the buffer is sized for the worst case at the call
+/// site.
+struct StackWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> StackWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn into_slice(self) -> &'a [u8] {
+        &self.buf[..self.pos]
+    }
+}
+
+impl<'a> core::fmt::Write for StackWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let space = self.buf.len().saturating_sub(self.pos);
+        let n = bytes.len().min(space);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+        if n < bytes.len() {
+            Err(core::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn kind_name(kind: u8) -> &'static [u8] {

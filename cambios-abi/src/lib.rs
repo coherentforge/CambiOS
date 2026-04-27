@@ -278,10 +278,37 @@ pub enum SyscallNumber {
     /// day one.
     VirtioModernCaps = 38,
 
-    // 39 SetWallclock and 40 GetWallclock are reserved by ADR-022
-    // (wall-clock time + path to decentralized time). The handlers
-    // are not yet implemented; numbers held to keep the ABI stable
-    // when the implementation lands.
+    /// SYS_SET_WALLCLOCK (39): publish a Unix-seconds baseline + a
+    /// trust-source tag describing where the time came from. Only
+    /// `udp-stack` holds the gating capability today; future signed-time
+    /// services or peer-attestation collectors would also receive it
+    /// (ADR-022 § 4 reservation table).
+    ///
+    /// Args: arg1 = unix_secs (u64), arg2 = source_tag (low byte; see
+    ///       ADR-022 § 4 for the canonical tag → trust-source map).
+    ///
+    /// Capability-gated on `CapabilityKind::SetWallclock`. Anonymous
+    /// senders rejected (Frame B identity gate).
+    ///
+    /// Returns 0 on success, `PermissionDenied` without the capability.
+    SetWallclock = 39,
+
+    /// SYS_GET_WALLCLOCK (40): read the current Unix-seconds baseline
+    /// projected to "now" via the kernel tick counter. Returns 0
+    /// before any successful `SetWallclock` (boot state — display
+    /// surfaces fall back to the timeless prompt). Lock-free,
+    /// wait-free, callable from any context.
+    ///
+    /// Joins the unidentified-allowed exempt set alongside
+    /// `GetTime` / `GetPid` / `Print`: rendering the clock from a
+    /// not-yet-bound boot module is fine, and there is no integrity
+    /// surface to protect on a *read* of a value the kernel
+    /// already chose to publish.
+    ///
+    /// No args.
+    ///
+    /// Returns Unix seconds (u64; 0 = unset sentinel).
+    GetWallclock = 40,
 
     /// SYS_AUDIT_EMIT_INPUT_FOCUS (41): compositor reports a window-focus
     /// transition into the kernel audit ring (T-7 Phase A,
@@ -333,7 +360,8 @@ pub enum SyscallNumber {
 impl SyscallNumber {
     /// Returns `true` for syscalls that require the caller to have a bound,
     /// non-zero Principal. Unidentified processes may only use the exempt
-    /// set: Exit, Yield, GetPid, GetTime, Print, GetPrincipal, ModuleReady.
+    /// set: Exit, Yield, GetPid, GetTime, GetWallclock, Print, GetPrincipal,
+    /// ModuleReady.
     ///
     /// This is the kernel-side half of the "identity is load-bearing" invariant.
     /// The userspace half is `recv_verified()` in libsys, which rejects
@@ -358,7 +386,8 @@ impl SyscallNumber {
             Self::MapFramebuffer |
             Self::VirtioModernCaps |
             Self::AuditEmitInputFocus |
-            Self::GetProcessPrincipal
+            Self::GetProcessPrincipal |
+            Self::SetWallclock
         )
     }
 
@@ -405,8 +434,8 @@ impl SyscallNumber {
             36 => Some(Self::ModuleReady),
             37 => Some(Self::TryRecvMsg),
             38 => Some(Self::VirtioModernCaps),
-            // 39 SetWallclock + 40 GetWallclock reserved by ADR-022;
-            // not yet wired through dispatch.
+            39 => Some(Self::SetWallclock),
+            40 => Some(Self::GetWallclock),
             41 => Some(Self::AuditEmitInputFocus),
             42 => Some(Self::GetProcessPrincipal),
             _ => None,
@@ -544,6 +573,10 @@ mod tests {
         // identity infrastructure is fully up. Making it identity-gated
         // would create a bootstrap circular dependency.
         SyscallNumber::ModuleReady,
+        // `GetWallclock` is a *read* of a value the kernel already chose
+        // to publish — there is no integrity surface to protect, and
+        // pre-bind boot modules legitimately need to render the clock.
+        SyscallNumber::GetWallclock,
     ];
 
     #[test]
@@ -579,6 +612,7 @@ mod tests {
             SyscallNumber::AuditInfo,
             SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
             SyscallNumber::TryRecvMsg, SyscallNumber::VirtioModernCaps,
+            SyscallNumber::SetWallclock, SyscallNumber::GetWallclock,
             SyscallNumber::AuditEmitInputFocus,
             SyscallNumber::GetProcessPrincipal,
         ];
@@ -598,32 +632,23 @@ mod tests {
 
     #[test]
     fn exempt_set_is_minimal() {
-        // The exempt set must be exactly 7 syscalls (Exit, Yield, GetPid,
-        // GetTime, Print, GetPrincipal, ModuleReady). If this test fails,
-        // someone added a new exempt syscall — that requires justification.
-        assert_eq!(EXEMPT.len(), 7, "exempt set size changed — review required");
+        // The exempt set must be exactly 8 syscalls (Exit, Yield, GetPid,
+        // GetTime, Print, GetPrincipal, ModuleReady, GetWallclock). If
+        // this test fails, someone added a new exempt syscall — that
+        // requires justification.
+        assert_eq!(EXEMPT.len(), 8, "exempt set size changed — review required");
     }
 
     #[test]
     fn all_syscall_numbers_covered() {
         // Verify from_u64 round-trips for all defined values, ensuring
-        // no gap in the requires_identity() match. ADR-022 reserves
-        // 39 (SetWallclock) and 40 (GetWallclock) but they are not yet
-        // wired through dispatch, so from_u64 returns None for them
-        // today; assert that explicitly so this test catches the day
-        // they land but isn't broken until then.
-        for i in 0..=38u64 {
+        // no gap in the requires_identity() match. ADR-022 wallclock
+        // pair (39 SetWallclock, 40 GetWallclock) lands here as part of
+        // the contiguous 0..=42 sweep.
+        for i in 0..=42u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
         }
-        assert!(SyscallNumber::from_u64(39).is_none(), "ADR-022 SetWallclock not yet wired");
-        assert!(SyscallNumber::from_u64(40).is_none(), "ADR-022 GetWallclock not yet wired");
-        let aef = SyscallNumber::from_u64(41);
-        assert_eq!(aef, Some(SyscallNumber::AuditEmitInputFocus));
-        let _ = aef.unwrap().requires_identity();
-        let gpp = SyscallNumber::from_u64(42);
-        assert_eq!(gpp, Some(SyscallNumber::GetProcessPrincipal));
-        let _ = gpp.unwrap().requires_identity();
     }
 }

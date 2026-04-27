@@ -11,6 +11,8 @@
 #![deny(unsafe_code)]
 
 use cambios_libsys as sys;
+use cambios_style::{format, style};
+use core::fmt::Write;
 
 // ============================================================================
 // Entry point
@@ -21,6 +23,12 @@ use cambios_libsys as sys;
 /// invoked, but registered at startup so the first call doesn't have to
 /// race endpoint setup.
 const SHELL_ENDPOINT: u32 = 18;
+
+/// Stack buffer size for the rendered prompt. The fully-styled
+/// `cambios@<short-did>:HH:MM> ` form runs to ~70 bytes once ANSI
+/// escapes are factored in; 128 leaves comfortable slack for any
+/// future segment without revisiting the type.
+const PROMPT_BUF_SIZE: usize = 128;
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
@@ -35,7 +43,8 @@ pub extern "C" fn _start() -> ! {
     sys::print(b"Type 'help' for available commands.\r\n");
 
     loop {
-        sys::print(b"cambios> ");
+        let mut prompt_buf = [0u8; PROMPT_BUF_SIZE];
+        sys::print(render_prompt(&mut prompt_buf));
 
         let mut line_buf = [0u8; 128];
         let len = read_line(&mut line_buf);
@@ -46,6 +55,70 @@ pub extern "C" fn _start() -> ! {
 
         let line = &line_buf[..len];
         dispatch_command(line);
+    }
+}
+
+// ============================================================================
+// Prompt rendering — identity- and time-aware (ADR-022)
+// ============================================================================
+
+/// Render the styled prompt into `buf`, return the populated slice.
+///
+/// Pulls the caller's bound Principal via `sys::get_principal` and the
+/// current Unix-seconds wall clock via `sys::get_wallclock`. The
+/// `cambios_style::format::prompt` helper renders the full
+/// `cambios@<short-did>:HH:MM> ` shape with sections dropped out
+/// when their inputs are unavailable (anonymous principal, unset
+/// wallclock).
+///
+/// The stack writer uses `core::fmt::Write` and tolerates buffer
+/// overflow by truncating silently — the caller's buffer should be
+/// sized for the worst-case prompt (see `PROMPT_BUF_SIZE`).
+fn render_prompt(buf: &mut [u8]) -> &[u8] {
+    let mut principal = [0u8; 32];
+    let _ = sys::get_principal(&mut principal);
+    let wall = sys::get_wallclock();
+
+    let mut writer = StackWriter::new(buf);
+    let _ = write!(writer, "{}", format::prompt(&principal, wall));
+    writer.into_slice()
+}
+
+/// Tiny `core::fmt::Write` adapter over a borrowed `&mut [u8]`. Used
+/// so `write!` macros can drive the styled-prompt rendering without
+/// allocation. Truncates on overflow rather than panicking.
+struct StackWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> StackWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// Consume the writer and return the populated bytes. Reborrowed
+    /// from the underlying buffer with the writer's recorded length.
+    fn into_slice(self) -> &'a [u8] {
+        &self.buf[..self.pos]
+    }
+}
+
+impl<'a> core::fmt::Write for StackWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let space = self.buf.len().saturating_sub(self.pos);
+        let n = bytes.len().min(space);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+        if n < bytes.len() {
+            // Buffer full — caller's buffer was undersized. Returning
+            // an Err signals the failure to `write!`; rendering
+            // silently truncates after this point.
+            Err(core::fmt::Error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -133,18 +206,66 @@ fn dispatch_command(line: &[u8]) {
 // ============================================================================
 
 fn cmd_help() {
-    sys::print(b"Built-in commands:\r\n");
-    sys::print(b"  help    - Show this help\r\n");
-    sys::print(b"  echo    - Print text\r\n");
-    sys::print(b"  time    - Show system ticks\r\n");
-    sys::print(b"  pid     - Show shell process ID\r\n");
-    sys::print(b"  clear   - Clear screen\r\n");
-    sys::print(b"  arcobj  - CambiObject store operations (put/get/list/delete)\r\n");
-    sys::print(b"  did-key - Render this process's Principal as did:key, or encode/decode one\r\n");
-    sys::print(b"  play    - Launch a game; `play` alone lists available games\r\n");
-    sys::print(b"  exit    - Exit shell\r\n");
-    sys::print(b"\r\nExternal commands (boot modules):\r\n");
+    // Help table — command names in emphasis, descriptions in dim,
+    // section headers in plain default. The 7-char command-column
+    // width fits every current entry and gives a fixed alignment
+    // point regardless of terminal width.
+    print_help_section("Built-in commands:");
+    print_help_row("help", "show this help");
+    print_help_row("echo", "print text");
+    print_help_row("time", "show system ticks");
+    print_help_row("pid", "show shell process ID");
+    print_help_row("clear", "clear screen");
+    print_help_row("arcobj", "CambiObject store ops (put/get/list/delete/name/names)");
+    print_help_row("did-key", "render Principal as did:key, or encode/decode one");
+    print_help_row("play", "launch a game; `play` alone lists available games");
+    print_help_row("exit", "exit shell");
+    sys::print(b"\r\n");
+    print_help_section("External commands (boot modules):");
     sys::print(b"  hello, key-store-service, fs-service, ...\r\n");
+}
+
+fn print_help_section(text: &str) {
+    let mut buf = [0u8; 128];
+    let mut w = StackWriter::new(&mut buf);
+    let _ = write!(w, "{}\r\n", text);
+    sys::print(w.into_slice());
+}
+
+fn print_help_row(cmd: &str, desc: &str) {
+    // Render: `  <emph cmd, padded to 8>  <dim desc>`. The `key_value`
+    // helper would produce a colon-bearing form; here we want
+    // colonless (verbs, not key-value pairs), so render manually.
+    let mut buf = [0u8; 192];
+    let mut w = StackWriter::new(&mut buf);
+    let _ = write!(
+        w,
+        "  {:<8}  {}\r\n",
+        StyledPad { inner: style::emphasis(cmd), visible_len: cmd.len(), width: 8 },
+        style::dim(desc),
+    );
+    sys::print(w.into_slice());
+}
+
+/// Helper: format a styled value left-padded to a *visible* width
+/// (i.e., padding accounts for the unstyled length, not the byte
+/// length including ANSI escapes). Standard Rust padding uses byte
+/// length, which would over-pad styled text.
+struct StyledPad<S: core::fmt::Display> {
+    inner: S,
+    visible_len: usize,
+    width: usize,
+}
+
+impl<S: core::fmt::Display> core::fmt::Display for StyledPad<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.inner)?;
+        let pad = self.width.saturating_sub(self.visible_len);
+        for _ in 0..pad {
+            f.write_str(" ")?;
+        }
+        Ok(())
+    }
 }
 
 fn cmd_echo(args: &[u8]) {
@@ -193,27 +314,25 @@ fn cmd_did_key(args: &[u8]) {
         let mut pk = [0u8; 32];
         let n = sys::get_principal(&mut pk);
         if n != 32 {
-            sys::print(b"did-key: failed to read this process's Principal\r\n");
+            print_styled_error("did-key", "failed to read this process's Principal");
             return;
         }
         if pk == [0u8; 32] {
-            sys::print(b"did-key: this process has no bound Principal (anonymous)\r\n");
+            print_styled_error(
+                "did-key",
+                "this process has no bound Principal (anonymous)",
+            );
             return;
         }
-        let rendered = sys::did_key_encode(&pk);
-        sys::print(rendered.as_bytes());
-        sys::print(b"\r\n");
+        print_styled_did_key(&pk);
         return;
     }
 
     // Decode mode: input looks like did:key:z...
     if trimmed.starts_with(b"did:key:") {
         match sys::did_key_decode(trimmed) {
-            Some(bytes) => {
-                print_hex32(&bytes);
-                sys::print(b"\r\n");
-            }
-            None => sys::print(b"did-key: not a valid Ed25519 did:key\r\n"),
+            Some(bytes) => print_styled_hex32(&bytes),
+            None => print_styled_error("did-key", "not a valid Ed25519 did:key"),
         }
         return;
     }
@@ -221,12 +340,57 @@ fn cmd_did_key(args: &[u8]) {
     // Encode mode: input is 64 hex chars (raw pubkey).
     let mut pk = [0u8; 32];
     if !parse_hex32(trimmed, &mut pk) {
-        sys::print(b"did-key: argument must be 64 hex chars OR a did:key:z... string\r\n");
+        print_styled_error(
+            "did-key",
+            "argument must be 64 hex chars OR a did:key:z... string",
+        );
         return;
     }
-    let rendered = sys::did_key_encode(&pk);
-    sys::print(rendered.as_bytes());
-    sys::print(b"\r\n");
+    print_styled_did_key(&pk);
+}
+
+/// Print a `did:key:z6Mk…` value with principal styling. Used by all
+/// three did-key modes (self / encode / decode) so the styled rendering
+/// is identical across them.
+fn print_styled_did_key(pubkey: &[u8; 32]) {
+    let rendered = sys::did_key_encode(pubkey);
+    let rendered_str = rendered.as_str().unwrap_or("did:key:?");
+    let mut buf = [0u8; 192];
+    let mut w = StackWriter::new(&mut buf);
+    let _ = write!(w, "{}\r\n", style::principal(rendered_str));
+    sys::print(w.into_slice());
+}
+
+/// Print a 32-byte hash as 64 hex chars styled dim. The dim treatment
+/// keeps "raw bytes" visually subordinate to the did:key form when
+/// both appear in the same demo flow.
+fn print_styled_hex32(bytes: &[u8; 32]) {
+    let mut hex = [0u8; 64];
+    for i in 0..32 {
+        hex[i * 2] = hex_nibble(bytes[i] >> 4);
+        hex[i * 2 + 1] = hex_nibble(bytes[i] & 0xF);
+    }
+    let hex_str = core::str::from_utf8(&hex).unwrap_or("?");
+    let mut buf = [0u8; 96];
+    let mut w = StackWriter::new(&mut buf);
+    let _ = write!(w, "{}\r\n", style::dim(hex_str));
+    sys::print(w.into_slice());
+}
+
+/// Print `<command>: <message>` with the command name dim and the
+/// message in error red. The shape matches the existing
+/// `<cmd>: <msg>` convention used throughout the shell.
+fn print_styled_error(command: &str, message: &str) {
+    let mut buf = [0u8; 256];
+    let mut w = StackWriter::new(&mut buf);
+    let _ = write!(
+        w,
+        "{}{} {}\r\n",
+        style::dim(command),
+        style::dim(":"),
+        style::error(message),
+    );
+    sys::print(w.into_slice());
 }
 
 // ============================================================================
@@ -676,42 +840,108 @@ fn print_named_entry(name: &[u8]) {
     let mut owner = [0u8; 32];
     owner.copy_from_slice(&reply.buf[STAT_OFF_OWNER..STAT_OFF_OWNER + 32]);
 
-    sys::print(b"  ");
-    sys::print(name);
-    sys::print(b"  hash=");
-    print_hex_short(hash);
-    sys::print(b"  author=");
-    print_principal_did_key(&author);
-    sys::print(b"  owner=");
-    print_principal_did_key(&owner);
-    sys::print(b"\r\n");
+    // Render one entry as a four-line block: emphasized name, then
+    // dim-labeled hash / author / owner. Multiline beats single-line
+    // for IIW hands-on density (1–5 entries typical) — each row sits
+    // long enough for a reader to absorb, and the principal_short
+    // form anchors identity in cyan-dim so the eye finds it first.
+    let mut buf = [0u8; 192];
+    let mut w = StackWriter::new(&mut buf);
+
+    // Name line
+    let _ = write!(
+        w,
+        "  {}\r\n",
+        style::emphasis(core::str::from_utf8(name).unwrap_or("?"))
+    );
+
+    // Hash, author, owner labeled rows. The leading spaces give a
+    // hanging-indent visual for a "this is a record" feel.
+    let hash_buf = hex_short_str(hash);
+    let _ = write!(
+        w,
+        "    {}\r\n",
+        format::key_value(
+            "hash",
+            style::dim(core::str::from_utf8(&hash_buf).unwrap_or("?")),
+            6,
+        )
+    );
+
+    write_principal_row(&mut w, "author", &author);
+    write_principal_row(&mut w, "owner", &owner);
+    let _ = write!(w, "\r\n");
+
+    sys::print(w.into_slice());
 }
 
-/// Print the first 8 bytes of a hash as 16 hex chars + ellipsis. Keeps each
-/// `arcobj names` row scannable on a 100-col terminal alongside two
-/// did:keys.
-fn print_hex_short(bytes: &[u8]) {
+/// Render one `<label>: <principal>` row into the writer. Anonymous
+/// principals render as a dim italic-style "anonymous" so the absence
+/// of an identity is visible without becoming the focal point.
+fn write_principal_row<'a>(
+    w: &mut StackWriter<'a>,
+    label: &str,
+    principal: &[u8; 32],
+) {
+    if *principal == [0u8; 32] {
+        let _ = write!(
+            w,
+            "    {}\r\n",
+            format::key_value(label, style::dim("(anonymous)"), 6)
+        );
+        return;
+    }
+    let short = format::principal_short(principal);
+    // Render with the full `did:key:` URI prefix preserved so the
+    // identity surface explicitly says "this is a did:key" — for
+    // hands-on demo readability. The short form omits the URI
+    // prefix; we add it back here.
+    let mut did_buf = [0u8; 32];
+    let did_str = render_did_with_prefix(&mut did_buf, short.as_str());
+    let _ = write!(
+        w,
+        "    {}\r\n",
+        format::key_value(label, style::principal(did_str), 6)
+    );
+}
+
+/// Compose `did:key:<short>` into a stack buffer, return the populated
+/// `&str`. The buffer must be at least
+/// `"did:key:".len() + DidShort::MAX_LEN` (= 8 + 16 = 24 bytes); 32
+/// gives slack.
+fn render_did_with_prefix<'a>(buf: &'a mut [u8; 32], short: &'a str) -> &'a str {
+    const PREFIX: &[u8] = b"did:key:";
+    let short_bytes = short.as_bytes();
+    let total = PREFIX.len() + short_bytes.len();
+    if total > buf.len() {
+        // Caller passed an undersized buffer — fall back to the short
+        // form alone rather than panic. The compile-time buffer size
+        // makes this branch unreachable in practice.
+        return short;
+    }
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    buf[PREFIX.len()..total].copy_from_slice(short_bytes);
+    core::str::from_utf8(&buf[..total]).unwrap_or(short)
+}
+
+/// Build the short hex form (16 chars + ASCII `...`) into a stack
+/// buffer. Returns a 19-byte array (16 hex + 3-byte ASCII ellipsis);
+/// caller renders the prefix slice as `&str` after. ASCII `...`
+/// chosen over Unicode `…` for terminal-encoding compatibility — see
+/// `cambios_style::format::ELLIPSIS` for the full rationale.
+fn hex_short_str(bytes: &[u8]) -> [u8; 19] {
+    let mut out = [0u8; 19];
     let n = core::cmp::min(bytes.len(), 8);
-    let mut buf = [0u8; 16];
     for i in 0..n {
         let hi = bytes[i] >> 4;
         let lo = bytes[i] & 0xF;
-        buf[i * 2] = hex_nibble(hi);
-        buf[i * 2 + 1] = hex_nibble(lo);
+        out[i * 2] = hex_nibble(hi);
+        out[i * 2 + 1] = hex_nibble(lo);
     }
-    sys::print(&buf[..n * 2]);
-    sys::print(b"...");
-}
-
-/// Render a 32-byte principal as did:key:z6Mk…, or the literal string
-/// `(anonymous)` if it's the zero Principal.
-fn print_principal_did_key(pk: &[u8; 32]) {
-    if *pk == [0u8; 32] {
-        sys::print(b"(anonymous)");
-        return;
-    }
-    let did = sys::did_key_encode(pk);
-    sys::print(did.as_bytes());
+    out[16] = b'.';
+    out[17] = b'.';
+    out[18] = b'.';
+    out
 }
 
 fn print_unknown_status(op: &str, status: u8) {

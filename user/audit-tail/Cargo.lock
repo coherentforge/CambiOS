@@ -11,6 +11,7 @@ name = "cambios-audit-tail"
 version = "0.1.0"
 dependencies = [
  "cambios-libsys",
+ "cambios-style",
 ]
 
 [[package]]
@@ -18,4 +19,11 @@ name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
  "cambios-abi",
+]
+
+[[package]]
+name = "cambios-style"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
 ]

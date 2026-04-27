@@ -40,6 +40,7 @@ pub mod boot_modules;
 pub mod audit;
 pub mod policy;
 pub mod pci;
+pub mod time;
 
 // Kernel heap allocator — initialized from Limine memory map in kmain
 #[cfg(not(any(test, fuzzing)))]

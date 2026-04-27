@@ -132,10 +132,30 @@ fn set_network_config(ip: [u8; 4], gateway: [u8; 4], mask: [u8; 4]) {
     }
 }
 
-// NTP server: time.google.com (216.239.35.0)
-const NTP_SERVER_IP: [u8; 4] = [216, 239, 35, 0];
+// NTP server: NIST `time-a-g.nist.gov` (129.6.15.28). NIST publishes
+// a "≥ 4h between queries" guideline for casual clients; respect it
+// (see NTP_REFRESH_TICKS_OK below). Renumber check: `dig +short
+// time-a-g.nist.gov`. ADR-022 § 5: day-1 setter is unauthenticated
+// NTP from a US-government IP — accepted day-1 risk, replaced when
+// NTS / Roughtime / peer-attested setters land at higher source_tag
+// reservations.
+const NTP_SERVER_IP: [u8; 4] = [129, 6, 15, 28];
 const NTP_PORT: u16 = 123;
 const NTP_CLIENT_PORT: u16 = 12345;
+
+// TUNING: 4 hours between successful NTP refreshes. Matches NIST's
+// public-policy guidance for casual clients. Replace when: a stricter
+// freshness requirement surfaces (e.g., signed-cert validators want
+// sub-hour drift bounds), or when the trust-source moves to NTS /
+// Roughtime which carry their own refresh cadence guidance.
+const NTP_REFRESH_TICKS_OK: u64 = 4 * 60 * 60 * 100;
+
+// TUNING: 60-second back-off on a transient NTP failure. Short enough
+// that a network blip recovers within minutes; long enough that a
+// persistent outage doesn't hammer NIST. Replace when: failure
+// telemetry shows we should adapt the cadence (exponential back-off,
+// jittered retry, etc.).
+const NTP_RETRY_TICKS_FAIL: u64 = 60 * 100;
 
 // Ethernet constants
 const ETH_HEADER_LEN: usize = 14;
@@ -625,72 +645,74 @@ fn udp_recv(out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
 // NTP demo
 // ============================================================================
 
-fn run_ntp_demo(cache: &mut ArpCache, our_mac: &[u8; 6]) {
-    // Silent-on-success: NTP demo validates the UDP path, but only errors
-    // are printed. The demo is verification-only; results are discarded.
-    let ntp_req = build_ntp_request();
-    if !udp_send(cache, our_mac, &NTP_SERVER_IP, NTP_CLIENT_PORT, NTP_PORT, &ntp_req) {
-        sys::print(b"[UDP] NTP send failed\n");
+/// Tracks NTP refresh cadence across the service loop. The next query
+/// is gated by `next_query_ticks`: on success we extend by 4h, on
+/// failure by 60s. Initialized so the first iteration of the service
+/// loop attempts a query immediately.
+struct NtpRefreshState {
+    next_query_ticks: u64,
+}
+
+impl NtpRefreshState {
+    fn ready_now() -> Self {
+        // `0` ticks is "now or earlier" — `tick_now >= 0` is always
+        // true, so the first service-loop iteration kicks off a query.
+        Self { next_query_ticks: 0 }
+    }
+}
+
+/// Drive an NTP refresh if the cooldown has elapsed. Cheap to call from
+/// the service loop's idle path; bails immediately when not yet due.
+fn maybe_refresh_ntp(
+    cache: &mut ArpCache,
+    our_mac: &[u8; 6],
+    state: &mut NtpRefreshState,
+) {
+    let now = sys::get_time();
+    if now < state.next_query_ticks {
         return;
     }
+    if query_and_publish_ntp(cache, our_mac) {
+        state.next_query_ticks = now.saturating_add(NTP_REFRESH_TICKS_OK);
+    } else {
+        state.next_query_ticks = now.saturating_add(NTP_RETRY_TICKS_FAIL);
+    }
+}
 
-    // Poll for NTP response. Silent on success, silent on timeout (demo only).
+/// Send one NTP request, wait briefly for the reply, and republish the
+/// kernel's wall-clock baseline on success. Returns `true` on success,
+/// `false` on send failure or response timeout.
+///
+/// On failure the kernel's previous baseline survives intact —
+/// `sys::set_wallclock` is *only* called with a parsed Unix timestamp,
+/// never with `0`. ADR-022 § 5 makes this load-bearing: `0` is the
+/// "unset" sentinel `GetWallclock` returns to consumers, so writing
+/// `0` would un-publish the clock.
+///
+/// Tagged `0` (unauthenticated NTP) per ADR-022 § 4. Future signed-time
+/// implementations will publish with their own tag values.
+fn query_and_publish_ntp(cache: &mut ArpCache, our_mac: &[u8; 6]) -> bool {
+    let ntp_req = build_ntp_request();
+    if !udp_send(cache, our_mac, &NTP_SERVER_IP, NTP_CLIENT_PORT, NTP_PORT, &ntp_req) {
+        return false;
+    }
+
+    // Poll for the response. The ~500 iterations match the prior demo's
+    // patience; each iteration also yields the CPU so the rest of the
+    // module's IPC traffic does not stall during the wait.
     let mut payload = [0u8; 128];
     for _ in 0..500 {
         if let Some((_src_ip, src_port, len)) = udp_recv(&mut payload) {
             if src_port == NTP_PORT && len >= NTP_PACKET_LEN {
-                if parse_ntp_response(&payload[..len]).is_some() {
-                    return;
+                if let Some(unix_ts) = parse_ntp_response(&payload[..len]) {
+                    let _ = sys::set_wallclock(unix_ts, 0);
+                    return true;
                 }
             }
         }
+        sys::yield_now();
     }
-}
-
-/// Convert Unix timestamp to (year, month, day, hour, minute, second).
-#[allow(dead_code)]
-fn unix_to_datetime(ts: u64) -> (u32, u8, u8, u8, u8, u8) {
-    let second = (ts % 60) as u8;
-    let ts = ts / 60;
-    let minute = (ts % 60) as u8;
-    let ts = ts / 60;
-    let hour = (ts % 24) as u8;
-    let mut days = (ts / 24) as u32;
-
-    // Calculate year from days since 1970-01-01
-    let mut year = 1970u32;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
-
-    // Calculate month/day
-    let leap = is_leap_year(year);
-    let days_in_month: [u32; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ];
-    let mut month = 0u8;
-    for (i, &dim) in days_in_month.iter().enumerate() {
-        if days < dim {
-            month = i as u8 + 1;
-            break;
-        }
-        days -= dim;
-    }
-    let day = days as u8 + 1;
-
-    (year, month, day, hour, minute, second)
-}
-
-#[allow(dead_code)]
-fn is_leap_year(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    false
 }
 
 // ============================================================================
@@ -700,8 +722,15 @@ fn is_leap_year(y: u32) -> bool {
 fn service_loop(cache: &mut ArpCache, our_mac: &[u8; 6]) -> ! {
     let mut recv_buf = [0u8; 292];
     let mut resp_buf = [0u8; 256];
+    let mut ntp_state = NtpRefreshState::ready_now();
 
     loop {
+        // Refresh the wall-clock if the cooldown has elapsed. Runs every
+        // service-loop iteration so the cadence respects whichever
+        // arrives first: a queued IPC command (handled below) or the
+        // cooldown deadline.
+        maybe_refresh_ntp(cache, our_mac, &mut ntp_state);
+
         let msg = match sys::recv_verified(UDP_ENDPOINT, &mut recv_buf) {
             Some(msg) => msg,
             None => {
@@ -927,10 +956,11 @@ pub extern "C" fn _start() -> ! {
         sys::print(b"[UDP] ERROR: ARP resolution failed for gateway\n");
     }
 
-    // Step 3: NTP demo (silent on success)
-    run_ntp_demo(&mut cache, &our_mac);
-
-    // Step 4: Register service endpoint and enter service loop
+    // Step 3: register service endpoint. The first NTP refresh runs
+    // inside service_loop on entry — it shares the cadence machinery
+    // with subsequent refreshes, so there is no special "boot-time" path
+    // to maintain. Pre-Phase-B this was a one-shot `run_ntp_demo` that
+    // discarded the result; ADR-022 makes the response load-bearing.
     sys::register_endpoint(UDP_ENDPOINT);
     sys::print(b"[UDP] ready on endpoint 21\n");
     sys::module_ready();

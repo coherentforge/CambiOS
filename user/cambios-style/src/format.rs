@@ -39,12 +39,20 @@ use crate::style::{DIM_PREFIX, RESET};
 const SHORT_PREFIX_BYTES: usize = 8;
 
 /// Stack buffer size for [`DidShort`]. Holds 8 ASCII chars + the
-/// 3-byte UTF-8 ellipsis = 11 bytes; 16 gives slack for any future
-/// length nudge without changing the type.
+/// 3-byte ASCII ellipsis (`...`) = 11 bytes; 16 gives slack for any
+/// future length nudge without changing the type.
 const DID_SHORT_BUF: usize = 16;
 
-/// UTF-8 encoding of the ellipsis character `…` (U+2026).
-const ELLIPSIS: &[u8] = "…".as_bytes();
+/// Three-dot ASCII ellipsis. Originally the Unicode `…` glyph (U+2026,
+/// 3 UTF-8 bytes), but a terminal that isn't UTF-8-aware (some
+/// SSH-into-tty paths, default macOS Terminal in legacy encodings,
+/// QEMU stdout viewed through a Latin-1 pager) renders the byte
+/// sequence as `â¦` — wrong, brittle, and exactly the kind of detail
+/// that costs a demo. Three ASCII dots render identically in every
+/// encoding for a one-glyph cosmetic loss. Replace when: GUI Grid /
+/// every surface gains proper UTF-8 rendering AND we have a way to
+/// guarantee the consumer terminal is UTF-8 too.
+const ELLIPSIS: &[u8] = b"...";
 
 // ─── DidShort ─────────────────────────────────────────────────────
 
@@ -154,6 +162,81 @@ pub fn key_value<V: Display>(key: &str, value: V, key_width: usize) -> KeyValue<
     KeyValue { key, value, key_width }
 }
 
+// ─── Prompt ───────────────────────────────────────────────────────
+
+/// Render the standard CambiOS shell prompt as a `Display` value:
+/// `cambios@<short-did>:HH:MM> ` with semantic styling on each
+/// segment. Sections drop out when their inputs are unavailable so the
+/// boot path stays readable:
+///
+/// | principal | wallclock_secs | rendered prompt          |
+/// |-----------|----------------|---------------------------|
+/// | anonymous | 0              | `cambios> `               |
+/// | anonymous | non-zero       | `cambios:HH:MM> `         |
+/// | bound     | 0              | `cambios@z6Mk7L4f…> `     |
+/// | bound     | non-zero       | `cambios@z6Mk7L4f…:HH:MM> `|
+///
+/// "anonymous" is the all-zero Principal returned by
+/// `cambios_libsys::get_principal` for unbound processes.
+///
+/// The returned `Prompt` borrows from `principal`; it must outlive the
+/// `write!` / `print!` call that consumes it. Callers who already
+/// have the principal in a stack buffer (the common case for
+/// `sys::get_principal`) get this for free.
+pub fn prompt(principal: &[u8; 32], wallclock_secs: u64) -> Prompt<'_> {
+    Prompt {
+        principal,
+        wallclock_secs,
+    }
+}
+
+/// Display wrapper produced by [`prompt`]. See [`prompt`] for the
+/// rendering rules.
+#[derive(Clone, Copy)]
+pub struct Prompt<'a> {
+    principal: &'a [u8; 32],
+    wallclock_secs: u64,
+}
+
+impl<'a> Display for Prompt<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use crate::style;
+        use cambios_libsys::time::unix_to_datetime;
+
+        write!(f, "{}", style::dim("cambios"))?;
+
+        if !is_anonymous(self.principal) {
+            let short = principal_short(self.principal);
+            write!(f, "{}{}", style::dim("@"), style::principal(short.as_str()))?;
+        }
+
+        if self.wallclock_secs != 0 {
+            let (_, _, _, hour, minute, _) = unix_to_datetime(self.wallclock_secs);
+            // Compose "HH:MM" into a 5-byte stack buffer. Hour and
+            // minute are bounded by 23 and 59 so the two-digit
+            // arithmetic always yields valid ASCII.
+            let mut hh_mm = [0u8; 5];
+            hh_mm[0] = b'0' + (hour / 10);
+            hh_mm[1] = b'0' + (hour % 10);
+            hh_mm[2] = b':';
+            hh_mm[3] = b'0' + (minute / 10);
+            hh_mm[4] = b'0' + (minute % 10);
+            // Bytes are guaranteed ASCII; from_utf8 cannot fail here.
+            // The unwrap_or guards the impossible case without panic.
+            let hh_mm_str = core::str::from_utf8(&hh_mm).unwrap_or("00:00");
+            write!(f, "{}{}", style::dim(":"), style::time(hh_mm_str))?;
+        }
+
+        write!(f, "{}", style::dim("> "))
+    }
+}
+
+/// All-zero principal — the convention `cambios_libsys::get_principal`
+/// uses to mean "this process has no bound identity yet."
+fn is_anonymous(principal: &[u8; 32]) -> bool {
+    principal.iter().all(|&b| b == 0)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -190,8 +273,8 @@ mod tests {
     fn principal_short_ends_with_ellipsis() {
         let short = principal_short(&FIXED_PUBKEY);
         assert!(
-            short.as_str().ends_with('…'),
-            "short form `{}` does not end with the ellipsis",
+            short.as_str().ends_with("..."),
+            "short form `{}` does not end with `...`",
             short.as_str()
         );
     }
@@ -257,5 +340,73 @@ mod tests {
         // "hash" is 4 chars, key_width is 4 — no extra spaces inserted.
         let line = format!("{}", key_value("hash", "v", 4));
         assert_eq!(line, "  \x1b[2mhash:\x1b[0m v");
+    }
+
+    // ─── Prompt rendering ────────────────────────────────────────
+
+    /// Anonymous principal — `cambios_libsys::get_principal` returns
+    /// this for unbound processes.
+    const ANON: [u8; 32] = [0u8; 32];
+
+    /// 2026-04-26 13:42:00 UTC. Day-aware; only the HH:MM segment is
+    /// rendered in the prompt.
+    const WALL_2026_04_26_1342: u64 = 1_777_161_600 + 13 * 3600 + 42 * 60;
+
+    #[test]
+    fn prompt_anonymous_unset_wallclock_is_minimal() {
+        let line = format!("{}", prompt(&ANON, 0));
+        assert_eq!(line, "\x1b[2mcambios\x1b[0m\x1b[2m> \x1b[0m");
+    }
+
+    #[test]
+    fn prompt_bound_principal_renders_short_did() {
+        let line = format!("{}", prompt(&FIXED_PUBKEY, 0));
+        // "cambios" + "@" + short-did + "> "  — all dim except short-did
+        // which is principal-styled (cyan+dim). Built piecewise so a
+        // future prefix-length nudge updates one helper, not the
+        // expected string.
+        let short = principal_short(&FIXED_PUBKEY);
+        let expected = format!(
+            "\x1b[2mcambios\x1b[0m\x1b[2m@\x1b[0m\x1b[36;2m{}\x1b[0m\x1b[2m> \x1b[0m",
+            short.as_str(),
+        );
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn prompt_anonymous_with_wallclock_renders_time() {
+        let line = format!("{}", prompt(&ANON, WALL_2026_04_26_1342));
+        assert_eq!(
+            line,
+            "\x1b[2mcambios\x1b[0m\x1b[2m:\x1b[0m\x1b[33;2m13:42\x1b[0m\x1b[2m> \x1b[0m"
+        );
+    }
+
+    #[test]
+    fn prompt_full_form_has_all_segments() {
+        let line = format!("{}", prompt(&FIXED_PUBKEY, WALL_2026_04_26_1342));
+        let short = principal_short(&FIXED_PUBKEY);
+        let expected = format!(
+            "\x1b[2mcambios\x1b[0m\
+             \x1b[2m@\x1b[0m\x1b[36;2m{}\x1b[0m\
+             \x1b[2m:\x1b[0m\x1b[33;2m13:42\x1b[0m\
+             \x1b[2m> \x1b[0m",
+            short.as_str(),
+        );
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn prompt_pads_single_digit_hours_and_minutes() {
+        // 2026-04-26 03:05:00 UTC = 1777161600 + 3*3600 + 5*60.
+        let wall = 1_777_161_600 + 3 * 3600 + 5 * 60;
+        let line = format!("{}", prompt(&ANON, wall));
+        assert!(line.contains("03:05"), "rendered: {}", line);
+    }
+
+    #[test]
+    fn prompt_handles_midnight_zero_zero() {
+        let line = format!("{}", prompt(&ANON, 1_777_161_600));
+        assert!(line.contains("00:00"), "rendered: {}", line);
     }
 }

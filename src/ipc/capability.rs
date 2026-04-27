@@ -67,6 +67,13 @@ pub enum CapabilityKind {
     /// to the `audit-tail` boot module; future kernelvisor / AI-watcher
     /// consumers will hold this cap.
     AuditConsumer,
+    /// Right to call `SYS_SET_WALLCLOCK` and republish the kernel's
+    /// Unix-seconds baseline ([ADR-022](docs/adr/022-wall-clock-time.md)).
+    /// Granted at boot only to `udp-stack` (the day-1 NTP client); future
+    /// signed-time / Roughtime / peer-attestation collectors will also
+    /// receive it. Without this capability the syscall returns
+    /// `PermissionDenied`.
+    SetWallclock,
 }
 
 /// Errors from capability operations
@@ -151,6 +158,11 @@ pub struct ProcessCapabilities {
     /// `audit-tail` boot module; gates `SYS_AUDIT_ATTACH` and
     /// `SYS_GET_PROCESS_PRINCIPAL`.
     audit_consumer: bool,
+    /// System capability: can this process republish the kernel's wall-clock
+    /// baseline via `SYS_SET_WALLCLOCK` ([ADR-022](docs/adr/022-wall-clock-time.md))?
+    /// Granted at boot only to `udp-stack` (day-1 NTP setter). Without this
+    /// capability the syscall returns `PermissionDenied`.
+    set_wallclock: bool,
 }
 
 impl ProcessCapabilities {
@@ -168,6 +180,7 @@ impl ProcessCapabilities {
             large_channel: false,
             emit_input_audit: false,
             audit_consumer: false,
+            set_wallclock: false,
         }
     }
 
@@ -310,6 +323,7 @@ impl ProcessCapabilities {
             CapabilityKind::LargeChannel => self.large_channel = true,
             CapabilityKind::EmitInputAudit => self.emit_input_audit = true,
             CapabilityKind::AuditConsumer => self.audit_consumer = true,
+            CapabilityKind::SetWallclock => self.set_wallclock = true,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -324,6 +338,7 @@ impl ProcessCapabilities {
             CapabilityKind::LargeChannel => self.large_channel,
             CapabilityKind::EmitInputAudit => self.emit_input_audit,
             CapabilityKind::AuditConsumer => self.audit_consumer,
+            CapabilityKind::SetWallclock => self.set_wallclock,
             CapabilityKind::Endpoint => false,
         }
     }
@@ -338,6 +353,7 @@ impl ProcessCapabilities {
             CapabilityKind::LargeChannel => self.large_channel = false,
             CapabilityKind::EmitInputAudit => self.emit_input_audit = false,
             CapabilityKind::AuditConsumer => self.audit_consumer = false,
+            CapabilityKind::SetWallclock => self.set_wallclock = false,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -802,6 +818,7 @@ impl CapabilityManager {
         caps.large_channel = false;
         caps.emit_input_audit = false;
         caps.audit_consumer = false;
+        caps.set_wallclock = false;
 
         Ok(count)
     }
@@ -1255,6 +1272,7 @@ mod tests {
             CapabilityKind::LargeChannel,
             CapabilityKind::EmitInputAudit,
             CapabilityKind::AuditConsumer,
+            CapabilityKind::SetWallclock,
         ];
 
         for kind in system_kinds {

@@ -9,7 +9,7 @@ dump, Limine banner, per-framebuffer enumeration), exits with a status code
 reflecting what actually happened.
 
 Exit codes:
-  0 — success sentinel seen (default: ``cambios> ``)
+  0 — success sentinel seen (default: ``CambiOS Shell v0.1`` — banner)
   1 — kernel panic, CPU exception, or Limine bailout
   2 — no sentinel within --timeout, or QEMU exited before one
 
@@ -72,8 +72,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="qemu-run-quiet.py")
     parser.add_argument("--timeout", type=int, default=60,
                         help="seconds before declaring a hang (default: 60)")
-    parser.add_argument("--success", default="cambios> ",
-                        help="success sentinel substring (default: 'cambios> ')")
+    parser.add_argument("--success", default="CambiOS Shell v0.1",
+                        help="success sentinel substring (default: 'CambiOS Shell v0.1' — the banner the shell prints right before the first prompt; stable across the various styled-prompt shapes the prompt itself can take)")
     args = parser.parse_args(sys.argv[1:sep])
     qemu_cmd = sys.argv[sep + 1:]
     if not qemu_cmd:
@@ -92,6 +92,13 @@ def main() -> int:
         pass
 
     success_re = re.compile(re.escape(args.success))
+    # Strip ANSI SGR escapes before sentinel-matching so styled output
+    # (Phase B/C: `cambios@<short-did>:HH:MM>` rendered with cyan/dim/
+    # yellow attributes via cambios-style) still matches plain-string
+    # sentinels like `cambios> `. Without this, the prompt's literal
+    # bytes are split by `\x1b[…m` sequences and `re.search(r"cambios> ")`
+    # never fires.
+    ansi_re = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
     start = time.monotonic()
     ring: deque[str] = deque(maxlen=RING_SIZE)
     saw_failure = False
@@ -119,7 +126,11 @@ def main() -> int:
         for raw in proc.stdout:
             line = raw.rstrip("\n")
             ring.append(line)
-            kind = classify(line, success_re)
+            # Sentinel matching runs against the ANSI-stripped form;
+            # the captured ring keeps the raw line for human review on
+            # failure (so ring output preserves any color the user
+            # would see).
+            kind = classify(ansi_re.sub("", line), success_re)
 
             if KMAIN_SENTINEL.search(line):
                 kmain_seen = True

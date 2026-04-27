@@ -25,6 +25,11 @@
 // SyscallNumber` without depending on cambios-abi directly.
 pub use cambios_abi::SyscallNumber;
 
+/// Userspace time helpers — Unix-seconds → calendar conversion and
+/// trust-source-tag rendering. Pure functions; safe to call from any
+/// context. See [`time`] for the per-function docs.
+pub mod time;
+
 
 // ============================================================================
 // Raw syscall primitives — the ONLY unsafe code in user-space
@@ -1062,6 +1067,29 @@ pub fn wait_task(task_id: u32) -> i64 {
 /// Get system time in ticks.
 pub fn get_time() -> u64 {
     syscall_raw3(SyscallNumber::GetTime as u64, 0, 0, 0) as u64
+}
+
+/// Republish the kernel's Unix-seconds wall-clock baseline.
+///
+/// Capability-gated on `SetWallclock` (ADR-022 § 3); only `udp-stack`
+/// holds the cap at boot today. `source_tag` describes where the time
+/// came from per the ADR-022 § 4 reservation table: `0`=unauthenticated
+/// NTP, `1`=NTS, `2`=Roughtime, `3`=peer-attested, `4`=signed-carrier.
+/// Reserved tag values are permanent; future ADRs may deprecate but
+/// not renumber.
+///
+/// Returns 0 on success, negative `SyscallError::PermissionDenied` if
+/// the caller does not hold the capability.
+pub fn set_wallclock(unix_secs: u64, source_tag: u8) -> i64 {
+    syscall_raw3(SyscallNumber::SetWallclock as u64, unix_secs, source_tag as u64, 0)
+}
+
+/// Read the current wall-clock as Unix seconds. Returns `0` before any
+/// successful `SetWallclock` (sentinel — the Unix epoch is unrepresentable
+/// in practice, so the value cannot legitimately be zero). Lock-free,
+/// wait-free, no capability check.
+pub fn get_wallclock() -> u64 {
+    syscall_raw3(SyscallNumber::GetWallclock as u64, 0, 0, 0) as u64
 }
 
 // ============================================================================

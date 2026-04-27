@@ -18,4 +18,12 @@ name = "cambios-shell"
 version = "0.1.0"
 dependencies = [
  "cambios-libsys",
+ "cambios-style",
+]
+
+[[package]]
+name = "cambios-style"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
 ]

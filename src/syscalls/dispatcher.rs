@@ -166,6 +166,11 @@ impl SyscallDispatcher {
             // Phase Scanout-4.a: virtio-modern PCI capability discovery (ADR-014)
             SyscallNumber::VirtioModernCaps => Self::handle_virtio_modern_caps(args, &ctx),
 
+            // ADR-022: wall-clock time. SetWallclock is capability-gated
+            // (only udp-stack today); GetWallclock is unidentified-allowed.
+            SyscallNumber::SetWallclock => Self::handle_set_wallclock(args, &ctx),
+            SyscallNumber::GetWallclock => Self::handle_get_wallclock(args, &ctx),
+
             // T-7 Phase A (docs/threat-model.md): compositor reports
             // window-focus transitions into the audit ring.
             SyscallNumber::AuditEmitInputFocus =>
@@ -3128,6 +3133,45 @@ impl SyscallDispatcher {
         ));
 
         Ok(0)
+    }
+
+    /// SYS_SET_WALLCLOCK (39) — republish the kernel's Unix-seconds
+    /// baseline. ADR-022 § 5: udp-stack queries NIST every 4h and calls
+    /// this with the result. Capability-gated; anonymous senders rejected.
+    ///
+    /// Three plain stores in `time::wallclock::set`; no lock acquired,
+    /// no IPC, no allocation — the handler is verification-friendly by
+    /// construction.
+    fn handle_set_wallclock(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::capability::CapabilityKind;
+
+        let unix_secs = args.arg1;
+        let source_tag = (args.arg2 & 0xff) as u8;
+
+        // Capability check: caller must hold SetWallclock. Granted only
+        // to udp-stack at boot today.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(ctx.process_id, CapabilityKind::SetWallclock)
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
+        } // drop CAPABILITY_MANAGER(4)
+
+        crate::time::wallclock::set(unix_secs, source_tag);
+        Ok(0)
+    }
+
+    /// SYS_GET_WALLCLOCK (40) — read the projected Unix-seconds value.
+    /// Returns 0 before any successful `SetWallclock` (sentinel for "no
+    /// time yet"). No capability check, no identity check; consumers
+    /// that read what the kernel already chose to publish need no
+    /// further authorization.
+    fn handle_get_wallclock(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Ok(crate::time::wallclock::get())
     }
 }
 
