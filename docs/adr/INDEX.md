@@ -33,3 +33,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 021 | [Typed BootError Propagation Through the Init Path](021-typed-boot-error-propagation.md) | Proposed | 2026-04-19 |
 | 022 | [Wall-Clock Time and the Path to Decentralized Time](022-wall-clock-time.md) | Accepted | 2026-04-25 |
 | 023 | [Audit Consumer Capability and Principal Resolution](023-audit-consumer-capability.md) | Proposed | 2026-04-26 |
+| 024 | [Syscall ABI in a Standalone Contract Crate (`arcos-abi`)](024-syscall-abi-crate.md) | Proposed | 2026-04-26 |
