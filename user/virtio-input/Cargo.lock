@@ -3,12 +3,19 @@
 version = 4
 
 [[package]]
+name = "arcos-abi"
+version = "0.1.0"
+
+[[package]]
 name = "arcos-libinput-proto"
 version = "0.1.0"
 
 [[package]]
 name = "arcos-libsys"
 version = "0.1.0"
+dependencies = [
+ "arcos-abi",
+]
 
 [[package]]
 name = "arcos-virtio-input"

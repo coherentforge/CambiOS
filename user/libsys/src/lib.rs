@@ -18,20 +18,13 @@
 
 #![no_std]
 
-// Syscall numbers (must match kernel src/syscalls/mod.rs)
-const SYS_EXIT: u64 = 0;
-const SYS_WRITE: u64 = 1;
-const SYS_REGISTER_ENDPOINT: u64 = 6;
-const SYS_YIELD: u64 = 7;
-const SYS_GET_PID: u64 = 8;
-const SYS_PRINT: u64 = 10;
-const SYS_RECV_MSG: u64 = 13;
-const SYS_OBJ_PUT: u64 = 14;
-const SYS_OBJ_GET: u64 = 15;
-const SYS_OBJ_DELETE: u64 = 16;
-const SYS_OBJ_LIST: u64 = 17;
-const SYS_CLAIM_BOOTSTRAP_KEY: u64 = 18;
-const SYS_OBJ_PUT_SIGNED: u64 = 19;
+// Syscall numbers come from the standalone `arcos-abi` crate so the
+// kernel and userspace share one source of truth (was previously a
+// hand-maintained mirror of the kernel enum). Re-exported `pub` so
+// downstream consumers like policy-service can `use arcos_libsys::
+// SyscallNumber` without depending on arcos-abi directly.
+pub use arcos_abi::SyscallNumber;
+
 
 // ============================================================================
 // Raw syscall primitives — the ONLY unsafe code in user-space
@@ -253,12 +246,12 @@ fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
 // ============================================================================
 
 pub fn exit(code: u32) -> ! {
-    syscall_raw3(SYS_EXIT, code as u64, 0, 0);
+    syscall_raw3(SyscallNumber::Exit as u64, code as u64, 0, 0);
     loop {}
 }
 
 pub fn print(msg: &[u8]) {
-    syscall_raw3(SYS_PRINT, msg.as_ptr() as u64, msg.len() as u64, 0);
+    syscall_raw3(SyscallNumber::Print as u64, msg.as_ptr() as u64, msg.len() as u64, 0);
 }
 
 /// Log an error message. Currently prints to the kernel console.
@@ -289,10 +282,9 @@ pub fn log_error(tag: &[u8], msg: &[u8]) {
 }
 
 pub fn register_endpoint(endpoint_id: u32) -> i64 {
-    syscall_raw3(SYS_REGISTER_ENDPOINT, endpoint_id as u64, 0, 0)
+    syscall_raw3(SyscallNumber::RegisterEndpoint as u64, endpoint_id as u64, 0, 0)
 }
 
-const SYS_MODULE_READY: u64 = 36;
 
 /// Signal to the kernel that this boot module has finished initialization
 /// and is about to enter its service loop.
@@ -311,30 +303,29 @@ const SYS_MODULE_READY: u64 = 36;
 /// Always returns 0. Idempotent at the kernel side: a second call from
 /// the same module, or a call from a late-loaded module, is a no-op.
 pub fn module_ready() {
-    syscall_raw3(SYS_MODULE_READY, 0, 0, 0);
+    syscall_raw3(SyscallNumber::ModuleReady as u64, 0, 0, 0);
 }
 
 pub fn yield_now() {
-    syscall_raw3(SYS_YIELD, 0, 0, 0);
+    syscall_raw3(SyscallNumber::Yield as u64, 0, 0, 0);
 }
 
 pub fn get_pid() -> u32 {
-    syscall_raw3(SYS_GET_PID, 0, 0, 0) as u32
+    syscall_raw3(SyscallNumber::GetPid as u64, 0, 0, 0) as u32
 }
 
-const SYS_GET_PRINCIPAL: u64 = 12;
 
 /// Read this process's bound Principal (32-byte Ed25519 public key).
 /// Returns 32 on success (caller buffer must be ≥32 bytes), or negative
 /// error. Unbound processes (no `BindPrincipal` at boot) see
 /// `Principal::ANONYMOUS` — 32 zero bytes.
 pub fn get_principal(out: &mut [u8; 32]) -> i64 {
-    syscall_raw3(SYS_GET_PRINCIPAL, out.as_mut_ptr() as u64, 32, 0)
+    syscall_raw3(SyscallNumber::GetPrincipal as u64, out.as_mut_ptr() as u64, 32, 0)
 }
 
 /// Send IPC message (Write syscall).
 pub fn write(endpoint: u32, buf: &[u8]) -> i64 {
-    syscall_raw3(SYS_WRITE, endpoint as u64, buf.as_ptr() as u64, buf.len() as u64)
+    syscall_raw3(SyscallNumber::Write as u64, endpoint as u64, buf.as_ptr() as u64, buf.len() as u64)
 }
 
 /// Receive IPC message with sender identity (blocking).
@@ -342,10 +333,9 @@ pub fn write(endpoint: u32, buf: &[u8]) -> i64 {
 /// Blocks on `MessageWait(endpoint)` when no message is queued.
 /// buf layout: [sender_principal:32][from_endpoint:4][payload:N]
 pub fn recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    syscall_raw3(SyscallNumber::RecvMsg as u64, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
 }
 
-const SYS_TRY_RECV_MSG: u64 = 37;
 
 /// Non-blocking variant of `recv_msg`. Returns bytes received (≥36) or 0
 /// if no message is queued — never blocks. Required for services that
@@ -353,33 +343,33 @@ const SYS_TRY_RECV_MSG: u64 = 37;
 /// endpoint and a kernel-command endpoint): blocking `recv_msg` on one
 /// endpoint would miss wakes on the other.
 pub fn try_recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_TRY_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+    syscall_raw3(SyscallNumber::TryRecvMsg as u64, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
 }
 
 /// Store object. Writes 32-byte hash to out_hash. Returns 0 or negative error.
 pub fn obj_put(content: &[u8], out_hash: &mut [u8; 32]) -> i64 {
-    syscall_raw3(SYS_OBJ_PUT, content.as_ptr() as u64, content.len() as u64, out_hash.as_mut_ptr() as u64)
+    syscall_raw3(SyscallNumber::ObjPut as u64, content.as_ptr() as u64, content.len() as u64, out_hash.as_mut_ptr() as u64)
 }
 
 /// Get object content by hash. Returns bytes read or negative error.
 pub fn obj_get(hash: &[u8; 32], out_buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_OBJ_GET, hash.as_ptr() as u64, out_buf.as_mut_ptr() as u64, out_buf.len() as u64)
+    syscall_raw3(SyscallNumber::ObjGet as u64, hash.as_ptr() as u64, out_buf.as_mut_ptr() as u64, out_buf.len() as u64)
 }
 
 /// Delete object by hash. Returns 0 or negative error.
 pub fn obj_delete(hash: &[u8; 32]) -> i64 {
-    syscall_raw3(SYS_OBJ_DELETE, hash.as_ptr() as u64, 0, 0)
+    syscall_raw3(SyscallNumber::ObjDelete as u64, hash.as_ptr() as u64, 0, 0)
 }
 
 /// List object hashes. Returns count of objects.
 pub fn obj_list(out_buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_OBJ_LIST, out_buf.as_mut_ptr() as u64, out_buf.len() as u64, 0)
+    syscall_raw3(SyscallNumber::ObjList as u64, out_buf.as_mut_ptr() as u64, out_buf.len() as u64, 0)
 }
 
 /// Store a pre-signed object. Kernel verifies the signature.
 pub fn obj_put_signed(content: &[u8], sig: &[u8; 64], out_hash: &mut [u8; 32]) -> i64 {
     syscall_raw4(
-        SYS_OBJ_PUT_SIGNED,
+        SyscallNumber::ObjPutSigned as u64,
         content.as_ptr() as u64,
         content.len() as u64,
         sig.as_ptr() as u64,
@@ -390,7 +380,7 @@ pub fn obj_put_signed(content: &[u8], sig: &[u8; 64], out_hash: &mut [u8; 32]) -
 /// Claim the bootstrap secret key from the kernel (one-shot).
 /// Returns 64 on success, negative error on failure.
 pub fn claim_bootstrap_key(out_sk: &mut [u8; 64]) -> i64 {
-    syscall_raw3(SYS_CLAIM_BOOTSTRAP_KEY, out_sk.as_mut_ptr() as u64, 0, 0)
+    syscall_raw3(SyscallNumber::ClaimBootstrapKey as u64, out_sk.as_mut_ptr() as u64, 0, 0)
 }
 
 // ============================================================================
@@ -905,11 +895,6 @@ pub fn recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMes
 // Device / DMA syscalls
 // ============================================================================
 
-const SYS_ALLOCATE: u64 = 3;
-const SYS_MAP_MMIO: u64 = 20;
-const SYS_ALLOC_DMA: u64 = 21;
-const SYS_DEVICE_INFO: u64 = 22;
-const SYS_PORT_IO: u64 = 23;
 
 /// Allocate `num_pages` of plain RW user-space virtual memory. Returns
 /// the base virtual address as a positive value on success, or a
@@ -924,26 +909,26 @@ const SYS_PORT_IO: u64 = 23;
 /// sprite buffers / software render targets, not DMA.
 pub fn allocate(num_pages: u32) -> i64 {
     let bytes = (num_pages as u64) * 4096;
-    syscall_raw3(SYS_ALLOCATE, bytes, 0, 0)
+    syscall_raw3(SyscallNumber::Allocate as u64, bytes, 0, 0)
 }
 
 /// Map device MMIO into this process's address space.
 /// Returns user-space virtual address, or negative error.
 pub fn map_mmio(phys_addr: u64, num_pages: u32) -> i64 {
-    syscall_raw3(SYS_MAP_MMIO, phys_addr, num_pages as u64, 0)
+    syscall_raw3(SyscallNumber::MapMmio as u64, phys_addr, num_pages as u64, 0)
 }
 
 /// Allocate physically contiguous DMA-capable pages with guard pages.
 /// Returns user-space virtual address. Physical address written to `out_paddr`.
 pub fn alloc_dma(num_pages: u32, out_paddr: &mut u64) -> i64 {
-    syscall_raw3(SYS_ALLOC_DMA, num_pages as u64, 0, out_paddr as *mut u64 as u64)
+    syscall_raw3(SyscallNumber::AllocDma as u64, num_pages as u64, 0, out_paddr as *mut u64 as u64)
 }
 
 /// Query PCI device info by index.
 /// Writes a 108-byte device descriptor to `out_buf`.
 /// Returns 0 on success, negative error if index is out of range.
 pub fn device_info(index: u32, out_buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_DEVICE_INFO, index as u64, out_buf.as_mut_ptr() as u64, out_buf.len() as u64)
+    syscall_raw3(SyscallNumber::DeviceInfo as u64, index as u64, out_buf.as_mut_ptr() as u64, out_buf.len() as u64)
 }
 
 /// Perform kernel-validated port I/O on a PCI device I/O BAR.
@@ -952,7 +937,7 @@ pub fn device_info(index: u32, out_buf: &mut [u8]) -> i64 {
 /// `flags` bit 0: direction (0=read, 1=write)
 /// `flags` bits 2:1: width (0=byte, 1=word, 2=dword)
 pub fn port_io(port: u16, value: u32, flags: u32) -> i64 {
-    syscall_raw3(SYS_PORT_IO, port as u64, value as u64, flags as u64)
+    syscall_raw3(SyscallNumber::PortIo as u64, port as u64, value as u64, flags as u64)
 }
 
 /// Read a byte from a PCI device I/O port.
@@ -1002,7 +987,6 @@ pub fn port_write32(port: u16, value: u32) -> Result<(), i64> {
 //
 // Byte layout must match `arcos::pci::VirtioModernCaps` exactly.
 
-const SYS_VIRTIO_MODERN_CAPS: u64 = 38;
 
 /// One virtio-pci capability entry (virtio spec §4.1.4.1).
 ///
@@ -1043,7 +1027,7 @@ pub struct VirtioModernCaps {
 pub fn virtio_modern_caps(index: u32) -> Option<VirtioModernCaps> {
     let mut caps = VirtioModernCaps::default();
     let r = syscall_raw3(
-        SYS_VIRTIO_MODERN_CAPS,
+        SyscallNumber::VirtioModernCaps as u64,
         index as u64,
         &mut caps as *mut VirtioModernCaps as u64,
         core::mem::size_of::<VirtioModernCaps>() as u64,
@@ -1058,41 +1042,32 @@ pub fn virtio_modern_caps(index: u32) -> Option<VirtioModernCaps> {
 // Shell / interactive syscalls
 // ============================================================================
 
-const SYS_CONSOLE_READ: u64 = 24;
-const SYS_SPAWN: u64 = 25;
-const SYS_WAIT_TASK: u64 = 26;
-const SYS_GET_TIME: u64 = 9;
 
 /// Read bytes from the serial console (non-blocking).
 /// Returns the number of bytes read (0 if no data available).
 pub fn console_read(buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_CONSOLE_READ, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+    syscall_raw3(SyscallNumber::ConsoleRead as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
 }
 
 /// Spawn a boot module by name. Returns the new task ID, or negative error.
 pub fn spawn(name: &[u8]) -> i64 {
-    syscall_raw3(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0)
+    syscall_raw3(SyscallNumber::Spawn as u64, name.as_ptr() as u64, name.len() as u64, 0)
 }
 
 /// Block until the specified child task exits. Returns the child's exit code.
 pub fn wait_task(task_id: u32) -> i64 {
-    syscall_raw3(SYS_WAIT_TASK, task_id as u64, 0, 0)
+    syscall_raw3(SyscallNumber::WaitTask as u64, task_id as u64, 0, 0)
 }
 
 /// Get system time in ticks.
 pub fn get_time() -> u64 {
-    syscall_raw3(SYS_GET_TIME, 0, 0, 0) as u64
+    syscall_raw3(SyscallNumber::GetTime as u64, 0, 0, 0) as u64
 }
 
 // ============================================================================
 // Phase 3.2d.iv: Shared-memory channel syscalls (ADR-005)
 // ============================================================================
 
-const SYS_CHANNEL_CREATE: u64 = 28;
-const SYS_CHANNEL_ATTACH: u64 = 29;
-const SYS_CHANNEL_CLOSE: u64 = 30;
-const SYS_CHANNEL_REVOKE: u64 = 31;
-const SYS_CHANNEL_INFO: u64 = 32;
 
 /// Create a shared-memory channel.
 ///
@@ -1111,7 +1086,7 @@ pub fn channel_create(
     out_vaddr: &mut u64,
 ) -> i64 {
     syscall_raw4(
-        SYS_CHANNEL_CREATE,
+        SyscallNumber::ChannelCreate as u64,
         size_pages as u64,
         peer_principal.as_ptr() as u64,
         role as u64,
@@ -1125,21 +1100,21 @@ pub fn channel_create(
 /// specified at create time. Returns the user-space virtual address of
 /// the shared region on success, or a negative error code.
 pub fn channel_attach(channel_id: u64) -> i64 {
-    syscall_raw3(SYS_CHANNEL_ATTACH, channel_id, 0, 0)
+    syscall_raw3(SyscallNumber::ChannelAttach as u64, channel_id, 0, 0)
 }
 
 /// Close a channel. Both sides' mappings are removed.
 ///
 /// Only the creator or peer may call this. Returns 0 on success.
 pub fn channel_close(channel_id: u64) -> i64 {
-    syscall_raw3(SYS_CHANNEL_CLOSE, channel_id, 0, 0)
+    syscall_raw3(SyscallNumber::ChannelClose as u64, channel_id, 0, 0)
 }
 
 /// Force-revoke a channel (bootstrap/policy authority required).
 ///
 /// Returns 0 on success.
 pub fn channel_revoke(channel_id: u64) -> i64 {
-    syscall_raw3(SYS_CHANNEL_REVOKE, channel_id, 0, 0)
+    syscall_raw3(SyscallNumber::ChannelRevoke as u64, channel_id, 0, 0)
 }
 
 /// Query channel metadata.
@@ -1147,7 +1122,7 @@ pub fn channel_revoke(channel_id: u64) -> i64 {
 /// Writes a 46-byte descriptor to `out_buf`. Returns 0 on success.
 pub fn channel_info(channel_id: u64, out_buf: &mut [u8]) -> i64 {
     syscall_raw3(
-        SYS_CHANNEL_INFO,
+        SyscallNumber::ChannelInfo as u64,
         channel_id,
         out_buf.as_mut_ptr() as u64,
         out_buf.len() as u64,
@@ -1158,8 +1133,6 @@ pub fn channel_info(channel_id: u64, out_buf: &mut [u8]) -> i64 {
 // Audit infrastructure (Phase 3.3, ADR-007)
 // ============================================================================
 
-const SYS_AUDIT_ATTACH: u64 = 33;
-const SYS_AUDIT_INFO: u64 = 34;
 
 /// Attach as the audit ring consumer.
 ///
@@ -1171,7 +1144,7 @@ const SYS_AUDIT_INFO: u64 = 34;
 /// the `audit-tail` boot module; future kernelvisor / AI-watcher
 /// consumers hold this cap.
 pub fn audit_attach() -> i64 {
-    syscall_raw3(SYS_AUDIT_ATTACH, 0, 0, 0)
+    syscall_raw3(SyscallNumber::AuditAttach as u64, 0, 0, 0)
 }
 
 /// Read audit ring statistics into `out_buf`.
@@ -1195,14 +1168,13 @@ pub fn audit_attach() -> i64 {
 /// ```
 pub fn audit_info(out_buf: &mut [u8]) -> i64 {
     syscall_raw3(
-        SYS_AUDIT_INFO,
+        SyscallNumber::AuditInfo as u64,
         out_buf.as_mut_ptr() as u64,
         out_buf.len() as u64,
         0,
     )
 }
 
-const SYS_AUDIT_EMIT_INPUT_FOCUS: u64 = 41;
 
 /// Emit a window-focus-change event into the kernel audit ring
 /// (T-7 Phase A, docs/threat-model.md).
@@ -1221,14 +1193,13 @@ pub fn audit_emit_input_focus(
     owner_principal: &[u8; 32],
 ) -> i64 {
     syscall_raw3(
-        SYS_AUDIT_EMIT_INPUT_FOCUS,
+        SyscallNumber::AuditEmitInputFocus as u64,
         new_window_id as u64,
         old_window_id as u64,
         owner_principal.as_ptr() as u64,
     )
 }
 
-const SYS_GET_PROCESS_PRINCIPAL: u64 = 42;
 
 /// Resolve a `ProcessId` (raw u64; encodes slot + generation per
 /// ADR-008) to its bound 32-byte Principal. Lets an audit consumer
@@ -1245,7 +1216,7 @@ const SYS_GET_PROCESS_PRINCIPAL: u64 = 42;
 /// target (no live binding and no recent-exits entry).
 pub fn get_process_principal(target_pid_raw: u64, out: &mut [u8; 32]) -> i64 {
     syscall_raw3(
-        SYS_GET_PROCESS_PRINCIPAL,
+        SyscallNumber::GetProcessPrincipal as u64,
         target_pid_raw,
         out.as_mut_ptr() as u64,
         32,
@@ -1256,8 +1227,6 @@ pub fn get_process_principal(target_pid_raw: u64, out: &mut [u8; 32]) -> i64 {
 // Hardware-IRQ wait + framebuffer mapping (Phase GUI-0, ADR-011)
 // ============================================================================
 
-const SYS_WAIT_IRQ: u64 = 5;
-const SYS_MAP_FRAMEBUFFER: u64 = 35;
 
 /// Block this task until the named IRQ fires.
 ///
@@ -1268,7 +1237,7 @@ const SYS_MAP_FRAMEBUFFER: u64 = 35;
 ///
 /// Today only one task may register per IRQ (first-come-first-served).
 pub fn wait_irq(irq: u32) -> i64 {
-    syscall_raw3(SYS_WAIT_IRQ, irq as u64, 0, 0)
+    syscall_raw3(SyscallNumber::WaitIrq as u64, irq as u64, 0, 0)
 }
 
 /// Layout of the descriptor returned by [`map_framebuffer`].
@@ -1312,7 +1281,7 @@ pub const FRAMEBUFFER_DESCRIPTOR_SIZE: usize = 32;
 pub fn map_framebuffer(index: u32, out: &mut FramebufferDescriptor) -> Result<(), i64> {
     let mut buf = [0u8; FRAMEBUFFER_DESCRIPTOR_SIZE];
     let rc = syscall_raw3(
-        SYS_MAP_FRAMEBUFFER,
+        SyscallNumber::MapFramebuffer as u64,
         index as u64,
         buf.as_mut_ptr() as u64,
         FRAMEBUFFER_DESCRIPTOR_SIZE as u64,
