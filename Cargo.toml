@@ -30,6 +30,7 @@ license = "AGPL-3.0-or-later"
 authors = ["CambiOS Development Team"]
 
 [dependencies]
+arcos-abi = { path = "arcos-abi" }
 bitflags = "2.3"
 limine = "0.5"
 blake3 = { version = "1.8", default-features = false, features = ["pure"] }

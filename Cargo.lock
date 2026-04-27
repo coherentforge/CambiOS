@@ -6,6 +6,7 @@ version = 4
 name = "arcos"
 version = "0.1.0"
 dependencies = [
+ "arcos-abi",
  "bitflags 2.11.0",
  "blake3",
  "ed25519-compact",
@@ -13,6 +14,10 @@ dependencies = [
  "uart_16550",
  "x86_64",
 ]
+
+[[package]]
+name = "arcos-abi"
+version = "0.1.0"
 
 [[package]]
 name = "arrayref"

@@ -998,7 +998,7 @@ verify:
 stats:
 	@echo "=== CambiOS stats (derived from source) ==="
 	@printf "Syscalls:        "
-	@sed -n '/^pub enum SyscallNumber/,/^}/p' src/syscalls/mod.rs | grep -Ec '^[[:space:]]+[A-Z][A-Za-z]+ = [0-9]+,'
+	@sed -n '/^pub enum SyscallNumber/,/^}/p' arcos-abi/src/lib.rs | grep -Ec '^[[:space:]]+[A-Z][A-Za-z]+ = [0-9]+,'
 	@printf "Kernel .rs:      "
 	@find src -name '*.rs' | wc -l | tr -d ' '
 	@printf "Userspace .rs:   "
