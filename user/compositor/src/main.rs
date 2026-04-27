@@ -222,16 +222,26 @@ fn pump_input_once(window_table: &WindowTable) -> bool {
         None => return true,
     };
 
-    // v0 input policy: only forward keyboard events. Pointer move/button,
-    // scroll, gamepad, axis, and touch are dropped here without ever
-    // crossing the IPC boundary into the focused window. terminal-window
-    // is keyboard-only, the games shipping today are keyboard-only, and
-    // mouse-jiggle PointerMove was generating ~50 events/sec of
-    // never-consumed traffic during run-gui sessions. A real
-    // per-window subscription protocol (clients announce which device
-    // classes they want) lands when the first pointer-using app does.
-    if event.device_class != DeviceClass::Keyboard {
-        return true;
+    // v0 input policy: forward Keyboard and Pointer events to the focused
+    // window. Controller / Tablet / Touch / Sensor / Accessibility /
+    // Generic dropped here for now — no consumer expects them and the
+    // first one to surface should ship alongside per-class subscription.
+    //
+    // Pointer was originally dropped at this gate (mouse-jiggle generates
+    // ~50 PointerMove/sec of traffic and the keyboard-only games shipping
+    // at the time would have eaten that for nothing). `tree` is mouse-
+    // driven and has been since shortly after, so the gate ran out of
+    // utility — pointer events now flow through. terminal-window's
+    // encoder (`encoder.rs`) already drops anything non-Keyboard at the
+    // first check, so the IPC traffic is bounded by "events the active
+    // window cares about" + a small constant for the editor. Real
+    // per-window subscription (clients announce which device classes they
+    // want) is still the right shape long-term; lands when a second
+    // pointer-using app surfaces and the spam matters more than the
+    // simplicity.
+    match event.device_class {
+        DeviceClass::Keyboard | DeviceClass::Pointer => {}
+        _ => return true,
     }
 
     // Find the focused window's reply endpoint. v0: first live window.
