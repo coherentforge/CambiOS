@@ -1713,6 +1713,35 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                     }
                 }
 
+                // Demo path: terminal-window also gets `SetWallclock`
+                // so an operator can manually set the wall clock from
+                // the GUI shell when NTP is unavailable — e.g., the
+                // default `make run` QEMU args attach virtio-net-pci
+                // without a paired `-netdev` backend, so udp-stack's
+                // NTP query goes into the void and the clock never
+                // populates. Same name-match pattern as udp-stack /
+                // MapFramebuffer / AuditConsumer above. Acceptable
+                // because terminal-window is identity-bound at boot
+                // and the audit ring still records every SetWallclock
+                // invocation. Revisit when: NTP works reliably in the
+                // demo build OR a dedicated time-management service
+                // takes over (no reason for the shell to hold this
+                // cap once a proper time service exists).
+                if short_name == b"terminal-window" {
+                    use cambios_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
+                    if let Some(cap_mgr) = cap_guard.as_mut() {
+                        let _ = cap_mgr.grant_system_capability(
+                            process_id,
+                            CapabilityKind::SetWallclock,
+                        );
+                        println!(
+                            "    ✓ Granted SetWallclock to terminal-window (process {})",
+                            process_id.slot(),
+                        );
+                    }
+                }
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.0, result.process_id.slot(), result.entry_point

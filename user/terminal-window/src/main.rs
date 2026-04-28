@@ -187,6 +187,7 @@ fn dispatch_command(terminal: &mut Terminal<GuiBackend>, line: &[u8]) {
         b"version" => cmd_version(terminal),
         b"pid" => cmd_pid(terminal),
         b"play" => cmd_play(terminal, rest),
+        b"clock" => cmd_clock(terminal, rest),
         b"exit" => {
             terminal.write(b"bye\r\n");
             terminal.backend_mut().render_if_dirty();
@@ -208,6 +209,7 @@ fn cmd_help(t: &mut Terminal<GuiBackend>) {
     t.write(b"  version     show CambiOS version\r\n");
     t.write(b"  pid         show this task's pid\r\n");
     t.write(b"  play <game> launch a game (`play` alone lists them)\r\n");
+    t.write(b"  clock <secs> set wall clock from a Unix timestamp\r\n");
     t.write(b"  exit        leave the terminal\r\n");
 }
 
@@ -309,6 +311,69 @@ fn cmd_play(t: &mut Terminal<GuiBackend>, args: &[u8]) {
     }
     t.backend_mut().invalidate_all();
     // REPL loop's render_if_dirty repaints; next read_line re-prompts.
+}
+
+// ============================================================================
+// `clock` — manual wall-clock setter (demo path; ADR-022 fallback)
+// ============================================================================
+//
+// Calls `sys::set_wallclock(unix_secs, 0)` (source_tag=0 = unauthenticated).
+// terminal-window holds the `SetWallclock` capability via a name-based
+// grant in `src/microkernel/main.rs`, the same shape udp-stack uses for
+// its NTP-driven setter. The demo path exists because the default `make
+// run` QEMU args attach virtio-net-pci without a paired `-netdev`
+// backend, so udp-stack's NTP query never round-trips and the
+// wall-clock stays at the unset sentinel — leaving the prompt's
+// `:HH:MM` segment dropped per `cambios_style::format::prompt`.
+//
+// Once NTP works reliably in the demo build (matched `-netdev user`
+// + audited round-trip success), this command is decorative — keep it
+// for offline demos; remove it when a dedicated time-management
+// service takes over.
+
+fn cmd_clock(t: &mut Terminal<GuiBackend>, args: &[u8]) {
+    let trimmed = trim_ascii(args);
+    if trimmed.is_empty() {
+        t.write(b"usage: clock <unix-secs>\r\n");
+        t.write(b"  set the system wall clock from a Unix timestamp.\r\n");
+        t.write(b"  example: `clock 1761570000` (2025-10-27 14:20:00 UTC).\r\n");
+        return;
+    }
+    let unix_secs = match parse_u64(trimmed) {
+        Some(n) if n != 0 => n,
+        _ => {
+            t.write(b"clock: argument must be a positive integer (Unix seconds)\r\n");
+            return;
+        }
+    };
+    let rc = sys::set_wallclock(unix_secs, 0);
+    if rc < 0 {
+        t.write(b"clock: kernel rejected (rc=");
+        let mut buf = [0u8; 16];
+        let n = format_i64(&mut buf, rc);
+        t.write(&buf[..n]);
+        t.write(b")\r\n");
+        return;
+    }
+    t.write(b"clock set; prompt updates next render.\r\n");
+}
+
+/// Parse an ASCII decimal Unix timestamp into a u64. Returns `None`
+/// for empty input, non-digit characters, or overflow. `0` decodes
+/// successfully here even though `cmd_clock` rejects it as the unset
+/// sentinel — the parser stays narrow, the policy lives in the caller.
+fn parse_u64(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &b in s {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(n)
 }
 
 // ============================================================================
