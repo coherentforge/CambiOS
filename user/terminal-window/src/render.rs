@@ -25,12 +25,9 @@
 //! we already had for the 2× scaled bitmap — so the grid stays at
 //! 64×24 and the rest of the world doesn't notice the swap.
 
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-
 use cambios_libgui::{font_aa::BUILTIN_FONT_JBM, Color, Rect, Surface};
 
 use crate::grid::{Cell, Grid, ATTR_BOLD, ATTR_DIM, COLS, FG_DEFAULT, VISIBLE_ROWS};
-use crate::splash::{blend_toward, draw_text_scaled, ACCENT, BG_0, FG_0, WATERMARK_ALPHA};
 
 /// Cell width = font cell width (advance is monospace in JBM, baked
 /// into a 16-px slot). Pinned to the const baked into the font data so
@@ -40,111 +37,34 @@ pub const CELL_W: u16 = BUILTIN_FONT_JBM.cell_w;
 /// Cell height = font cell height. 32 px in the current bake.
 pub const CELL_H: u16 = BUILTIN_FONT_JBM.cell_h;
 
-/// Background color (filled before each row's text is drawn).
-/// Matches `--bg-0` from `coherentforge.com/cambios/css/style.css` so
-/// the terminal's body shares the visual identity of the splash and
-/// the published site — a deliberate dark blue-black, not pure black.
+/// Background color — fully transparent ARGB so the watermark layer
+/// sitting behind this front layer shows through wherever cells have
+/// no glyph. The RGB component is incidental (alpha=0 makes it
+/// invisible to the alpha-blend path); `--bg-0` kept here as a
+/// documentation anchor matching the site's color story.
 const BG: Color = Color(0x00_0c_0e_11);
 
 /// Default foreground (the unstyled prompt color). Matches `--fg-0`
-/// from the site's stylesheet — slightly cool off-white. Resolved by
-/// `resolve_color` as the `FG_DEFAULT` base before dim/bold modifiers.
-const FG_PLAIN: Color = Color(0x00_e2_e4_e8);
+/// from the site's stylesheet — slightly cool off-white. Alpha 0xFF
+/// means fully opaque under the compositor's alpha-blend path so cell
+/// glyphs read solidly on top of the watermark below.
+const FG_PLAIN: Color = Color(0xFF_e2_e4_e8);
 
 /// Caret color — block-style; covers the cell at the cursor. Pure
-/// white reads against `BG` more cleanly than `FG_PLAIN` would,
-/// signaling "this cell is active" rather than "this cell has text."
-const CARET: Color = Color(0x00_FF_FF_FF);
+/// white at full opacity reads as "this cell is active."
+const CARET: Color = Color(0xFF_FF_FF_FF);
 
 // ─── Watermark layer ─────────────────────────────────────────────
 //
-// The splash module hands the render path a watermark — small,
-// dim-tinted "CambiOS" parked in the bottom-right corner — once its
-// recede animation completes. The watermark's role is to keep the
-// brand mark visible behind the live terminal grid as a permanent
-// background presence. Each dirty row that intersects the
-// watermark's y range re-stamps the watermark slice into its BG
-// band before drawing cell glyphs; cells without text leave the
-// watermark visible, cells with text composite on top.
+// Handled by the compositor's z-stack now. The splash module opens a
+// back layer (z=0, opaque) and stamps the wordmark + watermark there;
+// terminal-window opens a front layer (z=1, alpha-blend) and renders
+// the live grid here with transparent BG so the back layer's
+// watermark shows through wherever cells have no glyph.
 //
-// Conceptually a z-index — watermark below, cell glyphs above. See
-// the `splash` module's doc comment for why this implementation
-// sits at the per-row scale rather than as a true compositor layer.
-
-const WATERMARK_CAMBI: &[u8] = b"Cambi";
-const WATERMARK_OS: &[u8] = b"OS";
-
-static WATERMARK_ENABLED: AtomicBool = AtomicBool::new(false);
-static WATERMARK_X: AtomicI32 = AtomicI32::new(0);
-static WATERMARK_Y: AtomicI32 = AtomicI32::new(0);
-
-/// Hand watermark geometry to the render path. Called by the splash
-/// module when its recede animation reaches the watermark frame.
-/// Subsequent calls to [`render`] redraw the watermark slice on every
-/// dirty row that intersects the watermark's y range.
-pub fn enable_watermark(x: i32, y: i32) {
-    WATERMARK_X.store(x, Ordering::Relaxed);
-    WATERMARK_Y.store(y, Ordering::Relaxed);
-    // Release on the flag publishes the x/y stores to readers.
-    WATERMARK_ENABLED.store(true, Ordering::Release);
-}
-
-/// True if the splash has handed the watermark over and the row-fill
-/// path should preserve it. Acquired before reading the position
-/// atomics so the flag's release pairing publishes them coherently.
-fn watermark_active() -> bool {
-    WATERMARK_ENABLED.load(Ordering::Acquire)
-}
-
-/// Re-stamp the watermark text into the row's BG band if and only if
-/// the row's pixel y range overlaps the watermark. Must run AFTER
-/// `fill_rect(BG)` (which would otherwise erase the watermark) and
-/// BEFORE the per-cell glyph blits (so cell text composites on top).
-///
-/// Cell-glyph overwrites in the watermark zone (an opaque 'W' lands on
-/// part of the watermark) are corrected on the next dirty redraw of
-/// the same row — `draw_row` always re-stamps. Net effect: watermark
-/// stays intact through scrolls, command output, prompt redraws.
-fn stamp_watermark_band(surf: &mut Surface, row_y_start: i32, row_h: i32) {
-    if !watermark_active() {
-        return;
-    }
-    let wm_x = WATERMARK_X.load(Ordering::Relaxed);
-    let wm_y = WATERMARK_Y.load(Ordering::Relaxed);
-    let wm_h = BUILTIN_FONT_JBM.cell_h as i32;
-    let wm_y_end = wm_y + wm_h;
-    let row_y_end = row_y_start + row_h;
-    // Skip rows that don't overlap the watermark band.
-    if row_y_start >= wm_y_end || row_y_end <= wm_y {
-        return;
-    }
-    // The full watermark stamps regardless of partial-row overlap; the
-    // pixels outside the row's y range will be erased on whichever
-    // adjacent row's `fill_rect` runs next, then re-stamped when that
-    // row also calls into here. Net cost: ~3.5 KB of glyph pixels per
-    // dirty row in the watermark band, which is in the noise.
-    let cambi_dim = blend_toward(FG_0, BG_0, WATERMARK_ALPHA);
-    let accent_dim = blend_toward(ACCENT, BG_0, WATERMARK_ALPHA);
-    let cambi_w = (WATERMARK_CAMBI.len() as i32) * (BUILTIN_FONT_JBM.cell_w as i32);
-    draw_text_scaled(
-        surf,
-        wm_x,
-        wm_y,
-        WATERMARK_CAMBI,
-        1,
-        cambi_dim,
-        &BUILTIN_FONT_JBM,
-    );
-    draw_text_scaled(
-        surf,
-        wm_x + cambi_w,
-        wm_y,
-        WATERMARK_OS,
-        1,
-        accent_dim,
-        &BUILTIN_FONT_JBM,
-    );
-}
+// The earlier per-row "re-stamp watermark in draw_row's BG band"
+// implementation lived here in this module; it was the right shape
+// for a single-window surface and is now obsolete.
 
 // ─── ANSI 8-color palette ────────────────────────────────────────
 //
@@ -153,14 +73,14 @@ fn stamp_watermark_band(surf: &mut Surface, row_y_start: i32, row_h: i32) {
 // yellow / cyan + default + dim/bold on top, but the full table is
 // here so unhandled SGR codes still resolve cleanly.
 
-const PALETTE_BLACK:   Color = Color(0x00_00_00_00);
-const PALETTE_RED:     Color = Color(0x00_CC_00_00);
-const PALETTE_GREEN:   Color = Color(0x00_00_CC_00);
-const PALETTE_YELLOW:  Color = Color(0x00_CC_CC_00);
-const PALETTE_BLUE:    Color = Color(0x00_44_88_FF); // softened — pure blue is unreadable on black
-const PALETTE_MAGENTA: Color = Color(0x00_CC_00_CC);
-const PALETTE_CYAN:    Color = Color(0x00_00_CC_CC);
-const PALETTE_WHITE:   Color = Color(0x00_CC_CC_CC);
+const PALETTE_BLACK:   Color = Color(0xFF_00_00_00);
+const PALETTE_RED:     Color = Color(0xFF_CC_00_00);
+const PALETTE_GREEN:   Color = Color(0xFF_00_CC_00);
+const PALETTE_YELLOW:  Color = Color(0xFF_CC_CC_00);
+const PALETTE_BLUE:    Color = Color(0xFF_44_88_FF); // softened — pure blue is unreadable on black
+const PALETTE_MAGENTA: Color = Color(0xFF_CC_00_CC);
+const PALETTE_CYAN:    Color = Color(0xFF_00_CC_CC);
+const PALETTE_WHITE:   Color = Color(0xFF_CC_CC_CC);
 
 /// Resolve a `(fg_idx, attrs)` pair into the RGBA color the renderer
 /// will pass to `draw_text_aa`. `dim` halves brightness; `bold`
@@ -273,10 +193,11 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
 }
 
 /// Re-render row `row` as a single horizontal strip: fill BG over the
-/// full cell band, restamp the watermark slice (if the row intersects
-/// it), then blit each cell's glyph through the AA font using a color
-/// resolved from the cell's `(fg, attrs)` pair. Watermark sits below
-/// glyphs so cells without text leave the brand mark visible.
+/// full cell band, then blit each cell's glyph through the AA font
+/// using a color resolved from the cell's `(fg, attrs)` pair. BG is
+/// fully transparent under the alpha-blend compositor path, so any
+/// back layer (e.g. the splash watermark) shows through cells without
+/// glyphs.
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     let cell_y = (row as u16) * CELL_H;
 
@@ -289,10 +210,6 @@ fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
         },
         BG,
     );
-
-    // Watermark redraw — fill_rect just erased anything in this row's
-    // band, including any prior watermark pixels there. Re-stamp.
-    stamp_watermark_band(surf, cell_y as i32, CELL_H as i32);
 
     // The glyph cell already includes built-in vertical leading from
     // the bake step (ascent + descent + balanced top/bottom margin),

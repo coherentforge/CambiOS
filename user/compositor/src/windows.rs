@@ -68,6 +68,15 @@ pub struct Window {
     /// Sequence of the last FrameReady the client sent, for
     /// diagnostics / future damage-aggregation.
     pub last_client_seq: u32,
+    /// Z-order rank within the same-client back-to-front stack —
+    /// 0 = back, larger = front. v0 supports same-client layering
+    /// only (e.g., terminal-window's watermark + terminal pair); a
+    /// future window-manager service handles cross-client stacking.
+    pub z_order: u8,
+    /// True if the surface's high byte is alpha — compositor blends
+    /// this window over whatever sits below in the stack rather than
+    /// overwriting. False for the legacy XRGB-overwrite path.
+    pub alpha_blend: bool,
 }
 
 /// Fixed-size slab of live windows + a monotonic id counter.
@@ -116,6 +125,15 @@ impl WindowTable {
 
     pub fn iter(&self) -> impl Iterator<Item = &Window> {
         self.windows.iter().filter_map(Option::as_ref)
+    }
+
+    /// Pick the front-most live window — highest `z_order` wins, ties
+    /// broken by table order (first-live-in-table). Used for input
+    /// routing: the front window receives forwarded events; back
+    /// layers (e.g. terminal-window's watermark canvas) are render-
+    /// only and never receive input.
+    pub fn front(&self) -> Option<&Window> {
+        self.iter().max_by_key(|w| w.z_order)
     }
 }
 
@@ -178,29 +196,44 @@ fn handle_create_window(
     from_endpoint: u32,
     window_table: &mut WindowTable,
 ) {
-    let (width, height) = match decode_create_window(payload) {
-        Some(t) => t,
+    let req = match decode_create_window(payload) {
+        Some(r) => r,
         None => {
             send_error(from_endpoint, GuiError::InvalidMessage);
             return;
         }
     };
+    let width = req.width;
+    let height = req.height;
+    // Reply routing: prefer the explicit `reply_endpoint` from the
+    // payload (multi-layer clients need this — the kernel-stamped
+    // `from_endpoint` is sticky to the FIRST register_endpoint call
+    // and won't match the layer's actual endpoint). Legacy clients
+    // pass 0 to mean "use the kernel-stamped sender" — same shape as
+    // pre-z-index single-window CreateWindow.
+    let reply_to = if req.reply_endpoint != 0 {
+        req.reply_endpoint
+    } else {
+        from_endpoint
+    };
 
     if width == 0 || height == 0 || width > MAX_WINDOW_DIMENSION || height > MAX_WINDOW_DIMENSION {
-        send_error(from_endpoint, GuiError::InvalidDimensions);
+        send_error(reply_to, GuiError::InvalidDimensions);
         return;
     }
 
     let slot_idx = match window_table.find_slot() {
         Some(i) => i,
         None => {
-            send_error(from_endpoint, GuiError::TooManyWindows);
+            send_error(reply_to, GuiError::TooManyWindows);
             return;
         }
     };
 
-    // Allocate the surface channel. pitch = width × 4 (XRGB8888, no
-    // scanline padding). size_pages rounds up to a page boundary.
+    // Allocate the surface channel. pitch = width × 4 (XRGB8888 or
+    // ARGB8888 — same byte layout, only the high-byte interpretation
+    // changes per the window's `alpha_blend` flag). size_pages rounds
+    // up to a page boundary.
     let pitch = width * SURFACE_BYTES_PER_PIXEL;
     let bytes = (pitch as u64) * (height as u64);
     let size_pages = ((bytes + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as u32;
@@ -208,7 +241,7 @@ fn handle_create_window(
     let mut surface_vaddr: u64 = 0;
     let rc = sys::channel_create(size_pages, sender_principal, CHANNEL_ROLE_CONSUMER, &mut surface_vaddr);
     if rc < 0 {
-        send_error(from_endpoint, GuiError::SurfaceAllocFailed);
+        send_error(reply_to, GuiError::SurfaceAllocFailed);
         return;
     }
     let channel_id = rc as u64;
@@ -217,13 +250,18 @@ fn handle_create_window(
     window_table.windows[slot_idx] = Some(Window {
         window_id,
         owner_principal: *sender_principal,
-        client_endpoint: from_endpoint,
+        // Store the explicit reply endpoint so input forwarding +
+        // future protocol replies route to the layer's own queue,
+        // not to whatever the kernel happened to stamp first.
+        client_endpoint: reply_to,
         width,
         height,
         pitch,
         surface_channel_id: channel_id,
         surface_vaddr,
         last_client_seq: 0,
+        z_order: req.z_order,
+        alpha_blend: req.alpha_blend,
     });
 
     sys::print(b"[COMPOSITOR] window created\r\n");
@@ -243,7 +281,7 @@ fn handle_create_window(
         Some(n) => n,
         None => return, // Buffer too small — impossible for a 32-byte message
     };
-    let _ = sys::write(from_endpoint, &reply[..n]);
+    let _ = sys::write(reply_to, &reply[..n]);
 }
 
 fn handle_frame_ready(

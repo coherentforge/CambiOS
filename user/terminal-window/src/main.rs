@@ -44,9 +44,16 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // Configuration
 // ============================================================================
 
-/// terminal-window's reply endpoint. Picked from the empty 0..15 range
-/// so it never collides with any boot-module service or game.
-const TERMINAL_WINDOW_ENDPOINT: u32 = 14;
+/// Reply endpoint for the back layer (splash + steady-state watermark).
+/// Holds the WelcomeClient handshake reply and stays registered for
+/// the life of the process; never polled afterward (the back layer
+/// is render-only and the compositor routes input to the front).
+const BACK_LAYER_ENDPOINT: u32 = 14;
+
+/// Reply endpoint for the front layer (live terminal grid). Receives
+/// input events forwarded by the compositor — the front layer wins
+/// the focus tie since it's the highest-z window in this client.
+const FRONT_LAYER_ENDPOINT: u32 = 15;
 
 /// Window dimensions. 1024×768 lines up exactly with the 128×96 cell
 /// grid (`grid::COLS` × `grid::VISIBLE_ROWS`) at 8×8 glyphs — no wasted
@@ -94,22 +101,40 @@ pub extern "C" fn _start() -> ! {
         ALLOCATOR.lock().init(ptr, HEAP_SIZE);
     }
 
-    let mut backend = match GuiBackend::open(WINDOW_WIDTH, WINDOW_HEIGHT, TERMINAL_WINDOW_ENDPOINT)
-    {
+    // Open the back layer first and run the splash on it. After the
+    // splash returns, the back surface holds the steady-state
+    // watermark; we keep `_back_client` in scope for the rest of the
+    // process so the compositor's window table keeps the layer alive.
+    let _back_client =
+        match cambios_terminal_window::splash::run(WINDOW_WIDTH, WINDOW_HEIGHT, BACK_LAYER_ENDPOINT)
+        {
+            Ok(c) => c,
+            Err(_) => {
+                sys::print(b"[terminal-window] failed to open back layer for splash\n");
+                sys::exit(1);
+            }
+        };
+
+    // Open the front layer (z=1, alpha-blend). The terminal grid
+    // renders here; cells with no glyph leave alpha=0 so the back
+    // layer's watermark shows through; cells with glyphs are opaque
+    // and the compositor alpha-blends them on top.
+    let backend = match GuiBackend::open_layer(
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+        FRONT_LAYER_ENDPOINT,
+        1,
+        true,
+    ) {
         Ok(b) => b,
         Err(_) => {
-            sys::print(b"[terminal-window] failed to open compositor window\n");
+            sys::print(b"[terminal-window] failed to open front layer\n");
             sys::exit(1);
         }
     };
 
-    sys::print(b"[terminal-window] window open\n");
+    sys::print(b"[terminal-window] both layers open\n");
     sys::module_ready();
-
-    // Boot splash — centered "CambiOS" title, ~1.6 s total. Bypasses
-    // the Grid layer to render at 4× scale; clears to black before
-    // returning so the terminal banner takes over a clean surface.
-    cambios_terminal_window::splash::show(&mut backend);
 
     let mut terminal = Terminal::new(backend);
     let mut editor = LineEditor::new(64);

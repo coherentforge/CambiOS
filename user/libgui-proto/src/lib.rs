@@ -234,28 +234,95 @@ impl MsgTag {
 // unknown discriminant, wrong tag).
 // ----------------------------------------------------------------------------
 
+/// Decoded form of `CreateWindow`.
+///
+/// `z_order` ranks the window in the compositor's back-to-front
+/// stack within a single client (0 = back, larger = front). v0
+/// supports same-client layering only (e.g., a back layer
+/// holding a watermark behind a front layer holding the live
+/// terminal); cross-client z-order is the responsibility of a
+/// future window-manager service. `alpha_blend` selects the
+/// composite mode for this window — when `true`, the compositor
+/// honors the high byte of each surface pixel as alpha and blends
+/// the surface over whatever is below; when `false` (default),
+/// pixels are treated as XRGB and overwrite (today's behavior for
+/// every existing client).
+///
+/// `reply_endpoint` is the endpoint the compositor sends the
+/// matching WelcomeClient back to. v0 single-window clients pass 0
+/// to mean "use the kernel-stamped sender endpoint" (matches the
+/// pre-z-index behavior — the kernel's `REPLY_ENDPOINT` is set on
+/// first-register and stays sticky). Multi-layer clients
+/// (terminal-window's back+front) pass the layer's specific
+/// endpoint here so each handshake routes back to the matching
+/// `recv_verified` call regardless of which endpoint registered
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateWindowMsg {
+    pub width: u32,
+    pub height: u32,
+    pub z_order: u8,
+    pub alpha_blend: bool,
+    pub reply_endpoint: u32,
+}
+
 /// `CreateWindow` — client → compositor.
-/// Layout: `[tag:4][width:4][height:4]` = 12 bytes.
-pub fn encode_create_window(buf: &mut [u8], width: u32, height: u32) -> Option<usize> {
-    if buf.len() < 12 {
+/// Layout: `[tag:4][width:4][height:4][z_order:1][alpha_blend:1][pad:2]
+///          [reply_endpoint:4]` = 20 bytes.
+///
+/// Backwards-compat note: older 12-byte CreateWindow messages
+/// (pre-z-index) decode cleanly with `z_order = 0`,
+/// `alpha_blend = false`, and `reply_endpoint = 0` (which the
+/// compositor reads as "use the kernel-stamped sender endpoint"),
+/// matching their original semantics.
+pub fn encode_create_window(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    z_order: u8,
+    alpha_blend: bool,
+    reply_endpoint: u32,
+) -> Option<usize> {
+    if buf.len() < 20 {
         return None;
     }
     buf[..4].copy_from_slice(&MsgTag::CreateWindow.as_u32().to_le_bytes());
     buf[4..8].copy_from_slice(&width.to_le_bytes());
     buf[8..12].copy_from_slice(&height.to_le_bytes());
-    Some(12)
+    buf[12] = z_order;
+    buf[13] = if alpha_blend { 1 } else { 0 };
+    buf[14] = 0;
+    buf[15] = 0;
+    buf[16..20].copy_from_slice(&reply_endpoint.to_le_bytes());
+    Some(20)
 }
 
-pub fn decode_create_window(buf: &[u8]) -> Option<(u32, u32)> {
+pub fn decode_create_window(buf: &[u8]) -> Option<CreateWindowMsg> {
     if buf.len() < 12
         || u32::from_le_bytes(buf[0..4].try_into().ok()?) != MsgTag::CreateWindow.as_u32()
     {
         return None;
     }
-    Some((
-        u32::from_le_bytes(buf[4..8].try_into().ok()?),
-        u32::from_le_bytes(buf[8..12].try_into().ok()?),
-    ))
+    let width = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    // Bytes 12+ are absent in v0 (12-byte) messages, present in v1
+    // (16-byte: +z/alpha) and v2 (20-byte: +reply_endpoint). Defaults
+    // mean "match v0 semantics" so the compositor can talk to a
+    // legacy client without protocol changes.
+    let z_order = if buf.len() >= 13 { buf[12] } else { 0 };
+    let alpha_blend = if buf.len() >= 14 { buf[13] != 0 } else { false };
+    let reply_endpoint = if buf.len() >= 20 {
+        u32::from_le_bytes(buf[16..20].try_into().ok()?)
+    } else {
+        0
+    };
+    Some(CreateWindowMsg {
+        width,
+        height,
+        z_order,
+        alpha_blend,
+        reply_endpoint,
+    })
 }
 
 /// Decoded form of [`encode_welcome_client`]. Separate struct rather

@@ -46,7 +46,7 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use cambios_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT};
+use cambios_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT, MAX_WINDOWS};
 use cambios_libinput_proto::{decode_event, DeviceClass};
 use cambios_libsys as sys;
 use cambios_libscanout::{
@@ -59,7 +59,7 @@ mod windows;
 use scanout::{
     Backend, HeadlessBackend, LimineFbBackend, ScanoutBackend, ScanoutBuffer, ScanoutEvent,
 };
-use windows::{handle_client_payload, WindowTable, WindowView};
+use windows::{handle_client_payload, Window, WindowTable, WindowView};
 
 /// Maximum IPC receive buffer size for the main dispatch loop.
 /// Sized to hold the largest libgui-proto message (FrameReady with
@@ -153,8 +153,14 @@ pub extern "C" fn _start() -> ! {
     let mut last_focus: Option<(u32, [u8; 32])> = None;
     loop {
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
-        if let DispatchOutcome::ClientFrame(view) = outcome {
-            composite_and_present(&mut backend, &view);
+        if matches!(outcome, DispatchOutcome::ClientFrame(_)) {
+            // Z-stack composition: any window's FrameReady triggers a
+            // full back-to-front recomposition because a higher-layer
+            // alpha-blended pixel may now show different content from
+            // a lower layer through transparent regions. The trigger
+            // window inside the variant is informational; the
+            // composite_and_present call walks the table.
+            composite_and_present(&mut backend, &window_table);
         }
 
         let has_windows = window_table.iter().next().is_some();
@@ -164,14 +170,14 @@ pub extern "C" fn _start() -> ! {
         had_windows = has_windows;
 
         // T-7 Phase A: detect focus transitions and report them to the
-        // audit ring. The current focus is `window_table.iter().next()`
-        // (matches pump_input_once's routing decision). On transition,
-        // emit an InputFocusChange event with the old and new
-        // (window_id, owner_principal) pair. Initial focus is encoded
-        // as old_id=0; focus loss as new_id=0 + zero principal.
+        // audit ring. Focus tracks the front-most live window
+        // (highest `z_order`) — same rule pump_input_once uses for
+        // event routing. On transition, emit an InputFocusChange event
+        // with the old and new (window_id, owner_principal) pair.
+        // Initial focus is encoded as old_id=0; focus loss as
+        // new_id=0 + zero principal.
         let current_focus = window_table
-            .iter()
-            .next()
+            .front()
             .map(|w| (w.window_id, w.owner_principal));
         if current_focus != last_focus {
             let (old_id, _old_principal) = match last_focus {
@@ -203,9 +209,12 @@ pub extern "C" fn _start() -> ! {
 /// forward it to the focused window. Returns `true` if an event was
 /// dispatched, `false` if the endpoint was empty.
 ///
-/// v0 focus model: the focused window is the first live entry in the
-/// window table. Multi-window focus arbitration (last-clicked, Z-order,
-/// explicit focus API) lands with the first multi-window app.
+/// Focus model: events go to the **front-most** live window — the
+/// one with the highest `z_order` (ties broken by table order). Back
+/// layers (e.g. terminal-window's watermark canvas) never receive
+/// input. Single-window apps land at z=0 and are still "the front"
+/// trivially. Cross-client focus arbitration (last-clicked,
+/// explicit focus API) lands with the first multi-window WM service.
 fn pump_input_once(window_table: &WindowTable) -> bool {
     let mut buf = [0u8; RECV_HEADER_BYTES + INPUT_EVENT_SIZE];
     let n = sys::try_recv_msg(COMPOSITOR_INPUT_ENDPOINT, &mut buf);
@@ -244,8 +253,9 @@ fn pump_input_once(window_table: &WindowTable) -> bool {
         _ => return true,
     }
 
-    // Find the focused window's reply endpoint. v0: first live window.
-    let target = match window_table.iter().next() {
+    // Find the focused window's reply endpoint — the front-most
+    // (highest z_order) live window.
+    let target = match window_table.front() {
         Some(w) => w.client_endpoint,
         None => return true, // no window to route to; drop event
     };
@@ -336,12 +346,52 @@ fn pump_dispatch_once<B: ScanoutBackend>(
 ///
 /// Only meaningful against a `Backend::Limine` backend today; headless
 /// has no scanout buffer to blit to.
-fn composite_and_present(backend: &mut Backend, view: &WindowView) {
+fn composite_and_present(backend: &mut Backend, window_table: &WindowTable) {
     let scanout = match backend {
         Backend::Limine(b) => b.scanout,
         Backend::Headless(_) => return,
     };
-    blit_surface_to_scanout(view, &scanout);
+
+    // Snapshot every live window into a fixed-size array, then sort by
+    // z_order ascending so we composite back-to-front. Insertion sort
+    // is fine — MAX_WINDOWS is bounded and small (32 today), and the
+    // common case is 1–2 windows.
+    let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+    let mut count = 0usize;
+    for w in window_table.iter() {
+        if count < MAX_WINDOWS {
+            sorted[count] = Some(w);
+            count += 1;
+        }
+    }
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 {
+            let lo = sorted[j - 1].unwrap().z_order;
+            let hi = sorted[j].unwrap().z_order;
+            if hi < lo {
+                sorted.swap(j, j - 1);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Composite. The back-most window always overwrites (its pixels
+    // become the scanout's base regardless of `alpha_blend`); higher
+    // layers either overwrite (`alpha_blend=false`) or alpha-blend
+    // (`alpha_blend=true`) on top of whatever's there.
+    for (idx, slot) in sorted[..count].iter().enumerate() {
+        let w = slot.expect("count tracks Some entries");
+        let view = WindowView::from(w);
+        if idx == 0 || !w.alpha_blend {
+            blit_surface_to_scanout(&view, &scanout);
+        } else {
+            blend_surface_onto_scanout(&view, &scanout);
+        }
+    }
+
     if backend.submit_frame(scanout.display_id, &[]).is_err() {
         sys::print(b"[COMPOSITOR] submit_frame (client) failed\r\n");
         return;
@@ -390,10 +440,76 @@ fn composite_blank_and_present(backend: &mut Backend) {
     sys::print(b"[COMPOSITOR] blanked scanout (last window gone)\r\n");
 }
 
+/// Alpha-blend a window surface (ARGB8888) over the scanout buffer at
+/// origin (0, 0). Used for layered windows that opted into
+/// `alpha_blend=true` at create time. Each surface pixel's high byte
+/// is interpreted as alpha; alpha=0 leaves the scanout pixel
+/// untouched, alpha=255 fully replaces, intermediate values blend.
+///
+/// The blend uses a /256 right-shift instead of /255 to avoid the
+/// per-pixel divide; the precision loss (≤ 1 unit per channel) is
+/// invisible. Alpha=0 is a fast-skip — common for layered windows
+/// that are mostly transparent (e.g. terminal-window's front layer
+/// where most cells are blank space → fully-transparent BG).
+#[allow(unsafe_code)]
+fn blend_surface_onto_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
+    let sw = view.width as usize;
+    let sh = view.height as usize;
+    let src_pitch_pixels = (view.pitch / 4) as usize;
+
+    let dst_w = scanout.geometry.width as usize;
+    let dst_h = scanout.geometry.height as usize;
+    let dst_pitch_pixels = (scanout.geometry.pitch / 4) as usize;
+
+    let copy_w = sw.min(dst_w);
+    let copy_h = sh.min(dst_h);
+
+    // SAFETY: same as `blit_surface_to_scanout` — both mappings are
+    // owned by this process, the loop bounds are clamped to the
+    // smaller of the two dimensions, and write_volatile prevents
+    // re-ordering of shared-memory accesses. The arithmetic on each
+    // pixel is u32-internal: u8 channels widened to u32, multiplied,
+    // shifted; can't overflow.
+    unsafe {
+        let src_base = view.surface_vaddr as *const u32;
+        let dst_base = scanout.vaddr as *mut u32;
+        for y in 0..copy_h {
+            let src_row = src_base.add(y * src_pitch_pixels);
+            let dst_row = dst_base.add(y * dst_pitch_pixels);
+            for x in 0..copy_w {
+                let src = core::ptr::read_volatile(src_row.add(x));
+                let alpha = (src >> 24) & 0xFF;
+                if alpha == 0 {
+                    continue;
+                }
+                if alpha == 0xFF {
+                    core::ptr::write_volatile(dst_row.add(x), src & 0x00_FF_FF_FF);
+                    continue;
+                }
+                let dst = core::ptr::read_volatile(dst_row.add(x));
+                let inv = 255 - alpha;
+                let sr = (src >> 16) & 0xFF;
+                let sg = (src >> 8) & 0xFF;
+                let sb = src & 0xFF;
+                let dr = (dst >> 16) & 0xFF;
+                let dg = (dst >> 8) & 0xFF;
+                let db = dst & 0xFF;
+                let or = (sr * alpha + dr * inv) >> 8;
+                let og = (sg * alpha + dg * inv) >> 8;
+                let ob = (sb * alpha + db * inv) >> 8;
+                let out = (or << 16) | (og << 8) | ob;
+                core::ptr::write_volatile(dst_row.add(x), out);
+            }
+        }
+    }
+}
+
 /// Copy a window surface (XRGB8888, pitch bytes per row) into the
 /// scanout buffer at origin (0, 0). Both mappings are owned by this
 /// process via channel_attach, so direct pointer writes are safe; the
-/// kernel enforced RW on the channel mapping at attach time.
+/// kernel enforced RW on the channel mapping at attach time. Used
+/// for the back-most window (always) and for opaque higher layers
+/// (`alpha_blend=false`).
 fn blit_surface_to_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
     let sw = view.width as usize;
     let sh = view.height as usize;

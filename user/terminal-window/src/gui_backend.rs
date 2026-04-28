@@ -50,11 +50,26 @@ pub struct GuiBackend {
 
 impl GuiBackend {
     /// Open a new compositor window and wire it to a fresh `Grid`.
-    /// `width` / `height` are pixel dimensions; `my_endpoint` is the
-    /// caller process's reply endpoint (compositor will route input
-    /// events here).
+    /// Convenience wrapper for the single-window case — opens at z=0
+    /// with opaque XRGB compositing.
     pub fn open(width: u32, height: u32, my_endpoint: u32) -> Result<Self, ClientError> {
-        let client = Client::open(width, height, my_endpoint)?;
+        Self::open_layer(width, height, my_endpoint, 0, false)
+    }
+
+    /// Open a layered compositor window and wire it to a fresh `Grid`.
+    /// `z_order` ranks this window in the compositor's back-to-front
+    /// stack within the same client; `alpha_blend = true` asks the
+    /// compositor to honor the surface's high-byte alpha channel.
+    /// Used by terminal-window's front layer (z=1, alpha-blend) so
+    /// the back-layer watermark shows through transparent cells.
+    pub fn open_layer(
+        width: u32,
+        height: u32,
+        my_endpoint: u32,
+        z_order: u8,
+        alpha_blend: bool,
+    ) -> Result<Self, ClientError> {
+        let client = Client::open_layer(width, height, my_endpoint, z_order, alpha_blend)?;
         Ok(Self {
             client,
             grid: Grid::new(),
@@ -103,9 +118,13 @@ impl GuiBackend {
         let width = self.client.width();
         let height = self.client.height();
         let endpoint = self.client.endpoint();
+        let z_order = self.client.z_order();
+        let alpha_blend = self.client.alpha_blend();
         // The endpoint is already registered with the kernel — reopen
-        // skips re-register.
-        let new_client = Client::reopen(width, height, endpoint)?;
+        // skips re-register. Layer params (z_order, alpha_blend) carry
+        // over so reopening a layered front window doesn't silently
+        // demote it to z=0/opaque.
+        let new_client = Client::reopen_layer(width, height, endpoint, z_order, alpha_blend)?;
         self.client = new_client;
         self.grid.mark_all_dirty();
         Ok(())
