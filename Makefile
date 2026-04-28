@@ -710,7 +710,8 @@ run: iso disk-img
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
-		-device virtio-net-pci \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0 \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 		-device virtio-blk-pci,drive=cambios-disk0 \
 		-vga virtio \
@@ -731,7 +732,8 @@ run-quiet: iso disk-img
 			-serial mon:stdio \
 			-smp 2 \
 			-m 4G \
-			-device virtio-net-pci \
+			-netdev user,id=net0 \
+			-device virtio-net-pci,netdev=net0 \
 			-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 			-device virtio-blk-pci,drive=cambios-disk0 \
 			-vga virtio \
@@ -748,7 +750,8 @@ run-gui: iso disk-img
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
-		-device virtio-net-pci \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0 \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 		-device virtio-blk-pci,drive=cambios-disk0 \
 		-device virtio-keyboard-pci \
@@ -837,7 +840,8 @@ run-img-x86: img-x86
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
-		-device virtio-net-pci \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0 \
 		-no-reboot
 
 # ============================================================================
@@ -900,7 +904,8 @@ run-img-usb: img-usb
 		-serial mon:stdio \
 		-smp 2 \
 		-m 4G \
-		-device virtio-net-pci \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0 \
 		-no-reboot
 
 # Write the GPT image to a USB stick (with safety prompt).
