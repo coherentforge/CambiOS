@@ -44,11 +44,26 @@ pub struct Surface<'a> {
     pitch_pixels: usize,
     width: u32,
     height: u32,
+    /// True if pixels in this surface should be interpreted as ARGB
+    /// (high byte = alpha) by the compositor. False (default) for
+    /// XRGB surfaces — every pre-z-index libgui consumer.
+    ///
+    /// Affects `blend_pixel` only: XRGB surfaces lerp the source onto
+    /// the destination's RGB and write XRGB (the surface IS the final
+    /// composited image because the compositor blits opaque). ARGB
+    /// surfaces write the source color with the glyph mask alpha as
+    /// the high byte and leave the lerp to the compositor (which
+    /// blends with whatever lower-z layer sits below). `set_pixel`
+    /// preserves whatever high byte the caller passes — same for both
+    /// modes.
+    alpha_blend: bool,
     _marker: PhantomData<&'a mut [u32]>,
 }
 
 impl<'a> Surface<'a> {
-    /// Build a Surface from a raw pixel pointer + geometry.
+    /// Build a Surface from a raw pixel pointer + geometry. Uses the
+    /// classic XRGB interpretation; the resulting Surface's
+    /// `blend_pixel` lerps inside the surface as before.
     ///
     /// # Safety
     /// - `base` must point to at least `pitch_pixels * height` u32s
@@ -70,6 +85,31 @@ impl<'a> Surface<'a> {
             pitch_pixels,
             width,
             height,
+            alpha_blend: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Build an ARGB-aware Surface from a raw pixel pointer + geometry.
+    /// `blend_pixel` writes the source color with the glyph mask alpha
+    /// as the high byte instead of pre-blending inside the surface,
+    /// letting the compositor's alpha-over path mix with the layer
+    /// below.
+    ///
+    /// # Safety
+    /// Same as [`Surface::from_raw`].
+    pub unsafe fn from_raw_argb(
+        base: *mut u32,
+        pitch_pixels: usize,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            base,
+            pitch_pixels,
+            width,
+            height,
+            alpha_blend: true,
             _marker: PhantomData,
         }
     }
@@ -127,15 +167,27 @@ impl<'a> Surface<'a> {
     }
 
     /// Blend `color` onto the pixel at `(x, y)` with `alpha` (0 = no
-    /// change, 255 = fully replace). Reads the existing pixel,
-    /// linear-interpolates each XRGB8888 channel, writes the result.
-    /// Out-of-bounds silently dropped.
+    /// change, 255 = fully replace). Out-of-bounds silently dropped.
+    ///
+    /// XRGB mode: reads the existing pixel, linear-interpolates each
+    /// XRGB8888 channel, writes the result back as XRGB. The surface
+    /// IS the final composited image because the compositor blits
+    /// opaque — what's in the surface is what shows.
+    ///
+    /// ARGB mode (set via [`Surface::from_raw_argb`]): writes the
+    /// source color with `alpha` as the high byte and the source RGB
+    /// in the low three bytes. No destination read; the compositor's
+    /// alpha-over path lerps with whatever lower-z layer sits below.
+    /// This is the right semantic for layered windows where "what
+    /// shows here" depends on what's beneath, not on what was last
+    /// written into this surface.
     ///
     /// Used by the antialiased font path
-    /// ([`crate::font_aa::AntialiasedFont`]). Slower than `set_pixel`
-    /// because it requires a destination read; callers should fast-path
-    /// alpha == 0 (skip) and alpha == 255 (use `set_pixel`) before
-    /// invoking this.
+    /// ([`crate::font_aa::AntialiasedFont`]). Callers should fast-path
+    /// `alpha == 0` (skip) and `alpha == 255` (use `set_pixel`) before
+    /// invoking this in the XRGB path; in the ARGB path
+    /// `alpha == 0xFF` is also handled here as the natural source-only
+    /// case.
     #[inline]
     pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
         if x < 0 || y < 0 {
@@ -146,23 +198,29 @@ impl<'a> Surface<'a> {
         if ux >= self.width || uy >= self.height {
             return;
         }
-        // SAFETY: bounds checked above; `pitch_pixels >= width` is the
-        // module-level invariant. Volatile read+write to keep the
-        // compositor's view of shared memory coherent.
         unsafe {
             let off = (uy as usize) * self.pitch_pixels + (ux as usize);
             let p = self.base.add(off);
-            let bg = p.read_volatile();
-            let a = alpha as u32;
-            let inv = 255 - a;
             let fg = color.as_u32();
-            // Per-channel lerp, XRGB8888 layout. The X channel stays 0
-            // (Color::as_u32 keeps the high byte clear).
-            let br = (((fg >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * inv) / 255;
-            let bg_g = (((fg >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * inv) / 255;
-            let bb = ((fg & 0xFF) * a + (bg & 0xFF) * inv) / 255;
-            let blended = (br << 16) | (bg_g << 8) | bb;
-            p.write_volatile(blended);
+
+            if self.alpha_blend {
+                // ARGB layered surface: write source RGB with the glyph
+                // mask alpha. Compositor handles the lerp.
+                let argb = ((alpha as u32) << 24) | (fg & 0x00_FF_FF_FF);
+                p.write_volatile(argb);
+            } else {
+                // XRGB classic surface: lerp source onto destination,
+                // write XRGB. The X channel stays 0 — every existing
+                // libgui consumer relies on this.
+                let bg = p.read_volatile();
+                let a = alpha as u32;
+                let inv = 255 - a;
+                let br = (((fg >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * inv) / 255;
+                let bg_g = (((fg >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * inv) / 255;
+                let bb = ((fg & 0xFF) * a + (bg & 0xFF) * inv) / 255;
+                let blended = (br << 16) | (bg_g << 8) | bb;
+                p.write_volatile(blended);
+            }
         }
     }
 

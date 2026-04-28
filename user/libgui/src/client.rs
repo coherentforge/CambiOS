@@ -306,20 +306,26 @@ impl Client {
         // - `surface_vaddr` is the caller's own mapping of the
         //   surface channel, returned by `channel_attach`, and is
         //   valid for the lifetime of `self`.
-        // - `pitch / 4` gives pitch in u32 pixels; XRGB8888 is 4
-        //   bytes per pixel.
+        // - `pitch / 4` gives pitch in u32 pixels; XRGB8888 / ARGB8888
+        //   are 4 bytes per pixel.
         // - `&mut self` ensures no other Rust reference to the
         //   Surface exists for the borrow.
         // - The compositor reads the same memory from another
         //   process; `Surface::set_pixel` uses `write_volatile` to
         //   keep stores observable.
+        // ARGB mode is selected when this client opened with
+        // `alpha_blend=true` so `blend_pixel` writes ARGB instead of
+        // pre-blending inside the surface — required for layered
+        // windows where the eventual composition happens in the
+        // compositor.
+        let pitch_pixels = (self.pitch / 4) as usize;
+        let base = self.surface_vaddr as *mut u32;
         unsafe {
-            Surface::from_raw(
-                self.surface_vaddr as *mut u32,
-                (self.pitch / 4) as usize,
-                self.width,
-                self.height,
-            )
+            if self.alpha_blend {
+                Surface::from_raw_argb(base, pitch_pixels, self.width, self.height)
+            } else {
+                Surface::from_raw(base, pitch_pixels, self.width, self.height)
+            }
         }
     }
 

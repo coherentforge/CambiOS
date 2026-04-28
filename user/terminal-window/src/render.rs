@@ -112,17 +112,23 @@ fn resolve_color(fg: u8, attrs: u8) -> Color {
     }
 }
 
-/// Scale every channel of a Color by `num/den` (saturating). Pure
-/// integer math; no floating point.
+/// Scale every RGB channel of a Color by `num/den` (saturating). Pure
+/// integer math; no floating point. The high byte (alpha under the
+/// alpha-blend compositor path) passes through unchanged so a dim-
+/// styled glyph at full opacity stays opaque — only its color
+/// brightness drops. Without this, dim cells rendered alpha=0
+/// (fully transparent) and the prompt was invisible against the
+/// watermark layer.
 fn scale_brightness(c: Color, num: u32, den: u32) -> Color {
     let raw = c.0;
+    let a = raw & 0xFF00_0000;
     let r = ((raw >> 16) & 0xFF) as u32;
     let g = ((raw >> 8) & 0xFF) as u32;
     let b = (raw & 0xFF) as u32;
     let r2 = (r * num / den).min(0xFF);
     let g2 = (g * num / den).min(0xFF);
     let b2 = (b * num / den).min(0xFF);
-    Color((r2 << 16) | (g2 << 8) | b2)
+    Color(a | (r2 << 16) | (g2 << 8) | b2)
 }
 
 /// Identity helper that lets the bold path read more naturally
