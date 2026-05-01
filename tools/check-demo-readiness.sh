@@ -127,7 +127,7 @@ else
     fail "xorriso missing — brew install xorriso (x86_64 ISO build will fail)"
 fi
 
-# cc: needed to compile Limine's host helper (Makefile builds /tmp/limine/limine from C source)
+# cc: needed to compile Limine's host helper (Makefile builds $LIMINE_DIR/limine from C source; default $HOME/.cache/cambios/limine)
 if have cc; then
     ok "cc present (needed for Limine host tool)"
 else

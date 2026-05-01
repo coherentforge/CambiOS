@@ -17,7 +17,7 @@
 
 KERNEL := target/x86_64-unknown-none/release/cambios_microkernel
 ISO := cambios.iso
-LIMINE_DIR := /tmp/limine
+LIMINE_DIR := $(HOME)/.cache/cambios/limine
 LIMINE_BRANCH := v8.x-binary
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 
@@ -596,9 +596,15 @@ bake-font:
 export-pubkey: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) --export-pubkey bootstrap_pubkey.bin
 
-# Auto-clone Limine if /tmp/limine was cleaned (reboot, macOS periodic cleanup, etc.)
+# Auto-clone Limine if $(LIMINE_DIR) was cleaned or partially nibbled.
+# rm -rf before clone defends against the macOS /tmp daily-cleanup case
+# that prompted the move out of /tmp: per-file atime cleanup can leave
+# the dir present but missing key files (e.g., BOOTX64.EFI gone while
+# BOOTAA64.EFI survives), and `git clone` refuses a non-empty target.
 $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
 	@echo "=== Cloning Limine $(LIMINE_BRANCH) ==="
+	rm -rf $(LIMINE_DIR)
+	mkdir -p $(dir $(LIMINE_DIR))
 	git clone $(LIMINE_REPO) --branch=$(LIMINE_BRANCH) --depth=1 $(LIMINE_DIR)
 
 # Upstream's `limine-binary` branch ships the pre-built EFI stages but
