@@ -23,9 +23,18 @@
 #
 # Parse rule: the first line matching /^\s*-?\s*Staged files/ (case-
 # insensitive) begins the block. Following lines are paths iff they are
-# (a) indented more than the header, (b) contain no internal whitespace,
-# (c) non-empty. The block ends at the first line that fails those
-# tests, or at the end of the message.
+# (a) indented more than the header, (b) non-empty, (c) after stripping
+# any leading Markdown bullet (`- ` or `* `) the remainder contains no
+# internal whitespace. The block ends at the first line that fails
+# those tests, or at the end of the message.
+#
+# The bullet-strip means both forms parse identically:
+#     Staged files:           Staged files:
+#       Makefile                - Makefile
+#       tools/foo.py            - tools/foo.py
+# Bare-indented was the original form; bullet form was added because
+# Markdown convention reaches for `- ` and the bullet doesn't change
+# what `git diff --cached --name-only` correspondence means.
 #
 # Bypass: `git commit --no-verify` (discouraged; prefer to write the
 # block correctly).
@@ -59,7 +68,13 @@ def extract_claimed_paths(msg):
             if leading <= header_indent:
                 break
             token = rstripped.strip()
-            if re.search(r'\s', token):
+            # Strip Markdown bullet prefix so `- foo` and `foo` parse
+            # identically. Prose continuation (e.g. `- This change`)
+            # still ends the block because the post-strip token retains
+            # internal whitespace.
+            if token.startswith(('- ', '* ')):
+                token = token[2:].lstrip()
+            if not token or re.search(r'\s', token):
                 # Prose continuation — end of block.
                 break
             claimed.append(token)
@@ -94,8 +109,11 @@ def main():
         print("  block like:", file=sys.stderr)
         print("", file=sys.stderr)
         print("    Staged files:", file=sys.stderr)
-        print("      path/to/one.rs", file=sys.stderr)
-        print("      path/to/two.rs", file=sys.stderr)
+        print("      - path/to/one.rs", file=sys.stderr)
+        print("      - path/to/two.rs", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  (Bullets `- ` / `* ` are optional; bare paths also work.)",
+              file=sys.stderr)
         print("", file=sys.stderr)
         print("  This catches working-tree sweeps where `git add -A` or",
               file=sys.stderr)
