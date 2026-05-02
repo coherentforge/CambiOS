@@ -35,3 +35,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 023 | [Audit Consumer Capability and Principal Resolution](023-audit-consumer-capability.md) | Proposed | 2026-04-26 |
 | 024 | [Syscall ABI in a Standalone Contract Crate (`cambios-abi`)](024-syscall-abi-crate.md) | Proposed | 2026-04-26 |
 | 025 | [Principal as 32-byte AID (decoupled from key bytes)](025-principal-as-aid.md) | Proposed | 2026-04-30 |
+| 026 | [Identity Transcription at the Kernel Ring](026-identity-transcription-at-the-kernel-ring.md) | Proposed | 2026-05-02 |
