@@ -20,3 +20,9 @@ iso_root/
 # The local .venv / __pycache__ / server.py belong to that project,
 # not this one.
 tools/mcp-rust-analyzer/
+
+# Python bytecode cache from tools/*.py runs.
+__pycache__/
+
+# Personal scratch notes — drafts, proposals, working memos.
+notes/
