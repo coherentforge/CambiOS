@@ -999,9 +999,9 @@ impl SyscallDispatcher {
         // caller_principal already resolved by dispatch()
         let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::InvalidArg)?;
 
-        // ADR-020 Phase B: write 32-byte public key via typed slice.
+        // ADR-020 Phase B: write 32-byte AID via typed slice.
         let out_slice = UserWriteSlice::validate(ctx, out_buf, 32)?;
-        out_slice.write_from(&principal.public_key)?;
+        out_slice.write_from(principal.aid())?;
 
         Ok(32)
     }
@@ -1070,7 +1070,7 @@ impl SyscallDispatcher {
                 let mut header = [0u8; 36];
 
                 if let Some(principal) = msg.sender_principal {
-                    header[0..32].copy_from_slice(&principal.public_key);
+                    header[0..32].copy_from_slice(principal.aid());
                 }
                 header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
 
@@ -1183,7 +1183,7 @@ impl SyscallDispatcher {
 
             let mut header = [0u8; 36];
             if let Some(principal) = msg.sender_principal {
-                header[0..32].copy_from_slice(&principal.public_key);
+                header[0..32].copy_from_slice(principal.aid());
             }
             header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
 
@@ -1318,8 +1318,15 @@ impl SyscallDispatcher {
         // Verify signature if the object is signed (non-empty signature).
         // Unsigned objects (empty signature) are returned as-is for backward
         // compatibility — the caller can check the signature field if needed.
+        // Routes through crate::crypto::verify (Step 4 / Change A) so v1.5
+        // can swap in a per-record sig_algo dispatch with one match arm.
         if !obj.signature.is_empty_sig()
-            && !crate::fs::verify_signature(&obj.owner, &obj.content, &obj.signature) {
+            && !crate::crypto::verify(
+                crate::crypto::SignatureAlgo::Ed25519,
+                crate::crypto::PublicKeyRef::Ed25519(&obj.owner),
+                &obj.content,
+                crate::crypto::SignatureRef::Ed25519(&obj.signature.data),
+            ) {
                 return Err(SyscallError::PermissionDenied);
             }
 
@@ -1363,7 +1370,7 @@ impl SyscallDispatcher {
 
 
         let obj = store.get(&hash).map_err(|_| SyscallError::EndpointNotFound)?;
-        if obj.owner != principal.public_key {
+        if obj.owner != *principal.aid() {
             return Err(SyscallError::PermissionDenied);
         }
 
@@ -1515,8 +1522,16 @@ impl SyscallDispatcher {
         // caller_principal already resolved by dispatch()
         let principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
-        // Verify the signature against the caller's Principal and content
-        if !crate::fs::verify_signature(&principal.public_key, &kbuf[..content_len], &signature) {
+        // Verify the signature against the caller's current key and content.
+        // Routes through crate::crypto::verify (Step 4 / Change A); the
+        // Principal accessor is `current_key_bytes()` (Step 5 / Change D),
+        // whose body becomes a keystore lookup at v1.5 per ADR-025.
+        if !crate::crypto::verify(
+            crate::crypto::SignatureAlgo::Ed25519,
+            crate::crypto::PublicKeyRef::Ed25519(principal.current_key_bytes()),
+            &kbuf[..content_len],
+            crate::crypto::SignatureRef::Ed25519(&signature.data),
+        ) {
             return Err(SyscallError::PermissionDenied);
         }
 
@@ -2155,7 +2170,7 @@ impl SyscallDispatcher {
 
         // Use signed verifier with bootstrap key
         let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        let verifier = SignedBinaryVerifier::with_key(bootstrap.public_key);
+        let verifier = SignedBinaryVerifier::with_key(*bootstrap.current_key_bytes());
 
 
         // Lock ordering: SCHEDULER(1) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
@@ -2999,9 +3014,9 @@ impl SyscallDispatcher {
         })
         .ok_or(SyscallError::InvalidArg)?;
 
-        // --- Step 4: write principal bytes to user buffer ---
+        // --- Step 4: write principal AID bytes to user buffer ---
         let out_slice = UserWriteSlice::validate(ctx, out_buf, 32)?;
-        out_slice.write_from(&principal.public_key)?;
+        out_slice.write_from(principal.aid())?;
 
         Ok(32)
     }

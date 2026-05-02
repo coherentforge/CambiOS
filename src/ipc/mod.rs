@@ -100,38 +100,80 @@ impl fmt::Debug for ProcessId {
 // Principal — cryptographic identity primitive
 // ============================================================================
 
-/// A cryptographic identity: an Ed25519 public key.
+/// A 32-byte AID (Autonomic Identifier) identifying a CambiOS principal.
 ///
-/// In Phase 0, this is just 32 opaque bytes (no crypto verification yet).
-/// The interface is permanent — the implementation gains real crypto in Phase 1.
+/// In v1, the AID bytes coincide with an Ed25519 public key (no key event
+/// log yet). In v1.5+, the AID is `blake3(key_event_log_inception_block)` and
+/// the actual signing key is resolved via the keystore service. The 32-byte
+/// size is architectural — it is the identifier, not the key.
 ///
-/// Equality is based on the full 32-byte public key (constant-time is a
-/// Phase 1 concern when real keys are in play).
+/// Field access goes through [`Principal::aid`] (identity comparison, IPC
+/// stamping, lookup) or [`Principal::current_key_bytes`] (signature verify).
+/// Both look identical today; at v1.5 only `current_key_bytes()` changes — its
+/// body becomes a keystore lookup. That split is the cheap insurance policy
+/// that turns the v1.5 migration into a one-function change instead of a
+/// five-site refactor.
+///
+/// Equality is the full 32-byte AID. See [ADR-025](../../docs/adr/025-principal-as-aid.md)
+/// and [docs/identity.md](../../docs/identity.md).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Principal {
-    pub public_key: [u8; 32],
+    pub(crate) aid: [u8; 32],
 }
 
 impl Principal {
-    /// Create a Principal from a 32-byte public key.
-    pub const fn from_public_key(key: [u8; 32]) -> Self {
-        Principal { public_key: key }
+    /// Create a Principal from a 32-byte AID.
+    ///
+    /// In v1, the AID bytes are the Ed25519 public key bytes (no separate
+    /// key event log). In v1.5+, callers should derive the AID from the
+    /// inception event log instead of passing key bytes directly.
+    pub const fn from_aid(aid: [u8; 32]) -> Self {
+        Principal { aid }
     }
 
-    /// The zero Principal — used as a sentinel / "no identity" marker.
-    pub const ZERO: Self = Principal { public_key: [0u8; 32] };
+    /// Backward-compat alias for [`Principal::from_aid`]. In v1, the AID
+    /// bytes are the public key bytes — same construction either way. New
+    /// code should prefer `from_aid` to make the AID semantics explicit.
+    pub const fn from_public_key(key: [u8; 32]) -> Self {
+        Principal { aid: key }
+    }
+
+    /// The zero Principal — sentinel / "no identity" marker.
+    pub const ZERO: Self = Principal { aid: [0u8; 32] };
 
     /// Check if this is the zero (unset) Principal.
     pub fn is_zero(&self) -> bool {
-        self.public_key == [0u8; 32]
+        self.aid == [0u8; 32]
+    }
+
+    /// The AID — 32-byte identity tag. Used for equality, IPC stamping, and
+    /// capability/process-table lookup. **Stable across key rotations** — at
+    /// v1.5+ this never changes when the underlying signing key changes.
+    pub fn aid(&self) -> &[u8; 32] {
+        &self.aid
+    }
+
+    /// The current signing key bytes for this Principal.
+    ///
+    /// In v1: returns the AID bytes directly (AID and key coincide).
+    ///
+    /// In v1.5+: this function's body becomes a keystore lookup (`AID →
+    /// current key`). All verifier sites already call through here, so the
+    /// migration is a one-function change rather than a five-site refactor.
+    /// Callers that need *identity* (not the verify input) should use
+    /// [`Self::aid`] instead.
+    ///
+    /// Revisit when: keystore service ADR lands per identity.md Phase 1.5.
+    pub fn current_key_bytes(&self) -> &[u8; 32] {
+        &self.aid
     }
 }
 
 impl fmt::Debug for Principal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Show first 8 bytes hex for readability
+        // First 8 bytes of the AID, in hex.
         write!(f, "Principal(")?;
-        for byte in &self.public_key[..8] {
+        for byte in &self.aid[..8] {
             write!(f, "{:02x}", byte)?;
         }
         write!(f, "...)")
@@ -140,7 +182,7 @@ impl fmt::Debug for Principal {
 
 impl fmt::Display for Principal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for byte in &self.public_key[..8] {
+        for byte in &self.aid[..8] {
             write!(f, "{:02x}", byte)?;
         }
         write!(f, "…")

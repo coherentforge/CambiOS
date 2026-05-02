@@ -314,7 +314,7 @@ fn encode_record_header(buf: &mut Block, obj: &CambiObject) -> Result<(), StoreE
     for (i, cap) in obj.capabilities.iter().enumerate() {
         let base = HDR_OFF_CAPS + i * CAP_ENTRY_SIZE;
         buf[base + CAP_OFF_PRINCIPAL..base + CAP_OFF_PRINCIPAL + 32]
-            .copy_from_slice(&cap.principal.public_key);
+            .copy_from_slice(cap.principal.aid());
         let expiry = cap.expiry.unwrap_or(0);
         buf[base + CAP_OFF_EXPIRY..base + CAP_OFF_EXPIRY + 8]
             .copy_from_slice(&expiry.to_le_bytes());

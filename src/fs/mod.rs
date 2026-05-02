@@ -64,16 +64,20 @@ pub fn sign_content(secret_key_bytes: &[u8; 64], content: &[u8]) -> SignatureByt
 
 /// Verify an Ed25519 signature over content using the signer's public key.
 ///
-/// Returns `true` if the signature is valid, `false` otherwise.
-/// A zeroed (empty) signature always fails verification.
+/// Thin wrapper over [`crate::crypto::verify`] that hard-codes Ed25519. New
+/// code that already knows it's verifying an algorithm-tagged artifact
+/// (ARCSIG trailer, on-disk record, signed-input event) should call
+/// `crypto::verify` directly with an explicit `SignatureAlgo`.
+///
+/// Returns `true` if the signature is valid, `false` otherwise. A zeroed
+/// (empty) signature always fails verification.
 pub fn verify_signature(public_key: &[u8; 32], content: &[u8], signature: &SignatureBytes) -> bool {
-    // Empty signatures always fail
-    if signature.data == [0u8; 64] {
-        return false;
-    }
-    let pk = ed25519_compact::PublicKey::new(*public_key);
-    let sig = ed25519_compact::Signature::new(signature.data);
-    pk.verify(content, &sig).is_ok()
+    crate::crypto::verify(
+        crate::crypto::SignatureAlgo::Ed25519,
+        crate::crypto::PublicKeyRef::Ed25519(public_key),
+        content,
+        crate::crypto::SignatureRef::Ed25519(&signature.data),
+    )
 }
 
 /// Derive an Ed25519 keypair from a 32-byte seed.
@@ -96,12 +100,12 @@ pub fn keypair_from_seed(seed: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
 
 /// Signature algorithm tag. Phase 1B uses Ed25519.
 /// ML-DSA-65 (post-quantum) is Phase 1.5+.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SignatureAlgo {
-    Ed25519 = 0,
-    MlDsa65 = 1,
-}
+///
+/// Re-exported from [`crate::crypto::SignatureAlgo`], which owns the canonical
+/// definition (kernel-wide verify boundary). Kept under this name so existing
+/// `fs::SignatureAlgo` call sites (CambiObject metadata, on-disk records)
+/// continue to compile without the rename touching every site.
+pub use crate::crypto::SignatureAlgo;
 
 /// Signature bytes. Fixed at 64 bytes for Ed25519.
 /// Phase 1.5+ extends to variable-length for ML-DSA (3293 bytes).
@@ -265,8 +269,8 @@ impl CambiObject {
         let hash = content_hash(&content);
         CambiObject {
             content_hash: hash,
-            author: author.public_key,
-            owner: author.public_key, // Creator is initial owner
+            author: *author.aid(),
+            owner: *author.aid(), // Creator is initial owner
             sig_algo: SignatureAlgo::Ed25519,
             signature: SignatureBytes::EMPTY,
             capabilities: ObjectCapSet::new(),
@@ -286,8 +290,8 @@ impl CambiObject {
         let hash = content_hash(&content);
         CambiObject {
             content_hash: hash,
-            author: author.public_key,
-            owner: owner.public_key,
+            author: *author.aid(),
+            owner: *owner.aid(),
             sig_algo: SignatureAlgo::Ed25519,
             signature: SignatureBytes::EMPTY,
             capabilities: ObjectCapSet::new(),

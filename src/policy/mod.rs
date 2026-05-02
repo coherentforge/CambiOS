@@ -467,7 +467,7 @@ pub fn policy_check(
         let cap_guard = crate::CAPABILITY_MANAGER.lock();
         if let Some(ref cap_mgr) = *cap_guard {
             if let Ok(p) = cap_mgr.get_principal(process_id) {
-                p.public_key
+                *p.aid()
             } else {
                 [0u8; 32]
             }

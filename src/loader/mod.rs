@@ -128,6 +128,12 @@ pub enum DenyReason {
     MissingSignature,
     /// Ed25519 signature verification failed
     InvalidSignature,
+    /// `ARCSIG` trailer is present but its (version, algo) tuple is not
+    /// supported by this kernel build (e.g. a v2 trailer or ML-DSA-65
+    /// signature loaded by a kernel that only knows v1 Ed25519). Distinct
+    /// from `MissingSignature` so the audit trail can tell a downgrade
+    /// attempt from an unsigned binary.
+    UnsupportedSignatureFormat,
 }
 
 /// Result of binary verification
@@ -279,31 +285,96 @@ impl BinaryVerifier for DefaultVerifier {
 
 /// Signature trailer appended to ELF binaries by the host-side signing tool.
 ///
-/// Format: `[original ELF bytes][Ed25519 signature: 64 bytes][magic: 8 bytes]`
+/// Format (v1 + Ed25519, 72 bytes total):
+/// `[original ELF bytes][sig: 64 bytes]["ARCSIG"][version: u8 = 1][algo: u8 = 0]`
 ///
-/// Magic: `ARCSIG\x01\x00` (version 1, no padding).
-/// Total trailer size: 72 bytes.
+/// The 8-byte trailer header has two independent dispatch axes:
+/// - **byte [N-2]** = trailer-format-version (1 today; bumped only when the
+///   *layout* changes for non-crypto reasons, e.g. embedding a key-id).
+/// - **byte [N-1]** = signature algorithm (0 = Ed25519; matches the
+///   `SignatureAlgorithm` u8 values that will be lifted into `src/crypto/`
+///   alongside the future `crypto::verify` dispatch boundary).
 ///
-/// The signature covers all bytes before the trailer (the original ELF).
+/// The signature covers `blake3(elf_bytes)`, not raw bytes, so YubiKey signing
+/// only feeds a 32-byte hash through the smart-card interface.
+pub const SIGNATURE_TRAILER_PREFIX: &[u8; 6] = b"ARCSIG";
+/// Length of the fixed-shape trailer header: prefix(6) + version(1) + algo(1).
+pub const SIGNATURE_TRAILER_HEADER_LEN: usize = 8;
+/// v1 trailer-format-version.
+pub const TRAILER_VERSION_V1: u8 = 1;
+/// Ed25519 algorithm tag — matches the v1.5 `SignatureAlgorithm::Ed25519` u8.
+pub const TRAILER_ALGO_ED25519: u8 = 0;
+/// Total trailer size for the (v1, Ed25519) shape: 64-byte signature + 8-byte header.
+pub const SIGNATURE_TRAILER_V1_ED25519_SIZE: usize = 64 + SIGNATURE_TRAILER_HEADER_LEN;
+
+/// Backward-compat alias for tests that emit v1 Ed25519 trailers.
+/// New code should construct trailers via the (version, algo) bytes directly.
 pub const SIGNATURE_TRAILER_MAGIC: &[u8; 8] = b"ARCSIG\x01\x00";
-pub const SIGNATURE_TRAILER_SIZE: usize = 64 + 8; // signature + magic
+/// Backward-compat alias. Equal to `SIGNATURE_TRAILER_V1_ED25519_SIZE`; kept
+/// because existing tests use the legacy constant name.
+pub const SIGNATURE_TRAILER_SIZE: usize = SIGNATURE_TRAILER_V1_ED25519_SIZE;
+
+/// Result of inspecting an ELF binary for an `ARCSIG` signature trailer.
+#[derive(Debug, Clone, Copy)]
+pub enum TrailerStatus<'a> {
+    /// No `ARCSIG` trailer detected — the binary is unsigned.
+    Absent,
+    /// `ARCSIG` trailer is present, but its (version, algo) tuple is not
+    /// supported by this kernel build (e.g. a future v2 / ML-DSA trailer
+    /// loaded by an old kernel). Recorded explicitly so the verifier can
+    /// distinguish "unsigned" from "signed but I don't speak this version."
+    Unsupported { version: u8, algo: u8 },
+    /// A v1 trailer with an Ed25519 signature.
+    V1Ed25519 { elf: &'a [u8], sig: [u8; 64] },
+}
+
+/// Inspect a binary for an `ARCSIG` signature trailer and dispatch on its
+/// (version, algo) tuple.
+///
+/// Backward compat: a binary with the legacy magic suffix `ARCSIG\x01\x00` is
+/// interpreted as `(version=1, algo=0)` — i.e. v1 + Ed25519 — and parses as
+/// [`TrailerStatus::V1Ed25519`]. Existing signed binaries continue to verify
+/// without modification.
+pub fn parse_signature_trailer(binary: &[u8]) -> TrailerStatus<'_> {
+    if binary.len() < SIGNATURE_TRAILER_HEADER_LEN {
+        return TrailerStatus::Absent;
+    }
+    let header_start = binary.len() - SIGNATURE_TRAILER_HEADER_LEN;
+    if &binary[header_start..header_start + 6] != SIGNATURE_TRAILER_PREFIX {
+        return TrailerStatus::Absent;
+    }
+    let version = binary[header_start + 6];
+    let algo = binary[header_start + 7];
+
+    match (version, algo) {
+        (TRAILER_VERSION_V1, TRAILER_ALGO_ED25519) => {
+            if binary.len() < SIGNATURE_TRAILER_V1_ED25519_SIZE {
+                return TrailerStatus::Unsupported { version, algo };
+            }
+            let sig_start = binary.len() - SIGNATURE_TRAILER_V1_ED25519_SIZE;
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&binary[sig_start..header_start]);
+            TrailerStatus::V1Ed25519 {
+                elf: &binary[..sig_start],
+                sig,
+            }
+        }
+        _ => TrailerStatus::Unsupported { version, algo },
+    }
+}
 
 /// Strip the signature trailer from a signed binary.
 ///
-/// Returns `Some((elf_bytes, signature_bytes))` if the trailer is present,
-/// `None` if the binary is unsigned.
+/// Returns `Some((elf_bytes, signature_bytes))` only for v1 + Ed25519 trailers
+/// (the only shape known today). Other shapes return `None` and are
+/// indistinguishable here from "unsigned"; callers that need to distinguish
+/// "unsigned" from "signed-but-unsupported-format" should use
+/// [`parse_signature_trailer`] instead.
 pub fn strip_signature_trailer(binary: &[u8]) -> Option<(&[u8], [u8; 64])> {
-    if binary.len() < SIGNATURE_TRAILER_SIZE {
-        return None;
+    match parse_signature_trailer(binary) {
+        TrailerStatus::V1Ed25519 { elf, sig } => Some((elf, sig)),
+        _ => None,
     }
-    let magic_start = binary.len() - 8;
-    if &binary[magic_start..] != SIGNATURE_TRAILER_MAGIC {
-        return None;
-    }
-    let sig_start = magic_start - 64;
-    let mut sig = [0u8; 64];
-    sig.copy_from_slice(&binary[sig_start..magic_start]);
-    Some((&binary[..sig_start], sig))
 }
 
 /// SCAFFOLDING: maximum number of trusted ELF signing keys.
@@ -352,19 +423,31 @@ impl BinaryVerifier for SignedBinaryVerifier {
         metadata: &ElfBinary,
         segments: &[SegmentLoad],
     ) -> VerifyResult {
-        // 1. Check for signature trailer
-        let (elf_bytes, sig_bytes) = match strip_signature_trailer(binary) {
-            Some(pair) => pair,
-            None => return VerifyResult::Deny(DenyReason::MissingSignature),
+        // 1. Inspect the trailer and dispatch on (version, algo).
+        let (elf_bytes, sig_bytes) = match parse_signature_trailer(binary) {
+            TrailerStatus::V1Ed25519 { elf, sig } => (elf, sig),
+            TrailerStatus::Absent => {
+                return VerifyResult::Deny(DenyReason::MissingSignature);
+            }
+            TrailerStatus::Unsupported { .. } => {
+                // Trailer present but kernel doesn't know this (version, algo).
+                // Audit trail can distinguish this from MissingSignature.
+                return VerifyResult::Deny(DenyReason::UnsupportedSignatureFormat);
+            }
         };
 
-        // 2. Verify signature against at least one trusted key.
-        //    The signature covers blake3(elf_bytes), not the raw bytes.
-        //    This allows hardware signing keys (YubiKey) to sign a 32-byte hash
-        //    instead of piping entire binaries through the smart card interface.
+        // 2. Verify signature against at least one trusted key via the
+        //    kernel-wide crypto::verify boundary (Step 4 / Change A).
+        //    The signature covers blake3(elf_bytes), not the raw bytes —
+        //    YubiKey signing only feeds a 32-byte hash through the smart card.
         let elf_hash = crate::fs::content_hash(elf_bytes);
         let sig_valid = self.trusted_keys[..self.key_count].iter().any(|pk| {
-            crate::fs::verify_signature(pk, &elf_hash, &crate::fs::SignatureBytes { data: sig_bytes })
+            crate::crypto::verify(
+                crate::crypto::SignatureAlgo::Ed25519,
+                crate::crypto::PublicKeyRef::Ed25519(pk),
+                &elf_hash,
+                crate::crypto::SignatureRef::Ed25519(&sig_bytes),
+            )
         });
         if !sig_valid {
             return VerifyResult::Deny(DenyReason::InvalidSignature);
@@ -448,6 +531,7 @@ pub fn load_elf_process(
                 DenyReason::MissingSignature => 6,
                 DenyReason::InvalidSignature => 7,
                 DenyReason::PagePermConflict => 8,
+                DenyReason::UnsupportedSignatureFormat => 9,
             };
             crate::audit::emit(crate::audit::RawAuditEvent::binary_rejected(
                 reason_code, crate::audit::now(), 0,
@@ -1234,6 +1318,80 @@ mod tests {
     fn test_strip_signature_trailer_too_short() {
         let short = [0u8; 10];
         assert!(strip_signature_trailer(&short).is_none());
+    }
+
+    /// Confirm the typed parser surfaces a v1 + Ed25519 trailer as
+    /// `TrailerStatus::V1Ed25519` — the load-bearing happy path.
+    #[test]
+    fn test_parse_signature_trailer_v1_ed25519() {
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        let seed = [1u8; 32];
+        let (_, sk) = crate::fs::keypair_from_seed(&seed);
+        let signed = sign_binary(&elf, &sk);
+
+        match parse_signature_trailer(&signed) {
+            TrailerStatus::V1Ed25519 { elf: stripped, sig } => {
+                assert_eq!(stripped, &elf[..]);
+                assert_ne!(sig, [0u8; 64]);
+            }
+            other => panic!("expected V1Ed25519, got {:?}", other),
+        }
+    }
+
+    /// A trailer with the `ARCSIG` prefix but an unknown (version, algo)
+    /// tuple must surface as `Unsupported` — distinct from `Absent` so the
+    /// audit trail can tell signed-but-unknown-version from unsigned.
+    #[test]
+    fn test_parse_signature_trailer_unsupported_version() {
+        let mut signed = [0u8; SIGNATURE_TRAILER_V1_ED25519_SIZE].to_vec();
+        let header_start = signed.len() - SIGNATURE_TRAILER_HEADER_LEN;
+        signed[header_start..header_start + 6].copy_from_slice(SIGNATURE_TRAILER_PREFIX);
+        signed[header_start + 6] = 99; // unknown version
+        signed[header_start + 7] = TRAILER_ALGO_ED25519;
+
+        match parse_signature_trailer(&signed) {
+            TrailerStatus::Unsupported { version, algo } => {
+                assert_eq!(version, 99);
+                assert_eq!(algo, TRAILER_ALGO_ED25519);
+            }
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+    }
+
+    /// v1 trailer with a non-Ed25519 algo (e.g. ML-DSA-65 = 1) is also
+    /// surfaced as `Unsupported` — the kernel today only knows Ed25519.
+    /// At v1.5 this case becomes the live path for ML-DSA-65 binaries.
+    #[test]
+    fn test_parse_signature_trailer_unsupported_algo() {
+        let mut signed = [0u8; SIGNATURE_TRAILER_V1_ED25519_SIZE].to_vec();
+        let header_start = signed.len() - SIGNATURE_TRAILER_HEADER_LEN;
+        signed[header_start..header_start + 6].copy_from_slice(SIGNATURE_TRAILER_PREFIX);
+        signed[header_start + 6] = TRAILER_VERSION_V1;
+        signed[header_start + 7] = 1; // ML-DSA-65 reserved tag
+
+        match parse_signature_trailer(&signed) {
+            TrailerStatus::Unsupported { version, algo } => {
+                assert_eq!(version, TRAILER_VERSION_V1);
+                assert_eq!(algo, 1);
+            }
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+    }
+
+    /// `parse_signature_trailer` on a binary without an `ARCSIG` prefix
+    /// returns `Absent`, distinguishing unsigned binaries from signed-but-
+    /// unsupported ones at the audit layer.
+    #[test]
+    fn test_parse_signature_trailer_absent() {
+        let elf = build_test_elf(0x400000, &[
+            (0x400000, 0x1000, 0x1000, phdr_flags::PF_R | phdr_flags::PF_X),
+        ]);
+        match parse_signature_trailer(&elf) {
+            TrailerStatus::Absent => {}
+            other => panic!("expected Absent, got {:?}", other),
+        }
     }
 
     #[test]

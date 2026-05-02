@@ -35,6 +35,7 @@ pub mod syscalls;
 pub mod process;
 pub mod acpi;
 pub mod fs;
+pub mod crypto;
 pub mod boot;
 pub mod boot_modules;
 pub mod audit;
