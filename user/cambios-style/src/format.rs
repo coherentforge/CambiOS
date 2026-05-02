@@ -27,20 +27,27 @@ use crate::style::{DIM_PREFIX, RESET};
 /// showing enough identity material to disambiguate two principals
 /// at a glance.
 ///
-/// SCAFFOLDING: 8 chars is the IIW-demo readability sweet spot —
-/// `z6Mk7L4f…` is recognizable to the did: crowd and tight enough
-/// for the prompt. The first four characters (`z6Mk`) are fixed for
-/// every Ed25519 did:key, so the variable part is the next 4.
+/// SCAFFOLDING: prefix length kept to 4 — exactly the fixed
+/// `z6Mk` multibase+multicodec marker shared by every Ed25519
+/// did:key. The variable disambiguator lives entirely in the
+/// suffix (`SHORT_SUFFIX_BYTES`); rendering it as `z6Mk...XXXX`
+/// reads as a deliberate middle-truncation rather than a string
+/// that happened to get cut off.
 /// Why: hands-on demo prompt readability; collision-free among the
 /// principals likely on a single machine (≤ a few dozen).
 /// Replace when: a real consumer needs guaranteed disambiguation
 /// over a population large enough that 4 variable base58 chars
 /// (~24 bits) starts to collide.
-const SHORT_PREFIX_BYTES: usize = 8;
+const SHORT_PREFIX_BYTES: usize = 4;
 
-/// Stack buffer size for [`DidShort`]. Holds 8 ASCII chars + the
-/// 3-byte ASCII ellipsis (`...`) = 11 bytes; 16 gives slack for any
-/// future length nudge without changing the type.
+/// SCAFFOLDING: 4 chars from the tail of the multibase body. Carries
+/// the variable disambiguator now that the prefix is fixed `z6Mk`.
+/// Same replace-when criterion as `SHORT_PREFIX_BYTES`.
+const SHORT_SUFFIX_BYTES: usize = 4;
+
+/// Stack buffer size for [`DidShort`]. Holds 4 prefix + 3-byte ASCII
+/// ellipsis + 4 suffix = 11 bytes; 16 gives slack for any future
+/// length nudge without changing the type.
 const DID_SHORT_BUF: usize = 16;
 
 /// Three-dot ASCII ellipsis. Originally the Unicode `…` glyph (U+2026,
@@ -93,10 +100,12 @@ impl Display for DidShort {
 }
 
 /// Render a Principal pubkey as a short did:key identifier of the
-/// shape `z6Mk7L4f…` — multibase + multicodec prefix, 4 chars of
-/// pubkey material, ellipsis. The `did:key:` URI prefix is omitted
-/// to keep the prompt tight; the `z` and `6Mk` markers remain so a
-/// reader familiar with did:key still recognizes the form.
+/// shape `z6Mk...XXXX` — fixed multibase+multicodec marker, ellipsis,
+/// then the last 4 chars of the multibase body. The `did:key:` URI
+/// prefix is omitted to keep the prompt tight; the `z` and `6Mk`
+/// markers remain so a reader familiar with did:key still recognizes
+/// the form. Middle-truncation reads as a deliberate elision rather
+/// than a string that ran off a fixed-width display.
 ///
 /// Delegates the multibase encoding to
 /// `cambios_libsys::did_key_encode` so this crate stays the
@@ -116,12 +125,18 @@ pub fn principal_short(pubkey: &[u8; 32]) -> DidShort {
         full_bytes
     };
 
-    let take = SHORT_PREFIX_BYTES.min(body.len());
+    let prefix_n = SHORT_PREFIX_BYTES.min(body.len());
+    // Keep prefix and suffix disjoint when the body is unexpectedly
+    // short (cannot happen for a real did:key, but keep it total).
+    let suffix_n = SHORT_SUFFIX_BYTES.min(body.len() - prefix_n);
     let mut out = DidShort { buf: [0; DID_SHORT_BUF], len: 0 };
-    out.buf[..take].copy_from_slice(&body[..take]);
-    let mut len = take;
+    let mut len = 0;
+    out.buf[len..len + prefix_n].copy_from_slice(&body[..prefix_n]);
+    len += prefix_n;
     out.buf[len..len + ELLIPSIS.len()].copy_from_slice(ELLIPSIS);
     len += ELLIPSIS.len();
+    out.buf[len..len + suffix_n].copy_from_slice(&body[body.len() - suffix_n..]);
+    len += suffix_n;
     out.len = len as u8;
     out
 }
@@ -270,20 +285,26 @@ mod tests {
     }
 
     #[test]
-    fn principal_short_ends_with_ellipsis() {
+    fn principal_short_has_middle_ellipsis() {
+        // Shape: `z6Mk` + `...` + 4 trailing chars of the body.
         let short = principal_short(&FIXED_PUBKEY);
-        assert!(
-            short.as_str().ends_with("..."),
-            "short form `{}` does not end with `...`",
-            short.as_str()
+        let s = short.as_str();
+        assert_eq!(
+            &s[SHORT_PREFIX_BYTES..SHORT_PREFIX_BYTES + ELLIPSIS.len()],
+            "...",
+            "short form `{}` is missing middle ellipsis",
+            s,
         );
     }
 
     #[test]
-    fn principal_short_keeps_eight_chars_then_ellipsis() {
-        // 8 ASCII bytes from the multibase body + 3-byte ellipsis = 11.
+    fn principal_short_length_is_prefix_plus_ellipsis_plus_suffix() {
+        // 4 ASCII bytes prefix + 3-byte ellipsis + 4 ASCII bytes suffix = 11.
         let short = principal_short(&FIXED_PUBKEY);
-        assert_eq!(short.len(), SHORT_PREFIX_BYTES + ELLIPSIS.len());
+        assert_eq!(
+            short.len(),
+            SHORT_PREFIX_BYTES + ELLIPSIS.len() + SHORT_SUFFIX_BYTES,
+        );
     }
 
     #[test]
