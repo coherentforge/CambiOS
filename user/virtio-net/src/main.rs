@@ -73,8 +73,13 @@ const STATUS_NO_DEVICE: u8 = 3;
 // Virtio-net constants
 // ============================================================================
 
-/// Virtio-net header (legacy format, 10 bytes). Prepended to every packet.
-const VIRTIO_NET_HDR_SIZE: usize = 10;
+/// Virtio-net header size for the legacy carrier without MRG_RXBUF (10
+/// bytes; ARCHITECTURAL — `struct virtio_net_hdr`, virtio §5.1.6).
+const VIRTIO_NET_HDR_SIZE_LEGACY: usize = 10;
+/// Virtio-net header size for modern carriers (`VIRTIO_F_VERSION_1`
+/// negotiated; 12 bytes — `struct virtio_net_hdr_v1` always includes the
+/// `num_buffers` field per virtio §5.1.6.1, regardless of MRG_RXBUF).
+const VIRTIO_NET_HDR_SIZE_MODERN: usize = 12;
 
 /// Number of pre-posted RX bounce buffers.
 const RX_RING_SIZE: usize = 16;
@@ -103,6 +108,10 @@ struct NetDriver {
     rx_bufs: [Option<BounceBuffer>; RX_RING_SIZE],
     /// Single TX bounce buffer (synchronous sends — one at a time).
     tx_buf: BounceBuffer,
+    /// Wire-format virtio-net header size (10 legacy / 12 modern; see
+    /// VIRTIO_NET_HDR_SIZE_* constants). Must match what the device
+    /// expects or 2 bytes of every packet are misinterpreted.
+    hdr_size: usize,
 }
 
 impl NetDriver {
@@ -197,6 +206,12 @@ impl NetDriver {
         let rx_bufs: [Option<BounceBuffer>; RX_RING_SIZE] =
             core::array::from_fn(|_| None);
 
+        let hdr_size = if is_modern {
+            VIRTIO_NET_HDR_SIZE_MODERN
+        } else {
+            VIRTIO_NET_HDR_SIZE_LEGACY
+        };
+
         let mut driver = NetDriver {
             transport,
             rx_notify,
@@ -206,6 +221,7 @@ impl NetDriver {
             tx_queue,
             rx_bufs,
             tx_buf,
+            hdr_size,
         };
 
         // Post initial RX buffers
@@ -250,7 +266,7 @@ impl NetDriver {
             return false;
         }
 
-        let total_len = VIRTIO_NET_HDR_SIZE + packet.len();
+        let total_len = self.hdr_size + packet.len();
         if total_len > self.tx_buf.size as usize {
             return false; // Packet too large
         }
@@ -258,7 +274,7 @@ impl NetDriver {
         // Build virtio-net header (all zeros = no offload)
         self.tx_buf.zero();
         // Copy packet data after the header
-        let dst = (self.tx_buf.vaddr + VIRTIO_NET_HDR_SIZE as u64) as *mut u8;
+        let dst = (self.tx_buf.vaddr + self.hdr_size as u64) as *mut u8;
         // This write goes to the bounce buffer (driver memory), not device memory
         #[allow(unsafe_code)]
         unsafe {
@@ -311,17 +327,17 @@ impl NetDriver {
 
         if let Some((pending, validated_len)) = self.rx_queue.pop_used() {
             // validated_len includes the virtio-net header
-            if validated_len as usize <= VIRTIO_NET_HDR_SIZE {
+            if (validated_len as usize) <= self.hdr_size {
                 // No actual payload — repost buffer
                 self.recycle_rx_buffer(pending);
                 return 0;
             }
 
-            let payload_len = validated_len as usize - VIRTIO_NET_HDR_SIZE;
+            let payload_len = validated_len as usize - self.hdr_size;
             let copy_len = core::cmp::min(payload_len, out.len());
 
             // Read payload from bounce buffer (skip virtio-net header)
-            let src = (pending.vaddr + VIRTIO_NET_HDR_SIZE as u64) as *const u8;
+            let src = (pending.vaddr + self.hdr_size as u64) as *const u8;
             #[allow(unsafe_code)]
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), copy_len);

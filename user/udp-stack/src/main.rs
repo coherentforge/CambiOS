@@ -458,6 +458,16 @@ impl ArpCache {
 // Virtio-net IPC client
 // ============================================================================
 
+// Reply endpoint for virtio-net IPC: must match the endpoint the
+// kernel stamps as `from` on our outgoing writes. Per Phase 4b, that
+// is `REPLY_ENDPOINT[us]` — the first endpoint we registered, i.e.
+// `UDP_ENDPOINT`. _start MUST register UDP_ENDPOINT before calling
+// any of the helpers below; otherwise replies queue on pid-slot
+// (the kernel's pre-registration fallback) and these helpers hang.
+fn net_reply_endpoint() -> u32 {
+    UDP_ENDPOINT
+}
+
 /// Send a raw Ethernet frame through virtio-net. Returns true on success.
 fn net_send_frame(frame: &[u8]) -> bool {
     if frame.len() > 255 {
@@ -468,9 +478,8 @@ fn net_send_frame(frame: &[u8]) -> bool {
     req[1..1 + frame.len()].copy_from_slice(frame);
     sys::write(NET_ENDPOINT, &req[..1 + frame.len()]);
 
-    let my_ep = sys::get_pid();
     let mut resp = [0u8; 292];
-    let n = blocking_recv(my_ep, &mut resp);
+    let n = blocking_recv(net_reply_endpoint(), &mut resp);
     n > IPC_HEADER_LEN && resp[IPC_HEADER_LEN] == 0
 }
 
@@ -479,9 +488,8 @@ fn net_send_frame(frame: &[u8]) -> bool {
 fn net_recv_frame(out: &mut [u8]) -> usize {
     sys::write(NET_ENDPOINT, &[NET_CMD_RECV]);
 
-    let my_ep = sys::get_pid();
     let mut resp = [0u8; 292];
-    let n = blocking_recv(my_ep, &mut resp);
+    let n = blocking_recv(net_reply_endpoint(), &mut resp);
     if n <= IPC_HEADER_LEN || resp[IPC_HEADER_LEN] != 0 {
         return 0; // NO_DATA or error
     }
@@ -494,11 +502,10 @@ fn net_recv_frame(out: &mut [u8]) -> usize {
 
 /// Get our MAC address from virtio-net.
 fn net_get_mac() -> Option<[u8; 6]> {
-    let my_ep = sys::get_pid();
     let mut resp = [0u8; 292];
 
     sys::write(NET_ENDPOINT, &[NET_CMD_GET_MAC]);
-    let n = blocking_recv(my_ep, &mut resp);
+    let n = blocking_recv(net_reply_endpoint(), &mut resp);
     if n >= IPC_HEADER_LEN + 7 && resp[IPC_HEADER_LEN] == 0 {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&resp[IPC_HEADER_LEN + 1..IPC_HEADER_LEN + 7]);
@@ -538,9 +545,15 @@ fn arp_resolve(
         return None;
     }
 
-    // Poll for ARP reply
+    // Poll for ARP reply with a wall-clock deadline (mirrors
+    // query_and_publish_ntp's pattern). QEMU TCG's slirp delivers
+    // replies only when the guest goes idle and HLTs; an iteration
+    // bound is unsafe because tight yield_now loops can complete
+    // before the idle task ever runs. 100 ticks ≈ 1 s, far longer
+    // than slirp's local ARP latency (sub-millisecond on host).
+    let deadline = sys::get_time().saturating_add(100);
     let mut recv_frame = [0u8; 256];
-    for _ in 0..30 {
+    while sys::get_time() < deadline {
         let n = net_recv_frame(&mut recv_frame);
         if n >= ETH_HEADER_LEN + 28 {
             if let Some((ethertype, eth_off)) = parse_eth_frame(&recv_frame[..n]) {
@@ -554,6 +567,7 @@ fn arp_resolve(
                 }
             }
         }
+        sys::yield_now();
     }
     None
 }
@@ -697,11 +711,16 @@ fn query_and_publish_ntp(cache: &mut ArpCache, our_mac: &[u8; 6]) -> bool {
         return false;
     }
 
-    // Poll for the response. The ~500 iterations match the prior demo's
-    // patience; each iteration also yields the CPU so the rest of the
-    // module's IPC traffic does not stall during the wait.
+    // Poll for the response with a wall-clock deadline. QEMU TCG's slirp
+    // backend processes incoming UDP only when the guest goes idle and
+    // executes HLT — yield_now alone may not schedule the idle task if
+    // other modules are runnable, so we anchor the bound on get_time()
+    // (100 Hz tick) rather than iteration count. 300 ticks ≈ 3 s, far
+    // longer than the ~100 ms NIST round-trip seen on the wire.
+    let start = sys::get_time();
+    let deadline = start.saturating_add(300);
     let mut payload = [0u8; 128];
-    for _ in 0..500 {
+    while sys::get_time() < deadline {
         if let Some((_src_ip, src_port, len)) = udp_recv(&mut payload) {
             if src_port == NTP_PORT && len >= NTP_PACKET_LEN {
                 if let Some(unix_ts) = parse_ntp_response(&payload[..len]) {
@@ -939,29 +958,36 @@ fn print_mac(mac: &[u8; 6]) {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    // Step 1: Get our MAC from virtio-net
+    // Step 1: register UDP_ENDPOINT FIRST. Per Phase 4b, this is the
+    // endpoint the kernel stamps as `from` on every outgoing write —
+    // virtio-net's responses then queue here, and `net_reply_endpoint`
+    // matches. Registering after the first IPC call would route
+    // virtio-net's responses to pid-slot (the pre-registration
+    // fallback), and the helpers (which now read from UDP_ENDPOINT)
+    // would hang forever.
+    sys::register_endpoint(UDP_ENDPOINT);
+
+    // Step 2: Get our MAC from virtio-net
     let our_mac = match net_get_mac() {
         Some(mac) => mac,
         None => {
             sys::print(b"[UDP] ERROR: failed to get MAC from virtio-net\n");
-            sys::register_endpoint(UDP_ENDPOINT);
             error_loop();
         }
     };
 
-    // Step 2: ARP resolve gateway (silent on success)
+    // Step 3: ARP resolve gateway (silent on success)
     let mut cache = ArpCache::new();
     let gw = gateway_ip();
     if arp_resolve(&mut cache, &our_mac, &gw).is_none() {
         sys::print(b"[UDP] ERROR: ARP resolution failed for gateway\n");
     }
 
-    // Step 3: register service endpoint. The first NTP refresh runs
-    // inside service_loop on entry — it shares the cadence machinery
-    // with subsequent refreshes, so there is no special "boot-time" path
-    // to maintain. Pre-Phase-B this was a one-shot `run_ntp_demo` that
+    // Step 4: announce readiness. The first NTP refresh runs inside
+    // service_loop on entry — it shares the cadence machinery with
+    // subsequent refreshes, so there is no special "boot-time" path to
+    // maintain. Pre-Phase-B this was a one-shot `run_ntp_demo` that
     // discarded the result; ADR-022 makes the response load-bearing.
-    sys::register_endpoint(UDP_ENDPOINT);
     sys::print(b"[UDP] ready on endpoint 21\n");
     sys::module_ready();
     service_loop(&mut cache, &our_mac)
