@@ -249,3 +249,25 @@ To keep the follow-up from being lost in an appendix:
 ### Verification
 
 After this change, every `SYS_OBJ_*` handler dispatches via match-arm calls (monomorphized at compile time, statically analyzable, exhaustive). The trait remains as the specification verifier targets implement against. The kernel binary contains no `dyn ObjectStore` references.
+
+## Divergence: 2026-04-30 — Principal as 32-byte AID
+
+- **Superseded by:** [ADR-025](025-principal-as-aid.md) (Principal as 32-byte AID, decoupled from key bytes)
+- **Trigger:** Pre-v1 audit of post-quantum migration cost. ML-DSA-65 keys are 1952 bytes; if "Principal IS the Ed25519 pubkey" remained the contract, the v1.5 PQ upgrade would force `sender_principal` out of the 256-byte IPC envelope ([ADR-005](005-ipc-primitives-control-and-bulk.md)) and force a redesign of the boot-sized capability tables ([ADR-008](008-boot-time-sized-object-tables.md)). [identity.md § Dynamic-Sized Field Space](../identity.md#dynamic-sized-field-space) had already declared the identity layer "algorithm-agnostic" with dynamic-sized keys — a posture this ADR's Principal definition contradicted.
+
+### What changed
+
+The ratified contract for `Principal` is now: **a 32-byte AID (Autonomic Identifier), not a public key.** The 32-byte size is architectural — fixed by the AID model, invariant under key rotation and algorithm migration. In v1, the AID bytes coincide with an Ed25519 pubkey for backward continuity (no key event log yet, no rotation, no keystore). In v1.5+, the AID is `blake3(key_event_log_inception_block)` and the actual signing key is resolved at verify time via the keystore service.
+
+The `Principal` struct in [src/ipc/mod.rs](../../src/ipc/mod.rs) renames `public_key: [u8; 32]` to `aid: [u8; 32]` and exposes two accessors: `aid()` for identity equality / IPC stamping / lookup, and `current_key_bytes()` for verifier sites. Pre-v1, `current_key_bytes()` is the identity function on `aid()`; at v1.5 its body becomes a keystore round-trip — a one-function migration instead of a five-site refactor.
+
+### What did *not* change
+
+- **The `sender_principal` wire format** stays 32 bytes ([src/ipc/mod.rs](../../src/ipc/mod.rs) `Message::sender_principal`). The 256-byte IPC envelope ([ADR-005](005-ipc-primitives-control-and-bulk.md)) is preserved without modification.
+- **`BindPrincipal` semantics.** The kernel still accepts a raw 32-byte value from userspace; it does not hash. The semantic shift is in vocabulary: those 32 bytes are now the AID, and v1 happens to use raw pubkey bytes as a v1-only AID-derivation shortcut.
+- **Bootstrap trust model.** The bootstrap Principal continues to be compile-time embedded in `bootstrap_pubkey.bin`. (The file format gains a header in a separate change so the algorithm is explicit, but the trust path is unchanged.)
+- **CambiObject author/owner fields.** Still raw 32-byte public keys per [ADR-004](004-cryptographic-integrity.md). When the keystore lands at v1.5, those fields can either continue to carry pubkeys or migrate to AIDs; that choice belongs to the keystore-service ADR, not this one.
+
+### Note on the original Principal definition above
+
+The struct shown in this ADR's "Principal: The Identity Primitive" section ([line 35](#principal-the-identity-primitive)) lists a `key_hash: [u8; 16]` FNV-1a fast-comparison field that was never implemented in the actual code (the kernel-side `Principal` only ever carried `public_key: [u8; 32]`). That field is dropped under ADR-025; comparison is by full 32-byte AID equality. Documenting here so the historical drift between the original ADR and the kernel code does not propagate further.

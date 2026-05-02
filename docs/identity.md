@@ -41,10 +41,19 @@ Daily use should be frictionless. Password or otherwise traditionally secured wo
 
 An CambiOS identity is irrevocable. A **cryptographic key pair** is generated locally, controlled exclusively by its holder, verifiable by anyone, and dependent on no external authority for its existence. The identity layer is **algorithm-agnostic** — all key material, signatures, and verification are mediated through dynamic-sized fields so the system can transition between classical and post-quantum schemes without structural changes.
 
+The identity primitive itself, however, is a **fixed 32-byte AID (Autonomic Identifier)** — separate from the underlying key bytes. This is the load-bearing decision: the AID is what identifies a Principal, the keys are what authenticate signatures *from* that Principal, and the two are decoupled so keys can rotate or change algorithm without changing the identity. See [ADR-025](adr/025-principal-as-aid.md) for the full ratification.
+
 ```
-Identity {
-    algorithm:    SignatureAlgorithm,   // which scheme produced this key
-    public_key:   Vec<u8>,             // dynamic-sized — 32 bytes (Ed25519) to 1312 bytes (ML-DSA-65)
+Principal {
+    aid:          [u8; 32],            // KERI-style identifier — fixed 32 bytes, stable across rotations
+    // The AID is computed once at inception:
+    //   v1:    aid = ed25519_public_key_bytes  (no key event log yet)
+    //   v1.5+: aid = blake3(key_event_log_inception_block)
+}
+
+Identity {  // resolved at verify time via the keystore service (post-v1)
+    algorithm:    SignatureAlgorithm,   // which scheme produced the current key
+    public_key:   Vec<u8>,              // dynamic-sized — 32 bytes (Ed25519) to 1952 bytes (ML-DSA-65)
     // private_key never stored in this struct — lives in the key store
 }
 
@@ -55,7 +64,9 @@ enum SignatureAlgorithm {
 }
 ```
 
-The public key is the identity. Anyone who holds your public key can verify that data was signed by you. No one who lacks your private key can produce a valid signature. There is no enrollment, no approval, no account creation. Generating the key pair is the act of creating the identity.
+The AID is the identity. Anyone who knows your AID can ask the keystore for your current verification key and check that data was signed by you. No one who lacks your private key can produce a valid signature. There is no enrollment, no approval, no account creation. Generating the key pair (and recording the inception event) is the act of creating the identity.
+
+In **v1**, the keystore is implicit — the AID bytes coincide with an Ed25519 public key, so resolution is the identity function. In **v1.5+**, key rotation and algorithm migration become first-class: the AID stays fixed; the keystore mapping changes. Existing signed artifacts continue to validate because the AID-to-key-history chain is preserved in the rotation log.
 
 In **dual mode**, a signature is the concatenation of a classical Ed25519 signature and a post-quantum ML-DSA-65 signature. Both must verify independently. This provides security against classical attackers today and quantum attackers in the future — an attacker must break *both* schemes to forge a signature.
 

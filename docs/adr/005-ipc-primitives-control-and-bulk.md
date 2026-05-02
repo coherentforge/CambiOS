@@ -330,3 +330,20 @@ When implementing the changes specified by this ADR, the following CLAUDE.md sec
 - **§ "Syscall Numbers"** — add the four new channel syscalls when assigned
 - **§ "Required Reading by Subsystem"** (when added) — under "If you are touching IPC" and "If you are adding a new user-space service"
 - **§ "Post-Change Review Protocol" Step 8** (when added) — channels touch page tables, so the change set affects the memory subsystem reference docs as well
+
+## Divergence: 2026-05-01 — Post-Quantum Audit (Non-Change)
+
+- **Trigger:** Pre-v1 audit of post-quantum migration. ML-DSA-65 keys are 1952 bytes; signatures are 3293 bytes. The question: does the 256-byte control envelope survive the v1.5 PQ upgrade, or does it have to grow?
+- **Conclusion:** **The 256-byte envelope is correct as specified.** No change to the wire format, no change to the per-endpoint queue sizing, no change to the Three-Layer Enforcement Pipeline.
+- **Reasoning recorded so future re-litigation has the audit trail:**
+  - **Signatures are not in the IPC hot path.** ARCSIG trailers live on ELF binaries (loader), `ObjPutSigned` signatures live in object metadata (storage). Today's IPC messages do not carry inline signatures. The largest existing message is `libfs-proto::PUT_BY_NAME` at ~201 bytes; signed-input events ([ADR-012](012-input-architecture-and-device-classes.md) tier ≥2) are 96-byte event records, with signatures travelling as separate 96-byte signature events behind the same ceiling.
+  - **`sender_principal` is fixed at 32 bytes regardless of key algorithm.** Per [ADR-025](025-principal-as-aid.md), a `Principal` is a 32-byte AID — decoupled from the underlying signing key. When ML-DSA-65 lands, the keystore swaps Ed25519 → ML-DSA-65, but the AID stays 32 bytes; the IPC stamp does not grow.
+  - **Bulk + signed payloads belong on channels, not the control envelope.** A PQ-signed artifact (large content + 3293-byte signature) routes via [§ Channels](#channels-bulk-data-path) or via `ObjectStore` references in a 256-byte control message. Growing the envelope to "make room for PQ sigs" would (a) defeat the verification-tractability rationale that motivated 256 in the first place and (b) still not solve the data-plane problem channels exist to solve.
+- **What this enables that growing the envelope would not:** A future ML-DSA-65 (or hybrid Ed25519 + ML-DSA-65) sender stamps the same `sender_principal` as today's Ed25519 sender. Recipients see the same 32-byte tag. The kernel's per-endpoint queue allocation (`MAX_ENDPOINTS × MAX_QUEUE_DEPTH × MESSAGE_SIZE`) does not change. Verification proofs over the IPC hot path remain bounded.
+- **Companion changes that landed alongside this audit (pre-v1):**
+  - [ADR-025](025-principal-as-aid.md) ratifying Principal-as-AID.
+  - `bootstrap_pubkey.bin` gains a CKEY v1 header so its algorithm is explicit at boot.
+  - ARCSIG trailer parser dispatches on (version, algo) bytes instead of byte-exact matching the legacy magic suffix.
+  - New `src/crypto/` module owns the verify boundary, dispatching on `SignatureAlgo`. Five Ed25519 call sites now route through it.
+  - `Principal::aid()` / `Principal::current_key_bytes()` accessors split identity from verify-input — at v1.5, only `current_key_bytes()`'s body changes.
+- **Revisit when:** identity.md Phase 1.5 lands and the keystore service ADR is being designed. At that point, re-confirm the 256-byte envelope still holds (it should — the audit reasoning above does not depend on which algorithm the keystore returns).
