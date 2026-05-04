@@ -6,7 +6,7 @@
 //! Per [ADR-013](../../../docs/adr/013-riscv64-architecture-support.md)
 //! Decision 5, the PLIC is the sole platform-wide router for *device*
 //! interrupts on RISC-V. Timers ride CLINT-via-SBI (ADR-013 Decision
-//! 4); IPIs will ride SBI too (R-5). The PLIC lives entirely in MMIO
+//! 4); IPIs ride SBI too. The PLIC lives entirely in MMIO
 //! and is discovered at boot from the DTB's `/soc/plic@*` node.
 //!
 //! ## Register layout (standard SiFive-derived PLIC)
@@ -26,11 +26,11 @@
 //!
 //! A "context" is `(hart, privilege_level)`. On QEMU virt the layout
 //! is `hart N M-mode = context 2N`, `hart N S-mode = context 2N + 1`.
-//! For single-hart boot on hart 0, S-mode context = 1. Phase R-5 will
-//! generalize to all harts and revisit context mapping for platforms
-//! that skip M-mode contexts (some embedded cores).
+//! For single-hart boot on hart 0, S-mode context = 1. Multi-hart
+//! support generalizes to all harts and revisits context mapping for
+//! platforms that skip M-mode contexts (some embedded cores).
 //!
-//! ## Phase R-3.d scope
+//! ## Module scope
 //!
 //! This module owns:
 //! - [`init`] — map the MMIO, clear all priorities, threshold = 0,
@@ -40,13 +40,13 @@
 //! - [`claim`] / [`complete`] — the hardware handshake.
 //! - [`dispatch_pending`] — one-shot entry point from the trap vector:
 //!   claim → `crate::INTERRUPT_ROUTER` lookup (`try_lock` — lock
-//!   position 8) → inline UART-RX fallback for R-3.d → complete.
+//!   position 8) → inline UART-RX fallback → complete.
 //!
 //! The [`INTERRUPT_ROUTER`] integration is forward-compatible: once a
-//! user-space driver registers a TaskId for an IRQ (R-3.f / R-4+),
-//! the dispatch path sends it the [`InterruptContext`] via the
-//! existing IPC machinery, matching x86_64/AArch64. Until then the
-//! inline UART path provides the R-3.d milestone signal.
+//! user-space driver registers a TaskId for an IRQ, the dispatch path
+//! sends it the [`InterruptContext`] via the existing IPC machinery,
+//! matching x86_64/AArch64. Until then the inline UART path provides
+//! a working signal.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -85,7 +85,7 @@ const MAX_SOURCES: u32 = 128;
 
 /// SCAFFOLDING: hart 0 S-mode context on QEMU virt (and standard
 /// SiFive PLIC context ordering: context 2N = hart N M-mode, 2N+1 =
-/// hart N S-mode). R-5 generalizes once we bring up APs.
+/// hart N S-mode).
 /// Why: single-hart boot targets hart 0; S-mode = context 1.
 /// Replace when: R-5 wakes APs — context must be computed per hart
 ///   or read from the DTB `interrupts-extended` property on the PLIC
@@ -105,7 +105,6 @@ static PLIC_MMIO_VBASE: AtomicU64 = AtomicU64::new(0);
 static PLIC_MMIO_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Hart S-mode context used by this kernel. Zero if PLIC is not live.
-/// R-5 revisits when multiple harts start taking IRQs.
 static S_CONTEXT: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
@@ -169,7 +168,7 @@ fn claim_offset(context: u32) -> u64 {
 // Initialization
 // ============================================================================
 
-/// Map the PLIC MMIO region into kernel space (via R-3.a's
+/// Map the PLIC MMIO region into kernel space (via
 /// `early_map_mmio`), reset all per-source priorities, clear the
 /// S-mode context's enable bitmap, set threshold = 0 (accept any
 /// priority ≥ 1), and enable `sie.SEIE` so S-mode takes external
@@ -340,11 +339,11 @@ pub fn complete(source_id: u32) {
 /// Console IRQ — the source ID the kernel treats as "read a byte from
 /// the primary UART inline." Set by kmain after reading
 /// `BootInfo::console_irq` from the DTB; zero means "no inline
-/// handling." Phase R-3.d diagnostic — once a real console driver
+/// handling." Diagnostic path — once a real console driver
 /// registers in [`INTERRUPT_ROUTER`], we delete the inline path.
 static CONSOLE_IRQ: AtomicU32 = AtomicU32::new(0);
 
-/// Record the console IRQ for inline R-3.d handling. Called once
+/// Record the console IRQ for inline diagnostic handling. Called once
 /// during kmain wiring.
 pub fn set_console_irq(irq: u32) {
     CONSOLE_IRQ.store(irq, Ordering::Release);
@@ -372,7 +371,7 @@ pub unsafe fn dispatch_pending() {
         // because the router's lock (position 8) sits above anything
         // we hold on the interrupt path. If contended, we skip the
         // lookup and fall through to inline handling; the router
-        // state is observational for R-3.d (no driver is registered
+        // state is observational (no driver is registered
         // yet so `lookup` would return `None` anyway).
         let routed = crate::INTERRUPT_ROUTER
             .try_lock()
@@ -390,7 +389,7 @@ pub unsafe fn dispatch_pending() {
                 source_id,
             );
         } else if source_id == CONSOLE_IRQ.load(Ordering::Acquire) && source_id != 0 {
-            // R-3.d diagnostic: read the waiting byte and log it.
+            // Diagnostic: read the waiting byte and log it.
             // Single-key echo, no line editing — this is proof the
             // PLIC path works end-to-end, not a console driver.
             if let Some(byte) = crate::io::read_byte() {

@@ -6,7 +6,7 @@
 //! Single entry point for all exceptions and interrupts, installed at
 //! `stvec` with MODE=0 (direct). `scause` distinguishes what happened.
 //!
-//! ## Phase R-4.a scope: U↔S-capable vector
+//! ## U↔S-capable vector scope
 //!
 //! Handles traps from both S-mode (kernel preemption, kernel-side
 //! breakpoints) and U-mode (`ecall` syscalls, page faults from user
@@ -285,10 +285,10 @@ const SCAUSE_CODE_MASK: u64 = (1 << 63) - 1;
 /// Interrupt cause code — supervisor timer.
 const IRQ_TIMER: u64 = 5;
 
-/// Interrupt cause code — supervisor external (PLIC, wired in R-3.d).
+/// Interrupt cause code — supervisor external (PLIC).
 const IRQ_EXTERNAL: u64 = 9;
 
-/// Interrupt cause code — supervisor software (IPI, wired in R-5).
+/// Interrupt cause code — supervisor software (IPI).
 const IRQ_SOFTWARE: u64 = 1;
 
 // ============================================================================
@@ -489,7 +489,7 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
             IRQ_EXTERNAL => {
                 // PLIC-routed device IRQ. `dispatch_pending` drains
                 // every pending source: claim → router lookup (or
-                // R-3.d inline UART fallback) → complete.
+                // inline UART fallback) → complete.
                 //
                 // SAFETY: trap handler runs with interrupts masked;
                 // the PLIC driver is safe to call from ISR context
@@ -501,7 +501,7 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
                 unsafe { super::plic::dispatch_pending(); }
             }
             IRQ_SOFTWARE => {
-                // R-5.b: SBI-delivered S-mode software interrupt.
+                // SBI-delivered S-mode software interrupt.
                 // Currently the only producer is `tlb::broadcast_
                 // shootdown` on other harts — drain the payload +
                 // clear sip.SSIP + ACK.
@@ -517,11 +517,10 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
         }
     } else {
         // Synchronous exception. Everything listed below — except the
-        // ECALL-from-U syscall path — is a kernel bug at this stage
-        // (R-3.b+c milestone): user code isn't running yet for most
-        // arms, so ECALL-from-U is the only legitimate user-originated
-        // entry, and any page fault / illegal instruction in S-mode
-        // signals a kernel problem.
+        // ECALL-from-U syscall path — is a kernel bug: ECALL-from-U is
+        // the only legitimate user-originated entry, and any page
+        // fault / illegal instruction in S-mode signals a kernel
+        // problem.
         //
         // SAFETY: `saved` was populated by the trap vector before this
         // function was called; the pointer is valid for the duration
@@ -531,7 +530,7 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
         // before classify_sync_fault, which would otherwise have to
         // model the syscall path.
         if code == 8 {
-            // ECALL from U-mode — the R-4 syscall entry point.
+            // ECALL from U-mode — the syscall entry point.
             // The Rust-side handler extracts a7/a0..a5 from the
             // SavedContext, dispatches, writes the return value back
             // to a0, and bumps sepc past the 4-byte ecall so sret

@@ -38,7 +38,7 @@ pub mod riscv64;
 pub use riscv64::*;
 
 // ============================================================================
-// Portable TLB shootdown wrapper (Phase 3.2d.iii)
+// Portable TLB shootdown wrapper
 // ============================================================================
 
 /// Invalidate a range of pages across all CPUs.
@@ -67,12 +67,12 @@ pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
     aarch64::tlb::shootdown_range(virt_addr, page_count as usize);
 }
 
-/// RISC-V variant: local `sfence.vma` only in Phase R-1/R-3.
-/// Phase R-5 will extend this to broadcast via SBI IPI across harts.
+/// RISC-V variant: local `sfence.vma` plus cross-hart broadcast via
+/// SBI IPI when other harts are online.
 #[cfg(target_arch = "riscv64")]
 #[inline]
 pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
-    // SAFETY: Local sfence.vma is safe from S-mode. Cross-hart coherence
-    // lands in Phase R-5 (ADR-013 Decision 5) via SBI IPI.
+    // SAFETY: Local sfence.vma is safe from S-mode. Cross-hart
+    // coherence is provided via SBI IPI per ADR-013 Decision 5.
     riscv64::tlb::shootdown_range(virt_addr, page_count as usize);
 }

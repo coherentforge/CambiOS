@@ -23,15 +23,6 @@
 //! | GS base (per-CPU)  | TPIDR_EL1          | `tp` register + `sscratch`    |
 //! | TLB shootdown IPI  | TLBI broadcast     | SBI IPI + local sfence.vma    |
 //!
-//! ## Phase status
-//!
-//! Phase R-1 lands the skeleton: SavedContext layout, stub context
-//! primitives (panic until Phase R-3), percpu via `tp` register, trap
-//! vector install stub, minimal PLIC/TLB wrappers. Context switching
-//! proper, timer ticks, and U-mode entry come in Phase R-3 / R-4. See
-//! the plan file at `/Users/jasonricca/.claude/plans/
-//! melodic-tumbling-muffin.md`.
-
 pub mod entry;
 pub mod paging;
 pub mod percpu;
@@ -281,12 +272,12 @@ core::arch::global_asm!(
 
 /// Full register snapshot captured on trap entry.
 ///
-/// The RISC-V trap handler (in Phase R-3) saves all 32 GPRs plus
-/// `sepc` and `sstatus` into this struct on the kernel stack, then
-/// passes its SP to the portable scheduler. On trap exit the same
-/// struct is restored and `sret` returns to user or kernel mode.
+/// The RISC-V trap handler saves all 32 GPRs plus `sepc` and
+/// `sstatus` into this struct on the kernel stack, then passes its
+/// SP to the portable scheduler. On trap exit the same struct is
+/// restored and `sret` returns to user or kernel mode.
 ///
-/// Layout (byte offsets used by assembly in Phase R-3):
+/// Layout (byte offsets used by trap-vector assembly):
 /// ```text
 ///   0..256  gpr[0..32]   (x0..x31 — x0 hardwired zero, slot unused)
 /// 256..264  sepc
@@ -625,11 +616,8 @@ extern "C" fn yield_inner(current_sp: u64) -> u64 {
 
 /// Park the current hart until the next interrupt.
 ///
-/// Masks S-mode interrupts, sets SP to the per-CPU kernel stack, then
-/// loops on `wfi`. The interrupt handler will resume scheduling when
-/// the next timer tick fires (Phase R-3 onward).
-///
-/// For Phase R-1 this is simply `wfi` in a loop — no scheduling yet.
+/// Loops on `wfi` from S-mode. The trap handler resumes scheduling
+/// when the next timer tick fires.
 ///
 /// # Safety
 /// `kernel_stack_top` must point to the top of a valid kernel stack for
@@ -651,8 +639,8 @@ pub fn halt_until_preempted(_kernel_stack_top: u64) -> ! {
 
 /// Stashed pointer to an on-stack SavedContext, set by the yield path
 /// when it needs the scheduler to inspect the current trap frame.
-/// Mirrors the AArch64 SWITCH_CONTEXT_PTR pattern. Phase R-3 wires it
-/// through the trap handler.
+/// Mirrors the AArch64 SWITCH_CONTEXT_PTR pattern. Wired via the
+/// trap handler.
 static SWITCH_CONTEXT_PTR: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 

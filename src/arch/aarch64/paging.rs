@@ -21,7 +21,7 @@
 //!   and the internal `DEVICE_MEMORY_FLAG` sentinel used by
 //!   `make_leaf_pte` to pick AttrIndx
 //!
-//! Refactored out of `src/memory/mod.rs` in Phase R-3.a (see
+//! Refactored out of `src/memory/mod.rs` (see
 //! [ADR-013](../../../docs/adr/013-riscv64-architecture-support.md)
 //! Divergence) so the RISC-V port can plug a Sv48 sibling into the same
 //! shared module without duplicating the walk logic.

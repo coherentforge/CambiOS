@@ -27,7 +27,7 @@
 //!
 //! `sscratch` holds the kernel PerCpu* when running in U-mode, and zero
 //! when running in S-mode (zero signals "trap came from S-mode" so the
-//! trap handler knows not to swap — Phase R-3 wires this).
+//! trap handler knows not to swap).
 
 /// Maximum number of harts supported. Matches x86_64 / AArch64 for
 /// consistency across architectures.
@@ -67,7 +67,7 @@ pub struct PerCpu {
     current_task_id: u32,
     /// Interrupt nesting depth (0 = thread context, >0 = trap context).
     interrupt_depth: u32,
-    /// Phase R-4 trap-entry scratch: on U→S entry the vector stashes
+    /// Trap-entry scratch: on U→S entry the vector stashes
     /// the user's `sp` here (via `sd sp, 40(tp)`) before loading the
     /// kernel stack from `kernel_stack_top`, then immediately copies
     /// it back into the SavedContext's gpr[2] slot once the trap

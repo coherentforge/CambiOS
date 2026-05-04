@@ -7,7 +7,7 @@
 //! which operates on the **local hart only**. Unlike AArch64's
 //! hardware-broadcast TLBI or x86_64's IPI + invlpg combo, remote
 //! invalidation on RISC-V requires explicit software coordination
-//! via SBI IPI (Phase R-5.b) or, where available, the Svinval
+//! via SBI IPI or, where available, the Svinval
 //! extension's `sinval.vma` (not wired yet — probed but unused).
 //!
 //! ## sfence.vma operand forms
@@ -21,7 +21,7 @@
 //! kernel-mode fence). That decision is revisited if/when the kernel
 //! grows multi-process ASID tagging.
 //!
-//! ## Remote shootdown protocol (Phase R-5.b)
+//! ## Remote shootdown protocol
 //!
 //! One shootdown is in flight at a time, serialized by
 //! `SHOOTDOWN_LOCK`. The initiator:
@@ -208,7 +208,7 @@ fn broadcast_shootdown(virt_start: u64, num_pages: usize) {
             // correctness bar is remote-flush-or-stall. Log and spin
             // below will never complete — but the system is broken
             // anyway if SBI IPI is unavailable. The fallback path
-            // (Svinval or direct CLINT MMIO) is R-6 scope.
+            // (Svinval or direct CLINT MMIO) is a future fallback.
             crate::println!(
                 "⚠ sbi_send_ipi failed: err={} targets={:#x}",
                 err,

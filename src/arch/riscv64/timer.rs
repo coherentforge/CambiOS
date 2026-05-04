@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Timer — RISC-V (SBI-mediated, Phase R-3.c)
+//! Timer — RISC-V (SBI-mediated)
 //!
 //! Per [ADR-013](../../../docs/adr/013-riscv64-architecture-support.md)
 //! Decision 4, CambiOS uses the SBI Timer Extension rather than
@@ -112,9 +112,10 @@ pub unsafe fn rearm() {
     unsafe { sbi::sbi_set_timer(deadline) };
 }
 
-// The R-3.b+c diagnostic `on_timer_interrupt` (rearm + tick counter +
-// per-50-tick println) was superseded in R-3.f: the trap handler now
-// routes `IRQ_TIMER` directly to `super::timer_isr_inner` which rearms
+// The early-bring-up diagnostic `on_timer_interrupt` (rearm + tick
+// counter + per-50-tick println) was superseded: the trap handler
+// now routes `IRQ_TIMER` directly to `super::timer_isr_inner` which
+// rearms
 // via `rearm()` above and delegates scheduling to
 // `crate::scheduler::on_timer_isr`. Keep `init` / `rearm` here as the
 // public timer surface; context-switch decisions live in the portable

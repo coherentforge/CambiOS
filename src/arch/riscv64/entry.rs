@@ -9,8 +9,8 @@
 //!   a0 = hart id (the booting hart's id, may be non-zero on QEMU)
 //!   a1 = physical address of the Flattened Device Tree (DTB)
 //!
-//! Phase R-2 responsibilities of `_start`:
-//!   1. Park secondary harts on `wfi` (SMP wake is Phase R-5).
+//! Responsibilities of `_start`:
+//!   1. Park secondary harts on `wfi` (BSP-only path; APs wake via SBI HSM later).
 //!   2. Set up a small boot stack in .bss (`BOOT_STACK`).
 //!   3. Call Rust [`riscv64_fill_boot_page_tables`] to populate the
 //!      Sv48 boot page tables (identity map + HHDM + higher-half
@@ -62,8 +62,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 ///
 /// SCAFFOLDING: small fixed boot stack used only by the early entry
 /// path on the BSP.
-/// Why: 16 KiB matches the AArch64 boot stack convention; Phase R-3
-///      scheduler creates per-task stacks.
+/// Why: 16 KiB matches the AArch64 boot stack convention; the
+///      scheduler creates per-task stacks once it's live.
 /// Replace when: per-CPU / per-task kernel stacks land.
 pub const BOOT_STACK_SIZE: usize = 16 * 1024;
 
@@ -71,7 +71,7 @@ pub const BOOT_STACK_SIZE: usize = 16 * 1024;
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
 
 // ============================================================================
-// AP (Application Processor) bootstrap — Phase R-5
+// AP (Application Processor) bootstrap
 // ============================================================================
 
 /// SCAFFOLDING: maximum number of APs we can bootstrap simultaneously.
@@ -278,7 +278,7 @@ pub unsafe extern "C" fn riscv64_fill_boot_page_tables() -> u64 {
 // - `wfi`, `csrci sstatus, _`, `csrw satp, _`, `sfence.vma` are all
 //   safe S-mode instructions.
 // - Hart-id parking ("only hart 0 boots") matches QEMU virt's default;
-//   Phase R-5 will read the BSP hart id from the DTB instead.
+//   kmain reads the actual BSP hart id from the DTB after paging is on.
 core::arch::global_asm!(
     ".section .text.boot, \"ax\"",
     ".global _start",
@@ -286,7 +286,7 @@ core::arch::global_asm!(
     "_start:",
     // Disable S-mode interrupts (SIE = bit 1 of sstatus).
     "csrci sstatus, 0x2",
-    // Park any hart that isn't hart 0 (Phase R-5 reads BSP from DTB).
+    // Park any hart that isn't hart 0 (assembly entry hardcodes hart 0; kmain reads actual BSP from DTB).
     "bnez a0, .Lpark_hart",
     // Preserve OpenSBI-provided args in callee-saved regs across
     // the Rust call below. Use s2/s3 — not s0/s1 — because on
@@ -294,7 +294,7 @@ core::arch::global_asm!(
     // clobber any value stashed in s0. (Historic BSP-only bug: the
     // hart_id save landed in s0 and got overwritten; BSP happened
     // to boot on hart 0 so the observable value always matched. The
-    // R-5.a AP path has hart_id != 0 and exposed the bug.)
+    // AP path has hart_id != 0 and exposed the bug.)
     "mv s2, a0",                    // s2 = hart_id
     "mv s3, a1",                    // s3 = dtb_phys
     // Set up boot stack: sp = &BOOT_STACK + BOOT_STACK_SIZE.

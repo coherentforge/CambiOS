@@ -7,10 +7,7 @@
 //! 4 KiB / 48-bit paging module in [`crate::memory::paging`] calls into
 //! this file whenever it needs to inspect or construct a PTE. See
 //! [ADR-013](../../../docs/adr/013-riscv64-architecture-support.md) for
-//! the decisions this module encodes, and the plan-file note at
-//! `/Users/jasonricca/.claude/plans/melodic-tumbling-muffin.md` for the
-//! R-3.a ordering rationale (split the shared cfg before the first
-//! consumer — PLIC in R-3.d — lands).
+//! the decisions this module encodes.
 //!
 //! ## Sv48 PTE layout
 //!
@@ -109,7 +106,7 @@ pub fn make_leaf_pte(phys: u64, flags: flags::PageFlags) -> u64 {
 /// `sfence.vma zero, zero` flushes all TLB entries for all ASIDs on the
 /// current hart — broad, but correct, and the shared paging module
 /// installs one mapping at a time so the cost is a wash. Remote-hart
-/// invalidation lands in Phase R-5 via SBI IPI.
+/// invalidation goes via SBI IPI when other harts are online.
 ///
 /// # Safety
 /// Must be called from S-mode.
