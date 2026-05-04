@@ -186,7 +186,7 @@ impl VmaTracker {
 }
 
 // ============================================================================
-// Phase 3.2a: MAX_PROCESSES is no longer a compile-time constant.
+// MAX_PROCESSES is no longer a compile-time constant.
 //
 // The number of process slots is now computed at boot from the active
 // tier policy and the available-memory figure — see
@@ -233,7 +233,7 @@ pub enum ProcessCreateError {
 /// allocator no longer lives inline — it's constructed in place at
 /// the start of each process's heap by [`ProcessDescriptor::new`] and
 /// accessed via [`ProcessDescriptor::allocator_mut`]. See the module
-/// doc and ADR-008 Phase 3.2a follow-up for the rationale.
+/// doc and ADR-008 for the rationale.
 ///
 /// # Invariants (for formal verification)
 ///
@@ -258,7 +258,7 @@ pub enum ProcessCreateError {
 pub struct ProcessDescriptor {
     /// Physical base address of this process's heap (for page tables).
     /// The first `size_of::<BuddyAllocator>()` bytes at this address hold
-    /// the process's buddy allocator state (Phase 3.2a follow-up).
+    /// the process's buddy allocator state.
     pub phys_base: u64,
     /// HHDM-mapped virtual base (for kernel-side access).
     /// `virt_base as *mut BuddyAllocator` is a valid, initialized pointer
@@ -277,13 +277,13 @@ impl ProcessDescriptor {
     /// heap region from the frame allocator and placing a fresh
     /// `BuddyAllocator` in the first few KB of that heap.
     ///
-    /// Phase 3.2a: heap is no longer at a deterministic PID-derived
-    /// physical address. Each process gets a fresh contiguous region
-    /// from the frame allocator, which means process exit MUST free
-    /// it via [`ProcessDescriptor::reclaim_heap`] to avoid a leak.
+    /// Heap is not at a deterministic PID-derived physical address —
+    /// each process gets a fresh contiguous region from the frame
+    /// allocator, which means process exit MUST free it via
+    /// [`ProcessDescriptor::reclaim_heap`] to avoid a leak.
     ///
-    /// Phase 3.2a follow-up (Item 1): the per-process `BuddyAllocator`
-    /// lives in the heap itself at `virt_base..virt_base + size_of::<BuddyAllocator>()`,
+    /// The per-process `BuddyAllocator` lives in the heap itself at
+    /// `virt_base..virt_base + size_of::<BuddyAllocator>()`,
     /// constructed via `core::ptr::write` with
     /// `new_with_reserved_prefix` so user allocations skip the
     /// allocator's own state. This shrinks `SLOT_OVERHEAD` (the per-
@@ -412,8 +412,8 @@ impl ProcessDescriptor {
     ///
     /// Returns the number of VMA regions reclaimed (for diagnostics).
     ///
-    /// Phase 3.2d.ii (Roadmap item 17): closes the VMA region leak
-    /// that previously occurred on process exit.
+    /// Closes the VMA region leak that previously occurred on
+    /// process exit.
     #[cfg(not(test))]
     pub fn reclaim_user_vmas(
         &mut self,
@@ -519,7 +519,7 @@ impl ProcessDescriptor {
 /// Process table — slice-backed storage from the kernel object table
 /// region.
 ///
-/// Phase 3.2a: storage is a `&'static mut [Option<ProcessDescriptor>]`
+/// Storage is a `&'static mut [Option<ProcessDescriptor>]`
 /// slice handed in from `memory::object_table::init()`. The slice
 /// length equals `config::num_slots()`, computed at boot from the
 /// SCAFFOLDING: number of recent process exits to remember for
@@ -591,8 +591,8 @@ impl RecentExitsRing {
 
 /// active tier policy and available RAM. See ADR-008.
 ///
-/// Phase 3.2c: per-slot generation counters prevent stale `ProcessId`
-/// references from targeting a reused slot. The generation for a slot
+/// Per-slot generation counters prevent stale `ProcessId` references
+/// from targeting a reused slot. The generation for a slot
 /// is incremented in `destroy_process` and stamped into the
 /// `ProcessId` returned by `create_process`. Lookups compare the
 /// caller's `ProcessId.generation()` against the stored generation.
@@ -600,7 +600,7 @@ pub struct ProcessTable {
     processes: &'static mut [Option<ProcessDescriptor>],
     /// Cached HHDM offset for creating new processes
     hhdm_offset: u64,
-    /// Per-slot generation counter (Phase 3.2c, ADR-008 § Open Problem 9).
+    /// Per-slot generation counter (ADR-008 § Open Problem 9).
     /// Heap-allocated at construction, one `u32` per slot. Incremented
     /// in `destroy_process` when a slot becomes free. The current
     /// generation is stamped into the `ProcessId` returned by
@@ -623,8 +623,8 @@ impl ProcessTable {
     /// (slice pointer, length, hhdm_offset, generations) lands there —
     /// the actual slot storage lives in the object table region.
     ///
-    /// Phase 3.2c: also allocates a heap-backed generation counter array,
-    /// one `u32` per slot, all starting at 0.
+    /// Also allocates a heap-backed generation counter array, one
+    /// `u32` per slot, all starting at 0.
     pub fn from_object_slice(
         processes: &'static mut [Option<ProcessDescriptor>],
         hhdm_offset: u64,
@@ -656,9 +656,9 @@ impl ProcessTable {
     /// Find a free slot by linear scan. Returns the slot index, or
     /// `None` if all slots are occupied.
     ///
-    /// Phase 3.2c: replaces the external `NEXT_PROCESS_ID` atomic.
-    /// Linear scan is O(n) in `num_slots` but bounded and
-    /// verification-friendly (no free-list state to reason about).
+    /// Replaces the external `NEXT_PROCESS_ID` atomic. Linear scan is
+    /// O(n) in `num_slots` but bounded and verification-friendly (no
+    /// free-list state to reason about).
     fn find_free_slot(&self) -> Option<usize> {
         self.processes.iter().position(|slot| slot.is_none())
     }
@@ -671,16 +671,16 @@ impl ProcessTable {
 
     /// Create a new process and allocate its heap region.
     ///
-    /// Phase 3.2c: the process table allocates the slot internally via
-    /// linear scan and stamps the current generation counter into the
-    /// returned `ProcessId`. The caller no longer passes a ProcessId
-    /// — it receives one. This closes the ambient-authority gap where
-    /// any caller could pick an arbitrary slot index.
+    /// The process table allocates the slot internally via linear scan
+    /// and stamps the current generation counter into the returned
+    /// `ProcessId`. The caller no longer passes a ProcessId — it
+    /// receives one. This closes the ambient-authority gap where any
+    /// caller could pick an arbitrary slot index.
     ///
     /// Failure modes:
     /// - `"No free process slots"` — all slots occupied
     /// - `"Failed to allocate process heap"` — frame allocator
-    ///   exhausted (after Phase 3.2a, heaps are allocated on demand)
+    ///   exhausted (heaps are allocated on demand)
     /// - `"Failed to allocate page table"` — per-process PML4
     ///   allocation failed
     pub fn create_process(
@@ -750,7 +750,7 @@ impl ProcessTable {
 
     /// Get process physical heap base address from the stored descriptor.
     ///
-    /// Phase 3.2a: heaps are no longer at a deterministic
+    /// Heaps are not at a deterministic
     /// `PROCESS_HEAP_BASE + pid * HEAP_SIZE` address — the base is
     /// whatever the frame allocator handed us at creation time. This
     /// getter reads the stored `phys_base` field.
@@ -775,8 +775,7 @@ impl ProcessTable {
 
     /// Destroy a process and reclaim all its kernel-managed resources.
     ///
-    /// Phase 3.2d.ii (Roadmap item 17): full lifecycle cleanup. The
-    /// reclamation order is important:
+    /// Full lifecycle cleanup. The reclamation order is important:
     ///
     /// 1. **VMA regions** — unmap every VMA-tracked user page and free
     ///    its physical frame. Must come first because unmapping
@@ -786,7 +785,7 @@ impl ProcessTable {
     ///    Must come after VMA reclaim (leaf pages are gone).
     /// 3. **Heap** — free the contiguous heap region (existing path).
     /// 4. **Generation increment** — prevent stale ProcessId from
-    ///    targeting the reused slot (Phase 3.2c).
+    ///    targeting the reused slot.
     ///
     /// Kernel stack deallocation is deferred to a separate cleanup
     /// pass (bounded leak, requires scheduler-level deferred-free
@@ -1009,7 +1008,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 3.2d.ii: reclaim_user_vmas tests
+    // reclaim_user_vmas tests
     //
     // These use the #[cfg(test)] stub which drains the VMA tracker
     // without touching real page tables.
