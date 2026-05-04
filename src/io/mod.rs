@@ -156,7 +156,7 @@ impl fmt::Write for Ns16550 {
 
 /// QEMU `virt` machine NS16550 physical base address. Translated
 /// through HHDM at init time. In production the address is discovered
-/// from the DTB (Phase R-1 boot stub) — this constant is the default.
+/// from the DTB at boot — this constant is the default.
 #[cfg(target_arch = "riscv64")]
 const NS16550_PHYS_BASE: u64 = 0x1000_0000;
 
@@ -230,7 +230,7 @@ macro_rules! println {
 /// UART's IRQ line, which the PLIC routes to S-mode external
 /// interrupts. The trap handler then reads the byte via [`read_byte`]
 /// inside `plic::dispatch_pending` while the first real console
-/// driver is not yet running (R-3.d diagnostic path).
+/// driver is not yet running (diagnostic path).
 ///
 /// x86_64 and AArch64 do not need this — their device IRQ paths are
 /// wired via different driver code; the console on those arches stays
