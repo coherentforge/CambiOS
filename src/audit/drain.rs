@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Global audit ring buffer and drain logic (Phase 3.3b, ADR-007).
+//! Global audit ring buffer and drain logic (ADR-007).
 //!
 //! The `AuditRing` receives events from per-CPU staging buffers via
 //! `drain_tick()`, called from the BSP timer ISR at 100 Hz. User-space

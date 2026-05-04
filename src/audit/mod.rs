@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Kernel audit event infrastructure (Phase 3.3, ADR-007).
+//! Kernel audit event infrastructure (ADR-007).
 //!
 //! Provides an internal observability surface for the policy service and
 //! AI watcher. Events are emitted from syscall handlers and the loader
@@ -648,7 +648,7 @@ pub const FLAG_SAMPLED: u8 = 0x01;
 /// enough for pattern detection.
 ///
 /// Replace when: policy service can dynamically adjust sampling rate via
-/// a control IPC message (Phase 3.4+).
+/// a control IPC message.
 pub const AUDIT_IPC_SAMPLE_RATE: u32 = 100;
 
 /// Emit an audit event to the current CPU's staging buffer.
@@ -715,7 +715,7 @@ pub fn emit(event: RawAuditEvent) {
 
     // Under test/fuzzing, emit is a no-op — there is no per-CPU hardware.
     // Also a no-op on riscv64 until the audit per-CPU staging is wired
-    // through the RISC-V backend (post-R-5 work — see ADR-013).
+    // through the RISC-V backend (see ADR-013).
     #[cfg(any(test, fuzzing, target_arch = "riscv64"))]
     {
         let _ = event;
