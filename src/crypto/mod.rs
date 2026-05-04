@@ -11,8 +11,8 @@
 //! its shape.
 //!
 //! See [ADR-025](../../docs/adr/025-principal-as-aid.md) (Principal-as-AID)
-//! and [identity.md](../../docs/identity.md) Phase 1.5 for the post-quantum
-//! roadmap this boundary protects.
+//! and [identity.md](../../docs/identity.md) for the post-quantum roadmap
+//! this boundary protects.
 //!
 //! ## Convention compliance
 //! - **No dynamic dispatch.** [`SignatureAlgo`] is `#[repr(u8)]` and
@@ -81,7 +81,7 @@ pub fn verify(
             _ => false,
         },
         SignatureAlgo::MlDsa65 => {
-            // Deferred: ML-DSA-65 verification ([identity.md](../../docs/identity.md) Phase 1.5).
+            // Deferred: ML-DSA-65 verification (see [identity.md](../../docs/identity.md)).
             // Why: PQ crate selection unresolved; 256 KB boot stack budget for lattice ops needs measurement.
             // Revisit when: identity.md Phase 1.5 lands (post-v1).
             false
@@ -133,9 +133,9 @@ mod tests {
         ));
     }
 
-    /// The `MlDsa65` arm returns `false` until v1.5 lands. This test will
-    /// flip to `assert!(...)` and gain a real-key fixture when ML-DSA-65 is
-    /// implemented per identity.md Phase 1.5.
+    /// The `MlDsa65` arm returns `false` until ML-DSA-65 is implemented.
+    /// This test will flip to `assert!(...)` and gain a real-key fixture
+    /// when that lands per identity.md.
     #[test]
     fn verify_mldsa65_arm_returns_false_pre_v1_5() {
         let key = [0u8; 32];
