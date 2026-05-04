@@ -71,7 +71,7 @@ use memory::frame_allocator::FrameAllocator;
 // 2. PER_CPU_TIMER[*] (tick counting)
 // 3. IPC_MANAGER (message queues)
 // 4. CAPABILITY_MANAGER (access control)
-// 5. CHANNEL_MANAGER (shared-memory channel table)      [Phase 3.2d.iii]
+// 5. CHANNEL_MANAGER (shared-memory channel table)
 // 6. PROCESS_TABLE (process metadata)                   [was 5]
 // 7. FRAME_ALLOCATOR (physical page allocation)         [was 6]
 // 8. INTERRUPT_ROUTER (interrupt routing)               [was 7]
@@ -171,8 +171,7 @@ pub fn local_timer() -> &'static IrqSpinlock<Option<Timer>> {
 ///
 /// # Safety
 /// `tp` register must have been initialized via `percpu::init_bsp` or
-/// `percpu::init_ap`. True after the S-mode boot stub (Phase R-1)
-/// runs.
+/// `percpu::init_ap`. True after the S-mode boot stub runs.
 #[cfg(target_arch = "riscv64")]
 pub fn local_scheduler() -> &'static IrqSpinlock<Option<Box<Scheduler>>> {
     // SAFETY: `tp` points at a valid PerCpu after boot; cpu_id is a pure read.
@@ -309,9 +308,9 @@ pub fn online_cpu_count() -> usize {
     ONLINE_CPU_COUNT.load(Ordering::Acquire) as usize
 }
 
-// Phase 3.2c: NEXT_PROCESS_ID removed. ProcessTable::create_process
-// now allocates slots internally via linear scan with generation
-// stamping. See ADR-008 § Open Problem 9.
+// NEXT_PROCESS_ID removed. ProcessTable::create_process now allocates
+// slots internally via linear scan with generation stamping.
+// See ADR-008 § Open Problem 9.
 
 /// Minimum tick interval between balance attempts (1 second at 100Hz).
 const BALANCE_INTERVAL_TICKS: u64 = 100;
@@ -410,7 +409,7 @@ pub fn try_load_balance() {
 
 /// Bootstrap Principal — the first identity in the system.
 ///
-/// Generated at boot from a deterministic seed (Phase 0) or device entropy.
+/// Generated at boot from a deterministic seed or device entropy.
 /// Used to restrict BindPrincipal syscall: only the bootstrap Principal can
 /// bind identities to processes. Written once during boot, read-only after.
 pub static BOOTSTRAP_PRINCIPAL: BootstrapPrincipal = BootstrapPrincipal::new();
@@ -532,7 +531,7 @@ pub static SHARDED_IPC: ipc::ShardedIpcManager = ipc::ShardedIpcManager::new();
 pub static CAPABILITY_MANAGER: Spinlock<Option<Box<CapabilityManager>>> = Spinlock::new(None);
 
 /// Channel manager — shared-memory channel table (lock position 5).
-/// Initialized at boot after CAPABILITY_MANAGER (Phase 3.2d.iii).
+/// Initialized at boot after CAPABILITY_MANAGER.
 pub static CHANNEL_MANAGER: Spinlock<Option<Box<ipc::channel::ChannelManager>>> = Spinlock::new(None);
 
 pub static PROCESS_TABLE: Spinlock<Option<Box<ProcessTable>>> = Spinlock::new(None);
@@ -604,7 +603,7 @@ pub static REPLY_ENDPOINT: [core::sync::atomic::AtomicU32; 256] =
     [const { core::sync::atomic::AtomicU32::new(0) }; 256];
 
 // ============================================================================
-// Policy service infrastructure (Phase 3.4, ADR-006)
+// Policy service infrastructure (ADR-006)
 // ============================================================================
 
 /// Whether the policy service has been identified and the upcall path is active.
