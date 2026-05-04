@@ -2,7 +2,7 @@
 
 *A secure bridge from human consciousness to the electron.*
 
-CambiOS is a general-purpose operating system built on a verification-ready microkernel written in Rust. Every process is isolated, every binary is verified before it runs, every IPC message carries an unforgeable cryptographic identity, and nothing in the stack phones home. It targets **x86_64**, **AArch64**, and **RISC-V (riscv64gc)**, boots in QEMU on all three, and is designed to eventually run on sovereign silicon.
+That's the dream. We're building a stack that doesn't add to the problem, on hardware that still has the problem, for people who understand what that means. CambiOS is a general-purpose operating system built on a verification-ready microkernel written in Rust. Every process is isolated, every binary is verified before it runs, every IPC message carries an unforgeable cryptographic identity, and nothing in the stack phones home. It targets **x86_64**, **AArch64**, and **RISC-V (riscv64gc)**, boots in QEMU on all three, and is designed to eventually run on sovereign silicon. This is an ambitious project, bordering on audacious, but it might be something the world needs now more than ever.
 
 - Why CambiOS exists → [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md)
 - What's built right now → [STATUS.md](STATUS.md)
@@ -14,7 +14,7 @@ There are two essential problems with modern operating systems. The first we're 
 
 ## The Software Problem
 
-It's an open secret. Modern operating systems — Windows, macOS, Linux — are inherently leaky, buggy, and insecure. They were designed for a world that no longer exists: one where vendors are trustworthy, your identity comes from "someone else," a password is adequate to protect it, and code was trusted to swim in one vast pool with no lanes or lifeguards. Every telemetry scandal, every ransomware story, every "a kernel extension crashed my laptop" moment traces back to one of those assumptions. Zero-day exploits come alive here, where memory safety really isn't, privilege equals access, and every attack is an escalation.
+It's an open secret. Modern operating systems — Windows, macOS, Linux — are inherently leaky, buggy, and/or insecure. They were designed for a world that no longer exists: one where vendors are trustworthy, your identity comes from "someone else," a password is adequate to protect it, and code was trusted to swim in one vast pool with no lanes or lifeguards. Every telemetry scandal, every ransomware story, every "a kernel extension crashed my laptop" moment traces back to one of those assumptions. Zero-day exploits come alive here, where memory safety really isn't, privilege equals access, and every attack is an escalation.
 
 CambiOS rejects this, fundamentally, at the design level. Rust itself closes entire classes of memory bugs. The kernel (the "pool") is *very* small. Drivers and services run isolated in user-space — a crash here is more a hiccup than a blue screen of death. Every process has a cryptographic identity. Every binary is verified before it runs. Every IPC message carries an unforgeable sender. There are no privileges to escalate — no capabilities are given without established credentials. Nothing phones home. This is 99% of what's wrong with modern operating systems — and it's fixable today, in software, without waiting for anyone.
 
