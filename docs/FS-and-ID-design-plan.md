@@ -107,15 +107,41 @@ For *implementation details* of each phase (which structs, which files, which sy
 
 **Out of scope:** runtime YubiKey access from the running kernel (requires USB HID, deferred to post-v1), key rotation, multi-key trust anchors.
 
-### Phase 1C — Key-store service in degraded mode + signed ObjectStore puts
+### Phase 1C — Multi-Principal vault service (degraded mode for v1)
 
-**Goal:** Move the key-handling logic out of the kernel entirely, even for the bootstrap identity. Establishes the user-space key-store as the gateway for all signing operations. Phase 1C ships a key-store service that runs in "degraded mode" — it has no access to a private key (the YubiKey lives only on the build host, not at runtime) — but the IPC interface and the FS service's calling convention are real. When runtime YubiKey access is added later, the key-store transitions out of degraded mode without changes to its consumers.
+**Goal:** Move identity material out of the kernel and into the vault — userspace's home for plurality. The kernel keeps one process bound to one Principal; the vault holds N Principals per human and selects which one a newly-spawned process receives. After Phase 1C, the architectural boundary that [ADR-026](adr/026-identity-transcription-at-the-kernel-ring.md) codifies — kernel transcribes, vault holds plurality, AI sandbox is per-Principal — is real, even though biometric unlock and social attestation land in later phases.
 
-**Why this matters:** It establishes the architectural boundary. The kernel manages identity *binding* (which Principal belongs to which process); user-space manages identity *material* (where the keys live, how signing happens). The boundary is real even when one side is currently a no-op.
+**Why this matters:** Without the vault, the per-process Principal is whatever the kernel happens to bind at boot — bootstrap-Principal-derived for the foreseeable future. A spawn-time Principal-selection API has to exist somewhere; without Phase 1C it would either accrete inside the kernel (violating the [ADR-026](adr/026-identity-transcription-at-the-kernel-ring.md) § 1 transcription invariant) or get bolted onto each subsystem that needs identity (FS, IPC handshakes, signing). Phase 1C provides one canonical site, with the right shape, before anything depends on it.
 
-**Scope:** `user/key-store-service/` with an IPC endpoint for signing requests, `ObjPutSigned` syscall for storing pre-signed objects in the kernel ObjectStore, fs-service requests signing from the key-store before calling `ObjPut` (and falls back to unsigned puts when the key-store is in degraded mode), `ClaimBootstrapKey` syscall as the one-shot kernel→user transfer of any bootstrap secret material that exists.
+**The slot is the same; the model is different.** The endpoint at slot 17 was originally labeled `key-store-service` — the v0 sketch was one-key-per-device. The architectural slot does not change: it is still the userspace gateway for signing operations and the reason `ObjPutSigned` exists. The model changes per [identity.md § The Vault](identity.md#the-vault): the slot now holds a multi-Principal vault. v1 ships with the vault interface and at minimum a single Principal; full plurality lights up as Phase 6 (biometric commitment) and Phase 7 (social attestation) come online and the vault gains the recovery + plurality features that justify the "many" in "many Principals."
 
-**Out of scope:** runtime YubiKey communication (requires USB HID — post-v1), per-process derived keys for delegated signing (requires the biometric/social work in later phases), hardware-backed sealed storage of derived keys (TPM/Secure Enclave integration — long-term).
+**Scope:**
+
+- `user/vault-service/` at endpoint 17 (renamed from `key-store-service`, same slot — the shell command and the boot manifest entry change name; nothing else moves). IPC interface for the operations below.
+- `bind_for_spawn(context_label) → Principal`: parent processes consult the vault before invoking `SYS_SPAWN`; the kernel binds the new process to whatever Principal the vault returns. The kernel does not know the vault exists; from the kernel's view, spawn just receives a Principal byte string ([ADR-025](adr/025-principal-as-aid.md) AID) to transcribe forward onto the new process's `ProcessCapabilities.principal` slot.
+- `sign_with(principal, data) → Signature`: authored content and IPC handshakes that need a signature ask the vault; private keys never leave the vault process. fs-service requests signing from the vault before calling `ObjPut`/`ObjPutSigned`.
+- N Principals per vault, encrypted at rest under a vault key derived from device entropy. Biometric input lands in Phase 6; for v1 the key derives from device entropy alone, and the vault is *interface-multi-Principal but practice-single-Principal* — N is bounded only by storage and there is no UX for generating new Principals until the vault gains a control surface.
+- `ObjPutSigned` stays cap-gated. The kernel-side syscall is unchanged: "store this pre-signed object." Signature is produced by the vault before the syscall is invoked; the kernel verifies the signature against the bound Principal as it does today. No kernel-side signing change.
+- Per-Principal AI containment is now a real architectural property. When the policy service calls `SYS_REVOKE_CAPABILITY` on capabilities held by Principal `P`, only processes bound to `P` lose the cap; other Principals in the same vault are untouched. This is what makes "AI watches and contains" usable when the AI lands; see [ADR-007 § Divergence](adr/007-capability-revocation-and-telemetry.md#divergence) for the mechanism statement and [ADR-026 § 3](adr/026-identity-transcription-at-the-kernel-ring.md) for the framing.
+- Boot path: vault-service is a signed boot module like fs-service. It starts before fs-service so that fs-service's `ObjPutSigned` calls can already route to a vault. Order in `BOOT_MODULE_ORDER` ratchets accordingly.
+
+**Out of scope (this phase):**
+
+- Biometric commitment as part of vault key derivation — Phase 6.
+- Social attestation / quorum recovery — Phase 6/7.
+- Runtime YubiKey access from the running kernel (requires USB HID — post-v1).
+- Hardware-backed sealed storage of derived keys (TPM/Secure Enclave integration — long-term).
+- Witness-bearing external caps for cold-path revocation. Named as a slot in [ADR-007 § Divergence](adr/007-capability-revocation-and-telemetry.md#divergence) entry 5; the wire/disk format lands in that ADR's amendment, not here.
+- Cross-device vault sync. Per-Principal CRDT replication is the design contract (each Principal owns its log; vault entries replicate per-Principal, no server-side aggregation), but the actual sync substrate ships with [Phase 7 SSB bridge](#phase-7--ssb-bridge).
+- Migrating the bootstrap-Principal authority check on `SYS_REVOKE_CAPABILITY` to a capability check. This is one of the transcription-invariant vestiges flagged by ADR-026 § 1 and [ADR-007 § Divergence](adr/007-capability-revocation-and-telemetry.md#divergence) entry 6, but the migration belongs to Phase 3.4 (when the policy service lands as the mediator), not Phase 1C.
+
+**Architectural invariants from ADR-026 that Phase 1C makes load-bearing:**
+
+- Kernel transcription invariant ([ADR-026 § 1](adr/026-identity-transcription-at-the-kernel-ring.md)): the spawn syscall accepts a Principal byte string and transcribes it onto the new process's bound-Principal field. It does not branch on the Principal value. It does not consult the vault. Plurality is invisible to the kernel by construction.
+- Cap-shape duality ([ADR-026 § 2](adr/026-identity-transcription-at-the-kernel-ring.md)): vault-issued caps may carry the rich form (sub-Principal + scope + lineage) when emitted across trust domains; kernel internal caps remain `(endpoint, rights)`. The vault is the natural site for the cold-path / external cap form to be produced and consumed.
+- AI sandbox is per-Principal ([ADR-026 § 3](adr/026-identity-transcription-at-the-kernel-ring.md)): containment narrows the holder Principal's caps, never the vault as a whole. A compromised `social_Principal` does not take down `banking_Principal` even when both are vault entries for the same human.
+
+**Cross-references:** [ADR-026](adr/026-identity-transcription-at-the-kernel-ring.md) (kernel-side framing this phase realizes), [ADR-025](adr/025-principal-as-aid.md) (Principal-as-AID — the byte string the vault hands to spawn), [identity.md § The Vault](identity.md#the-vault) (user-facing model), [identity.md § Phase 1C: Vault Service](identity.md#phase-1c-vault-service) (the source-of-truth phase scope this entry mirrors), [ADR-007 § Divergence](adr/007-capability-revocation-and-telemetry.md#divergence) (multi-Principal containment + cold-path revocation slot), [ADR-003](adr/003-content-addressed-storage-and-identity.md) (Phase 0 design rationale this builds on).
 
 ### Phase 2A — First user-space hardware driver (network)
 
