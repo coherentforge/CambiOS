@@ -23,11 +23,11 @@ use interceptor::IpcInterceptor as _;
 /// SCAFFOLDING: maximum number of IPC endpoints in the system.
 /// Why: one endpoint per service in the simple case. Sharded IPC has one
 ///      shard per endpoint; the per-shard message queues are sized from this.
-///      Historically matched `MAX_PROCESSES = 32`; `MAX_PROCESSES` is gone
-///      as of Phase 3.2a (the process table now scales with tier policy via
+///      Historically matched `MAX_PROCESSES = 32`; `MAX_PROCESSES` is now
+///      runtime-computed (the process table scales with tier policy via
 ///      `config::num_slots()`), but `MAX_ENDPOINTS` remains a fixed cap.
-/// Replace when: a Phase 3 service needs more than 32 endpoints, or the IPC
-///      shard array becomes a contention point at higher process counts.
+/// Replace when: a service needs more than 32 endpoints, or the IPC shard
+///      array becomes a contention point at higher process counts.
 ///      Eventually this should track `config::num_slots()` the same way.
 ///      See docs/ASSUMPTIONS.md.
 pub const MAX_ENDPOINTS: usize = 32;
@@ -36,7 +36,7 @@ pub const MAX_ENDPOINTS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EndpointId(pub u32);
 
-/// Process identifier with generation counter (Phase 3.2c, ADR-008).
+/// Process identifier with generation counter (ADR-008).
 ///
 /// Encodes `(slot_index: u32, generation: u32)` in a single `u64`.
 /// The slot index is the array position in the process table and
@@ -163,7 +163,7 @@ impl Principal {
     /// Callers that need *identity* (not the verify input) should use
     /// [`Self::aid`] instead.
     ///
-    /// Revisit when: keystore service ADR lands per identity.md Phase 1.5.
+    /// Revisit when: keystore service ADR lands.
     pub fn current_key_bytes(&self) -> &[u8; 32] {
         &self.aid
     }
@@ -295,9 +295,9 @@ pub trait MessageQueue {
 /// may be permitted to share authority without being permitted to take it
 /// back, which is the right behavior for audit-trail-style delegations.
 ///
-/// In Phase 3.1 the `revoke` field exists but no policy path consults it yet.
-/// `SYS_REVOKE_CAPABILITY` is bootstrap-Principal-only until Phase 3.4 lands the
-/// policy service that mediates the "holder-of-revoke-right can call revoke"
+/// The `revoke` field exists but no policy path consults it yet.
+/// `SYS_REVOKE_CAPABILITY` is bootstrap-Principal-only until the policy
+/// service lands to mediate the "holder-of-revoke-right can call revoke"
 /// path described in ADR-007 §"Who can revoke".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityRights {
@@ -342,7 +342,7 @@ impl CapabilityRights {
 /// SCAFFOLDING: 16 messages per endpoint queue.
 /// Why: verification wants a predictable memory layout and bounded queue size.
 ///      Pre-allocated 32 endpoints × 16 messages × ~280 B ≈ 140 KiB at boot.
-/// Replace when: Phase 3 audit telemetry channel (ADR-007) starts seeing bursts
+/// Replace when: the audit telemetry channel (ADR-007) starts seeing bursts
 ///      that overflow this — first dropped event is the trigger. Note: bumping
 ///      this also bumps the boot memory cost linearly. See docs/ASSUMPTIONS.md.
 ///

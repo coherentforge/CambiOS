@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Shared-memory data channels (Phase 3.2d.i, ADR-005).
+//! Shared-memory data channels (ADR-005).
 //!
 //! A channel is a region of physical memory that the kernel maps into two
 //! processes' address spaces, with a capability that records the
@@ -52,8 +52,8 @@ pub const MAX_CHANNELS: usize = 256;
 ///      typical channel sizes remain in the single-digit MiB range.
 /// Replace when: HDR + supersampling beyond 2× backing scale on 5K/8K
 ///      displays pushes single-surface size past 256 MiB. The tier-aware
-///      policy service (Phase 3.4) and a future `LargeChannel` capability
-///      should gate these allocations before the ceiling rises further.
+///      policy service and a future `LargeChannel` capability should
+///      gate these allocations before the ceiling rises further.
 ///      See docs/ASSUMPTIONS.md.
 pub const MAX_CHANNEL_PAGES: u32 = 65536;
 
@@ -322,7 +322,7 @@ pub struct ChannelCreateParams {
 /// validates principals. Does NOT allocate frames, map pages, or perform
 /// TLB shootdowns — those are the syscall handler's responsibility.
 ///
-/// Lock position: 5 in the global hierarchy (Phase 3.2d.iii).
+/// Lock position: 5 in the global hierarchy.
 /// Stored in `Spinlock<Option<Box<ChannelManager>>>`.
 pub struct ChannelManager {
     /// Channel table. `None` = free slot.

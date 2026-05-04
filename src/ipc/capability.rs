@@ -18,20 +18,20 @@ use core::fmt;
 /// Endpoint capabilities are stored per-slot in the endpoint capability
 /// array; system capabilities are stored as flags in [`ProcessCapabilities`].
 ///
-/// Phase 3.2b introduces `CreateProcess` as the first system capability
-/// (ADR-008 § Migration Path). Phase 3.2d.iii adds `CreateChannel`
-/// (ADR-005). Phase GUI-0+ (ADR-011) adds `LegacyPortIo`,
-/// `MapFramebuffer`, and `LargeChannel` for the future graphics stack.
+/// System capability kinds are defined per the ADRs that introduced
+/// them: `CreateProcess` (ADR-008 § Migration Path), `CreateChannel`
+/// (ADR-005), and `LegacyPortIo` / `MapFramebuffer` / `LargeChannel`
+/// (ADR-011) for the graphics stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityKind {
     /// IPC endpoint access with specific rights.
     /// Stored in the per-process endpoint capability array.
     Endpoint,
-    /// Right to create new processes (Phase 3.2b, ADR-008 § Migration Path).
+    /// Right to create new processes (ADR-008 § Migration Path).
     /// Checked at process-creation call sites (handle_spawn,
     /// load_boot_modules) before invoking `ProcessTable::create_process`.
     CreateProcess,
-    /// Right to create shared-memory channels (Phase 3.2d.iii, ADR-005).
+    /// Right to create shared-memory channels (ADR-005).
     /// Checked at `SYS_CHANNEL_CREATE` before allocating channel memory.
     CreateChannel,
     /// Right to access whitelisted ISA legacy I/O ports via
@@ -112,11 +112,11 @@ pub struct Capability {
 /// SCAFFOLDING: 32 capabilities per process.
 /// Why: bounded set for verification; cache-line-friendly linear scan. Originally
 ///      chosen to match `MAX_PROCESSES` and `MAX_ENDPOINTS` (a process can
-///      typically hold capabilities for ~half the system's endpoints). As of
-///      Phase 3.2a, `MAX_PROCESSES` is runtime-computed (`config::num_slots()`),
-///      but this per-process cap is still a fixed compile-time 32.
-/// Replace when: Phase 3 work hits this — the policy service holds one capability
-///      per service it mediates, the audit consumer holds one per producer.
+///      typically hold capabilities for ~half the system's endpoints).
+///      `MAX_PROCESSES` is now runtime-computed (`config::num_slots()`), but
+///      this per-process cap is still a fixed compile-time 32.
+/// Replace when: the policy service hits this — it holds one capability per
+///      service it mediates, the audit consumer holds one per producer.
 ///      32 will get tight fast. See docs/ASSUMPTIONS.md.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessCapabilities {
@@ -131,23 +131,23 @@ pub struct ProcessCapabilities {
     /// explicit unbind (prevents identity theft).
     principal: Option<Principal>,
     /// System capability: can this process create new processes?
-    /// Phase 3.2b (ADR-008 § Migration Path). Checked at process-creation
-    /// call sites before invoking `ProcessTable::create_process`.
+    /// ADR-008 § Migration Path. Checked at process-creation call sites
+    /// before invoking `ProcessTable::create_process`.
     create_process: bool,
     /// System capability: can this process create shared-memory channels?
-    /// Phase 3.2d.iii (ADR-005). Checked at `SYS_CHANNEL_CREATE`.
+    /// ADR-005. Checked at `SYS_CHANNEL_CREATE`.
     create_channel: bool,
     /// System capability: can this process access whitelisted ISA legacy
     /// I/O ports (PS/2 controller, etc.) via `SYS_PORT_IO`?
-    /// Phase GUI-0+ (ADR-011). Reserved for future input-driver work.
+    /// ADR-011. Reserved for future input-driver work.
     legacy_port_io: bool,
     /// System capability: can this process map a Limine-reported
     /// framebuffer via `SYS_MAP_FRAMEBUFFER`?
-    /// Phase GUI-0 (ADR-011). Granted to the compositor/gpu-driver.
+    /// ADR-011. Granted to the compositor/gpu-driver.
     map_framebuffer: bool,
     /// System capability: can this process allocate channels above the
     /// standard per-call envelope?
-    /// Phase GUI-0+ (ADR-011). Reserved for future tier-aware policy.
+    /// ADR-011. Reserved for future tier-aware policy.
     large_channel: bool,
     /// System capability: can this process write `InputFocusChange`
     /// events into the kernel audit ring via `SYS_AUDIT_EMIT_INPUT_FOCUS`?
@@ -312,8 +312,8 @@ impl ProcessCapabilities {
     /// Grant a system capability.
     ///
     /// Endpoint capabilities use [`grant()`]; this method handles
-    /// non-endpoint capability kinds (Phase 3.2b: `CreateProcess`,
-    /// Phase 3.2d.iii: `CreateChannel`).
+    /// non-endpoint capability kinds (`CreateProcess`, `CreateChannel`,
+    /// and the GUI capabilities).
     pub fn grant_system(&mut self, kind: CapabilityKind) {
         match kind {
             CapabilityKind::CreateProcess => self.create_process = true,
@@ -363,8 +363,8 @@ impl ProcessCapabilities {
 ///
 /// Tracks capabilities for all processes. Central policy enforcement point.
 ///
-/// Phase 3.2a: slot storage is a `&'static mut [Option<ProcessCapabilities>]`
-/// slice backed by the kernel object table region (see
+/// Slot storage is a `&'static mut [Option<ProcessCapabilities>]` slice
+/// backed by the kernel object table region (see
 /// `memory::object_table::init`). The slice length equals
 /// `config::num_slots()`, computed at boot from the active tier policy.
 pub struct CapabilityManager {
@@ -422,7 +422,7 @@ impl CapabilityManager {
     }
 
     /// Look up a process's capability table by ProcessId, with
-    /// generation validation (Phase 3.2c).
+    /// generation validation.
     ///
     /// Returns `InvalidOperation` if the slot index is out of range,
     /// `ProcessNotFound` if the slot is empty or if the caller's
@@ -552,9 +552,9 @@ impl CapabilityManager {
 
     /// Grant a system capability to a process.
     ///
-    /// Phase 3.2b (ADR-008 § Migration Path): `CapabilityKind::CreateProcess`
-    /// is the first system capability. Granted to bootstrap-Principal
-    /// processes at boot so they can invoke `ProcessTable::create_process`.
+    /// ADR-008 § Migration Path: `CapabilityKind::CreateProcess` is the
+    /// first system capability. Granted to bootstrap-Principal processes
+    /// at boot so they can invoke `ProcessTable::create_process`.
     pub fn grant_system_capability(
         &mut self,
         process_id: ProcessId,
@@ -680,39 +680,39 @@ impl CapabilityManager {
     /// - The holder's next attempt to use the capability will fail the
     ///   standard [`verify_access`] check with [`CapabilityError::AccessDenied`],
     ///   which is the current v0 signal. (Active control-IPC notification is
-    ///   deferred — see "Phase 3.4" stub below.)
+    ///   deferred — see the policy-service stub below.)
     ///
-    /// # Authority — v0 (Phase 3.1)
+    /// # Authority — v0
     ///
     /// Only the bootstrap Principal can revoke. This matches the existing
     /// pattern for `SyscallNumber::BindPrincipal` and
     /// `SyscallNumber::ClaimBootstrapKey`. ADR-007 §"Who can revoke" specifies
     /// three authority paths (original grantor, holder of `revoke` right,
-    /// bootstrap/policy service); the other two land in Phase 3.4 when the
-    /// policy service exists as the mediator.
+    /// bootstrap/policy service); the other two land when the policy service
+    /// exists as the mediator.
     ///
     /// # Stubbed behavior (documented, not workarounds)
     ///
     /// The following ADR-007 §"How revocation interacts with channels" steps
-    /// are intentionally stubbed in Phase 3.1 because their prerequisites do
-    /// not exist yet. Each is marked in-code so a future maintainer cannot
-    /// miss them when the prerequisite lands.
+    /// are intentionally stubbed because their prerequisites do not exist
+    /// yet. Each is marked in-code so a future maintainer cannot miss them
+    /// when the prerequisite lands.
     ///
-    /// - **Phase 3.2d (channels).** If the capability kind is a channel role,
+    /// - **Channel-role unmap.** If the capability kind is a channel role,
     ///   unmap the shared pages from the holder's address space and issue a
     ///   TLB shootdown via `crate::arch::tlb::shootdown_range`. No channel
-    ///   kind exists in Phase 3.1 — all capabilities are endpoint rights.
-    /// - **Phase 3.3 (audit telemetry).** Emit an
+    ///   kind exists today — all capabilities are endpoint rights.
+    /// - **Audit telemetry.** Emit an
     ///   `audit::Event::CapabilityRevoked { revoker, holder, endpoint, … }`
-    ///   record to the per-CPU audit staging buffer. No audit subsystem
-    ///   exists in Phase 3.1.
-    /// - **Phase 3.4 (policy service).** Invalidate the per-CPU policy decision
-    ///   cache for the `(holder, endpoint)` key via an IPI broadcast, and
-    ///   send a control-IPC `CapabilityRevoked` notification to the holder
-    ///   via the kernel-initiated send primitive. Neither the cache nor
-    ///   the kernel-initiated send primitive exist in Phase 3.1.
+    ///   record to the per-CPU audit staging buffer when the audit subsystem
+    ///   wires this hook in.
+    /// - **Policy-service notification.** Invalidate the per-CPU policy
+    ///   decision cache for the `(holder, endpoint)` key via an IPI
+    ///   broadcast, and send a control-IPC `CapabilityRevoked` notification
+    ///   to the holder via the kernel-initiated send primitive. Neither the
+    ///   cache nor the kernel-initiated send primitive exists today.
     ///
-    /// Phase 3.1 honors the "atomic, immediate, structural" properties of
+    /// v0 honors the "atomic, immediate, structural" properties of
     /// ADR-007 §"What revocation means" — the capability is gone the moment
     /// this method returns. The *active notification* property is the part
     /// that is stubbed; the holder learns of the revocation via its next
@@ -724,22 +724,22 @@ impl CapabilityManager {
         revoker_principal: Principal,
         bootstrap: Principal,
     ) -> Result<(), CapabilityError> {
-        // Authority check — v0 (Phase 3.1): bootstrap Principal only.
-        // TODO Phase 3.4: also accept the original grantor and any holder of the
+        // Authority check — v0: bootstrap Principal only.
+        // TODO: also accept the original grantor and any holder of the
         // `revoke` right on `endpoint`, per ADR-007 §"Who can revoke".
         if revoker_principal != bootstrap {
             return Err(CapabilityError::AccessDenied);
         }
 
-        // Generation-checked lookup (Phase 3.2c)
+        // Generation-checked lookup
         self.lookup_mut(holder)?.revoke(endpoint)?;
 
-        // TODO Phase 3.2d: if the capability kind is a channel role, unmap the
-        // shared pages from the holder's address space and issue a TLB
-        // shootdown via crate::arch::tlb::shootdown_range(). Channels do not
-        // exist yet — all capabilities are endpoint rights in Phase 3.1.
+        // TODO: if the capability kind is a channel role, unmap the shared
+        // pages from the holder's address space and issue a TLB shootdown
+        // via crate::arch::tlb::shootdown_range(). Channels are not in the
+        // capability kind set yet — all capabilities are endpoint rights.
 
-        // Phase 3.3: emit audit event for revocation.
+        // Emit audit event for revocation.
         #[cfg(not(any(test, fuzzing)))]
         crate::audit::emit(crate::audit::RawAuditEvent::capability_revoked(
             // revoker_principal is the caller's identity; for now pass the
@@ -748,7 +748,7 @@ impl CapabilityManager {
             crate::scheduler::Timer::get_ticks(), 0,
         ));
 
-        // TODO Phase 3.4: invalidate the per-CPU policy decision cache for
+        // TODO: invalidate the per-CPU policy decision cache for
         // (holder, endpoint) via an IPI broadcast, then send a kernel-
         // originated control IPC notification to the holder using
         // kernel_send() + Principal::KERNEL. See ADR-006 §"Caching" and
@@ -772,11 +772,12 @@ impl CapabilityManager {
     ///
     /// # Stubbed behavior
     ///
-    /// Same Phase 3.2d/3.3/3.4 stubs as [`revoke`], applied per-capability
-    /// during iteration. Phase 3.3 (audit telemetry) will emit one
-    /// `CapabilityRevoked` event per removed capability (or a single
-    /// batched `ProcessTerminated` event that carries the count — that's a
-    /// telemetry-design choice for Phase 3.3 to make).
+    /// Same channel-unmap / audit-emit / policy-cache-invalidate stubs as
+    /// [`revoke`], applied per-capability during iteration. The audit
+    /// telemetry hook will emit one `CapabilityRevoked` event per removed
+    /// capability (or a single batched `ProcessTerminated` event that
+    /// carries the count — that's a telemetry-design choice for whoever
+    /// wires the audit hook in).
     ///
     /// Note: this removes capabilities from the process's table but does not
     /// unregister the process itself. The caller should call
@@ -795,7 +796,7 @@ impl CapabilityManager {
         // grant/revoke methods maintain that invariant, but clear-all should
         // be robust against any future layout change.
         //
-        // Phase 3.3: emit a single batched event for the count rather than
+        // Emit a single batched event for the count rather than
         // per-capability (process is exiting — individual revoke events would
         // be noise). The ProcessTerminated event in handle_exit covers this.
         for slot in caps.capabilities.iter_mut() {
@@ -803,14 +804,14 @@ impl CapabilityManager {
         }
         caps.count = 0;
 
-        // Clear system capabilities (Phase 3.2b, 3.2d.iii, Phase GUI-0+,
-        // T-7 Phase A). Every flag in `ProcessCapabilities` must reset
-        // here — security-review 2026-04-25 caught `emit_input_audit`
-        // missing on the original T-7 Phase A landing. Dead today
-        // (handle_exit pairs revoke_all with unregister_process which
-        // rebuilds the slot via ProcessCapabilities::new) but a
-        // landmine for any future "soft-revoke without unregister" path
-        // (Phase 3.4 +).
+        // Clear system capabilities (CreateProcess, CreateChannel, the
+        // GUI capabilities, and EmitInputAudit). Every flag in
+        // `ProcessCapabilities` must reset here — security-review
+        // 2026-04-25 caught `emit_input_audit` missing on the original
+        // T-7 landing. Dead today (handle_exit pairs revoke_all with
+        // unregister_process which rebuilds the slot via
+        // ProcessCapabilities::new) but a landmine for any future
+        // "soft-revoke without unregister" path.
         caps.create_process = false;
         caps.create_channel = false;
         caps.legacy_port_io = false;
@@ -1079,7 +1080,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 3.1 revocation tests — CapabilityManager::revoke() and
+    // Revocation tests — CapabilityManager::revoke() and
     // revoke_all_for_process(). See ADR-007 for the design.
     // ========================================================================
 
@@ -1352,8 +1353,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 3.2b system capability tests — CapabilityKind::CreateProcess.
-    // See ADR-008 § Migration Path.
+    // CreateProcess capability tests. See ADR-008 § Migration Path.
     // ========================================================================
 
     #[test]
@@ -1452,8 +1452,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 3.2d.iii system capability tests — CapabilityKind::CreateChannel.
-    // See ADR-005.
+    // CreateChannel capability tests. See ADR-005.
     // ========================================================================
 
     #[test]
@@ -1548,7 +1547,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 3.2c generation counter tests — ProcessId generation validation.
+    // Generation counter tests — ProcessId generation validation.
     // See ADR-008 § Open Problem 9.
     // ========================================================================
 
