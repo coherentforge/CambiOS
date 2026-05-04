@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Policy service kernel-side infrastructure (Phase 3.4, ADR-006).
+//! Policy service kernel-side infrastructure (ADR-006).
 //!
 //! This module provides the kernel plumbing for the externalized policy service:
 //!
@@ -590,7 +590,7 @@ pub fn expire_pending_queries() {
 
     let current_tick = Timer::get_ticks();
 
-    // Phase 1: collect expired task_ids under PolicyRouter lock
+    // Step 1: collect expired task_ids under PolicyRouter lock
     let (expired, count) = {
         let mut guard = match crate::POLICY_ROUTER.try_lock() {
             Some(g) => g,
@@ -600,7 +600,7 @@ pub fn expire_pending_queries() {
     };
     // PolicyRouter lock dropped here
 
-    // Phase 2: wake expired tasks (no locks from phase 1 held)
+    // Step 2: wake expired tasks (no locks from step 1 held)
     for entry in expired.iter().take(count) {
         if let Some(tid) = *entry {
             // No decision stored → DECISION_NONE (0) → fail-open Allow
