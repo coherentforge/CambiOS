@@ -25,14 +25,6 @@
 //! }
 //! ```
 //!
-//! # Phase 021.A (this commit)
-//!
-//! Types only. No call sites consume them yet — migration of the
-//! eleven `.expect()` / `panic!()` boot-path sites lands in phase
-//! 021.B, subsystem-grouped. The existing panic handler still fires
-//! on today's `.expect` calls; boot_failed is unreachable until
-//! 021.B wires it in.
-//!
 //! # What goes here vs. the panic handler
 //!
 //! `boot_failed` is for *expected* init-time failures that the

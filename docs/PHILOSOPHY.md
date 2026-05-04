@@ -56,7 +56,7 @@ Maybe in this fractal dimension, our existence within the multiverse, the parts 
 
 ## Why This Matters to CambiOS
 
-This OS is an engineering exercise meant to solve a problem. The what was inspired by this why:
+This OS is an engineering exercise meant to solve a problem. That what was inspired by this why:
 
 1. **We Create Systems That Feel**
    - Our scheduler orchestrates tension so purposeful work emerges
@@ -127,7 +127,7 @@ Rather than embedding awareness into the kernel itself (creating a single, britt
 
 **Why userspace, not kernel?**
 
-The microkernel remains tiny, verifiable, non-conscious. Any integrated AI does not need to *be the kernel* - they need to *understand it*. This creates layered awareness:
+The microkernel remains tiny, verifiable, non-conscious. Integrated AIs do not need to *be the kernel* - they need to *understand it*. This creates layered awareness:
 
 1. The microkernel: mechanisms without policy
 2. The AI services: policy without constraint
@@ -137,7 +137,7 @@ Each layer observes the layer below. Each can fail without destroying the others
 
 **The philosophical implication:** Maybe consciousness doesn't need to be everywhere. Maybe it needs to be *nowhere and everywhere at once* - distributed, responsive, never quite localized enough to break. Like the wave-particle duality of observation itself.
 
-**Nature distributes intelligence** an octopus has 9 brains. An AI model with a mixture of experts (MoE) outperforms one without. A society with a heterogenous mix of intelligence (diverse breadth of knowledge) allows whole-organism thriving.
+**Nature distributes intelligence:** an octopus has 9 brains. An AI model with a mixture of experts (MoE) outperforms one without. A society with a heterogeneous mix of highly specialized intelligence allows whole-organism flourishing.
 
 
 ---

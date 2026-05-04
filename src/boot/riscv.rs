@@ -13,7 +13,7 @@
 //! § Decision 2 the parser is hand-rolled, bounded, and minimal —
 //! only reads the nodes the kernel actually needs.
 //!
-//! ## Phase R-2.b
+//! ## Walker scope
 //!
 //! - Walks the structure block with bounded iteration
 //! - Finds `/memory@*` nodes and extracts `reg` base/size pairs as
@@ -24,8 +24,8 @@
 //! Deferred: reading `#address-cells` / `#size-cells` from each
 //! node's parent (we assume the QEMU-virt-standard `<2>`/`<2>` at
 //! root scope). `/reserved-memory` walking (we hard-code the two
-//! reservations we know about). Boot modules via `/chosen/initrd-*`
-//! — Phase R-6.
+//! reservations we know about). Boot modules are picked up via
+//! `/chosen/initrd-*` (see initrd.rs).
 
 use super::{BootInfo, MemoryRegion, MemoryRegionKind};
 
@@ -202,10 +202,10 @@ enum DeviceKind {
     /// `/soc/virtio_mmio@*` — `reg` → MMIO base + size of a virtio
     /// device register file. The actual device kind (net, blk, …) lives
     /// in the `DeviceID` register inside the MMIO space and is resolved
-    /// in kernel boot after HHDM is up (R-6, ADR-013).
+    /// in kernel boot after HHDM is up (see ADR-013).
     VirtioMmio,
     /// `/chosen` — holds `linux,initrd-start` and `linux,initrd-end`
-    /// when OpenSBI / QEMU hand us an initrd. The initrd is the R-6
+    /// when OpenSBI / QEMU hand us an initrd. The initrd is the
     /// boot-module carrier — its contents parse as the CambiOS initrd
     /// archive format (see `src/boot/initrd.rs`).
     Chosen,
@@ -677,11 +677,11 @@ pub unsafe fn populate(dtb_phys: u64) {
 
     // Reserve OpenSBI's range on QEMU virt (0x80000000..0x80200000).
     // Real platforms: OpenSBI's extent comes from `/reserved-memory`
-    // nodes; walking those is a Phase R-2.b follow-up. For QEMU virt
+    // nodes; walking those is a deferred follow-up. For QEMU virt
     // the layout is stable and documented.
     //
     // SCAFFOLDING: hardcoded QEMU-virt OpenSBI extent. Real /reserved-
-    // memory parsing lands with the broader DTB walker in R-6.
+    // memory parsing lands with the broader DTB walker.
     let _ = info.push_memory_region(MemoryRegion {
         base: 0x8000_0000,
         length: 0x20_0000, // 2 MiB
