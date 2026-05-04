@@ -509,7 +509,7 @@ pub fn load_elf_process(
     // --- Step 3: Verify before execute ---
     match verifier.verify(binary, &metadata, segments) {
         VerifyResult::Allow => {
-            // Phase 3.3: emit BinaryLoaded audit event.
+            // Emit BinaryLoaded audit event.
             let hash_prefix = {
                 let mut buf = [0u8; 24];
                 let len = binary.len().min(24);
@@ -541,8 +541,8 @@ pub fn load_elf_process(
     }
 
     // --- Step 4: Create process with per-process page table ---
-    // Phase 3.2c: process table allocates the slot and stamps the
-    // generation counter into the returned ProcessId.
+    // Process table allocates the slot and stamps the generation
+    // counter into the returned ProcessId.
     let process_id = process_table
         .create_process(frame_alloc, /* create_page_table = */ true)
         .map_err(|_| LoaderError::ProcessCreationFailed)?;
