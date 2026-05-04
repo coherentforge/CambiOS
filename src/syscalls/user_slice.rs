@@ -23,20 +23,18 @@
 //!   `write_user_buffer` helpers below. Can still fail if a page
 //!   is unmapped at the moment of copy.
 //!
-//! # Phase 020.C (this commit)
+//! # Module-private helpers
 //!
 //! The underlying `read_user_buffer` / `write_user_buffer` helpers
-//! that were `pub(super)` shims in dispatcher.rs during Phases B.x
-//! have moved here as module-private functions. Handler code in
-//! sibling modules (dispatcher.rs) can no longer call them
-//! directly — the typed slices are the only reachable path for
-//! user-pointer validation. Constants `MAX_USER_BUFFER` and
-//! `USER_SPACE_END` remain `pub(super)` because a few handlers
-//! still use them as pre-validate guards (redundant-but-cheap
-//! defense-in-depth alongside `UserSlice::validate`).
+//! are module-private. Handler code in sibling modules (dispatcher.rs)
+//! cannot call them directly — the typed slices are the only
+//! reachable path for user-pointer validation. Constants
+//! `MAX_USER_BUFFER` and `USER_SPACE_END` remain `pub(super)`
+//! because a few handlers still use them as pre-validate guards
+//! (redundant-but-cheap defense-in-depth alongside
+//! `UserSlice::validate`).
 //!
-//! Phase 020.D adds compile-fail tests asserting the lifetime and
-//! direction invariants.
+//! Compile-fail tests assert the lifetime and direction invariants.
 
 use super::SyscallError;
 use super::dispatcher::SyscallContext;
@@ -78,8 +76,8 @@ pub(super) const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
 // traversal without touching `crate::memory::paging` or HHDM.
 //
 // `read_user_buffer` / `write_user_buffer` wire the closures to the live
-// page-table walk + HHDM deref. Both are module-private after Phase 020.C:
-// the typed slices above are the only reachable path.
+// page-table walk + HHDM deref. Both are module-private: the typed
+// slices above are the only reachable path.
 
 /// Generic copy from a user-space virtual range into a kernel buffer.
 ///
@@ -622,10 +620,8 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 020.C relocations: early-exit guards for the underlying helpers,
-    // moved here from dispatcher.rs when read_user_buffer / write_user_buffer
-    // became module-private. These cover paths that fire before any page-
-    // table walk is attempted.
+    // Early-exit guards for the underlying helpers. These cover paths that
+    // fire before any page-table walk is attempted.
     // ========================================================================
 
     // ---- read_user_buffer early-exit guards --------------------------------
@@ -757,7 +753,6 @@ mod tests {
     // the translator and the read/write_phys closures, using identity
     // translation (vaddr == phys) so test reasoning matches the assertions:
     // "writes at vaddr 0x1500" lands at "page 0x1000 offset 0x500".
-    // Relocated from dispatcher.rs in Phase 020.C.
     // ========================================================================
 
     use std::cell::RefCell;

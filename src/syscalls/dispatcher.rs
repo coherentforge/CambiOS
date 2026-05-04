@@ -47,10 +47,10 @@ const MAX_DEVICE_IRQ: u32 = 224;
 // Dispatcher
 // ============================================================================
 //
-// User-buffer validation + page-walk helpers live in `super::user_slice`
-// (Phase 020.C). The `UserReadSlice<'ctx>` / `UserWriteSlice<'ctx>`
-// imports above are the only path handlers have to user memory; raw
-// `(addr, len)` pairs cannot cross the module boundary.
+// User-buffer validation + page-walk helpers live in `super::user_slice`.
+// The `UserReadSlice<'ctx>` / `UserWriteSlice<'ctx>` imports above are
+// the only path handlers have to user memory; raw `(addr, len)` pairs
+// cannot cross the module boundary.
 
 /// Dispatcher that routes syscalls to handlers
 pub struct SyscallDispatcher;
@@ -96,7 +96,7 @@ impl SyscallDispatcher {
             }
         }
 
-        // Phase 3.4: Policy service pre-dispatch check (ADR-006).
+        // Policy service pre-dispatch check (ADR-006).
         // Replaces the old IPC_MANAGER → interceptor → on_syscall path.
         // May block the calling task on a cache miss (upcall to user-space
         // policy service). Falls back to Allow if the policy service is
@@ -148,22 +148,22 @@ impl SyscallDispatcher {
             SyscallNumber::WaitTask => Self::handle_wait_task(args, &ctx),
             SyscallNumber::RevokeCapability => Self::handle_revoke_capability(args, &ctx),
 
-            // Phase 3.2d.iii: shared-memory channels (ADR-005)
+            // Shared-memory channels (ADR-005)
             SyscallNumber::ChannelCreate => Self::handle_channel_create(args, &ctx),
             SyscallNumber::ChannelAttach => Self::handle_channel_attach(args, &ctx),
             SyscallNumber::ChannelClose => Self::handle_channel_close(args, &ctx),
             SyscallNumber::ChannelRevoke => Self::handle_channel_revoke(args, &ctx),
             SyscallNumber::ChannelInfo => Self::handle_channel_info(args, &ctx),
 
-            // Phase 3.3: audit infrastructure (ADR-007)
+            // Audit infrastructure (ADR-007)
             SyscallNumber::AuditAttach => Self::handle_audit_attach(args, &ctx),
             SyscallNumber::AuditInfo => Self::handle_audit_info(args, &ctx),
 
-            // Phase GUI-0: graphics primitives (ADR-011)
+            // Graphics primitives (ADR-011)
             SyscallNumber::MapFramebuffer => Self::handle_map_framebuffer(args, &ctx),
             SyscallNumber::ModuleReady => Self::handle_module_ready(args, &ctx),
 
-            // Phase Scanout-4.a: virtio-modern PCI capability discovery (ADR-014)
+            // Virtio-modern PCI capability discovery (ADR-014)
             SyscallNumber::VirtioModernCaps => Self::handle_virtio_modern_caps(args, &ctx),
 
             // ADR-022: wall-clock time. SetWallclock is capability-gated
@@ -272,7 +272,7 @@ impl SyscallDispatcher {
         }
 
 
-        // Phase 3.2d.iii: revoke all channels the exiting process is
+        // Revoke all channels the exiting process is
         // party to (as creator or peer). For each revoked channel, unmap
         // pages from the surviving peer, issue TLB shootdown, and free
         // the physical frames.
@@ -298,10 +298,10 @@ impl SyscallDispatcher {
 
         // Reclaim process resources: VMA regions, page table frames, heap.
         //
-        // Phase 3.2d.ii: `destroy_process` now calls `reclaim_user_vmas`
-        // (unmaps VMA-tracked pages, frees frames), then
-        // `reclaim_process_page_tables` (frees PML4/intermediate PT frames),
-        // then `reclaim_heap` (frees contiguous heap region).
+        // `destroy_process` calls `reclaim_user_vmas` (unmaps VMA-tracked
+        // pages, frees frames), then `reclaim_process_page_tables` (frees
+        // PML4/intermediate PT frames), then `reclaim_heap` (frees
+        // contiguous heap region).
         //
         // Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7), valid.
         let heap_reclaimed = {
@@ -407,7 +407,7 @@ impl SyscallDispatcher {
         let mut kbuf = [0u8; 256];
         slice.read_into(&mut kbuf[..len])?;
 
-        // Virtio-blk kernel response endpoint (Phase 4a.iii): writes here
+        // Virtio-blk kernel response endpoint: writes here
         // skip the capability check and land in SHARDED_IPC. The kernel is
         // the only consumer; trust is by endpoint choice (mirror of the
         // POLICY_RESP_ENDPOINT pattern below). Note: NO scheduler wake —
@@ -1048,7 +1048,7 @@ impl SyscallDispatcher {
                 // Drop IPC/capability locks here
             };
 
-            // Virtio-blk kernel-command endpoint (Phase 4a.iii): kernel-origin
+            // Virtio-blk kernel-command endpoint: kernel-origin
             // commands land in `SHARDED_IPC` (not `IPC_MANAGER`). Scoped
             // narrowly to endpoint 26 so other recv paths — which have no
             // reason to consult SHARDED_IPC today — are unaffected.
@@ -2137,9 +2137,9 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Phase 3.2b (ADR-008): check CreateProcess authority before any
-        // resource allocation. CAPABILITY_MANAGER lock level = 4, no
-        // other locks held yet.
+        // ADR-008: check CreateProcess authority before any resource
+        // allocation. CAPABILITY_MANAGER lock level = 4, no other locks
+        // held yet.
         {
             let cap_guard = crate::CAPABILITY_MANAGER.lock();
             if let Some(cap_mgr) = cap_guard.as_ref() {
@@ -2181,7 +2181,7 @@ impl SyscallDispatcher {
         let sched = sched_guard.as_mut().ok_or(SyscallError::OutOfMemory)?;
         let pt = pt_guard.as_mut().ok_or(SyscallError::OutOfMemory)?;
 
-        // Phase 3.2c: process table allocates the slot internally;
+        // Process table allocates the slot internally;
         // ProcessId returned in the result.
         let result = loader::load_elf_process(
             binary,
@@ -2235,13 +2235,13 @@ impl SyscallDispatcher {
                         crate::ipc::CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
                     );
                 }
-                // Phase 3.2b (ADR-008): spawned processes inherit
-                // CreateProcess (trusted boot modules only for now).
+                // ADR-008: spawned processes inherit CreateProcess
+                // (trusted boot modules only for now).
                 let _ = cap_mgr.grant_system_capability(
                     process_id,
                     CapabilityKind::CreateProcess,
                 );
-                // Phase 3.2d.iv (ADR-005): spawned processes may create channels.
+                // ADR-005: spawned processes may create channels.
                 let _ = cap_mgr.grant_system_capability(
                     process_id,
                     CapabilityKind::CreateChannel,
@@ -2339,16 +2339,16 @@ impl SyscallDispatcher {
     ///
     /// Args: arg1 = target_process_id (u32), arg2 = endpoint_id (u32)
     ///
-    /// Authority — Phase 3.1 (per ADR-007 §"Who can revoke"):
+    /// Authority — v0 (per ADR-007 §"Who can revoke"):
     ///   Only the bootstrap Principal can call this. Matches the restriction
     ///   pattern of `handle_bind_principal` and `handle_claim_bootstrap_key`.
     ///
-    /// Phase 3.4 will relax this to also accept: the original grantor of the
+    /// Future work will relax this to also accept: the original grantor of the
     /// capability, and any process holding the `revoke` right on the endpoint
     /// (once the policy service exists as the mediator for those paths).
     ///
-    /// Phase 3.2d will refactor the argument shape from `(pid, endpoint)` to a
-    /// single `CapabilityHandle`, once channels force a system-wide capability
+    /// The argument shape will refactor from `(pid, endpoint)` to a single
+    /// `CapabilityHandle` once channels force a system-wide capability
     /// registry into existence.
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) — no higher locks held.
@@ -2389,7 +2389,7 @@ impl SyscallDispatcher {
     }
 
     // ========================================================================
-    // Phase 3.2d.iii: Shared-memory channels (ADR-005)
+    // Shared-memory channels (ADR-005)
     // ========================================================================
 
     /// SYS_CHANNEL_CREATE: Create a shared-memory channel.
@@ -2693,7 +2693,7 @@ impl SyscallDispatcher {
 
         let channel_id = ChannelId::from_raw(args.arg1);
 
-        // --- Authority check: bootstrap Principal only (Phase 3.1 pattern) ---
+        // --- Authority check: bootstrap Principal only (v0 pattern) ---
         let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
         let caller_principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
         if *caller_principal != bootstrap {
@@ -2859,7 +2859,7 @@ impl SyscallDispatcher {
     }
 
     // ========================================================================
-    // Audit infrastructure (Phase 3.3, ADR-007)
+    // Audit infrastructure (ADR-007)
     // ========================================================================
 
     /// SYS_AUDIT_ATTACH: Attach as the audit ring consumer.
@@ -2885,7 +2885,7 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // --- Phase 1: verify AuditConsumer system capability ---
+        // --- Step 1: verify AuditConsumer system capability ---
         {
             use crate::ipc::capability::CapabilityKind;
             let cap_guard = crate::CAPABILITY_MANAGER.lock();
@@ -2898,7 +2898,7 @@ impl SyscallDispatcher {
             }
         }
 
-        // --- Phase 2: read ring metadata ---
+        // --- Step 2: read ring metadata ---
         let (physical_base, page_count) = {
             let ring_guard = crate::AUDIT_RING.lock();
             let ring = ring_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
@@ -2910,7 +2910,7 @@ impl SyscallDispatcher {
             (ring.physical_base(), ring.page_count())
         }; // drop AUDIT_RING
 
-        // --- Phase 3: map pages into caller's address space ---
+        // --- Step 3: map pages into caller's address space ---
         let consumer_vaddr = {
             let mut pt_guard = crate::PROCESS_TABLE.lock();
             let vma = pt_guard
@@ -2943,14 +2943,14 @@ impl SyscallDispatcher {
             vaddr
         };
 
-        // --- Phase 4: record consumer in ring ---
+        // --- Step 4: record consumer in ring ---
         {
             let mut ring_guard = crate::AUDIT_RING.lock();
             if let Some(ring) = ring_guard.as_mut() {
-                // Re-check: another attach may have raced between phase 2 and 4.
+                // Re-check: another attach may have raced between step 2 and 4.
                 if ring.consumer_attached() {
                     // Undo: should unmap, but this race is extremely unlikely.
-                    // For Phase 3.3, log and return error.
+                    // For now, log and return error.
                     return Err(SyscallError::InvalidArg);
                 }
                 ring.set_consumer(ctx.process_id, consumer_vaddr);
@@ -3087,7 +3087,7 @@ impl SyscallDispatcher {
         };
         stats[44..48].copy_from_slice(&skips_u32.to_le_bytes());
 
-        // ADR-020 Phase B straggler caught during Phase C relocation:
+        // ADR-020 straggler caught during the user_slice relocation:
         // 48-byte audit stats via typed slice.
         let stats_slice = UserWriteSlice::validate(ctx, out_buf, 48)?;
         stats_slice.write_from(&stats)?;
@@ -3233,8 +3233,8 @@ mod tests {
     }
 
     // read_user_buffer / write_user_buffer early-exit guards relocated to
-    // src/syscalls/user_slice.rs during ADR-020 Phase 020.C along with the
-    // helpers themselves (now module-private there).
+    // src/syscalls/user_slice.rs (per ADR-020) along with the helpers
+    // themselves (now module-private there).
 
     // ---- handle_get_pid ----------------------------------------------------
 
@@ -3371,6 +3371,6 @@ mod tests {
     }
 
     // Multi-page copy_from_user_pages / copy_to_user_pages tests + the
-    // FakeSpace fixture were relocated to src/syscalls/user_slice.rs during
-    // ADR-020 Phase 020.C.
+    // FakeSpace fixture were relocated to src/syscalls/user_slice.rs
+    // (per ADR-020).
 }
