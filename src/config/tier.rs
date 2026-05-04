@@ -111,9 +111,9 @@ pub struct TableSizingPolicy {
 /// per-process state may require revisiting the tier defaults.
 ///
 /// The extra `+ 256` is a conscious padding: it gives tier policies ~4×
-/// headroom against per-field growth so the first few Phase 3 additions
-/// (audit subscription, channel handles, policy-service capability) do
-/// not immediately force a policy retune.
+/// headroom against per-field growth so the first few additions (audit
+/// subscription, channel handles, policy-service capability) do not
+/// immediately force a policy retune.
 pub const SLOT_OVERHEAD: usize = core::mem::size_of::<ProcessDescriptor>()
     + core::mem::size_of::<ProcessCapabilities>()
     + 256;
@@ -531,12 +531,12 @@ mod tests {
 
     /// 1 TB — sanity test that pathological RAM doesn't break the math.
     ///
-    /// After Phase 3.2a Item 1 (BuddyAllocator moved to per-heap storage),
-    /// `SLOT_OVERHEAD` shrunk from ~22 KB to ~2 KB. Tier3's 512 MiB
-    /// budget ceiling now buys far more slots than `max_slots = 65536`,
-    /// so tier3 at large RAM is **slot-bound** (max_slots is the binding
-    /// constraint). This is the binding flip the ADR-008 Post-Change
-    /// Review note predicted.
+    /// After BuddyAllocator moved to per-heap storage, `SLOT_OVERHEAD`
+    /// shrunk from ~22 KB to ~2 KB. Tier3's 512 MiB budget ceiling now
+    /// buys far more slots than `max_slots = 65536`, so tier3 at large
+    /// RAM is **slot-bound** (max_slots is the binding constraint).
+    /// This is the binding flip the ADR-008 Post-Change Review note
+    /// predicted.
     #[test]
     fn tier3_at_1_tb_is_slot_bound() {
         let n = num_slots_from(&TIER3_POLICY, 1024u64 * 1024 * 1024 * 1024);
