@@ -46,7 +46,7 @@ pub fn ensure_disk_store() {
         return;
     }
 
-    // Phase 1: handshake + open, no locks held. IPC yields are safe here.
+    // Step 1: handshake + open, no locks held. IPC yields are safe here.
     let mut device = VirtioBlkDevice::new();
     if device.ensure_handshake().is_err() {
         // Driver not available (e.g., AArch64 with no virtio-blk device).
@@ -66,7 +66,7 @@ pub fn ensure_disk_store() {
         }
     };
 
-    // Phase 2: install under lock (fast — no IPC, no yield).
+    // Step 2: install under lock (fast — no IPC, no yield).
     // Wraps the disk store in the `LazyDisk` variant of `ObjectStoreBackend`
     // (enum-dispatch shim per ADR-003 § Divergence) — no `dyn` trait object.
     {

@@ -7,8 +7,8 @@
 //! content-addressed signed objects with an immutable author, a transferable
 //! owner, and a cryptographic signature tying content to controller.
 //!
-//! Phase 1B: Real crypto. Content hashing uses Blake3. Signatures use
-//! Ed25519 and are verified on retrieval.
+//! Real crypto: content hashing uses Blake3; signatures use Ed25519
+//! and are verified on retrieval.
 //!
 //! The interfaces defined here are permanent. The implementations evolve.
 
@@ -98,8 +98,8 @@ pub fn keypair_from_seed(seed: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
 // Signature types
 // ============================================================================
 
-/// Signature algorithm tag. Phase 1B uses Ed25519.
-/// ML-DSA-65 (post-quantum) is Phase 1.5+.
+/// Signature algorithm tag. Currently Ed25519.
+/// ML-DSA-65 (post-quantum) is reserved for future support.
 ///
 /// Re-exported from [`crate::crypto::SignatureAlgo`], which owns the canonical
 /// definition (kernel-wide verify boundary). Kept under this name so existing
@@ -108,7 +108,7 @@ pub fn keypair_from_seed(seed: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
 pub use crate::crypto::SignatureAlgo;
 
 /// Signature bytes. Fixed at 64 bytes for Ed25519.
-/// Phase 1.5+ extends to variable-length for ML-DSA (3293 bytes).
+/// Future ML-DSA support extends to variable-length (3293 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureBytes {
     /// Ed25519 signature (64 bytes). Zeroed = unsigned.

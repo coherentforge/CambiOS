@@ -9,8 +9,8 @@
 //!
 //! - `MemBlockDevice` — in-kernel RAM buffer, for testing and for bring-up
 //!   before a real driver exists.
-//! - `VirtioBlkDevice` (Phase 4a.iii) — IPC client to the user-space
-//!   virtio-blk driver.
+//! - `VirtioBlkDevice` — IPC client to the user-space virtio-blk
+//!   driver.
 //!
 //! Separating the trait from the backend keeps the `DiskObjectStore` logic
 //! (on-disk format, index reconstruction, crash consistency) independent of
@@ -24,8 +24,8 @@
 //! acquires `IPC_MANAGER` at position 3). Callers MUST NOT hold the
 //! `OBJECT_STORE` spinlock across a `BlockDevice` call once a non-memory
 //! backend is wired. `MemBlockDevice` acquires no locks and is safe to call
-//! under `OBJECT_STORE`; the restructure to release-and-reacquire lands in
-//! Phase 4a.iii when the IPC-capable backend arrives.
+//! under `OBJECT_STORE`; the restructure to release-and-reacquire lands
+//! when the IPC-capable backend arrives.
 
 extern crate alloc;
 // `Vec` and `vec!` are only used by the test-gated `MemBlockDevice`
@@ -45,8 +45,8 @@ use alloc::vec::Vec;
 pub const BLOCK_SIZE: usize = 4096;
 
 /// A single block's worth of data. Fixed-size array so stack-allocated
-/// buffers are straightforward and DMA bounce buffers (Phase 4a.iii) can
-/// copy into a `Block` without allocation.
+/// buffers are straightforward and DMA bounce buffers can copy into a
+/// `Block` without allocation.
 pub type Block = [u8; BLOCK_SIZE];
 
 /// Errors from block-device operations.

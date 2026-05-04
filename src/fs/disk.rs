@@ -6,7 +6,7 @@
 //! The on-disk format is specified in ADR-010. This module is the reference
 //! reader/writer of that format. It is generic over any `BlockDevice` — the
 //! same code path is exercised by unit tests against `MemBlockDevice` and
-//! (in Phase 4a.iii) at runtime against `VirtioBlkDevice`.
+//! at runtime against `VirtioBlkDevice`.
 //!
 //! ## Structure
 //!
@@ -54,14 +54,14 @@ pub const FORMAT_VERSION: u32 = 1;
 ///      objects in realistic v1 use; 4096 gives ~4x headroom.
 ///      Memory cost: 4096 entries × (~48 bytes per BTreeMap entry + 1 bit
 ///      free-map) ≈ 200 KiB against the 4 MiB kernel heap.
-/// Replace when: Phase 5 (social log) or Phase 7 (SSB federation) cause
-///      object counts to approach ~1000; bump to 16384 or 65536, verify
-///      heap budget, update docs/ASSUMPTIONS.md.
+/// Replace when: social log or SSB federation cause object counts to
+///      approach ~1000; bump to 16384 or 65536, verify heap budget,
+///      update docs/ASSUMPTIONS.md.
 pub const MAX_OBJECTS_ON_DISK: u64 = 4096;
 
 /// SCAFFOLDING: maximum content length per object on disk. Matches
 /// `BLOCK_SIZE` — one block per content. Raised to multi-block content when
-/// Phase 4b lands channel-based bulk IPC and the format goes to version 2.
+/// channel-based bulk IPC lands and the format goes to version 2.
 pub const MAX_CONTENT_BYTES_ON_DISK: usize = BLOCK_SIZE;
 
 // Superblock field offsets (LBA 0)

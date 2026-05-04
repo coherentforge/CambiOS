@@ -4,7 +4,7 @@
 //! RAM-backed ObjectStore implementation
 //!
 //! Fixed-capacity (256 objects), heap-allocated, linear scan.
-//! Phase 0: no crypto verification, no disk persistence.
+//! No crypto verification, no disk persistence.
 //! Suitable for kernel integration testing and early user-space modules.
 
 extern crate alloc;
@@ -15,9 +15,9 @@ use alloc::alloc::{alloc, Layout};
 use super::{CambiObject, ObjectStore, ObjectMeta, StoreError, content_hash};
 
 /// SCAFFOLDING: maximum number of objects in the RAM store.
-/// Why: Phase 0 RAM-backed store with a fixed-capacity array. Linear scan for
+/// Why: RAM-backed store with a fixed-capacity array. Linear scan for
 ///      get/delete/list is fine at this size.
-/// Replace when: persistent ObjectStore (Phase 4) lands — that backend will be
+/// Replace when: persistent ObjectStore lands — that backend will be
 ///      dynamically sized and this constant goes away. Until then, the first
 ///      time we want to store > 256 objects this is the wall. See docs/ASSUMPTIONS.md.
 pub const MAX_OBJECTS: usize = 256;
@@ -25,7 +25,7 @@ pub const MAX_OBJECTS: usize = 256;
 /// RAM-backed ObjectStore.
 ///
 /// Stores up to `MAX_OBJECTS` CambiObjects in a heap-allocated array.
-/// Linear scan for get/delete/list — fine for Phase 0 testing.
+/// Linear scan for get/delete/list — fine at this size.
 ///
 /// Heap-allocated via `new_boxed()` to avoid stack overflow (matches
 /// existing kernel conventions for large structs).

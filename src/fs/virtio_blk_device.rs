@@ -29,8 +29,8 @@
 //! `VirtioBlkDevice` itself uses no internal lock. It is held behind the
 //! global `VIRTIO_BLK_DEVICE` spinlock (position 10, below `OBJECT_STORE`).
 //! Callers MUST NOT hold `OBJECT_STORE` across a call into this module —
-//! the plan/execute decomposition in `DiskObjectStore` (Phase 4a.iii
-//! Step 3) is the enforcement point.
+//! the plan/execute decomposition in `DiskObjectStore` is the enforcement
+//! point.
 
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
 use crate::ipc::{EndpointId, Message};
