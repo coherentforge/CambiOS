@@ -36,9 +36,9 @@ pub mod paging;
 /// - `early_map_mmio` — per-arch MMIO bring-up entry point, which calls
 ///   back into this module's `early_map_mmio_arch` driver
 ///
-/// R-3.a split this module from the original "AArch64-implementation
-/// gated with `#[cfg(not(target_arch = "x86_64"))]`" shape so RISC-V
-/// Sv48 can plug in without duplicating the walk logic. See ADR-013's
+/// Split out from the original "AArch64-implementation gated with
+/// `#[cfg(not(target_arch = "x86_64"))]`" shape so RISC-V Sv48 can
+/// plug in without duplicating the walk logic. See ADR-013's
 /// Divergence section.
 #[cfg(not(target_arch = "x86_64"))]
 pub mod paging {
@@ -299,8 +299,8 @@ pub mod paging {
         unsafe { write_entry(l3_phys, idx, 0) };
 
         // Invalidate TLB. On AArch64 this is a broadcast TLBI; on
-        // RISC-V it is a local sfence.vma today (SBI-IPI-broadcast lands
-        // in Phase R-5 per ADR-013 Decision 5).
+        // RISC-V it is a local sfence.vma plus SBI-IPI broadcast per
+        // ADR-013 Decision 5 when other harts are online.
         #[cfg(target_os = "none")]
         crate::arch::tlb::shootdown_page(va);
 
@@ -491,7 +491,7 @@ pub mod paging {
     ///
     /// On AArch64, Limine's HHDM does not cover device MMIO, so PL011
     /// and the GIC must be mapped into TTBR1 before serial output works.
-    /// On RISC-V, PLIC MMIO similarly must be mapped (R-3.d).
+    /// On RISC-V, PLIC MMIO similarly must be mapped.
     ///
     /// 3 frames is the worst case for one new MMIO page: one each for
     /// a missing L1, L2, and L3 table. (The L0 is always present — it

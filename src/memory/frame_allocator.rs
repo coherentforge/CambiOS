@@ -226,7 +226,7 @@ impl FrameAllocator {
     ///   raised for the v1 endgame graphics workload (ADR-011) which needs
     ///   GPU command buffers and GPU-visible memory regions well above the
     ///   virtio-net envelope.
-    /// - Per-process heaps (Phase 3.2a) where each process needs a
+    /// - Per-process heaps where each process needs a
     ///   `HEAP_SIZE / PAGE_SIZE` contiguous physical run (1024 frames /
     ///   4 MiB by default). The bitmap scan is `O(total_frames)`
     ///   regardless of `count`, so there's no per-call runtime concern for
@@ -279,7 +279,7 @@ impl FrameAllocator {
     /// Free `count` physically contiguous 4 KiB frames starting at `base`.
     ///
     /// Inverse of `allocate_contiguous`. Used by the process heap reclaim
-    /// path in `handle_exit` (Phase 3.2a).
+    /// path in `handle_exit`.
     ///
     /// All `count` frames must currently be allocated; partially-freed
     /// regions return `DoubleFree` and leave the bitmap unchanged (the
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_allocate_contiguous_large_run() {
-        // Phase 3.2a: the 64-frame cap on allocate_contiguous was lifted so
+        // The 64-frame cap on allocate_contiguous was lifted so
         // process heaps (now 1024 frames / 4 MiB by default) can be
         // allocated through this API. Verify that a 256-frame run works
         // end-to-end (a still-reasonable stand-in for heap allocation).

@@ -272,8 +272,8 @@ pub fn free_process_page_table(
 /// Kernel-half entries (256..512) are shared pointers into the
 /// kernel's own PDP/PD/PT hierarchy and **must not** be freed.
 ///
-/// Phase 3.2d.ii (Roadmap item 17): closes the page-table-frame
-/// leak documented in STATUS.md § Known Issues.
+/// Closes the page-table-frame leak documented in STATUS.md
+/// § Known Issues.
 ///
 /// Returns the total number of frames freed (including the PML4).
 ///

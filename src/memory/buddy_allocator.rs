@@ -43,11 +43,11 @@ pub struct Allocation {
 /// bits are set. The allocator stores the order for each allocation in a
 /// separate parallel bitmap so that `free()` only needs the offset.
 ///
-/// ## In-place construction (Phase 3.2a follow-up)
+/// ## In-place construction
 ///
-/// As of the Phase 3.2a follow-up, the allocator is constructed in place at
-/// the start of each process heap (not as a field of `ProcessDescriptor`
-/// anymore). The first `reserved_slots * MIN_SIZE` bytes of the heap hold
+/// The allocator is constructed in place at the start of each process
+/// heap (not as a field of `ProcessDescriptor`). The first
+/// `reserved_slots * MIN_SIZE` bytes of the heap hold
 /// the allocator's own state and are reserved so user allocations never
 /// overlap. Use [`BuddyAllocator::new_with_reserved_prefix`] to construct
 /// an allocator with a pre-reserved prefix; [`BuddyAllocator::new`] is
@@ -434,7 +434,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Reserved-prefix construction (Phase 3.2a Item 1: in-place allocator state)
+    // Reserved-prefix construction (in-place allocator state)
     // ========================================================================
 
     #[test]
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_new_with_reserved_prefix_allocator_state_size() {
-        // The practical Phase 3.2a use case: reserve enough space for the
+        // The practical use case: reserve enough space for the
         // allocator's own state. size_of::<BuddyAllocator>() is the
         // actual reservation size in ProcessDescriptor::new.
         let state_size = core::mem::size_of::<BuddyAllocator>();

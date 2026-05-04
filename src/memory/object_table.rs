@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Kernel object table region — Phase 3.2a of [ADR-008].
+//! Kernel object table region ([ADR-008]).
 //!
 //! The "kernel object table region" is a single contiguous physical
 //! allocation that backs two disjoint, page-aligned slices:
