@@ -380,7 +380,7 @@ pub enum BlockReason {
     DebuggerWait,
     /// Waiting for child process
     ChildWait,
-    /// Waiting for policy service to respond to a syscall query (Phase 3.4)
+    /// Waiting for policy service to respond to a syscall query
     PolicyWait(u64),
     /// Boot-time gate: module loaded but not yet released. `load_boot_modules`
     /// parks modules 1..N in this state; each predecessor's `sys_module_ready`
