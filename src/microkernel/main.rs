@@ -232,10 +232,10 @@ unsafe extern "C" fn kmain() -> ! {
     // and never touches `limine::*` types (modulo the AP-wakeup path in
     // `ap_entry`, which depends on Limine's MP active-wake mechanism and is
     // documented in src/boot/limine.rs as a deferred abstraction).
-    // ADR-021 Phase 021.B.1: boot-adapter failures return BootError
-    // rather than panicking. kmain returns `!` so we can't use `?`;
-    // dispatch to boot_failed on error so the halt path is the single
-    // typed boot-failure landing instead of a stack of .expect panics.
+    // ADR-021: boot-adapter failures return BootError rather than
+    // panicking. kmain returns `!` so we can't use `?`; dispatch to
+    // boot_failed on error so the halt path is the single typed
+    // boot-failure landing instead of a stack of .expect panics.
     cambios_core::boot::limine::populate(
         &HHDM_REQUEST,
         &MEMORY_MAP_REQUEST,
@@ -293,15 +293,15 @@ unsafe extern "C" fn kmain() -> ! {
     // Initialize physical frame allocator from Limine memory map
     init_frame_allocator();
 
-    // Phase 3.2a (ADR-008): compute num_slots from the active tier policy
-    // and allocate the kernel object table region BEFORE the process
-    // table and capability manager are constructed — they both borrow
-    // slice storage from this region.
+    // ADR-008: compute num_slots from the active tier policy and
+    // allocate the kernel object table region BEFORE the process table
+    // and capability manager are constructed — they both borrow slice
+    // storage from this region.
     init_kernel_object_tables();
 
-    // Phase 3.3 (ADR-007): allocate global audit ring buffer from frame
-    // allocator BEFORE any process is created, so early boot events
-    // (process creation, capability grants) are captured.
+    // ADR-007: allocate global audit ring buffer from frame allocator
+    // BEFORE any process is created, so early boot events (process
+    // creation, capability grants) are captured.
     audit_init();
 
     // Load our GDT (replaces Limine's) — must be before IDT and syscall init
@@ -386,10 +386,10 @@ unsafe extern "C" fn kmain() -> ! {
         map_acpi_regions(rsdp_phys);
 
         // SAFETY: All subsystems initialized. HHDM offset is set.
-        // ADR-021 Phase B.2: typed BootError propagation from the
-        // interrupts subsystem (APIC init, IST stack alloc, APIC
-        // calibration). kmain returns `!` so no `?`; dispatch to
-        // boot_failed for the single typed halt path.
+        // ADR-021: typed BootError propagation from the interrupts
+        // subsystem (APIC init, IST stack alloc, APIC calibration).
+        // kmain returns `!` so no `?`; dispatch to boot_failed for
+        // the single typed halt path.
         unsafe {
             cambios_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
                 .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
@@ -464,7 +464,7 @@ unsafe extern "C" fn kmain() -> ! {
             println!("  ✓ GIC Redistributor initialized (CPU 0)");
 
             // Start ARM Generic Timer at 100 Hz
-            // ADR-021 Phase B.3: typed BootError propagation.
+            // ADR-021: typed BootError propagation.
             cambios_core::arch::aarch64::timer::init(100)
                 .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
             println!("  ✓ ARM Generic Timer started (100 Hz)");
@@ -489,14 +489,14 @@ unsafe extern "C" fn kmain() -> ! {
         // SCAFFOLDING: ECAM base hard-coded for QEMU `virt`. Real
         // hardware discovers this from ACPI MCFG (aarch64) or the
         // `/soc/pci` DTB node. See `docs/ASSUMPTIONS.md`; replace when
-        // a non-QEMU aarch64 target boots or ADR-021 Phase C lands an
-        // MCFG/DTB parser.
+        // a non-QEMU aarch64 target boots or an MCFG/DTB parser lands
+        // (see ADR-021).
         /// SCAFFOLDING: QEMU `virt` aarch64 high PCIe ECAM base.
         /// Why: QEMU's `extended_memmap[VIRT_HIGH_PCIE_ECAM]` lands the
         ///      256 MiB ECAM window at 0x40_1000_0000 after the high
         ///      GIC redistributor. Matches the existing `GICD_PHYS` /
         ///      `GICR_PHYS` precedent — platform-fixed by QEMU.
-        /// Replace when: an MCFG/DTB parser lands (ADR-021 Phase C) or a
+        /// Replace when: an MCFG/DTB parser lands (see ADR-021) or a
         ///      non-QEMU aarch64 target boots. See docs/ASSUMPTIONS.md.
         const ECAM_PHYS_AARCH64: u64 = 0x40_1000_0000;
         /// SCAFFOLDING: QEMU publishes a 256 MiB ECAM window on aarch64.
@@ -547,7 +547,7 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     // ================================================================
-    // Phase 2: Start Application Processors (SMP)
+    // Start Application Processors (SMP)
     // ================================================================
     println!("Starting application processors...");
     // SAFETY: All BSP subsystems initialized (GDT, IDT, APIC, scheduler, heap).
@@ -592,9 +592,6 @@ unsafe extern "C" fn kmain() -> ! {
 //
 // `_start` (in src/arch/riscv64/entry.rs) calls this with the hart id
 // and DTB physical address that OpenSBI passed in registers a0/a1.
-// Phase R-1 keeps this minimal: install an empty BootInfo, bring up
-// the NS16550 UART through direct MMIO, print a banner, halt. Phase
-// R-2 grows real DTB parsing + paging + frame allocator init here.
 // ============================================================================
 
 /// RISC-V boot entry called from `_start` (arch/riscv64/entry.rs).
@@ -612,10 +609,11 @@ unsafe extern "C" fn kmain() -> ! {
 /// gives a higher-half virtual address. The kernel's portable code
 /// assumes exactly this layout.
 ///
-/// Phase R-2 expands this entry with: DTB parse → frame allocator →
-/// kernel heap init. Phase R-3 continues with trap vector, timer,
-/// scheduler. This function is the single continuation point for
-/// Phase R-N growth; everything lands here first.
+/// This is the single continuation point for the RISC-V boot path:
+/// DTB parse → frame allocator → kernel heap → object tables →
+/// per-hart data → trap vector → SBI timer → PLIC → virtio-mmio
+/// discovery → scheduler → SMP wakeup → idle wfi. Everything lands
+/// here first.
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
@@ -638,7 +636,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // regions + reservations.
     unsafe { cambios_core::boot::riscv::populate(dtb_phys); }
 
-    println!("=== CambiOS Microkernel [v0.2.0] (RISC-V Phase R-2) ===");
+    println!("=== CambiOS Microkernel [v0.2.0] (RISC-V) ===");
     println!(
         "Booted via OpenSBI on hart {}, DTB @ {:#x}",
         hart_id, dtb_phys
@@ -670,7 +668,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     }
     println!();
 
-    // Phase R-2.c: memory subsystem bring-up.
+    // Memory subsystem bring-up.
     // SAFETY: called once, single-hart, immediately after DTB populate.
     unsafe { cambios_core::memory::init(); }
     init_kernel_heap();
@@ -687,9 +685,9 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     }
 
     println!();
-    println!("Phase R-2 milestone: Sv48 + higher-half + DTB + heap + Box::new OK.");
+    println!("✓ Memory bring-up: Sv48 + higher-half + DTB + heap + Box::new OK.");
 
-    // Phase R-4.b: kernel object tables + process table. Required by
+    // Kernel object tables + process table. Required by
     // `loader::load_elf_process` (allocates a process slot for hello-
     // riscv64). The portable helpers already know how to bring these
     // up — kmain_riscv64 just needs to call them after the frame
@@ -697,12 +695,12 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     init_kernel_object_tables();
     process_table_init();
 
-    // Phase R-3.f: per-hart data via `tp`. The scheduler and any
-    // other portable code that reaches through `tp` (audit drain,
-    // local_scheduler, local_timer) depend on a valid PerCpu
-    // pointer; without this, the first timer ISR's
-    // `scheduler::on_timer_isr` dereferences stale OpenSBI-left
-    // garbage in `tp` and takes a load-access fault.
+    // Per-hart data via `tp`. The scheduler and any other portable
+    // code that reaches through `tp` (audit drain, local_scheduler,
+    // local_timer) depend on a valid PerCpu pointer; without this,
+    // the first timer ISR's `scheduler::on_timer_isr` dereferences
+    // stale OpenSBI-left garbage in `tp` and takes a load-access
+    // fault.
     //
     // SAFETY: single-hart boot, paging is active, no prior per-hart
     // code has run.
@@ -710,7 +708,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         cambios_core::arch::riscv64::percpu::init_bsp(hart_id);
     }
 
-    // Phase R-3.b+c: trap vector + SBI timer.
+    // Trap vector + SBI timer.
     //
     // Install the S-mode trap vector so any trap lands on our
     // handler. Then read the platform timebase from BootInfo (DTB
@@ -735,14 +733,14 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     }
 
     // SAFETY: trap vector just installed.
-    // ADR-021 Phase B.3: typed BootError on missing timebase.
+    // ADR-021: typed BootError on missing timebase.
     let reload = unsafe { cambios_core::arch::riscv64::timer::init(100) }
         .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
     println!("✓ SBI timer armed at 100 Hz (reload = {} ticks)", reload);
 
-    // Phase R-3.d: PLIC driver — init from DTB-reported MMIO range,
-    // enable the console UART source, and record its IRQ number so
-    // the trap handler's R-3.d inline RX diagnostic can match it.
+    // PLIC driver: init from DTB-reported MMIO range, enable the
+    // console UART source, and record its IRQ number so the trap
+    // handler's inline RX diagnostic can match it.
     match cambios_core::boot::info().plic_mmio {
         Some((phys_base, size_bytes)) => {
             println!(
@@ -754,7 +752,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
             // SAFETY: BootInfo was populated from the DTB; the PLIC
             // region is a real MMIO range and we're in single-hart
             // early boot with interrupts masked.
-            // ADR-021 Phase B.3: typed BootError on implausible PLIC range.
+            // ADR-021: typed BootError on implausible PLIC range.
             unsafe {
                 cambios_core::arch::riscv64::plic::init(phys_base, size_bytes)
                     .unwrap_or_else(|_| {
@@ -789,8 +787,8 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         }
     }
 
-    // Phase R-6: virtio-mmio discovery. DTB populated BootInfo with
-    // every `/soc/virtio_mmio@*` region; we now probe each one for
+    // Virtio-mmio discovery. DTB populated BootInfo with every
+    // `/soc/virtio_mmio@*` region; we now probe each one for
     // magic/version/device-id and synthesize a PCI-shaped entry in
     // the global device table so the unchanged `SYS_DEVICE_INFO`
     // syscall surfaces them to user-space drivers. Empty QEMU slots
@@ -828,28 +826,28 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         }
     }
 
-    // Phase R-6: kernel subsystems that the portable load_boot_modules
-    // path depends on. Same order as the x86_64/aarch64 call sequence
-    // in the Limine boot path — ipc → caps → identity → object store.
-    // Without these, SignedBinaryVerifier rejects every module because
-    // BOOTSTRAP_PRINCIPAL is still zero, and capability binding for
-    // kernel processes never happens.
+    // Kernel subsystems that the portable load_boot_modules path
+    // depends on. Same order as the x86_64/aarch64 call sequence in
+    // the Limine boot path — ipc → caps → identity → object store.
+    // Without these, SignedBinaryVerifier rejects every module
+    // because BOOTSTRAP_PRINCIPAL is still zero, and capability
+    // binding for kernel processes never happens.
     ipc_init();
     capability_manager_init();
     bootstrap_identity_init();
     object_store_init();
 
-    // Phase R-3.f: scheduler + Timer object install. The Scheduler's
-    // idle task (Task 0) is implicitly the kmain flow we're running —
+    // Scheduler + Timer object install. The Scheduler's idle task
+    // (Task 0) is implicitly the kmain flow we're running —
     // `Scheduler::init` marks it Running and current. The first
     // timer IRQ will fill in its saved_rsp. scheduler_init_riscv64
     // also runs load_boot_modules against the fresh scheduler before
     // publishing it into PER_CPU_SCHEDULER[0].
     scheduler_init_riscv64();
 
-    // Phase R-5.b: mark BSP online in the TLB-shootdown mask and
-    // probe the SBI IPI extension (warn-only if absent — single-
-    // hart boots never fire a cross-hart shootdown).
+    // Mark BSP online in the TLB-shootdown mask and probe the SBI
+    // IPI extension (warn-only if absent — single-hart boots never
+    // fire a cross-hart shootdown).
     cambios_core::arch::riscv64::tlb::mark_self_online(hart_id);
     let _ = cambios_core::arch::riscv64::tlb::probe_ipi_extension();
 
@@ -861,17 +859,17 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
         cambios_core::arch::riscv64::trap::enable_interrupts();
     }
 
-    // Phase R-5.a: wake secondary harts via SBI HSM. Each AP runs
-    // `_ap_start` → `kmain_riscv64_ap`, installs its own trap vector +
-    // timer + scheduler, and signals AP_READY_COUNT. BSP blocks here
-    // until every dispatched AP is online, so post-SMP init runs with
-    // the full hart set available.
+    // Wake secondary harts via SBI HSM. Each AP runs `_ap_start` →
+    // `kmain_riscv64_ap`, installs its own trap vector + timer +
+    // scheduler, and signals AP_READY_COUNT. BSP blocks here until
+    // every dispatched AP is online, so post-SMP init runs with the
+    // full hart set available.
     // SAFETY: BSP per-hart state is fully initialized; SBI is ready;
     // any wakeup error is reported and continues.
     unsafe { start_application_processors(); }
 
     println!();
-    println!("Phase R-6 milestone: SMP live + signed boot modules loaded from initrd.");
+    println!("✓ SMP live + signed boot modules loaded from initrd.");
     println!("Each hart runs its own scheduler + timer; the BOOT_MODULE_ORDER chain");
     println!("releases services in roster order. Cross-hart TLB shootdowns fire");
     println!("organically from the loader path — every process exit unmaps its ELF");
@@ -892,14 +890,14 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
 }
 
 // ============================================================================
-// Phase R-3.f — RISC-V scheduler integration + kernel ping task
+// RISC-V scheduler integration + kernel ping task
 // ============================================================================
 
 /// Create the Scheduler + Timer and install them in PER_CPU[0].
 ///
 /// Mirrors the x86_64 / AArch64 `scheduler_init`: builds the scheduler,
 /// runs `load_boot_modules` against it (signed ELFs delivered via the
-/// R-6 initrd path — see `src/boot/initrd.rs` + `src/boot/riscv.rs`
+/// initrd path — see `src/boot/initrd.rs` + `src/boot/riscv.rs`
 /// `/chosen` walker), then installs it into `PER_CPU_SCHEDULER[0]`.
 #[cfg(target_arch = "riscv64")]
 fn scheduler_init_riscv64() {
@@ -946,8 +944,8 @@ fn scheduler_init_riscv64() {
 /// and sp is in higher-half). Per-hart init mirrors the BSP flow:
 /// percpu tp, trap vector, SBI timer, PER_CPU scheduler + Timer,
 /// signal BSP, enable SIE, drop into idle wfi. No work is scheduled
-/// on APs yet — R-5.a's milestone is that the hart comes online
-/// cleanly; R-6 + user-space services will distribute load.
+/// on APs yet — the bring-up milestone is that the hart comes online
+/// cleanly; user-space services will distribute load.
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
@@ -1009,8 +1007,8 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
     println!("  ✓ AP hart={} cpu_idx={} online", hart_id, cpu_idx);
 
     // Step 7: enable SIE + SSIE and enter idle wfi. The scheduler
-    // sits with just its idle task for R-5.a/b; R-6 + task migration
-    // will fill it.
+    // sits with just its idle task for now; task migration will
+    // fill it.
     // SAFETY: trap vector installed; PerCpu/timer/scheduler all live.
     unsafe { cambios_core::arch::riscv64::trap::enable_interrupts(); }
     loop {
@@ -1213,8 +1211,8 @@ fn init_frame_allocator() {
         }
     }
     //
-    // Phase 3.2a (ADR-008): per-process heaps are no longer pre-reserved
-    // as a fixed slab at PROCESS_HEAP_BASE. Instead, each process
+    // ADR-008: per-process heaps are no longer pre-reserved as a
+    // fixed slab at PROCESS_HEAP_BASE. Instead, each process
     // allocates its heap on demand via `FrameAllocator::allocate_contiguous`
     // in `ProcessDescriptor::new`, and reclaims it via `free_contiguous`
     // in `ProcessTable::destroy_process` during `handle_exit`. No
@@ -1230,9 +1228,9 @@ fn init_frame_allocator() {
     );
 }
 
-/// Phase 3.2a (ADR-008): compute `num_slots` from the active tier policy
-/// and the available memory figure, allocate the kernel object table
-/// region from the frame allocator, and install the slice-backed
+/// ADR-008: compute `num_slots` from the active tier policy and the
+/// available memory figure, allocate the kernel object table region
+/// from the frame allocator, and install the slice-backed
 /// `ProcessTable` and `CapabilityManager` into their globals.
 ///
 /// After this runs, `PROCESS_TABLE` and `CAPABILITY_MANAGER` are set
@@ -1344,13 +1342,13 @@ fn init_kernel_object_tables() {
     *PROCESS_TABLE.lock() = Some(process_table);
     *CAPABILITY_MANAGER.lock() = Some(capability_manager);
 
-    // Phase 3.2d.iii: initialize the channel manager (lock position 5).
+    // Initialize the channel manager (lock position 5).
     *CHANNEL_MANAGER.lock() = Some(Box::new(
         cambios_core::ipc::channel::ChannelManager::new(),
     ));
 }
 
-/// Phase 3.3 (ADR-007): allocate global audit ring buffer from the frame
+/// ADR-007: allocate global audit ring buffer from the frame
 /// allocator and initialize the per-CPU staging buffers.
 ///
 /// Must be called after `init_frame_allocator()` and before any process
@@ -1520,10 +1518,10 @@ fn register_process_capabilities(process_id: ProcessId) {
             CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
         );
     }
-    // Phase 3.2b (ADR-008): boot modules are trusted and may spawn
-    // child processes (e.g., the shell uses SYS_SPAWN).
+    // ADR-008: boot modules are trusted and may spawn child processes
+    // (e.g., the shell uses SYS_SPAWN).
     let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
-    // Phase 3.2d.iv (ADR-005): boot modules may create shared-memory channels.
+    // ADR-005: boot modules may create shared-memory channels.
     let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
     // Bind bootstrap Principal to boot module processes (they're trusted)
     let bootstrap = BOOTSTRAP_PRINCIPAL.load();
@@ -1615,7 +1613,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
             }
         };
 
-        // Phase 3.2c: process table allocates slot + generation internally.
+        // Process table allocates slot + generation internally.
         match loader::load_elf_process(
             binary,
             Priority::NORMAL,
@@ -1634,7 +1632,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                 // Register in boot module registry for runtime Spawn syscall
                 BOOT_MODULE_REGISTRY.lock().register(short_name, addr, size as usize);
 
-                // Phase 3.4: identify the policy service by module name
+                // Identify the policy service by module name.
                 if short_name == b"policy-service" {
                     cambios_core::POLICY_SERVICE_PID.store(
                         process_id.as_raw(),
@@ -1643,16 +1641,16 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
                     println!("    ✓ Policy service identified as process {}", process_id.slot());
                 }
 
-                // Phase GUI-0+ (ADR-011, ADR-014): grant the
-                // `MapFramebuffer` system capability to modules that
-                // need to call `SYS_MAP_FRAMEBUFFER`. Today fb-demo
-                // (one-shot smoke test) and scanout-limine (Phase
-                // Scanout-2 fallback driver). Per ADR-014 the
-                // compositor never holds this capability — only
-                // scanout-driver services do. Grant is name-based
-                // rather than all-boot-modules because MapFramebuffer
-                // is a hardware-access capability, narrower than the
-                // default send/receive + CreateProcess grant.
+                // ADR-011, ADR-014: grant the `MapFramebuffer` system
+                // capability to modules that need to call
+                // `SYS_MAP_FRAMEBUFFER`. Today fb-demo (one-shot
+                // smoke test) and scanout-limine (fallback driver).
+                // Per ADR-014 the compositor never holds this
+                // capability — only scanout-driver services do.
+                // Grant is name-based rather than all-boot-modules
+                // because MapFramebuffer is a hardware-access
+                // capability, narrower than the default
+                // send/receive + CreateProcess grant.
                 if short_name == b"fb-demo" || short_name == b"scanout-limine" {
                     use cambios_core::ipc::capability::CapabilityKind;
                     let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
@@ -1775,7 +1773,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
     if loaded_count > 0 {
         println!("✓ Loaded {} signed module(s) as user processes", loaded_count);
-        // Phase 3.4: Enable policy enforcement if the policy service was loaded.
+        // Enable policy enforcement if the policy service was loaded.
         // The fail-open timeout handles the startup window before the policy
         // service processes its first query.
         if cambios_core::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire) != u64::MAX {
@@ -1784,8 +1782,8 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         }
     }
 
-    // Phase 3.2c: NEXT_PROCESS_ID removed — process table allocates
-    // slots internally via linear scan with generation stamping.
+    // NEXT_PROCESS_ID removed — process table allocates slots
+    // internally via linear scan with generation stamping.
 }
 
 /// Initialize IPC subsystem
@@ -1814,7 +1812,7 @@ fn ipc_init() {
 
 /// Initialize capability manager — register the first 3 kernel processes.
 ///
-/// Phase 3.2a: the `CapabilityManager` itself was constructed in
+/// The `CapabilityManager` itself was constructed in
 /// `init_kernel_object_tables` with slice-backed storage. This step
 /// only registers processes 0-2 (kernel tasks created in
 /// process_table_init) and grants their initial capabilities.
@@ -1871,11 +1869,11 @@ fn capability_manager_init() {
             }
         }
 
-        // Phase 3.2b (ADR-008): grant CreateProcess to all kernel
-        // processes. These run with the bootstrap Principal and
-        // orchestrate boot module loading + runtime Spawn.
+        // ADR-008: grant CreateProcess to all kernel processes.
+        // These run with the bootstrap Principal and orchestrate
+        // boot module loading + runtime Spawn.
         let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
-        // Phase 3.2d.iv (ADR-005): grant CreateChannel to kernel processes.
+        // ADR-005: grant CreateChannel to kernel processes.
         let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
     }
 
@@ -1956,7 +1954,8 @@ const fn parse_bootstrap_pubkey_v1(raw: &[u8]) -> [u8; 32] {
     }
     if raw[5] != 0 {
         panic!("bootstrap_pubkey.bin: algo byte != 0 — kernel only knows \
-                Ed25519. ML-DSA-65 (algo=1) lands at identity.md Phase 1.5.");
+                Ed25519. ML-DSA-65 (algo=1) is reserved for future \
+                post-quantum support; not yet implemented.");
     }
     let mut key = [0u8; 32];
     let mut i = 0;
@@ -1978,8 +1977,8 @@ const fn parse_bootstrap_aid_prefix_v1(raw: &[u8]) -> [u8; 2] {
     [raw[6], raw[7]]
 }
 
-/// Initialize the object store — Phase 4a.iii wires the disk-backed
-/// `LazyDiskStore` so objects persist across reboots. The handshake with
+/// Initialize the object store. Wires the disk-backed `LazyDiskStore`
+/// so objects persist across reboots. The handshake with
 /// the virtio-blk user-space driver happens on the first `SYS_OBJ_*` call
 /// (driver isn't running yet at this boot stage). Until that handshake,
 /// the store has no capacity and every `get` returns a deferred error;
@@ -2016,7 +2015,7 @@ fn object_store_init() {
 
 /// Initialize process table — populate the first 3 kernel processes.
 ///
-/// Phase 3.2a: the `ProcessTable` itself was constructed in
+/// The `ProcessTable` itself was constructed in
 /// `init_kernel_object_tables` with slice-backed storage. This step
 /// only creates the first three `ProcessDescriptor`s, allocating each
 /// one's heap via the frame allocator.
@@ -2038,7 +2037,7 @@ fn process_table_init() {
     // Create process descriptors for the first 3 processes (matching
     // task count). Each one gets a freshly allocated heap region via
     // FrameAllocator::allocate_contiguous (1024 frames / 4 MiB each).
-    // Phase 3.2c: slot + generation assigned by process table.
+    // Slot + generation assigned by process table.
     for i in 0..3 {
         match pt.create_process(&mut fa_guard, /* create_page_table = */ false) {
             Ok(process_id) => {
@@ -2175,7 +2174,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
         cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
 
         // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
-        // ADR-021 Phase B.3: AP discovers if BSP forgot to init the timer.
+        // ADR-021: AP discovers if BSP forgot to init the timer.
         cambios_core::arch::aarch64::timer::init_ap()
             .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
     }
@@ -2302,7 +2301,7 @@ fn distribute_tasks_to_aps() {
 /// Must be called after all BSP subsystems are initialized (GDT, IDT, APIC,
 /// scheduler, etc.) and after `init_hardware_interrupts()`.
 unsafe fn start_application_processors() {
-    // RISC-V SMP — Phase R-5.a. Iterate harts reported by the DTB
+    // RISC-V SMP. Iterate harts reported by the DTB
     // (`/cpus/cpu@N/reg`), skip the BSP (our own hart_id), and wake
     // each AP via SBI HSM's `sbi_hart_start`. The target PA is the
     // `_ap_start` assembly entry in `src/arch/riscv64/entry.rs`,
@@ -2532,7 +2531,7 @@ fn microkernel_loop() -> ! {
 
     // Tick-based gating: deterministic frequency regardless of interrupt rate.
     // Invariant check every 60s (6000 ticks @ 100Hz). The periodic status
-    // tick ("[Tick N] Tasks: ...") was removed in Phase 4b — it cluttered
+    // tick ("[Tick N] Tasks: ...") was removed because it cluttered
     // serial output without providing runtime value. Invariant verification
     // stays: it halts on corruption, which is silent and load-bearing.
     let mut last_verify_tick: u64 = 0;
