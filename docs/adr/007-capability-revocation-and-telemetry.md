@@ -1,6 +1,6 @@
 # ADR-007: Capability Revocation and Audit Telemetry
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-10
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-002](002-three-layer-enforcement-pipeline.md) (Three-Layer Enforcement Pipeline)
 - **Related:** [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC Primitives), [ADR-006](006-policy-service.md) (Policy Service)

@@ -1,6 +1,6 @@
 # ADR-011: Graphics Architecture and Scaling Assumptions
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-13
 - **Depends on:** [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC Bulk Path — Channels), [ADR-007](007-capability-revocation-and-telemetry.md) (Revocation + Telemetry), [ADR-009](009-purpose-tiers-scope.md) (Deployment Tiers)
 - **Related:** [CambiOS.md](../CambiOS.md) § "Graphics and windowing runs in user-space", [PHILOSOPHY.md](../PHILOSOPHY.md)

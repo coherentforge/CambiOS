@@ -1,6 +1,6 @@
 # ADR-014: Compositor ↔ Scanout-Driver Protocol
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-15
 - **Depends on:** [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC channels), [ADR-011](011-graphics-architecture-and-scaling.md) (Graphics architecture)
 - **Related:** [ADR-012](012-input-architecture-and-device-classes.md) (input flow into compositor; same modularity pattern, different transport).

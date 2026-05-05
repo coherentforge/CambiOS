@@ -1,6 +1,6 @@
 # ADR-023: Audit Consumer Capability and Principal Resolution
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-26
 - **Depends on:** [ADR-007](007-capability-revocation-and-telemetry.md) (audit ring + bootstrap-only attach), [ADR-008](008-boot-time-sized-object-tables.md) (capability-table sizing), [ADR-002](002-three-layer-enforcement-pipeline.md) (three-layer enforcement)
 - **Related:** [identity.md](../identity.md) (Principal model + did:key encoding), [PHILOSOPHY.md](../PHILOSOPHY.md) (AI watches, not decides)

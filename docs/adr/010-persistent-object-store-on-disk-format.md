@@ -1,6 +1,6 @@
 # ADR-010: Persistent ObjectStore — on-disk format
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-14
 - **Depends on:** [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-004](004-cryptographic-integrity.md) (Blake3 + Ed25519)
 - **Related:** [identity.md](../identity.md), [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md), [ADR-005](005-ipc-primitives-control-and-bulk.md)
@@ -156,7 +156,7 @@ Mount's record scan is a `for i in 0..capacity_slots` loop. `capacity_slots` is 
 
 ## Divergence
 
-Two things landed during Phase 4a.iii that deviate from the plan originally sketched alongside this ADR (in `/Users/jasonricca/.claude/plans/woolly-bouncing-squid.md`). Capturing them here so the ADR doesn't silently become fiction.
+Two things landed during Phase 4a.iii that deviate from the plan originally sketched alongside this ADR. Capturing them here so the ADR doesn't silently become fiction.
 
 ### 1. Plan/execute/commit decomposition not implemented
 

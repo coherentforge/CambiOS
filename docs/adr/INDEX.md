@@ -14,26 +14,26 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 002 | [Three-Layer Enforcement Pipeline for IPC and Syscalls](002-three-layer-enforcement-pipeline.md) | Accepted | 2026-04-04 |
 | 003 | [Content-Addressed Storage and Cryptographic Identity](003-content-addressed-storage-and-identity.md) | Accepted | 2026-04-05 |
 | 004 | [Cryptographic Integrity — Blake3 Hashing and Ed25519 Signatures](004-cryptographic-integrity.md) | Accepted | 2026-04-05 |
-| 005 | [IPC Primitives — Control Path and Bulk Data Path](005-ipc-primitives-control-and-bulk.md) | Proposed | 2026-04-10 |
-| 006 | [Policy Service — Externalized Authorization Decisions](006-policy-service.md) | Proposed | 2026-04-10 |
-| 007 | [Capability Revocation and Audit Telemetry](007-capability-revocation-and-telemetry.md) | Proposed | 2026-04-10 |
-| 008 | [Boot-Time-Sized Kernel Object Tables](008-boot-time-sized-object-tables.md) | Proposed | 2026-04-11 |
-| 009 | [Purpose, Deployment Tiers, and Scope Boundaries](009-purpose-tiers-scope.md) | Proposed | 2026-04-11 |
-| 010 | [Persistent ObjectStore — on-disk format](010-persistent-object-store-on-disk-format.md) | Proposed | 2026-04-14 |
-| 011 | [Graphics Architecture and Scaling Assumptions](011-graphics-architecture-and-scaling.md) | Proposed | 2026-04-13 |
-| 012 | [Input Architecture and Device Classes](012-input-architecture-and-device-classes.md) | Proposed | 2026-04-14 |
-| 013 | [RISC-V (riscv64gc) Architecture Support](013-riscv64-architecture-support.md) | Proposed | 2026-04-15 |
-| 014 | [Compositor ↔ Scanout-Driver Protocol](014-compositor-scanout-driver-protocol.md) | Proposed | 2026-04-15 |
+| 005 | [IPC Primitives — Control Path and Bulk Data Path](005-ipc-primitives-control-and-bulk.md) | Accepted | 2026-04-10 |
+| 006 | [Policy Service — Externalized Authorization Decisions](006-policy-service.md) | Accepted | 2026-04-10 |
+| 007 | [Capability Revocation and Audit Telemetry](007-capability-revocation-and-telemetry.md) | Accepted | 2026-04-10 |
+| 008 | [Boot-Time-Sized Kernel Object Tables](008-boot-time-sized-object-tables.md) | Accepted | 2026-04-11 |
+| 009 | [Purpose, Deployment Tiers, and Scope Boundaries](009-purpose-tiers-scope.md) | Accepted | 2026-04-11 |
+| 010 | [Persistent ObjectStore — on-disk format](010-persistent-object-store-on-disk-format.md) | Accepted | 2026-04-14 |
+| 011 | [Graphics Architecture and Scaling Assumptions](011-graphics-architecture-and-scaling.md) | Accepted | 2026-04-13 |
+| 012 | [Input Architecture and Device Classes](012-input-architecture-and-device-classes.md) | Accepted | 2026-04-14 |
+| 013 | [RISC-V (riscv64gc) Architecture Support](013-riscv64-architecture-support.md) | Accepted | 2026-04-15 |
+| 014 | [Compositor ↔ Scanout-Driver Protocol](014-compositor-scanout-driver-protocol.md) | Accepted | 2026-04-15 |
 | 015 | [Storage Tiers and the Commitment Ladder](015-storage-tiers-and-commitment-ladder.md) | Proposed | 2026-04-16 |
 | 016 | [Windows Compatibility via Bounded Static Shims](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-21 |
 | 017 | [User-Directed Cloud Inference](017-user-directed-cloud-inference.md) | Proposed | 2026-04-21 |
 | 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Proposed | 2026-04-19 |
 | 019 | [Process Fault Reaping and Peer-Generation Signaling](019-process-fault-reaping-and-peer-generation.md) | Proposed | 2026-04-19 |
-| 020 | [Typed User-Buffer Slices at the Syscall Boundary](020-typed-user-buffer-slices-at-syscall-boundary.md) | Proposed | 2026-04-19 |
-| 021 | [Typed BootError Propagation Through the Init Path](021-typed-boot-error-propagation.md) | Proposed | 2026-04-19 |
+| 020 | [Typed User-Buffer Slices at the Syscall Boundary](020-typed-user-buffer-slices-at-syscall-boundary.md) | Accepted | 2026-04-19 |
+| 021 | [Typed BootError Propagation Through the Init Path](021-typed-boot-error-propagation.md) | Accepted | 2026-04-19 |
 | 022 | [Wall-Clock Time and the Path to Decentralized Time](022-wall-clock-time.md) | Accepted | 2026-04-25 |
-| 023 | [Audit Consumer Capability and Principal Resolution](023-audit-consumer-capability.md) | Proposed | 2026-04-26 |
-| 024 | [Syscall ABI in a Standalone Contract Crate (`cambios-abi`)](024-syscall-abi-crate.md) | Proposed | 2026-04-26 |
-| 025 | [Principal as 32-byte AID (decoupled from key bytes)](025-principal-as-aid.md) | Proposed | 2026-04-30 |
-| 026 | [Identity Transcription at the Kernel Ring](026-identity-transcription-at-the-kernel-ring.md) | Proposed | 2026-05-02 |
+| 023 | [Audit Consumer Capability and Principal Resolution](023-audit-consumer-capability.md) | Accepted | 2026-04-26 |
+| 024 | [Syscall ABI in a Standalone Contract Crate (`cambios-abi`)](024-syscall-abi-crate.md) | Accepted | 2026-04-26 |
+| 025 | [Principal as 32-byte AID (decoupled from key bytes)](025-principal-as-aid.md) | Accepted | 2026-04-30 |
+| 026 | [Identity Transcription at the Kernel Ring](026-identity-transcription-at-the-kernel-ring.md) | Accepted | 2026-05-02 |
 | 027 | [Service Clusters — Identity-Bound Channel Meshes](027-service-clusters.md) | Proposed | 2026-05-03 |

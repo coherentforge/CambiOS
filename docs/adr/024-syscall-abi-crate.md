@@ -1,6 +1,6 @@
 # ADR-024: Syscall ABI in a Standalone Contract Crate (`cambios-abi`)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-26
 - **Depends on:** [ADR-002](002-three-layer-enforcement-pipeline.md) (the pipeline that enforces the ABI), [ADR-022](022-wall-clock-time.md) (slot reservation discipline that depends on a stable ABI definition)
 - **Related:** [ADR-023](023-audit-consumer-capability.md) (concurrent landing whose dead-code warnings on policy-service made the duplication concrete)

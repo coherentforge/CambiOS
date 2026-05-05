@@ -17,7 +17,7 @@ This ADR is **the kernel-side substrate** for dealing with process death that wa
 | Capturing fault context (fault kind, faulting address, PC) into the audit trail | **This ADR (kernel)** |
 | Signaling peer restart to surviving clients (endpoint generation counter) | **This ADR (kernel)** |
 | Deciding *whether*, *when*, and *how often* to restart a dead service | [ADR-018](018-init-process-and-boot-manifest.md) (user-space init) |
-| Restart backoff, dependency-graph restart propagation, giveup thresholds | [ADR-018](018-018-init-process-and-boot-manifest.md) (user-space init, manifest) |
+| Restart backoff, dependency-graph restart propagation, giveup thresholds | [ADR-018](018-init-process-and-boot-manifest.md) (user-space init, manifest) |
 | Crash-dump-as-CambiObject for consent-based diagnostics | **Future ADR** (deferred — captured as open question below) |
 
 The rule is the same one ADR-002 and ADR-006 already follow: **kernel makes mechanical checks, user-space makes policy decisions.** Init deciding to restart a service is a policy decision. The kernel delivering a clean, faithful record of what happened is a mechanical concern.
@@ -43,7 +43,7 @@ Four specific mechanical problems, each needed independently but composing into 
 
 **Problem 2 — no parent notification on fault.** `SYS_WAIT_TASK` only wakes on `SYS_EXIT` (via the parent-wake path in `handle_exit`). A parent — whether init or a user-space spawner — cannot observe a child's fault. Restart policy ([ADR-018](018-init-process-and-boot-manifest.md) § Restart and backoff) requires this observation.
 
-**Problem 3 — fault-kill is indistinguishable from clean exit.** Even if `SYS_WAIT_TASK` fired on fault, today's ABI surfaces only a `u32` exit code. A peer has no way to distinguish "process exited voluntarily with code 1" from "process faulted with a page fault at RIP 0x402300." The restart policy in [ADR-018](018-018-init-process-and-boot-manifest.md) wants to treat these differently: clean exit of a `OneShot` service is success; fault of a `OneShot` service may warrant a giveup. Today they are the same code path at the wire format.
+**Problem 3 — fault-kill is indistinguishable from clean exit.** Even if `SYS_WAIT_TASK` fired on fault, today's ABI surfaces only a `u32` exit code. A peer has no way to distinguish "process exited voluntarily with code 1" from "process faulted with a page fault at RIP 0x402300." The restart policy in [ADR-018](018-init-process-and-boot-manifest.md) wants to treat these differently: clean exit of a `OneShot` service is success; fault of a `OneShot` service may warrant a giveup. Today they are the same code path at the wire format.
 
 **Problem 4 — no peer-generation signal.** When fs-service restarts, clients holding endpoint-16 handles receive messages from "fs-service" at the same endpoint number with the same bound Principal — the manifest guarantees that (see [ADR-018 § 1](018-init-process-and-boot-manifest.md)). But any *stateful* handle the client held (an open inode, a session cookie, a long-lived channel) is now held against a process that no longer exists. The client has no kernel-observable primitive to detect this. They will see silent failures, stale reads, or worse — a new occupant of the same process slot interpreting the client's stale handle as its own.
 

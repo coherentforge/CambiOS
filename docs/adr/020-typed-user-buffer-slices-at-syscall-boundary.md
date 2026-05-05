@@ -1,6 +1,6 @@
 # ADR-020: Typed User-Buffer Slices at the Syscall Boundary
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-19
 - **Depends on:** CLAUDE.md Development Convention 1 (no panics in kernel) and Convention 6 (invariants encoded in types), [ADR-002](002-three-layer-enforcement-pipeline.md) (kernel is the enforcement boundary between user and kernel trust domains)
 - **Related:** [ADR-019](019-process-fault-reaping-and-peer-generation.md) (the proposed `ExitInfo` struct is one of many user-provided output buffers; this ADR's types are how that handshake should be implemented), [ADR-018](018-init-process-and-boot-manifest.md) (manifest-driven spawn; init-facing syscalls take user pointers like every other syscall), [ADR-007](007-capability-revocation-and-telemetry.md) (audit events for user-pointer validation failures fit the existing machinery)

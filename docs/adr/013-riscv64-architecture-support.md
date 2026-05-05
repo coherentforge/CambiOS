@@ -1,9 +1,9 @@
 # ADR-013: RISC-V (riscv64gc) Architecture Support
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-15
 - **Depends on:** [ADR-001](001-smp-scheduling-and-lock-hierarchy.md) (SMP scheduling and lock hierarchy), [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC primitives — control and bulk), [ADR-009](009-purpose-tiers-scope.md) (Purpose, deployment tiers, and scope)
-- **Related:** [src/boot/mod.rs](../../src/boot/mod.rs) (BootInfo abstraction this ADR plugs into), [CLAUDE.md](../../CLAUDE.md) § "Multi-Platform Strategy", plan file at `/Users/jasonricca/.claude/plans/melodic-tumbling-muffin.md`
+- **Related:** [src/boot/mod.rs](../../src/boot/mod.rs) (BootInfo abstraction this ADR plugs into), [CLAUDE.md](../../CLAUDE.md) § "Multi-Platform Strategy"
 - **Supersedes:** N/A
 
 ## Context
@@ -159,7 +159,7 @@ This ADR also commits to two structural conventions that reduce the cost of thre
 
 ## Implementation
 
-The execution sequence is recorded in the plan file at `/Users/jasonricca/.claude/plans/melodic-tumbling-muffin.md`, not duplicated here. Phase markers (R-0 through R-6) appear in [STATUS.md](../../STATUS.md) as they land.
+Per-phase commits in `git log` are the granular execution record. Phase markers (R-0 through R-6) appear in [STATUS.md](../../STATUS.md) as they land.
 
 Critical files to be created (full list in the plan):
 

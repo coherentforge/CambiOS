@@ -1,6 +1,6 @@
 # ADR-026: Identity Transcription at the Kernel Ring
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-02
 - **Depends on:** [ADR-025](025-principal-as-aid.md) (Principal as 32-byte AID — the identity primitive this builds on), [ADR-000](000-zta-and-cap.md) (ZTA + capability foundations), [ADR-002](002-three-layer-enforcement-pipeline.md) (Three-Layer Enforcement Pipeline — the existing hot-path cap check), [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC Primitives — precedent for the same shape duality at the IPC layer)
 - **Related:** [identity.md](../identity.md) (rewritten 2026-05-02 to land the multi-Principal vault and the framing this ADR codifies), [ADR-007](007-capability-revocation-and-telemetry.md) (Capability Revocation — receives an amendment for non-revocation accumulators that this ADR motivates), [ADR-010](010-persistent-object-store-on-disk-format.md) (cold-path cap form, on-disk), [ADR-015](015-storage-tiers-and-commitment-ladder.md) (same duality at the storage layer), [ADR-016](016-win-compat-api-ai-boundary.md) (strongest existing precedent for AI-doesn't-write-policy)
@@ -182,7 +182,7 @@ The transcription invariant is a verification-friendly property:
 
 **Why considered.** The vault is the userspace half of the same architectural picture. Single ADR covering "kernel transcribes; vault holds plurality; cap shape duality reflects the boundary; AI sandboxes per-Principal" is conceptually unified.
 
-**Why rejected (for now).** The vault is a userspace service spec — APIs, sync substrate, biometric integration, recovery protocol. It deserves its own ADR with its own threat model, its own deferred questions, and its own verification posture. This ADR is the *kernel-architecture statement* that the vault ADR will cite. Decision deferred per [session memory `project_identity_boundary_phenomenon`](../../.claude/projects/-Users-jasonricca-Library-CloudStorage-OneDrive-Personal-Synthesis-coding-ArcOS-Dev/memory/project_identity_boundary_phenomenon.md): the multi-Principal vault may land as its own ADR, or as the keystore-service ADR deferred by [ADR-025](025-principal-as-aid.md#deferred). Either way, the kernel-side framing is settled here, separately, first.
+**Why rejected (for now).** The vault is a userspace service spec — APIs, sync substrate, biometric integration, recovery protocol. It deserves its own ADR with its own threat model, its own deferred questions, and its own verification posture. This ADR is the *kernel-architecture statement* that the vault ADR will cite. The multi-Principal vault may land as its own ADR, or as the keystore-service ADR deferred by [ADR-025](025-principal-as-aid.md#deferred). Either way, the kernel-side framing is settled here, separately, first.
 
 ### Option C: Per-claim ADRs
 

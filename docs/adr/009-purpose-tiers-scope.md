@@ -1,6 +1,6 @@
 # ADR-009: Purpose, Deployment Tiers, and Scope Boundaries
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-11
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities)
 - **Related:** [CambiOS.md](../CambiOS.md), [PHILOSOPHY.md](../PHILOSOPHY.md), [SECURITY.md](../SECURITY.md), [win-compat.md](../win-compat.md), [identity.md](../identity.md), [GOVERNANCE.md](../GOVERNANCE.md)

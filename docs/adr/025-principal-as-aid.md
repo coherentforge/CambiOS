@@ -1,6 +1,6 @@
 # ADR-025: Principal as 32-byte AID (decoupled from key bytes)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-30
 - **Depends on:** [ADR-003](003-content-addressed-storage-and-identity.md) (the original "Principal IS the Ed25519 pubkey" decision this supersedes the implementation contract for), [ADR-005](005-ipc-primitives-control-and-bulk.md) (the 256-byte IPC envelope this protects)
 - **Related:** [identity.md](../identity.md) (algorithm-agnostic design intent, post-quantum roadmap), [ADR-004](004-cryptographic-integrity.md) (signing primitives), [ADR-007](007-capability-revocation-and-telemetry.md) (Principal binding on capabilities)

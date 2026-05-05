@@ -1,6 +1,6 @@
 # ADR-021: Typed BootError Propagation Through the Init Path
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-19
 - **Depends on:** CLAUDE.md Development Convention 1 (no `panic!` / `expect` / `unwrap` in non-test kernel code; every failure must be a typed Result)
 - **Related:** [ADR-019](019-process-fault-reaping-and-peer-generation.md) (which scoped runtime *kernel-mode* fault recovery out; this ADR handles the *boot-time* failure path, a different surface), [ADR-013](013-riscv64-architecture-support.md) (RISC-V boot stub and DTB-derived timer; several of the sites live in the RISC-V init chain)

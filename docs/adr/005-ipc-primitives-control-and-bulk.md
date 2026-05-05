@@ -1,6 +1,6 @@
 # ADR-005: IPC Primitives — Control Path and Bulk Data Path
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-10
 - **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-002](002-three-layer-enforcement-pipeline.md) (Three-Layer Enforcement Pipeline)
 - **Supersedes:** N/A
