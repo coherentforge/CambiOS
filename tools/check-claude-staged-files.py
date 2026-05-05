@@ -21,12 +21,15 @@
 # anywhere in the commit message. Non-Claude commits pass through
 # untouched; Jason's manual commits do not need a Staged files block.
 #
-# Parse rule: the first line matching /^\s*-?\s*Staged files/ (case-
-# insensitive) begins the block. Following lines are paths iff they are
-# (a) indented more than the header, (b) non-empty, (c) after stripping
-# any leading Markdown bullet (`- ` or `* `) the remainder contains no
-# internal whitespace. The block ends at the first line that fails
-# those tests, or at the end of the message.
+# Parse rule: the first line matching /^\s*-?\s*Staged files\s*:\s*$/
+# (case-insensitive) begins the block. The trailing `:\s*$` means a
+# bare prose mention like "...actually staged files. That shape..." no
+# longer matches as the header — the line must be exactly the header,
+# not a phrase containing "staged files". Following lines are paths
+# iff they are (a) indented more than the header, (b) non-empty, (c)
+# after stripping any leading Markdown bullet (`- ` or `* `) the
+# remainder contains no internal whitespace. The block ends at the
+# first line that fails those tests, or at the end of the message.
 #
 # The bullet-strip means both forms parse identically:
 #     Staged files:           Staged files:
@@ -45,7 +48,7 @@ import sys
 from pathlib import Path
 
 
-HEADER_RE = re.compile(r'^(?P<indent>\s*)-?\s*Staged files\b', re.IGNORECASE)
+HEADER_RE = re.compile(r'^(?P<indent>\s*)-?\s*Staged files\s*:\s*$', re.IGNORECASE)
 
 
 def extract_claimed_paths(msg):
