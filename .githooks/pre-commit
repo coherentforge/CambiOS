@@ -29,6 +29,13 @@
 #                              comment block (CLAUDE.md Development
 #                              Convention 1). Don't-grow-the-baseline
 #                              gate. Tier 1 E3 (prancy-manatee plan).
+#   check-status-freshness:    STATUS.md `last_synced_to_code:` must be
+#                              within 7 days of today. Advisory only
+#                              (exit 0; warn-but-pass first iteration).
+#                              Tightens to exit 1 once the warn cycle
+#                              proves it does not change behavior.
+#                              Misfire-fix follow-up to the 2026-04-22
+#                              → 2026-05-04 12-day drift window.
 #
 # Bypass: `git commit --no-verify` (discouraged; use for emergencies only).
 
@@ -40,3 +47,4 @@ python3 tools/check-banned-paths.py
 python3 tools/check-index-isolation.py
 python3 tools/check-lockfile-additions.py
 python3 tools/check-unsafe-coverage.py
+python3 tools/check-status-freshness.py

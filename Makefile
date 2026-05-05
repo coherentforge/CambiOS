@@ -1061,6 +1061,15 @@ check-banned-paths:
 check-lockfile:
 	@python3 tools/check-lockfile-additions.py
 
+# STATUS.md freshness gate — warn (advisory only) when the file's
+# `last_synced_to_code:` is more than 7 days behind today. Fires on
+# pre-commit so per-landing increments stay cheaper than the catch-up
+# sync that recovers from prolonged drift. Tightens to a hard block
+# (exit 1) once the warn cycle proves it does not change behavior;
+# see tools/check-status-freshness.py for the trigger and rationale.
+check-status-freshness:
+	@python3 tools/check-status-freshness.py
+
 # Pre-edit audit for a file. Run before the first Edit on any file per
 # session — especially under parallel-thread development. Surfaces
 # uncommitted changes (HEAD commit, status, full diff) so the caller
