@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Standalone proof crate for the kernel's DTB parser. Excluded from
+# the kernel workspace (see root Cargo.toml). Builds under Kani's
+# bundled toolchain via `cargo kani` from this directory.
+#
+# The proven source is the kernel's `src/boot/riscv.rs`, included
+# verbatim via `#[path = ...]`. `populate()` and its `super::{BootInfo,
+# MemoryRegion, MemoryRegionKind}` import are gated with
+# `#[cfg(not(any(test, fuzzing)))]`; `build.rs` sets `--cfg fuzzing`
+# so that branch compiles out, leaving only the pure parser core.
+# Three constants the walker references via `super::` (MAX_MEMORY_REGIONS,
+# MAX_HARTS, MAX_VIRTIO_MMIO_DEVICES) are stubbed in `src/lib.rs`.
+
+[package]
+name = "dtb-proofs"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }

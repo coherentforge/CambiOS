@@ -144,13 +144,6 @@ src/audit/mod.rs:568:FLAG_SAMPLED
 src/boot/initrd.rs:55:ARCHIVE_VERSION
 src/boot/initrd.rs:58:ARCHIVE_HEADER_SIZE
 src/boot/initrd.rs:61:ENTRY_HEADER_SIZE
-src/boot/riscv.rs:37:FDT_MAGIC
-src/boot/riscv.rs:40:FDT_BEGIN_NODE
-src/boot/riscv.rs:41:FDT_END_NODE
-src/boot/riscv.rs:42:FDT_PROP
-src/boot/riscv.rs:43:FDT_NOP
-src/boot/riscv.rs:44:FDT_END
-src/boot/riscv.rs:713:VMA_TO_PMA_OFFSET
 src/boot_modules.rs:12:MAX_MODULES
 src/boot_modules.rs:15:MAX_NAME_LEN
 src/config/tier.rs:117:SLOT_OVERHEAD

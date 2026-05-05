@@ -27,20 +27,31 @@
 //! reservations we know about). Boot modules are picked up via
 //! `/chosen/initrd-*` (see initrd.rs).
 
+// `populate()` is the only consumer of these types; it is gated below
+// with `#[cfg(not(any(test, fuzzing)))]` so verification/dtb-proofs can
+// `#[path]`-include this file without dragging in `super::BootInfo` and
+// its kernel-graph tentacles. Same pattern as verification/capability-proofs.
+#[cfg(not(any(test, fuzzing)))]
 use super::{BootInfo, MemoryRegion, MemoryRegionKind};
 
 // ============================================================================
 // FDT header + tokens
 // ============================================================================
 
-/// FDT header magic bytes in big-endian. Every valid DTB starts with this.
+/// HARDWARE: FDT header magic. Devicetree Specification v0.4 §5.1.
+/// Every valid DTB starts with this big-endian u32.
 const FDT_MAGIC: u32 = 0xd00dfeed;
 
-/// FDT structure block tokens (big-endian u32s).
+/// HARDWARE: FDT structure-block token IDs. Devicetree Specification
+/// v0.4 §5.4. Wire-format constants; not a project choice.
 const FDT_BEGIN_NODE: u32 = 0x1;
+/// HARDWARE: see [`FDT_BEGIN_NODE`].
 const FDT_END_NODE: u32 = 0x2;
+/// HARDWARE: see [`FDT_BEGIN_NODE`].
 const FDT_PROP: u32 = 0x3;
+/// HARDWARE: see [`FDT_BEGIN_NODE`].
 const FDT_NOP: u32 = 0x4;
+/// HARDWARE: see [`FDT_BEGIN_NODE`].
 const FDT_END: u32 = 0x9;
 
 /// SCAFFOLDING: DTB structure-block walk bound — max tokens processed.
@@ -64,33 +75,33 @@ const FDT_HEADER_MIN: usize = 40;
 /// FDT header fields we care about. Raw u32s are big-endian on disk;
 /// fields here are already converted to native endianness.
 #[derive(Clone, Copy, Debug)]
-struct FdtHeader {
-    totalsize: u32,
-    off_dt_struct: u32,
+pub(crate) struct FdtHeader {
+    pub(crate) totalsize: u32,
+    pub(crate) off_dt_struct: u32,
     #[allow(dead_code)]
-    off_dt_strings: u32,
-    size_dt_struct: u32,
+    pub(crate) off_dt_strings: u32,
+    pub(crate) size_dt_struct: u32,
     #[allow(dead_code)]
-    size_dt_strings: u32,
+    pub(crate) size_dt_strings: u32,
 }
 
 impl FdtHeader {
-    /// Read the FDT header from a physical address. `ptr` must point
-    /// at least `FDT_HEADER_MIN` bytes of memory containing a valid
-    /// header. Returns `None` on bad magic or if fields are
-    /// structurally incoherent.
+    /// Read the FDT header from a byte slice. Returns `None` if the
+    /// slice is shorter than `FDT_HEADER_MIN`, has a bad magic, or
+    /// declares structurally incoherent offsets.
     ///
-    /// # Safety
-    /// - `ptr` must be a valid readable address for at least 40 bytes.
-    unsafe fn read(ptr: *const u8) -> Option<Self> {
-        // All fields are big-endian u32 at fixed offsets.
-        // SAFETY: Caller promises ptr + 40 bytes is readable.
+    /// Verifier entry point: pure, no unsafe, no kernel graph deps.
+    pub(crate) fn read_slice(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < FDT_HEADER_MIN {
+            return None;
+        }
         let read_u32 = |offset: usize| -> u32 {
-            // SAFETY: offset < FDT_HEADER_MIN; caller promises readability.
-            let bytes = unsafe {
-                core::slice::from_raw_parts(ptr.add(offset), 4)
-            };
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ])
         };
 
         let magic = read_u32(0);
@@ -111,7 +122,9 @@ impl FdtHeader {
         };
 
         // Sanity: totalsize must cover the structure and strings
-        // blocks with their offsets inside the blob.
+        // blocks with their offsets inside the blob. Both ends are
+        // u32+u32-as-u64 to avoid wrapping if a malicious header
+        // declares offset+size near u32::MAX.
         let struct_end = header.off_dt_struct as u64 + header.size_dt_struct as u64;
         let strings_end = header.off_dt_strings as u64 + header.size_dt_strings as u64;
         if struct_end > header.totalsize as u64
@@ -130,8 +143,15 @@ impl FdtHeader {
 
 /// Read a big-endian u32 from a byte slice offset. Returns 0 if the
 /// read would overrun (caller should treat that as a termination).
-fn be_u32_at(data: &[u8], offset: usize) -> u32 {
-    if offset + 4 > data.len() {
+/// `checked_add` rather than `+` because under symbolic input
+/// `offset + 4` wraps when `offset > usize::MAX - 4`, panicking
+/// debug builds — found by verification/dtb-proofs.
+pub(crate) fn be_u32_at(data: &[u8], offset: usize) -> u32 {
+    let end = match offset.checked_add(4) {
+        Some(e) => e,
+        None => return 0,
+    };
+    if end > data.len() {
         return 0;
     }
     u32::from_be_bytes([
@@ -142,9 +162,14 @@ fn be_u32_at(data: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// Read a big-endian u64 from a byte slice offset.
-fn be_u64_at(data: &[u8], offset: usize) -> u64 {
-    if offset + 8 > data.len() {
+/// Read a big-endian u64 from a byte slice offset. `checked_add`
+/// for the same reason as [`be_u32_at`].
+pub(crate) fn be_u64_at(data: &[u8], offset: usize) -> u64 {
+    let end = match offset.checked_add(8) {
+        Some(e) => e,
+        None => return 0,
+    };
+    if end > data.len() {
         return 0;
     }
     u64::from_be_bytes([
@@ -284,7 +309,7 @@ fn classify_node(depth: usize, parent: DeviceKind, name: &[u8]) -> DeviceKind {
 /// on platforms that pre-date 64-bit DT addresses; OpenSBI / QEMU on
 /// 64-bit RISC-V may emit either width. Accept both: len==4 → u32 BE;
 /// len==8 → u64 BE. Anything else is rejected.
-fn parse_chosen_addr(value: &[u8]) -> Option<u64> {
+pub(crate) fn parse_chosen_addr(value: &[u8]) -> Option<u64> {
     match value.len() {
         4 => Some(be_u32_at(value, 0) as u64),
         8 => Some(be_u64_at(value, 0)),
@@ -299,7 +324,7 @@ fn parse_chosen_addr(value: &[u8]) -> Option<u64> {
 ///
 /// Returns up to [`super::MAX_MEMORY_REGIONS`] pairs; excess is
 /// silently dropped (bounded iteration).
-fn parse_reg_pairs(prop_value: &[u8], mut callback: impl FnMut(u64, u64)) {
+pub(crate) fn parse_reg_pairs(prop_value: &[u8], mut callback: impl FnMut(u64, u64)) {
     let entry_size = 16; // 2 × u64 = 16 bytes
     let count = prop_value.len() / entry_size;
     let bounded_count = count.min(super::MAX_MEMORY_REGIONS);
@@ -319,7 +344,7 @@ fn parse_reg_pairs(prop_value: &[u8], mut callback: impl FnMut(u64, u64)) {
 /// Everything here is plain data — no kernel types leak in. The walker
 /// is deliberately the only place that touches big-endian FDT byte
 /// layout.
-struct DtbFacts {
+pub(crate) struct DtbFacts {
     memory: [(u64, u64); super::MAX_MEMORY_REGIONS],
     memory_count: usize,
     timer_base_hz: Option<u32>,
@@ -377,6 +402,36 @@ impl DtbFacts {
 /// Walk the DTB and collect the facts the kernel needs in one pass.
 /// Returns `None` on invalid/truncated FDT.
 ///
+/// # Safety
+/// `dtb_phys` must point at a valid FDT blob with at least
+/// `FDT_HEADER_MIN` bytes readable; on success, `header.totalsize`
+/// bytes are read.
+unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
+    let ptr = dtb_phys as *const u8;
+
+    // Bootstrap header read just to learn totalsize; the canonical
+    // header parse runs again inside `walk_dtb_slice` against the
+    // full blob slice, so the verifier sees the same code path the
+    // kernel runs. The double-read costs 40 bytes; we trade it for
+    // a single source of truth on header validation.
+    // SAFETY: caller guarantees ≥ FDT_HEADER_MIN bytes readable at ptr.
+    let header_bytes = unsafe { core::slice::from_raw_parts(ptr, FDT_HEADER_MIN) };
+    let bootstrap_header = FdtHeader::read_slice(header_bytes)?;
+    let totalsize = bootstrap_header.totalsize as usize;
+
+    // SAFETY: caller guarantees the full FDT (totalsize bytes) is readable
+    //         once totalsize has been recovered from a validated header.
+    let full_blob = unsafe { core::slice::from_raw_parts(ptr, totalsize) };
+    walk_dtb_slice(full_blob)
+}
+
+/// Slice-only walker — verifier entry point.
+///
+/// Pure: takes a byte blob, returns parsed facts or `None` on
+/// malformed input. No unsafe, no kernel-graph dependencies. The
+/// production path (`walk_dtb`) consists of an unsafe pointer-to-slice
+/// conversion plus a delegation to this function.
+///
 /// Matches:
 /// - `/memory@*` → `reg` → memory regions (usable RAM).
 /// - `/cpus` → `timebase-frequency` → platform timer tick rate.
@@ -385,18 +440,13 @@ impl DtbFacts {
 /// - `/soc/serial@*` → `interrupts` → console IRQ source ID.
 /// - `/soc/virtio_mmio@*` → `reg` → virtio-mmio device regions.
 /// - `/chosen` → `linux,initrd-{start,end}` → initrd archive range.
-///
-/// # Safety
-/// `dtb_phys` must point at a valid FDT blob.
-unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
-    let ptr = dtb_phys as *const u8;
-
-    // SAFETY: caller guarantees a valid FDT at this address.
-    let header = unsafe { FdtHeader::read(ptr) }?;
-
+pub(crate) fn walk_dtb_slice(blob: &[u8]) -> Option<DtbFacts> {
+    let header = FdtHeader::read_slice(blob)?;
     let totalsize = header.totalsize as usize;
-    // SAFETY: same — we now have the totalsize from the validated header.
-    let full_blob = unsafe { core::slice::from_raw_parts(ptr, totalsize) };
+    if totalsize > blob.len() {
+        return None;
+    }
+    let full_blob = &blob[..totalsize];
 
     // Structure block — the token stream we walk.
     let struct_start = header.off_dt_struct as usize;
@@ -592,6 +642,7 @@ unsafe fn walk_dtb(dtb_phys: u64) -> Option<DtbFacts> {
 /// - `dtb_phys` must point at a valid FDT blob (present in `a1` on
 ///   S-mode entry per the RISC-V SBI spec).
 /// - Must be called exactly once, before [`super::info`] is read.
+#[cfg(not(any(test, fuzzing)))]
 pub unsafe fn populate(dtb_phys: u64) {
     let mut info = BootInfo::empty();
 
@@ -709,7 +760,10 @@ pub unsafe fn populate(dtb_phys: u64) {
     }
     // SAFETY: linker symbol — we only take its address, never dereference.
     let kernel_end_vma = (&raw const _kernel_end) as u64;
-    // Same offset used in the linker script's AT() expressions.
+    /// ARCHITECTURAL: kernel virtual-to-physical offset for RISC-V.
+    /// Mirrors the AT() expressions in linker-riscv64.ld; changing
+    /// either side without the other breaks every kernel-region
+    /// reservation. The high-half kernel sits at VMA = PMA + offset.
     const VMA_TO_PMA_OFFSET: u64 = 0xffffffff_00000000;
     let kernel_end_phys = kernel_end_vma - VMA_TO_PMA_OFFSET;
     let kernel_start: u64 = 0x8020_0000;
