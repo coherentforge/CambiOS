@@ -154,6 +154,19 @@ def main():
         for p in extra_in_body:
             print("    {}".format(p), file=sys.stderr)
     print("", file=sys.stderr)
+    if not claimed_set and actual_set:
+        # Zero-parsed-paths shape: header found, but no path lines were
+        # accepted. Almost always the column-zero pitfall — `- path` at
+        # the same indent as `Staged files:` parses as zero paths.
+        print("  Common cause: `Staged files:` path lines must be indented",
+              file=sys.stderr)
+        print("  past the header. The bullet `-` is part of the path token,",
+              file=sys.stderr)
+        print("  not the header column — `- path` at column 0 parses as zero",
+              file=sys.stderr)
+        print("  paths. Indent two spaces, e.g. `  - path/to/file`.",
+              file=sys.stderr)
+        print("", file=sys.stderr)
     print("  If a file is in the diff unexpectedly, it was likely swept in",
           file=sys.stderr)
     print("  from a parallel session — reset the index and re-stage only",
