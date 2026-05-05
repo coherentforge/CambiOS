@@ -129,7 +129,7 @@ Captured for future-maintainer visibility:
 
 ### Phased implementation (future work)
 
-Captured here to prevent the full plan file ([sorted-dazzling-widget.md](../../../../.claude/plans/sorted-dazzling-widget.md)) from being the only record:
+Captured here to prevent the full plan file from being the only record:
 
 1. **GUI-1 — First pixels.** Boot module maps framebuffer via `SYS_MAP_FRAMEBUFFER`, draws a gradient + embedded bitmap-font text. Validates kernel → framebuffer path end-to-end.
 2. **GUI-2 — Input.** `user/ps2-kbd` and `user/ps2-mouse` with legacy-port-whitelist syscall capability. Demo evolves to keyboard echo + cursor sprite.
