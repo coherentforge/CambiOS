@@ -140,7 +140,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window audit-tail user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 audit-tail-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 audit-tail-riscv64 sign-tool mkinitrd bake-font export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm pong super-sprouty-o terminal-window audit-tail user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 pong-aarch64 super-sprouty-o-aarch64 terminal-window-aarch64 audit-tail-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 pong-riscv64 super-sprouty-o-riscv64 terminal-window-riscv64 audit-tail-riscv64 sign-tool mkinitrd bake-font export-pubkey
 
 all: iso
 
@@ -1028,6 +1028,20 @@ symbols:
 # if two ADRs share a number. Run after any ADR edit or addition.
 check-adrs:
 	python3 tools/check-adrs.py
+
+# Mirror kernel ADRs to the cambios-site repo. Reads tools/sync-to-site.toml
+# for the slug map (kernel ADR stem -> site URL slug) and cross-doc reference
+# maps. Idempotent: re-running on a synced state writes nothing. Override
+# the site path with CAMBIOS_SITE_DIR or the script's --site-dir flag; the
+# default in the toml assumes a sibling layout.
+sync-site:
+	python3 tools/sync-to-site.py
+
+# Dry-run companion to `sync-site`: prints the would-update / would-create
+# plan and writes nothing. Useful as a pre-commit sanity check, and as the
+# smoke test after editing tools/sync-to-site.toml.
+sync-site-check:
+	python3 tools/sync-to-site.py --check
 
 # Enforce STATUS.md commit-isolation (see tools/check-index-isolation.py).
 # Rejects commits that bundle a structural STATUS.md change (> 20 lines

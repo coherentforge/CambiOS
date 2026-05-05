@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Configuration for tools/sync-to-site.py.
+#
+# Phase 1 scope: ADR sync only. Adds for other doc kinds will gain
+# new sections here without changing the script's existing behavior.
+
+[paths]
+# Site repo path. The default below assumes a sibling layout
+# (~/coding/cambios + ~/coding/cambios-site). Most contributors will
+# override this via the CAMBIOS_SITE_DIR env var or the --site-dir flag.
+# Set CAMBIOS_SITE_DIR in your shell rc to make `make sync-site` ergonomic:
+#     export CAMBIOS_SITE_DIR=/abs/path/to/cambios-site
+default_site_dir = "../cambios-site"
+
+# Used as the fallback for cross-doc links that have no site equivalent.
+github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
+
+# kernel ADR filename stem -> site ADR filename stem (= URL slug).
+# Identity entries are listed for documentation; only renames matter
+# functionally. Keep this list in lockstep with docs/adr/INDEX.md as new
+# ADRs land — sync-to-site.py exits with WARN on missing entries.
+[slug_map]
+"000-zta-and-cap" = "000-zta-and-cap"
+"001-smp-scheduling-and-lock-hierarchy" = "001-smp-scheduling"
+"002-three-layer-enforcement-pipeline" = "002-enforcement-pipeline"
+"003-content-addressed-storage-and-identity" = "003-content-addressed-storage"
+"004-cryptographic-integrity" = "004-cryptographic-integrity"
+"005-ipc-primitives-control-and-bulk" = "005-ipc-primitives"
+"006-policy-service" = "006-policy-service"
+"007-capability-revocation-and-telemetry" = "007-capability-revocation"
+"008-boot-time-sized-object-tables" = "008-boot-time-object-tables"
+"009-purpose-tiers-scope" = "009-purpose-tiers-scope"
+"010-persistent-object-store-on-disk-format" = "010-persistent-object-store"
+"011-graphics-architecture-and-scaling" = "011-graphics-architecture"
+"012-input-architecture-and-device-classes" = "012-input-architecture"
+"013-riscv64-architecture-support" = "013-riscv64-support"
+"014-compositor-scanout-driver-protocol" = "014-compositor-scanout"
+"015-storage-tiers-and-commitment-ladder" = "015-storage-tiers"
+"016-win-compat-api-ai-boundary" = "016-win-compat-api-ai-boundary"
+"017-user-directed-cloud-inference" = "017-user-directed-cloud-inference"
+"018-init-process-and-boot-manifest" = "018-init-process-and-boot-manifest"
+"019-process-fault-reaping-and-peer-generation" = "019-process-fault-reaping"
+"020-typed-user-buffer-slices-at-syscall-boundary" = "020-typed-user-buffer-slices"
+"021-typed-boot-error-propagation" = "021-typed-boot-error-propagation"
+"022-wall-clock-time" = "022-wall-clock-time"
+"023-audit-consumer-capability" = "023-audit-consumer-capability"
+"024-syscall-abi-crate" = "024-syscall-abi-crate"
+"025-principal-as-aid" = "025-principal-as-aid"
+"026-identity-transcription-at-the-kernel-ring" = "026-identity-transcription"
+"027-service-clusters" = "027-service-clusters"
+
+# Kernel docs/<FOO>.md references in ADR bodies (`](../FOO.md)`) -> site URL.
+# Anything not listed falls through to a GitHub blob link.
+# Includes all kernel docs the site has a copy of under /docs/, even if the
+# site copy isn't linked from the main nav (Hugo still serves it as a URL).
+[doc_map]
+"CambiOS.md" = "/docs/architecture/"
+"PHILOSOPHY.md" = "/docs/philosophy/"
+"SECURITY.md" = "/docs/security/"
+"GOVERNANCE.md" = "/docs/governance/"
+"ASSUMPTIONS.md" = "/docs/assumptions/"
+"INTERRUPT_ROUTING.md" = "/docs/interrupt-routing/"
+"SYSCALLS.md" = "/docs/syscalls/"
+"identity.md" = "/docs/identity/"
+"FS-and-ID-design-plan.md" = "/docs/fs-and-id-design/"
+"developer-experience.md" = "/docs/developer-experience/"
+"win-compat.md" = "/docs/win-compat/"
+
+# Repo-root files referenced as `](../../FOO.md)` from ADRs -> site URL.
+# Anything not listed falls through to a GitHub blob link.
+[root_doc_map]
+"STATUS.md" = "/docs/status/"
+"README.md" = "/"
