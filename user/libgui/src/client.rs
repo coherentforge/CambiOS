@@ -16,7 +16,8 @@
 
 use cambios_libgui_proto::{
     decode_input_event, decode_welcome_client, encode_create_window, encode_destroy_window,
-    encode_frame_ready, InputEvent, MsgTag, Rect, COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
+    encode_frame_ready, InputEvent, MsgTag, Rect, WelcomeClientMsg, COMPOSITOR_ENDPOINT,
+    MAX_MESSAGE_SIZE,
 };
 use cambios_libsys as sys;
 
@@ -211,11 +212,51 @@ impl Client {
             return Err(ClientError::CreateWindowWriteFailed(rc));
         }
 
-        // Block for WelcomeClient.
+        // Block for WelcomeClient, draining stale messages.
+        //
+        // Unlike `open_layer` (where the endpoint was just registered
+        // and the queue is empty), `reopen_layer` runs after the
+        // process has been live — typically after a full game
+        // lifecycle (close → spawn → wait_task → reopen). The
+        // endpoint queue can hold stale messages that the compositor
+        // forwarded during the game's lifetime: most commonly
+        // `InputEvent`s routed to the focused window before
+        // `backend.close()` ran, plus any input events the compositor
+        // forwards in the brief window between this CreateWindow
+        // landing in the compositor's queue and the
+        // WelcomeClient landing back in ours. Without filtering, the
+        // first `recv_verified` returns one of those, fails
+        // `decode_welcome_client`, and reopen aborts with
+        // `ClientError::DecodeWelcome` — the failure mode observed
+        // for `play super-sprouty-o → Ctrl+Q` post-tombstone-fix.
+        //
+        // The kernel guarantees per-endpoint FIFO delivery, so the
+        // stale messages (queued first) are seen before the
+        // WelcomeClient. Drain non-WelcomeClient payloads in a
+        // bounded loop until we find ours. The bound is generous —
+        // ADR-005's per-endpoint queue caps at 16 messages, and we
+        // also cover input forwards arriving in-flight while
+        // draining; 32 leaves headroom without enabling an infinite
+        // loop on a kernel bug. Anonymous-sender / short-message /
+        // syscall-error returns from `recv_verified` propagate as
+        // `RecvVerifiedFailed` — those are not "stale" and not
+        // recoverable here.
         let mut recv_buf = [0u8; MAX_MESSAGE_SIZE + 36];
-        let welcome = sys::recv_verified(my_endpoint, &mut recv_buf)
-            .ok_or(ClientError::RecvVerifiedFailed)?;
-        let msg = decode_welcome_client(welcome.payload()).ok_or(ClientError::DecodeWelcome)?;
+        const MAX_DRAIN: usize = 32;
+        let mut found: Option<WelcomeClientMsg> = None;
+        for _ in 0..MAX_DRAIN {
+            let welcome = sys::recv_verified(my_endpoint, &mut recv_buf)
+                .ok_or(ClientError::RecvVerifiedFailed)?;
+            if let Some(msg) = decode_welcome_client(welcome.payload()) {
+                found = Some(msg);
+                break;
+            }
+            // Non-WelcomeClient payload — discard and continue. The
+            // VerifiedMessage borrow on `recv_buf` ends at the
+            // bottom of this iteration, so the next `recv_verified`
+            // can re-borrow.
+        }
+        let msg = found.ok_or(ClientError::DecodeWelcome)?;
 
         // Attach the new surface channel.
         let rc = sys::channel_attach(msg.channel_id);
