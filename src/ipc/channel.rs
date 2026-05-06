@@ -182,21 +182,65 @@ impl ChannelRole {
 /// Channel lifecycle state machine.
 ///
 /// Transitions are strictly forward:
-/// `AwaitingAttach → Active → {Closed, Revoked}`
+/// `AwaitingAttach → Active → Revoking → {Closed, Revoked}`
 ///
 /// `AwaitingAttach` can also transition directly to `Closed` (if the
 /// creator closes before the peer attaches) or `Revoked` (if a third
-/// party revokes before attach).
+/// party revokes before attach) — the `Revoking` quiesce phase is
+/// skipped because no peer has attached and there is no peer mapping
+/// to quiesce.
+///
+/// `Revoking` is entered via [`ChannelManager::begin_teardown`] when
+/// an `Active` channel needs a quiesce window for the peer task
+/// before the kernel unmaps shared pages (ADR-027 Phase 1 per-channel
+/// quiesce protocol; closes the compositor #PF on clean client exit).
+/// While in `Revoking` the slot stays held: `attach`, `close`, and
+/// `revoke` all return `InvalidState`. The slot is freed on
+/// [`ChannelManager::complete_teardown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelState {
     /// Created by one process, awaiting the peer's `SYS_CHANNEL_ATTACH`.
     AwaitingAttach,
     /// Both processes attached, data can flow.
     Active,
+    /// Teardown initiated; peer task is being quiesced before unmap.
+    /// Slot is still occupied; no `attach`/`close`/`revoke` accepted.
+    /// Exits forward to `Closed` or `Revoked` via `complete_teardown`.
+    Revoking,
     /// Force-closed by a third party (revocation or process exit).
     Revoked,
     /// Gracefully closed by one of the channel's endpoints.
     Closed,
+}
+
+// ============================================================================
+// TeardownKind
+// ============================================================================
+
+/// Disposition of a channel teardown — selects the terminal state.
+///
+/// Passed to [`ChannelManager::begin_teardown`] and the matching
+/// [`ChannelManager::complete_teardown`]; both calls of a given
+/// teardown must use the same kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownKind {
+    /// Graceful close by an endpoint (creator or peer). Terminal state
+    /// is [`ChannelState::Closed`].
+    Close,
+    /// Forced revoke by a third party (bootstrap authority, policy
+    /// service, process-exit cleanup). Terminal state is
+    /// [`ChannelState::Revoked`].
+    Revoke,
+}
+
+impl TeardownKind {
+    #[inline]
+    const fn terminal_state(self) -> ChannelState {
+        match self {
+            TeardownKind::Close => ChannelState::Closed,
+            TeardownKind::Revoke => ChannelState::Revoked,
+        }
+    }
 }
 
 // ============================================================================
@@ -310,6 +354,42 @@ pub struct ChannelCreateParams {
     pub physical_base: u64,
     pub creator_vaddr: u64,
     pub created_at_tick: u64,
+}
+
+// ============================================================================
+// Two-phase teardown types
+// ============================================================================
+
+/// Snapshot returned by [`ChannelManager::begin_teardown`] when the
+/// channel was `Active` and a peer task may be in flight.
+///
+/// Carries the small set of fields the syscall handler needs to drive
+/// the quiesce protocol (notify the peer, mark its task pending-quiesce
+/// for the scheduler hook, wait for it to park) without holding the
+/// `CHANNEL_MANAGER` lock across the wait. After quiesce completes the
+/// handler calls [`ChannelManager::complete_teardown`] to free the slot.
+#[derive(Debug, Clone, Copy)]
+pub struct RevokingSnapshot {
+    pub id: ChannelId,
+    pub creator_pid: ProcessId,
+    pub peer_pid: Option<ProcessId>,
+    pub peer_principal: Principal,
+}
+
+/// Outcome of [`ChannelManager::begin_teardown`].
+///
+/// `Immediate` covers the `AwaitingAttach` short-circuit: there is no
+/// peer mapping to quiesce, the slot is freed, the caller proceeds
+/// directly to creator-side unmap.
+///
+/// `Quiesce` covers the `Active` case: the channel transitioned to
+/// `Revoking` and the slot is still held. The caller must run the
+/// quiesce protocol against the peer (see [`RevokingSnapshot`]) and
+/// then call [`ChannelManager::complete_teardown`].
+#[derive(Debug)]
+pub enum TeardownStart {
+    Immediate(ChannelRecord),
+    Quiesce(RevokingSnapshot),
 }
 
 // ============================================================================
@@ -498,7 +578,7 @@ impl ChannelManager {
 
         match record.state {
             ChannelState::AwaitingAttach | ChannelState::Active => {}
-            ChannelState::Closed | ChannelState::Revoked => {
+            ChannelState::Revoking | ChannelState::Closed | ChannelState::Revoked => {
                 return Err(ChannelError::InvalidState);
             }
         }
@@ -544,8 +624,9 @@ impl ChannelManager {
             .ok_or(ChannelError::InternalInvariant)?;
 
         match taken.state {
-            ChannelState::Closed | ChannelState::Revoked => {
-                // Put it back — already terminal.
+            ChannelState::Revoking | ChannelState::Closed | ChannelState::Revoked => {
+                // Put it back — already terminal, or mid-teardown via
+                // the two-phase begin/complete_teardown path.
                 self.channels[idx] = Some(taken);
                 return Err(ChannelError::InvalidState);
             }
@@ -556,6 +637,93 @@ impl ChannelManager {
         self.count -= 1;
         self.generations[idx] = self.generations[idx].wrapping_add(1);
 
+        Ok(taken)
+    }
+
+    /// Begin a two-phase teardown (ADR-027 Phase 1 quiesce protocol).
+    ///
+    /// On `AwaitingAttach`: short-circuits to terminal — no peer
+    /// mapping exists, so no quiesce is needed. The slot is freed,
+    /// the generation is bumped, and the record is returned in
+    /// [`TeardownStart::Immediate`] for the caller to drive
+    /// creator-side unmap.
+    ///
+    /// On `Active`: transitions the channel to
+    /// [`ChannelState::Revoking`] and returns
+    /// [`TeardownStart::Quiesce`] with a [`RevokingSnapshot`]. The slot
+    /// stays held; `attach`, `close`, and `revoke` against the channel
+    /// will return `InvalidState` until the teardown completes. The
+    /// caller must run the quiesce protocol against the peer (notify +
+    /// scheduler-side park / cooperative ack / timeout) and then call
+    /// [`ChannelManager::complete_teardown`] with the same
+    /// [`TeardownKind`].
+    ///
+    /// On any other state (`Revoking`, `Closed`, `Revoked`): returns
+    /// `Err(InvalidState)` — the channel is already torn down or being
+    /// torn down by another caller.
+    pub fn begin_teardown(
+        &mut self,
+        channel_id: ChannelId,
+        kind: TeardownKind,
+    ) -> Result<TeardownStart, ChannelError> {
+        let record = self.lookup_mut(channel_id)?;
+
+        match record.state {
+            ChannelState::AwaitingAttach => {
+                let idx = channel_id.index() as usize;
+                let mut taken = self.channels[idx]
+                    .take()
+                    .ok_or(ChannelError::InternalInvariant)?;
+                taken.state = kind.terminal_state();
+                self.count -= 1;
+                self.generations[idx] = self.generations[idx].wrapping_add(1);
+                Ok(TeardownStart::Immediate(taken))
+            }
+            ChannelState::Active => {
+                let snapshot = RevokingSnapshot {
+                    id: record.id,
+                    creator_pid: record.creator_pid,
+                    peer_pid: record.peer_pid,
+                    peer_principal: record.peer_principal,
+                };
+                record.state = ChannelState::Revoking;
+                Ok(TeardownStart::Quiesce(snapshot))
+            }
+            ChannelState::Revoking | ChannelState::Closed | ChannelState::Revoked => {
+                Err(ChannelError::InvalidState)
+            }
+        }
+    }
+
+    /// Complete a two-phase teardown started by
+    /// [`ChannelManager::begin_teardown`] with the matching `kind`.
+    ///
+    /// Channel must be in [`ChannelState::Revoking`]. Frees the slot,
+    /// bumps the generation, sets the terminal state per `kind`, and
+    /// returns the full `ChannelRecord` for the caller to perform
+    /// unmap + TLB shootdown + frame free.
+    ///
+    /// Returns `Err(InvalidState)` if the channel is not in `Revoking`
+    /// (begin_teardown was never called, or another caller already
+    /// completed it). Returns `Err(NotFound)` if the channel id is
+    /// stale or never existed.
+    pub fn complete_teardown(
+        &mut self,
+        channel_id: ChannelId,
+        kind: TeardownKind,
+    ) -> Result<ChannelRecord, ChannelError> {
+        let record = self.lookup_mut(channel_id)?;
+        if record.state != ChannelState::Revoking {
+            return Err(ChannelError::InvalidState);
+        }
+
+        let idx = channel_id.index() as usize;
+        let mut taken = self.channels[idx]
+            .take()
+            .ok_or(ChannelError::InternalInvariant)?;
+        taken.state = kind.terminal_state();
+        self.count -= 1;
+        self.generations[idx] = self.generations[idx].wrapping_add(1);
         Ok(taken)
     }
 
@@ -1146,5 +1314,348 @@ mod tests {
             mgr.get(bystander).unwrap().state,
             ChannelState::AwaitingAttach
         );
+    }
+
+    // -- Two-phase teardown (ADR-027 Phase 1 quiesce protocol) --
+    //
+    // begin_teardown short-circuits AwaitingAttach to terminal (no peer
+    // to quiesce) and parks Active in Revoking until complete_teardown
+    // fires. The Revoking state holds the slot, blocks new operations,
+    // and exits forward only.
+
+    #[test]
+    fn test_begin_teardown_active_revoke_returns_quiesce_snapshot() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+
+        match mgr.begin_teardown(id, TeardownKind::Revoke).unwrap() {
+            TeardownStart::Quiesce(snap) => {
+                assert_eq!(snap.id, id);
+                assert_eq!(snap.creator_pid, test_pid(1));
+                assert_eq!(snap.peer_pid, Some(test_pid(2)));
+                assert_eq!(snap.peer_principal, test_principal(0xBB));
+            }
+            TeardownStart::Immediate(_) => panic!("expected Quiesce for Active channel"),
+        }
+        // State moved to Revoking; slot still occupied.
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Revoking);
+        assert_eq!(mgr.count(), 1);
+    }
+
+    #[test]
+    fn test_begin_teardown_active_close_returns_quiesce_snapshot() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+
+        match mgr.begin_teardown(id, TeardownKind::Close).unwrap() {
+            TeardownStart::Quiesce(snap) => assert_eq!(snap.id, id),
+            TeardownStart::Immediate(_) => panic!("expected Quiesce for Active channel"),
+        }
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Revoking);
+    }
+
+    #[test]
+    fn test_begin_teardown_awaiting_attach_close_returns_immediate_closed() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+
+        match mgr.begin_teardown(id, TeardownKind::Close).unwrap() {
+            TeardownStart::Immediate(record) => {
+                assert_eq!(record.state, ChannelState::Closed);
+                assert_eq!(record.creator_pid, test_pid(1));
+                assert_eq!(record.peer_pid, None);
+            }
+            TeardownStart::Quiesce(_) => {
+                panic!("expected Immediate for AwaitingAttach channel")
+            }
+        }
+        // Slot freed.
+        assert_eq!(mgr.count(), 0);
+        assert_eq!(mgr.get(id).err(), Some(ChannelError::NotFound));
+    }
+
+    #[test]
+    fn test_begin_teardown_awaiting_attach_revoke_returns_immediate_revoked() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+
+        match mgr.begin_teardown(id, TeardownKind::Revoke).unwrap() {
+            TeardownStart::Immediate(record) => {
+                assert_eq!(record.state, ChannelState::Revoked);
+            }
+            TeardownStart::Quiesce(_) => {
+                panic!("expected Immediate for AwaitingAttach channel")
+            }
+        }
+        assert_eq!(mgr.count(), 0);
+    }
+
+    #[test]
+    fn test_begin_teardown_during_revoking_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+
+        assert_eq!(
+            mgr.begin_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::InvalidState)
+        );
+        assert_eq!(
+            mgr.begin_teardown(id, TeardownKind::Close).err(),
+            Some(ChannelError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn test_begin_teardown_after_close_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.close(id, test_pid(1)).unwrap();
+
+        // Slot is freed and generation bumped — stale id sees NotFound,
+        // not InvalidState. The "after close, reject" guard is the
+        // generation bump; this test pins that contract.
+        assert_eq!(
+            mgr.begin_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_begin_teardown_after_revoke_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.revoke(id).unwrap();
+
+        assert_eq!(
+            mgr.begin_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_begin_teardown_not_found() {
+        let mut mgr = ChannelManager::new();
+        assert_eq!(
+            mgr.begin_teardown(ChannelId::new(0, 0), TeardownKind::Revoke).err(),
+            Some(ChannelError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_complete_teardown_close_yields_closed_record() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Close).unwrap();
+
+        let record = mgr.complete_teardown(id, TeardownKind::Close).unwrap();
+        assert_eq!(record.state, ChannelState::Closed);
+        assert_eq!(record.peer_pid, Some(test_pid(2)));
+        assert_eq!(mgr.count(), 0);
+        // Slot freed; generation bumped.
+        assert_eq!(mgr.get(id).err(), Some(ChannelError::NotFound));
+    }
+
+    #[test]
+    fn test_complete_teardown_revoke_yields_revoked_record() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+
+        let record = mgr.complete_teardown(id, TeardownKind::Revoke).unwrap();
+        assert_eq!(record.state, ChannelState::Revoked);
+        assert_eq!(mgr.count(), 0);
+    }
+
+    #[test]
+    fn test_complete_teardown_active_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+
+        // Did not call begin_teardown; channel is Active, not Revoking.
+        assert_eq!(
+            mgr.complete_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::InvalidState)
+        );
+        // Channel still Active.
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Active);
+    }
+
+    #[test]
+    fn test_complete_teardown_awaiting_attach_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+
+        assert_eq!(
+            mgr.complete_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn test_complete_teardown_after_immediate_returns_not_found() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+
+        // begin_teardown short-circuited; slot already freed.
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+
+        assert_eq!(
+            mgr.complete_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_complete_teardown_double_call_returns_not_found() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+        mgr.complete_teardown(id, TeardownKind::Revoke).unwrap();
+
+        assert_eq!(
+            mgr.complete_teardown(id, TeardownKind::Revoke).err(),
+            Some(ChannelError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_close_during_revoking_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+
+        assert_eq!(
+            mgr.close(id, test_pid(1)).err(),
+            Some(ChannelError::InvalidState)
+        );
+        assert_eq!(
+            mgr.close(id, test_pid(2)).err(),
+            Some(ChannelError::InvalidState)
+        );
+        // State unchanged.
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Revoking);
+    }
+
+    #[test]
+    fn test_revoke_during_revoking_rejected() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+
+        assert_eq!(
+            mgr.revoke(id).err(),
+            Some(ChannelError::InvalidState)
+        );
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Revoking);
+    }
+
+    #[test]
+    fn test_revoking_holds_slot_against_create() {
+        // Slot stays occupied during Revoking. A subsequent create with
+        // the table otherwise full must not silently steal the slot.
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id, TeardownKind::Revoke).unwrap();
+
+        // Fill the rest of the table.
+        for i in 1..MAX_CHANNELS {
+            mgr.create(ChannelCreateParams {
+                creator_principal: test_principal(0xCC),
+                peer_principal: test_principal(0xDD),
+                creator_pid: test_pid(3),
+                role: ChannelRole::Producer,
+                num_pages: 1,
+                physical_base: (i as u64) * 0x1000,
+                creator_vaddr: 0x4000_0000 + (i as u64) * 0x1000,
+                created_at_tick: 0,
+            })
+            .unwrap();
+        }
+        assert_eq!(mgr.count(), MAX_CHANNELS);
+
+        // Slot 0 still belongs to the Revoking channel.
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Revoking);
+
+        // Next create returns TableFull — Revoking did not free the slot.
+        assert_eq!(
+            mgr.create(ChannelCreateParams {
+                creator_principal: test_principal(0xEE),
+                peer_principal: test_principal(0xFF),
+                creator_pid: test_pid(4),
+                role: ChannelRole::Producer,
+                num_pages: 1,
+                physical_base: 0xDEAD_0000,
+                creator_vaddr: 0x9000_0000,
+                created_at_tick: 0,
+            })
+            .err(),
+            Some(ChannelError::TableFull)
+        );
+    }
+
+    #[test]
+    fn test_full_two_phase_teardown_revoke_cycle() {
+        let mut mgr = ChannelManager::new();
+        let id = create_basic(&mut mgr);
+        mgr.attach(id, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Active);
+
+        // Phase 1: begin.
+        let snap = match mgr.begin_teardown(id, TeardownKind::Revoke).unwrap() {
+            TeardownStart::Quiesce(s) => s,
+            TeardownStart::Immediate(_) => panic!("expected Quiesce"),
+        };
+        assert_eq!(snap.id, id);
+        assert_eq!(mgr.get(id).unwrap().state, ChannelState::Revoking);
+
+        // Phase 2: complete.
+        let record = mgr.complete_teardown(id, TeardownKind::Revoke).unwrap();
+        assert_eq!(record.state, ChannelState::Revoked);
+        assert_eq!(record.creator_pid, test_pid(1));
+        assert_eq!(record.peer_pid, Some(test_pid(2)));
+        assert_eq!(record.creator_vaddr, 0x1000_0000);
+        assert_eq!(record.peer_vaddr, 0x2000_0000);
+        assert_eq!(mgr.count(), 0);
+    }
+
+    #[test]
+    fn test_slot_reuse_after_complete_teardown() {
+        // Generation bump on complete_teardown means a stale id from the
+        // pre-teardown channel does not collide with a re-created slot.
+        let mut mgr = ChannelManager::new();
+        let id1 = create_basic(&mut mgr);
+        mgr.attach(id1, test_principal(0xBB), test_pid(2), 0x2000_0000)
+            .unwrap();
+        let _ = mgr.begin_teardown(id1, TeardownKind::Revoke).unwrap();
+        mgr.complete_teardown(id1, TeardownKind::Revoke).unwrap();
+
+        let id2 = create_basic(&mut mgr);
+        assert_eq!(id2.index(), 0);
+        assert_eq!(id2.generation(), 1);
+        assert_ne!(id1, id2);
+        // Stale id1 rejected.
+        assert_eq!(mgr.get(id1).err(), Some(ChannelError::NotFound));
     }
 }
