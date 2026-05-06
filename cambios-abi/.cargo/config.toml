@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Override the parent project's bare-metal kernel target so this crate
+# can be built and tested standalone. cambios-abi is `no_std` but
+# architecture-agnostic (pure ABI types: SyscallNumber / SyscallError
+# / SyscallArgs / SyscallResult), so any host target compiles. Using
+# the native macOS-on-Apple-Silicon triple matches the tools/sign-elf
+# precedent and avoids cross-compile overhead under `cargo test`.
+#
+# Without this override, `cd cambios-abi && cargo test` inherits the
+# parent .cargo/config.toml's `target = "x86_64-unknown-none"`, which
+# has no std/test crates and the test runner fails to link.
+#
+# The kernel-side test path (`cargo test --lib --target
+# x86_64-apple-darwin` from the project root) re-exports cambios-abi
+# and exercises these tests through that — both paths now pass.
+[build]
+target = "aarch64-apple-darwin"
