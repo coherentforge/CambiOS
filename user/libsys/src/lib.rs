@@ -1148,6 +1148,10 @@ pub fn channel_revoke(channel_id: u64) -> i64 {
 /// Query channel metadata.
 ///
 /// Writes a 46-byte descriptor to `out_buf`. Returns 0 on success.
+/// Byte 0 is the channel-state discriminant; compare against the
+/// `CHANNEL_STATE_*` constants below. Bytes 1..46 carry role,
+/// page count, peer pids, vaddrs, etc.; see
+/// `SyscallDispatcher::handle_channel_info` for the full layout.
 pub fn channel_info(channel_id: u64, out_buf: &mut [u8]) -> i64 {
     syscall_raw3(
         SyscallNumber::ChannelInfo as u64,
@@ -1156,6 +1160,19 @@ pub fn channel_info(channel_id: u64, out_buf: &mut [u8]) -> i64 {
         out_buf.len() as u64,
     )
 }
+
+/// Channel-state byte values returned at offset 0 of the
+/// `channel_info` output buffer. Mirror the `ChannelState` enum
+/// discriminants in `src/ipc/channel.rs`. Userspace consumers
+/// (e.g. compositor's window-reap path per ADR-007 Divergence 7)
+/// check this byte against `CHANNEL_STATE_ACTIVE` to detect
+/// revoked / closed / mid-teardown channels and clean up any
+/// userspace state holding a stale handle.
+pub const CHANNEL_STATE_AWAITING_ATTACH: u8 = 0;
+pub const CHANNEL_STATE_ACTIVE: u8 = 1;
+pub const CHANNEL_STATE_REVOKING: u8 = 2;
+pub const CHANNEL_STATE_REVOKED: u8 = 3;
+pub const CHANNEL_STATE_CLOSED: u8 = 4;
 
 // ============================================================================
 // Audit infrastructure (Phase 3.3, ADR-007)

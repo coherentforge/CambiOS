@@ -152,6 +152,17 @@ pub extern "C" fn _start() -> ! {
     // pump_input_once); transitions happen on window create/destroy.
     let mut last_focus: Option<(u32, [u8; 32])> = None;
     loop {
+        // Userspace half of ADR-007 Divergence 7 (tombstone-on-
+        // revoke). When a client exits without an explicit
+        // DestroyWindow, the kernel revokes its surface channel and
+        // remaps our RO mapping to the kernel's tombstone zero page.
+        // Reaping here drops the dead window from the table within
+        // one main-loop iteration, so composite, focus, has-windows,
+        // and input-routing all see a clean state. Bounded by
+        // MAX_WINDOWS sys::channel_info calls per iteration — cheap
+        // even at the v1 endgame ~30-window target.
+        let _ = window_table.reap_dead_channels();
+
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
         if matches!(outcome, DispatchOutcome::ClientFrame(_)) {
             // Z-stack composition: any window's FrameReady triggers a

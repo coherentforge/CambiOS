@@ -135,6 +135,48 @@ impl WindowTable {
     pub fn front(&self) -> Option<&Window> {
         self.iter().max_by_key(|w| w.z_order)
     }
+
+    /// Drop windows whose surface channel is no longer Active.
+    ///
+    /// The userspace half of ADR-007 Divergence 7 (tombstone-on-
+    /// revoke). When a libgui client exits without sending an
+    /// explicit `DestroyWindow`, the kernel revokes the surface
+    /// channel and remaps the compositor's RO mapping to a shared
+    /// zero page. Reads no longer fault, but the WindowTable still
+    /// holds the dead entry — subsequent composite passes blit
+    /// zeros from the tombstone forever (visual artifact, not a
+    /// crash). This pass calls `sys::channel_info` on each live
+    /// window and drops any whose channel has transitioned to
+    /// `Revoking` / `Revoked` / `Closed`, or whose channel id is
+    /// stale (`channel_info` returns negative when the slot has been
+    /// freed and the generation bumped).
+    ///
+    /// Bounded cost: one syscall per live window, plus one
+    /// 46-byte stack buffer. Called once per main-loop iteration so
+    /// dead windows are reaped within one frame of the client exit.
+    /// Returns the count reaped (0 in steady state).
+    pub fn reap_dead_channels(&mut self) -> usize {
+        let mut info = [0u8; 46];
+        let mut reaped = 0usize;
+        for slot in self.windows.iter_mut() {
+            if let Some(w) = slot.as_ref() {
+                let rc = sys::channel_info(w.surface_channel_id, &mut info);
+                let dead = if rc == 0 {
+                    // info[0] is the ChannelState discriminant.
+                    info[0] != sys::CHANNEL_STATE_ACTIVE
+                } else {
+                    // channel id stale (slot freed + generation bumped) —
+                    // treat as dead, the client is gone.
+                    true
+                };
+                if dead {
+                    *slot = None;
+                    reaped += 1;
+                }
+            }
+        }
+        reaped
+    }
 }
 
 // ============================================================================
