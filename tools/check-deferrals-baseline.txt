@@ -80,7 +80,7 @@ src/ipc/capability.rs:683:deferred
 src/ipc/capability.rs:737:TODO
 src/ipc/capability.rs:745:for-now
 src/lib.rs:90:TBD
-src/lib.rs:423:deferred
+src/lib.rs:471:deferred
 src/memory/mod.rs:633:placeholder
 src/memory/mod.rs:642:placeholder
 src/microkernel/main.rs:918:for-now
@@ -94,8 +94,8 @@ src/process.rs:790:deferred
 src/process.rs:791:deferred
 src/scheduler/mod.rs:281:placeholder
 src/scheduler/mod.rs:282:placeholder
-src/syscalls/dispatcher.rs:1447:deferred
-src/syscalls/dispatcher.rs:2953:for-now
+src/syscalls/dispatcher.rs:1455:deferred
+src/syscalls/dispatcher.rs:2961:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now

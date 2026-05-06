@@ -717,6 +717,46 @@ impl Scheduler {
         }
     }
 
+    /// Find the `TaskId` of a task whose `process_id` matches the
+    /// given `ProcessId`, if one is owned by this CPU's scheduler.
+    ///
+    /// Used by the cross-CPU `lib::arm_quiesce_for_process` helper to
+    /// locate a peer task by its `ChannelRecord::peer_pid` without
+    /// maintaining a global pid→task map. The kernel's task↔process
+    /// linkage is 1:1 today, so the first match is the only match.
+    /// O(MAX_TASKS) scan; called from the slow path
+    /// (`SYS_CHANNEL_REVOKE`, process exit).
+    pub fn find_task_for_process(
+        &self,
+        process_id: crate::ipc::ProcessId,
+    ) -> Option<TaskId> {
+        self.tasks.iter().enumerate().find_map(|(idx, slot)| {
+            let task = slot.as_ref()?;
+            if task.process_id == Some(process_id) {
+                Some(TaskId(idx as u32))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Combined lookup-and-arm: find the task owned by `process_id`
+    /// in this scheduler, then call [`arm_quiesce`] on it. Returns
+    /// `None` if no task in this scheduler matches.
+    ///
+    /// Both the lookup and the arm happen under the caller's already-
+    /// held scheduler lock, so the task cannot be migrated or removed
+    /// between the two steps.
+    pub fn arm_quiesce_for_process(
+        &mut self,
+        process_id: crate::ipc::ProcessId,
+        channel_id_raw: u64,
+    ) -> Option<(TaskId, QuiesceArmResult)> {
+        let task_id = self.find_task_for_process(process_id)?;
+        let result = self.arm_quiesce(task_id, channel_id_raw).ok()?;
+        Some((task_id, result))
+    }
+
     /// Scheduler hook fired from `isr_tick_and_schedule` and
     /// `voluntary_yield` (ADR-027 Phase 1).
     ///
@@ -1968,5 +2008,72 @@ mod tests {
         let mut buf = alloc::string::String::new();
         write!(&mut buf, "{}", BlockReason::ChannelQuiesceWait(0x42)).unwrap();
         assert_eq!(buf, "ChannelQuiesceWait(66)");
+    }
+
+    #[test]
+    fn test_find_task_for_process_matches() {
+        use crate::ipc::ProcessId;
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let pid_a = ProcessId::new(7, 0);
+        let pid_b = ProcessId::new(8, 0);
+        sched.get_task_mut_pub(t1).unwrap().process_id = Some(pid_a);
+        sched.get_task_mut_pub(t2).unwrap().process_id = Some(pid_b);
+
+        assert_eq!(sched.find_task_for_process(pid_a), Some(t1));
+        assert_eq!(sched.find_task_for_process(pid_b), Some(t2));
+    }
+
+    #[test]
+    fn test_find_task_for_process_returns_none_when_no_match() {
+        use crate::ipc::ProcessId;
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let _t = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // No task has process_id set — find_task_for_process scans for
+        // the requested ProcessId and finds none.
+        assert_eq!(
+            sched.find_task_for_process(ProcessId::new(42, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_arm_quiesce_for_process_runs_full_flow() {
+        // arm_quiesce_for_process bridges ProcessId → TaskId → arm_quiesce
+        // under one lock. Verify it picks the right task and returns
+        // both the resolved id and the arm outcome.
+        use crate::ipc::ProcessId;
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        let pid = ProcessId::new(11, 0);
+        sched.get_task_mut_pub(tid).unwrap().process_id = Some(pid);
+        // Task is Ready by construction → ParkedNow.
+
+        let result = sched.arm_quiesce_for_process(pid, QUIESCE_TEST_CHANNEL_ID);
+        assert_eq!(result, Some((tid, QuiesceArmResult::ParkedNow)));
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(
+            task.block_reason,
+            Some(BlockReason::ChannelQuiesceWait(QUIESCE_TEST_CHANNEL_ID))
+        );
+    }
+
+    #[test]
+    fn test_arm_quiesce_for_process_unknown_pid_returns_none() {
+        use crate::ipc::ProcessId;
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        // No task with this pid exists → None (semantically equivalent
+        // to AlreadyOffCpu — the kernel proceeds with unmap).
+        assert_eq!(
+            sched.arm_quiesce_for_process(ProcessId::new(99, 0), QUIESCE_TEST_CHANNEL_ID),
+            None
+        );
     }
 }

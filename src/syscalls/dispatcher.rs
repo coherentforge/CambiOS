@@ -181,6 +181,14 @@ impl SyscallDispatcher {
             // for did:key rendering. Capability-gated on AuditConsumer.
             SyscallNumber::GetProcessPrincipal =>
                 Self::handle_get_process_principal(args, &ctx),
+
+            // ADR-027 Phase 1: per-channel quiesce cooperative ack.
+            // Slot reserved here; handler lands in the dispatcher
+            // migration commit alongside the begin_teardown / quiesce
+            // wait / complete_teardown wiring. Until then, calls return
+            // Enosys so userspace cannot accidentally consume the slot
+            // before the protocol is hooked up end-to-end.
+            SyscallNumber::ChannelQuiesceAck => Err(SyscallError::Enosys),
         }
     }
 

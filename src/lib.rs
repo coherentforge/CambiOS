@@ -296,6 +296,54 @@ pub fn wake_task_on_cpu(_task_id: scheduler::TaskId) -> bool {
     false
 }
 
+/// Arm the per-channel quiesce protocol on a peer task, locating the
+/// task across CPUs by its owning `ProcessId` (ADR-027 Phase 1).
+///
+/// The kernel's `ChannelRecord::peer_pid` is a `ProcessId`, but
+/// `Scheduler::arm_quiesce` operates on a `TaskId`. This helper bridges
+/// the two by scanning per-CPU schedulers in order. Today's CambiOS
+/// task↔process linkage is 1:1, so the first match is the only match;
+/// the iteration ends on the owning CPU's scheduler.
+///
+/// Returns `Some((task_id, QuiesceArmResult))` on success, `None` if
+/// no task is currently bound to `peer_pid` (process already exited /
+/// not yet spawned). `None` from this helper is the same shape as
+/// `QuiesceArmResult::AlreadyOffCpu` for the caller — the peer is not
+/// running on any CPU and the kernel may proceed with unmap.
+///
+/// Performance: O(MAX_CPUS × MAX_TASKS) worst case (scanning every
+/// per-CPU scheduler). With realistic v1 CPU counts (4-8) and task
+/// counts (~32 active), this is sub-millisecond. Called from
+/// `SYS_CHANNEL_REVOKE` and the `revoke_all_for_process` sweep on
+/// `SYS_EXIT` — slow paths where the cost is invisible.
+#[cfg(not(test))]
+pub fn arm_quiesce_for_process(
+    peer_pid: ipc::ProcessId,
+    channel_id_raw: u64,
+) -> Option<(scheduler::TaskId, scheduler::QuiesceArmResult)> {
+    for cpu in 0..MAX_CPUS {
+        let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+        if let Some(sched) = guard.as_mut() {
+            if let Some(result) = sched.arm_quiesce_for_process(peer_pid, channel_id_raw) {
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+/// Test stub for arm_quiesce_for_process. The per-CPU scheduler array
+/// isn't initialised under `cargo test --lib`; the
+/// `Scheduler::arm_quiesce_for_process` API is exercised directly in
+/// `src/scheduler/mod.rs::tests`.
+#[cfg(test)]
+pub fn arm_quiesce_for_process(
+    _peer_pid: ipc::ProcessId,
+    _channel_id_raw: u64,
+) -> Option<(scheduler::TaskId, scheduler::QuiesceArmResult)> {
+    None
+}
+
 // ============================================================================
 // Load balancing
 // ============================================================================

@@ -355,6 +355,36 @@ pub enum SyscallNumber {
     /// unknown target (no principal bound to the live process and no
     /// matching entry in the recent-exits ring).
     GetProcessPrincipal = 42,
+
+    /// SYS_CHANNEL_QUIESCE_ACK (43): cooperative ack of a pending
+    /// channel revoke (ADR-027 Phase 1 quiesce protocol; ADR-027
+    /// Decision 5 — same syscall serves cluster-shaped revoke at
+    /// post-HN). Signals to the kernel that the caller has stopped
+    /// reading from the channel and the kernel may proceed with the
+    /// unmap + TLB shootdown immediately rather than waiting for the
+    /// scheduler-side quiesce hook to fire at the next preempt.
+    ///
+    /// Args: arg1 = channel_id (u64; `ChannelId::as_raw()`).
+    ///
+    /// Identity-required: yes. Caller must hold a Principal that
+    /// matches `record.peer_principal` of the channel being revoked
+    /// (the channel must be in `Revoking` state). The kernel then
+    /// blocks the caller in `BlockReason::ChannelQuiesceWait` until
+    /// `complete_teardown` finishes, at which point the syscall
+    /// returns 0.
+    ///
+    /// Returns 0 on the wake after teardown completes,
+    /// `PermissionDenied` without identity / wrong peer Principal,
+    /// `InvalidArg` for stale channel id / wrong state.
+    ///
+    /// In v1 the kernel-side scheduler hook
+    /// (`Scheduler::try_park_current_for_quiesce` →
+    /// `BlockReason::ChannelQuiesceWait`) catches the peer at next
+    /// timer ISR within ≤10ms; userspace cooperation is therefore
+    /// optional for correctness. The slot is reserved + handled now
+    /// so cluster cooperation (post-HN, ADR-027 Decisions 1-3) plugs
+    /// in without needing a new syscall.
+    ChannelQuiesceAck = 43,
 }
 
 impl SyscallNumber {
@@ -387,7 +417,8 @@ impl SyscallNumber {
             Self::VirtioModernCaps |
             Self::AuditEmitInputFocus |
             Self::GetProcessPrincipal |
-            Self::SetWallclock
+            Self::SetWallclock |
+            Self::ChannelQuiesceAck
         )
     }
 
@@ -438,6 +469,7 @@ impl SyscallNumber {
             40 => Some(Self::GetWallclock),
             41 => Some(Self::AuditEmitInputFocus),
             42 => Some(Self::GetProcessPrincipal),
+            43 => Some(Self::ChannelQuiesceAck),
             _ => None,
         }
     }
@@ -615,6 +647,7 @@ mod tests {
             SyscallNumber::SetWallclock, SyscallNumber::GetWallclock,
             SyscallNumber::AuditEmitInputFocus,
             SyscallNumber::GetProcessPrincipal,
+            SyscallNumber::ChannelQuiesceAck,
         ];
 
         for &num in &all {
@@ -644,8 +677,9 @@ mod tests {
         // Verify from_u64 round-trips for all defined values, ensuring
         // no gap in the requires_identity() match. ADR-022 wallclock
         // pair (39 SetWallclock, 40 GetWallclock) lands here as part of
-        // the contiguous 0..=42 sweep.
-        for i in 0..=42u64 {
+        // the contiguous 0..=43 sweep. ADR-027 channel-quiesce-ack
+        // (43) is the most recent slot.
+        for i in 0..=43u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
