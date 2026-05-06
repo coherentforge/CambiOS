@@ -387,6 +387,15 @@ pub enum BlockReason {
     /// call wakes the next module in the chain. See `BOOT_MODULE_ORDER` in
     /// `src/lib.rs`.
     BootGate,
+    /// Parked by the per-channel quiesce protocol (ADR-027 Phase 1). The
+    /// kernel armed quiesce on this task because it is the peer of a
+    /// channel transitioning from Active to Revoking. The task is held
+    /// here until the kernel completes teardown (unmap + TLB shootdown +
+    /// frame free) and explicitly wakes it. Wake path: `wake_task` from
+    /// the syscall handler that called `complete_teardown`. Carries the
+    /// channel id (raw u64) for diagnostics + cooperative-ack matching
+    /// from `SYS_CHANNEL_QUIESCE_ACK`.
+    ChannelQuiesceWait(u64),
 }
 
 impl fmt::Display for BlockReason {
@@ -403,6 +412,7 @@ impl fmt::Display for BlockReason {
             BlockReason::ChildWait => write!(f, "ChildWait"),
             BlockReason::PolicyWait(qid) => write!(f, "PolicyWait({})", qid),
             BlockReason::BootGate => write!(f, "BootGate"),
+            BlockReason::ChannelQuiesceWait(id) => write!(f, "ChannelQuiesceWait({})", id),
         }
     }
 }
@@ -455,6 +465,18 @@ pub struct Task {
     pub parent_task: Option<TaskId>,
     /// Exit code stored when the task terminates (for WaitTask to collect).
     pub exit_code: u32,
+    /// Pending channel-quiesce hint set by `Scheduler::arm_quiesce`
+    /// (ADR-027 Phase 1). `Some(channel_id_raw)` means the kernel has
+    /// marked a channel `Revoking` and this task is the peer to be
+    /// quiesced before unmap. The portable scheduler entry points
+    /// (`isr_tick_and_schedule`, `voluntary_yield`) check this on the
+    /// current task at every yield/preempt and, if set on a `Running`
+    /// task, transition it to `Blocked(ChannelQuiesceWait(id))` before
+    /// picking the next task. Cleared by the hook on park, or by
+    /// `arm_quiesce` itself when the task is `Ready` (parked
+    /// immediately) or already non-runnable. Defensively reset to
+    /// `None` in every constructor.
+    pub pending_quiesce_channel: Option<u64>,
 }
 
 impl Task {
@@ -478,6 +500,7 @@ impl Task {
             in_ready_queue: false,
             parent_task: None,
             exit_code: 0,
+            pending_quiesce_channel: None,
         }
     }
 
@@ -507,6 +530,7 @@ impl Task {
             in_ready_queue: false,
             parent_task: None,
             exit_code: 0,
+            pending_quiesce_channel: None,
         }
     }
 

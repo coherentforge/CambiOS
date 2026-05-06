@@ -29,6 +29,26 @@ pub struct ContextSwitchHint {
     pub page_table_root: u64,
 }
 
+/// Outcome of [`Scheduler::arm_quiesce`] (ADR-027 Phase 1).
+///
+/// Tells the syscall handler whether the peer task is already off-CPU
+/// (the kernel may proceed with unmap immediately) or whether the
+/// caller must wait for the next yield/preempt to park it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuiesceArmResult {
+    /// Task was `Ready`: parked synchronously into
+    /// `Blocked(ChannelQuiesceWait(channel_id))`. Caller may proceed.
+    ParkedNow,
+    /// Task was `Running`: pending hint set on the task; the scheduler
+    /// hook (`isr_tick_and_schedule` / `voluntary_yield`) will park it
+    /// at the next yield/preempt (≤ one timer tick away).
+    PendingOnYield,
+    /// Task was already non-runnable (`Blocked` / `Terminated` /
+    /// `Suspended`). No state change. Caller may proceed — the task
+    /// is not running on any CPU.
+    AlreadyOffCpu,
+}
+
 /// Portable timer ISR handler: tick timer + tick scheduler.
 ///
 /// Called from architecture-specific timer ISR stubs. Returns the RSP to
@@ -486,8 +506,15 @@ impl Scheduler {
             }
         }
 
-        // Check if time slice expired
-        if !self.time_slice_expired() {
+        // ADR-027 Phase 1 quiesce hook: if the current task has a pending
+        // channel-quiesce hint, park it into Blocked(ChannelQuiesceWait)
+        // before scheduling. Forces schedule() even when the time slice
+        // hasn't expired — the parked task is no longer Running and must
+        // not stay current.
+        let quiesced = self.try_park_current_for_quiesce();
+
+        // Check if time slice expired (or quiesce hook just parked the task)
+        if !quiesced && !self.time_slice_expired() {
             return current_rsp; // No switch needed
         }
 
@@ -528,6 +555,13 @@ impl Scheduler {
                 task.saved_rsp = current_rsp;
             }
         }
+
+        // ADR-027 Phase 1 quiesce hook: park the current task into
+        // Blocked(ChannelQuiesceWait) if its pending hint is set and
+        // it's still Running. No-op if a syscall handler already
+        // transitioned the task to Blocked (e.g. handle_recv_msg —
+        // the existing block reason wins).
+        self.try_park_current_for_quiesce();
 
         // Select next task
         match self.schedule() {
@@ -626,6 +660,105 @@ impl Scheduler {
         }
     }
 
+    /// Arm the per-channel quiesce protocol on a peer task (ADR-027 Phase 1).
+    ///
+    /// Called by the syscall handler that begins a channel teardown
+    /// (`begin_teardown` returning `TeardownStart::Quiesce`) to make
+    /// sure the peer task is not running on any CPU before the kernel
+    /// unmaps its channel pages.
+    ///
+    /// Behavior depends on the task's current state:
+    /// - `Running`: sets `pending_quiesce_channel = Some(channel_id_raw)`.
+    ///   The scheduler hook (`try_park_current_for_quiesce`) parks the
+    ///   task at next ISR tick or voluntary yield (≤ one tick = 10ms
+    ///   at 100 Hz). Returns `PendingOnYield`.
+    /// - `Ready`: parks synchronously into
+    ///   `Blocked(ChannelQuiesceWait(channel_id_raw))`. Returns
+    ///   `ParkedNow`. The hint field is left `None` because the task
+    ///   never reaches the hook.
+    /// - `Blocked` / `Terminated` / `Suspended`: no state change.
+    ///   Returns `AlreadyOffCpu`. The task's existing block reason is
+    ///   preserved (a peer already blocked on `MessageWait` etc. is
+    ///   already off-CPU; the kernel's unmap is safe).
+    ///
+    /// Errors:
+    /// - `TaskNotFound`: no task at that slot.
+    /// - `InvalidTaskState`: caller passed `TaskId(0)` (idle task —
+    ///   never blockable per `block_task`'s contract).
+    ///
+    /// `channel_id_raw` is `ChannelId::as_raw()`. Untyped here so this
+    /// module stays free of `crate::ipc::channel` imports.
+    pub fn arm_quiesce(
+        &mut self,
+        task_id: TaskId,
+        channel_id_raw: u64,
+    ) -> Result<QuiesceArmResult, ScheduleError> {
+        if task_id == TaskId(0) {
+            return Err(ScheduleError::InvalidTaskState);
+        }
+        let task = self.get_task_mut(task_id).ok_or(ScheduleError::TaskNotFound)?;
+        match task.state {
+            TaskState::Running => {
+                task.pending_quiesce_channel = Some(channel_id_raw);
+                Ok(QuiesceArmResult::PendingOnYield)
+            }
+            TaskState::Ready => {
+                task.state = TaskState::Blocked;
+                task.block_reason = Some(BlockReason::ChannelQuiesceWait(channel_id_raw));
+                task.pending_quiesce_channel = None;
+                // in_ready_queue left as-is; stale entry cleaned lazily on pop
+                // (matches block_task's invariant).
+                self.runnable_count = self.runnable_count.saturating_sub(1);
+                Ok(QuiesceArmResult::ParkedNow)
+            }
+            TaskState::Blocked | TaskState::Terminated | TaskState::Suspended => {
+                Ok(QuiesceArmResult::AlreadyOffCpu)
+            }
+        }
+    }
+
+    /// Scheduler hook fired from `isr_tick_and_schedule` and
+    /// `voluntary_yield` (ADR-027 Phase 1).
+    ///
+    /// If the current task has a pending channel-quiesce hint AND is
+    /// still `Running` (i.e. has not already been transitioned to
+    /// `Blocked` by the syscall handler that's calling us), park it
+    /// into `Blocked(ChannelQuiesceWait(id))`. Returns `true` if the
+    /// task was parked — the caller must force a `schedule()` because
+    /// the early-return based on time-slice is no longer correct.
+    fn try_park_current_for_quiesce(&mut self) -> bool {
+        let task_id = match self.current_task {
+            Some(id) => id,
+            None => return false,
+        };
+        // Idle task is never quiesced; defensive guard mirroring
+        // block_task's TaskId(0) gate.
+        if task_id == TaskId(0) {
+            return false;
+        }
+        let task = match self.get_task_mut(task_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        let channel = match task.pending_quiesce_channel.take() {
+            Some(c) => c,
+            None => return false,
+        };
+        if task.state != TaskState::Running {
+            // Already blocked / terminated / suspended via another path
+            // (handle_recv_msg, handle_exit, …). Hint cleared above; the
+            // task's existing block_reason is preserved — a peer parked
+            // on MessageWait is already off-CPU and the kernel's unmap
+            // is safe; no need to overwrite the wake-path block reason
+            // with ChannelQuiesceWait.
+            return false;
+        }
+        task.state = TaskState::Blocked;
+        task.block_reason = Some(BlockReason::ChannelQuiesceWait(channel));
+        self.runnable_count = self.runnable_count.saturating_sub(1);
+        true
+    }
+
     /// Wake a blocked task
     ///
     /// Moves task from Blocked to Ready state.
@@ -639,6 +772,14 @@ impl Scheduler {
 
             task.state = TaskState::Ready;
             task.block_reason = None;
+            // ADR-027 Phase 1: clear any stale quiesce hint on every
+            // Blocked → Ready transition. Defensive — if a Running task's
+            // hint was set and the task transitioned to Blocked via a
+            // different path (e.g., handle_recv_msg → MessageWait), the
+            // hint outlives the parking attempt and would re-park the
+            // task on the next Running run. Cleared here so post-wake
+            // execution is hint-free regardless of the wake source.
+            task.pending_quiesce_channel = None;
             task.reset_time_slice();
             let b = priority_to_band(task.priority);
             if !task.in_ready_queue {
@@ -678,6 +819,7 @@ impl Scheduler {
                     if waiting_irq == irq {
                         task.state = TaskState::Ready;
                         task.block_reason = None;
+                        task.pending_quiesce_channel = None; // ADR-027 hint cleanup
                         task.reset_time_slice();
                         if !task.in_ready_queue {
                             task.in_ready_queue = true;
@@ -716,6 +858,7 @@ impl Scheduler {
                     if ep == endpoint {
                         task.state = TaskState::Ready;
                         task.block_reason = None;
+                        task.pending_quiesce_channel = None; // ADR-027 hint cleanup
                         task.reset_time_slice();
                         if !task.in_ready_queue {
                             task.in_ready_queue = true;
@@ -1552,5 +1695,278 @@ mod tests {
         }
         // Only non-idle task is pinned — nothing migratable
         assert_eq!(sched.pick_migratable_task(), None);
+    }
+
+    // ========================================================================
+    // ADR-027 Phase 1: per-channel quiesce protocol
+    //
+    // arm_quiesce sets a per-task hint when the peer is Running, parks
+    // synchronously when Ready, and is a no-op (AlreadyOffCpu) when
+    // already non-runnable. The scheduler hook in
+    // isr_tick_and_schedule / voluntary_yield consumes the hint and
+    // parks the task into Blocked(ChannelQuiesceWait). Wake paths
+    // clear stale hints so a Running re-run never re-parks.
+    // ========================================================================
+
+    /// Arbitrary channel id used in the quiesce tests.
+    const QUIESCE_TEST_CHANNEL_ID: u64 = 0x0000_0007_0000_0042;
+
+    #[test]
+    fn test_arm_quiesce_idle_task_rejected() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+
+        assert_eq!(
+            sched.arm_quiesce(TaskId(0), QUIESCE_TEST_CHANNEL_ID),
+            Err(ScheduleError::InvalidTaskState)
+        );
+    }
+
+    #[test]
+    fn test_arm_quiesce_unknown_task_rejected() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+
+        assert_eq!(
+            sched.arm_quiesce(TaskId(99), QUIESCE_TEST_CHANNEL_ID),
+            Err(ScheduleError::TaskNotFound)
+        );
+    }
+
+    #[test]
+    fn test_arm_quiesce_ready_parks_synchronously() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Task is Ready by construction; do not run schedule().
+        assert_eq!(sched.get_task_pub(tid).unwrap().state, TaskState::Ready);
+
+        let result = sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        assert_eq!(result, QuiesceArmResult::ParkedNow);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(
+            task.block_reason,
+            Some(BlockReason::ChannelQuiesceWait(QUIESCE_TEST_CHANNEL_ID))
+        );
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_arm_quiesce_running_sets_hint_only() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Drive task to Running.
+        sched.schedule().unwrap();
+        assert_eq!(sched.current_task, Some(tid));
+        assert_eq!(sched.get_task_pub(tid).unwrap().state, TaskState::Running);
+
+        let result = sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        assert_eq!(result, QuiesceArmResult::PendingOnYield);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.block_reason, None);
+        assert_eq!(task.pending_quiesce_channel, Some(QUIESCE_TEST_CHANNEL_ID));
+    }
+
+    #[test]
+    fn test_arm_quiesce_blocked_returns_already_off_cpu() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(tid, BlockReason::MessageWait(5)).unwrap();
+
+        let result = sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        assert_eq!(result, QuiesceArmResult::AlreadyOffCpu);
+
+        // Existing block reason preserved — peer was already off-CPU on
+        // a different wait, kernel proceeds with unmap; no overwrite.
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(task.block_reason, Some(BlockReason::MessageWait(5)));
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_voluntary_yield_parks_running_task_with_hint() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        assert_eq!(sched.current_task, Some(tid));
+
+        // Arm quiesce on Running task → hint set, state still Running.
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        assert_eq!(sched.get_task_pub(tid).unwrap().state, TaskState::Running);
+
+        // Voluntary yield → hook parks the task.
+        sched.voluntary_yield(0xDEAD_BEEF);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(
+            task.block_reason,
+            Some(BlockReason::ChannelQuiesceWait(QUIESCE_TEST_CHANNEL_ID))
+        );
+        // Hint consumed by hook.
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_isr_tick_parks_running_task_with_hint_before_slice_expiry() {
+        // Quiesce hook must force a schedule() even when the time slice
+        // hasn't expired — otherwise the parked task stays current.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        assert_eq!(sched.current_task, Some(tid));
+
+        // Fresh time slice — slice not expired.
+        assert_eq!(sched.get_task_pub(tid).unwrap().time_remaining, 10);
+
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+
+        sched.isr_tick_and_schedule(0xDEAD_BEEF);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(
+            task.block_reason,
+            Some(BlockReason::ChannelQuiesceWait(QUIESCE_TEST_CHANNEL_ID))
+        );
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_yield_without_hint_does_not_park() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        assert_eq!(sched.current_task, Some(tid));
+
+        // No arm_quiesce — voluntary_yield must not park.
+        sched.voluntary_yield(0xDEAD_BEEF);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.block_reason, None);
+        // The yield itself doesn't transition state — voluntary_yield
+        // saves rsp + reschedules; the task stays Running (or becomes
+        // Ready when displaced) but is never Blocked without an
+        // explicit reason.
+        assert_ne!(task.state, TaskState::Blocked);
+    }
+
+    #[test]
+    fn test_hook_skips_blocked_task_clears_stale_hint() {
+        // Race shape commit 3 must tolerate: Running task's hint is
+        // set, then another path transitions it to Blocked
+        // (handle_recv_msg → MessageWait) before the hook fires. The
+        // hook must consume the now-stale hint without overwriting
+        // the wake-path block reason.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        assert_eq!(sched.current_task, Some(tid));
+
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        assert_eq!(
+            sched.get_task_pub(tid).unwrap().pending_quiesce_channel,
+            Some(QUIESCE_TEST_CHANNEL_ID)
+        );
+
+        // Different path moves task to Blocked(MessageWait).
+        sched.block_task(tid, BlockReason::MessageWait(7)).unwrap();
+
+        // Hook fires (e.g. via the next ISR tick on this CPU): clears
+        // the hint, leaves block_reason = MessageWait intact.
+        sched.isr_tick_and_schedule(0xDEAD_BEEF);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(task.block_reason, Some(BlockReason::MessageWait(7)));
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_wake_task_clears_pending_hint() {
+        // Defense against stale hints surviving a Blocked→Ready→Running
+        // round trip. wake_task must clear the hint so the next ISR
+        // tick after the wake doesn't re-park the task.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        sched.block_task(tid, BlockReason::MessageWait(7)).unwrap();
+        // Hint still set on the Blocked task.
+        assert_eq!(
+            sched.get_task_pub(tid).unwrap().pending_quiesce_channel,
+            Some(QUIESCE_TEST_CHANNEL_ID)
+        );
+
+        sched.wake_task(tid).unwrap();
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Ready);
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_wake_message_waiters_clears_pending_hint() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        sched.block_task(tid, BlockReason::MessageWait(11)).unwrap();
+        assert_eq!(
+            sched.get_task_pub(tid).unwrap().pending_quiesce_channel,
+            Some(QUIESCE_TEST_CHANNEL_ID)
+        );
+
+        let woken = sched.wake_message_waiters(11);
+        assert_eq!(woken, 1);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Ready);
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_wake_irq_waiters_clears_pending_hint() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.schedule().unwrap();
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        sched.block_task(tid, BlockReason::IoWait(3)).unwrap();
+        assert_eq!(
+            sched.get_task_pub(tid).unwrap().pending_quiesce_channel,
+            Some(QUIESCE_TEST_CHANNEL_ID)
+        );
+
+        let woken = sched.wake_irq_waiters(3);
+        assert_eq!(woken, 1);
+
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Ready);
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_block_reason_channel_quiesce_wait_display() {
+        // Display is consumed by audit / scheduler logging; pin the
+        // format so the audit consumer can pattern-match if it grows
+        // a quiesce-aware view.
+        use core::fmt::Write;
+        let mut buf = alloc::string::String::new();
+        write!(&mut buf, "{}", BlockReason::ChannelQuiesceWait(0x42)).unwrap();
+        assert_eq!(buf, "ChannelQuiesceWait(66)");
     }
 }

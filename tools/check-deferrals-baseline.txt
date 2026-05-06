@@ -92,8 +92,8 @@ src/microkernel/main.rs:2316:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:790:deferred
 src/process.rs:791:deferred
-src/scheduler/mod.rs:261:placeholder
-src/scheduler/mod.rs:262:placeholder
+src/scheduler/mod.rs:281:placeholder
+src/scheduler/mod.rs:282:placeholder
 src/syscalls/dispatcher.rs:1447:deferred
 src/syscalls/dispatcher.rs:2953:for-now
 src/syscalls/userspace.rs:31:for-now
