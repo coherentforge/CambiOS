@@ -136,7 +136,8 @@ impl WindowTable {
         self.iter().max_by_key(|w| w.z_order)
     }
 
-    /// Drop windows whose surface channel is no longer Active.
+    /// Drop windows whose surface channel is in a teardown-terminal
+    /// state.
     ///
     /// The userspace half of ADR-007 Divergence 7 (tombstone-on-
     /// revoke). When a libgui client exits without sending an
@@ -151,6 +152,18 @@ impl WindowTable {
     /// stale (`channel_info` returns negative when the slot has been
     /// freed and the generation bumped).
     ///
+    /// **Does NOT reap `AwaitingAttach` channels** — that's the
+    /// transient pre-`Active` state between
+    /// `compositor: channel_create` and `client: channel_attach`,
+    /// during which the WindowTable entry already exists but the
+    /// client hasn't received `WelcomeClient` yet. Reaping here
+    /// would drop windows the moment they're created and trigger
+    /// the `composite_blank_and_present` "last window gone" path on
+    /// the very next iteration, blanking the scanout to black.
+    /// Observed first under `play super-sprouty-o → Ctrl+Q` where
+    /// terminal-window's reopen path created a new (still-AwaitingAttach)
+    /// window and reap immediately dropped it.
+    ///
     /// Bounded cost: one syscall per live window, plus one
     /// 46-byte stack buffer. Called once per main-loop iteration so
     /// dead windows are reaped within one frame of the client exit.
@@ -163,7 +176,14 @@ impl WindowTable {
                 let rc = sys::channel_info(w.surface_channel_id, &mut info);
                 let dead = if rc == 0 {
                     // info[0] is the ChannelState discriminant.
-                    info[0] != sys::CHANNEL_STATE_ACTIVE
+                    // AwaitingAttach + Active are alive; everything
+                    // else is mid- or post-teardown.
+                    matches!(
+                        info[0],
+                        sys::CHANNEL_STATE_REVOKING
+                            | sys::CHANNEL_STATE_REVOKED
+                            | sys::CHANNEL_STATE_CLOSED
+                    )
                 } else {
                     // channel id stale (slot freed + generation bumped) —
                     // treat as dead, the client is gone.
