@@ -44,6 +44,77 @@ pub struct SyscallContext {
 const MAX_DEVICE_IRQ: u32 = 224;
 
 // ============================================================================
+// Tombstone page (ADR-007 Divergence entry 7)
+// ============================================================================
+
+/// Physical base of the kernel-owned tombstone zero page used by
+/// [`SyscallDispatcher::teardown_channel_mappings`] to remap revoked
+/// RO peer mappings instead of unmapping them. Set once at boot via
+/// [`init_tombstone`]; read on every channel teardown. 0 = uninit.
+///
+/// ADR-007 Divergence entry 7 documents the decision rationale. The
+/// concrete shape: one global RO 4 KiB page, allocated from the frame
+/// allocator, zeroed once at init, never freed. All revoked RO peer
+/// mappings point at it; reads return zeros without faulting,
+/// closing the open compositor #PF on clean client exit.
+///
+/// `AtomicU64` so the read on the teardown hot path is lock-free; the
+/// store happens once at boot before any process can revoke.
+static TOMBSTONE_PHYS_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read the tombstone page's physical base. Returns 0 if uninit
+/// (boot-order bug — `init_tombstone` should fire before any channel
+/// can revoke). Callers fall back to unmap-on-revoke when 0, which
+/// re-exposes the HN-blocker fault but keeps the kernel functional.
+#[inline]
+pub fn tombstone_phys_base() -> u64 {
+    TOMBSTONE_PHYS_BASE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Allocate the global tombstone page. Idempotent — call once during
+/// boot after `FRAME_ALLOCATOR` is live, before any process can revoke
+/// a channel.
+///
+/// On allocation failure (frame allocator out of memory, which would
+/// itself be a fatal boot condition), logs a warning and returns
+/// `false`; subsequent revokes fall back to unmap-on-revoke (the
+/// pre-tombstone behavior). On success the tombstone phys base is
+/// published via `Release` so the lock-free reads on the teardown
+/// hot path observe it.
+pub fn init_tombstone() -> bool {
+    if TOMBSTONE_PHYS_BASE.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        return true; // already initialised
+    }
+    let phys_base = {
+        let mut fa = crate::FRAME_ALLOCATOR.lock();
+        match fa.allocate_contiguous(1) {
+            Ok(frame) => frame.addr,
+            Err(_) => {
+                crate::println!(
+                    "WARN: tombstone allocation failed; channel revoke falls back to unmap-on-revoke (ADR-007 Divergence entry 7)"
+                );
+                return false;
+            }
+        }
+    };
+    // Zero the page. The frame allocator does not guarantee zeroed
+    // pages, and the tombstone's whole point is "reads return zeros."
+    let virt = phys_base + crate::hhdm_offset();
+    // SAFETY: `phys_base` was just allocated from the frame allocator
+    // and is exclusively owned by us; HHDM maps it to a valid kernel
+    // VA for the entire 4 KiB page; no other CPU has observed
+    // `TOMBSTONE_PHYS_BASE` yet (we have not stored it), so no
+    // concurrent reader can reach this memory via the tombstone path.
+    unsafe {
+        core::ptr::write_bytes(virt as *mut u8, 0, 4096);
+    }
+    TOMBSTONE_PHYS_BASE.store(phys_base, core::sync::atomic::Ordering::Release);
+    crate::println!("✓ Tombstone page allocated at phys {:#x}", phys_base);
+    true
+}
+
+// ============================================================================
 // Dispatcher
 // ============================================================================
 //
@@ -2784,44 +2855,94 @@ impl SyscallDispatcher {
     // Channel teardown helper (shared by close, revoke, process exit)
     // ========================================================================
 
-    /// Unmap a closed/revoked channel's pages from both processes,
-    /// issue TLB shootdown, free VMA slots, and free the physical frames.
+    /// Tear down a closed/revoked channel's mappings on both peers,
+    /// issue TLB shootdowns, free VMA slots, and free the physical
+    /// frames.
+    ///
+    /// Per ADR-007 Divergence entry 7 (tombstone-on-revoke), each
+    /// side's mapping is handled per its writability:
+    /// - **RO mapping** → unmap-then-remap to the kernel-owned
+    ///   tombstone zero page. Subsequent reads return zeros instead
+    ///   of faulting. Closes the HN-blocker compositor #PF on clean
+    ///   client exit (first observed 2026-04-25).
+    /// - **RW mapping** → unmap (existing behavior). Tombstone-as-RW
+    ///   would need per-peer scratch pages; deferred per ADR-007
+    ///   Divergence entry 8. Subsequent writes fault and the writer is
+    ///   killed by the existing #PF handler — acceptable for the
+    ///   catastrophic-state cases this covers (e.g., compositor →
+    ///   scanout-driver where the consumer dies).
+    ///
+    /// Writability per side comes from `record.role`:
+    /// - `Producer`: creator RW, peer RO
+    /// - `Consumer`: creator RO, peer RW
+    /// - `Bidirectional`: both RW
+    ///
+    /// Falls back to unmap-on-revoke when the tombstone wasn't
+    /// allocated at boot (`init_tombstone` failed) — the kernel stays
+    /// functional but the HN-blocker re-exposes.
     ///
     /// Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7), then
     /// TLB shootdown (lock-free).
     ///
-    /// Called after the ChannelManager lock has been released (the record
-    /// is already taken out of the table).
+    /// Called after the ChannelManager lock has been released (the
+    /// record is already taken out of the table).
     fn teardown_channel_mappings(record: &crate::ipc::channel::ChannelRecord) {
-        // Collect vaddrs for TLB shootdown after locks are released.
+        let tombstone = tombstone_phys_base();
+        let creator_writable = record.role.creator_writable();
+        let peer_writable = record.role.peer_writable();
+
         let mut shootdown_creator = false;
         let mut shootdown_peer = false;
 
         {
             let mut pt_guard = crate::PROCESS_TABLE.lock();
+            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
             if let Some(pt) = pt_guard.as_mut() {
-                // Unmap from creator.
+                // Creator side
                 if record.creator_vaddr != 0 {
                     if let Some(vma) = pt.vma_mut(record.creator_pid) {
                         vma.free_region(record.creator_vaddr);
                     }
                     let creator_cr3 = pt.get_cr3(record.creator_pid);
                     if creator_cr3 != 0 {
-                        // SAFETY: creator_cr3 is a valid page table. The
-                        // channel is closed so no user-space writes are
-                        // racing (the record is already Closed/Revoked).
+                        // SAFETY: `creator_cr3` is a valid root page-table
+                        // physical address obtained from the process table.
+                        // The channel record was already taken out of
+                        // `ChannelManager` so no other code path is mutating
+                        // these PTEs concurrently. We hold PROCESS_TABLE +
+                        // FRAME_ALLOCATOR for the duration of the walk.
                         unsafe {
-                            let mut page_table = crate::memory::paging::page_table_from_cr3(creator_cr3);
+                            let mut page_table =
+                                crate::memory::paging::page_table_from_cr3(creator_cr3);
+                            let remap_creator = !creator_writable && tombstone != 0;
                             for i in 0..record.num_pages as u64 {
                                 let vaddr = record.creator_vaddr + i * 4096;
+                                // Unmap original. Discard PhysFrame — the
+                                // original frames are freed in bulk below
+                                // via `free_contiguous`.
                                 let _ = crate::memory::paging::unmap_page(&mut page_table, vaddr);
+                                if remap_creator {
+                                    // SAFETY: `tombstone` was allocated and
+                                    // zeroed once at boot by `init_tombstone`;
+                                    // `user_ro()` flags expose it as readable
+                                    // but not writable to userspace; the PTE
+                                    // was just unmapped above so map_page
+                                    // does not collide.
+                                    let _ = crate::memory::paging::map_page(
+                                        &mut page_table,
+                                        vaddr,
+                                        tombstone,
+                                        crate::memory::paging::flags::user_ro(),
+                                        &mut fa_guard,
+                                    );
+                                }
                             }
                         }
                         shootdown_creator = true;
                     }
                 }
 
-                // Unmap from peer (if attached).
+                // Peer side (if attached)
                 if record.peer_vaddr != 0 {
                     if let Some(peer_pid) = record.peer_pid {
                         if let Some(vma) = pt.vma_mut(peer_pid) {
@@ -2829,12 +2950,28 @@ impl SyscallDispatcher {
                         }
                         let peer_cr3 = pt.get_cr3(peer_pid);
                         if peer_cr3 != 0 {
-                            // SAFETY: same reasoning as creator.
+                            // SAFETY: same reasoning as creator side.
                             unsafe {
-                                let mut page_table = crate::memory::paging::page_table_from_cr3(peer_cr3);
+                                let mut page_table =
+                                    crate::memory::paging::page_table_from_cr3(peer_cr3);
+                                let remap_peer = !peer_writable && tombstone != 0;
                                 for i in 0..record.num_pages as u64 {
                                     let vaddr = record.peer_vaddr + i * 4096;
-                                    let _ = crate::memory::paging::unmap_page(&mut page_table, vaddr);
+                                    let _ = crate::memory::paging::unmap_page(
+                                        &mut page_table,
+                                        vaddr,
+                                    );
+                                    if remap_peer {
+                                        // SAFETY: same as creator-side
+                                        // remap above.
+                                        let _ = crate::memory::paging::map_page(
+                                            &mut page_table,
+                                            vaddr,
+                                            tombstone,
+                                            crate::memory::paging::flags::user_ro(),
+                                            &mut fa_guard,
+                                        );
+                                    }
                                 }
                             }
                             shootdown_peer = true;
@@ -2842,24 +2979,30 @@ impl SyscallDispatcher {
                     }
                 }
             }
-        } // drop PROCESS_TABLE(6)
+        } // drop FRAME_ALLOCATOR(7), then PROCESS_TABLE(6)
 
-        // TLB shootdown for unmapped ranges (lock-free).
+        // TLB shootdown for changed ranges (lock-free). Required
+        // whether we tombstoned or unmapped — the PTE changed either
+        // way and stale TLB entries must be invalidated.
         if shootdown_creator {
-            // SAFETY: shootdown_range requires ring 0 and that the page table
-            // modifications (above) are already visible in memory.
+            // SAFETY: shootdown_range requires ring 0 and that the
+            // page-table mutations above are already visible.
             unsafe {
                 crate::arch::tlb_shootdown_range(record.creator_vaddr, record.num_pages);
             }
         }
         if shootdown_peer {
-            // SAFETY: Same preconditions — page table modifications are visible.
+            // SAFETY: same preconditions.
             unsafe {
                 crate::arch::tlb_shootdown_range(record.peer_vaddr, record.num_pages);
             }
         }
 
-        // Free the contiguous physical frames.
+        // Free the original contiguous physical frames. The PTEs that
+        // formerly pointed at them have been swapped to the tombstone
+        // (RO sides) or unmapped (RW sides), so no live mapping
+        // references this region anymore. The tombstone itself is
+        // never freed.
         {
             let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
             let _ = fa_guard.free_contiguous(record.physical_base, record.num_pages as usize);

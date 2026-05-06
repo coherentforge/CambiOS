@@ -304,6 +304,13 @@ unsafe extern "C" fn kmain() -> ! {
     // creation, capability grants) are captured.
     audit_init();
 
+    // ADR-007 Divergence entry 7: allocate the kernel-owned tombstone
+    // zero page used by channel teardown to remap revoked RO peer
+    // mappings instead of unmapping them. Must run before any process
+    // can revoke a channel; idempotent and falls back gracefully on
+    // allocation failure.
+    cambios_core::syscalls::dispatcher::init_tombstone();
+
     // Load our GDT (replaces Limine's) — must be before IDT and syscall init
     // On AArch64: no-op (EL1/EL0 managed via exception levels).
     // SAFETY: Single-threaded boot, interrupts disabled.
@@ -694,6 +701,11 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // allocator is live and before any user task spawns.
     init_kernel_object_tables();
     process_table_init();
+
+    // ADR-007 Divergence entry 7: tombstone for channel teardown.
+    // Same posture as kmain — allocate before any user process can
+    // revoke a channel.
+    cambios_core::syscalls::dispatcher::init_tombstone();
 
     // Per-hart data via `tp`. The scheduler and any other portable
     // code that reaches through `tp` (audit drain, local_scheduler,
