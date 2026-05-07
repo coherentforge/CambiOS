@@ -260,6 +260,21 @@ impl SyscallDispatcher {
             // Enosys so userspace cannot accidentally consume the slot
             // before the protocol is hooked up end-to-end.
             SyscallNumber::ChannelQuiesceAck => Err(SyscallError::Enosys),
+
+            // ADR-027 cluster handles: create / join / revoke / info.
+            // Slots reserved here; handlers + cap-promotion +
+            // cluster-policy module land in the cluster-syscall
+            // implementation commit (after the lock-hierarchy renumber
+            // and the ADR-027 Divergence appendix). Until then, calls
+            // return Enosys so userspace cannot accidentally consume
+            // the slots before the manager is wired up end-to-end.
+            // ClusterManager bookkeeping skeleton already lives at
+            // src/ipc/cluster.rs; these arms drive it once the
+            // handlers land.
+            SyscallNumber::ClusterCreate
+            | SyscallNumber::ClusterJoin
+            | SyscallNumber::ClusterRevoke
+            | SyscallNumber::ClusterInfo => Err(SyscallError::Enosys),
         }
     }
 

@@ -385,6 +385,109 @@ pub enum SyscallNumber {
     /// so cluster cooperation (post-HN, ADR-027 Decisions 1-3) plugs
     /// in without needing a new syscall.
     ChannelQuiesceAck = 43,
+
+    /// SYS_CLUSTER_CREATE (44): create a `Forming` cluster from a
+    /// `ClusterPolicy` manifest naming expected member Principals and
+    /// roles. Caller becomes the cluster's creator and receives a
+    /// `ClusterId` for subsequent ops. See [ADR-027](../docs/adr/027-service-clusters.md)
+    /// Decision 1 + § Syscalls.
+    ///
+    /// Caller must hold `CapabilityKind::CreateCluster` (granted to
+    /// `init` at boot per ADR-027 § Migration Path step 6 and the
+    /// surrounding boot manifest, [ADR-018](../docs/adr/018-init-process-and-boot-manifest.md)).
+    ///
+    /// Args: TBD with handler implementation. Conceptual shape per
+    /// ADR-027 § Architecture: policy + manifest of (Principal, role)
+    /// pairs. Wire format (inline vs userspace-pointer-to-params)
+    /// lands with the dispatcher commit.
+    ///
+    /// Returns: ClusterId (`u64` raw form) on success;
+    /// `PermissionDenied` without the cap or identity;
+    /// `InvalidArg` for an unknown policy or a manifest entry whose
+    /// role does not belong to the policy.
+    ///
+    /// Identity-required: yes. Slot reserved here per ADR-027 § Syscalls
+    /// (renumbered from the original 41 reservation per the Divergence
+    /// appendix landing in the same chain — slots 41/42/43 already
+    /// shipped as `AuditEmitInputFocus` / `GetProcessPrincipal` /
+    /// `ChannelQuiesceAck`). Handler lands in the dispatcher migration
+    /// commit alongside the cluster-policy + cap-promotion wiring.
+    /// Until then the dispatcher returns `Enosys` so userspace cannot
+    /// accidentally consume the slot before the protocol is hooked up.
+    ClusterCreate = 44,
+
+    /// SYS_CLUSTER_JOIN (45): join a `Forming` or `Active` cluster as
+    /// a named role. Kernel verifies the caller's bound Principal
+    /// matches the manifest's expected Principal for that role,
+    /// transitions the member from `Expected` → `Joined`, and promotes
+    /// the role's pre-computed cap set into `ProcessCapabilities`.
+    /// Auto-promotes the cluster `Forming` → `Active` when the last
+    /// expected member joins.
+    ///
+    /// Cap promotion is closed-world per ADR-027 Decision 2: each
+    /// `(ClusterPolicy, ClusterRole)` pair maps to a fixed cap set
+    /// hardcoded in the kernel cluster-policy module. No
+    /// caller-supplied cap list — that's the verification-friendly
+    /// shape.
+    ///
+    /// Args: TBD with handler. Conceptual shape: `cluster_id` (u64
+    /// raw form) + `role` (u32). Wire format lands with the dispatcher
+    /// commit.
+    ///
+    /// Returns: 0 on success; `PermissionDenied` for Principal
+    /// mismatch or absent identity; `InvalidArg` for stale
+    /// `cluster_id`, `Revoking`/`Revoked` cluster, an already-joined
+    /// role, or a role that has no expected-member slot in the
+    /// manifest.
+    ///
+    /// Identity-required: yes. Slot reserved here per ADR-027 §
+    /// Syscalls (renumber per the Divergence appendix). Handler stub
+    /// returns `Enosys` until the dispatcher migration commit.
+    ClusterJoin = 45,
+
+    /// SYS_CLUSTER_REVOKE (46): tear down an `Active` (or `Forming`)
+    /// cluster. Caller must be the cluster's creator or hold
+    /// `CapabilityKind::ClusterRevoke` (granted at join to the
+    /// coordinator role per ADR-027 Decision 2 — typically the
+    /// compositor in the rendering limb).
+    ///
+    /// Per the v1 stance documented in the ADR-027 Divergence
+    /// appendix landing in this chain (path A — advisory quiesce),
+    /// cluster revoke composes per-channel revoke and inherits
+    /// tombstone-on-revoke semantics from
+    /// [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md)
+    /// Divergence 7. The wider quiesce-then-atomic-revoke protocol
+    /// from ADR-027 § Decision 3 step 2 becomes load-bearing under
+    /// SMP RW peer mappings (post-v1) and is reservable via the
+    /// existing `ChannelQuiesceAck = 43`.
+    ///
+    /// Args: TBD with handler. Conceptual shape: `cluster_id` (u64
+    /// raw form).
+    ///
+    /// Returns: 0 on success; `PermissionDenied` without authority;
+    /// `InvalidArg` for stale or already-`Revoked` cluster.
+    ///
+    /// Identity-required: yes. Slot reserved here per ADR-027 §
+    /// Syscalls (renumber per the Divergence appendix). Handler stub
+    /// returns `Enosys` until the dispatcher migration commit.
+    ClusterRevoke = 46,
+
+    /// SYS_CLUSTER_INFO (47): read cluster metadata (state,
+    /// member list, channel ids, policy) into a caller-supplied
+    /// buffer. Read-only; does not transition state.
+    ///
+    /// Args: TBD with handler. Conceptual shape: `cluster_id` (u64),
+    /// `user_buf` (u64), `buf_len` (u64). Wire format mirrors
+    /// `SYS_CHANNEL_INFO`.
+    ///
+    /// Returns: bytes written on success; `InvalidArg` for stale
+    /// cluster_id or undersize buffer; `PermissionDenied` without
+    /// identity.
+    ///
+    /// Identity-required: yes. Slot reserved here per ADR-027 §
+    /// Syscalls (renumber per the Divergence appendix). Handler stub
+    /// returns `Enosys` until the dispatcher migration commit.
+    ClusterInfo = 47,
 }
 
 impl SyscallNumber {
@@ -418,7 +521,9 @@ impl SyscallNumber {
             Self::AuditEmitInputFocus |
             Self::GetProcessPrincipal |
             Self::SetWallclock |
-            Self::ChannelQuiesceAck
+            Self::ChannelQuiesceAck |
+            Self::ClusterCreate | Self::ClusterJoin |
+            Self::ClusterRevoke | Self::ClusterInfo
         )
     }
 
@@ -470,6 +575,10 @@ impl SyscallNumber {
             41 => Some(Self::AuditEmitInputFocus),
             42 => Some(Self::GetProcessPrincipal),
             43 => Some(Self::ChannelQuiesceAck),
+            44 => Some(Self::ClusterCreate),
+            45 => Some(Self::ClusterJoin),
+            46 => Some(Self::ClusterRevoke),
+            47 => Some(Self::ClusterInfo),
             _ => None,
         }
     }
@@ -648,6 +757,8 @@ mod tests {
             SyscallNumber::AuditEmitInputFocus,
             SyscallNumber::GetProcessPrincipal,
             SyscallNumber::ChannelQuiesceAck,
+            SyscallNumber::ClusterCreate, SyscallNumber::ClusterJoin,
+            SyscallNumber::ClusterRevoke, SyscallNumber::ClusterInfo,
         ];
 
         for &num in &all {
@@ -676,10 +787,12 @@ mod tests {
     fn all_syscall_numbers_covered() {
         // Verify from_u64 round-trips for all defined values, ensuring
         // no gap in the requires_identity() match. ADR-022 wallclock
-        // pair (39 SetWallclock, 40 GetWallclock) lands here as part of
-        // the contiguous 0..=43 sweep. ADR-027 channel-quiesce-ack
-        // (43) is the most recent slot.
-        for i in 0..=43u64 {
+        // pair (39/40) lands inside the contiguous 0..=47 sweep.
+        // ADR-027 cluster-handle reservations (44 ClusterCreate, 45
+        // ClusterJoin, 46 ClusterRevoke, 47 ClusterInfo) are the most
+        // recent slots — handlers Enosys-stubbed in the dispatcher
+        // until the cluster-syscall implementation commit lands.
+        for i in 0..=47u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
