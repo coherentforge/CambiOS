@@ -372,10 +372,12 @@ Lock ordering MUST be followed to prevent deadlock.
 
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-CHANNEL_MANAGER(5) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7) →
-INTERRUPT_ROUTER(8) → OBJECT_STORE(9)
+CLUSTER_MANAGER(5) → CHANNEL_MANAGER(6) → PROCESS_TABLE(7) →
+FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) → OBJECT_STORE(10)
 ```
-`*` = IrqSpinlock (saves/disables interrupts before acquiring, prevents same-CPU deadlock when timer ISR fires while lock is held). Others use plain Spinlock.
+`*` = IrqSpinlock (saves/disables interrupts before acquiring, prevents same-CPU deadlock when timer ISR fires while lock is held). Others use plain Spinlock — including `CLUSTER_MANAGER`, which never runs in ISR context (cluster ops are syscall-driven).
+
+`CLUSTER_MANAGER(5)` inserted per [ADR-027 § Architecture](docs/adr/027-service-clusters.md). Cluster operations acquire `CLUSTER_MANAGER` → (`CAPABILITY_MANAGER` for cap promotion / revoke) → `CHANNEL_MANAGER` (per-channel teardown during cluster revoke) → `PROCESS_TABLE` (member-PID lookup) → `FRAME_ALLOCATOR` (unmap-driven frame frees). Strictly downward — no inversion.
 
 Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.rs` comment.
 

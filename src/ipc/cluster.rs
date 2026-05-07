@@ -379,9 +379,8 @@ pub struct ClusterCreateParams {
 /// responsibility.
 ///
 /// Lock position: 5 in the global hierarchy (between
-/// `CAPABILITY_MANAGER` and `CHANNEL_MANAGER` per ADR-027
-/// § Architecture; the renumber lands with the lock-hierarchy update
-/// commit).
+/// `CAPABILITY_MANAGER(4)` and `CHANNEL_MANAGER(6)` per ADR-027
+/// § Architecture). Plain `Spinlock` — never held in ISR context.
 pub struct ClusterManager {
     clusters: [Option<ClusterRecord>; MAX_CLUSTERS],
     /// Per-slot generation counter. Incremented on

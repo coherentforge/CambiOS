@@ -67,15 +67,16 @@ use memory::frame_allocator::FrameAllocator;
 // CRITICAL: Global lock ordering to prevent deadlocks
 // ====================================================
 // Acquire locks in this order ONLY. Never acquire in reverse or nested order:
-// 1. PER_CPU_SCHEDULER[*] (highest priority - preemption, task state)
-// 2. PER_CPU_TIMER[*] (tick counting)
-// 3. IPC_MANAGER (message queues)
-// 4. CAPABILITY_MANAGER (access control)
-// 5. CHANNEL_MANAGER (shared-memory channel table)
-// 6. PROCESS_TABLE (process metadata)                   [was 5]
-// 7. FRAME_ALLOCATOR (physical page allocation)         [was 6]
-// 8. INTERRUPT_ROUTER (interrupt routing)               [was 7]
-// 9. OBJECT_STORE (filesystem — highest-level subsystem) [was 8]
+// 1.  PER_CPU_SCHEDULER[*] (highest priority - preemption, task state)
+// 2.  PER_CPU_TIMER[*] (tick counting)
+// 3.  IPC_MANAGER (message queues)
+// 4.  CAPABILITY_MANAGER (access control)
+// 5.  CLUSTER_MANAGER (service-cluster bookkeeping; ADR-027) [new — ADR-027]
+// 6.  CHANNEL_MANAGER (shared-memory channel table)         [was 5]
+// 7.  PROCESS_TABLE (process metadata)                      [was 6]
+// 8.  FRAME_ALLOCATOR (physical page allocation)            [was 7]
+// 9.  INTERRUPT_ROUTER (interrupt routing)                  [was 8]
+// 10. OBJECT_STORE (filesystem — highest-level subsystem)   [was 9]
 //
 // Per-CPU lock rule: NEVER hold two different CPUs' scheduler (or timer) locks
 // simultaneously. If cross-CPU access is required (e.g., task migration), acquire

@@ -414,7 +414,8 @@ pub enum TeardownStart {
 /// validates principals. Does NOT allocate frames, map pages, or perform
 /// TLB shootdowns — those are the syscall handler's responsibility.
 ///
-/// Lock position: 5 in the global hierarchy.
+/// Lock position: 6 in the global hierarchy (was 5 before
+/// ADR-027 inserted `CLUSTER_MANAGER` at 5).
 /// Stored in `Spinlock<Option<Box<ChannelManager>>>`.
 pub struct ChannelManager {
     /// Channel table. `None` = free slot.
