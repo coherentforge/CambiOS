@@ -176,6 +176,14 @@ pub extern "C" fn _start() -> ! {
     // moves. v0 focus is "first live window in the table" (see
     // pump_input_once); transitions happen on window create/destroy.
     let mut last_focus: Option<(u32, [u8; 32])> = None;
+
+    // C11 mouse cursor: track absolute pointer position by accumulating
+    // PointerMove deltas + reading absolute PointerButton coords. Hidden
+    // until the first pointer event arrives (no pointer hardware =
+    // never visible). After paint, the `dirty` flag triggers a
+    // recomposite even when no client frame is in flight, so cursor
+    // motion is responsive.
+    let mut pointer = PointerState::new();
     loop {
         // Userspace half of ADR-007 Divergence 7 (tombstone-on-
         // revoke). When a client exits without an explicit
@@ -189,14 +197,16 @@ pub extern "C" fn _start() -> ! {
         let _ = window_table.reap_dead_channels();
 
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
-        if matches!(outcome, DispatchOutcome::ClientFrame(_)) {
+        let mut needs_composite = matches!(outcome, DispatchOutcome::ClientFrame(_));
+        if needs_composite {
             // Z-stack composition: any window's FrameReady triggers a
             // full back-to-front recomposition because a higher-layer
             // alpha-blended pixel may now show different content from
             // a lower layer through transparent regions. The trigger
             // window inside the variant is informational; the
             // composite_and_present call walks the table.
-            composite_and_present(&mut backend, &window_table);
+            composite_and_present(&mut backend, &window_table, &pointer);
+            pointer.dirty = false;
         }
 
         let has_windows = window_table.iter().next().is_some();
@@ -232,8 +242,75 @@ pub extern "C" fn _start() -> ! {
         // to the focused window; a single scheduler tick may carry
         // multiple key/pointer events, so drain in a tight inner loop
         // rather than one-per-yield.
-        while pump_input_once(&mut window_table) {}
+        while pump_input_once(&mut window_table, &mut pointer) {}
+
+        // Recomposite if pointer state changed during the input drain
+        // (cursor moved, became visible, etc.). Without this the
+        // cursor would only update when a client also submitted a
+        // FrameReady — making the pointer feel laggy on idle scenes.
+        if pointer.dirty && !needs_composite {
+            composite_and_present(&mut backend, &window_table, &pointer);
+            pointer.dirty = false;
+            needs_composite = true;
+        }
+        let _ = needs_composite; // silence unused-write lint after final assign
+
         sys::yield_now();
+    }
+}
+
+// ============================================================================
+// Pointer state — absolute cursor position tracking (C11 mouse cursor)
+// ============================================================================
+
+/// Compositor-side absolute pointer position + visibility flag.
+///
+/// `PointerMove` events carry deltas; the compositor accumulates them
+/// here so the cursor sprite knows where to paint. `PointerButton`
+/// events carry the pointer's absolute position at the moment of the
+/// click (driver-tracked); we trust the driver-stamped value and
+/// re-baseline.
+///
+/// `visible` defaults to `false` — without pointer hardware no events
+/// fire and the cursor never appears. After the first pointer event
+/// arrives, `visible` flips on for the rest of the boot.
+///
+/// `dirty` is set on every position update; the main loop reads it to
+/// trigger a recomposite even on input-only iterations (no client
+/// FrameReady) so the cursor doesn't lag behind the user's hand.
+#[derive(Clone, Copy, Debug)]
+struct PointerState {
+    x: i32,
+    y: i32,
+    visible: bool,
+    dirty: bool,
+}
+
+impl PointerState {
+    const fn new() -> Self {
+        Self { x: 0, y: 0, visible: false, dirty: false }
+    }
+
+    /// Apply a relative delta from a `PointerMove` event. Clamps to a
+    /// generous bound (4096×4096) so a runaway driver can't overflow
+    /// the i32 — actual scanout-bounds clipping happens at paint time.
+    fn apply_move(&mut self, dx: i32, dy: i32) {
+        self.x = self.x.saturating_add(dx).clamp(-4096, 4096);
+        self.y = self.y.saturating_add(dy).clamp(-4096, 4096);
+        self.visible = true;
+        self.dirty = true;
+    }
+
+    /// Reset to the absolute position carried in a `PointerButton`
+    /// event. The driver tracks the live pointer position and stamps
+    /// it on every button event; this re-baseline keeps us in sync if
+    /// we ever miss a `PointerMove` (e.g. driver dropped one before
+    /// userspace registered).
+    fn apply_absolute(&mut self, x: i32, y: i32) {
+        self.x = x.clamp(-4096, 4096);
+        self.y = y.clamp(-4096, 4096);
+        self.visible = true;
+        self.dirty = true;
     }
 }
 
@@ -251,7 +328,7 @@ pub extern "C" fn _start() -> ! {
 /// input. Single-window apps land at z=0 and are still "the front"
 /// trivially. Cross-client focus arbitration (last-clicked,
 /// explicit focus API) lands with the first multi-window WM service.
-fn pump_input_once(window_table: &mut WindowTable) -> bool {
+fn pump_input_once(window_table: &mut WindowTable, pointer: &mut PointerState) -> bool {
     let mut buf = [0u8; RECV_HEADER_BYTES + INPUT_EVENT_SIZE];
     let n = sys::try_recv_msg(COMPOSITOR_INPUT_ENDPOINT, &mut buf);
     if n <= 0 {
@@ -287,6 +364,19 @@ fn pump_input_once(window_table: &mut WindowTable) -> bool {
     match event.device_class {
         DeviceClass::Keyboard | DeviceClass::Pointer => {}
         _ => return true,
+    }
+
+    // C11 cursor tracking: update the compositor-side absolute pointer
+    // position before any other pointer-event handling. PointerMove
+    // carries deltas; PointerButton carries the driver's absolute
+    // position at the click moment (re-baseline trick).
+    if event.device_class == DeviceClass::Pointer {
+        let p = event.pointer();
+        match event.event_type {
+            EventType::PointerMove => pointer.apply_move(p.dx, p.dy),
+            EventType::PointerButton => pointer.apply_absolute(p.dx, p.dy),
+            _ => {}
+        }
     }
 
     // Raise-on-click: a `PointerButton` event carries the absolute
@@ -411,7 +501,11 @@ fn pump_dispatch_once<B: ScanoutBackend>(
 ///
 /// Only meaningful against a `Backend::Limine` backend today; headless
 /// has no scanout buffer to blit to.
-fn composite_and_present(backend: &mut Backend, window_table: &WindowTable) {
+fn composite_and_present(
+    backend: &mut Backend,
+    window_table: &WindowTable,
+    pointer: &PointerState,
+) {
     let scanout = match backend {
         Backend::Limine(b) => b.scanout,
         Backend::Headless(_) => return,
@@ -467,6 +561,14 @@ fn composite_and_present(backend: &mut Backend, window_table: &WindowTable) {
     // and lands here.
     if let Some(front) = window_table.front() {
         paint_focus_border(&scanout, front.x, front.y, front.width, front.height);
+    }
+
+    // C11: paint the cursor sprite last, on top of focus border + all
+    // window content. Hot-spot is the apex (top-left) at (px, py).
+    // Hidden until the first pointer event arrives — without pointer
+    // hardware the cursor never appears.
+    if pointer.visible {
+        paint_cursor(&scanout, pointer.x, pointer.y);
     }
 
     if backend.submit_frame(scanout.display_id, &[]).is_err() {
@@ -708,6 +810,67 @@ fn paint_focus_border(scanout: &ScanoutBuffer, x: i32, y: i32, w: u32, h: u32) {
     for py in (y + 1)..bottom {
         write_px(x, py);
         write_px(right, py);
+    }
+}
+
+/// ARCHITECTURAL: cursor sprite bounding box in pixels. v1 picks a
+/// 10×14 right-triangle pointer arrow with the apex at top-left
+/// (the hot-spot). Black outline along the left edge, the
+/// (top-left → bottom-right) diagonal, and the bottom edge; white
+/// fill in between. Procedurally drawn — no bitmap data — so the
+/// shape is just two arithmetic loops. Changing this is a visual-
+/// design decision (cursor theme), not a tuning bump.
+const CURSOR_WIDTH: i32 = 10;
+const CURSOR_HEIGHT: i32 = 14;
+
+/// ARCHITECTURAL: cursor body color (XRGB8888). White interior so
+/// the cursor stands out on dark surfaces; black outline (encoded
+/// directly in `paint_cursor`) keeps it visible on light surfaces.
+const CURSOR_FILL_COLOR: u32 = 0x00_FF_FF_FF;
+
+/// ARCHITECTURAL: cursor outline color (XRGB8888). Pure black for
+/// maximum contrast against the white interior + variable client
+/// surface backgrounds.
+const CURSOR_OUTLINE_COLOR: u32 = 0x00_00_00_00;
+
+/// Paint the cursor sprite at scanout-coordinate `(px, py)` (the
+/// hot-spot is the apex, top-left). Procedural triangle:
+/// - Apex at (0, 0) widening down-right to (CURSOR_WIDTH-1,
+///   CURSOR_HEIGHT-1).
+/// - Outline pixels at column 0, the diagonal column for each row,
+///   and the entire bottom row.
+/// - Interior pixels (between left edge and diagonal) painted white.
+///
+/// Clipped to scanout bounds — cursor that goes partly off-screen
+/// shows only the visible portion.
+#[allow(unsafe_code)]
+fn paint_cursor(scanout: &ScanoutBuffer, px: i32, py: i32) {
+    let dst_w = scanout.geometry.width as i32;
+    let dst_h = scanout.geometry.height as i32;
+    let dst_pitch_pixels = (scanout.geometry.pitch / 4) as usize;
+
+    let write_px = |x: i32, y: i32, color: u32| {
+        if x < 0 || y < 0 || x >= dst_w || y >= dst_h {
+            return;
+        }
+        // SAFETY: scanout.vaddr is the compositor's RW mapping. (x, y)
+        // bounds-checked above; offset within pitch × height.
+        unsafe {
+            let dst_base = scanout.vaddr as *mut u32;
+            let off = y as usize * dst_pitch_pixels + x as usize;
+            core::ptr::write_volatile(dst_base.add(off), color);
+        }
+    };
+
+    for r in 0..CURSOR_HEIGHT {
+        // Width of the cursor triangle at this row, growing linearly
+        // from 1 (apex) to CURSOR_WIDTH (base).
+        let row_width = ((r * (CURSOR_WIDTH - 1)) / (CURSOR_HEIGHT - 1)) + 1;
+        for c in 0..row_width {
+            let is_outline = c == 0 || c == row_width - 1 || r == CURSOR_HEIGHT - 1;
+            let color = if is_outline { CURSOR_OUTLINE_COLOR } else { CURSOR_FILL_COLOR };
+            write_px(px + c, py + r, color);
+        }
     }
 }
 
