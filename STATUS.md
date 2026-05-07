@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-05-04 (CLAIMS.md + dtb-proofs + multi-Principal vault + ADR-025/026/027)
+last_synced_to_code: 2026-05-06 (ADR-027 ClusterManager skeleton)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so
@@ -30,6 +30,7 @@ belongs in the linked ADR, not here.
 
 Chronological, newest first. ~3 week window — older items rotate out; git log has the full history.
 
+- **2026-05-06** — [ADR-027](docs/adr/027-service-clusters.md) `ClusterManager` skeleton at [src/ipc/cluster.rs](src/ipc/cluster.rs): pure bookkeeping + state machine (`Forming → Active → Revoking → Revoked`; member `Expected → Joined → Departed`), slot+generation table, 34 host tests covering create/join/auto-promote/depart/attach-channel/begin-revoke/complete-revoke/slot-reuse. Three SCAFFOLDING bounds (`MAX_CLUSTERS` / `MAX_CLUSTER_MEMBERS` / `MAX_CLUSTER_CHANNELS` = 32 each per ADR-027 § Architecture v1-endgame math) tagged + rowed in [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md). No syscalls, no scheduler hooks, no integration — cluster ABI reservation, lock-hierarchy renumber, handlers, and rendering-limb migration follow per ADR-027 § Migration Path steps 4–7.
 - **2026-05-04** — [verification/CLAIMS.md](verification/CLAIMS.md): the honest gap-map between "what runs" (this file) and "what's proven." 14 rows spanning all four Status values (Proven / Tested / Asserted / Aspirational) and all three Layers (1=behavior, 2=guarantee, 3=meaning). Strict schema requires `Bound:` and `Gap:` on every row; vacuous rows fail review. Layer-3 meaning-claims (Zero-trust, AI-watches-not-decides) are explicitly Aspirational by their nature and the doc says so. C-11 (IPC identity transcription invariant) and C-12 (ObjectStore ownership) carry the planned Kani→Verus pivot triggers.
 - **2026-05-04** — `verification/dtb-proofs/`: 5 Kani harnesses on the DTB parser at `src/boot/riscv.rs` (header validation, byte-extraction safety, wire-format contracts, bounded callbacks). Slice-shim refactor extracts pure `walk_dtb_slice(&[u8])` and `FdtHeader::read_slice(&[u8])` as the verifier entry points; the unsafe `walk_dtb(dtb_phys)` becomes a 4-line pointer-to-slice bridge. Real Kani finding fixed: `be_u32_at` / `be_u64_at` claimed "return 0 on overrun" but actually panicked with arithmetic overflow when the symbolic offset reached `usize::MAX - 8`; both helpers now use `checked_add`. ADR-013 Decision 2's "no panics" claim now has provable backing for the byte-extraction layer. End-to-end walker proof (P-DTB-6) deliberately deferred — its CBMC budget at the natural bound exceeds one CPU-hour; needs walker restructuring or the planned Kani→Verus pivot, not unwind-tuning.
 - **2026-05-03** — Multi-Principal vault Phase 1C: new userspace service extending key-store (endpoint 17) with kernel consultation at process spawn. Plurality lives in userspace; kernel keeps Principal singular and atomic. AI sandbox is per-Principal. Implements the design from the [identity.md](docs/identity.md) Phase 1C rewrite + ADR-026.
@@ -91,7 +92,7 @@ Chronological, newest first. ~3 week window — older items rotate out; git log 
 | Shell (`arcobj` CLI incl.) | Done | x/a/r | `user/shell/` | — |
 | Spawn / WaitTask syscalls | Done | x/a/r | `src/syscalls/dispatcher.rs` | — |
 | Wall-clock subsystem (`SetWallclock` / `GetWallclock` syscalls + `SetWallclock` cap) | Done (Phase 4d) | x/a/r | `src/time/wallclock.rs`, `src/syscalls/dispatcher.rs` (handle_set_wallclock / handle_get_wallclock) | [ADR-022](docs/adr/022-wall-clock-time.md) |
-| Service clusters | Designed (kernel-ABI cluster handle + lock placement + first target = rendering limb); no implementation yet | — | — | [ADR-027](docs/adr/027-service-clusters.md) |
+| Service clusters | `ClusterManager` skeleton landed (pure bookkeeping + state machine + 34 host tests); cluster syscalls + lock-hierarchy renumber + handlers + rendering-limb migration pending | — | `src/ipc/cluster.rs` | [ADR-027](docs/adr/027-service-clusters.md) |
 | PCI bus discovery | Done (x86_64 = port I/O mechanism 1; aarch64 + riscv64 = ECAM via `init_ecam`; riscv64 also synthesizes virtio-mmio via `register_virtio_mmio`) | x/a/r | `src/pci/` | — |
 | Device syscalls (MapMmio/AllocDma/DeviceInfo/PortIo/VirtioModernCaps) | Done | x/a/r | `src/syscalls/dispatcher.rs` | — |
 | Bootloader abstraction (BootInfo + `src/boot/`) | Done (Phase GUI-0) | x/a/r | `src/boot/` | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) |
