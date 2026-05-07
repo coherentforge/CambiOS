@@ -15,6 +15,10 @@ Every design decision in kernel code must keep future formal verification achiev
 
 BuddyAllocator (pure bookkeeping, host-testable) is the template; new kernel components follow the pattern.
 
+## Build with the End in Mind
+
+Architectural choices — bounds, test infrastructure, abstractions, decomposition, error types — aim at the v1-endgame workload, not throwaway scaffolding. The Formal Verification list above is one application; Convention 8's SCAFFOLDING rule is another. The general form: when facing a design choice, the question is *"what does v1 need from this?"*, not *"what's cheapest now?"*. When stuck between two compromised options, widen the horizon (time, hardware, workload) until the compromise dissolves.
+
 ## Project Vision
 
 CambiOS is a next-gen AI-integrated operating system built on these principles:
@@ -34,7 +38,6 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **Host:** macOS (Apple Silicon)
 - **Kernel targets:** `x86_64-unknown-none`, `aarch64-unknown-none`, and `riscv64gc-unknown-none-elf` (ELF, bare metal). RISC-V backend is in progress (Phase R-0 done) — see [ADR-013](docs/adr/013-riscv64-architecture-support.md) and [STATUS.md](STATUS.md) RISC-V port phases.
 - **Unit tests:** `cargo test --lib` (runs natively on macOS)
-- **Integration testing:** QEMU (installed via Homebrew)
 - **AArch64 boot media:** FAT disk image via `mtools` (ISO/cdrom doesn't work for AArch64 UEFI on QEMU)
 - **RISC-V boot:** OpenSBI (M-mode firmware, ships with QEMU as `-bios default`) hands a DTB pointer to a custom S-mode boot stub at `src/boot/riscv.rs`. No Limine on RISC-V.
 
@@ -81,10 +84,7 @@ Commit at topic boundaries within a session, not at session end. Bisectable hist
 
 ## Prompt-Shaping Changelog
 
-Open mechanism decisions awaiting a Revisit-when trigger. Codified rules and shipped tooling are out of scope here - their history is in `git log -- CLAUDE.md`. Newest first.
-
-- **2026-05-04** - `make check-status-freshness` shipped as advisory (warn-but-pass; `tools/check-status-freshness.py` + `.githooks/pre-commit` entry). Triggered by 12-day STATUS.md drift between 2026-04-22 (last sync) and 2026-05-04 (catch-up): 110 commits in the gap, several major architectural decisions (ADR-025/026/027, multi-Principal vault Phase 1C, ADR-022 wall-clock impl, two new proof crates) unrepresented in the index until a single large catch-up sync had to recover them. The Post-Change Review §8 checklist did not fire on most of those 110 commits, so this is the same-shape mechanism the working-tree-sweep ladder used: prose discipline failed silently, ship a lint with a noisy stderr that reads on every commit. Threshold N=7 days (a working week of accumulated landings is the catch-up cliff). **Revisit when:** the warn fires twice without a STATUS.md update following it (i.e. the noisy stderr did not change behavior). At that point swap exit 0 for exit 1 in `tools/check-status-freshness.py` and the lint becomes a hard gate. If the warn instead fires zero times for a month (because per-landing increments resumed), there is no need to escalate; the mechanism is doing its job at warn-level.
-- **2026-05-02** - Pre-push edit-window gate (`tools/check-edit-window.py`) fired a false positive on a legitimately-authored commit. Root cause: `CLAUDE_PREFLIGHT_SESSION` was not exported in this session, so `tools/log-claude-edit.py:90-92` silently no-op'd every Edit/Write - including the `Write` of `docs/adr/026-identity-transcription-at-the-kernel-ring.md`. The pre-push gate read prior sessions' jsonl logs from `.git/claude-edit-log/` and saw ADR-026 absent; gate enforced. Original promise was "warn-but-pass without an edit log," but the implementation enforces as long as *some* log file exists - even if no log exists for *this* session. The asymmetry: gate keys on directory-wide presence of any log, not on the current session's log presence. **Mechanism candidates:** (a) `tools/check-edit-window.py` checks `.git/claude-edit-log/${CLAUDE_PREFLIGHT_SESSION}.jsonl` exists before enforcing; missing → warn-but-pass per the original promise. (b) `tools/log-claude-edit.py` emits a one-line "session logging disabled (CLAUDE_PREFLIGHT_SESSION unset)" notice on first invocation so the silent no-op surfaces before push, not at push time. **Revisit when:** second false positive, or next pre-push gate touch.
+Open mechanism decisions awaiting Revisit-when triggers — see [docs/dev-notes/prompt-shaping-changelog.md](docs/dev-notes/prompt-shaping-changelog.md). Codified rules and shipped tooling are out of scope; their history lives in `git log -- CLAUDE.md` and `git log -- tools/`.
 
 ## Development Conventions
 
@@ -213,67 +213,7 @@ Observed symptom → likely root cause. The symptom rarely names the invariant i
 
 ### Adding a new syscall
 
-Seven places must change atomically. Canonical reference: `TryRecvMsg = 37` landing. Skipping any step produces a specific failure mode named below.
-
-**(1) Declare the variant** — [src/syscalls/mod.rs](src/syscalls/mod.rs), in the `SyscallNumber` enum.
-```rust
-/// SYS_TRY_RECV_MSG (37): non-blocking variant of RecvMsg. Returns 0
-/// immediately if no message is queued, instead of parking the task
-/// on `MessageWait(endpoint)`. …
-TryRecvMsg = 37,
-```
-*Skipping:* userspace hits `SyscallError::Enosys` because `from_u64` doesn't know the number.
-
-**(2) Classify identity requirement** — same file, `requires_identity()` match.
-```rust
-Self::Write | Self::Read | Self::RecvMsg | Self::TryRecvMsg |
-```
-*Skipping:* if the new syscall touches identity-bearing state and you forget this arm, unidentified processes can call it. The `identity_required_syscalls_are_gated` test below fails — that is the safety net. **Do not silence the test by adding the syscall to the `EXEMPT` set unless the syscall genuinely needs no identity** (check the small exempt list for precedent).
-
-**(3) Wire `from_u64`** — same file.
-```rust
-37 => Some(Self::TryRecvMsg),
-```
-*Skipping:* runtime dispatch returns `None`, the kernel returns `Enosys`, the syscall appears un-implemented.
-
-**(4) Update test coverage** — same file, `#[cfg(test)] mod tests`.
-```rust
-// Add to the `all` array in identity_required_syscalls_are_gated:
-SyscallNumber::TryRecvMsg,
-
-// Extend the range in all_syscall_numbers_covered:
-for i in 0..=37u64 { … }
-```
-*Skipping:* the new variant isn't exercised by `all_syscall_numbers_covered` (test passes vacuously) and isn't checked against the exempt set (test passes because the check iterates `all`, not the enum). Both tests are *cooperative* — they only catch omissions when you also maintain the arrays. This is by design; treat it as a prompt to think about coverage.
-
-**(5) Dispatch the call** — [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs), in `handle_syscall`'s dispatch match.
-```rust
-SyscallNumber::TryRecvMsg => Self::handle_try_recv_msg(args, &ctx),
-```
-*Skipping:* compile error (match non-exhaustive). This is the one step the compiler catches for free.
-
-**(6) Implement the handler** — same file.
-```rust
-fn handle_try_recv_msg(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-    let endpoint_id = args.arg1_u32();
-    let user_buf = args.arg2;
-    let buf_len = args.arg_usize(3);
-    // … capability check → IPC recv → page-walk to user buffer …
-}
-```
-*Skipping:* compile error at step (5). Paired with it.
-
-**(7) Expose the userspace wrapper** — [user/libsys/src/lib.rs](user/libsys/src/lib.rs). Add the `SYS_*` constant alongside the others, then the safe wrapper.
-```rust
-const SYS_TRY_RECV_MSG: u64 = 37;
-
-pub fn try_recv_msg(endpoint: u32, buf: &mut [u8]) -> i64 {
-    syscall_raw3(SYS_TRY_RECV_MSG, endpoint as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
-}
-```
-*Skipping:* userspace services can't call the syscall without raw `asm!`. The kernel side works; every consumer is broken until libsys catches up.
-
-**Verification:** `cargo test --lib` + `make check-all`. **Flow-specific stop-and-ask:** syscall in exempt set? (default: no). New capability-check kind? (unread-subsystem gate on `src/ipc/capability.rs`). New arch backend helper? (all three arches).
+Seven coordinated places must change atomically (variant declaration, identity gate, `from_u64` wire-up, test coverage, dispatcher arm, handler, libsys wrapper) — full walkthrough with each step's failure mode in [docs/dev-notes/syscall-workflow.md](docs/dev-notes/syscall-workflow.md). Canonical reference: `TryRecvMsg = 37`. **Flow-specific stop-and-ask:** syscall in exempt set? new capability-check kind? new arch backend helper?
 
 ## Quick Reference
 
@@ -431,7 +371,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) ([§ Divergence](docs/adr/002-three-layer-enforcement-pipeline.md#divergence): interceptor moved from `Box<dyn IpcInterceptor>` to `IpcInterceptorBackend` enum-dispatch shim — same precedent as ADR-003 for `OBJECT_STORE`) | `src/ipc/interceptor.rs` (trait + `IpcInterceptorBackend` enum), `src/ipc/mod.rs` (`IpcManager.interceptor` and `ShardedIpcManager.interceptor` field sites) |
 | **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
 | **Audit consumer capability / kernelvisor prep / `audit-tail` boot module** | [ADR-023](docs/adr/023-audit-consumer-capability.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (the bootstrap-only check ADR-023 supersedes) | `user/audit-tail/src/main.rs`, `src/syscalls/dispatcher.rs` (`handle_audit_attach`, `handle_get_process_principal`), `src/process.rs` (`RecentExitsRing`) |
-| **Identity / Principal / sender_principal** | [identity.md](docs/identity.md), [ADR-025](docs/adr/025-principal-as-aid.md) (Principal as 32-byte AID — supersedes the implementation contract from [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md)) | [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) (intent only) |
+| **Identity / Principal / sender_principal** | [identity.md](docs/identity.md), [ADR-025](docs/adr/025-principal-as-aid.md) (Principal as 32-byte AID — supersedes the implementation contract from [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md)), [ADR-026](docs/adr/026-identity-transcription-at-the-kernel-ring.md) (kernel transcribes identity events without interpreting them) | [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) (intent only) |
 | **ObjectStore / CambiObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
 | **Persistent ObjectStore / on-disk format / BlockDevice** | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) | `src/fs/block.rs`, `src/fs/disk.rs`; [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) for the `CambiObject` model the format serializes |
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
@@ -442,6 +382,16 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) (+ § Divergence: virtio-input-first, `COMPOSITOR_INPUT_ENDPOINT = 30`, first-live-window focus) | `user/libinput-proto/src/lib.rs` (96-byte wire + class payloads + modifier/button bitfields), `user/virtio-input/` (main.rs + transport.rs + virtqueue.rs + evdev.rs), `user/compositor/src/main.rs::pump_input_once` (→ focused window via `MsgTag::InputEvent = 0x4030`), `user/libgui/src/client.rs::poll_event`. Hub deferred until second consumer or signed-carrier hardware. `signature_block` reserved from day one so ADR-012 Input-5 lands without format revision. |
 | **Security review / threat model** | [SECURITY.md](docs/SECURITY.md), [threat-model.md](docs/threat-model.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) | All ADRs |
 | **"Is X done yet?" / current state** | [STATUS.md](STATUS.md) | — |
+
+**Orphan ADRs** — not bound to any subsystem row above; consult when their topic enters scope:
+- [ADR-015](docs/adr/015-storage-tiers-and-commitment-ladder.md) — storage durability tiers / commitment ladder. Read when working on persistence, replication, or durability guarantees.
+- [ADR-016](docs/adr/016-win-compat-api-ai-boundary.md) — Win32 API surface and the AI-translation boundary. Read when working on the Windows compatibility shim.
+- [ADR-017](docs/adr/017-user-directed-cloud-inference.md) — user-directed cloud inference policy. Read when adding cloud-AI routing or consent flows.
+- [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md) — process fault reaping and peer generation. Read when working on process lifecycle, fault recovery, or service restart.
+- [ADR-020](docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md) — typed user buffer slices at the syscall boundary. Read alongside the syscall walkthrough when a new syscall takes user pointers.
+- [ADR-021](docs/adr/021-typed-boot-error-propagation.md) — typed boot error propagation; enforced by `make check-boot-panics`. Read when working on `src/microkernel/main.rs` or any boot-init path.
+- [ADR-022](docs/adr/022-wall-clock-time.md) — wall-clock time syscalls (44/45) and the SetWallclock cap (reservation only; impl deferred behind audit refactor). Read when impl resumes.
+- [ADR-024](docs/adr/024-syscall-abi-crate.md) — `cambios-abi` crate as the syscall ABI definition surface. Read when modifying the syscall ABI or generating bindings.
 
 ## Design Documents
 
