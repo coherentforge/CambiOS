@@ -140,7 +140,7 @@ src/arch/x86_64/tlb.rs:27:TLB_SHOOTDOWN_VECTOR
 src/arch/x86_64/tlb.rs:32:MAX_INDIVIDUAL_PAGES
 src/audit/buffer.rs:36:STAGING_BUFFER_CAPACITY
 src/audit/drain.rs:56:AUDIT_RING_PAGES
-src/audit/mod.rs:642:FLAG_SAMPLED
+src/audit/mod.rs:728:FLAG_SAMPLED
 src/boot/initrd.rs:55:ARCHIVE_VERSION
 src/boot/initrd.rs:58:ARCHIVE_HEADER_SIZE
 src/boot/initrd.rs:61:ENTRY_HEADER_SIZE

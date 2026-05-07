@@ -438,7 +438,11 @@ impl SyscallDispatcher {
         }; // drop CLUSTER_MANAGER
 
         for id in &clusters_to_revoke {
-            Self::do_cluster_revoke(*id);
+            Self::do_cluster_revoke(
+                *id,
+                ctx.process_id,
+                crate::audit::CLUSTER_REVOKE_REASON_MEMBER_EXIT,
+            );
         }
 
         // Reclaim process resources: VMA regions, page table frames, heap.
@@ -3199,6 +3203,15 @@ impl SyscallDispatcher {
             .map_err(|_| SyscallError::InvalidArg)?
         }; // drop CLUSTER_MANAGER
 
+        crate::audit::emit(crate::audit::RawAuditEvent::cluster_created(
+            ctx.process_id,
+            cluster_id.as_raw(),
+            policy as u32,
+            count as u32,
+            crate::audit::now(),
+            0,
+        ));
+
         crate::println!(
             "  [ClusterCreate] pid={} policy={:?} members={} → id={:#x}",
             ctx.process_id.slot(),
@@ -3323,7 +3336,11 @@ impl SyscallDispatcher {
             return Err(SyscallError::PermissionDenied);
         }
 
-        Self::do_cluster_revoke(cluster_id);
+        Self::do_cluster_revoke(
+            cluster_id,
+            ctx.process_id,
+            crate::audit::CLUSTER_REVOKE_REASON_EXPLICIT,
+        );
 
         crate::println!(
             "  [ClusterRevoke] pid={} cluster={:#x}",
@@ -3419,7 +3436,11 @@ impl SyscallDispatcher {
     /// `CLUSTER_MANAGER` is *not* held across the per-channel fanout
     /// in step 2 — the snapshot pattern carries the data the loop
     /// needs.
-    fn do_cluster_revoke(cluster_id: crate::ipc::cluster::ClusterId) {
+    fn do_cluster_revoke(
+        cluster_id: crate::ipc::cluster::ClusterId,
+        initiator: crate::ipc::ProcessId,
+        reason: u32,
+    ) {
         // Step 1: begin_revoke + snapshot.
         let snapshot = {
             let mut guard = crate::CLUSTER_MANAGER.lock();
@@ -3485,6 +3506,29 @@ impl SyscallDispatcher {
                 let _ = mgr.complete_revoke(cluster_id);
             }
         }
+
+        // Step 5: audit. Counts come from the snapshot — both arrays
+        // are fixed-size with `Some` entries for live members /
+        // attached channels.
+        let member_count = snapshot
+            .joined_member_pids
+            .iter()
+            .filter(|p| p.is_some())
+            .count() as u32;
+        let channel_count = snapshot
+            .channels
+            .iter()
+            .filter(|c| c.is_some())
+            .count() as u32;
+        crate::audit::emit(crate::audit::RawAuditEvent::cluster_revoked(
+            initiator,
+            cluster_id.as_raw(),
+            member_count,
+            channel_count,
+            reason,
+            crate::audit::now(),
+            0,
+        ));
     }
 
     // ========================================================================

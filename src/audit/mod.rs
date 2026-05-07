@@ -68,7 +68,33 @@ pub enum AuditEventKind {
     /// changes — including initial focus and focus loss when the
     /// last live window exits.
     InputFocusChange = 16,
+    /// After `SYS_CLUSTER_CREATE` succeeds (ADR-027). Emitted by
+    /// `handle_cluster_create` once the cluster record is in
+    /// `Forming` state.
+    ClusterCreated = 17,
+    /// After cluster revoke completes (ADR-027 Decision 3).
+    /// Emitted by `do_cluster_revoke` from both the explicit
+    /// `SYS_CLUSTER_REVOKE` path and the exit-path auto-revoke
+    /// when a joined member's process exits and the cluster's
+    /// policy returns `RevokeCluster` for the departed role. The
+    /// `arg2` slot carries a `CLUSTER_REVOKE_REASON_*` discriminant
+    /// distinguishing the two paths.
+    ClusterRevoked = 18,
 }
+
+/// ARCHITECTURAL: `cluster_revoked` event's `arg2` discriminant for
+/// "caller of SYS_CLUSTER_REVOKE initiated the teardown" (cluster
+/// creator, `ClusterRevoke` cap holder, or bootstrap Principal).
+/// Wire-format value — changing it is a new audit-event variant,
+/// not a value bump.
+pub const CLUSTER_REVOKE_REASON_EXPLICIT: u32 = 0;
+
+/// ARCHITECTURAL: `cluster_revoked` event's `arg2` discriminant for
+/// "a joined member's process exited and the cluster's policy
+/// returned `RevokeCluster`." The `subject_pid` field carries the
+/// exiting member's pid. Wire-format value — same caveat as
+/// `CLUSTER_REVOKE_REASON_EXPLICIT`.
+pub const CLUSTER_REVOKE_REASON_MEMBER_EXIT: u32 = 1;
 
 /// ARCHITECTURAL: size of one serialized audit event in bytes.
 ///
@@ -636,6 +662,66 @@ impl RawAuditEvent {
             0,
         )
     }
+
+    /// `CLUSTER_CREATED`: after SYS_CLUSTER_CREATE succeeds (ADR-027).
+    ///
+    /// - `subject_pid`: the creator (cluster's `creator_pid`)
+    /// - `object_id`: cluster id (raw `ClusterId`)
+    /// - `arg0`: `ClusterPolicy` discriminant
+    /// - `arg1`: expected-member count from the manifest
+    pub fn cluster_created(
+        creator: ProcessId,
+        cluster_id: u64,
+        policy: u32,
+        member_count: u32,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ClusterCreated,
+            0,
+            sequence,
+            timestamp,
+            creator.as_raw(),
+            cluster_id,
+            policy as u64,
+            member_count as u64,
+            0,
+            0,
+        )
+    }
+
+    /// `CLUSTER_REVOKED`: after cluster teardown completes (ADR-027).
+    ///
+    /// - `subject_pid`: the initiator — caller of `SYS_CLUSTER_REVOKE`
+    ///   for explicit revoke, or the exiting member's pid for
+    ///   auto-revoke
+    /// - `object_id`: cluster id (raw `ClusterId`)
+    /// - `arg0`: joined-member count at revoke time
+    /// - `arg1`: cluster-attached channel count at revoke time
+    /// - `arg2`: reason — see `CLUSTER_REVOKE_REASON_*`
+    pub fn cluster_revoked(
+        initiator: ProcessId,
+        cluster_id: u64,
+        member_count: u32,
+        channel_count: u32,
+        reason: u32,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ClusterRevoked,
+            0,
+            sequence,
+            timestamp,
+            initiator.as_raw(),
+            cluster_id,
+            member_count as u64,
+            channel_count as u64,
+            reason as u64,
+            0,
+        )
+    }
 }
 
 /// Flag: this event was generated via sampling (not every occurrence).
@@ -963,5 +1049,64 @@ mod tests {
         let seq: u32 = 0xFFFF_FFFE;
         let e = RawAuditEvent::capability_denied(ProcessId::new(0, 0), EndpointId(0), 0, seq);
         assert_eq!(e.sequence(), seq);
+    }
+
+    #[test]
+    fn cluster_created_builder() {
+        let creator = ProcessId::new(8, 0);
+        let e = RawAuditEvent::cluster_created(creator, 0x0000_0000_0000_0007, 0, 2, 1100, 11);
+
+        assert_eq!(e.kind(), AuditEventKind::ClusterCreated as u8);
+        assert_eq!(e.subject_pid(), creator.as_raw());
+        assert_eq!(e.object_id(), 0x0000_0000_0000_0007);
+        assert_eq!(e.arg0(), 0); // RenderingLimb policy discriminant
+        assert_eq!(u64::from_le_bytes(e.data[40..48].try_into().unwrap()), 2); // member_count
+    }
+
+    #[test]
+    fn cluster_revoked_builder_explicit() {
+        let initiator = ProcessId::new(8, 0);
+        let e = RawAuditEvent::cluster_revoked(
+            initiator,
+            0x0000_0000_0000_0007,
+            2,
+            0,
+            CLUSTER_REVOKE_REASON_EXPLICIT,
+            1200,
+            12,
+        );
+
+        assert_eq!(e.kind(), AuditEventKind::ClusterRevoked as u8);
+        assert_eq!(e.subject_pid(), initiator.as_raw());
+        assert_eq!(e.object_id(), 0x0000_0000_0000_0007);
+        assert_eq!(e.arg0(), 2); // member_count
+        assert_eq!(u64::from_le_bytes(e.data[40..48].try_into().unwrap()), 0); // channel_count
+        assert_eq!(
+            u64::from_le_bytes(e.data[48..56].try_into().unwrap()),
+            CLUSTER_REVOKE_REASON_EXPLICIT as u64,
+        );
+    }
+
+    #[test]
+    fn cluster_revoked_builder_member_exit() {
+        // Auto-revoke from a member's process exit. The exiting member's
+        // pid lands in subject_pid; reason discriminates from explicit.
+        let exiting = ProcessId::new(11, 0);
+        let e = RawAuditEvent::cluster_revoked(
+            exiting,
+            0x0000_0000_0000_000B,
+            3,
+            1,
+            CLUSTER_REVOKE_REASON_MEMBER_EXIT,
+            5000,
+            42,
+        );
+
+        assert_eq!(e.kind(), AuditEventKind::ClusterRevoked as u8);
+        assert_eq!(e.subject_pid(), exiting.as_raw());
+        assert_eq!(
+            u64::from_le_bytes(e.data[48..56].try_into().unwrap()),
+            CLUSTER_REVOKE_REASON_MEMBER_EXIT as u64,
+        );
     }
 }

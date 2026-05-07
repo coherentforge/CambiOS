@@ -211,6 +211,8 @@ fn kind_name(kind: u8) -> &'static [u8] {
         14 => b"AnomalyHook",
         15 => b"AuditDropped",
         16 => b"InputFocusChange",
+        17 => b"ClusterCreated",
+        18 => b"ClusterRevoked",
         _ => b"Unknown",
     }
 }
