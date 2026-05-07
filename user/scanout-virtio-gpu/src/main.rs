@@ -368,6 +368,24 @@ fn handle_register_compositor(
     let principal = *msg.sender().as_bytes();
     let reply_endpoint = msg.from_endpoint();
 
+    // ADR-027 Phase 2 step 7: decode the rendering-limb cluster_id
+    // from the message and join the cluster as the Scanout role. If
+    // decode fails (malformed / pre-cluster-migration message) or
+    // the compositor signaled no-cluster (u64::MAX sentinel), skip
+    // the join and continue with the existing handshake — cluster
+    // membership is structural in v1 and not load-bearing for the
+    // pairwise cap-token-passing path.
+    if let Some(cluster_id) = cambios_libscanout::decode_register_compositor(msg.payload()) {
+        if cluster_id != u64::MAX {
+            let rc = sys::cluster_join(cluster_id, sys::CLUSTER_ROLE_SCANOUT);
+            if rc < 0 {
+                sys::print(b"[SCANOUT-VGPU] cluster_join failed; continuing\r\n");
+            } else {
+                sys::print(b"[SCANOUT-VGPU] joined rendering-limb cluster\r\n");
+            }
+        }
+    }
+
     // Compute scanout size. XRGB8888 = 4 bytes per pixel, pitch = width * 4.
     let pitch: u32 = setup.width * 4;
     let frame_bytes = (pitch as usize) * (setup.height as usize);

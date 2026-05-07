@@ -1542,6 +1542,14 @@ fn register_process_capabilities(process_id: ProcessId) {
     let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
     // ADR-005: boot modules may create shared-memory channels.
     let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
+    // ADR-027: boot modules may register service clusters. Same trust
+    // posture as CreateChannel — clusters are bookkeeping over channels
+    // (ADR-027 § Decision 1), so the cap-promotion granularity matches.
+    // Tighter name-based grant (compositor-only, or a future userspace
+    // init) can replace the universal grant when a misuse pattern
+    // surfaces; until then, the bootstrap-Principal fallback in
+    // handle_cluster_create is the safety net.
+    let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateCluster);
     // Bind bootstrap Principal to boot module processes (they're trusted)
     let bootstrap = BOOTSTRAP_PRINCIPAL.load();
     if !bootstrap.is_zero() {
@@ -1894,6 +1902,9 @@ fn capability_manager_init() {
         let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
         // ADR-005: grant CreateChannel to kernel processes.
         let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
+        // ADR-027: grant CreateCluster to kernel processes. Same
+        // trust posture as CreateChannel.
+        let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateCluster);
     }
 
     println!("  ✓ Capability manager initialized with {} processes", cap_mgr.process_count());

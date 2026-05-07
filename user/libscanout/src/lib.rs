@@ -250,15 +250,37 @@ pub const MAX_MESSAGE_SIZE: usize = 256;
 // input (truncation, unknown enum discriminant, mismatched tag).
 // ----------------------------------------------------------------------------
 
-/// `RegisterCompositor` — compositor → driver, no payload beyond the tag.
-/// Sender Principal (stamped by the kernel) is what authorizes the driver
-/// to bind to this compositor.
-pub fn encode_register_compositor(buf: &mut [u8]) -> Option<usize> {
-    if buf.len() < 4 {
+/// `RegisterCompositor` — compositor → driver. Carries the
+/// rendering-limb `cluster_id` (ADR-027 § Decision 1) so the driver
+/// can join the kernel-arbitrated cluster the compositor created at
+/// startup. Sender Principal (stamped by the kernel) is still the
+/// authorization for the driver-side bind; the cluster handle adds
+/// structural membership tracking on top.
+///
+/// Layout: `[tag:4][cluster_id:8]` = 12 bytes.
+pub fn encode_register_compositor(buf: &mut [u8], cluster_id: u64) -> Option<usize> {
+    if buf.len() < 12 {
         return None;
     }
     buf[..4].copy_from_slice(&MsgTag::RegisterCompositor.as_u32().to_le_bytes());
-    Some(4)
+    buf[4..12].copy_from_slice(&cluster_id.to_le_bytes());
+    Some(12)
+}
+
+/// Decode a `RegisterCompositor` message and extract the
+/// rendering-limb `cluster_id`.
+///
+/// Returns the `cluster_id` on success; `None` if the buffer is too
+/// short or the tag mismatches.
+pub fn decode_register_compositor(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let tag = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    if tag != MsgTag::RegisterCompositor.as_u32() {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[4..12].try_into().ok()?))
 }
 
 /// `WelcomeCompositor` — driver → compositor.

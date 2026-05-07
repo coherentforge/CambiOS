@@ -145,6 +145,23 @@ fn handle_register_compositor(state: &mut DriverState, msg: &VerifiedMessage) {
     state.compositor_endpoint = msg.from_endpoint();
     sys::print(b"[SCANOUT-LIMINE] compositor registered\r\n");
 
+    // ADR-027 Phase 2 step 7: join the rendering-limb cluster
+    // (decoded from the RegisterCompositor message). u64::MAX is the
+    // "no cluster" sentinel for backward compat / cluster_create
+    // failure — skip cluster_join and continue with the pairwise
+    // handshake. Cluster membership is structural in v1; cap
+    // promotion (cluster_policy::caps_for_role) is still a stub.
+    if let Some(cluster_id) = cambios_libscanout::decode_register_compositor(msg.payload()) {
+        if cluster_id != u64::MAX {
+            let rc = sys::cluster_join(cluster_id, sys::CLUSTER_ROLE_SCANOUT);
+            if rc < 0 {
+                sys::print(b"[SCANOUT-LIMINE] cluster_join failed; continuing\r\n");
+            } else {
+                sys::print(b"[SCANOUT-LIMINE] joined rendering-limb cluster\r\n");
+            }
+        }
+    }
+
     // Allocate the scanout channel sized for the framebuffer.
     let size_bytes = (state.fb.pitch as u64) * (state.fb.height as u64);
     let pages = size_bytes.div_ceil(4096) as u32;

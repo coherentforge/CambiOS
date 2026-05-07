@@ -1175,6 +1175,102 @@ pub const CHANNEL_STATE_REVOKED: u8 = 3;
 pub const CHANNEL_STATE_CLOSED: u8 = 4;
 
 // ============================================================================
+// Service clusters (ADR-027)
+// ============================================================================
+
+/// Cluster policy discriminants. Mirror `ClusterPolicy` in
+/// `src/ipc/cluster.rs`. v1 ships RenderingLimb only; StorageLimb and
+/// AudioLimb reserve future values.
+pub const CLUSTER_POLICY_RENDERING_LIMB: u32 = 0;
+
+/// Cluster role discriminants for the RenderingLimb policy. Mirror
+/// `ClusterRole` in `src/ipc/cluster.rs`. The `(policy, role)` pair
+/// is closed-world per ADR-027 § Decision 2 — adding a value here
+/// without a matching kernel arm is rejected at create-time with
+/// `RoleNotInPolicy`.
+pub const CLUSTER_ROLE_COMPOSITOR: u32 = 0;
+pub const CLUSTER_ROLE_SCANOUT: u32 = 1;
+pub const CLUSTER_ROLE_INPUT: u32 = 2;
+
+/// Cluster manifest entry — the wire-format struct
+/// `SYS_CLUSTER_CREATE` reads from a userspace pointer.
+///
+/// Layout: `[principal: [u8; 32], role: u32]` packed = 36 bytes.
+/// `#[repr(C)]` is sufficient — `u32` after `[u8; 32]` has no
+/// alignment padding because `[u8; N]` aligns to 1.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ClusterMember {
+    pub principal: [u8; 32],
+    pub role: u32,
+}
+
+const _: () = {
+    // Compile-time assertion: kernel expects exactly 36 bytes per
+    // member entry (see ASSUMPTIONS.md `MEMBER_BYTES`). If this
+    // fires, either the layout changed or the wire format split.
+    assert!(core::mem::size_of::<ClusterMember>() == 36);
+};
+
+/// Create a service cluster (ADR-027).
+///
+/// `policy`: cluster type (use `CLUSTER_POLICY_*` constants).
+/// `members`: manifest of expected `(Principal, role)` pairs.
+///
+/// Returns the `ClusterId` (raw `u64`, ≥ 0) on success, or a
+/// negative error. Requires `CapabilityKind::CreateCluster` OR
+/// bootstrap Principal.
+pub fn cluster_create(policy: u32, members: &[ClusterMember]) -> i64 {
+    syscall_raw3(
+        SyscallNumber::ClusterCreate as u64,
+        policy as u64,
+        members.as_ptr() as u64,
+        members.len() as u64,
+    )
+}
+
+/// Join a cluster as the named role.
+///
+/// The kernel verifies the caller's bound Principal matches the
+/// manifest's expected Principal for `role`. Returns 0 on success.
+pub fn cluster_join(cluster_id: u64, role: u32) -> i64 {
+    syscall_raw3(SyscallNumber::ClusterJoin as u64, cluster_id, role as u64, 0)
+}
+
+/// Tear down a cluster (ADR-027 Decision 3).
+///
+/// Caller must be the cluster's creator OR hold
+/// `CapabilityKind::ClusterRevoke` OR be the bootstrap Principal.
+/// Returns 0 on success.
+pub fn cluster_revoke(cluster_id: u64) -> i64 {
+    syscall_raw3(SyscallNumber::ClusterRevoke as u64, cluster_id, 0, 0)
+}
+
+/// Read cluster metadata into a 28-byte buffer.
+///
+/// Wire format (little-endian):
+/// `[state:u32][policy:u32][creator_pid_slot:u32]`
+/// `[joined_members:u32][active_channels:u32][created_at_tick:u64]`
+///
+/// Returns 0 on success.
+pub fn cluster_info(cluster_id: u64, out_buf: &mut [u8]) -> i64 {
+    syscall_raw3(
+        SyscallNumber::ClusterInfo as u64,
+        cluster_id,
+        out_buf.as_mut_ptr() as u64,
+        out_buf.len() as u64,
+    )
+}
+
+/// Cluster-state byte values returned at offset 0 of the
+/// `cluster_info` output buffer (4 bytes, but the discriminant fits
+/// in the low byte). Mirror `ClusterState` in `src/ipc/cluster.rs`.
+pub const CLUSTER_STATE_FORMING: u32 = 0;
+pub const CLUSTER_STATE_ACTIVE: u32 = 1;
+pub const CLUSTER_STATE_REVOKING: u32 = 2;
+pub const CLUSTER_STATE_REVOKED: u32 = 3;
+
+// ============================================================================
 // Audit infrastructure (Phase 3.3, ADR-007)
 // ============================================================================
 

@@ -2392,6 +2392,13 @@ impl SyscallDispatcher {
                     process_id,
                     CapabilityKind::CreateChannel,
                 );
+                // ADR-027: spawned processes may register service clusters
+                // (same trust posture as CreateChannel — clusters are
+                // bookkeeping over channels per ADR-027 § Decision 1).
+                let _ = cap_mgr.grant_system_capability(
+                    process_id,
+                    CapabilityKind::CreateCluster,
+                );
                 // T-7 Phase A (docs/threat-model.md): only the compositor
                 // gets EmitInputAudit. The cap was over-granted to every
                 // spawned module in the original landing (mirroring

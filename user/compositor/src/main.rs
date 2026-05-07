@@ -93,6 +93,31 @@ pub extern "C" fn _start() -> ! {
         sys::print(b"[COMPOSITOR] registered endpoint 30 (input)\r\n");
     }
 
+    // ADR-027 Phase 2 step 7: register the rendering limb as a
+    // service cluster *before* the scanout handshake, so the
+    // scanout-driver can call `cluster_join` when it receives our
+    // `RegisterCompositor` message. Compositor is the natural
+    // creator (see ADR-027 § Migration Path step 7 — compositor is
+    // the coordinator role that detects cluster-fatal conditions).
+    //
+    // Manifest: 2 members in v1 — compositor + scanout.
+    // virtio-input membership deferred — see register_rendering_limb_cluster.
+    // Revisit when: virtio-input gains an inbound endpoint to receive cluster_id.
+    // All three boot modules share the bootstrap Principal today
+    // (Frame-A vestige); the manifest names them by role for
+    // structural membership tracking.
+    let cluster_id = match register_rendering_limb_cluster() {
+        Some(id) => id,
+        None => {
+            sys::print(b"[COMPOSITOR] cluster_create failed; continuing without cluster\r\n");
+            // 0 is a valid ClusterId (idx=0 gen=0). Use u64::MAX as
+            // the "no cluster" sentinel in our wire field; the
+            // scanout-driver's decode skips cluster_join when it
+            // sees this value.
+            u64::MAX
+        }
+    };
+
     // Boot-gate ordering: do the scanout handshake BEFORE calling
     // `module_ready()`. Downstream modules include hello-window
     // (Scanout-3), which immediately sends `CreateWindow` to ep28 —
@@ -102,7 +127,7 @@ pub extern "C" fn _start() -> ! {
     // "expected WelcomeCompositor, got other tag". Serialising the
     // gate resolves the race; shell is a leaf that doesn't touch the
     // compositor so the ~1 handshake RTT delay is harmless.
-    let mut backend = match handshake_with_scanout_driver() {
+    let mut backend = match handshake_with_scanout_driver(cluster_id) {
         Some(b) => {
             sys::print(b"[COMPOSITOR] backend bound: scanout-limine\r\n");
             b
@@ -573,10 +598,74 @@ fn blit_surface_to_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
 /// Today only the `LimineFbBackend` is built — when virtio-gpu / Intel
 /// land, the `WelcomeCompositor` reply gains a backend-kind hint and
 /// this function fans out by kind.
-fn handshake_with_scanout_driver() -> Option<Backend> {
-    // 1. Send RegisterCompositor to the driver's endpoint.
+/// Build the rendering-limb manifest and register the cluster with
+/// the kernel (ADR-027 § Migration Path step 7).
+///
+/// Returns the `ClusterId` (raw u64) on success. `None` on failure
+/// — the caller falls back to a "no cluster" sentinel in the
+/// `RegisterCompositor` wire payload, and the scanout-driver skips
+/// `cluster_join` accordingly.
+///
+/// Manifest in v1: compositor + scanout, both bound to the bootstrap
+/// Principal (all three rendering modules share it today — Frame-A
+/// vestige).
+//
+// Deferred: include virtio-input as a third manifest member.
+// Why: virtio-input has no inbound endpoint to receive cluster_id.
+// Revisit when: virtio-input gains an inbound endpoint, OR a
+//      different mechanism for cluster_id handoff lands (env var /
+//      boot manifest field).
+fn register_rendering_limb_cluster() -> Option<u64> {
+    use sys::{ClusterMember, CLUSTER_POLICY_RENDERING_LIMB,
+              CLUSTER_ROLE_COMPOSITOR, CLUSTER_ROLE_SCANOUT};
+
+    let mut own_principal = [0u8; 32];
+    if sys::get_principal(&mut own_principal) < 0 {
+        sys::print(b"[COMPOSITOR] get_principal failed; cluster_create skipped\r\n");
+        return None;
+    }
+
+    // All RenderingLimb members share the bootstrap Principal in v1
+    // (per `src/microkernel/main.rs::register_process_capabilities`).
+    // The manifest names them distinctly by role for structural
+    // membership tracking; Principal-matching at join is currently
+    // vacuous as a trust boundary (kernel re-checks at SYS_CLUSTER_JOIN
+    // anyway, defense-in-depth).
+    let manifest = [
+        ClusterMember { principal: own_principal, role: CLUSTER_ROLE_COMPOSITOR },
+        ClusterMember { principal: own_principal, role: CLUSTER_ROLE_SCANOUT },
+    ];
+
+    let rc = sys::cluster_create(CLUSTER_POLICY_RENDERING_LIMB, &manifest);
+    if rc < 0 {
+        sys::print(b"[COMPOSITOR] cluster_create returned negative rc\r\n");
+        return None;
+    }
+    sys::print(b"[COMPOSITOR] rendering-limb cluster created\r\n");
+
+    // Compositor itself joins as the Compositor role. Scanout joins
+    // when it receives RegisterCompositor with the cluster_id below.
+    let cluster_id = rc as u64;
+    if sys::cluster_join(cluster_id, CLUSTER_ROLE_COMPOSITOR) < 0 {
+        sys::print(b"[COMPOSITOR] self cluster_join failed\r\n");
+        // Cluster exists but we couldn't join — return None so the
+        // wire payload signals "no cluster" and scanout doesn't try
+        // to join an asymmetric cluster either.
+        return None;
+    }
+    Some(cluster_id)
+}
+
+fn handshake_with_scanout_driver(cluster_id: u64) -> Option<Backend> {
+    // 1. Send RegisterCompositor (with cluster_id) to the driver's
+    //    endpoint. The driver decodes the cluster_id and calls
+    //    SYS_CLUSTER_JOIN itself — the cap-token-passing role of the
+    //    pairwise handshake is unchanged in v1 (cluster_policy::
+    //    caps_for_role is still a stub), so this is structural
+    //    membership wiring on top of the existing protocol, not a
+    //    replacement of it.
     let mut send_buf = [0u8; 16];
-    let n = encode_register_compositor(&mut send_buf)?;
+    let n = encode_register_compositor(&mut send_buf, cluster_id)?;
     let rc = sys::write(SCANOUT_DRIVER_ENDPOINT, &send_buf[..n]);
     if rc < 0 {
         sys::print(b"[COMPOSITOR] write to scanout-driver failed\r\n");

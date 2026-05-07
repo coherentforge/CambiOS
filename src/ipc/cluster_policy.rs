@@ -53,9 +53,10 @@ pub enum ClusterDepartureAction {
 /// entries match what userspace actually consumes.
 //
 // Deferred: populate the rendering-limb cap table.
-// Why: real cap shapes live in the existing pairwise handshakes (see doc above).
-// Revisit when: the rendering-limb migration commit lands, or any
-//      cluster-using userspace consumer needs promoted caps.
+// Why: substrate not built — needs SYS_CHANNEL_CREATE cluster_id arg.
+// Revisit when: SYS_CHANNEL_CREATE gains a cluster_id arg (so channels
+//      can be auto-attached at create time) AND the existing pairwise
+//      handshakes' cap tokens are due to be stripped.
 pub fn caps_for_role(
     _policy: ClusterPolicy,
     _role: ClusterRole,
