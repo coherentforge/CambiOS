@@ -305,8 +305,29 @@ fn cmd_play(t: &mut Terminal<GuiBackend>, args: &[u8]) {
 
     // Game's done — re-attach our window. If reopen fails the GUI is
     // dead and the terminal can't draw; clean exit beats a zombie.
-    if t.backend_mut().reopen().is_err() {
-        sys::print(b"[terminal-window] reopen failed after game exit\n");
+    // Print the specific ClientError variant so a future regression
+    // surfaces with which step failed (encode / write / recv_verified
+    // / decode_welcome / channel_attach / …) instead of a generic
+    // "reopen failed" — same operational-signal posture udp-stack's
+    // NTP failure prints take. The triggering bug for this surface
+    // (`decode_welcome` from stale InputEvents in the queue) is
+    // closed by libgui's reopen_layer drain loop; the variant naming
+    // stays for the next regression.
+    if let Err(e) = t.backend_mut().reopen() {
+        use cambios_libgui::ClientError;
+        let tag: &[u8] = match e {
+            ClientError::RegisterEndpointFailed(_) => b"register_endpoint",
+            ClientError::EncodeCreateWindow => b"encode_create_window",
+            ClientError::CreateWindowWriteFailed(_) => b"create_window_write",
+            ClientError::RecvVerifiedFailed => b"recv_verified",
+            ClientError::DecodeWelcome => b"decode_welcome",
+            ClientError::ChannelAttachFailed(_) => b"channel_attach",
+            ClientError::EncodeFrameReady => b"encode_frame_ready",
+            ClientError::FrameReadyWriteFailed(_) => b"frame_ready_write",
+        };
+        sys::print(b"[terminal-window] reopen failed after game exit: ");
+        sys::print(tag);
+        sys::print(b"\n");
         sys::exit(1);
     }
     t.backend_mut().invalidate_all();
