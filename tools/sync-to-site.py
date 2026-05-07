@@ -185,7 +185,10 @@ def main() -> int:
 
     verb = "would be applied" if args.check else "applied"
     print(f"\n{total} change(s) {verb}.")
-    return 1 if total else 0
+    # Exit 1 only in --check mode when drift exists (useful for CI / pre-commit).
+    # In write mode, applying changes is the goal — return 0 so `make sync-site`
+    # doesn't look failed.
+    return 1 if (args.check and total) else 0
 
 
 if __name__ == "__main__":
