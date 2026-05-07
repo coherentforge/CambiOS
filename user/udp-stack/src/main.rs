@@ -708,6 +708,15 @@ fn maybe_refresh_ntp(
 fn query_and_publish_ntp(cache: &mut ArpCache, our_mac: &[u8; 6]) -> bool {
     let ntp_req = build_ntp_request();
     if !udp_send(cache, our_mac, &NTP_SERVER_IP, NTP_CLIENT_PORT, NTP_PORT, &ntp_req) {
+        // Operational signal: NTP send failed (ARP unresolved /
+        // virtio-net IPC down). Logged because the silent-failure
+        // posture this path used to have made "wallclock just
+        // doesn't get set" indistinguishable from "everything is
+        // fine" — both shapes look identical to the user. The
+        // success path is mute by design; the failure paths
+        // (here + the timeout below) are the long-term diagnostic
+        // surface for "why is the prompt missing :HH:MM?".
+        sys::print(b"[UDP] NTP send failed\n");
         return false;
     }
 
@@ -731,6 +740,10 @@ fn query_and_publish_ntp(cache: &mut ArpCache, our_mac: &[u8; 6]) -> bool {
         }
         sys::yield_now();
     }
+    // Operational signal: NTP timed out (slirp routing / NIST
+    // unreachable / recv-path silently dropping). Same rationale as
+    // the send-failed print above.
+    sys::print(b"[UDP] NTP timeout (no response within 3s)\n");
     false
 }
 
