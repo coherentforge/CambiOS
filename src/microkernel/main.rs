@@ -1254,7 +1254,9 @@ fn init_kernel_object_tables() {
     use cambios_core::memory::frame_allocator::PAGE_SIZE;
     use cambios_core::memory::object_table;
     use cambios_core::process::ProcessTable;
-    use cambios_core::{CAPABILITY_MANAGER, CHANNEL_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE};
+    use cambios_core::{
+        CAPABILITY_MANAGER, CHANNEL_MANAGER, CLUSTER_MANAGER, FRAME_ALLOCATOR, PROCESS_TABLE,
+    };
 
     // Available memory figure: the *free* frame count at this point
     // in boot, times the page size. This is what's actually allocatable
@@ -1354,7 +1356,12 @@ fn init_kernel_object_tables() {
     *PROCESS_TABLE.lock() = Some(process_table);
     *CAPABILITY_MANAGER.lock() = Some(capability_manager);
 
-    // Initialize the channel manager (lock position 5).
+    // Initialize the cluster manager (lock position 5, ADR-027 § Architecture).
+    *CLUSTER_MANAGER.lock() = Some(Box::new(
+        cambios_core::ipc::cluster::ClusterManager::new(),
+    ));
+
+    // Initialize the channel manager (lock position 6, was 5 before ADR-027).
     *CHANNEL_MANAGER.lock() = Some(Box::new(
         cambios_core::ipc::channel::ChannelManager::new(),
     ));

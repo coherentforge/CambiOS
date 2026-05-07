@@ -579,8 +579,15 @@ pub static IPC_MANAGER: Spinlock<Option<Box<IpcManager>>> = Spinlock::new(None);
 pub static SHARDED_IPC: ipc::ShardedIpcManager = ipc::ShardedIpcManager::new();
 pub static CAPABILITY_MANAGER: Spinlock<Option<Box<CapabilityManager>>> = Spinlock::new(None);
 
-/// Channel manager — shared-memory channel table (lock position 5).
-/// Initialized at boot after CAPABILITY_MANAGER.
+/// Cluster manager — service-cluster bookkeeping (lock position 5,
+/// inserted between `CAPABILITY_MANAGER` and `CHANNEL_MANAGER` per
+/// [ADR-027 § Architecture](../docs/adr/027-service-clusters.md)).
+/// Initialized at boot after `CAPABILITY_MANAGER`.
+pub static CLUSTER_MANAGER: Spinlock<Option<Box<ipc::cluster::ClusterManager>>> = Spinlock::new(None);
+
+/// Channel manager — shared-memory channel table (lock position 6,
+/// was 5 before ADR-027 inserted CLUSTER_MANAGER at 5).
+/// Initialized at boot after CLUSTER_MANAGER.
 pub static CHANNEL_MANAGER: Spinlock<Option<Box<ipc::channel::ChannelManager>>> = Spinlock::new(None);
 
 pub static PROCESS_TABLE: Spinlock<Option<Box<ProcessTable>>> = Spinlock::new(None);

@@ -74,6 +74,21 @@ pub enum CapabilityKind {
     /// receive it. Without this capability the syscall returns
     /// `PermissionDenied`.
     SetWallclock,
+    /// Right to call `SYS_CLUSTER_CREATE` and register a service
+    /// cluster ([ADR-027](../../docs/adr/027-service-clusters.md)).
+    /// Granted to `init` at boot per ADR-027 § Migration Path step 6
+    /// (the boot manifest is the cluster creator). The bootstrap-
+    /// Principal-equivalent path also accepts cluster_create until
+    /// the policy service mediates the grant.
+    CreateCluster,
+    /// Right to call `SYS_CLUSTER_REVOKE` against a cluster the
+    /// holder is a member of ([ADR-027](../../docs/adr/027-service-clusters.md)
+    /// Decision 2). Promoted at member-join time per the cluster's
+    /// policy — typically only the coordinator role holds this (e.g.
+    /// the compositor in the rendering limb). The cluster's creator
+    /// can call `SYS_CLUSTER_REVOKE` without holding this cap; this
+    /// kind covers the non-creator authority path.
+    ClusterRevoke,
 }
 
 /// Errors from capability operations
@@ -163,6 +178,15 @@ pub struct ProcessCapabilities {
     /// Granted at boot only to `udp-stack` (day-1 NTP setter). Without this
     /// capability the syscall returns `PermissionDenied`.
     set_wallclock: bool,
+    /// System capability: can this process call `SYS_CLUSTER_CREATE`
+    /// ([ADR-027](../../docs/adr/027-service-clusters.md))? Granted to
+    /// `init` at boot per ADR-027 § Migration Path step 6.
+    create_cluster: bool,
+    /// System capability: can this process call `SYS_CLUSTER_REVOKE`
+    /// on a cluster it is a member of? Promoted at member-join per
+    /// the cluster's policy (typically only the coordinator role).
+    /// Cluster creators can revoke without this cap.
+    cluster_revoke: bool,
 }
 
 impl ProcessCapabilities {
@@ -181,6 +205,8 @@ impl ProcessCapabilities {
             emit_input_audit: false,
             audit_consumer: false,
             set_wallclock: false,
+            create_cluster: false,
+            cluster_revoke: false,
         }
     }
 
@@ -324,6 +350,8 @@ impl ProcessCapabilities {
             CapabilityKind::EmitInputAudit => self.emit_input_audit = true,
             CapabilityKind::AuditConsumer => self.audit_consumer = true,
             CapabilityKind::SetWallclock => self.set_wallclock = true,
+            CapabilityKind::CreateCluster => self.create_cluster = true,
+            CapabilityKind::ClusterRevoke => self.cluster_revoke = true,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -339,6 +367,8 @@ impl ProcessCapabilities {
             CapabilityKind::EmitInputAudit => self.emit_input_audit,
             CapabilityKind::AuditConsumer => self.audit_consumer,
             CapabilityKind::SetWallclock => self.set_wallclock,
+            CapabilityKind::CreateCluster => self.create_cluster,
+            CapabilityKind::ClusterRevoke => self.cluster_revoke,
             CapabilityKind::Endpoint => false,
         }
     }
@@ -354,6 +384,8 @@ impl ProcessCapabilities {
             CapabilityKind::EmitInputAudit => self.emit_input_audit = false,
             CapabilityKind::AuditConsumer => self.audit_consumer = false,
             CapabilityKind::SetWallclock => self.set_wallclock = false,
+            CapabilityKind::CreateCluster => self.create_cluster = false,
+            CapabilityKind::ClusterRevoke => self.cluster_revoke = false,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -820,6 +852,8 @@ impl CapabilityManager {
         caps.emit_input_audit = false;
         caps.audit_consumer = false;
         caps.set_wallclock = false;
+        caps.create_cluster = false;
+        caps.cluster_revoke = false;
 
         Ok(count)
     }

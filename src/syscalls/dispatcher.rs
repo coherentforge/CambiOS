@@ -261,20 +261,15 @@ impl SyscallDispatcher {
             // before the protocol is hooked up end-to-end.
             SyscallNumber::ChannelQuiesceAck => Err(SyscallError::Enosys),
 
-            // ADR-027 cluster handles: create / join / revoke / info.
-            // Slots reserved here; handlers + cap-promotion +
-            // cluster-policy module land in the cluster-syscall
-            // implementation commit (after the lock-hierarchy renumber
-            // and the ADR-027 Divergence appendix). Until then, calls
-            // return Enosys so userspace cannot accidentally consume
-            // the slots before the manager is wired up end-to-end.
-            // ClusterManager bookkeeping skeleton already lives at
-            // src/ipc/cluster.rs; these arms drive it once the
-            // handlers land.
-            SyscallNumber::ClusterCreate
-            | SyscallNumber::ClusterJoin
-            | SyscallNumber::ClusterRevoke
-            | SyscallNumber::ClusterInfo => Err(SyscallError::Enosys),
+            // ADR-027 cluster handles. Wire to ClusterManager
+            // (src/ipc/cluster.rs) + cluster_policy
+            // (src/ipc/cluster_policy.rs). Cap promotion is a no-op
+            // in v1 (cluster_policy::caps_for_role returns empty);
+            // the rendering-limb migration commit populates it.
+            SyscallNumber::ClusterCreate => Self::handle_cluster_create(args, &ctx),
+            SyscallNumber::ClusterJoin => Self::handle_cluster_join(args, &ctx),
+            SyscallNumber::ClusterRevoke => Self::handle_cluster_revoke(args, &ctx),
+            SyscallNumber::ClusterInfo => Self::handle_cluster_info(args, &ctx),
         }
     }
 
@@ -390,6 +385,62 @@ impl SyscallDispatcher {
             }
         };
 
+        // ADR-027: cluster-departure cleanup. For every cluster the
+        // exiting process was a joined member of, mark its member-state
+        // Departed and consult the policy (cluster_policy::on_member_depart)
+        // to decide whether the whole cluster must be torn down. For
+        // RenderingLimb v1 the policy is "any departure is fatal" — the
+        // surviving members lose their peer's mappings and need to bring
+        // the limb back up cleanly. Empty for processes that aren't in
+        // any cluster (the common case).
+        //
+        // Lock ordering: CLUSTER_MANAGER(5) released before
+        // do_cluster_revoke re-acquires it + downstream locks. Sits
+        // between channel cleanup (just above) and process-resource
+        // reclaim (just below) — same shape as channels.
+        let clusters_to_revoke: alloc::vec::Vec<crate::ipc::cluster::ClusterId> = {
+            use crate::ipc::cluster::MemberState;
+            use crate::ipc::cluster_policy::ClusterDepartureAction;
+
+            let mut guard = crate::CLUSTER_MANAGER.lock();
+            if let Some(mgr) = guard.as_mut() {
+                let cluster_ids = mgr.mark_departed_for_process(ctx.process_id);
+                let mut to_revoke = alloc::vec::Vec::new();
+                for id in cluster_ids {
+                    if let Ok(record) = mgr.get(id) {
+                        // Find the now-Departed member with our pid;
+                        // could be matched on multiple roles in
+                        // theory (v1 disallows; check all anyway).
+                        for member_slot in record.members.iter() {
+                            if let Some(member) = member_slot.as_ref() {
+                                if member.state == MemberState::Departed
+                                    && member.joined_pid == Some(ctx.process_id)
+                                {
+                                    if matches!(
+                                        crate::ipc::cluster_policy::on_member_depart(
+                                            record.policy,
+                                            member.role,
+                                        ),
+                                        ClusterDepartureAction::RevokeCluster
+                                    ) {
+                                        to_revoke.push(id);
+                                        break; // one revoke per cluster
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                to_revoke
+            } else {
+                alloc::vec::Vec::new()
+            }
+        }; // drop CLUSTER_MANAGER
+
+        for id in &clusters_to_revoke {
+            Self::do_cluster_revoke(*id);
+        }
+
         // Reclaim process resources: VMA regions, page table frames, heap.
         //
         // `destroy_process` calls `reclaim_user_vmas` (unmaps VMA-tracked
@@ -429,12 +480,13 @@ impl SyscallDispatcher {
         ));
 
         crate::println!(
-            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s), {} chan(s){})",
+            "  [Exit] pid={} task={} code={} (reclaimed {} cap(s), {} chan(s), {} cluster(s){})",
             ctx.process_id.slot(),
             ctx.task_id.0,
             exit_code,
             revoked_count,
             channels_revoked,
+            clusters_to_revoke.len(),
             if heap_reclaimed { ", heap+vma+pt" } else { "" }
         );
 
@@ -3021,6 +3073,410 @@ impl SyscallDispatcher {
         {
             let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
             let _ = fa_guard.free_contiguous(record.physical_base, record.num_pages as usize);
+        }
+    }
+
+    // ========================================================================
+    // Service clusters (ADR-027)
+    // ========================================================================
+
+    /// SYS_CLUSTER_CREATE (44): create a `Forming` cluster.
+    ///
+    /// Args:
+    ///   arg1 = policy (u32; [`ClusterPolicy::from_u32`])
+    ///   arg2 = members_user_ptr (u64; `*const ClusterMemberSpec`)
+    ///   arg3 = member_count (u32; `≤ MAX_CLUSTER_MEMBERS`)
+    ///
+    /// Wire layout per member: `{ principal: [u8; 32], role: u32 }`
+    /// = 36 bytes packed. Total user buffer = `36 × member_count`.
+    ///
+    /// Returns: `ClusterId` raw `u64` on success.
+    ///
+    /// Authority: `CapabilityKind::CreateCluster` OR bootstrap
+    /// Principal (the bootstrap path is the v1 fallback until the
+    /// boot manifest grants the cap to `init` — see ADR-027 §
+    /// Migration Path step 6).
+    ///
+    /// Lock ordering: `CAPABILITY_MANAGER(4)` → `CLUSTER_MANAGER(5)`.
+    fn handle_cluster_create(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::cluster::{
+            ClusterCreateParams, ClusterPolicy, ClusterRole, MAX_CLUSTER_MEMBERS,
+        };
+
+        let policy_raw = args.arg1_u32();
+        let members_ptr = args.arg2;
+        let count = args.arg_usize(3);
+
+        let policy = ClusterPolicy::from_u32(policy_raw).ok_or(SyscallError::InvalidArg)?;
+        if count == 0 || count > MAX_CLUSTER_MEMBERS {
+            return Err(SyscallError::InvalidArg);
+        }
+        if members_ptr == 0 || members_ptr >= USER_SPACE_END {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Authority: CreateCluster cap OR bootstrap Principal.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            let has_cap = cap_mgr
+                .has_system_capability(
+                    ctx.process_id,
+                    crate::ipc::capability::CapabilityKind::CreateCluster,
+                )
+                .unwrap_or(false);
+            if !has_cap {
+                let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+                let caller_principal = ctx
+                    .caller_principal
+                    .as_ref()
+                    .ok_or(SyscallError::PermissionDenied)?;
+                if *caller_principal != bootstrap {
+                    return Err(SyscallError::PermissionDenied);
+                }
+            }
+        } // drop CAPABILITY_MANAGER
+
+        // Read member array from user space (count-prefixed,
+        // 36 bytes per entry — see Wire layout above). Copy into a
+        // kernel-local buffer first to close TOCTOU on userspace
+        // mutating between bounds-check and decode.
+        /// ARCHITECTURAL: SYS_CLUSTER_CREATE per-member wire size.
+        /// `{ principal: [u8; 32], role: u32 }` packed = 36 bytes.
+        /// Changing this is a new syscall, not a size bump.
+        const MEMBER_BYTES: usize = 36;
+        let total_bytes = count * MEMBER_BYTES;
+        if total_bytes > MAX_USER_BUFFER {
+            return Err(SyscallError::InvalidArg);
+        }
+        let user_slice = UserReadSlice::validate(ctx, members_ptr, total_bytes)?;
+        let mut buf = [0u8; MEMBER_BYTES * MAX_CLUSTER_MEMBERS];
+        user_slice.read_into(&mut buf[..total_bytes])?;
+
+        // Decode into ClusterCreateParams::expected_members. The
+        // ClusterManager re-validates `(policy, role)` per
+        // kernel-no-trust discipline.
+        let mut expected_members: [Option<(crate::ipc::Principal, ClusterRole)>;
+            MAX_CLUSTER_MEMBERS] = [None; MAX_CLUSTER_MEMBERS];
+        for i in 0..count {
+            let off = i * MEMBER_BYTES;
+            let mut principal_bytes = [0u8; 32];
+            principal_bytes.copy_from_slice(&buf[off..off + 32]);
+            let role_raw = u32::from_le_bytes([
+                buf[off + 32],
+                buf[off + 33],
+                buf[off + 34],
+                buf[off + 35],
+            ]);
+            let role = ClusterRole::from_u32(role_raw).ok_or(SyscallError::InvalidArg)?;
+            expected_members[i] = Some((
+                crate::ipc::Principal::from_aid(principal_bytes),
+                role,
+            ));
+        }
+
+        let tick = crate::scheduler::Timer::get_ticks();
+
+        let cluster_id = {
+            let mut guard = crate::CLUSTER_MANAGER.lock();
+            let mgr = guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            mgr.create(ClusterCreateParams {
+                policy,
+                creator_pid: ctx.process_id,
+                created_at_tick: tick,
+                expected_members,
+            })
+            .map_err(|_| SyscallError::InvalidArg)?
+        }; // drop CLUSTER_MANAGER
+
+        crate::println!(
+            "  [ClusterCreate] pid={} policy={:?} members={} → id={:#x}",
+            ctx.process_id.slot(),
+            policy,
+            count,
+            cluster_id.as_raw(),
+        );
+        Ok(cluster_id.as_raw())
+    }
+
+    /// SYS_CLUSTER_JOIN (45): join a cluster as a named role.
+    ///
+    /// Args:
+    ///   arg1 = cluster_id (u64; `ClusterId::as_raw`)
+    ///   arg2 = role (u32; [`ClusterRole::from_u32`])
+    ///
+    /// Returns: 0 on success.
+    ///
+    /// Identity-required. Caller's bound Principal must match the
+    /// manifest's expected Principal for the named role; kernel
+    /// transitions the member `Expected` → `Joined` and (if last
+    /// expected member just joined) auto-promotes the cluster
+    /// `Forming` → `Active`.
+    ///
+    /// Lock ordering: `CLUSTER_MANAGER(5)` (state transition), released,
+    /// then `CAPABILITY_MANAGER(4)` (cap promotion). Promotion-table is
+    /// a no-op stub in v1; release-acquire respects 4 < 5 because the
+    /// 5 borrow is dropped before 4 is taken.
+    fn handle_cluster_join(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::cluster::{ClusterId, ClusterRole};
+
+        let cluster_id = ClusterId::from_raw(args.arg1);
+        let role_raw = args.arg2 as u32;
+        let role = ClusterRole::from_u32(role_raw).ok_or(SyscallError::InvalidArg)?;
+
+        let caller_principal = *ctx
+            .caller_principal
+            .as_ref()
+            .ok_or(SyscallError::PermissionDenied)?;
+
+        // Phase 1: cluster state transition under CLUSTER_MANAGER.
+        let policy = {
+            let mut guard = crate::CLUSTER_MANAGER.lock();
+            let mgr = guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            let record = mgr
+                .join(cluster_id, role, caller_principal, ctx.process_id)
+                .map_err(|e| match e {
+                    crate::ipc::cluster::ClusterError::PrincipalMismatch => {
+                        SyscallError::PermissionDenied
+                    }
+                    _ => SyscallError::InvalidArg,
+                })?;
+            record.policy
+        }; // drop CLUSTER_MANAGER
+
+        // Phase 2: cap promotion under CAPABILITY_MANAGER.
+        // V1 stub: caps_for_role returns empty. This loop runs zero
+        // iterations until cluster_policy.rs is populated by the
+        // rendering-limb migration commit.
+        let caps_to_grant = crate::ipc::cluster_policy::caps_for_role(policy, role);
+        if !caps_to_grant.is_empty() {
+            let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            for &(endpoint, rights) in caps_to_grant {
+                let _ = cap_mgr.grant_capability(ctx.process_id, endpoint, rights);
+            }
+        }
+
+        crate::println!(
+            "  [ClusterJoin] pid={} cluster={:#x} role={:?}",
+            ctx.process_id.slot(),
+            cluster_id.as_raw(),
+            role,
+        );
+        Ok(0)
+    }
+
+    /// SYS_CLUSTER_REVOKE (46): tear down a cluster.
+    ///
+    /// Args:
+    ///   arg1 = cluster_id (u64)
+    ///
+    /// Returns: 0 on success.
+    ///
+    /// Authority: cluster's creator OR `CapabilityKind::ClusterRevoke`
+    /// OR bootstrap Principal.
+    ///
+    /// Lock-acquisition: see [`Dispatcher::do_cluster_revoke`].
+    fn handle_cluster_revoke(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::cluster::ClusterId;
+        let cluster_id = ClusterId::from_raw(args.arg1);
+
+        // Read creator_pid out under CLUSTER_MANAGER, release.
+        let creator_pid = {
+            let guard = crate::CLUSTER_MANAGER.lock();
+            let mgr = guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            mgr.get(cluster_id)
+                .map_err(|_| SyscallError::InvalidArg)?
+                .creator_pid
+        };
+
+        let caller_principal = *ctx
+            .caller_principal
+            .as_ref()
+            .ok_or(SyscallError::PermissionDenied)?;
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        let is_creator = ctx.process_id == creator_pid;
+        let is_bootstrap = caller_principal == bootstrap;
+        let has_cap = if !is_creator && !is_bootstrap {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            cap_mgr
+                .has_system_capability(
+                    ctx.process_id,
+                    crate::ipc::capability::CapabilityKind::ClusterRevoke,
+                )
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !is_creator && !is_bootstrap && !has_cap {
+            return Err(SyscallError::PermissionDenied);
+        }
+
+        Self::do_cluster_revoke(cluster_id);
+
+        crate::println!(
+            "  [ClusterRevoke] pid={} cluster={:#x}",
+            ctx.process_id.slot(),
+            cluster_id.as_raw(),
+        );
+        Ok(0)
+    }
+
+    /// SYS_CLUSTER_INFO (47): read cluster metadata.
+    ///
+    /// Args:
+    ///   arg1 = cluster_id (u64)
+    ///   arg2 = out_buf (u64; user-space pointer)
+    ///   arg3 = buf_len (u32; must be ≥ `CLUSTER_INFO_BYTES`)
+    ///
+    /// Wire layout (28 bytes, little-endian):
+    /// `[state:u32][policy:u32][creator_pid_slot:u32]`
+    /// `[joined_members:u32][active_channels:u32][created_at_tick:u64]`
+    ///
+    /// Returns: 0 on success.
+    ///
+    /// Lock ordering: `CLUSTER_MANAGER(5)` only.
+    fn handle_cluster_info(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use crate::ipc::cluster::{ClusterId, MemberState};
+
+        /// ARCHITECTURAL: SYS_CLUSTER_INFO descriptor size.
+        /// `[state:u32][policy:u32][creator_pid_slot:u32]`
+        /// `[joined_members:u32][active_channels:u32][created_at_tick:u64]`
+        /// = 28 bytes. Changing this is a new syscall, not a size bump.
+        const CLUSTER_INFO_BYTES: usize = 28;
+
+        let cluster_id = ClusterId::from_raw(args.arg1);
+        let out_buf = args.arg2;
+        let buf_len = args.arg_usize(3);
+
+        if buf_len < CLUSTER_INFO_BYTES || out_buf == 0 || out_buf >= USER_SPACE_END {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        let mut info = [0u8; CLUSTER_INFO_BYTES];
+        {
+            let guard = crate::CLUSTER_MANAGER.lock();
+            let mgr = guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            let record = mgr.get(cluster_id).map_err(|_| SyscallError::InvalidArg)?;
+
+            let joined_count = record
+                .members
+                .iter()
+                .filter(|m| m.as_ref().is_some_and(|m| m.state == MemberState::Joined))
+                .count() as u32;
+            let active_channels = record.channels.iter().filter(|c| c.is_some()).count() as u32;
+
+            info[0..4].copy_from_slice(&(record.state as u32).to_le_bytes());
+            info[4..8].copy_from_slice(&(record.policy as u32).to_le_bytes());
+            info[8..12].copy_from_slice(&record.creator_pid.slot().to_le_bytes());
+            info[12..16].copy_from_slice(&joined_count.to_le_bytes());
+            info[16..20].copy_from_slice(&active_channels.to_le_bytes());
+            info[20..28].copy_from_slice(&record.created_at_tick.to_le_bytes());
+        } // drop CLUSTER_MANAGER
+
+        let info_slice = UserWriteSlice::validate(ctx, out_buf, CLUSTER_INFO_BYTES)?;
+        info_slice.write_from(&info)?;
+        Ok(0)
+    }
+
+    /// Drive a cluster's teardown — used by SYS_CLUSTER_REVOKE and by
+    /// handle_exit's cluster-departure auto-revoke path. **Skips
+    /// authority checks** — caller is responsible.
+    ///
+    /// Per ADR-027 Decision 3 + Divergence 2 (path A — advisory
+    /// quiesce, leaning on tombstone-on-revoke from ADR-007 Divergence
+    /// 7 for RO peer mappings):
+    ///
+    /// 1. **`begin_revoke`** under `CLUSTER_MANAGER(5)`: transition
+    ///    `Active`|`Forming` → `Revoking`, snapshot member pids +
+    ///    channel ids, release.
+    /// 2. **Per-channel teardown** under `CHANNEL_MANAGER(6)` →
+    ///    `PROCESS_TABLE(7)` → `FRAME_ALLOCATOR(8)`: drives each
+    ///    channel through the existing revoke + unmap-or-tombstone
+    ///    path.
+    /// 3. **Cap revoke** under `CAPABILITY_MANAGER(4)`: for each
+    ///    joined member, remove caps `caps_for_role` returned at
+    ///    join. V1 stub returns empty, so this is a no-op until C7.
+    ///    The 5-released-then-4-taken acquisition order respects
+    ///    4 < 5 because step 1 already released `CLUSTER_MANAGER`.
+    /// 4. **`complete_revoke`** under `CLUSTER_MANAGER(5)`: `Revoking`
+    ///    → `Revoked`, free slot, bump generation.
+    ///
+    /// `CLUSTER_MANAGER` is *not* held across the per-channel fanout
+    /// in step 2 — the snapshot pattern carries the data the loop
+    /// needs.
+    fn do_cluster_revoke(cluster_id: crate::ipc::cluster::ClusterId) {
+        // Step 1: begin_revoke + snapshot.
+        let snapshot = {
+            let mut guard = crate::CLUSTER_MANAGER.lock();
+            match guard.as_mut() {
+                Some(mgr) => match mgr.begin_revoke(cluster_id) {
+                    Ok(snap) => snap,
+                    Err(_) => return, // already Revoking/Revoked or stale id
+                },
+                None => return,
+            }
+        };
+
+        // Step 2: per-channel teardown.
+        for ch_slot in snapshot.channels.iter() {
+            if let Some(channel_id) = ch_slot {
+                let record = {
+                    let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+                    match chan_guard.as_mut() {
+                        Some(chan_mgr) => chan_mgr.revoke(*channel_id).ok(),
+                        None => None,
+                    }
+                };
+                if let Some(record) = record {
+                    Self::teardown_channel_mappings(&record);
+                }
+            }
+        }
+
+        // Step 3: cap revoke per joined member. V1 stub = no-op loop.
+        // We re-look-up the cluster to find each member's role (the
+        // snapshot only carries pids; role lives in
+        // ClusterRecord.members[i] at the same index). The cluster is
+        // in `Revoking` state so the lookup succeeds.
+        for (i, pid_slot) in snapshot.joined_member_pids.iter().enumerate() {
+            if let Some(pid) = pid_slot {
+                let role = {
+                    let guard = crate::CLUSTER_MANAGER.lock();
+                    guard.as_ref().and_then(|mgr| {
+                        mgr.get(cluster_id)
+                            .ok()
+                            .and_then(|rec| rec.members[i].as_ref().map(|m| m.role))
+                    })
+                };
+                if let Some(role) = role {
+                    let caps =
+                        crate::ipc::cluster_policy::caps_for_role(snapshot.policy, role);
+                    if !caps.is_empty() {
+                        let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+                        if let Some(cap_mgr) = cap_guard.as_mut() {
+                            for &(endpoint, _rights) in caps {
+                                let _ = cap_mgr.revoke_capability(*pid, endpoint);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 4: complete_revoke.
+        {
+            let mut guard = crate::CLUSTER_MANAGER.lock();
+            if let Some(mgr) = guard.as_mut() {
+                let _ = mgr.complete_revoke(cluster_id);
+            }
         }
     }
 

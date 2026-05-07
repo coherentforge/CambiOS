@@ -10,6 +10,7 @@
 pub mod capability;
 pub mod channel;
 pub mod cluster;
+pub mod cluster_policy;
 pub mod interceptor;
 
 extern crate alloc;
