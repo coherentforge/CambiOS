@@ -15,9 +15,10 @@
 //! don't hide protocol primitives.
 
 use cambios_libgui_proto::{
-    decode_input_event, decode_welcome_client, encode_create_window, encode_destroy_window,
-    encode_drag_window_by, encode_frame_ready, InputEvent, MsgTag, Rect, WelcomeClientMsg,
-    COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
+    decode_input_event, decode_welcome_client, decode_window_resized, encode_create_window,
+    encode_destroy_window, encode_drag_window_by, encode_frame_ready, encode_request_resize,
+    InputEvent, MsgTag, Rect, WelcomeClientMsg, WindowResizedMsg, COMPOSITOR_ENDPOINT,
+    MAX_MESSAGE_SIZE,
 };
 use cambios_libinput_proto::{button, EventType};
 use cambios_libsys as sys;
@@ -54,6 +55,12 @@ pub enum ClientError {
     /// `sys::write(COMPOSITOR_ENDPOINT, …)` returned an error code
     /// from a later FrameReady.
     FrameReadyWriteFailed(i64),
+    /// RequestResize encode failed (output buffer too small — should
+    /// never happen with the built-in 16-byte send buffer).
+    EncodeRequestResize,
+    /// `sys::write(COMPOSITOR_ENDPOINT, …)` returned an error code
+    /// from a RequestResize send.
+    RequestResizeWriteFailed(i64),
 }
 
 /// A live connection to the compositor for one window. Holds the
@@ -87,6 +94,13 @@ pub struct Client {
     /// deltas are forwarded as `DragWindowBy` instead of as
     /// `InputEvent`.
     drag_active: bool,
+    /// Set by [`Client::poll_event`] when it consumes a
+    /// `WindowResized` notification: the channel has been re-attached
+    /// and `width / height / pitch` reflect the new geometry. The
+    /// stored tuple is `(new_w, new_h)`. Apps poll
+    /// [`Client::take_resize_pending`] to learn the resize landed and
+    /// repaint at the new size; consuming the value clears it.
+    resize_pending: Option<(u32, u32)>,
 }
 
 impl Client {
@@ -177,6 +191,7 @@ impl Client {
             alpha_blend,
             drag_region: None,
             drag_active: false,
+            resize_pending: None,
         })
     }
 
@@ -294,6 +309,7 @@ impl Client {
             alpha_blend,
             drag_region: None,
             drag_active: false,
+            resize_pending: None,
         })
     }
 
@@ -354,6 +370,17 @@ impl Client {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Returns and clears the most recent resize notification consumed
+    /// by [`Client::poll_event`]. The tuple is `(new_w, new_h)` — the
+    /// dimensions are also live on [`Client::width`] / [`Client::height`]
+    /// after the notification is processed; the explicit "pending"
+    /// signal exists so apps can detect "size just changed, repaint
+    /// from scratch" without diffing against a remembered size each
+    /// frame. Returns `None` if no resize landed since the last call.
+    pub fn take_resize_pending(&mut self) -> Option<(u32, u32)> {
+        self.resize_pending.take()
     }
 
     /// Borrow the surface mutably for a drawing pass. The returned
@@ -451,6 +478,12 @@ impl Client {
         let tag = MsgTag::from_u32(u32::from_le_bytes(tag_bytes))?;
         let event = match tag {
             MsgTag::InputEvent => decode_input_event(payload)?,
+            MsgTag::WindowResized => {
+                if let Some(msg) = decode_window_resized(payload) {
+                    self.apply_resize_notification(&msg);
+                }
+                return None;
+            }
             // WindowClosed / ErrorResponse arrive on the same endpoint;
             // v0 silently drops them. Future: surface via a separate
             // `poll_notification()` or a combined `poll_message()`.
@@ -532,5 +565,48 @@ impl Client {
             return Err(ClientError::FrameReadyWriteFailed(rc));
         }
         Ok(())
+    }
+
+    /// Ask the compositor to reallocate this window's surface at
+    /// `(new_w, new_h)`. Best-effort fire-and-send; the compositor's
+    /// response arrives later as a `WindowResized` notification on this
+    /// endpoint and is consumed transparently by [`Client::poll_event`].
+    /// The app discovers the resize landed via
+    /// [`Client::take_resize_pending`] and should repaint at the new
+    /// size — surface contents are not preserved across the reallocation.
+    pub fn request_resize(&self, new_w: u32, new_h: u32) -> Result<(), ClientError> {
+        let mut buf = [0u8; 16];
+        let n = encode_request_resize(&mut buf, self.window_id, new_w, new_h)
+            .ok_or(ClientError::EncodeRequestResize)?;
+        let rc = sys::write(COMPOSITOR_ENDPOINT, &buf[..n]);
+        if rc < 0 {
+            return Err(ClientError::RequestResizeWriteFailed(rc));
+        }
+        Ok(())
+    }
+
+    /// Apply a compositor `WindowResized` notification: detach the old
+    /// channel mapping, attach the new one, update geometry fields,
+    /// and stash the new dimensions for [`Client::take_resize_pending`]
+    /// to surface to the app. Failures from `channel_close` are
+    /// non-fatal (the old vaddr is unmapped at process exit anyway);
+    /// a failure from `channel_attach` leaves the surface mapping in
+    /// an inconsistent state but is reported via `resize_pending` so
+    /// the app at least learns the resize landed and can detect the
+    /// inconsistency by checking [`Client::width`] against its own
+    /// expectations on the next frame. v0 does not surface the
+    /// attach error directly — adding that is a one-line API change
+    /// when the first real failure mode appears.
+    fn apply_resize_notification(&mut self, msg: &WindowResizedMsg) {
+        let _ = sys::channel_close(self.channel_id);
+        let rc = sys::channel_attach(msg.new_channel_id);
+        if rc >= 0 {
+            self.surface_vaddr = rc as u64;
+        }
+        self.channel_id = msg.new_channel_id;
+        self.width = msg.new_w;
+        self.height = msg.new_h;
+        self.pitch = msg.new_pitch;
+        self.resize_pending = Some((msg.new_w, msg.new_h));
     }
 }

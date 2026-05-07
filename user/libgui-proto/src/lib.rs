@@ -203,6 +203,13 @@ pub enum MsgTag {
     /// PointerButton + PointerMove events when the user drags inside a
     /// drag region returned by `decorate()`.
     DragWindowBy = 0x3030,
+    /// Tier 2 resizable windows: client requests its surface be
+    /// reallocated at `(new_w, new_h)`. Compositor quiesces the old
+    /// surface channel, allocates a new one sized for the new
+    /// dimensions, and replies with [`MsgTag::WindowResized`]. The
+    /// compositor MAY also originate a resize on its own (edge-grab
+    /// drag) — both paths converge on the same `WindowResized` reply.
+    RequestResize = 0x3031,
 
     // Compositor → client (0x40xx)
     WelcomeClient = 0x4001,
@@ -212,6 +219,14 @@ pub enum MsgTag {
     /// Payload is the 96-byte [`InputEvent`] wire format defined by
     /// `cambios-libinput-proto` (ADR-012).
     InputEvent = 0x4030,
+    /// Tier 2 resizable windows: notification that a previous
+    /// `RequestResize` (or compositor-driven edge-grab) has produced a
+    /// fresh surface channel. Client closes its current channel,
+    /// attaches `new_channel_id`, and updates `width / height / pitch`.
+    /// The old channel is torn down by the compositor's quiesce
+    /// machinery — clients must not assume the old mapping survives
+    /// past handling this message.
+    WindowResized = 0x4040,
 }
 
 impl MsgTag {
@@ -221,10 +236,12 @@ impl MsgTag {
             0x3010 => Some(Self::FrameReady),
             0x3020 => Some(Self::DestroyWindow),
             0x3030 => Some(Self::DragWindowBy),
+            0x3031 => Some(Self::RequestResize),
             0x4001 => Some(Self::WelcomeClient),
             0x4010 => Some(Self::WindowClosed),
             0x4020 => Some(Self::ErrorResponse),
             0x4030 => Some(Self::InputEvent),
+            0x4040 => Some(Self::WindowResized),
             _ => None,
         }
     }
@@ -587,6 +604,97 @@ pub fn decode_drag_window_by(buf: &[u8]) -> Option<(u32, i32, i32)> {
     Some((window_id, dx, dy))
 }
 
+/// `RequestResize` — client → compositor, request the compositor to
+/// reallocate this window's surface at `(new_w, new_h)`. Layout:
+/// `[tag:4][window_id:4][new_w:4][new_h:4]` = 16 bytes.
+///
+/// Compositor responds with [`encode_window_resized`] carrying the new
+/// channel id (or [`encode_error_response`] with `InvalidDimensions` if
+/// the request is out of range). Surface contents are not preserved
+/// across the resize — the client must repaint after attaching.
+pub fn encode_request_resize(
+    buf: &mut [u8],
+    window_id: u32,
+    new_w: u32,
+    new_h: u32,
+) -> Option<usize> {
+    if buf.len() < 16 {
+        return None;
+    }
+    buf[..4].copy_from_slice(&MsgTag::RequestResize.as_u32().to_le_bytes());
+    buf[4..8].copy_from_slice(&window_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&new_w.to_le_bytes());
+    buf[12..16].copy_from_slice(&new_h.to_le_bytes());
+    Some(16)
+}
+
+pub fn decode_request_resize(buf: &[u8]) -> Option<(u32, u32, u32)> {
+    if buf.len() < 16
+        || u32::from_le_bytes(buf[0..4].try_into().ok()?) != MsgTag::RequestResize.as_u32()
+    {
+        return None;
+    }
+    let window_id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let new_w = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    let new_h = u32::from_le_bytes(buf[12..16].try_into().ok()?);
+    Some((window_id, new_w, new_h))
+}
+
+/// Decoded form of [`encode_window_resized`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowResizedMsg {
+    pub window_id: u32,
+    pub new_w: u32,
+    pub new_h: u32,
+    pub new_pitch: u32,
+    pub new_channel_id: u64,
+}
+
+/// `WindowResized` — compositor → client. Notification that the
+/// window's surface has been reallocated and the client must close its
+/// current channel and attach `new_channel_id`. Layout:
+/// `[tag:4][window_id:4][new_w:4][new_h:4][new_pitch:4][new_channel_id:8]`
+/// = 28 bytes.
+pub fn encode_window_resized(
+    buf: &mut [u8],
+    window_id: u32,
+    new_w: u32,
+    new_h: u32,
+    new_pitch: u32,
+    new_channel_id: u64,
+) -> Option<usize> {
+    if buf.len() < 28 {
+        return None;
+    }
+    buf[..4].copy_from_slice(&MsgTag::WindowResized.as_u32().to_le_bytes());
+    buf[4..8].copy_from_slice(&window_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&new_w.to_le_bytes());
+    buf[12..16].copy_from_slice(&new_h.to_le_bytes());
+    buf[16..20].copy_from_slice(&new_pitch.to_le_bytes());
+    buf[20..28].copy_from_slice(&new_channel_id.to_le_bytes());
+    Some(28)
+}
+
+pub fn decode_window_resized(buf: &[u8]) -> Option<WindowResizedMsg> {
+    if buf.len() < 28
+        || u32::from_le_bytes(buf[0..4].try_into().ok()?) != MsgTag::WindowResized.as_u32()
+    {
+        return None;
+    }
+    let window_id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let new_w = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    let new_h = u32::from_le_bytes(buf[12..16].try_into().ok()?);
+    let new_pitch = u32::from_le_bytes(buf[16..20].try_into().ok()?);
+    let new_channel_id = u64::from_le_bytes(buf[20..28].try_into().ok()?);
+    Some(WindowResizedMsg {
+        window_id,
+        new_w,
+        new_h,
+        new_pitch,
+        new_channel_id,
+    })
+}
+
 // ============================================================================
 // Tests — protocol round-trips
 // ============================================================================
@@ -712,7 +820,13 @@ mod tests {
     #[test]
     fn msg_tag_direction_bytes_are_distinct() {
         // High nibble 0x3 = client → compositor, 0x4 = compositor → client
-        for tag in [MsgTag::CreateWindow, MsgTag::FrameReady, MsgTag::DestroyWindow] {
+        for tag in [
+            MsgTag::CreateWindow,
+            MsgTag::FrameReady,
+            MsgTag::DestroyWindow,
+            MsgTag::DragWindowBy,
+            MsgTag::RequestResize,
+        ] {
             assert_eq!(tag.as_u32() >> 12, 3, "client→compositor tag {:?} wrong direction", tag);
         }
         for tag in [
@@ -720,9 +834,72 @@ mod tests {
             MsgTag::WindowClosed,
             MsgTag::ErrorResponse,
             MsgTag::InputEvent,
+            MsgTag::WindowResized,
         ] {
             assert_eq!(tag.as_u32() >> 12, 4, "compositor→client tag {:?} wrong direction", tag);
         }
+    }
+
+    #[test]
+    fn request_resize_roundtrip() {
+        let mut buf = [0u8; 16];
+        let n = encode_request_resize(&mut buf, /* window_id */ 7, /* new_w */ 1024, /* new_h */ 768).unwrap();
+        assert_eq!(n, 16);
+        let (window_id, new_w, new_h) = decode_request_resize(&buf[..n]).unwrap();
+        assert_eq!(window_id, 7);
+        assert_eq!(new_w, 1024);
+        assert_eq!(new_h, 768);
+    }
+
+    #[test]
+    fn request_resize_rejects_wrong_tag() {
+        let mut buf = [0u8; 16];
+        // Encode a DragWindowBy tag instead.
+        buf[..4].copy_from_slice(&MsgTag::DragWindowBy.as_u32().to_le_bytes());
+        assert!(decode_request_resize(&buf).is_none());
+    }
+
+    #[test]
+    fn request_resize_rejects_truncated() {
+        let mut buf = [0u8; 16];
+        let _ = encode_request_resize(&mut buf, 1, 100, 100).unwrap();
+        assert!(decode_request_resize(&buf[..15]).is_none());
+    }
+
+    #[test]
+    fn window_resized_roundtrip() {
+        let mut buf = [0u8; 32];
+        let n = encode_window_resized(
+            &mut buf,
+            /* window_id */ 3,
+            /* new_w */ 800,
+            /* new_h */ 600,
+            /* new_pitch */ 3200,
+            /* new_channel_id */ 0xCAFEBABE_DEADBEEF,
+        )
+        .unwrap();
+        assert_eq!(n, 28);
+        let m = decode_window_resized(&buf[..n]).unwrap();
+        assert_eq!(m.window_id, 3);
+        assert_eq!(m.new_w, 800);
+        assert_eq!(m.new_h, 600);
+        assert_eq!(m.new_pitch, 3200);
+        assert_eq!(m.new_channel_id, 0xCAFEBABE_DEADBEEF);
+    }
+
+    #[test]
+    fn window_resized_rejects_wrong_tag() {
+        let mut buf = [0u8; 32];
+        // Encode an InputEvent tag instead — same direction (0x40xx).
+        buf[..4].copy_from_slice(&MsgTag::InputEvent.as_u32().to_le_bytes());
+        assert!(decode_window_resized(&buf).is_none());
+    }
+
+    #[test]
+    fn window_resized_rejects_truncated() {
+        let mut buf = [0u8; 32];
+        let _ = encode_window_resized(&mut buf, 1, 100, 100, 400, 0).unwrap();
+        assert!(decode_window_resized(&buf[..27]).is_none());
     }
 
     #[test]
