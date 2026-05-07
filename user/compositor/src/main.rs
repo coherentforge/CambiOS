@@ -47,7 +47,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use cambios_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT, MAX_WINDOWS};
-use cambios_libinput_proto::{decode_event, DeviceClass};
+use cambios_libinput_proto::{decode_event, DeviceClass, EventType};
 use cambios_libsys as sys;
 use cambios_libscanout::{
     decode_display_connected, encode_register_compositor, MsgTag,
@@ -232,7 +232,7 @@ pub extern "C" fn _start() -> ! {
         // to the focused window; a single scheduler tick may carry
         // multiple key/pointer events, so drain in a tight inner loop
         // rather than one-per-yield.
-        while pump_input_once(&window_table) {}
+        while pump_input_once(&mut window_table) {}
         sys::yield_now();
     }
 }
@@ -251,7 +251,7 @@ pub extern "C" fn _start() -> ! {
 /// input. Single-window apps land at z=0 and are still "the front"
 /// trivially. Cross-client focus arbitration (last-clicked,
 /// explicit focus API) lands with the first multi-window WM service.
-fn pump_input_once(window_table: &WindowTable) -> bool {
+fn pump_input_once(window_table: &mut WindowTable) -> bool {
     let mut buf = [0u8; RECV_HEADER_BYTES + INPUT_EVENT_SIZE];
     let n = sys::try_recv_msg(COMPOSITOR_INPUT_ENDPOINT, &mut buf);
     if n <= 0 {
@@ -289,12 +289,41 @@ fn pump_input_once(window_table: &WindowTable) -> bool {
         _ => return true,
     }
 
-    // Find the focused window's reply endpoint — the front-most
-    // (highest z_order) live window.
-    let target = match window_table.front() {
-        Some(w) => w.client_endpoint,
+    // Raise-on-click: a `PointerButton` event carries the absolute
+    // pointer position in `dx`/`dy` (per
+    // [user/libinput-proto/src/lib.rs](user/libinput-proto/src/lib.rs#L240)).
+    // Hit-test against window rects from front-most to back-most;
+    // bump the front_seq of the first match. No-op if the click
+    // lands outside every window.
+    if event.event_type == EventType::PointerButton {
+        let p = event.pointer();
+        if let Some(window_id) = window_table.hit_test(p.dx, p.dy) {
+            window_table.raise(window_id);
+        }
+    }
+
+    // Find the focused window's reply endpoint and screen-space
+    // origin — the front-most (highest front_seq) live window.
+    // After a raise-on-click above, the just-clicked window is the
+    // new front and its window-local coordinates are what we
+    // forward.
+    let (target, origin_x, origin_y) = match window_table.front() {
+        Some(w) => (w.client_endpoint, w.x, w.y),
         None => return true, // no window to route to; drop event
     };
+
+    // Translate absolute pointer coords to window-local before
+    // forwarding. Keyboard and PointerMove events carry
+    // window-irrelevant data (keycode / deltas), so we only adjust
+    // PointerButton's absolute position.
+    let mut event = event;
+    if event.event_type == EventType::PointerButton {
+        let mut p = event.pointer();
+        p.dx -= origin_x;
+        p.dy -= origin_y;
+        event.payload[0..4].copy_from_slice(&p.dx.to_le_bytes());
+        event.payload[4..8].copy_from_slice(&p.dy.to_le_bytes());
+    }
 
     // Forward as a tagged libgui-proto InputEvent message.
     let mut send_buf = [0u8; 4 + INPUT_EVENT_SIZE];
@@ -388,10 +417,10 @@ fn composite_and_present(backend: &mut Backend, window_table: &WindowTable) {
         Backend::Headless(_) => return,
     };
 
-    // Snapshot every live window into a fixed-size array, then sort by
-    // z_order ascending so we composite back-to-front. Insertion sort
-    // is fine — MAX_WINDOWS is bounded and small (32 today), and the
-    // common case is 1–2 windows.
+    // Snapshot every live window into a fixed-size array, then sort
+    // by `front_seq` ascending so we composite back-to-front.
+    // Insertion sort is fine — MAX_WINDOWS is bounded and small (32
+    // today), and the common case is 1–2 windows.
     let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
     let mut count = 0usize;
     for w in window_table.iter() {
@@ -403,8 +432,8 @@ fn composite_and_present(backend: &mut Backend, window_table: &WindowTable) {
     for i in 1..count {
         let mut j = i;
         while j > 0 {
-            let lo = sorted[j - 1].unwrap().z_order;
-            let hi = sorted[j].unwrap().z_order;
+            let lo = sorted[j - 1].unwrap().front_seq;
+            let hi = sorted[j].unwrap().front_seq;
             if hi < lo {
                 sorted.swap(j, j - 1);
                 j -= 1;
@@ -426,6 +455,18 @@ fn composite_and_present(backend: &mut Backend, window_table: &WindowTable) {
         } else {
             blend_surface_onto_scanout(&view, &scanout);
         }
+    }
+
+    // Server-drawn 1px focus border around the front-most window.
+    // Non-spoofable identity signal — clients cannot paint outside
+    // their own surface, so this rectangle is always the compositor's
+    // statement of "this is the focused window." The decoration plan
+    // (~/.claude/plans/how-heavy-a-lift-expressive-wand.md) pins
+    // client-side decorations + 1px server focus border + Principal-
+    // badge HUD; the border is the smallest piece of that triplet
+    // and lands here.
+    if let Some(front) = window_table.front() {
+        paint_focus_border(&scanout, front.x, front.y, front.width, front.height);
     }
 
     if backend.submit_frame(scanout.display_id, &[]).is_err() {
@@ -489,40 +530,53 @@ fn composite_blank_and_present(backend: &mut Backend) {
 /// where most cells are blank space → fully-transparent BG).
 #[allow(unsafe_code)]
 fn blend_surface_onto_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
-    let sw = view.width as usize;
-    let sh = view.height as usize;
+    let dst_w = scanout.geometry.width as i32;
+    let dst_h = scanout.geometry.height as i32;
     let src_pitch_pixels = (view.pitch / 4) as usize;
-
-    let dst_w = scanout.geometry.width as usize;
-    let dst_h = scanout.geometry.height as usize;
     let dst_pitch_pixels = (scanout.geometry.pitch / 4) as usize;
 
-    let copy_w = sw.min(dst_w);
-    let copy_h = sh.min(dst_h);
+    // Compute the (src_x, src_y) → (dst_x, dst_y) intersection.
+    // A negative window position clips off the left/top of the
+    // source; off-the-right/bottom clips the trailing edge.
+    let win_w = view.width as i32;
+    let win_h = view.height as i32;
+    let src_x0 = if view.x < 0 { -view.x } else { 0 };
+    let src_y0 = if view.y < 0 { -view.y } else { 0 };
+    let dst_x0 = view.x.max(0);
+    let dst_y0 = view.y.max(0);
+    let copy_w = (win_w - src_x0).min(dst_w - dst_x0).max(0) as usize;
+    let copy_h = (win_h - src_y0).min(dst_h - dst_y0).max(0) as usize;
+    if copy_w == 0 || copy_h == 0 {
+        return; // wholly off-screen
+    }
+    let src_x0 = src_x0 as usize;
+    let src_y0 = src_y0 as usize;
+    let dst_x0 = dst_x0 as usize;
+    let dst_y0 = dst_y0 as usize;
 
     // SAFETY: same as `blit_surface_to_scanout` — both mappings are
     // owned by this process, the loop bounds are clamped to the
-    // smaller of the two dimensions, and write_volatile prevents
-    // re-ordering of shared-memory accesses. The arithmetic on each
-    // pixel is u32-internal: u8 channels widened to u32, multiplied,
-    // shifted; can't overflow.
+    // intersection of source rect and scanout rect, and
+    // write_volatile prevents re-ordering of shared-memory accesses.
+    // Per-pixel arithmetic is u32-internal: u8 channels widened to
+    // u32, multiplied, shifted; can't overflow.
     unsafe {
         let src_base = view.surface_vaddr as *const u32;
         let dst_base = scanout.vaddr as *mut u32;
-        for y in 0..copy_h {
-            let src_row = src_base.add(y * src_pitch_pixels);
-            let dst_row = dst_base.add(y * dst_pitch_pixels);
-            for x in 0..copy_w {
-                let src = core::ptr::read_volatile(src_row.add(x));
+        for row in 0..copy_h {
+            let src_row = src_base.add((src_y0 + row) * src_pitch_pixels);
+            let dst_row = dst_base.add((dst_y0 + row) * dst_pitch_pixels);
+            for col in 0..copy_w {
+                let src = core::ptr::read_volatile(src_row.add(src_x0 + col));
                 let alpha = (src >> 24) & 0xFF;
                 if alpha == 0 {
                     continue;
                 }
                 if alpha == 0xFF {
-                    core::ptr::write_volatile(dst_row.add(x), src & 0x00_FF_FF_FF);
+                    core::ptr::write_volatile(dst_row.add(dst_x0 + col), src & 0x00_FF_FF_FF);
                     continue;
                 }
-                let dst = core::ptr::read_volatile(dst_row.add(x));
+                let dst = core::ptr::read_volatile(dst_row.add(dst_x0 + col));
                 let inv = 255 - alpha;
                 let sr = (src >> 16) & 0xFF;
                 let sg = (src >> 8) & 0xFF;
@@ -534,7 +588,7 @@ fn blend_surface_onto_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
                 let og = (sg * alpha + dg * inv) >> 8;
                 let ob = (sb * alpha + db * inv) >> 8;
                 let out = (or << 16) | (og << 8) | ob;
-                core::ptr::write_volatile(dst_row.add(x), out);
+                core::ptr::write_volatile(dst_row.add(dst_x0 + col), out);
             }
         }
     }
@@ -547,16 +601,30 @@ fn blend_surface_onto_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
 /// for the back-most window (always) and for opaque higher layers
 /// (`alpha_blend=false`).
 fn blit_surface_to_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
-    let sw = view.width as usize;
-    let sh = view.height as usize;
+    let dst_w = scanout.geometry.width as i32;
+    let dst_h = scanout.geometry.height as i32;
     let src_pitch_pixels = (view.pitch / 4) as usize;
-
-    let dst_w = scanout.geometry.width as usize;
-    let dst_h = scanout.geometry.height as usize;
     let dst_pitch_pixels = (scanout.geometry.pitch / 4) as usize;
 
-    let copy_w = sw.min(dst_w);
-    let copy_h = sh.min(dst_h);
+    // Compute the source/destination rect intersection. Negative
+    // window position clips the leading edge of the source rect;
+    // positions past the scanout's right/bottom clip the trailing
+    // edge. Wholly-off-screen windows return early without painting.
+    let win_w = view.width as i32;
+    let win_h = view.height as i32;
+    let src_x0 = if view.x < 0 { -view.x } else { 0 };
+    let src_y0 = if view.y < 0 { -view.y } else { 0 };
+    let dst_x0 = view.x.max(0);
+    let dst_y0 = view.y.max(0);
+    let copy_w = (win_w - src_x0).min(dst_w - dst_x0).max(0) as usize;
+    let copy_h = (win_h - src_y0).min(dst_h - dst_y0).max(0) as usize;
+    if copy_w == 0 || copy_h == 0 {
+        return;
+    }
+    let src_x0 = src_x0 as usize;
+    let src_y0 = src_y0 as usize;
+    let dst_x0 = dst_x0 as usize;
+    let dst_y0 = dst_y0 as usize;
 
     // SAFETY:
     // - `view.surface_vaddr` was obtained from `channel_create`
@@ -565,25 +633,81 @@ fn blit_surface_to_scanout(view: &WindowView, scanout: &ScanoutBuffer) {
     // - `scanout.vaddr` was obtained from `channel_attach` on the
     //   scanout channel (compositor peer, maps RW). Valid for
     //   `pitch × height` bytes.
-    // - Bounded loops: `copy_h ≤ dst_h ≤ scanout height`,
-    //   `copy_w ≤ dst_w ≤ scanout width`, and src strides are the
-    //   client's declared pitch/height — the compositor trusted the
-    //   declared geometry when allocating the channel, and the kernel
-    //   enforced the channel size bound.
+    // - Bounded loops: `copy_h ≤ dst_h - dst_y0`,
+    //   `copy_w ≤ dst_w - dst_x0`, and src strides are the client's
+    //   declared pitch/height — the compositor trusted the declared
+    //   geometry when allocating the channel, and the kernel enforced
+    //   the channel size bound.
     // - `write_volatile` is used because the source and destination
     //   are shared memory; the compiler must not re-order or elide.
     #[allow(unsafe_code)]
     unsafe {
         let src_base = view.surface_vaddr as *const u32;
         let dst_base = scanout.vaddr as *mut u32;
-        for y in 0..copy_h {
-            let src_row = src_base.add(y * src_pitch_pixels);
-            let dst_row = dst_base.add(y * dst_pitch_pixels);
-            for x in 0..copy_w {
-                let pixel = core::ptr::read_volatile(src_row.add(x));
-                core::ptr::write_volatile(dst_row.add(x), pixel);
+        for row in 0..copy_h {
+            let src_row = src_base.add((src_y0 + row) * src_pitch_pixels);
+            let dst_row = dst_base.add((dst_y0 + row) * dst_pitch_pixels);
+            for col in 0..copy_w {
+                let pixel = core::ptr::read_volatile(src_row.add(src_x0 + col));
+                core::ptr::write_volatile(dst_row.add(dst_x0 + col), pixel);
             }
         }
+    }
+}
+
+/// Paint a 1-pixel rectangle around the window at `(x, y, w, h)` in
+/// scanout coordinates. ARCHITECTURAL color value chosen for
+/// visibility on both light and dark client surfaces; the decoration
+/// model pinned in
+/// `~/.claude/plans/how-heavy-a-lift-expressive-wand.md` calls for
+/// this server-painted indicator as the non-spoofable focus signal.
+///
+/// Clips to scanout bounds — partial off-screen windows show only the
+/// visible portion of the border. No-op if the rect is wholly
+/// off-screen.
+#[allow(unsafe_code)]
+fn paint_focus_border(scanout: &ScanoutBuffer, x: i32, y: i32, w: u32, h: u32) {
+    /// ARCHITECTURAL: focus-border pixel color (XRGB8888).
+    /// Compositor-chosen, non-spoofable. Picked for contrast against
+    /// the existing client surface palette (terminal-window's
+    /// charcoal background, white-on-black text). Changing this is a
+    /// visual-design decision, not a tuning bump.
+    const FOCUS_COLOR: u32 = 0x00_FF_C8_3A; // amber
+    let dst_w = scanout.geometry.width as i32;
+    let dst_h = scanout.geometry.height as i32;
+    let dst_pitch_pixels = (scanout.geometry.pitch / 4) as usize;
+    let right = x + w as i32 - 1;
+    let bottom = y + h as i32 - 1;
+    if right < 0 || bottom < 0 || x >= dst_w || y >= dst_h {
+        return;
+    }
+
+    // Helper closure to write one pixel if in-bounds. write_volatile
+    // for the same shared-memory reason as the blit functions.
+    let write_px = |px: i32, py: i32| {
+        if px < 0 || py < 0 || px >= dst_w || py >= dst_h {
+            return;
+        }
+        // SAFETY: scanout.vaddr is the compositor's RW mapping of
+        // the scanout channel. (px, py) is bounds-checked above; the
+        // index `py * dst_pitch_pixels + px` is within the channel's
+        // pitch × height bytes.
+        unsafe {
+            let dst_base = scanout.vaddr as *mut u32;
+            let off = py as usize * dst_pitch_pixels + px as usize;
+            core::ptr::write_volatile(dst_base.add(off), FOCUS_COLOR);
+        }
+    };
+
+    // Top + bottom edges.
+    for px in x..=right {
+        write_px(px, y);
+        write_px(px, bottom);
+    }
+    // Left + right edges (excluding corners already drawn above).
+    for py in (y + 1)..bottom {
+        write_px(x, py);
+        write_px(right, py);
     }
 }
 

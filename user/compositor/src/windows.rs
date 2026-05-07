@@ -58,6 +58,14 @@ pub struct Window {
     /// Endpoint the compositor replies to (REPLY_ENDPOINT of the
     /// client at CreateWindow time).
     pub client_endpoint: u32,
+    /// Top-left position in scanout coordinates. New windows land at
+    /// `(0, 0)` today; movement comes via the `DragWindowBy` wire
+    /// message (libgui-proto). Signed because partial off-screen
+    /// placement is allowed (negative values clip the window's left/
+    /// top edges in the blit; positive values past the scanout edge
+    /// clip the right/bottom).
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
     pub pitch: u32,
@@ -73,6 +81,18 @@ pub struct Window {
     /// only (e.g., terminal-window's watermark + terminal pair); a
     /// future window-manager service handles cross-client stacking.
     pub z_order: u8,
+    /// Cross-client front ordering. Assigned monotonically at
+    /// `CreateWindow` time and bumped to the next value on
+    /// raise-to-front (pointer click, future explicit raise API).
+    /// `composite_and_present` sorts back-to-front ascending by this
+    /// field; `front()` returns the live window with the highest
+    /// `front_seq`. Replaces the original cross-client purpose of
+    /// `z_order`; `z_order` continues to express same-client layering
+    /// as a tie-breaker is left unused for v1 — same-client raise
+    /// preservation is a known v1 limitation (terminal-window's
+    /// watermark + text layers can split across other windows after
+    /// a click on just one of them).
+    pub front_seq: u32,
     /// True if the surface's high byte is alpha — compositor blends
     /// this window over whatever sits below in the stack rather than
     /// overwriting. False for the legacy XRGB-overwrite path.
@@ -88,6 +108,11 @@ pub struct Window {
 pub struct WindowTable {
     windows: [Option<Window>; MAX_WINDOWS],
     next_window_id: u32,
+    /// Monotonic counter feeding `Window::front_seq`. Skip 0 on wrap
+    /// — same convention as `next_window_id`. Bumped both at create
+    /// (so new windows naturally land in front of older ones) and at
+    /// raise-on-click (so the clicked window comes to front).
+    next_front_seq: u32,
 }
 
 impl WindowTable {
@@ -95,6 +120,7 @@ impl WindowTable {
         Self {
             windows: [None; MAX_WINDOWS],
             next_window_id: 1,
+            next_front_seq: 1,
         }
     }
 
@@ -104,6 +130,26 @@ impl WindowTable {
         let next = self.next_window_id.wrapping_add(1);
         self.next_window_id = if next == 0 { 1 } else { next };
         id
+    }
+
+    /// Allocate the next `front_seq` value. Same wrap discipline as
+    /// `alloc_window_id`. Used at create-time and on raise-on-click.
+    pub fn alloc_front_seq(&mut self) -> u32 {
+        let s = self.next_front_seq;
+        let next = self.next_front_seq.wrapping_add(1);
+        self.next_front_seq = if next == 0 { 1 } else { next };
+        s
+    }
+
+    /// Raise a window to the front by bumping its `front_seq` to the
+    /// next monotonic value. No-op if the window id is unknown.
+    pub fn raise(&mut self, window_id: u32) {
+        if let Some(idx) = self.find_window(window_id) {
+            let seq = self.alloc_front_seq();
+            if let Some(w) = self.get_mut(idx) {
+                w.front_seq = seq;
+            }
+        }
     }
 
     fn find_slot(&self) -> Option<usize> {
@@ -127,13 +173,55 @@ impl WindowTable {
         self.windows.iter().filter_map(Option::as_ref)
     }
 
-    /// Pick the front-most live window — highest `z_order` wins, ties
-    /// broken by table order (first-live-in-table). Used for input
-    /// routing: the front window receives forwarded events; back
-    /// layers (e.g. terminal-window's watermark canvas) are render-
-    /// only and never receive input.
+    /// Pick the front-most live window — highest `front_seq` wins,
+    /// ties broken by table order (first-live-in-table). Used for
+    /// input routing: the front window receives forwarded events;
+    /// back layers (e.g. terminal-window's watermark canvas) are
+    /// render-only and never receive input.
     pub fn front(&self) -> Option<&Window> {
-        self.iter().max_by_key(|w| w.z_order)
+        self.iter().max_by_key(|w| w.front_seq)
+    }
+
+    /// Hit-test a screen-absolute point against live windows from
+    /// front-most to back-most. Returns the window id of the first
+    /// rect that contains the point, or `None` if the point lies
+    /// outside every window. Used by `pump_input_once` for
+    /// raise-on-click on `PointerButton` events.
+    pub fn hit_test(&self, screen_x: i32, screen_y: i32) -> Option<u32> {
+        // Collect live windows + sort descending by front_seq so we
+        // try the front-most candidate first. Bounded array, no
+        // allocation.
+        let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+        let mut count = 0usize;
+        for w in self.iter() {
+            if count < MAX_WINDOWS {
+                sorted[count] = Some(w);
+                count += 1;
+            }
+        }
+        // Insertion sort descending by front_seq.
+        for i in 1..count {
+            let mut j = i;
+            while j > 0 {
+                let lo = sorted[j - 1].unwrap().front_seq;
+                let hi = sorted[j].unwrap().front_seq;
+                if hi > lo {
+                    sorted.swap(j, j - 1);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        for slot in sorted[..count].iter() {
+            let w = slot.unwrap();
+            let right = w.x + w.width as i32;
+            let bottom = w.y + w.height as i32;
+            if screen_x >= w.x && screen_x < right && screen_y >= w.y && screen_y < bottom {
+                return Some(w.window_id);
+            }
+        }
+        None
     }
 
     /// Drop windows whose surface channel is in a teardown-terminal
@@ -309,6 +397,7 @@ fn handle_create_window(
     let channel_id = rc as u64;
 
     let window_id = window_table.alloc_window_id();
+    let front_seq = window_table.alloc_front_seq();
     window_table.windows[slot_idx] = Some(Window {
         window_id,
         owner_principal: *sender_principal,
@@ -316,6 +405,12 @@ fn handle_create_window(
         // future protocol replies route to the layer's own queue,
         // not to whatever the kernel happened to stamp first.
         client_endpoint: reply_to,
+        // New windows land at scanout origin in v1. The
+        // `DragWindowBy` wire message (libgui-proto) lets clients
+        // move themselves; future placement policy (e.g.
+        // "stagger by N pixels per new window") is a follow-up.
+        x: 0,
+        y: 0,
         width,
         height,
         pitch,
@@ -323,6 +418,7 @@ fn handle_create_window(
         surface_vaddr,
         last_client_seq: 0,
         z_order: req.z_order,
+        front_seq,
         alpha_blend: req.alpha_blend,
     });
 
@@ -448,6 +544,11 @@ fn send_error(from_endpoint: u32, error: GuiError) {
 #[derive(Clone, Copy, Debug)]
 pub struct WindowView {
     pub window_id: u32,
+    /// Top-left position in scanout coordinates (mirrored from
+    /// `Window::{x, y}` so the blit functions don't need a
+    /// `&WindowTable` borrow).
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
     pub pitch: u32,
@@ -458,6 +559,8 @@ impl From<&Window> for WindowView {
     fn from(w: &Window) -> Self {
         Self {
             window_id: w.window_id,
+            x: w.x,
+            y: w.y,
             width: w.width,
             height: w.height,
             pitch: w.pitch,
