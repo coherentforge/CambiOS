@@ -56,6 +56,7 @@
 
 pub mod bitmap;
 pub mod client;
+pub mod decorations;
 pub mod font;
 pub mod font_aa;
 pub mod frame_clock;
@@ -64,6 +65,7 @@ pub mod tile_grid;
 
 pub use bitmap::Bitmap;
 pub use client::{Client, ClientError};
+pub use decorations::{decorate, decorate_with_color, DragRegion, TITLE_BAR_HEIGHT, TITLE_DEFAULT_COLOR};
 pub use font::{Font, BUILTIN_FONT_8X8};
 pub use font_aa::{AntialiasedFont, BUILTIN_FONT_JBM};
 pub use frame_clock::FrameClock;

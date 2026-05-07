@@ -16,11 +16,13 @@
 
 use cambios_libgui_proto::{
     decode_input_event, decode_welcome_client, encode_create_window, encode_destroy_window,
-    encode_frame_ready, InputEvent, MsgTag, Rect, WelcomeClientMsg, COMPOSITOR_ENDPOINT,
-    MAX_MESSAGE_SIZE,
+    encode_drag_window_by, encode_frame_ready, InputEvent, MsgTag, Rect, WelcomeClientMsg,
+    COMPOSITOR_ENDPOINT, MAX_MESSAGE_SIZE,
 };
+use cambios_libinput_proto::{button, EventType};
 use cambios_libsys as sys;
 
+use crate::decorations::DragRegion;
 use crate::Surface;
 
 /// Bytes the kernel prepends to a `recv_msg` / `try_recv_msg` result:
@@ -73,6 +75,18 @@ pub struct Client {
     next_seq: u32,
     z_order: u8,
     alpha_blend: bool,
+    /// Drag-tracking state populated when the client calls
+    /// `decorate()`. `Some(region)` means subsequent pointer events
+    /// inside `region` synthesize `DragWindowBy` messages instead of
+    /// being forwarded to the application. `None` (default) means
+    /// the client opted out of decorations and all pointer events
+    /// pass through.
+    drag_region: Option<crate::decorations::DragRegion>,
+    /// `true` after a button-down lands inside `drag_region` and
+    /// before the matching button-up. While set, `PointerMove`
+    /// deltas are forwarded as `DragWindowBy` instead of as
+    /// `InputEvent`.
+    drag_active: bool,
 }
 
 impl Client {
@@ -161,6 +175,8 @@ impl Client {
             next_seq: 0,
             z_order,
             alpha_blend,
+            drag_region: None,
+            drag_active: false,
         })
     }
 
@@ -276,6 +292,8 @@ impl Client {
             next_seq: 0,
             z_order,
             alpha_blend,
+            drag_region: None,
+            drag_active: false,
         })
     }
 
@@ -403,6 +421,16 @@ impl Client {
     /// interleaved with `sys::yield_now()` between drain cycles so
     /// the scheduler can run other tasks while input is idle.
     ///
+    /// **Drag-tracking interception (Tier 1 movable windows).** If
+    /// the client called [`Client::decorate`] earlier, pointer events
+    /// inside the drag region are intercepted: a button-down inside
+    /// the region starts a drag, subsequent `PointerMove` deltas are
+    /// synthesized into `DragWindowBy` messages and sent to the
+    /// compositor (no application-visible event), and the matching
+    /// button-up ends the drag. Click-and-drag outside the drag
+    /// region passes through unchanged. The interception is
+    /// transparent to the application.
+    ///
     /// v0 does not handle `WindowClosed` — a real app would want to
     /// learn its window went away. Added when the first app actually
     /// destroys / re-creates windows at runtime.
@@ -421,12 +449,88 @@ impl Client {
         let payload = &buf[RECV_HEADER_BYTES..total];
         let tag_bytes: [u8; 4] = payload[0..4].try_into().ok()?;
         let tag = MsgTag::from_u32(u32::from_le_bytes(tag_bytes))?;
-        match tag {
-            MsgTag::InputEvent => decode_input_event(payload),
+        let event = match tag {
+            MsgTag::InputEvent => decode_input_event(payload)?,
             // WindowClosed / ErrorResponse arrive on the same endpoint;
             // v0 silently drops them. Future: surface via a separate
             // `poll_notification()` or a combined `poll_message()`.
-            _ => None,
+            _ => return None,
+        };
+
+        // Drag-tracking pass — only if the client called decorate().
+        if let Some(region) = self.drag_region {
+            match event.event_type {
+                EventType::PointerButton => {
+                    let p = event.pointer();
+                    let pressed = (p.buttons & button::LEFT) != 0;
+                    if pressed && region.contains(p.dx, p.dy) {
+                        // Button-down inside drag region: start drag.
+                        self.drag_active = true;
+                        return None;
+                    }
+                    if !pressed {
+                        // Button-up: end any active drag. Whether the
+                        // up event passes through depends on whether
+                        // the down was intercepted; for simplicity,
+                        // intercept the up too whenever drag was
+                        // active so the application sees a clean
+                        // event sequence with no orphan ups.
+                        if self.drag_active {
+                            self.drag_active = false;
+                            return None;
+                        }
+                    }
+                }
+                EventType::PointerMove => {
+                    if self.drag_active {
+                        let p = event.pointer();
+                        let _ = self.request_drag(p.dx, p.dy);
+                        return None;
+                    }
+                }
+                _ => {}
+            }
         }
+
+        Some(event)
+    }
+
+    /// Paint a v1 title bar at the top of this window's surface and
+    /// register the drag region with the compositor-side drag tracker.
+    /// Returns the drag rect in window-local coordinates.
+    ///
+    /// Call once after [`Client::open`] / [`Client::open_layer`] (and
+    /// optionally each frame to repaint the bar over application
+    /// content). After calling, [`Client::poll_event`] intercepts
+    /// pointer events inside the drag region and synthesizes
+    /// `DragWindowBy` messages on the wire.
+    pub fn decorate(&mut self) -> DragRegion {
+        let mut surface = self.surface_mut();
+        let region = crate::decorations::decorate(&mut surface);
+        self.drag_region = Some(region);
+        region
+    }
+
+    /// Variant of [`Client::decorate`] taking a custom title-bar color.
+    pub fn decorate_with_color(&mut self, color: crate::Color) -> DragRegion {
+        let mut surface = self.surface_mut();
+        let region = crate::decorations::decorate_with_color(&mut surface, color);
+        self.drag_region = Some(region);
+        region
+    }
+
+    /// Send a `DragWindowBy { dx, dy }` message to the compositor.
+    /// Public mostly for clients that want to drive drag from a custom
+    /// state machine — most clients just call [`Client::decorate`] and
+    /// rely on the automatic interception in [`Client::poll_event`].
+    pub fn request_drag(&self, dx: i32, dy: i32) -> Result<(), ClientError> {
+        let mut buf = [0u8; 16];
+        let n =
+            encode_drag_window_by(&mut buf, self.window_id, dx, dy).ok_or(ClientError::EncodeFrameReady)?;
+        let rc = sys::write(COMPOSITOR_ENDPOINT, &buf[..n]);
+        if rc < 0 {
+            return Err(ClientError::FrameReadyWriteFailed(rc));
+        }
+        Ok(())
     }
 }

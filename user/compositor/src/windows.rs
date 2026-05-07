@@ -329,6 +329,10 @@ pub fn handle_client_payload(
             handle_destroy_window(payload, sender_principal, from_endpoint, window_table);
             None
         }
+        MsgTag::DragWindowBy => {
+            handle_drag_window_by(payload, sender_principal, from_endpoint, window_table);
+            None
+        }
         // 0x40xx tags (compositor → client) must never arrive here.
         MsgTag::WelcomeClient
         | MsgTag::WindowClosed
@@ -338,6 +342,53 @@ pub fn handle_client_payload(
             None
         }
     }
+}
+
+/// Apply a client-requested window translation. The client sends
+/// this when the user drags inside the title bar (libgui's
+/// `decorate()` drag region); compositor adjusts the window's
+/// `(x, y)` and the next composite picks up the new position.
+///
+/// Authority: only the window's owning Principal may move it.
+/// Future authz hardening can add an "is the requesting endpoint
+/// the same one CreateWindow used" check; today the kernel-stamped
+/// `sender_principal` ownership match is sufficient.
+fn handle_drag_window_by(
+    payload: &[u8],
+    sender_principal: &[u8; 32],
+    from_endpoint: u32,
+    window_table: &mut WindowTable,
+) {
+    let (window_id, dx, dy) = match cambios_libgui_proto::decode_drag_window_by(payload) {
+        Some(t) => t,
+        None => {
+            send_error(from_endpoint, GuiError::InvalidMessage);
+            return;
+        }
+    };
+    let slot = match window_table.find_window(window_id) {
+        Some(s) => s,
+        None => {
+            send_error(from_endpoint, GuiError::NoSuchWindow);
+            return;
+        }
+    };
+    let w = match window_table.get_mut(slot) {
+        Some(w) => w,
+        None => {
+            send_error(from_endpoint, GuiError::NoSuchWindow);
+            return;
+        }
+    };
+    if &w.owner_principal != sender_principal {
+        // Same convention as `handle_frame_ready`: a foreign-Principal
+        // request to manipulate a window is reported as
+        // `NoSuchWindow` (the docs explicitly call this case out).
+        send_error(from_endpoint, GuiError::NoSuchWindow);
+        return;
+    }
+    w.x = w.x.saturating_add(dx);
+    w.y = w.y.saturating_add(dy);
 }
 
 fn handle_create_window(

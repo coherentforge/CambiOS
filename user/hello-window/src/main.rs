@@ -48,6 +48,14 @@ pub extern "C" fn _start() -> ! {
     };
     sys::print(b"[HELLO-WINDOW] window opened, drawing\r\n");
 
+    // Tier 1 movable windows: paint a title bar and register the
+    // drag region. After this, click-and-drag inside the top
+    // `TITLE_BAR_HEIGHT` rows moves the window. libgui's poll_event
+    // intercepts those events transparently — the rest of this main
+    // loop is unchanged. Single line of adoption per the
+    // ~/.claude/plans/how-heavy-a-lift-expressive-wand.md plan.
+    let _drag_region = client.decorate();
+
     let w = client.width();
     let h = client.height();
     {
@@ -55,6 +63,9 @@ pub extern "C" fn _start() -> ! {
 
         // Fill background bright green (preserves the visual
         // contract from the open-coded Scanout-3 hello-window).
+        // The decorate() call above already painted the title bar;
+        // clear() overwrites the entire surface, so re-decorate
+        // after clearing.
         surf.clear(Color::rgb(0x00, 0xC8, 0x00));
 
         // White border — exercises draw_line on long horizontals
@@ -68,6 +79,9 @@ pub extern "C" fn _start() -> ! {
         // against the green.
         surf.fill_rect(Rect { x: 16, y: 16, w: 120, h: 32 }, Color::BLACK);
         surf.draw_text_builtin(24, 24, "HELLO LIBGUI", Color::WHITE);
+
+        // Re-paint title bar after clear() (clear overwrote it).
+        let _ = cambios_libgui::decorations::decorate(&mut surf);
 
         // A small 4×3 tile grid below — the "I could build Tree on
         // top of this" canary. Each tile filled red, outlined white.

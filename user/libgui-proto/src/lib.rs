@@ -196,6 +196,13 @@ pub enum MsgTag {
     CreateWindow = 0x3001,
     FrameReady = 0x3010,
     DestroyWindow = 0x3020,
+    /// Tier 1 movable windows: client requests its window be moved by
+    /// `(dx, dy)` pixels in scanout coords. Compositor adjusts the
+    /// window's position and recomposites. No surface reallocation.
+    /// libgui's drag-tracking helper synthesizes these from
+    /// PointerButton + PointerMove events when the user drags inside a
+    /// drag region returned by `decorate()`.
+    DragWindowBy = 0x3030,
 
     // Compositor → client (0x40xx)
     WelcomeClient = 0x4001,
@@ -213,6 +220,7 @@ impl MsgTag {
             0x3001 => Some(Self::CreateWindow),
             0x3010 => Some(Self::FrameReady),
             0x3020 => Some(Self::DestroyWindow),
+            0x3030 => Some(Self::DragWindowBy),
             0x4001 => Some(Self::WelcomeClient),
             0x4010 => Some(Self::WindowClosed),
             0x4020 => Some(Self::ErrorResponse),
@@ -543,6 +551,42 @@ pub fn decode_input_event(buf: &[u8]) -> Option<InputEvent> {
     cambios_libinput_proto::decode_event(&buf[4..4 + INPUT_EVENT_SIZE])
 }
 
+/// `DragWindowBy` — client → compositor, request to translate
+/// `window_id` by `(dx, dy)` pixels in scanout coords. Layout:
+/// `[tag:4][window_id:4][dx:i32 (4)][dy:i32 (4)]` = 16 bytes.
+///
+/// Synthesized by the libgui drag-tracking helper from PointerButton
+/// + PointerMove sequences when the pointer drags inside a region
+/// returned by `decorate()`. Compositor adjusts the window's
+/// `(x, y)` and recomposites; no surface reallocation.
+pub fn encode_drag_window_by(
+    buf: &mut [u8],
+    window_id: u32,
+    dx: i32,
+    dy: i32,
+) -> Option<usize> {
+    if buf.len() < 16 {
+        return None;
+    }
+    buf[..4].copy_from_slice(&MsgTag::DragWindowBy.as_u32().to_le_bytes());
+    buf[4..8].copy_from_slice(&window_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&dx.to_le_bytes());
+    buf[12..16].copy_from_slice(&dy.to_le_bytes());
+    Some(16)
+}
+
+pub fn decode_drag_window_by(buf: &[u8]) -> Option<(u32, i32, i32)> {
+    if buf.len() < 16
+        || u32::from_le_bytes(buf[0..4].try_into().ok()?) != MsgTag::DragWindowBy.as_u32()
+    {
+        return None;
+    }
+    let window_id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let dx = i32::from_le_bytes(buf[8..12].try_into().ok()?);
+    let dy = i32::from_le_bytes(buf[12..16].try_into().ok()?);
+    Some((window_id, dx, dy))
+}
+
 // ============================================================================
 // Tests — protocol round-trips
 // ============================================================================
@@ -707,6 +751,32 @@ mod tests {
         let mut buf = [0u8; MAX_MESSAGE_SIZE];
         encode_welcome_client(&mut buf, 1, 1, 1, 1, 4, 32, PixelFormat::Xrgb8888).unwrap();
         assert!(decode_input_event(&buf).is_none());
+    }
+
+    #[test]
+    fn drag_window_by_roundtrip() {
+        let mut buf = [0u8; 16];
+        let n = encode_drag_window_by(&mut buf, 7, -3, 11).unwrap();
+        assert_eq!(n, 16);
+        let (window_id, dx, dy) = decode_drag_window_by(&buf[..n]).unwrap();
+        assert_eq!(window_id, 7);
+        assert_eq!(dx, -3);
+        assert_eq!(dy, 11);
+    }
+
+    #[test]
+    fn drag_window_by_rejects_wrong_tag() {
+        let mut buf = [0u8; 16];
+        // Encode a CreateWindow tag instead.
+        buf[..4].copy_from_slice(&MsgTag::CreateWindow.as_u32().to_le_bytes());
+        assert!(decode_drag_window_by(&buf).is_none());
+    }
+
+    #[test]
+    fn drag_window_by_rejects_truncated() {
+        let mut buf = [0u8; 16];
+        let _ = encode_drag_window_by(&mut buf, 1, 0, 0).unwrap();
+        assert!(decode_drag_window_by(&buf[..15]).is_none());
     }
 
     #[test]
