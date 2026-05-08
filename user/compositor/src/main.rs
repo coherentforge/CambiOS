@@ -46,8 +46,11 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use cambios_libgui_proto::{encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT, MAX_WINDOWS};
-use cambios_libinput_proto::{decode_event, DeviceClass, EventType};
+use cambios_libgui_proto::{
+    encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT, MAX_WINDOWS,
+    MAX_WINDOW_DIMENSION,
+};
+use cambios_libinput_proto::{button, decode_event, DeviceClass, EventType};
 use cambios_libsys as sys;
 use cambios_libscanout::{
     decode_display_connected, encode_register_compositor, MsgTag,
@@ -59,7 +62,7 @@ mod windows;
 use scanout::{
     Backend, HeadlessBackend, LimineFbBackend, ScanoutBackend, ScanoutBuffer, ScanoutEvent,
 };
-use windows::{handle_client_payload, Window, WindowTable, WindowView};
+use windows::{commit_window_resize, handle_client_payload, ResizeEdge, Window, WindowTable, WindowView};
 
 /// Maximum IPC receive buffer size for the main dispatch loop.
 /// Sized to hold the largest libgui-proto message (FrameReady with
@@ -184,6 +187,10 @@ pub extern "C" fn _start() -> ! {
     // recomposite even when no client frame is in flight, so cursor
     // motion is responsive.
     let mut pointer = PointerState::new();
+    // C12c edge-grab: in-flight resize-drag state. `None` outside of a
+    // gesture; `Some` between LEFT-press inside a window's resize-grab
+    // band and the corresponding LEFT-release.
+    let mut resize_drag: Option<ResizeDrag> = None;
     loop {
         // Userspace half of ADR-007 Divergence 7 (tombstone-on-
         // revoke). When a client exits without an explicit
@@ -205,7 +212,7 @@ pub extern "C" fn _start() -> ! {
             // a lower layer through transparent regions. The trigger
             // window inside the variant is informational; the
             // composite_and_present call walks the table.
-            composite_and_present(&mut backend, &window_table, &pointer);
+            composite_and_present(&mut backend, &window_table, &pointer, resize_drag.as_ref());
             pointer.dirty = false;
         }
 
@@ -242,14 +249,16 @@ pub extern "C" fn _start() -> ! {
         // to the focused window; a single scheduler tick may carry
         // multiple key/pointer events, so drain in a tight inner loop
         // rather than one-per-yield.
-        while pump_input_once(&mut window_table, &mut pointer) {}
+        while pump_input_once(&mut window_table, &mut pointer, &mut resize_drag) {}
 
         // Recomposite if pointer state changed during the input drain
         // (cursor moved, became visible, etc.). Without this the
         // cursor would only update when a client also submitted a
         // FrameReady — making the pointer feel laggy on idle scenes.
+        // The same `dirty` flag is set by `ResizeDrag::update` so the
+        // ghost frame tracks pointer motion.
         if pointer.dirty && !needs_composite {
-            composite_and_present(&mut backend, &window_table, &pointer);
+            composite_and_present(&mut backend, &window_table, &pointer, resize_drag.as_ref());
             pointer.dirty = false;
             needs_composite = true;
         }
@@ -284,11 +293,19 @@ struct PointerState {
     y: i32,
     visible: bool,
     dirty: bool,
+    /// Live button mask from the most recent Pointer event. The driver
+    /// stamps the post-transition state on every event (see
+    /// `user/virtio-input/src/main.rs::handle_pointer_button`); we
+    /// keep the previous tick's mask here so that a `PointerButton`
+    /// event with `LEFT` set can be classified as press (rising edge)
+    /// versus release-of-other-button (LEFT was already set). Same
+    /// trick is needed for any future modifier-button gestures.
+    prev_buttons: u16,
 }
 
 impl PointerState {
     const fn new() -> Self {
-        Self { x: 0, y: 0, visible: false, dirty: false }
+        Self { x: 0, y: 0, visible: false, dirty: false, prev_buttons: 0 }
     }
 
     /// Apply a relative delta from a `PointerMove` event. Clamps to a
@@ -315,6 +332,134 @@ impl PointerState {
 }
 
 // ============================================================================
+// Resize-drag state — Tier 2 edge-grab (C12c)
+// ============================================================================
+
+/// SCAFFOLDING: edge-grab band thickness in pixels. A press inside the
+/// outermost `RESIZE_GRAB_PX` columns/rows of a window starts a
+/// resize-drag; a press in the interior falls through to the existing
+/// raise-on-click + forward-to-client path.
+/// Why: matches the spec in
+/// `~/.claude/plans/how-heavy-a-lift-expressive-wand.md` § Tier 2.
+/// 4 px is hittable on a 1× display without dominating the title-bar
+/// drag region (libgui's `decorate()` uses the top ~16 px for title).
+/// Replace when: HiDPI backing-scale lands and the constant needs to
+/// scale with display density.
+const RESIZE_GRAB_PX: i32 = 4;
+
+/// SCAFFOLDING: minimum window dimension during ghost-frame drag. The
+/// drag accumulator clamps below this so a pointer drag past the
+/// opposite edge can't shrink the window to 0×0 (which would fail
+/// `commit_window_resize`'s `InvalidDimensions` gate at release time).
+/// Why: protocol caps the upper bound (`MAX_WINDOW_DIMENSION`); the
+/// lower bound is a UI-survivability concern — windows tinier than a
+/// few cursor-widths are unusable and impossible to recover from.
+/// Replace when: a per-window minimum-size hint enters the protocol.
+const MIN_RESIZE_DIM: u32 = 32;
+
+/// SCAFFOLDING: ghost-frame outline color (XRGB8888). White for
+/// contrast against amber focus border + arbitrary client surfaces.
+/// Why: the ghost frame is the drag's visual feedback channel; it
+/// must be readable against both light- and dark-content windows. The
+/// existing focus border is amber; white is the next-most-visible
+/// color that doesn't visually merge with it.
+/// Replace when: full HiDPI / theming pass replaces compositor-side
+/// constants with runtime-configurable theme values.
+const GHOST_FRAME_COLOR: u32 = 0x00_FF_FF_FF;
+
+/// In-flight resize-drag state. `None` when no drag is active. Owned
+/// by the main loop; passed by mutable reference into
+/// `pump_input_once` and by shared reference into
+/// `composite_and_present` (for the ghost-frame paint).
+///
+/// `start_*` is the snapshot at pointer-down; `pending_*` is the
+/// proposed bounds updated on each `PointerMove`. On pointer-up the
+/// `pending_*` values are committed via [`commit_window_resize`].
+/// The actual `Window` record is left unchanged for the duration of
+/// the drag — the surface stays the original size; the ghost-frame
+/// outline is the only on-screen indicator of the proposed size.
+#[derive(Clone, Copy, Debug)]
+struct ResizeDrag {
+    window_id: u32,
+    edge: ResizeEdge,
+    start_pointer_x: i32,
+    start_pointer_y: i32,
+    start_win_x: i32,
+    start_win_y: i32,
+    start_w: u32,
+    start_h: u32,
+    pending_x: i32,
+    pending_y: i32,
+    pending_w: u32,
+    pending_h: u32,
+}
+
+impl ResizeDrag {
+    /// Recompute `pending_*` from a screen-coord pointer position,
+    /// applying the edge-anchor rules: dragging the top or left edge
+    /// moves the corresponding `pending_x`/`pending_y` while the
+    /// opposite edge stays fixed; bottom/right edges only change
+    /// dimensions. Corners drag both an edge pair simultaneously.
+    /// All values clamped to `[MIN_RESIZE_DIM, MAX_WINDOW_DIMENSION]`.
+    fn update(&mut self, pointer_x: i32, pointer_y: i32) {
+        let dx = pointer_x - self.start_pointer_x;
+        let dy = pointer_y - self.start_pointer_y;
+
+        // Width / x update.
+        let (new_w, new_x) = match self.edge {
+            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => {
+                let raw = self.start_w as i32 + dx;
+                (
+                    clamp_resize_dim(raw),
+                    self.start_win_x,
+                )
+            }
+            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => {
+                let raw = self.start_w as i32 - dx;
+                let clamped = clamp_resize_dim(raw);
+                let consumed = self.start_w as i32 - clamped as i32;
+                (clamped, self.start_win_x + consumed)
+            }
+            _ => (self.start_w, self.start_win_x),
+        };
+
+        // Height / y update.
+        let (new_h, new_y) = match self.edge {
+            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+                let raw = self.start_h as i32 + dy;
+                (clamp_resize_dim(raw), self.start_win_y)
+            }
+            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => {
+                let raw = self.start_h as i32 - dy;
+                let clamped = clamp_resize_dim(raw);
+                let consumed = self.start_h as i32 - clamped as i32;
+                (clamped, self.start_win_y + consumed)
+            }
+            _ => (self.start_h, self.start_win_y),
+        };
+
+        self.pending_x = new_x;
+        self.pending_y = new_y;
+        self.pending_w = new_w;
+        self.pending_h = new_h;
+    }
+}
+
+/// Clamp a candidate dimension into the valid resize range. Negative
+/// values (pointer dragged past the opposite edge) snap to
+/// `MIN_RESIZE_DIM`; values above `MAX_WINDOW_DIMENSION` snap down so
+/// `commit_window_resize` doesn't reject the eventual commit.
+fn clamp_resize_dim(raw: i32) -> u32 {
+    if raw < MIN_RESIZE_DIM as i32 {
+        MIN_RESIZE_DIM
+    } else if raw > MAX_WINDOW_DIMENSION as i32 {
+        MAX_WINDOW_DIMENSION
+    } else {
+        raw as u32
+    }
+}
+
+// ============================================================================
 // Input routing
 // ============================================================================
 
@@ -328,7 +473,24 @@ impl PointerState {
 /// input. Single-window apps land at z=0 and are still "the front"
 /// trivially. Cross-client focus arbitration (last-clicked,
 /// explicit focus API) lands with the first multi-window WM service.
-fn pump_input_once(window_table: &mut WindowTable, pointer: &mut PointerState) -> bool {
+///
+/// **Resize-drag interception (C12c).** Before forwarding, the
+/// drag-state machine intercepts pointer events:
+/// - `PointerButton` with `LEFT` rising edge inside a window's
+///   resize-grab band → start a `ResizeDrag` (raises window, no
+///   forward to client).
+/// - `PointerMove` during an active drag → update pending bounds
+///   (no forward to client; ghost-frame paint shows the proposed
+///   geometry).
+/// - `PointerButton` with `LEFT` falling edge during an active drag
+///   → commit via `commit_window_resize` (no forward to client).
+/// All other paths fall through to the existing
+/// raise-on-click + window-local forwarding.
+fn pump_input_once(
+    window_table: &mut WindowTable,
+    pointer: &mut PointerState,
+    resize_drag: &mut Option<ResizeDrag>,
+) -> bool {
     let mut buf = [0u8; RECV_HEADER_BYTES + INPUT_EVENT_SIZE];
     let n = sys::try_recv_msg(COMPOSITOR_INPUT_ENDPOINT, &mut buf);
     if n <= 0 {
@@ -377,6 +539,112 @@ fn pump_input_once(window_table: &mut WindowTable, pointer: &mut PointerState) -
             EventType::PointerButton => pointer.apply_absolute(p.dx, p.dy),
             _ => {}
         }
+    }
+
+    // Resize-drag state machine (C12c). All pointer interactions while
+    // a drag is in flight are consumed by the compositor; nothing
+    // forwards to the client until the drag commits or aborts.
+    if event.device_class == DeviceClass::Pointer {
+        let p = event.pointer();
+        let prev_left = pointer.prev_buttons & button::LEFT != 0;
+        let curr_left = p.buttons & button::LEFT != 0;
+
+        if event.event_type == EventType::PointerButton
+            && !prev_left
+            && curr_left
+            && resize_drag.is_none()
+        {
+            // LEFT rising edge — candidate for drag start. Snapshot
+            // the candidate window into an owned `Window` value so all
+            // immutable borrows release before `raise()`'s mutable
+            // borrow.
+            let candidate = window_table
+                .hit_test_resize(p.dx, p.dy, RESIZE_GRAB_PX)
+                .and_then(|(window_id, edge)| {
+                    window_table
+                        .iter()
+                        .find(|w| w.window_id == window_id)
+                        .copied()
+                        .map(|w| (window_id, edge, w))
+                });
+            if let Some((window_id, edge, w)) = candidate {
+                // Raise the dragged window so the focus border tracks
+                // the resize gesture. Same shape as a raise-on-click
+                // on the window's content.
+                window_table.raise(window_id);
+                *resize_drag = Some(ResizeDrag {
+                    window_id,
+                    edge,
+                    start_pointer_x: p.dx,
+                    start_pointer_y: p.dy,
+                    start_win_x: w.x,
+                    start_win_y: w.y,
+                    start_w: w.width,
+                    start_h: w.height,
+                    pending_x: w.x,
+                    pending_y: w.y,
+                    pending_w: w.width,
+                    pending_h: w.height,
+                });
+                pointer.prev_buttons = p.buttons;
+                pointer.dirty = true; // ghost frame now needs paint
+                return true;
+            }
+        }
+
+        if let Some(drag) = resize_drag.as_mut() {
+            match event.event_type {
+                EventType::PointerMove => {
+                    drag.update(pointer.x, pointer.y);
+                    pointer.dirty = true;
+                    pointer.prev_buttons = p.buttons;
+                    return true;
+                }
+                EventType::PointerButton if prev_left && !curr_left => {
+                    // LEFT falling edge during drag — commit.
+                    let final_drag = *drag;
+                    *resize_drag = None;
+                    let new_x = if final_drag.pending_x != final_drag.start_win_x {
+                        Some(final_drag.pending_x)
+                    } else {
+                        None
+                    };
+                    let new_y = if final_drag.pending_y != final_drag.start_win_y {
+                        Some(final_drag.pending_y)
+                    } else {
+                        None
+                    };
+                    if commit_window_resize(
+                        window_table,
+                        final_drag.window_id,
+                        final_drag.pending_w,
+                        final_drag.pending_h,
+                        new_x,
+                        new_y,
+                    )
+                    .is_err()
+                    {
+                        sys::print(b"[COMPOSITOR] edge-drag resize commit failed\r\n");
+                    }
+                    pointer.prev_buttons = p.buttons;
+                    pointer.dirty = true;
+                    return true;
+                }
+                EventType::PointerButton => {
+                    // Other-button transition during drag (e.g. RIGHT
+                    // press while LEFT still held). Consume but don't
+                    // commit; LEFT release is the only commit trigger.
+                    pointer.prev_buttons = p.buttons;
+                    return true;
+                }
+                _ => {
+                    pointer.prev_buttons = p.buttons;
+                    return true;
+                }
+            }
+        }
+
+        pointer.prev_buttons = p.buttons;
     }
 
     // Raise-on-click: a `PointerButton` event carries the absolute
@@ -505,6 +773,7 @@ fn composite_and_present(
     backend: &mut Backend,
     window_table: &WindowTable,
     pointer: &PointerState,
+    resize_drag: Option<&ResizeDrag>,
 ) {
     let scanout = match backend {
         Backend::Limine(b) => b.scanout,
@@ -563,10 +832,25 @@ fn composite_and_present(
         paint_focus_border(&scanout, front.x, front.y, front.width, front.height);
     }
 
-    // C11: paint the cursor sprite last, on top of focus border + all
-    // window content. Hot-spot is the apex (top-left) at (px, py).
-    // Hidden until the first pointer event arrives — without pointer
-    // hardware the cursor never appears.
+    // C12c ghost frame: 1px outline at the proposed bounds during an
+    // active edge-drag. The window's actual surface stays at its
+    // current size for the duration of the drag (channel realloc
+    // happens once on commit, not per-move); the ghost frame is the
+    // user's only on-screen indicator of the new bounds.
+    if let Some(drag) = resize_drag {
+        paint_ghost_frame(
+            &scanout,
+            drag.pending_x,
+            drag.pending_y,
+            drag.pending_w,
+            drag.pending_h,
+        );
+    }
+
+    // C11: paint the cursor sprite last, on top of focus border, ghost
+    // frame, and all window content. Hot-spot is the apex (top-left)
+    // at (px, py). Hidden until the first pointer event arrives —
+    // without pointer hardware the cursor never appears.
     if pointer.visible {
         paint_cursor(&scanout, pointer.x, pointer.y);
     }
@@ -807,6 +1091,52 @@ fn paint_focus_border(scanout: &ScanoutBuffer, x: i32, y: i32, w: u32, h: u32) {
         write_px(px, bottom);
     }
     // Left + right edges (excluding corners already drawn above).
+    for py in (y + 1)..bottom {
+        write_px(x, py);
+        write_px(right, py);
+    }
+}
+
+/// Paint a 1-pixel rectangle at proposed-resize bounds during an
+/// active edge-drag (C12c). Same shape as
+/// [`paint_focus_border`] but in `GHOST_FRAME_COLOR` (white) so it
+/// reads as a distinct visual signal — focus border is amber and
+/// frames the *current* window position; the ghost frame is white
+/// and frames the *proposed* bounds. Both can be on screen
+/// simultaneously while the drag is in flight.
+///
+/// Clipped to scanout bounds — partial off-screen ghost frames show
+/// only the visible portion. No-op if the rect is wholly off-screen.
+#[allow(unsafe_code)]
+fn paint_ghost_frame(scanout: &ScanoutBuffer, x: i32, y: i32, w: u32, h: u32) {
+    let dst_w = scanout.geometry.width as i32;
+    let dst_h = scanout.geometry.height as i32;
+    let dst_pitch_pixels = (scanout.geometry.pitch / 4) as usize;
+    let right = x + w as i32 - 1;
+    let bottom = y + h as i32 - 1;
+    if right < 0 || bottom < 0 || x >= dst_w || y >= dst_h {
+        return;
+    }
+
+    let write_px = |px: i32, py: i32| {
+        if px < 0 || py < 0 || px >= dst_w || py >= dst_h {
+            return;
+        }
+        // SAFETY: scanout.vaddr is the compositor's RW mapping of the
+        // scanout channel. (px, py) is bounds-checked above; the
+        // index `py * dst_pitch_pixels + px` is within the channel's
+        // pitch × height bytes.
+        unsafe {
+            let dst_base = scanout.vaddr as *mut u32;
+            let off = py as usize * dst_pitch_pixels + px as usize;
+            core::ptr::write_volatile(dst_base.add(off), GHOST_FRAME_COLOR);
+        }
+    };
+
+    for px in x..=right {
+        write_px(px, y);
+        write_px(px, bottom);
+    }
     for py in (y + 1)..bottom {
         write_px(x, py);
         write_px(right, py);

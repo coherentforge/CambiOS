@@ -45,6 +45,23 @@ const SURFACE_BPP: u16 = 32;
 const SURFACE_BYTES_PER_PIXEL: u32 = 4;
 const PAGE_SIZE: u32 = 4096;
 
+/// Which edge or corner of a window an active resize-drag is anchored
+/// to. Returned by `WindowTable::hit_test_resize`; consumed by
+/// `main.rs::commit_resize_drag` to compute the pending dimensions
+/// from a pointer delta. Pure pure pure — no associated data, just the
+/// shape of the gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 /// One entry in the compositor's window table.
 ///
 /// `Copy` so `[Option<Window>; MAX_WINDOWS]` can be zero-initialised
@@ -183,16 +200,14 @@ impl WindowTable {
         self.iter().max_by_key(|w| w.front_seq)
     }
 
-    /// Hit-test a screen-absolute point against live windows from
-    /// front-most to back-most. Returns the window id of the first
-    /// rect that contains the point, or `None` if the point lies
-    /// outside every window. Used by `pump_input_once` for
-    /// raise-on-click on `PointerButton` events.
-    pub fn hit_test(&self, screen_x: i32, screen_y: i32) -> Option<u32> {
-        // Collect live windows + sort descending by front_seq so we
-        // try the front-most candidate first. Bounded array, no
-        // allocation.
-        let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+    /// Front-to-back snapshot of the live windows into a fixed-size
+    /// array. Shared by `hit_test` and `hit_test_resize` — both walk
+    /// the table front-most first. Bounded by `MAX_WINDOWS`, no
+    /// allocation. Returns the populated count.
+    fn snapshot_front_to_back<'a>(
+        &'a self,
+        sorted: &mut [Option<&'a Window>; MAX_WINDOWS],
+    ) -> usize {
         let mut count = 0usize;
         for w in self.iter() {
             if count < MAX_WINDOWS {
@@ -214,6 +229,17 @@ impl WindowTable {
                 }
             }
         }
+        count
+    }
+
+    /// Hit-test a screen-absolute point against live windows from
+    /// front-most to back-most. Returns the window id of the first
+    /// rect that contains the point, or `None` if the point lies
+    /// outside every window. Used by `pump_input_once` for
+    /// raise-on-click on `PointerButton` events.
+    pub fn hit_test(&self, screen_x: i32, screen_y: i32) -> Option<u32> {
+        let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+        let count = self.snapshot_front_to_back(&mut sorted);
         for slot in sorted[..count].iter() {
             let w = slot.unwrap();
             let right = w.x + w.width as i32;
@@ -221,6 +247,61 @@ impl WindowTable {
             if screen_x >= w.x && screen_x < right && screen_y >= w.y && screen_y < bottom {
                 return Some(w.window_id);
             }
+        }
+        None
+    }
+
+    /// Hit-test a screen-absolute point for a resize-grab edge.
+    /// Returns `(window_id, edge)` for the first window whose
+    /// `RESIZE_GRAB_PX`-thick edge band contains the point, walking
+    /// front-most first. Corners (where two edge bands intersect)
+    /// resolve to the diagonal `ResizeEdge` variant.
+    ///
+    /// Compositor-initiated resize-drag uses this *before* `hit_test`
+    /// in `pump_input_once`: a press inside an edge band starts an
+    /// edge-drag; a press elsewhere falls through to raise-on-click +
+    /// client forwarding (existing behavior). Title-bar drag (top
+    /// 4 px of a libgui-decorated window) is therefore *unreachable*
+    /// from the topmost row of pixels; users grabbing the title bar
+    /// click 4+ px below the top edge. UX-acceptable trade for v1.
+    pub fn hit_test_resize(
+        &self,
+        screen_x: i32,
+        screen_y: i32,
+        grab_px: i32,
+    ) -> Option<(u32, ResizeEdge)> {
+        let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+        let count = self.snapshot_front_to_back(&mut sorted);
+        for slot in sorted[..count].iter() {
+            let w = slot.unwrap();
+            let right = w.x + w.width as i32;
+            let bottom = w.y + w.height as i32;
+            // Window rect must contain the point at all.
+            if screen_x < w.x || screen_x >= right || screen_y < w.y || screen_y >= bottom {
+                continue;
+            }
+            let near_left = screen_x - w.x < grab_px;
+            let near_right = right - 1 - screen_x < grab_px;
+            let near_top = screen_y - w.y < grab_px;
+            let near_bottom = bottom - 1 - screen_y < grab_px;
+            let edge = match (near_top, near_bottom, near_left, near_right) {
+                (true, _, true, _) => Some(ResizeEdge::TopLeft),
+                (true, _, _, true) => Some(ResizeEdge::TopRight),
+                (_, true, true, _) => Some(ResizeEdge::BottomLeft),
+                (_, true, _, true) => Some(ResizeEdge::BottomRight),
+                (true, _, _, _) => Some(ResizeEdge::Top),
+                (_, true, _, _) => Some(ResizeEdge::Bottom),
+                (_, _, true, _) => Some(ResizeEdge::Left),
+                (_, _, _, true) => Some(ResizeEdge::Right),
+                _ => None,
+            };
+            if let Some(e) = edge {
+                return Some((w.window_id, e));
+            }
+            // Front-most window covered the point but the click was in
+            // its content interior. Don't fall through to lower windows
+            // — they're occluded.
+            return None;
         }
         None
     }
@@ -397,93 +478,75 @@ fn handle_drag_window_by(
     w.y = w.y.saturating_add(dy);
 }
 
-/// Resize a window's surface (Tier 2 — first real consumer of the
-/// ADR-027 Phase 1 two-phase teardown protocol).
+/// Reallocate a window's surface at new dimensions, optionally moving
+/// it to a new top-left position. The trusted core of the resize
+/// flow — auth/decode happens in callers.
+///
+/// Callers:
+/// - [`handle_request_resize`] — client `RequestResize` (the auth
+///   check verifies `sender_principal == owner_principal` first).
+/// - `main.rs::commit_resize_drag` — compositor-initiated edge-grab
+///   (no Principal check; compositor is the trusted authority for
+///   edge-drag UX).
+///
+/// `new_x`/`new_y = Some` updates the window's screen position
+/// atomically with the dimension change — needed when the drag-anchor
+/// is the top or left edge (the OPPOSITE corner stays fixed, so the
+/// top-left moves). `None` leaves position unchanged.
 ///
 /// Flow:
-/// 1. Decode `RequestResize` + validate dimensions.
-/// 2. Look up the window; reject foreign-Principal requests with
-///    `NoSuchWindow` (matches `handle_frame_ready` / `handle_drag…`).
-/// 3. `channel_begin_teardown(old, Close)` — kernel transitions the
-///    old surface channel to `Revoking` and arm-quiesces the peer
-///    (the client). For the typical `Active` channel the call returns
-///    `1` (Quiesce-in-flight); on the rare `AwaitingAttach` short-
-///    circuit it returns `0` (slot already torn down inline).
-/// 4. `channel_create` a fresh surface sized for `(new_w × new_h)`.
-/// 5. Send `WindowResized { new_channel_id, new_w, new_h, new_pitch }`
-///    to the client's reply endpoint. The client's libgui machinery
-///    `apply_resize_notification`s on its next `poll_event`: closes
-///    the old mapping (returns `InvalidState` because the slot is
-///    in `Revoking` — libgui ignores it), attaches the new channel.
-/// 6. Update the `Window` record to point at the new channel.
-/// 7. `channel_complete_teardown(old, Close)` — kernel unmaps both
-///    sides, frees pages, wakes any quiesce-parked task. (Skipped on
-///    the `AwaitingAttach` short-circuit because `begin` already
-///    finished.)
+/// 1. Validate dimensions against `MAX_WINDOW_DIMENSION`.
+/// 2. `channel_begin_teardown(old, Close)` — kernel transitions the
+///    old surface channel to `Revoking` and arm-quiesces the peer.
+///    Returns `1` (Quiesce-in-flight) for `Active` channels; `0`
+///    (already finished) for the `AwaitingAttach` short-circuit.
+/// 3. `channel_create` a fresh surface sized for `(new_w × new_h)`.
+/// 4. Send `WindowResized` to the client's reply endpoint. The client
+///    closes its old mapping (returns `InvalidState` because the slot
+///    is `Revoking` — libgui ignores it) and attaches the new channel.
+/// 5. Update the `Window` record (channel id / vaddr / w / h / pitch /
+///    optionally x / y) for subsequent composite passes.
+/// 6. `channel_complete_teardown` — unmaps both sides, frees pages,
+///    wakes any quiesce-parked task. Skipped on the
+///    `AwaitingAttach` short-circuit.
 ///
 /// Failure modes:
-/// - `begin_teardown` failure (negative): no kernel state change;
-///   send `SurfaceAllocFailed` and return.
-/// - `channel_create` failure (negative): finish the begin via
-///   `complete_teardown` so the slot is freed; send error. The client
-///   gets no `WindowResized` and its old surface vaddr is now a
-///   tombstone — the window is effectively dead, which is the same
-///   shape as a normal teardown.
-/// - `encode_window_resized` failure: defensive only — the 32-byte
-///   reply buffer is always large enough. Skip the write but still
-///   complete teardown.
-fn handle_request_resize(
-    payload: &[u8],
-    sender_principal: &[u8; 32],
-    from_endpoint: u32,
+/// - `Err(InvalidDimensions)` — caller decides where to send the error.
+/// - `Err(NoSuchWindow)` — window id was reaped between caller's check
+///   and this call (rare; benign in edge-drag).
+/// - `Err(SurfaceAllocFailed)` — kernel rejected `begin_teardown` or
+///   `channel_create`. On `channel_create` failure we still call
+///   `complete_teardown` so the slot is freed; the client's old
+///   surface vaddr becomes a tombstone (window effectively dead, same
+///   shape as a normal teardown).
+pub fn commit_window_resize(
     window_table: &mut WindowTable,
-) {
-    let (window_id, new_w, new_h) = match decode_request_resize(payload) {
-        Some(t) => t,
-        None => {
-            send_error(from_endpoint, GuiError::InvalidMessage);
-            return;
-        }
-    };
-
+    window_id: u32,
+    new_w: u32,
+    new_h: u32,
+    new_x: Option<i32>,
+    new_y: Option<i32>,
+) -> Result<(), GuiError> {
     if new_w == 0
         || new_h == 0
         || new_w > MAX_WINDOW_DIMENSION
         || new_h > MAX_WINDOW_DIMENSION
     {
-        send_error(from_endpoint, GuiError::InvalidDimensions);
-        return;
+        return Err(GuiError::InvalidDimensions);
     }
 
-    let slot = match window_table.find_window(window_id) {
-        Some(s) => s,
-        None => {
-            send_error(from_endpoint, GuiError::NoSuchWindow);
-            return;
-        }
+    let slot = window_table.find_window(window_id).ok_or(GuiError::NoSuchWindow)?;
+    let (old_channel_id, owner_principal) = {
+        let w = window_table.get_mut(slot).ok_or(GuiError::NoSuchWindow)?;
+        (w.surface_channel_id, w.owner_principal)
     };
 
-    let (old_channel_id, owner_principal, client_endpoint) = {
-        let w = match window_table.get_mut(slot) {
-            Some(w) => w,
-            None => return,
-        };
-        if &w.owner_principal != sender_principal {
-            send_error(from_endpoint, GuiError::NoSuchWindow);
-            return;
-        }
-        (w.surface_channel_id, w.owner_principal, w.client_endpoint)
-    };
-
-    // Begin teardown of old channel.
     let begin_rc = sys::channel_begin_teardown(old_channel_id, sys::TEARDOWN_KIND_CLOSE);
     if begin_rc < 0 {
-        send_error(client_endpoint, GuiError::SurfaceAllocFailed);
-        return;
+        return Err(GuiError::SurfaceAllocFailed);
     }
     let needs_complete = begin_rc == 1;
 
-    // Allocate the new surface channel.
     let new_pitch = new_w * SURFACE_BYTES_PER_PIXEL;
     let new_bytes = (new_pitch as u64) * (new_h as u64);
     let new_size_pages = ((new_bytes + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as u32;
@@ -498,39 +561,105 @@ fn handle_request_resize(
         if needs_complete {
             let _ = sys::channel_complete_teardown(old_channel_id, sys::TEARDOWN_KIND_CLOSE);
         }
-        send_error(client_endpoint, GuiError::SurfaceAllocFailed);
-        return;
+        return Err(GuiError::SurfaceAllocFailed);
     }
     let new_channel_id = create_rc as u64;
 
-    // Notify the client. WindowResized fits in 28 bytes; 32-byte
-    // buffer leaves 4 bytes of slack for protocol evolution.
-    let mut reply = [0u8; 32];
-    if let Some(n) = encode_window_resized(
-        &mut reply,
-        window_id,
-        new_w,
-        new_h,
-        new_pitch,
-        new_channel_id,
-    ) {
-        let _ = sys::write(client_endpoint, &reply[..n]);
+    // Read client_endpoint AFTER the kernel calls — if the slot was
+    // reaped between find_window and now (unlikely; channel_create
+    // succeeded), the get_mut below also returns None and we skip the
+    // notify. The realloc succeeded but the window is gone; the new
+    // channel will be revoked by normal teardown.
+    let client_endpoint = window_table
+        .get_mut(slot)
+        .map(|w| w.client_endpoint)
+        .unwrap_or(0);
+
+    if client_endpoint != 0 {
+        let mut reply = [0u8; 32];
+        if let Some(n) = encode_window_resized(
+            &mut reply,
+            window_id,
+            new_w,
+            new_h,
+            new_pitch,
+            new_channel_id,
+        ) {
+            let _ = sys::write(client_endpoint, &reply[..n]);
+        }
     }
 
-    // Update the Window record so subsequent composite passes draw
-    // from the new surface.
     if let Some(w) = window_table.get_mut(slot) {
         w.surface_channel_id = new_channel_id;
         w.surface_vaddr = new_surface_vaddr;
         w.width = new_w;
         w.height = new_h;
         w.pitch = new_pitch;
+        if let Some(nx) = new_x {
+            w.x = nx;
+        }
+        if let Some(ny) = new_y {
+            w.y = ny;
+        }
     }
 
-    // Complete teardown of the old channel — unmaps both sides, wakes
-    // any quiesce-parked task, frees physical pages.
     if needs_complete {
         let _ = sys::channel_complete_teardown(old_channel_id, sys::TEARDOWN_KIND_CLOSE);
+    }
+
+    Ok(())
+}
+
+/// Client-initiated resize via `RequestResize`. Decodes, runs the
+/// auth check (sender_principal must equal owner_principal), and
+/// delegates the actual realloc to [`commit_window_resize`]. Errors
+/// before commit go to `from_endpoint` (the kernel-stamped reply
+/// target before ownership is established); errors during commit go
+/// to the window's recorded `client_endpoint` — unified error
+/// reporting since both endpoints route to the owning client by then.
+fn handle_request_resize(
+    payload: &[u8],
+    sender_principal: &[u8; 32],
+    from_endpoint: u32,
+    window_table: &mut WindowTable,
+) {
+    let (window_id, new_w, new_h) = match decode_request_resize(payload) {
+        Some(t) => t,
+        None => {
+            send_error(from_endpoint, GuiError::InvalidMessage);
+            return;
+        }
+    };
+
+    let slot = match window_table.find_window(window_id) {
+        Some(s) => s,
+        None => {
+            send_error(from_endpoint, GuiError::NoSuchWindow);
+            return;
+        }
+    };
+    let client_endpoint = {
+        let w = match window_table.get_mut(slot) {
+            Some(w) => w,
+            None => return,
+        };
+        if &w.owner_principal != sender_principal {
+            send_error(from_endpoint, GuiError::NoSuchWindow);
+            return;
+        }
+        w.client_endpoint
+    };
+
+    if let Err(e) = commit_window_resize(window_table, window_id, new_w, new_h, None, None) {
+        // InvalidDimensions is a client mistake — route to the
+        // pre-auth reply endpoint so the client sees it on its first
+        // message exchange. SurfaceAllocFailed is a kernel/compositor
+        // failure observed post-auth — route to the recorded endpoint.
+        let target = match e {
+            GuiError::InvalidDimensions => from_endpoint,
+            _ => client_endpoint,
+        };
+        send_error(target, e);
     }
 }
 
