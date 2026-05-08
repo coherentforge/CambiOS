@@ -705,11 +705,39 @@ mod tests {
 
     #[test]
     fn create_window_roundtrip() {
-        let mut buf = [0u8; 16];
-        let n = encode_create_window(&mut buf, 640, 480).unwrap();
-        assert_eq!(n, 12);
-        let (w, h) = decode_create_window(&buf).unwrap();
-        assert_eq!((w, h), (640, 480));
+        let mut buf = [0u8; 32];
+        let n = encode_create_window(
+            &mut buf,
+            /* width */ 640,
+            /* height */ 480,
+            /* z_order */ 2,
+            /* alpha_blend */ true,
+            /* reply_endpoint */ 0xDEAD_BEEF,
+        )
+        .unwrap();
+        assert_eq!(n, 20);
+        let msg = decode_create_window(&buf).unwrap();
+        assert_eq!(msg.width, 640);
+        assert_eq!(msg.height, 480);
+        assert_eq!(msg.z_order, 2);
+        assert!(msg.alpha_blend);
+        assert_eq!(msg.reply_endpoint, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn create_window_decodes_v0_legacy_layout() {
+        // 12-byte v0 buffer (no z_order / alpha_blend / reply_endpoint).
+        // Decoder defaults to v0 semantics: z=0, alpha=false, reply=0.
+        let mut buf = [0u8; 12];
+        buf[..4].copy_from_slice(&MsgTag::CreateWindow.as_u32().to_le_bytes());
+        buf[4..8].copy_from_slice(&100u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&50u32.to_le_bytes());
+        let msg = decode_create_window(&buf).unwrap();
+        assert_eq!(msg.width, 100);
+        assert_eq!(msg.height, 50);
+        assert_eq!(msg.z_order, 0);
+        assert!(!msg.alpha_blend);
+        assert_eq!(msg.reply_endpoint, 0);
     }
 
     #[test]
@@ -810,7 +838,7 @@ mod tests {
     #[test]
     fn decode_rejects_wrong_tag() {
         let mut buf = [0u8; MAX_MESSAGE_SIZE];
-        encode_create_window(&mut buf, 100, 100).unwrap();
+        encode_create_window(&mut buf, 100, 100, 0, false, 0).unwrap();
         // Try to decode as WelcomeClient
         assert!(decode_welcome_client(&buf).is_none());
         // Try to decode as FrameReady

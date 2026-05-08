@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Override the parent project's bare-metal kernel target so this crate
+# can be built and tested standalone. libgui-proto is `no_std` for
+# its production use but its test module needs `std` (test runner +
+# `assert_eq!`). Without this override, `cargo test
+# -p cambios-libgui-proto` inherits the parent .cargo/config.toml's
+# `target = "x86_64-unknown-none"`, which has no std/test crates and
+# the runner fails to link.
+#
+# Mirrors the cambios-abi precedent (cambios-abi/.cargo/config.toml)
+# — same shape, same rationale, same native macOS-on-Apple-Silicon
+# triple to avoid cross-compile overhead.
+[build]
+target = "aarch64-apple-darwin"
