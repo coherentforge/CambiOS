@@ -324,6 +324,8 @@ fn cmd_play(t: &mut Terminal<GuiBackend>, args: &[u8]) {
             ClientError::ChannelAttachFailed(_) => b"channel_attach",
             ClientError::EncodeFrameReady => b"encode_frame_ready",
             ClientError::FrameReadyWriteFailed(_) => b"frame_ready_write",
+            ClientError::EncodeRequestResize => b"encode_request_resize",
+            ClientError::RequestResizeWriteFailed(_) => b"request_resize_write",
         };
         sys::print(b"[terminal-window] reopen failed after game exit: ");
         sys::print(tag);

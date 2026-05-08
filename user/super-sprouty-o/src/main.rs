@@ -113,6 +113,8 @@ pub extern "C" fn _start() -> ! {
                 cambios_libgui::ClientError::ChannelAttachFailed(_) => b"channel_attach",
                 cambios_libgui::ClientError::EncodeFrameReady => b"encode_frame_ready",
                 cambios_libgui::ClientError::FrameReadyWriteFailed(_) => b"frame_ready_write",
+                cambios_libgui::ClientError::EncodeRequestResize => b"encode_request_resize",
+                cambios_libgui::ClientError::RequestResizeWriteFailed(_) => b"request_resize_write",
             };
             sys::log_error(b"SPROUTY", tag);
             sys::exit(1);
