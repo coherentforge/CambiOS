@@ -140,7 +140,7 @@ src/arch/x86_64/tlb.rs:27:TLB_SHOOTDOWN_VECTOR
 src/arch/x86_64/tlb.rs:32:MAX_INDIVIDUAL_PAGES
 src/audit/buffer.rs:36:STAGING_BUFFER_CAPACITY
 src/audit/drain.rs:56:AUDIT_RING_PAGES
-src/audit/mod.rs:728:FLAG_SAMPLED
+src/audit/mod.rs:802:FLAG_SAMPLED
 src/boot/initrd.rs:55:ARCHIVE_VERSION
 src/boot/initrd.rs:58:ARCHIVE_HEADER_SIZE
 src/boot/initrd.rs:61:ENTRY_HEADER_SIZE
@@ -210,7 +210,7 @@ src/io/mod.rs:161:NS16550_PHYS_BASE
 src/io/mod.rs:291:UARTFR_RXFE
 src/ipc/channel.rs:42:MAX_CHANNELS
 src/ipc/channel.rs:58:MAX_CHANNEL_PAGES
-src/lib.rs:365:BALANCE_INTERVAL_TICKS
+src/lib.rs:397:BALANCE_INTERVAL_TICKS
 src/loader/elf.rs:15:ELF_CLASS_64BIT
 src/loader/elf.rs:16:ELF_DATA_LITTLE_ENDIAN
 src/loader/elf.rs:17:ELF_TYPE_EXECUTABLE

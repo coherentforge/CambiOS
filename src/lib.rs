@@ -345,6 +345,38 @@ pub fn arm_quiesce_for_process(
     None
 }
 
+/// Wake any task parked in `Blocked(ChannelQuiesceWait(channel_id_raw))`
+/// across every per-CPU scheduler (ADR-027 Phase 1).
+///
+/// Companion to [`arm_quiesce_for_process`]: where that helper parks a
+/// peer task on whichever CPU owns it, this helper drains those parked
+/// tasks back to `Ready` once `complete_teardown` has freed the channel
+/// slot. Walking every CPU rather than the channel's owning CPU costs
+/// O(MAX_CPUS) per call but keeps the wake path correct under task
+/// migration — the peer might have moved CPUs between
+/// `arm_quiesce_for_process` and `wake_quiesce_for_channel`.
+///
+/// Returns the total number of tasks woken across all CPUs.
+#[cfg(not(test))]
+pub fn wake_quiesce_for_channel(channel_id_raw: u64) -> usize {
+    let mut total = 0;
+    for cpu in 0..MAX_CPUS {
+        let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+        if let Some(sched) = guard.as_mut() {
+            total += sched.wake_quiesce(channel_id_raw);
+        }
+    }
+    total
+}
+
+/// Test stub — per-CPU scheduler array unavailable under host tests.
+/// `Scheduler::wake_quiesce` is exercised directly in
+/// `src/scheduler/mod.rs::tests`.
+#[cfg(test)]
+pub fn wake_quiesce_for_channel(_channel_id_raw: u64) -> usize {
+    0
+}
+
 // ============================================================================
 // Load balancing
 // ============================================================================

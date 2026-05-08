@@ -254,12 +254,25 @@ impl SyscallDispatcher {
                 Self::handle_get_process_principal(args, &ctx),
 
             // ADR-027 Phase 1: per-channel quiesce cooperative ack.
-            // Slot reserved here; handler lands in the dispatcher
-            // migration commit alongside the begin_teardown / quiesce
-            // wait / complete_teardown wiring. Until then, calls return
-            // Enosys so userspace cannot accidentally consume the slot
-            // before the protocol is hooked up end-to-end.
-            SyscallNumber::ChannelQuiesceAck => Err(SyscallError::Enosys),
+            // Cooperative path the libgui resize flow does not invoke
+            // (resize relies on advisory cooperation — client willingly
+            // closes its side after WindowResized), but a forced-revoke
+            // / cluster-revoke / process-exit consumer can call to park
+            // itself synchronously and return cleanly when
+            // `complete_teardown` wakes it.
+            SyscallNumber::ChannelQuiesceAck =>
+                Self::handle_channel_quiesce_ack(args, &ctx),
+
+            // ADR-027 Phase 1 two-phase teardown — substrate for
+            // resize, cluster revoke, and forced-revoke flows. The
+            // pair brackets the kernel-side quiesce window; the
+            // libgui resize handler is the first real consumer, with
+            // forced-teardown / cluster-revoke migrating off the
+            // single-phase `ChannelClose` path as ADR-027 phases land.
+            SyscallNumber::ChannelBeginTeardown =>
+                Self::handle_channel_begin_teardown(args, &ctx),
+            SyscallNumber::ChannelCompleteTeardown =>
+                Self::handle_channel_complete_teardown(args, &ctx),
 
             // ADR-027 cluster handles. Wire to ClusterManager
             // (src/ipc/cluster.rs) + cluster_policy
@@ -2876,6 +2889,237 @@ impl SyscallDispatcher {
             record.num_pages,
         );
 
+        Ok(0)
+    }
+
+    /// SYS_CHANNEL_BEGIN_TEARDOWN: start the two-phase teardown of a
+    /// channel (ADR-027 Phase 1). Caller must be the channel's
+    /// creator or peer (same auth as `channel_close`).
+    ///
+    /// Args: arg1 = channel_id (u64), arg2 = TeardownKind low byte
+    /// (0 = Close, 1 = Revoke).
+    ///
+    /// Returns 0 on the `AwaitingAttach` short-circuit (slot torn
+    /// down inline; subsequent `complete_teardown` will return
+    /// `InvalidArg`), 1 on the `Active → Revoking` quiesce path
+    /// (peer arming in flight; caller must drive the workflow that
+    /// arranges the peer's cooperation, then call
+    /// `complete_teardown`).
+    ///
+    /// Lock ordering: CHANNEL_MANAGER(6) → (drop) → optional
+    /// `arm_quiesce_for_process` walk over PER_CPU_SCHEDULER(1)
+    /// (acquired by the helper, never held with CHANNEL_MANAGER).
+    /// On the `Immediate` arm: same teardown chain as
+    /// `handle_channel_close` — PROCESS_TABLE(7) + FRAME_ALLOCATOR(8)
+    /// inside `teardown_channel_mappings`, then TLB shootdown.
+    fn handle_channel_begin_teardown(
+        args: SyscallArgs,
+        ctx: &SyscallContext,
+    ) -> SyscallResult {
+        use crate::ipc::channel::{ChannelId, TeardownKind, TeardownStart};
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+        let kind = match args.arg2 & 0xFF {
+            0 => TeardownKind::Close,
+            1 => TeardownKind::Revoke,
+            _ => return Err(SyscallError::InvalidArg),
+        };
+        let kind_u8 = (args.arg2 & 0xFF) as u8;
+
+        let outcome = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            // Endpoint authority: same shape as handle_channel_close.
+            // Look up the record once for the auth check before
+            // mutating state — begin_teardown itself doesn't validate
+            // the caller because the channel manager is pure
+            // bookkeeping (kept arch-agnostic / verification-clean).
+            let record = chan_mgr.get(channel_id)
+                .map_err(|_| SyscallError::InvalidArg)?;
+            let is_creator = record.creator_pid == ctx.process_id;
+            let is_peer = record.peer_pid == Some(ctx.process_id);
+            if !is_creator && !is_peer {
+                return Err(SyscallError::PermissionDenied);
+            }
+            chan_mgr.begin_teardown(channel_id, kind)
+                .map_err(|_| SyscallError::InvalidArg)?
+        }; // drop CHANNEL_MANAGER(6)
+
+        match outcome {
+            TeardownStart::Immediate(record) => {
+                let num_pages = record.num_pages;
+                Self::teardown_channel_mappings(&record);
+                crate::audit::emit(crate::audit::RawAuditEvent::channel_closed(
+                    ctx.process_id,
+                    channel_id.as_raw(),
+                    0,
+                    0,
+                    crate::audit::now(),
+                    0,
+                ));
+                crate::println!(
+                    "  [ChannelBeginTeardown:Immediate] pid={} channel={} pages={}",
+                    ctx.process_id.slot(),
+                    channel_id.as_raw(),
+                    num_pages,
+                );
+                Ok(0)
+            }
+            TeardownStart::Quiesce(snapshot) => {
+                if let Some(peer_pid) = snapshot.peer_pid {
+                    let _ = crate::arm_quiesce_for_process(peer_pid, channel_id.as_raw());
+                }
+                crate::audit::emit(crate::audit::RawAuditEvent::channel_teardown_started(
+                    ctx.process_id,
+                    channel_id.as_raw(),
+                    kind_u8,
+                    crate::audit::now(),
+                    0,
+                ));
+                crate::println!(
+                    "  [ChannelBeginTeardown:Quiesce] pid={} channel={} kind={}",
+                    ctx.process_id.slot(),
+                    channel_id.as_raw(),
+                    kind_u8,
+                );
+                Ok(1)
+            }
+        }
+    }
+
+    /// SYS_CHANNEL_COMPLETE_TEARDOWN: finish the two-phase teardown
+    /// started by `handle_channel_begin_teardown` (ADR-027 Phase 1).
+    /// Channel must be in `Revoking`; same `kind` discriminant as the
+    /// matching begin call.
+    ///
+    /// Args: arg1 = channel_id (u64), arg2 = TeardownKind low byte
+    /// (0 = Close, 1 = Revoke).
+    ///
+    /// Lock ordering: CHANNEL_MANAGER(6) → (drop) → PROCESS_TABLE(7)
+    /// + FRAME_ALLOCATOR(8) inside `teardown_channel_mappings`, then
+    /// `wake_quiesce_for_channel` walks PER_CPU_SCHEDULER(1) (helper
+    /// never holds it with anything else). Identical lock sequence
+    /// to `handle_channel_close` plus the wake walk at the end.
+    fn handle_channel_complete_teardown(
+        args: SyscallArgs,
+        ctx: &SyscallContext,
+    ) -> SyscallResult {
+        use crate::ipc::channel::{ChannelId, TeardownKind};
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+        let kind = match args.arg2 & 0xFF {
+            0 => TeardownKind::Close,
+            1 => TeardownKind::Revoke,
+            _ => return Err(SyscallError::InvalidArg),
+        };
+        let kind_u8 = (args.arg2 & 0xFF) as u8;
+
+        let record = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+            // Endpoint authority — same as begin_teardown. The slot
+            // is still occupied (Revoking holds the slot) so the
+            // record is reachable; complete_teardown then takes it.
+            let record = chan_mgr.get(channel_id)
+                .map_err(|_| SyscallError::InvalidArg)?;
+            let is_creator = record.creator_pid == ctx.process_id;
+            let is_peer = record.peer_pid == Some(ctx.process_id);
+            if !is_creator && !is_peer {
+                return Err(SyscallError::PermissionDenied);
+            }
+            chan_mgr.complete_teardown(channel_id, kind)
+                .map_err(|_| SyscallError::InvalidArg)?
+        }; // drop CHANNEL_MANAGER(6)
+
+        let num_pages = record.num_pages;
+        Self::teardown_channel_mappings(&record);
+        let woken = crate::wake_quiesce_for_channel(channel_id.as_raw());
+
+        crate::audit::emit(crate::audit::RawAuditEvent::channel_teardown_completed(
+            ctx.process_id,
+            channel_id.as_raw(),
+            kind_u8,
+            num_pages,
+            crate::audit::now(),
+            0,
+        ));
+        crate::println!(
+            "  [ChannelCompleteTeardown] pid={} channel={} pages={} woken={}",
+            ctx.process_id.slot(),
+            channel_id.as_raw(),
+            num_pages,
+            woken,
+        );
+
+        Ok(0)
+    }
+
+    /// SYS_CHANNEL_QUIESCE_ACK: cooperative-ack of a pending channel
+    /// revoke (ADR-027 Phase 1). Caller voluntarily transitions its
+    /// own task into `Blocked(ChannelQuiesceWait(channel_id))` and
+    /// yields. The matching `complete_teardown` wakes the task by
+    /// calling `wake_quiesce_for_channel`; the syscall returns 0 to
+    /// the awoken task.
+    ///
+    /// Authority: caller's bound Principal must match
+    /// `record.peer_principal` of the channel being revoked, AND the
+    /// channel must currently be in `Revoking`. This is the cooperative
+    /// path — the kernel-side `try_park_current_for_quiesce` hook
+    /// catches a peer that did not voluntarily ack at the next ISR
+    /// tick (≤ 10 ms at 100 Hz) regardless.
+    ///
+    /// Lock ordering: CHANNEL_MANAGER(6) → (drop) → PER_CPU_SCHEDULER(1)
+    /// (block_task) → (drop) → yield_save_and_switch.
+    fn handle_channel_quiesce_ack(
+        args: SyscallArgs,
+        ctx: &SyscallContext,
+    ) -> SyscallResult {
+        use crate::ipc::channel::{ChannelId, ChannelState};
+
+        let channel_id = ChannelId::from_raw(args.arg1);
+
+        // Authority + state precondition.
+        {
+            let chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
+            let record = chan_mgr.get(channel_id)
+                .map_err(|_| SyscallError::InvalidArg)?;
+            if record.state != ChannelState::Revoking {
+                return Err(SyscallError::InvalidArg);
+            }
+            let caller = ctx.caller_principal.as_ref()
+                .ok_or(SyscallError::PermissionDenied)?;
+            if *caller != record.peer_principal {
+                return Err(SyscallError::PermissionDenied);
+            }
+        } // drop CHANNEL_MANAGER(6)
+
+        // Park ourselves and yield. Same disable-IF-before-block
+        // pattern as handle_wait_irq / handle_recv_msg — the timer
+        // ISR must not see Blocked state before
+        // yield_save_and_switch saves the correct context.
+        // SAFETY: kernel privilege; cli is local to this CPU.
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+        {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_mut() {
+                let _ = sched.block_task(
+                    ctx.task_id,
+                    crate::scheduler::BlockReason::ChannelQuiesceWait(channel_id.as_raw()),
+                );
+            }
+            // IrqSpinlock drop preserves the cli we just issued.
+        }
+        // SAFETY: on kernel stack, no locks held.
+        unsafe { crate::arch::yield_save_and_switch(); }
+        // Woken by handle_channel_complete_teardown's
+        // wake_quiesce_for_channel call. The channel slot is gone;
+        // any subsequent surface access by the caller will fault on
+        // the unmapped peer mapping unless they re-attach a fresh
+        // channel first.
         Ok(0)
     }
 

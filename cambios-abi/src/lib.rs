@@ -488,6 +488,58 @@ pub enum SyscallNumber {
     /// Syscalls (renumber per the Divergence appendix). Handler stub
     /// returns `Enosys` until the dispatcher migration commit.
     ClusterInfo = 47,
+
+    /// SYS_CHANNEL_BEGIN_TEARDOWN (48): start the two-phase teardown
+    /// of a channel (ADR-027 Phase 1). Must be paired with a
+    /// matching `SYS_CHANNEL_COMPLETE_TEARDOWN` carrying the same
+    /// `kind`. The intervening window is when the caller arranges
+    /// peer cooperation — for resize, sends a fresh
+    /// `WindowResized` to the client; for cluster revoke, walks the
+    /// member set; for forced revoke, gives the kernel time to
+    /// quiesce the peer task before unmap.
+    ///
+    /// Args: arg1 = channel_id (u64; `ChannelId::as_raw()`),
+    ///       arg2 = kind (u8 in low byte: 0 = Close, 1 = Revoke).
+    ///
+    /// On `Active` channels the kernel transitions to `Revoking`,
+    /// arms quiesce on the peer (parks Running peer at next ISR /
+    /// yield, parks Ready peer synchronously, no-op for already-
+    /// off-CPU peer), and returns 1 to signal "quiesce in flight".
+    /// On `AwaitingAttach` channels (no peer to quiesce) the kernel
+    /// short-circuits the slot to the terminal state, runs unmap
+    /// inline, and returns 0 — a subsequent `complete_teardown`
+    /// is rejected with `InvalidArg` (slot already gone).
+    ///
+    /// Authority: caller must be the channel's creator or peer
+    /// (same shape as `ChannelClose`). Bootstrap-Principal authority
+    /// continues to use `ChannelRevoke` (single-phase) for forced
+    /// teardown; this two-phase API is for cooperative teardown
+    /// initiated by an endpoint.
+    ///
+    /// Returns: 0 (Immediate, slot already torn down), 1 (Quiesce,
+    /// peer arming in flight, must call complete_teardown next),
+    /// `PermissionDenied` if not an endpoint, `InvalidArg` for
+    /// stale id / wrong state.
+    ChannelBeginTeardown = 48,
+
+    /// SYS_CHANNEL_COMPLETE_TEARDOWN (49): finish the two-phase
+    /// teardown started by `SYS_CHANNEL_BEGIN_TEARDOWN`. Channel
+    /// must be in `Revoking` and the same `kind` must be passed.
+    /// The kernel completes the slot transition (terminal state
+    /// per `kind`), unmaps both sides via `teardown_channel_mappings`,
+    /// frees physical pages, and wakes any task parked in
+    /// `Blocked(ChannelQuiesceWait(channel_id))` so it returns from
+    /// its `SYS_CHANNEL_QUIESCE_ACK`.
+    ///
+    /// Args: arg1 = channel_id (u64), arg2 = kind (u8 low byte).
+    ///
+    /// Authority: same as `ChannelBeginTeardown` — endpoint of the
+    /// channel. The `Revoking` state guarantees no other endpoint
+    /// can call `attach`/`close`/`revoke` between the two phases.
+    ///
+    /// Returns: 0 on success, `InvalidArg` for stale id / wrong
+    /// state / kind-mismatch.
+    ChannelCompleteTeardown = 49,
 }
 
 impl SyscallNumber {
@@ -522,6 +574,7 @@ impl SyscallNumber {
             Self::GetProcessPrincipal |
             Self::SetWallclock |
             Self::ChannelQuiesceAck |
+            Self::ChannelBeginTeardown | Self::ChannelCompleteTeardown |
             Self::ClusterCreate | Self::ClusterJoin |
             Self::ClusterRevoke | Self::ClusterInfo
         )
@@ -579,6 +632,8 @@ impl SyscallNumber {
             45 => Some(Self::ClusterJoin),
             46 => Some(Self::ClusterRevoke),
             47 => Some(Self::ClusterInfo),
+            48 => Some(Self::ChannelBeginTeardown),
+            49 => Some(Self::ChannelCompleteTeardown),
             _ => None,
         }
     }
@@ -759,6 +814,8 @@ mod tests {
             SyscallNumber::ChannelQuiesceAck,
             SyscallNumber::ClusterCreate, SyscallNumber::ClusterJoin,
             SyscallNumber::ClusterRevoke, SyscallNumber::ClusterInfo,
+            SyscallNumber::ChannelBeginTeardown,
+            SyscallNumber::ChannelCompleteTeardown,
         ];
 
         for &num in &all {
@@ -787,12 +844,14 @@ mod tests {
     fn all_syscall_numbers_covered() {
         // Verify from_u64 round-trips for all defined values, ensuring
         // no gap in the requires_identity() match. ADR-022 wallclock
-        // pair (39/40) lands inside the contiguous 0..=47 sweep.
-        // ADR-027 cluster-handle reservations (44 ClusterCreate, 45
-        // ClusterJoin, 46 ClusterRevoke, 47 ClusterInfo) are the most
-        // recent slots — handlers Enosys-stubbed in the dispatcher
-        // until the cluster-syscall implementation commit lands.
-        for i in 0..=47u64 {
+        // pair (39/40) lands inside the contiguous 0..=49 sweep.
+        // ADR-027 cluster-handle reservations (44..=47) and the
+        // two-phase channel-teardown pair (48 ChannelBeginTeardown,
+        // 49 ChannelCompleteTeardown) round out the current high-water
+        // mark. The two-phase pair is the kernel-side substrate for
+        // the resize / cluster-revoke / forced-teardown family;
+        // userspace consumers wire in via the libsys wrappers.
+        for i in 0..=49u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();

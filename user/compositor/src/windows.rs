@@ -26,8 +26,9 @@
 //! in `main.rs` is what ties front and back together each frame.
 
 use cambios_libgui_proto::{
-    decode_create_window, decode_destroy_window, decode_frame_ready_header, encode_error_response,
-    encode_welcome_client, GuiError, MsgTag, PixelFormat, MAX_WINDOWS, MAX_WINDOW_DIMENSION,
+    decode_create_window, decode_destroy_window, decode_frame_ready_header,
+    decode_request_resize, encode_error_response, encode_welcome_client, encode_window_resized,
+    GuiError, MsgTag, PixelFormat, MAX_WINDOWS, MAX_WINDOW_DIMENSION,
 };
 use cambios_libsys as sys;
 
@@ -333,11 +334,16 @@ pub fn handle_client_payload(
             handle_drag_window_by(payload, sender_principal, from_endpoint, window_table);
             None
         }
+        MsgTag::RequestResize => {
+            handle_request_resize(payload, sender_principal, from_endpoint, window_table);
+            None
+        }
         // 0x40xx tags (compositor → client) must never arrive here.
         MsgTag::WelcomeClient
         | MsgTag::WindowClosed
         | MsgTag::ErrorResponse
-        | MsgTag::InputEvent => {
+        | MsgTag::InputEvent
+        | MsgTag::WindowResized => {
             send_error(from_endpoint, GuiError::InvalidMessage);
             None
         }
@@ -389,6 +395,143 @@ fn handle_drag_window_by(
     }
     w.x = w.x.saturating_add(dx);
     w.y = w.y.saturating_add(dy);
+}
+
+/// Resize a window's surface (Tier 2 — first real consumer of the
+/// ADR-027 Phase 1 two-phase teardown protocol).
+///
+/// Flow:
+/// 1. Decode `RequestResize` + validate dimensions.
+/// 2. Look up the window; reject foreign-Principal requests with
+///    `NoSuchWindow` (matches `handle_frame_ready` / `handle_drag…`).
+/// 3. `channel_begin_teardown(old, Close)` — kernel transitions the
+///    old surface channel to `Revoking` and arm-quiesces the peer
+///    (the client). For the typical `Active` channel the call returns
+///    `1` (Quiesce-in-flight); on the rare `AwaitingAttach` short-
+///    circuit it returns `0` (slot already torn down inline).
+/// 4. `channel_create` a fresh surface sized for `(new_w × new_h)`.
+/// 5. Send `WindowResized { new_channel_id, new_w, new_h, new_pitch }`
+///    to the client's reply endpoint. The client's libgui machinery
+///    `apply_resize_notification`s on its next `poll_event`: closes
+///    the old mapping (returns `InvalidState` because the slot is
+///    in `Revoking` — libgui ignores it), attaches the new channel.
+/// 6. Update the `Window` record to point at the new channel.
+/// 7. `channel_complete_teardown(old, Close)` — kernel unmaps both
+///    sides, frees pages, wakes any quiesce-parked task. (Skipped on
+///    the `AwaitingAttach` short-circuit because `begin` already
+///    finished.)
+///
+/// Failure modes:
+/// - `begin_teardown` failure (negative): no kernel state change;
+///   send `SurfaceAllocFailed` and return.
+/// - `channel_create` failure (negative): finish the begin via
+///   `complete_teardown` so the slot is freed; send error. The client
+///   gets no `WindowResized` and its old surface vaddr is now a
+///   tombstone — the window is effectively dead, which is the same
+///   shape as a normal teardown.
+/// - `encode_window_resized` failure: defensive only — the 32-byte
+///   reply buffer is always large enough. Skip the write but still
+///   complete teardown.
+fn handle_request_resize(
+    payload: &[u8],
+    sender_principal: &[u8; 32],
+    from_endpoint: u32,
+    window_table: &mut WindowTable,
+) {
+    let (window_id, new_w, new_h) = match decode_request_resize(payload) {
+        Some(t) => t,
+        None => {
+            send_error(from_endpoint, GuiError::InvalidMessage);
+            return;
+        }
+    };
+
+    if new_w == 0
+        || new_h == 0
+        || new_w > MAX_WINDOW_DIMENSION
+        || new_h > MAX_WINDOW_DIMENSION
+    {
+        send_error(from_endpoint, GuiError::InvalidDimensions);
+        return;
+    }
+
+    let slot = match window_table.find_window(window_id) {
+        Some(s) => s,
+        None => {
+            send_error(from_endpoint, GuiError::NoSuchWindow);
+            return;
+        }
+    };
+
+    let (old_channel_id, owner_principal, client_endpoint) = {
+        let w = match window_table.get_mut(slot) {
+            Some(w) => w,
+            None => return,
+        };
+        if &w.owner_principal != sender_principal {
+            send_error(from_endpoint, GuiError::NoSuchWindow);
+            return;
+        }
+        (w.surface_channel_id, w.owner_principal, w.client_endpoint)
+    };
+
+    // Begin teardown of old channel.
+    let begin_rc = sys::channel_begin_teardown(old_channel_id, sys::TEARDOWN_KIND_CLOSE);
+    if begin_rc < 0 {
+        send_error(client_endpoint, GuiError::SurfaceAllocFailed);
+        return;
+    }
+    let needs_complete = begin_rc == 1;
+
+    // Allocate the new surface channel.
+    let new_pitch = new_w * SURFACE_BYTES_PER_PIXEL;
+    let new_bytes = (new_pitch as u64) * (new_h as u64);
+    let new_size_pages = ((new_bytes + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as u32;
+    let mut new_surface_vaddr: u64 = 0;
+    let create_rc = sys::channel_create(
+        new_size_pages,
+        &owner_principal,
+        CHANNEL_ROLE_CONSUMER,
+        &mut new_surface_vaddr,
+    );
+    if create_rc < 0 {
+        if needs_complete {
+            let _ = sys::channel_complete_teardown(old_channel_id, sys::TEARDOWN_KIND_CLOSE);
+        }
+        send_error(client_endpoint, GuiError::SurfaceAllocFailed);
+        return;
+    }
+    let new_channel_id = create_rc as u64;
+
+    // Notify the client. WindowResized fits in 28 bytes; 32-byte
+    // buffer leaves 4 bytes of slack for protocol evolution.
+    let mut reply = [0u8; 32];
+    if let Some(n) = encode_window_resized(
+        &mut reply,
+        window_id,
+        new_w,
+        new_h,
+        new_pitch,
+        new_channel_id,
+    ) {
+        let _ = sys::write(client_endpoint, &reply[..n]);
+    }
+
+    // Update the Window record so subsequent composite passes draw
+    // from the new surface.
+    if let Some(w) = window_table.get_mut(slot) {
+        w.surface_channel_id = new_channel_id;
+        w.surface_vaddr = new_surface_vaddr;
+        w.width = new_w;
+        w.height = new_h;
+        w.pitch = new_pitch;
+    }
+
+    // Complete teardown of the old channel — unmaps both sides, wakes
+    // any quiesce-parked task, frees physical pages.
+    if needs_complete {
+        let _ = sys::channel_complete_teardown(old_channel_id, sys::TEARDOWN_KIND_CLOSE);
+    }
 }
 
 fn handle_create_window(

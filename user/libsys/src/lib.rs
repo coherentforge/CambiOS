@@ -1145,6 +1145,74 @@ pub fn channel_revoke(channel_id: u64) -> i64 {
     syscall_raw3(SyscallNumber::ChannelRevoke as u64, channel_id, 0, 0)
 }
 
+/// `TeardownKind` discriminants for the two-phase teardown syscall
+/// pair. Mirror the kernel's `crate::ipc::channel::TeardownKind` so
+/// userspace consumers don't need to import the kernel ABI surface
+/// for the raw values.
+pub const TEARDOWN_KIND_CLOSE: u32 = 0;
+pub const TEARDOWN_KIND_REVOKE: u32 = 1;
+
+/// `SYS_CHANNEL_BEGIN_TEARDOWN`: start the two-phase teardown of a
+/// channel (ADR-027 Phase 1). Caller must be an endpoint of the
+/// channel (creator or peer); same auth as [`channel_close`].
+///
+/// Returns:
+/// - `0` (Immediate) when the channel was `AwaitingAttach` and got
+///   torn down inline. **Do not call** [`channel_complete_teardown`]
+///   afterward — it will return `InvalidArg`.
+/// - `1` (Quiesce) when the channel was `Active`; it is now in
+///   `Revoking`, the peer is being arm-quiesced. The caller must
+///   complete teardown via [`channel_complete_teardown`] with the
+///   matching `kind`.
+/// - Negative error code on failure (`PermissionDenied` if not an
+///   endpoint, `InvalidArg` for stale id / wrong state).
+///
+/// `kind` is one of `TEARDOWN_KIND_CLOSE` / `TEARDOWN_KIND_REVOKE`.
+pub fn channel_begin_teardown(channel_id: u64, kind: u32) -> i64 {
+    syscall_raw3(
+        SyscallNumber::ChannelBeginTeardown as u64,
+        channel_id,
+        kind as u64,
+        0,
+    )
+}
+
+/// `SYS_CHANNEL_COMPLETE_TEARDOWN`: finish the two-phase teardown
+/// started by [`channel_begin_teardown`] (ADR-027 Phase 1). Channel
+/// must be in `Revoking`; pass the same `kind` as the matching begin
+/// call. Wakes any peer task parked in
+/// `Blocked(ChannelQuiesceWait(channel_id))`.
+///
+/// Returns 0 on success, negative error code on failure.
+pub fn channel_complete_teardown(channel_id: u64, kind: u32) -> i64 {
+    syscall_raw3(
+        SyscallNumber::ChannelCompleteTeardown as u64,
+        channel_id,
+        kind as u64,
+        0,
+    )
+}
+
+/// `SYS_CHANNEL_QUIESCE_ACK`: cooperative ack of a pending channel
+/// revoke (ADR-027 Phase 1). The kernel parks the calling task into
+/// `Blocked(ChannelQuiesceWait(channel_id))` until the matching
+/// [`channel_complete_teardown`] runs, at which point this syscall
+/// returns 0 to the awoken task.
+///
+/// Authority: caller's bound Principal must match the channel's
+/// `peer_principal`, and the channel must currently be in
+/// `Revoking`. Returns `PermissionDenied` / `InvalidArg` otherwise.
+///
+/// In v1 this syscall is reserved-for-correctness rather than
+/// load-bearing — the kernel-side scheduler hook
+/// (`Scheduler::try_park_current_for_quiesce`) catches an
+/// uncooperative peer at the next ISR within ≤10 ms anyway. The
+/// cooperative ack exists so future cluster / forced-revoke flows
+/// can fast-path the wait without bouncing off a tick.
+pub fn channel_quiesce_ack(channel_id: u64) -> i64 {
+    syscall_raw3(SyscallNumber::ChannelQuiesceAck as u64, channel_id, 0, 0)
+}
+
 /// Query channel metadata.
 ///
 /// Writes a 46-byte descriptor to `out_buf`. Returns 0 on success.

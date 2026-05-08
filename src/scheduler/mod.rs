@@ -757,6 +757,63 @@ impl Scheduler {
         Some((task_id, result))
     }
 
+    /// Wake any task parked in `Blocked(ChannelQuiesceWait(channel_id_raw))`
+    /// (ADR-027 Phase 1).
+    ///
+    /// Companion to [`arm_quiesce`]: when a `complete_teardown` finishes
+    /// and the channel slot is gone, any peer that voluntarily acked via
+    /// `SYS_CHANNEL_QUIESCE_ACK` (or that the scheduler hook parked at
+    /// next ISR) must be moved back to `Ready` so its syscall can return.
+    /// Tasks blocked on different channels are left untouched.
+    ///
+    /// Mirror of [`wake_message_waiters`] — same scan, different match
+    /// arm. Bounded enqueue buffer so we don't allocate from the wake
+    /// path; the cap matches `wake_irq_waiters` / `wake_message_waiters`.
+    ///
+    /// Returns the number of tasks woken.
+    pub fn wake_quiesce(&mut self, channel_id_raw: u64) -> usize {
+        /// SCAFFOLDING: stack-resident enqueue-buffer cap. v1 has 1
+        /// peer task per channel (1:1 process↔task), so realistic
+        /// `woken` is 1; 8 leaves slack for a future N:1 task model.
+        /// Why: bounded so we don't allocate from the wake path.
+        /// Replace when: process↔task becomes 1:N AND a real workload
+        /// parks multiple tasks on the same `ChannelQuiesceWait`.
+        const MAX_QUIESCE_WAKE: usize = 8;
+        let mut to_enqueue: [(TaskId, usize); MAX_QUIESCE_WAKE] =
+            [(TaskId(0), 0); MAX_QUIESCE_WAKE];
+        let mut woken = 0;
+
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state != TaskState::Blocked {
+                continue;
+            }
+            let matches = matches!(
+                task.block_reason,
+                Some(BlockReason::ChannelQuiesceWait(c)) if c == channel_id_raw
+            );
+            if !matches {
+                continue;
+            }
+            task.state = TaskState::Ready;
+            task.block_reason = None;
+            task.pending_quiesce_channel = None;
+            task.reset_time_slice();
+            if !task.in_ready_queue {
+                task.in_ready_queue = true;
+                if woken < to_enqueue.len() {
+                    to_enqueue[woken] = (task.id, priority_to_band(task.priority));
+                }
+            }
+            woken += 1;
+        }
+
+        for &(tid, band) in &to_enqueue[..woken.min(to_enqueue.len())] {
+            self.ready_queues[band].push_back(tid);
+        }
+        self.runnable_count += woken;
+        woken
+    }
+
     /// Scheduler hook fired from `isr_tick_and_schedule` and
     /// `voluntary_yield` (ADR-027 Phase 1).
     ///
@@ -1828,6 +1885,54 @@ mod tests {
         assert_eq!(task.state, TaskState::Blocked);
         assert_eq!(task.block_reason, Some(BlockReason::MessageWait(5)));
         assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_wake_quiesce_wakes_matching_channel() {
+        // Park a task in ChannelQuiesceWait(matching id) → wake_quiesce
+        // moves it to Ready and re-enqueues into its priority band.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+        // Parked synchronously because Ready (not Running).
+        assert_eq!(sched.get_task_pub(tid).unwrap().state, TaskState::Blocked);
+
+        let woken = sched.wake_quiesce(QUIESCE_TEST_CHANNEL_ID);
+        assert_eq!(woken, 1);
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Ready);
+        assert_eq!(task.block_reason, None);
+        assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_wake_quiesce_ignores_different_channel() {
+        // Task parked on channel A; wake_quiesce(B) is a no-op.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.arm_quiesce(tid, QUIESCE_TEST_CHANNEL_ID).unwrap();
+
+        let other_channel: u64 = QUIESCE_TEST_CHANNEL_ID ^ 0xFFFF_FFFF_FFFF_FFFF;
+        let woken = sched.wake_quiesce(other_channel);
+        assert_eq!(woken, 0);
+        assert_eq!(sched.get_task_pub(tid).unwrap().state, TaskState::Blocked);
+    }
+
+    #[test]
+    fn test_wake_quiesce_ignores_non_quiesce_blocked() {
+        // Task blocked on MessageWait must not be touched.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(tid, BlockReason::MessageWait(5)).unwrap();
+
+        let woken = sched.wake_quiesce(QUIESCE_TEST_CHANNEL_ID);
+        assert_eq!(woken, 0);
+        let task = sched.get_task_pub(tid).unwrap();
+        assert_eq!(task.state, TaskState::Blocked);
+        assert_eq!(task.block_reason, Some(BlockReason::MessageWait(5)));
     }
 
     #[test]

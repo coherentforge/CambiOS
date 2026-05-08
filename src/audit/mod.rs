@@ -80,6 +80,26 @@ pub enum AuditEventKind {
     /// `arg2` slot carries a `CLUSTER_REVOKE_REASON_*` discriminant
     /// distinguishing the two paths.
     ClusterRevoked = 18,
+    /// After `SYS_CHANNEL_BEGIN_TEARDOWN` succeeds on an `Active`
+    /// channel (ADR-027 Phase 1 quiesce protocol). Marks the start
+    /// of the two-phase teardown window — the channel is in
+    /// `Revoking`, the peer is being arm-quiesced. The matching
+    /// completion event lands as `ChannelTeardownCompleted`. Not
+    /// emitted on the `AwaitingAttach` short-circuit path: that
+    /// transition is a single-step terminal close and is reported
+    /// as the existing `ChannelClosed` event instead.
+    /// - `subject_pid`: the endpoint that initiated teardown
+    /// - `object_id`: channel id
+    /// - `arg0`: kind discriminant (0 = Close, 1 = Revoke)
+    ChannelTeardownStarted = 19,
+    /// After `SYS_CHANNEL_COMPLETE_TEARDOWN` succeeds. The channel
+    /// slot is freed, both sides unmapped, any quiesced peer task
+    /// woken. Pairs with the matching `ChannelTeardownStarted`.
+    /// - `subject_pid`: the endpoint that completed teardown
+    /// - `object_id`: channel id
+    /// - `arg0`: kind discriminant (0 = Close, 1 = Revoke)
+    /// - `arg1`: number of pages freed
+    ChannelTeardownCompleted = 20,
 }
 
 /// ARCHITECTURAL: `cluster_revoked` event's `arg2` discriminant for
@@ -440,6 +460,60 @@ impl RawAuditEvent {
             channel_id,
             bytes_transferred,
             lifetime_ticks,
+            0,
+            0,
+        )
+    }
+
+    /// `CHANNEL_TEARDOWN_STARTED`: after `begin_teardown` on `Active`.
+    ///
+    /// - `subject_pid`: the endpoint that initiated teardown
+    /// - `object_id`: channel id
+    /// - `arg0`: TeardownKind discriminant (0 = Close, 1 = Revoke)
+    pub fn channel_teardown_started(
+        initiator: ProcessId,
+        channel_id: u64,
+        kind: u8,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ChannelTeardownStarted,
+            0,
+            sequence,
+            timestamp,
+            initiator.as_raw(),
+            channel_id,
+            kind as u64,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// `CHANNEL_TEARDOWN_COMPLETED`: after `complete_teardown` succeeds.
+    ///
+    /// - `subject_pid`: the endpoint that completed teardown
+    /// - `object_id`: channel id
+    /// - `arg0`: TeardownKind discriminant (0 = Close, 1 = Revoke)
+    /// - `arg1`: number of pages freed
+    pub fn channel_teardown_completed(
+        completer: ProcessId,
+        channel_id: u64,
+        kind: u8,
+        num_pages: u32,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ChannelTeardownCompleted,
+            0,
+            sequence,
+            timestamp,
+            completer.as_raw(),
+            channel_id,
+            kind as u64,
+            num_pages as u64,
             0,
             0,
         )
