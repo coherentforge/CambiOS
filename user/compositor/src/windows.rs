@@ -251,59 +251,68 @@ impl WindowTable {
         None
     }
 
-    /// Hit-test a screen-absolute point for a resize-grab edge.
-    /// Returns `(window_id, edge)` for the first window whose
-    /// `RESIZE_GRAB_PX`-thick edge band contains the point, walking
-    /// front-most first. Corners (where two edge bands intersect)
-    /// resolve to the diagonal `ResizeEdge` variant.
+    /// Hit-test a screen-absolute point for a resize-grab edge on the
+    /// front-most window only. Returns `(window_id, edge)` if the
+    /// point lies within the front-most window's
+    /// `RESIZE_GRAB_PX`-thick edge band; `None` otherwise — including
+    /// when the click is on a *back* window's exposed area.
     ///
-    /// Compositor-initiated resize-drag uses this *before* `hit_test`
-    /// in `pump_input_once`: a press inside an edge band starts an
-    /// edge-drag; a press elsewhere falls through to raise-on-click +
-    /// client forwarding (existing behavior). Title-bar drag (top
-    /// 4 px of a libgui-decorated window) is therefore *unreachable*
-    /// from the topmost row of pixels; users grabbing the title bar
-    /// click 4+ px below the top edge. UX-acceptable trade for v1.
+    /// Why front-only (not "first-hit walking front-to-back"):
+    /// matches the focus border's visual contract — only the
+    /// front-most window shows the amber outline, so only it should
+    /// be resizable. A click outside the front window's rect, even
+    /// if it lands on a back window's exposed edge band, returns
+    /// `None`. To resize a back window, raise it first
+    /// (raise-on-click on the back window's content area).
+    ///
+    /// This rule prevents the v1 failure where a small front window
+    /// (e.g. tree game at 352×392) sits over a full-screen back
+    /// window (e.g. terminal-window's 1024×768 watermark). With
+    /// front-to-back walking, dragging anywhere near the screen
+    /// border would hit the watermark's edge and the compositor
+    /// would tear down the watermark's surface channel — not what
+    /// the user expected, and on the second resize the watermark
+    /// channel happened to be the kernel's lowest channel id (the
+    /// scanout channel between compositor and scanout-driver in some
+    /// boot orderings), at which point the entire display path
+    /// faulted.
+    ///
+    /// Title-bar drag (top 4 px of a libgui-decorated window) is
+    /// therefore unreachable from the topmost row of pixels; users
+    /// grabbing the title bar click 4+ px below the top edge.
+    /// UX-acceptable trade for v1.
     pub fn hit_test_resize(
         &self,
         screen_x: i32,
         screen_y: i32,
         grab_px: i32,
     ) -> Option<(u32, ResizeEdge)> {
-        let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
-        let count = self.snapshot_front_to_back(&mut sorted);
-        for slot in sorted[..count].iter() {
-            let w = slot.unwrap();
-            let right = w.x + w.width as i32;
-            let bottom = w.y + w.height as i32;
-            // Window rect must contain the point at all.
-            if screen_x < w.x || screen_x >= right || screen_y < w.y || screen_y >= bottom {
-                continue;
-            }
-            let near_left = screen_x - w.x < grab_px;
-            let near_right = right - 1 - screen_x < grab_px;
-            let near_top = screen_y - w.y < grab_px;
-            let near_bottom = bottom - 1 - screen_y < grab_px;
-            let edge = match (near_top, near_bottom, near_left, near_right) {
-                (true, _, true, _) => Some(ResizeEdge::TopLeft),
-                (true, _, _, true) => Some(ResizeEdge::TopRight),
-                (_, true, true, _) => Some(ResizeEdge::BottomLeft),
-                (_, true, _, true) => Some(ResizeEdge::BottomRight),
-                (true, _, _, _) => Some(ResizeEdge::Top),
-                (_, true, _, _) => Some(ResizeEdge::Bottom),
-                (_, _, true, _) => Some(ResizeEdge::Left),
-                (_, _, _, true) => Some(ResizeEdge::Right),
-                _ => None,
-            };
-            if let Some(e) = edge {
-                return Some((w.window_id, e));
-            }
-            // Front-most window covered the point but the click was in
-            // its content interior. Don't fall through to lower windows
-            // — they're occluded.
+        let front = self.front()?;
+        let right = front.x + front.width as i32;
+        let bottom = front.y + front.height as i32;
+        if screen_x < front.x
+            || screen_x >= right
+            || screen_y < front.y
+            || screen_y >= bottom
+        {
             return None;
         }
-        None
+        let near_left = screen_x - front.x < grab_px;
+        let near_right = right - 1 - screen_x < grab_px;
+        let near_top = screen_y - front.y < grab_px;
+        let near_bottom = bottom - 1 - screen_y < grab_px;
+        let edge = match (near_top, near_bottom, near_left, near_right) {
+            (true, _, true, _) => ResizeEdge::TopLeft,
+            (true, _, _, true) => ResizeEdge::TopRight,
+            (_, true, true, _) => ResizeEdge::BottomLeft,
+            (_, true, _, true) => ResizeEdge::BottomRight,
+            (true, _, _, _) => ResizeEdge::Top,
+            (_, true, _, _) => ResizeEdge::Bottom,
+            (_, _, true, _) => ResizeEdge::Left,
+            (_, _, _, true) => ResizeEdge::Right,
+            _ => return None,
+        };
+        Some((front.window_id, edge))
     }
 
     /// Drop windows whose surface channel is in a teardown-terminal
