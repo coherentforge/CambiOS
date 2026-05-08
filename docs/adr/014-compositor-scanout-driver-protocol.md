@@ -279,3 +279,68 @@ A future optimization: compositor tells driver "this client surface IS the scano
 - **Scanout-4.c** — damage-rect-aware partial TRANSFER/FLUSH; zero-copy frame path; multi-display; hotplug; EDID; RequestModeChange; aarch64/riscv64 scanout-virtio-gpu builds.
 - **Scanout-5 (Intel UHD)** — bare-metal Dell target. Untouched.
 - **Remote / headless backends** — still in the Open Questions section above; no work started.
+
+### 2026-05-08 — Client ↔ compositor protocol formalized (libgui-proto)
+
+**What changed from the plan.** ADR-014's § Module Boundary names "client surfaces, window state, focus, z-order" as things the compositor knows but does not specify the wire protocol crossing the seam between GUI clients and the compositor. The C9-C12c chain (titlebar drag + focus border + cursor + edge-grab resize, all landed 2026-05-07 / 05-08) wrote that protocol into `user/libgui-proto/`; this appendix ratifies it inside ADR-014 rather than spinning a separate ADR. Promotion criterion below.
+
+**Endpoints.**
+
+- `COMPOSITOR_ENDPOINT = 28` — registered by the compositor at boot. Every libgui client sends control messages here. Already defined in ADR-014 § Endpoints; reused rather than duplicated.
+- `COMPOSITOR_INPUT_ENDPOINT = 30` — registered by the compositor at boot specifically for input drivers (per ADR-012). Compositor decodes raw 96-byte InputEvents from this endpoint and forwards to the focused window via the `InputEvent` libgui-proto message below — the pump_input_once pipeline.
+
+Both numbers are part of the OS interface (same sense as `SCANOUT_DRIVER_ENDPOINT = 27`) and live as `pub const` in libgui-proto.
+
+**Message tag convention.** 16-bit tags split by direction:
+
+- `0x3xxx` — client → compositor (request).
+- `0x4xxx` — compositor → client (reply or async event).
+
+Same shape as ADR-014's existing `0x1xxx` (compositor → scanout-driver) / `0x2xxx` (scanout-driver → compositor) split, just on a different seam. Direction is enforced by `handle_client_payload` rejecting any 0x4xxx tag with `InvalidMessage` (peer can't send a reply-direction message).
+
+**Messages (v1, ten total).**
+
+| Tag | Name | Direction | Purpose |
+|---|---|---|---|
+| `0x3001` | `CreateWindow` | C→C | Allocate a window + surface channel. v2 layout (20 B): width, height, z_order, alpha_blend, reply_endpoint. v0 (12 B) + v1 (16 B) layouts still decode for legacy clients. |
+| `0x3010` | `FrameReady` | C→C | Client just wrote pixels; up to 16 damage rects (≥17 sends "full surface dirty" by header `damage_count = 0`). |
+| `0x3020` | `DestroyWindow` | C→C | Owner-Principal teardown of a specific window. |
+| `0x3030` | `DragWindowBy` | C→C | Title-bar drag from libgui's `decorate()` — moves the window's `(x, y)` in scanout coords by `(dx, dy)`. No surface realloc. |
+| `0x3031` | `RequestResize` | C→C | Client-initiated resize; compositor runs the two-phase teardown protocol (ADR-027) and replies with `WindowResized`. |
+| `0x4001` | `WelcomeClient` | C→C | Compositor's reply to `CreateWindow`: window_id, surface channel id, geometry, pixel format. |
+| `0x4010` | `WindowClosed` | C→C | Compositor-initiated teardown notice (currently unused; reserved for forced-close, e.g., compositor shutdown). |
+| `0x4020` | `ErrorResponse` | C→C | Per-request error (TooManyWindows, InvalidDimensions, NoSuchWindow, InvalidMessage, CompositorShuttingDown, SurfaceAllocFailed). |
+| `0x4030` | `InputEvent` | C→C | Forwarded input event (96-byte libinput-proto envelope) for the focused window. PointerButton coords translated to window-local before forward. |
+| `0x4040` | `WindowResized` | C→C | Reply to `RequestResize` and to compositor-initiated edge-grab commits: new channel id + new geometry. Client closes its old surface mapping (returns `InvalidState` because the old slot is `Revoking`; libgui swallows it) and `channel_attach`es the new one. |
+
+Detailed binary layouts are intentionally not in this ADR — same call ADR-014 makes for the scanout-driver protocol ("the contract is what messages exist, not what bit goes where"). `cambios-libgui-proto`'s encoders/decoders are the authoritative wire definition.
+
+**Authority model.**
+
+- Every C→C message is identity-stamped: the compositor reads `sender_principal` from the kernel's `recv_msg` header (`Window::owner_principal` is set from the `CreateWindow` sender). Any subsequent message claiming a `window_id` whose owner_principal doesn't match the kernel-stamped sender is rejected as `NoSuchWindow` (chosen over `Forbidden` to avoid leaking window-existence to non-owners).
+- C→C messages reach the compositor at `COMPOSITOR_ENDPOINT = 28`; the compositor replies to the client's recorded `client_endpoint` (the first endpoint the client registered, looked up via the kernel's `REPLY_ENDPOINT` map). `CreateWindow.reply_endpoint != 0` overrides this for multi-layer clients whose reply queue isn't the kernel-stamped first endpoint.
+- The drag/resize messages (0x3030 / 0x3031) are the only ones today where the compositor *can also synthesize equivalent state changes itself* — title-bar drag is libgui-driven, but resize-drag is compositor-driven (edge-grab UX, C12c). For that path the compositor calls `commit_window_resize` directly, bypassing the per-message Principal check (compositor is the trusted authority for edge-drag UX). The kernel-stamped check is preserved on the client-initiated path.
+
+**Surface channel role convention.**
+
+- `SYS_CHANNEL_CREATE` is called by the compositor with `role = Consumer` and `peer_principal = client's Principal`. From the kernel's perspective the compositor reads (Consumer); the peer (client) writes. From the user's mental model: the client renders into the surface, the compositor reads the rendered pixels and composites them into the scanout. RW on both ends — the kernel maps Consumer-role channels RW for the creator and RW for the peer; the role is a documentation/audit hint, not a permission gate.
+- Surface channels are bound 1:1 to a `Window`. Resize replaces the channel atomically (begin_teardown → channel_create → WindowResized → complete_teardown, per ADR-027 § Phase 1). Ownership is the window's owner_principal; revoke on owner exit goes through ADR-007 Divergence 7 tombstone-on-revoke.
+
+**Bounds (lands inside libgui-proto, listed here for visibility).**
+
+- `MAX_WINDOWS = 32` — compositor's window-table size + libgui-proto's wire-protocol upper bound.
+- `MAX_WINDOW_DIMENSION = 8192` — per-axis cap; `RequestResize` rejects above this.
+- `MAX_DAMAGE_RECTS_PER_FRAME = 16` — fits a `FrameReady` in 256 bytes; above this, clients send "full surface dirty."
+- `MAX_MESSAGE_SIZE = 256` — control-IPC message ceiling, matching ADR-005's bound.
+
+All four are SCAFFOLDING in `libgui-proto/src/lib.rs` with replace-when triggers tied to the multi-monitor / cluster-of-windows / 4K-Retina endgame work — same envelope ADR-011 sized the kernel-side bounds for.
+
+**What did NOT diverge.** ADR-014's compositor↔scanout-driver protocol shape (`ScanoutBackend` trait, control-IPC + shared-memory split, endpoint numbers 27/28, register-by-Principal) is unchanged. The C↔C protocol layers on top of the same channel substrate (ADR-005) — no new IPC primitives. Capability surface stays as named in § Capability model (compositor still needs no MMIO, DMA, or framebuffer mappings).
+
+**Promotion trigger (when this becomes its own ADR).** Lift the appendix into a standalone ADR — numbered at promotion time, not pre-allocated — when any of:
+
+- The protocol gains a 5th client→compositor or 5th compositor→client message beyond the v1 ten.
+- A non-libgui client implementation surfaces (alternate widget toolkit, native app bypassing libgui), making "libgui-proto is the de-facto definition" insufficient as the contract.
+- A trusted-overlay channel lands for auth UI (mentioned in ADR-011's spoofing follow-up) — that's a structurally different conversation between compositor and a privileged client and warrants its own protocol surface.
+
+Until then, this appendix is the ratified record + the libgui-proto crate is the implementation.
