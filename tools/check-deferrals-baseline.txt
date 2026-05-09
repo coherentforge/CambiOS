@@ -455,7 +455,7 @@ tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/middleware/me
 tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/middleware/message_logger.py:31:placeholder
 tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/middleware/message_logger.py:32:placeholder
 tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/protocols/websockets/wsproto_impl.py:115:TODO
-user/compositor/src/main.rs:511:for-now
+user/compositor/src/main.rs:560:for-now
 user/libgui-proto/src/lib.rs:27:deferred
 user/libgui/src/font.rs:13:placeholder
 user/libgui/src/font.rs:248:placeholder

@@ -44,7 +44,10 @@
 // re-exports trip dead-code warnings; muted here.
 #![allow(dead_code)]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU8, Ordering};
+use linked_list_allocator::LockedHeap;
 
 use cambios_libgui_proto::{
     encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT, MAX_WINDOWS,
@@ -64,6 +67,32 @@ use scanout::{
 };
 use windows::{commit_window_resize, handle_client_payload, ResizeEdge, Window, WindowTable, WindowView};
 
+/// SCAFFOLDING: compositor userspace heap, 16 MiB.
+///
+/// Why: the v1-endgame compositor is a general-purpose pixel pipeline
+/// (multi-monitor, damage-tracked partial recomposition, animation
+/// state per window, effect intermediates for blur/shadow, trusted
+/// overlay surfaces, dynamic linger/fade backing buffers). None of
+/// those workloads can be statically pre-sized in BSS at endgame
+/// scale without massive over-provisioning for the 95% case.
+/// Steady-state estimate at v1: one ~3 MiB linger buffer + a few MiB
+/// of damage/animation/overlay state ≈ 4-5 MiB. 25%-utilization rule
+/// (per ASSUMPTIONS.md § Sizing SCAFFOLDING bounds) targets 4× that
+/// → 16-20 MiB. Choosing 16 MiB as the lower-end starting point.
+/// Allocated via `sys::allocate(HEAP_PAGES)` at `_start`; mapped
+/// anonymously into the compositor's address space at VMA_ALLOC_BASE
+/// (0x1000_0000) onward, well clear of the static segment.
+/// Replace when: a real workload pushes heap utilization past ~75%
+/// (linker-list-allocator fragmentation will start to bite first),
+/// at which point either bump the pool or split fixed-size things
+/// (Window state, damage rects) into a slab/pool layered allocator
+/// keeping the general heap for variable-size things.
+const HEAP_BYTES: usize = 16 * 1024 * 1024;
+const HEAP_PAGES: u32 = (HEAP_BYTES / 4096) as u32;
+
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
 /// Maximum IPC receive buffer size for the main dispatch loop.
 /// Sized to hold the largest libgui-proto message (FrameReady with
 /// 16 damage rects = 144 bytes) plus the 36-byte `recv_msg` header.
@@ -78,6 +107,26 @@ const RECV_HEADER_BYTES: usize = 36;
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     sys::print(b"[COMPOSITOR] Phase Scanout-2 (ADR-014)\r\n");
+
+    // Initialize the userspace heap before any alloc-using code runs.
+    // Failure here is fatal — no fallback path makes sense, and every
+    // subsequent feature added on top of the heap would need a
+    // duplicate static-pool branch otherwise.
+    let heap_vaddr = sys::allocate(HEAP_PAGES);
+    if heap_vaddr <= 0 {
+        sys::log_error(b"COMPOSITOR", b"heap allocate failed");
+        sys::exit(1);
+    }
+    // SAFETY: `sys::allocate` returned a positive vaddr pointing at
+    // HEAP_PAGES * 4096 = HEAP_BYTES of freshly-mapped, zero-filled,
+    // process-private anonymous memory. This is the only call site
+    // that initializes ALLOCATOR; no other code reads or writes the
+    // returned region directly, so the allocator owns it exclusively.
+    unsafe {
+        ALLOCATOR
+            .lock()
+            .init(heap_vaddr as usize as *mut u8, HEAP_BYTES);
+    }
 
     if sys::register_endpoint(COMPOSITOR_ENDPOINT) < 0 {
         sys::log_error(b"COMPOSITOR", b"register_endpoint(28) failed");
