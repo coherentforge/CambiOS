@@ -822,13 +822,18 @@ fn handle_destroy_window(
     from_endpoint: u32,
     window_table: &mut WindowTable,
 ) {
-    let window_id = match decode_destroy_window(payload) {
-        Some(id) => id,
+    let (window_id, _linger_ms) = match decode_destroy_window(payload) {
+        Some(pair) => pair,
         None => {
             send_error(from_endpoint, GuiError::InvalidMessage);
             return;
         }
     };
+    // Deferred: honor `linger_ms` (hold last frame for that
+    // duration before reaping). Wire field is plumbed; behavior is
+    // not — current immediate-teardown is preserved.
+    // Revisit when: a client calls `close_with_linger` with a
+    // non-zero value (visible regression: splash gap is unbridged).
 
     let slot = match window_table.find_window(window_id) {
         Some(s) => s,

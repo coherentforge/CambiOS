@@ -485,23 +485,33 @@ pub fn read_damage_rect(buf: &[u8], index: usize) -> Option<Rect> {
 }
 
 /// `DestroyWindow` — client → compositor.
-/// Layout: `[tag:4][window_id:4]` = 8 bytes.
-pub fn encode_destroy_window(buf: &mut [u8], window_id: u32) -> Option<usize> {
-    if buf.len() < 8 {
+/// Layout: `[tag:4][window_id:4][linger_ms:4]` = 12 bytes.
+///
+/// `linger_ms` requests the compositor hold the window's last
+/// rendered frame for that many milliseconds after destroy before
+/// reaping. `linger_ms = 0` is immediate teardown (no hold). The
+/// primitive is reusable across app-quit fade-out, graceful-crash
+/// cushion, suspend/resume hold-frame, and eventual minimize
+/// animations.
+pub fn encode_destroy_window(buf: &mut [u8], window_id: u32, linger_ms: u32) -> Option<usize> {
+    if buf.len() < 12 {
         return None;
     }
     buf[..4].copy_from_slice(&MsgTag::DestroyWindow.as_u32().to_le_bytes());
     buf[4..8].copy_from_slice(&window_id.to_le_bytes());
-    Some(8)
+    buf[8..12].copy_from_slice(&linger_ms.to_le_bytes());
+    Some(12)
 }
 
-pub fn decode_destroy_window(buf: &[u8]) -> Option<u32> {
-    if buf.len() < 8
+pub fn decode_destroy_window(buf: &[u8]) -> Option<(u32, u32)> {
+    if buf.len() < 12
         || u32::from_le_bytes(buf[0..4].try_into().ok()?) != MsgTag::DestroyWindow.as_u32()
     {
         return None;
     }
-    Some(u32::from_le_bytes(buf[4..8].try_into().ok()?))
+    let window_id = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let linger_ms = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    Some((window_id, linger_ms))
 }
 
 /// `WindowClosed` — compositor → client. Notification that the
@@ -802,10 +812,27 @@ mod tests {
     #[test]
     fn destroy_window_roundtrip() {
         let mut buf = [0u8; 16];
-        let n = encode_destroy_window(&mut buf, 0xFEED).unwrap();
-        assert_eq!(n, 8);
-        let id = decode_destroy_window(&buf).unwrap();
+        let n = encode_destroy_window(&mut buf, 0xFEED, 0).unwrap();
+        assert_eq!(n, 12);
+        let (id, linger) = decode_destroy_window(&buf).unwrap();
         assert_eq!(id, 0xFEED);
+        assert_eq!(linger, 0);
+    }
+
+    #[test]
+    fn destroy_window_roundtrip_with_linger() {
+        let mut buf = [0u8; 16];
+        let n = encode_destroy_window(&mut buf, 7, 1500).unwrap();
+        assert_eq!(n, 12);
+        let (id, linger) = decode_destroy_window(&buf).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(linger, 1500);
+    }
+
+    #[test]
+    fn destroy_window_rejects_short_buf() {
+        let mut buf = [0u8; 11];
+        assert!(encode_destroy_window(&mut buf, 1, 0).is_none());
     }
 
     #[test]
