@@ -65,7 +65,7 @@ mod windows;
 use scanout::{
     Backend, HeadlessBackend, LimineFbBackend, ScanoutBackend, ScanoutBuffer, ScanoutEvent,
 };
-use windows::{commit_window_resize, handle_client_payload, ResizeEdge, Window, WindowTable, WindowView};
+use windows::{commit_window_resize, handle_client_payload, LingerEntry, ResizeEdge, WindowTable, WindowView};
 
 /// SCAFFOLDING: compositor userspace heap, 16 MiB.
 ///
@@ -251,9 +251,17 @@ pub extern "C" fn _start() -> ! {
         // MAX_WINDOWS sys::channel_info calls per iteration — cheap
         // even at the v1 endgame ~30-window target.
         let _ = window_table.reap_dead_channels();
+        // Reap lingerers whose deadline has elapsed. Free side: the
+        // backing pixel buffer is dropped back to the heap. Edge case
+        // worth noting: a lingerer expiring is what triggers the
+        // "last frame gone" blank below when there is no active
+        // window left, so this MUST run before the `has_visible`
+        // check.
+        let lingerers_reaped = window_table.reap_expired_lingers(sys::get_time());
 
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
-        let mut needs_composite = matches!(outcome, DispatchOutcome::ClientFrame(_));
+        let mut needs_composite = matches!(outcome, DispatchOutcome::ClientFrame(_))
+            || lingerers_reaped > 0;
         if needs_composite {
             // Z-stack composition: any window's FrameReady triggers a
             // full back-to-front recomposition because a higher-layer
@@ -265,7 +273,7 @@ pub extern "C" fn _start() -> ! {
             pointer.dirty = false;
         }
 
-        let has_windows = window_table.iter().next().is_some();
+        let has_windows = window_table.has_visible();
         if had_windows && !has_windows {
             composite_blank_and_present(&mut backend);
         }
@@ -818,6 +826,37 @@ fn pump_dispatch_once<B: ScanoutBackend>(
 ///
 /// Only meaningful against a `Backend::Limine` backend today; headless
 /// has no scanout buffer to blit to.
+/// Sortable composite-pass entry. Unifies active windows and
+/// lingerers behind one type so the back-to-front sort + blit loop
+/// doesn't have to special-case the two collections. `Copy` so the
+/// stack snapshot array can use `[None; N]`-style init.
+#[derive(Clone, Copy)]
+struct BlitSlot {
+    view: WindowView,
+    alpha_blend: bool,
+    front_seq: u32,
+}
+
+/// Build a `WindowView` for a lingerer that points at its private
+/// backing buffer instead of the (now-closed) channel mapping.
+/// The buffer is tightly packed (no row padding), so pitch is
+/// `width * 4` bytes — different from the active-window pitch
+/// which honors the channel's page-aligned row stride. The
+/// `blit_surface_to_scanout` / `blend_surface_onto_scanout`
+/// readers compute row stride from `pitch`, so this is the only
+/// piece of geometry that diverges between the two paths.
+fn linger_view(entry: &LingerEntry) -> WindowView {
+    WindowView {
+        window_id: entry.window.window_id,
+        x: entry.window.x,
+        y: entry.window.y,
+        width: entry.window.width,
+        height: entry.window.height,
+        pitch: entry.window.width * 4,
+        surface_vaddr: entry.pixels.as_ptr() as u64,
+    }
+}
+
 fn composite_and_present(
     backend: &mut Backend,
     window_table: &WindowTable,
@@ -829,15 +868,34 @@ fn composite_and_present(
         Backend::Headless(_) => return,
     };
 
-    // Snapshot every live window into a fixed-size array, then sort
-    // by `front_seq` ascending so we composite back-to-front.
-    // Insertion sort is fine — MAX_WINDOWS is bounded and small (32
-    // today), and the common case is 1–2 windows.
-    let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+    // Snapshot every visible surface — active windows AND lingerers
+    // — into a fixed-size array, then sort by `front_seq` ascending
+    // so we composite back-to-front. Lingerers preserve the
+    // `front_seq` they had at destroy time so a held frame stays
+    // layered correctly relative to active siblings (e.g. an arcade
+    // chooser lingers underneath a freshly-spawned game's first
+    // frame). Insertion sort is fine — MAX_WINDOWS + MAX_LINGERERS
+    // is bounded, and the common case is 1-2 windows + 0-1
+    // lingerers.
+    let mut sorted: [Option<BlitSlot>; MAX_WINDOWS * 2] = [None; MAX_WINDOWS * 2];
     let mut count = 0usize;
     for w in window_table.iter() {
-        if count < MAX_WINDOWS {
-            sorted[count] = Some(w);
+        if count < sorted.len() {
+            sorted[count] = Some(BlitSlot {
+                view: WindowView::from(w),
+                alpha_blend: w.alpha_blend,
+                front_seq: w.front_seq,
+            });
+            count += 1;
+        }
+    }
+    for entry in window_table.iter_lingerers() {
+        if count < sorted.len() {
+            sorted[count] = Some(BlitSlot {
+                view: linger_view(entry),
+                alpha_blend: entry.window.alpha_blend,
+                front_seq: entry.window.front_seq,
+            });
             count += 1;
         }
     }
@@ -855,17 +913,16 @@ fn composite_and_present(
         }
     }
 
-    // Composite. The back-most window always overwrites (its pixels
+    // Composite. The back-most surface always overwrites (its pixels
     // become the scanout's base regardless of `alpha_blend`); higher
     // layers either overwrite (`alpha_blend=false`) or alpha-blend
     // (`alpha_blend=true`) on top of whatever's there.
     for (idx, slot) in sorted[..count].iter().enumerate() {
-        let w = slot.expect("count tracks Some entries");
-        let view = WindowView::from(w);
-        if idx == 0 || !w.alpha_blend {
-            blit_surface_to_scanout(&view, &scanout);
+        let s = slot.expect("count tracks Some entries");
+        if idx == 0 || !s.alpha_blend {
+            blit_surface_to_scanout(&s.view, &scanout);
         } else {
-            blend_surface_onto_scanout(&view, &scanout);
+            blend_surface_onto_scanout(&s.view, &scanout);
         }
     }
 
