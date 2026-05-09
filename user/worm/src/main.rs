@@ -155,6 +155,10 @@ pub extern "C" fn _start() -> ! {
     loop {
         let mut dirty = false;
         let mut drained = false;
+        // Resize is ignored here (no `take_resize_pending()` call).
+        // libgui's `poll_event` consumes `WindowResized` and re-attaches
+        // the surface; on grow, the unrendered area is black until the
+        // next full redraw.
         while let Some(ev) = client.poll_event() {
             drained = true;
             if handle_event(&ev, &mut worm, &client) {

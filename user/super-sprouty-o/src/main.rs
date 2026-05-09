@@ -136,6 +136,10 @@ pub extern "C" fn _start() -> ! {
     sys::print(b"[SPROUTY] entering event loop\r\n");
     loop {
         let mut drained = false;
+        // Resize is ignored here (no `take_resize_pending()` call).
+        // libgui's `poll_event` consumes `WindowResized` and re-attaches
+        // the surface; on grow, the unrendered area is black until the
+        // next full redraw.
         while let Some(ev) = client.poll_event() {
             drained = true;
             match handle_event(&ev, &mut input) {
