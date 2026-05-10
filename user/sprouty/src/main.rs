@@ -32,19 +32,19 @@ mod sprites;
 
 use cambios_libgui::{modifier, Bitmap, Client, EventType, FrameClock, InputEvent};
 use cambios_libsys as sys;
-use cambios_super_sprouty_o::{
+use cambios_sprouty::{
     game::{Game, Input},
     level,
 };
 
 /// IPC endpoint. `MAX_ENDPOINTS` is a SCAFFOLDING bound of 32 in
 /// [src/ipc/mod.rs], so valid IDs are 0..=31. 22 is free under the
-/// current allocation (16=FS, 17=KS, 18=shell, 19=pong, 20=virtio-net,
+/// current allocation (16=FS, 17=KS, 18=shell, 19=ping, 20=virtio-net,
 /// 21=udp-stack, 24/25/26=virtio-blk, 27=scanout-driver, 28=compositor,
 /// 29=worm/hello-window, 30=input, 31=tree).
 ///
-/// Revisit when: MAX_ENDPOINTS is raised — super-sprouty-o moves to
-/// its class-grouped slot (34) alongside Tree=31 / Worm=32 / Pong=33.
+/// Revisit when: MAX_ENDPOINTS is raised — sprouty moves to
+/// its class-grouped slot (34) alongside Tree=31 / Worm=32 / Ping=33.
 // Was 22 (POLICY_QUERY_ENDPOINT collision). Then 23, which silently
 // collides with `POLICY_RESP_ENDPOINT` -- the kernel hardcodes a
 // "only the policy service may write to ep 23" check in
@@ -60,15 +60,15 @@ use cambios_super_sprouty_o::{
 const SPROUTY_ENDPOINT: u32 = 15;
 
 /// TUNING: physics tick interval in kernel ticks (1 tick = 10 ms at
-/// 100 Hz). 3 → 30 ms → 33 FPS — first game past pong's 20 FPS, first
+/// 100 Hz). 3 → 30 ms → 33 FPS — first game past ping's 20 FPS, first
 /// stress-test of the compositor + scanout path above that rate. If
 /// the Session-3 live FPS counter shows sustained <30 fps, fall back
-/// to 5 ticks (20 FPS, matching pong) is a one-line change.
+/// to 5 ticks (20 FPS, matching ping) is a one-line change.
 const STEP_TICKS: u64 = 3;
 
 /// USB HID usage codes. Full evdev→HID table in
 /// `user/virtio-input/src/evdev.rs`; redeclared here for the codes
-/// this game cares about, same locality discipline as tree/worm/pong.
+/// this game cares about, same locality discipline as tree/worm/ping.
 mod keys {
     pub const LEFT: u32 = 0x50;
     pub const RIGHT: u32 = 0x4F;
@@ -81,7 +81,7 @@ mod keys {
     pub const W: u32 = 0x1A;
     pub const R: u32 = 0x15;
     pub const ESCAPE: u32 = 0x29;
-    /// Ctrl+Q exits to shell (matches pong/tree/worm). ESCAPE also
+    /// Ctrl+Q exits to shell (matches ping/tree/worm). ESCAPE also
     /// quits per sprouty's own UX, kept for keyboard-only setups.
     pub const Q: u32 = 0x14;
 }

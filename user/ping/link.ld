@@ -1,11 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2024-2026 Jason Ricca */
 
-/* CambiOS user-space ELF linker script (super-sprouty-o, RISC-V) — ADR-011/012.
- * Matches the shape used by user/pong/link-riscv64.ld and siblings:
- * .sdata/.sbss folded into .data/.bss, .riscv.attributes discarded. */
-
-OUTPUT_FORMAT("elf64-littleriscv")
+/* CambiOS user-space ELF linker script (ping, x86_64) — first-party app. */
+OUTPUT_FORMAT("elf64-x86-64")
 ENTRY(_start)
 
 SECTIONS
@@ -27,12 +24,10 @@ SECTIONS
     .data : {
         *(.data .data.*)
         *(.got .got.*)
-        *(.sdata .sdata.*)
     }
 
     .bss : {
         *(.bss .bss.*)
-        *(.sbss .sbss.*)
     }
 
     /DISCARD/ : {
@@ -40,6 +35,5 @@ SECTIONS
         *(.note*)
         *(.eh_frame*)
         *(.gnu.hash)
-        *(.riscv.attributes)
     }
 }

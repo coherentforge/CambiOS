@@ -401,11 +401,11 @@ fn print_styled_error(command: &str, message: &str) {
 // to the generic "Unknown command" path. `play` alone lists the games so
 // the shell self-documents.
 //
-// When a new game lands (e.g. super-sprouty-o), add it to GAMES in the
+// When a new game lands (e.g. sprouty), add it to GAMES in the
 // same commit that registers it as a boot module.
 // ============================================================================
 
-const GAMES: &[&[u8]] = &[b"tree", b"worm", b"pong", b"super-sprouty-o"];
+const GAMES: &[&[u8]] = &[b"tree", b"worm", b"ping", b"sprouty"];
 
 fn cmd_play(args: &[u8]) {
     let name = trim(args);

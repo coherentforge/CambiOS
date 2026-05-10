@@ -1616,11 +1616,11 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         // semantics so boot lands at `cambios>` rather than in a game;
         // the cleaner mechanisms are larger scope than the HN launcher
         // arc.
-        // Revisit when: the super-sprouty-o launcher arc closes within
+        // Revisit when: the sprouty launcher arc closes within
         // this session — followup scheduled to replace this list with a
         // config-driven mechanism.
         const SPAWN_ONLY_MODULES: &[&[u8]] =
-            &[b"tree", b"worm", b"pong", b"super-sprouty-o"];
+            &[b"tree", b"worm", b"ping", b"sprouty"];
 
         if SPAWN_ONLY_MODULES.iter().any(|name| *name == short_name) {
             BOOT_MODULE_REGISTRY

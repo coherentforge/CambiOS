@@ -339,7 +339,7 @@ impl WindowTable {
     /// would drop windows the moment they're created and trigger
     /// the `composite_blank_and_present` "last window gone" path on
     /// the very next iteration, blanking the scanout to black.
-    /// Observed first under `play super-sprouty-o → Ctrl+Q` where
+    /// Observed first under `play sprouty → Ctrl+Q` where
     /// terminal-window's reopen path created a new (still-AwaitingAttach)
     /// window and reap immediately dropped it.
     ///

@@ -253,7 +253,7 @@ fn cmd_pid(t: &mut Terminal<GuiBackend>) {
 // userspace allowlist exists to print a readable error before any
 // close/spawn happens, instead of surfacing a numeric kernel rc.
 
-const KNOWN_GAMES: &[&[u8]] = &[b"tree", b"worm", b"pong", b"super-sprouty-o"];
+const KNOWN_GAMES: &[&[u8]] = &[b"tree", b"worm", b"ping", b"sprouty"];
 
 fn is_known_game(name: &[u8]) -> bool {
     KNOWN_GAMES.iter().any(|g| *g == name)
@@ -263,13 +263,13 @@ fn cmd_play(t: &mut Terminal<GuiBackend>, args: &[u8]) {
     let name = trim_ascii(args);
     if name.is_empty() {
         t.write(b"usage: play <game>\r\n");
-        t.write(b"games: tree, worm, pong, super-sprouty-o\r\n");
+        t.write(b"games: tree, worm, ping, sprouty\r\n");
         return;
     }
     if !is_known_game(name) {
         t.write(b"unknown game: ");
         t.write(name);
-        t.write(b"\r\ntry: tree, worm, pong, super-sprouty-o\r\n");
+        t.write(b"\r\ntry: tree, worm, ping, sprouty\r\n");
         return;
     }
 

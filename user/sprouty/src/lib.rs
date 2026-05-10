@@ -4,7 +4,7 @@
 //! Super Sprouty-O library crate — exposes pure-logic modules so
 //! physics, collision, camera math, and level helpers are host-testable
 //! via `cargo test --lib --target x86_64-apple-darwin`, same split
-//! pattern as pong + worm.
+//! pattern as ping + worm.
 //!
 //! - [`level`]: static tilemap + viewport constants + visible-range
 //!   culling math (Session 2a onward).

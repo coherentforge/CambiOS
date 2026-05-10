@@ -259,7 +259,7 @@ impl Client {
         // first `recv_verified` returns one of those, fails
         // `decode_welcome_client`, and reopen aborts with
         // `ClientError::DecodeWelcome` — the failure mode observed
-        // for `play super-sprouty-o → Ctrl+Q` post-tombstone-fix.
+        // for `play sprouty → Ctrl+Q` post-tombstone-fix.
         //
         // The kernel guarantees per-endpoint FIFO delivery, so the
         // stale messages (queued first) are seen before the

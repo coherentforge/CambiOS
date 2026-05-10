@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Pong game logic — pure bookkeeping, no I/O.
+//! Ping game logic — pure bookkeeping, no I/O.
 //!
 //! First CambiOS first-party app with continuous-motion physics
 //! (Tree is grid-based reveal, Worm is grid-stepped cells). Same
@@ -88,7 +88,7 @@ pub const RIGHT_PADDLE_X: i32 = COURT_W - PADDLE_INSET_X - PADDLE_W;
 /// 50 ms / 20 FPS cadence the main loop runs, 7 px/tick = 140 px/sec,
 /// giving a ball-to-paddle flight of ~3 s across the 432-px gap
 /// between paddle inner edges. Slow enough for a beginner, fast
-/// enough to feel like Pong.
+/// enough to feel like Ping.
 ///
 /// Replace when: playtest feedback converges on a different starting
 /// pace, or the tick rate changes (the derived flight time is the
@@ -104,7 +104,7 @@ const BALL_INITIAL_VX_SUBPX: i32 = 7 * PX_ONE;
 const BALL_MAX_VX_SUBPX: i32 = 11 * PX_ONE;
 
 /// TUNING: horizontal speedup per paddle hit. +0.25 px/tick per rally
-/// → ~16 hits to go from 7 to 11 px/tick. Matches classic Pong feel
+/// → ~16 hits to go from 7 to 11 px/tick. Matches classic Ping feel
 /// where a long rally accelerates into late-game pressure.
 const SPEEDUP_PER_HIT_SUBPX: i32 = PX_ONE / 4;
 
@@ -172,7 +172,7 @@ pub enum State {
     /// Ball is at center. `ticks_remaining` counts down to zero, then
     /// the state transitions to `Playing` with the ball served
     /// *toward* `server`'s opponent (`server` just lost the previous
-    /// point, so they get the serve — classic Pong). Initial game
+    /// point, so they get the serve — classic Ping). Initial game
     /// starts with `server = Left` by convention.
     Serving { ticks_remaining: u64, server: Side },
     Playing,
@@ -234,7 +234,7 @@ impl Ball {
 
 // --- full game state ---
 
-pub struct Pong {
+pub struct Ping {
     state: State,
     left_score: u8,
     right_score: u8,
@@ -244,7 +244,7 @@ pub struct Pong {
     rng: Xorshift64,
 }
 
-impl Pong {
+impl Ping {
     /// New game: scores 0–0, paddles centered, ball at center, Left
     /// gets the opening serve. The serve delay grants a beat before
     /// action starts so the player can focus.
@@ -480,7 +480,7 @@ impl Pong {
 
     /// Reverse horizontal velocity, speed up by a small increment
     /// (capped), and set new vertical velocity based on where the
-    /// ball struck the paddle. Classic Pong: hit the paddle's top
+    /// ball struck the paddle. Classic Ping: hit the paddle's top
     /// edge → ball goes up fast; hit its bottom edge → ball goes
     /// down fast; hit center → flat return.
     fn bounce_off_paddle(ball: &mut Ball, paddle: &Paddle) {
@@ -488,7 +488,7 @@ impl Pong {
         let new_abs_vx = (ball.vx_subpx.abs() + SPEEDUP_PER_HIT_SUBPX).min(BALL_MAX_VX_SUBPX);
         ball.vx_subpx = if ball.vx_subpx < 0 { new_abs_vx } else { -new_abs_vx };
 
-        // Spin from hit offset. Fully determines vy — classic Pong.
+        // Spin from hit offset. Fully determines vy — classic Ping.
         let offset = ball.center_y_subpx() - paddle.center_y_subpx();
         let half_paddle = (PADDLE_H << PX_BITS) / 2;
         let clamped = offset.clamp(-half_paddle, half_paddle);
@@ -523,7 +523,7 @@ impl Pong {
             return;
         }
 
-        // Reset ball; next serve goes to the loser (classic Pong:
+        // Reset ball; next serve goes to the loser (classic Ping:
         // server earns the next serve by losing, which is inverted
         // from tennis — CambiOS follows the original arcade rule).
         let next_server = scorer.flip();
@@ -566,7 +566,7 @@ impl Xorshift64 {
 mod tests {
     use super::*;
 
-    fn advance_through_serve(p: &mut Pong) {
+    fn advance_through_serve(p: &mut Ping) {
         // Tick the serve countdown + the first physics step that
         // launches the ball. After this, state must be Playing.
         for _ in 0..=SERVE_DELAY_TICKS as u32 {
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn new_game_starts_serving_left_zero_zero() {
-        let p = Pong::new(1);
+        let p = Ping::new(1);
         assert_eq!(p.left_score(), 0);
         assert_eq!(p.right_score(), 0);
         match p.state() {
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn serving_countdown_transitions_to_playing() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         // Ball must have a non-zero horizontal velocity now.
         assert_ne!(p.ball().vx_subpx, 0);
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn ball_reflects_off_top_wall() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         // Force a hard-upward ball trajectory right against the top.
         {
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn ball_reflects_off_bottom_wall() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         p.ball = Ball {
             x_subpx: (COURT_W / 2) << PX_BITS,
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn ball_exits_left_wall_scores_right() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         // Warp ball to the left of the court, moving further left so
         // no paddle can catch it.
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn ball_exits_right_wall_scores_left() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         p.ball = Ball {
             x_subpx: (COURT_W << PX_BITS) + PX_ONE,
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn reaching_win_score_transitions_to_match_over() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         // Simulate Left at WIN_SCORE-1, then score one more.
         p.left_score = WIN_SCORE - 1;
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn match_over_step_is_noop() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         p.state = State::MatchOver { winner: Side::Left };
         let changed = p.step(PaddleMotion::Up);
         assert!(!changed);
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn reset_returns_to_zero_zero_serving_left() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         p.left_score = 4;
         p.right_score = 3;
         p.state = State::MatchOver { winner: Side::Left };
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn player_paddle_moves_up_with_up_motion() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         let y0 = p.left_paddle.y_subpx;
         let _ = p.step(PaddleMotion::Up);
         assert!(p.left_paddle.y_subpx < y0);
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn player_paddle_moves_down_with_down_motion() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         let y0 = p.left_paddle.y_subpx;
         let _ = p.step(PaddleMotion::Down);
         assert!(p.left_paddle.y_subpx > y0);
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn player_paddle_clamps_at_top() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         // Drive paddle up for many ticks — must not go above 0.
         for _ in 0..200 {
             let _ = p.step(PaddleMotion::Up);
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn player_paddle_clamps_at_bottom() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         for _ in 0..200 {
             let _ = p.step(PaddleMotion::Down);
         }
@@ -750,7 +750,7 @@ mod tests {
 
     #[test]
     fn bouncing_off_paddle_reverses_vx_and_speeds_up() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
 
         // Position the left paddle so its center aligns with ball
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn bouncing_off_paddle_edge_imparts_spin() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
 
         // Put the paddle at the top of the court, ball near the
@@ -796,7 +796,7 @@ mod tests {
         // Simulate many hits and confirm vx magnitude never exceeds
         // the cap. Bounded iteration — 1000 rallies is wildly more
         // than any real match.
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         for _ in 0..1000 {
             // Force a paddle hit every iteration by teleporting ball
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn ai_paddle_follows_ball_vertically() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         // Put ball at the top of the court; AI paddle starts centered.
         p.ball.y_subpx = 0;
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn ai_deadband_prevents_twitch_when_aligned() {
-        let mut p = Pong::new(1);
+        let mut p = Ping::new(1);
         advance_through_serve(&mut p);
         // Perfectly align AI paddle center to ball center.
         let paddle_half_h = (PADDLE_H << PX_BITS) / 2;

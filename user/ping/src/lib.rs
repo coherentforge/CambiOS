@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Pong lib entry — exposes the pure-logic `game` module for host
+//! Ping lib entry — exposes the pure-logic `game` module for host
 //! unit-testing via `cargo test --lib --target x86_64-apple-darwin`.
 //!
 //! Same library-split pattern as worm: the bin crate (`main.rs` +

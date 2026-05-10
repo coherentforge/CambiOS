@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! CambiOS Pong — third first-party app (ADR-011 stack, ADR-012
+//! CambiOS Ping — third first-party app (ADR-011 stack, ADR-012
 //! input, libgui v0 + FrameClock). Single-player vs AI with
 //! continuous-motion physics on the Tree/Worm shared garden palette.
 //!
@@ -23,7 +23,7 @@
 //! ## V0 control flow
 //!
 //! 1. Handshake via `libgui::Client::open(WINDOW_W, WINDOW_H, PONG_ENDPOINT)`.
-//! 2. Seed a Pong game.
+//! 2. Seed a Ping game.
 //! 3. Paint initial frame (shows READY... overlay for the serve delay).
 //! 4. Loop:
 //!    - Drain events (update held keys, handle R / ESC to reset).
@@ -43,27 +43,27 @@
 
 use cambios_libgui::{modifier, Client, EventType, FrameClock, InputEvent};
 use cambios_libsys as sys;
-use cambios_pong::game::{PaddleMotion, Pong, State};
+use cambios_ping::game::{PaddleMotion, Ping, State};
 
 mod render;
 
-/// Pong's IPC endpoint. `MAX_ENDPOINTS` is a SCAFFOLDING bound of 32
+/// Ping's IPC endpoint. `MAX_ENDPOINTS` is a SCAFFOLDING bound of 32
 /// (valid IDs 0..=31), so the class-grouped plan from the HN-launch
-/// sequencing (Tree=31, Worm=32, Pong=33, Mario=34) can't land until
+/// sequencing (Tree=31, Worm=32, Ping=33, Mario=34) can't land until
 /// the bound is bumped. 19 is genuinely free in the current scheme
 /// (16=FS, 17=KS, 18=shell, 20=net, 21=UDP, 22/23=policy, 24..26=blk,
 /// 27=scanout-driver, 28=compositor, 29=worm/hello-window, 30=input,
 /// 31=tree). Worm chose 29 by squeezing between compositor + input;
-/// Pong chooses 19 because that's a truly unused slot, which means
-/// running pong alongside any future dev-only module doesn't collide
+/// Ping chooses 19 because that's a truly unused slot, which means
+/// running ping alongside any future dev-only module doesn't collide
 /// with 29.
 ///
-/// Revisit when: MAX_ENDPOINTS is raised kernel-side — Pong moves to
+/// Revisit when: MAX_ENDPOINTS is raised kernel-side — Ping moves to
 /// the class-grouped slot (33) with Worm + Mario at 32 + 34.
 const PONG_ENDPOINT: u32 = 19;
 
 /// USB HID usage codes. Full evdev→HID table in
-/// `user/virtio-input/src/evdev.rs`; only the codes Pong cares about
+/// `user/virtio-input/src/evdev.rs`; only the codes Ping cares about
 /// are redeclared here, same locality discipline as Worm + Tree.
 mod keys {
     // Movement: W/S canonical, Up/Down as a fallback for players who
@@ -81,12 +81,12 @@ mod keys {
 
 /// TUNING: physics tick interval, in kernel ticks (1 tick = 10 ms at
 /// 100 Hz). 5 → 50 ms → 20 FPS. Worm runs at 20 ticks / 200 ms because
-/// grid-stepped games don't benefit from sub-half-second frames; Pong
+/// grid-stepped games don't benefit from sub-half-second frames; Ping
 /// is continuous and needs the higher rate for the ball to read as
 /// motion rather than as a slideshow.
 ///
 /// Not 60 FPS. The compositor path hasn't been profiled at sustained
-/// high frame rates — the HN-launch plan calls this out as Pong's
+/// high frame rates — the HN-launch plan calls this out as Ping's
 /// stress-test territory. 20 FPS is defensible for v0: ball at
 /// 7–11 px/tick → 140–220 px/sec, readable motion. If the scanout
 /// profiling pass (post-v0) shows 60 FPS headroom, tune this down to
@@ -118,10 +118,10 @@ impl Input {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    sys::print(b"[PONG] booting\r\n");
+    sys::print(b"[PING] booting\r\n");
 
     // Leaf boot module — release the boot gate immediately so
-    // downstream modules (shell, anything after pong in the manifest)
+    // downstream modules (shell, anything after ping in the manifest)
     // don't block on our compositor round-trip.
     sys::module_ready();
 
@@ -140,24 +140,24 @@ pub extern "C" fn _start() -> ! {
                 cambios_libgui::ClientError::EncodeRequestResize => b"encode_request_resize",
                 cambios_libgui::ClientError::RequestResizeWriteFailed(_) => b"request_resize_write",
             };
-            sys::log_error(b"PONG", tag);
+            sys::log_error(b"PING", tag);
             sys::exit(1);
         }
     };
-    sys::print(b"[PONG] window opened\r\n");
+    sys::print(b"[PING] window opened\r\n");
 
     // Same seed shape as Tree + Worm — time XOR (pid * PHI) so
     // distinct launches get distinct serves.
     let seed = sys::get_time() ^ ((sys::get_pid() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let mut pong = Pong::new(seed);
+    let mut ping = Ping::new(seed);
     let mut input = Input::default();
 
     let mut clock = FrameClock::new(STEP_TICKS);
     clock.seed(sys::get_time());
 
-    redraw(&mut client, &pong);
+    redraw(&mut client, &ping);
 
-    sys::print(b"[PONG] entering event loop\r\n");
+    sys::print(b"[PING] entering event loop\r\n");
     loop {
         let mut dirty = false;
         let mut drained = false;
@@ -167,22 +167,22 @@ pub extern "C" fn _start() -> ! {
         // next full redraw.
         while let Some(ev) = client.poll_event() {
             drained = true;
-            if handle_event(&ev, &mut pong, &mut input, &mut clock, &client) {
+            if handle_event(&ev, &mut ping, &mut input, &mut clock, &client) {
                 dirty = true;
             }
         }
 
         // Physics tick — only advance when there's game to run. In
         // MatchOver, the frame is a static tableau.
-        if !matches!(pong.state(), State::MatchOver { .. })
+        if !matches!(ping.state(), State::MatchOver { .. })
             && clock.tick(sys::get_time())
-            && pong.step(input.motion())
+            && ping.step(input.motion())
         {
             dirty = true;
         }
 
         if dirty {
-            redraw(&mut client, &pong);
+            redraw(&mut client, &ping);
         }
 
         if !drained && !dirty {
@@ -197,7 +197,7 @@ pub extern "C" fn _start() -> ! {
 /// always applied here.
 fn handle_event(
     ev: &InputEvent,
-    pong: &mut Pong,
+    ping: &mut Ping,
     input: &mut Input,
     clock: &mut FrameClock,
     client: &Client,
@@ -221,7 +221,7 @@ fn handle_event(
                     false
                 }
                 keys::R | keys::ESCAPE => {
-                    pong.reset();
+                    ping.reset();
                     clock.seed(sys::get_time());
                     true
                 }
@@ -246,13 +246,13 @@ fn handle_event(
     }
 }
 
-fn redraw(client: &mut Client, pong: &Pong) {
+fn redraw(client: &mut Client, ping: &Ping) {
     {
         let mut surf = client.surface_mut();
-        render::draw(&mut surf, pong);
+        render::draw(&mut surf, ping);
     }
     if client.submit_full().is_err() {
-        sys::log_error(b"PONG", b"submit_full failed");
+        sys::log_error(b"PING", b"submit_full failed");
         // Recoverable on the next frame. Exit only on unrecoverable
         // handshake failure.
     }
@@ -260,6 +260,6 @@ fn redraw(client: &mut Client, pong: &Pong) {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"PONG", b"panic");
+    sys::log_error(b"PING", b"panic");
     sys::exit(255);
 }

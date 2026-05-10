@@ -34,7 +34,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cambios-pong"
+name = "cambios-ping"
 version = "0.1.0"
 dependencies = [
  "cambios-libgui",

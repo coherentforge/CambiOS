@@ -11,8 +11,8 @@
 //! kernel `iretq` GPF for larger .rodata is resolved.
 
 use cambios_libgui::{Bitmap, Color, Rect, Surface};
-use cambios_super_sprouty_o::game::{Game, Status};
-use cambios_super_sprouty_o::level::{self, GOAL_COL, GOAL_ROW, LEVEL, SURFACE_H, SURFACE_W, TILE_SIZE};
+use cambios_sprouty::game::{Game, Status};
+use cambios_sprouty::level::{self, GOAL_COL, GOAL_ROW, LEVEL, SURFACE_H, SURFACE_W, TILE_SIZE};
 
 use crate::sprites::{GROUND, SPROUTY_IDLE, TRANSPARENT, WEED};
 
