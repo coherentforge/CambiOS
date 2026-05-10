@@ -44,10 +44,7 @@
 // re-exports trip dead-code warnings; muted here.
 #![allow(dead_code)]
 
-extern crate alloc;
-
 use core::sync::atomic::{AtomicU8, Ordering};
-use linked_list_allocator::LockedHeap;
 
 use cambios_libgui_proto::{
     encode_input_event, INPUT_EVENT_SIZE, COMPOSITOR_INPUT_ENDPOINT, MAX_WINDOWS,
@@ -65,33 +62,7 @@ mod windows;
 use scanout::{
     Backend, HeadlessBackend, LimineFbBackend, ScanoutBackend, ScanoutBuffer, ScanoutEvent,
 };
-use windows::{commit_window_resize, handle_client_payload, LingerEntry, ResizeEdge, WindowTable, WindowView};
-
-/// SCAFFOLDING: compositor userspace heap, 16 MiB.
-///
-/// Why: the v1-endgame compositor is a general-purpose pixel pipeline
-/// (multi-monitor, damage-tracked partial recomposition, animation
-/// state per window, effect intermediates for blur/shadow, trusted
-/// overlay surfaces, dynamic linger/fade backing buffers). None of
-/// those workloads can be statically pre-sized in BSS at endgame
-/// scale without massive over-provisioning for the 95% case.
-/// Steady-state estimate at v1: one ~3 MiB linger buffer + a few MiB
-/// of damage/animation/overlay state ≈ 4-5 MiB. 25%-utilization rule
-/// (per ASSUMPTIONS.md § Sizing SCAFFOLDING bounds) targets 4× that
-/// → 16-20 MiB. Choosing 16 MiB as the lower-end starting point.
-/// Allocated via `sys::allocate(HEAP_PAGES)` at `_start`; mapped
-/// anonymously into the compositor's address space at VMA_ALLOC_BASE
-/// (0x1000_0000) onward, well clear of the static segment.
-/// Replace when: a real workload pushes heap utilization past ~75%
-/// (linker-list-allocator fragmentation will start to bite first),
-/// at which point either bump the pool or split fixed-size things
-/// (Window state, damage rects) into a slab/pool layered allocator
-/// keeping the general heap for variable-size things.
-const HEAP_BYTES: usize = 16 * 1024 * 1024;
-const HEAP_PAGES: u32 = (HEAP_BYTES / 4096) as u32;
-
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+use windows::{commit_window_resize, handle_client_payload, ResizeEdge, Window, WindowTable, WindowView};
 
 /// Maximum IPC receive buffer size for the main dispatch loop.
 /// Sized to hold the largest libgui-proto message (FrameReady with
@@ -107,26 +78,6 @@ const RECV_HEADER_BYTES: usize = 36;
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     sys::print(b"[COMPOSITOR] Phase Scanout-2 (ADR-014)\r\n");
-
-    // Initialize the userspace heap before any alloc-using code runs.
-    // Failure here is fatal — no fallback path makes sense, and every
-    // subsequent feature added on top of the heap would need a
-    // duplicate static-pool branch otherwise.
-    let heap_vaddr = sys::allocate(HEAP_PAGES);
-    if heap_vaddr <= 0 {
-        sys::log_error(b"COMPOSITOR", b"heap allocate failed");
-        sys::exit(1);
-    }
-    // SAFETY: `sys::allocate` returned a positive vaddr pointing at
-    // HEAP_PAGES * 4096 = HEAP_BYTES of freshly-mapped, zero-filled,
-    // process-private anonymous memory. This is the only call site
-    // that initializes ALLOCATOR; no other code reads or writes the
-    // returned region directly, so the allocator owns it exclusively.
-    unsafe {
-        ALLOCATOR
-            .lock()
-            .init(heap_vaddr as usize as *mut u8, HEAP_BYTES);
-    }
 
     if sys::register_endpoint(COMPOSITOR_ENDPOINT) < 0 {
         sys::log_error(b"COMPOSITOR", b"register_endpoint(28) failed");
@@ -251,17 +202,9 @@ pub extern "C" fn _start() -> ! {
         // MAX_WINDOWS sys::channel_info calls per iteration — cheap
         // even at the v1 endgame ~30-window target.
         let _ = window_table.reap_dead_channels();
-        // Reap lingerers whose deadline has elapsed. Free side: the
-        // backing pixel buffer is dropped back to the heap. Edge case
-        // worth noting: a lingerer expiring is what triggers the
-        // "last frame gone" blank below when there is no active
-        // window left, so this MUST run before the `has_visible`
-        // check.
-        let lingerers_reaped = window_table.reap_expired_lingers(sys::get_time());
 
         let outcome = pump_dispatch_once(&mut backend, &mut window_table);
-        let mut needs_composite = matches!(outcome, DispatchOutcome::ClientFrame(_))
-            || lingerers_reaped > 0;
+        let mut needs_composite = matches!(outcome, DispatchOutcome::ClientFrame(_));
         if needs_composite {
             // Z-stack composition: any window's FrameReady triggers a
             // full back-to-front recomposition because a higher-layer
@@ -273,7 +216,7 @@ pub extern "C" fn _start() -> ! {
             pointer.dirty = false;
         }
 
-        let has_windows = window_table.has_visible();
+        let has_windows = window_table.iter().next().is_some();
         if had_windows && !has_windows {
             composite_blank_and_present(&mut backend);
         }
@@ -826,37 +769,6 @@ fn pump_dispatch_once<B: ScanoutBackend>(
 ///
 /// Only meaningful against a `Backend::Limine` backend today; headless
 /// has no scanout buffer to blit to.
-/// Sortable composite-pass entry. Unifies active windows and
-/// lingerers behind one type so the back-to-front sort + blit loop
-/// doesn't have to special-case the two collections. `Copy` so the
-/// stack snapshot array can use `[None; N]`-style init.
-#[derive(Clone, Copy)]
-struct BlitSlot {
-    view: WindowView,
-    alpha_blend: bool,
-    front_seq: u32,
-}
-
-/// Build a `WindowView` for a lingerer that points at its private
-/// backing buffer instead of the (now-closed) channel mapping.
-/// The buffer is tightly packed (no row padding), so pitch is
-/// `width * 4` bytes — different from the active-window pitch
-/// which honors the channel's page-aligned row stride. The
-/// `blit_surface_to_scanout` / `blend_surface_onto_scanout`
-/// readers compute row stride from `pitch`, so this is the only
-/// piece of geometry that diverges between the two paths.
-fn linger_view(entry: &LingerEntry) -> WindowView {
-    WindowView {
-        window_id: entry.window.window_id,
-        x: entry.window.x,
-        y: entry.window.y,
-        width: entry.window.width,
-        height: entry.window.height,
-        pitch: entry.window.width * 4,
-        surface_vaddr: entry.pixels.as_ptr() as u64,
-    }
-}
-
 fn composite_and_present(
     backend: &mut Backend,
     window_table: &WindowTable,
@@ -868,34 +780,15 @@ fn composite_and_present(
         Backend::Headless(_) => return,
     };
 
-    // Snapshot every visible surface — active windows AND lingerers
-    // — into a fixed-size array, then sort by `front_seq` ascending
-    // so we composite back-to-front. Lingerers preserve the
-    // `front_seq` they had at destroy time so a held frame stays
-    // layered correctly relative to active siblings (e.g. an arcade
-    // chooser lingers underneath a freshly-spawned game's first
-    // frame). Insertion sort is fine — MAX_WINDOWS + MAX_LINGERERS
-    // is bounded, and the common case is 1-2 windows + 0-1
-    // lingerers.
-    let mut sorted: [Option<BlitSlot>; MAX_WINDOWS * 2] = [None; MAX_WINDOWS * 2];
+    // Snapshot every live window into a fixed-size array, then sort
+    // by `front_seq` ascending so we composite back-to-front.
+    // Insertion sort is fine — MAX_WINDOWS is bounded and small (32
+    // today), and the common case is 1–2 windows.
+    let mut sorted: [Option<&Window>; MAX_WINDOWS] = [None; MAX_WINDOWS];
     let mut count = 0usize;
     for w in window_table.iter() {
-        if count < sorted.len() {
-            sorted[count] = Some(BlitSlot {
-                view: WindowView::from(w),
-                alpha_blend: w.alpha_blend,
-                front_seq: w.front_seq,
-            });
-            count += 1;
-        }
-    }
-    for entry in window_table.iter_lingerers() {
-        if count < sorted.len() {
-            sorted[count] = Some(BlitSlot {
-                view: linger_view(entry),
-                alpha_blend: entry.window.alpha_blend,
-                front_seq: entry.window.front_seq,
-            });
+        if count < MAX_WINDOWS {
+            sorted[count] = Some(w);
             count += 1;
         }
     }
@@ -913,16 +806,17 @@ fn composite_and_present(
         }
     }
 
-    // Composite. The back-most surface always overwrites (its pixels
+    // Composite. The back-most window always overwrites (its pixels
     // become the scanout's base regardless of `alpha_blend`); higher
     // layers either overwrite (`alpha_blend=false`) or alpha-blend
     // (`alpha_blend=true`) on top of whatever's there.
     for (idx, slot) in sorted[..count].iter().enumerate() {
-        let s = slot.expect("count tracks Some entries");
-        if idx == 0 || !s.alpha_blend {
-            blit_surface_to_scanout(&s.view, &scanout);
+        let w = slot.expect("count tracks Some entries");
+        let view = WindowView::from(w);
+        if idx == 0 || !w.alpha_blend {
+            blit_surface_to_scanout(&view, &scanout);
         } else {
-            blend_surface_onto_scanout(&s.view, &scanout);
+            blend_surface_onto_scanout(&view, &scanout);
         }
     }
 

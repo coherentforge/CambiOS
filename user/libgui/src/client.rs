@@ -346,17 +346,8 @@ impl Client {
     /// inside a poll_event borrow; the Client is normally dropped
     /// immediately afterward via sys::exit anyway.
     pub fn close(&self) {
-        self.close_with_linger(0);
-    }
-
-    /// As [`Client::close`], but asks the compositor to hold the
-    /// window's last rendered frame for `linger_ms` milliseconds
-    /// before reaping. Used by transition-aware clients to cushion
-    /// the gap between this window's exit and the next window's
-    /// first frame. `linger_ms = 0` is identical to `close()`.
-    pub fn close_with_linger(&self, linger_ms: u32) {
         let mut buf = [0u8; 16];
-        if let Some(n) = encode_destroy_window(&mut buf, self.window_id, linger_ms) {
+        if let Some(n) = encode_destroy_window(&mut buf, self.window_id) {
             let _ = sys::write(COMPOSITOR_ENDPOINT, &buf[..n]);
         }
     }

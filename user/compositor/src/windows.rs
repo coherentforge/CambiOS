@@ -25,7 +25,6 @@
 //! this module never talks to a `ScanoutBackend` — the render-loop glue
 //! in `main.rs` is what ties front and back together each frame.
 
-use alloc::vec::Vec;
 use cambios_libgui_proto::{
     decode_create_window, decode_destroy_window, decode_frame_ready_header,
     decode_request_resize, encode_error_response, encode_welcome_client, encode_window_resized,
@@ -45,44 +44,6 @@ const CHANNEL_ROLE_CONSUMER: u32 = 1;
 const SURFACE_BPP: u16 = 32;
 const SURFACE_BYTES_PER_PIXEL: u32 = 4;
 const PAGE_SIZE: u32 = 4096;
-
-/// SCAFFOLDING: maximum requested linger duration in milliseconds.
-/// Compositor silently clamps `DestroyWindow.linger_ms` to this cap.
-/// Why: lingering windows occupy a slot in `WindowTable.lingerers`
-/// and a backing pixel buffer on the compositor's heap. A bound caps
-/// blast radius if a client requests an unreasonable duration. 5 s
-/// covers the v1-endgame consumers we know — splash transitions
-/// (~800 ms typical), app-quit fade-out (~300 ms), graceful-crash
-/// cushion (~1-3 s). Suspend / resume / minimize-to-taskbar do not
-/// fit the "hold for N ms then reap" shape and will design their
-/// own primitive when they land.
-/// Replace when: a real consumer surfaces a linger request between
-/// 5 and 30 s and the use case is genuinely "show a frozen frame
-/// for that long" rather than a different lifecycle entirely.
-const MAX_LINGER_MS: u32 = 5_000;
-
-/// SCAFFOLDING: max concurrent lingerers.
-/// Why: each lingerer holds a pixel-sized backing buffer
-/// (width × height × 4 B). On a 16 MiB compositor heap with the
-/// v1 typical lingerer ~1-3 MiB, 4 concurrent fits comfortably.
-/// `try_reserve_exact` on the buffer alloc is the heap-side bound;
-/// this constant is the structural bound on the side-list itself.
-/// Replace when: heap grows to a size where >4 simultaneous
-/// transitions become routine (multi-app launch sequences,
-/// virtual-desktop swipe-out, expose / mission-control batch
-/// minimize) — at that point this becomes a TUNING value rather
-/// than a structural cap.
-const MAX_LINGERERS: usize = 4;
-
-/// Kernel timer tick rate is 100 Hz (CLAUDE.md § Timer / Preemptive
-/// Scheduling). Each `sys::get_time` tick is 10 ms.
-const MS_PER_TICK: u64 = 10;
-
-/// Convert a millisecond duration to ticks, rounding up so the
-/// caller never gets shorter than the requested duration.
-fn ms_to_ticks(ms: u32) -> u64 {
-    (ms as u64 + MS_PER_TICK - 1) / MS_PER_TICK
-}
 
 /// Which edge or corner of a window an active resize-drag is anchored
 /// to. Returned by `WindowTable::hit_test_resize`; consumed by
@@ -156,32 +117,6 @@ pub struct Window {
     pub alpha_blend: bool,
 }
 
-/// One window held in linger state — its owner sent
-/// `DestroyWindow { linger_ms > 0 }` and the compositor copied the
-/// surface's last-rendered pixels into a private buffer so the
-/// frame outlives the client's exit. Detached from the active
-/// `windows[]` table — lingerers are excluded from focus, input,
-/// and hit-test, but still composited from the backing buffer
-/// until `deadline_ticks` elapses.
-pub struct LingerEntry {
-    /// Snapshot of the window at destroy-with-linger time. Geometry,
-    /// `front_seq` (so layering is preserved), `alpha_blend`,
-    /// `owner_principal` (diagnostic). `surface_channel_id` is a
-    /// stale breadcrumb — the channel was closed when the entry was
-    /// created; do not use it for I/O.
-    pub window: Window,
-    /// Owned copy of the window's last-rendered pixels. Length is
-    /// `width * height` u32 entries. Heap-allocated; data pointer
-    /// is stable for the entry's lifetime — no push / reserve is
-    /// performed after the initial fill, so `Vec::as_ptr` returns
-    /// the same address across composite passes.
-    pub pixels: Vec<u32>,
-    /// Tick (per `sys::get_time`) at which this entry should be
-    /// reaped. `WindowTable::reap_expired_lingers` drops entries
-    /// whose deadline has passed.
-    pub deadline_ticks: u64,
-}
-
 /// Fixed-size slab of live windows + a monotonic id counter.
 ///
 /// Scanout-3 never frees from the middle of the table except via
@@ -190,11 +125,6 @@ pub struct LingerEntry {
 /// "invalid / no window").
 pub struct WindowTable {
     windows: [Option<Window>; MAX_WINDOWS],
-    /// Side-list of windows in linger state. Bounded by
-    /// `MAX_LINGERERS` (structural) and the compositor heap
-    /// (per-buffer). Composite path walks both `windows[]` (active)
-    /// and `lingerers` (held frames) sorted by `front_seq`.
-    lingerers: Vec<LingerEntry>,
     next_window_id: u32,
     /// Monotonic counter feeding `Window::front_seq`. Skip 0 on wrap
     /// — same convention as `next_window_id`. Bumped both at create
@@ -204,10 +134,9 @@ pub struct WindowTable {
 }
 
 impl WindowTable {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             windows: [None; MAX_WINDOWS],
-            lingerers: Vec::new(),
             next_window_id: 1,
             next_front_seq: 1,
         }
@@ -260,22 +189,6 @@ impl WindowTable {
 
     pub fn iter(&self) -> impl Iterator<Item = &Window> {
         self.windows.iter().filter_map(Option::as_ref)
-    }
-
-    /// Iterate windows currently in linger state (post-destroy,
-    /// pre-deadline). Composited but not focusable, not input-routed,
-    /// not hit-tested. Used by the render path to blit lingerers from
-    /// their backing buffers alongside active windows.
-    pub fn iter_lingerers(&self) -> impl Iterator<Item = &LingerEntry> {
-        self.lingerers.iter()
-    }
-
-    /// True if any window — active or lingering — is currently
-    /// visible. Drives the main loop's blank-vs-composite decision:
-    /// a tick with no active windows but live lingerers should still
-    /// composite (the held frames are pixels worth showing).
-    pub fn has_visible(&self) -> bool {
-        self.iter().next().is_some() || !self.lingerers.is_empty()
     }
 
     /// Pick the front-most live window — highest `front_seq` wins,
@@ -462,23 +375,6 @@ impl WindowTable {
             }
         }
         reaped
-    }
-
-    /// Drop lingerers whose deadline has elapsed. Called once per
-    /// main-loop iteration alongside `reap_dead_channels`. The
-    /// `now_ticks` argument is read from `sys::get_time` by the
-    /// caller so this method stays a pure data transform on
-    /// `WindowTable` (verifier-friendly: no syscall side-effects).
-    /// Returns the count reaped.
-    ///
-    /// Vec<LingerEntry>::retain shrinks in place, so per-entry
-    /// cost is O(1) amortised. The dropped `LingerEntry` runs its
-    /// destructor — frees the backing pixel buffer back to the
-    /// compositor heap.
-    pub fn reap_expired_lingers(&mut self, now_ticks: u64) -> usize {
-        let before = self.lingerers.len();
-        self.lingerers.retain(|e| now_ticks < e.deadline_ticks);
-        before - self.lingerers.len()
     }
 }
 
@@ -926,8 +822,8 @@ fn handle_destroy_window(
     from_endpoint: u32,
     window_table: &mut WindowTable,
 ) {
-    let (window_id, linger_ms) = match decode_destroy_window(payload) {
-        Some(pair) => pair,
+    let window_id = match decode_destroy_window(payload) {
+        Some(id) => id,
         None => {
             send_error(from_endpoint, GuiError::InvalidMessage);
             return;
@@ -942,9 +838,7 @@ fn handle_destroy_window(
         }
     };
 
-    // Validate ownership and snapshot the fields the linger path
-    // needs while the borrow is still scoped tight.
-    let snapshot = {
+    let channel_id = {
         let w = match window_table.get_mut(slot) {
             Some(w) => w,
             None => return,
@@ -953,90 +847,11 @@ fn handle_destroy_window(
             send_error(from_endpoint, GuiError::NoSuchWindow);
             return;
         }
-        *w
+        w.surface_channel_id
     };
 
-    if linger_ms == 0 || !try_promote_to_lingerer(window_table, &snapshot, linger_ms) {
-        // Immediate teardown: either the client asked for it
-        // (linger_ms = 0), or the linger promotion failed (cap hit
-        // or backing-buffer alloc failed). Falling through to the
-        // immediate path is the right user-visible behavior in both
-        // cases — linger is a best-effort hint, not a guarantee.
-        let _ = sys::channel_close(snapshot.surface_channel_id);
-        window_table.windows[slot] = None;
-        return;
-    }
-
-    // Linger promotion succeeded. The lingerer owns the pixels now;
-    // detach the slot and close the channel. The compositor's RO
-    // mapping of the channel is no longer needed — composite reads
-    // from `LingerEntry.pixels` until the deadline.
-    let _ = sys::channel_close(snapshot.surface_channel_id);
+    let _ = sys::channel_close(channel_id);
     window_table.windows[slot] = None;
-}
-
-/// Attempt to copy the window's surface pixels into a fresh
-/// backing buffer and push a `LingerEntry`. Returns `true` if
-/// the lingerer was registered, `false` if the cap was hit or
-/// allocation failed (caller falls back to immediate teardown).
-///
-/// `linger_ms` is clamped to `MAX_LINGER_MS` before deadline
-/// computation so a misbehaving client can't keep a slot longer
-/// than v1 policy allows.
-#[allow(unsafe_code)]
-fn try_promote_to_lingerer(
-    window_table: &mut WindowTable,
-    window: &Window,
-    linger_ms: u32,
-) -> bool {
-    if window_table.lingerers.len() >= MAX_LINGERERS {
-        return false;
-    }
-
-    let pixel_count = (window.width as usize) * (window.height as usize);
-    if pixel_count == 0 {
-        return false;
-    }
-
-    let mut pixels: Vec<u32> = Vec::new();
-    if pixels.try_reserve_exact(pixel_count).is_err() {
-        return false;
-    }
-
-    let pitch_pixels = (window.pitch / SURFACE_BYTES_PER_PIXEL) as usize;
-    let row_pixels = window.width as usize;
-
-    // SAFETY: `window.surface_vaddr` is the compositor's RO mapping
-    // of the surface channel — set by `commit_window_resize` /
-    // `handle_create_window` to point at `pitch * height` bytes of
-    // mapped, attached, non-revoked memory (we are still holding
-    // the channel; the close happens after this function returns
-    // successfully). The read window is bounded:
-    //   row in 0..height
-    //   col in 0..width
-    //   offset = row * pitch_pixels + col, with pitch_pixels >= width
-    // so byte offset < height * pitch <= channel mapped extent.
-    // `read_volatile` matches the existing `blit_surface_to_scanout`
-    // contract — prevents reorder around the live channel reads.
-    unsafe {
-        let src_base = window.surface_vaddr as *const u32;
-        for row in 0..(window.height as usize) {
-            let row_base = src_base.add(row * pitch_pixels);
-            for col in 0..row_pixels {
-                pixels.push(core::ptr::read_volatile(row_base.add(col)));
-            }
-        }
-    }
-
-    let clamped = linger_ms.min(MAX_LINGER_MS);
-    let deadline = sys::get_time().saturating_add(ms_to_ticks(clamped));
-
-    window_table.lingerers.push(LingerEntry {
-        window: *window,
-        pixels,
-        deadline_ticks: deadline,
-    });
-    true
 }
 
 // ============================================================================
