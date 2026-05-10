@@ -116,6 +116,18 @@ struct InputDevice {
     modifiers: u16,
     /// Live pointer button bitmask (bit-OR of `button::*`).
     buttons: u16,
+    /// Live pointer absolute position, accumulated from EV_REL events.
+    /// Stamped on every outgoing `PointerButton` event so consumers
+    /// (compositor) can read the click coordinates without a separate
+    /// PointerMove arriving first. Without this, the contract documented
+    /// at `PointerState::apply_absolute` is violated and the compositor
+    /// resets its cursor to (0, 0) on every button transition —
+    /// triggering edge-grab resize on every click into a window at the
+    /// scanout origin. Clamped to a generous bound matching the
+    /// compositor's clamp; actual scanout-bounds clipping happens at
+    /// paint time.
+    pointer_x: i32,
+    pointer_y: i32,
 }
 
 // ============================================================================
@@ -273,6 +285,8 @@ fn initialize_device(pci_index: u32, device_id: u32) -> Option<InputDevice> {
         seq: 0,
         modifiers: 0,
         buttons: 0,
+        pointer_x: 0,
+        pointer_y: 0,
     })
 }
 
@@ -416,8 +430,15 @@ fn handle_pointer_button(dev: &mut InputDevice, code: u16, value: u32) {
         dev.buttons &= !bit;
     }
     let payload = PointerPayload {
-        dx: 0,
-        dy: 0,
+        // Stamp the current absolute pointer position. The compositor's
+        // `PointerState::apply_absolute` re-baselines from this, and the
+        // edge-grab + raise-on-click hit-test paths read these
+        // coordinates directly. Without this stamp, every click clobbers
+        // the compositor's cursor to (0, 0) and triggers a TopLeft
+        // resize-grab on whatever window happens to live at the scanout
+        // origin.
+        dx: dev.pointer_x,
+        dy: dev.pointer_y,
         buttons: dev.buttons,
         scroll_x: 0,
         scroll_y: 0,
@@ -452,10 +473,16 @@ fn handle_pointer_rel(dev: &mut InputDevice, code: u16, value: i32) {
     let etype = match code {
         REL_X => {
             payload.dx = value;
+            // Track absolute position so PointerButton events can stamp it.
+            // Clamped to match `PointerState::apply_absolute`'s bound on
+            // the compositor side; matches the contract documented at
+            // `InputDevice::pointer_x`.
+            dev.pointer_x = dev.pointer_x.saturating_add(value).clamp(-4096, 4096);
             EventType::PointerMove
         }
         REL_Y => {
             payload.dy = value;
+            dev.pointer_y = dev.pointer_y.saturating_add(value).clamp(-4096, 4096);
             EventType::PointerMove
         }
         REL_WHEEL => {
