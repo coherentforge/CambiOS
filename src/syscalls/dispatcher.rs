@@ -656,11 +656,29 @@ impl SyscallDispatcher {
         let ipc_mgr = ipc_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
         let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
 
-        if ipc_mgr.send_message_with_capability(ctx.process_id, endpoint, msg, cap_mgr).is_err() {
-            crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
-                ctx.process_id, endpoint, crate::audit::now(), 0,
-            ));
-            return Err(SyscallError::PermissionDenied);
+        // Distinguish security-relevant denials (capability + interceptor)
+        // from operational backpressure (QueueFull). The audit ring is for
+        // security events; logging queue-full as CapabilityDenied flooded
+        // the ring during boot when a busy receiver (e.g., terminal-window
+        // doing initial render) couldn't drain its 16-deep input queue
+        // fast enough to absorb virtio-input's PointerMove stream — every
+        // overflow showed up as a fake cap-denied event in audit-tail and
+        // saturated serial. Operational errors return an EAGAIN-shaped
+        // status so the caller can react, but no audit emit.
+        match ipc_mgr.send_message_with_capability(ctx.process_id, endpoint, msg, cap_mgr) {
+            Ok(()) => {}
+            Err(crate::ipc::IpcError::PermissionDenied) => {
+                crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+                    ctx.process_id, endpoint, crate::audit::now(), 0,
+                ));
+                return Err(SyscallError::PermissionDenied);
+            }
+            Err(crate::ipc::IpcError::QueueFull) => {
+                return Err(SyscallError::OutOfMemory);
+            }
+            Err(_) => {
+                return Err(SyscallError::InvalidArg);
+            }
         }
 
         // Drop IPC/capability locks before acquiring scheduler (lock ordering)
