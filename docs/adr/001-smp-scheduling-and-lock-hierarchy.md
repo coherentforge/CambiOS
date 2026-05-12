@@ -371,3 +371,51 @@ The load balancer currently picks the first Ready task. For mixed-priority workl
 ## Verification
 
 Test counts and what each scheduler test covers (creation, task lifecycle, block/wake, IRQ wake, priority scheduling, migration primitives, idle task immutability, etc.) live in [STATUS.md § Test coverage](../../STATUS.md#test-coverage). The current scheduler implementation reference is [SCHEDULER.md](../../src/scheduler/SCHEDULER.md). QEMU integration covers `-smp 1` and `-smp 2`: stable preemptive multitasking, task migration, cross-CPU wake, load balancer quiescence when balanced.
+
+## Divergence
+
+The original ADR text above is the decision record as ratified on 2026-04-03. Subsequent changes that intersect this ADR's surface are recorded here as appendices — the original reasoning is not edited.
+
+### 2026-04-05 — Scheduler task storage moved to Vec; MAX_TASKS 32 → 256 (commit 41ed98c)
+
+`Scheduler.tasks` changed from a fixed `[Option<Task>; 32]` to `Vec<Option<Task>>`, and `MAX_TASKS` changed from 32 to 256. The per-priority ready queues are `VecDeque<TaskId>`. Rationale: the 32-slot bound was tight even for development workloads, and a heap-backed table keeps the per-CPU stack footprint constant as the task table grows (Convention 4). `TASK_CPU_MAP` scaled in lockstep to `[AtomicU16; 256]` ([src/lib.rs:208](../../src/lib.rs#L208)); both bounds are SCAFFOLDING per Convention 8 and must move together. The slot-preservation migration property is unchanged — slot 3 on CPU 0 and slot 3 on CPU 1 still cannot both be occupied.
+
+### 2026-04-05 — `ShardedIpcManager` introduced; cross-CPU send path replaced (commits 41ed98c, d69ca6e)
+
+The "IPC send: cross-CPU receiver search" pseudocode in the ADR (a scan-all-schedulers loop in a function called `ipc_send_and_notify`) was the global-`IpcManager` shape. The current send path goes through `ShardedIpcManager` ([src/ipc/mod.rs:978](../../src/ipc/mod.rs#L978)) with per-endpoint shard locks (see "Additional lock domains" in [CLAUDE.md § Lock Ordering](../../CLAUDE.md)). `Scheduler::find_highest_priority_receiver` ([src/scheduler/mod.rs:983](../../src/scheduler/mod.rs#L983)) is preserved as the per-scheduler receiver-lookup primitive. The stale prose was deleted from `microkernel/main.rs` on 2026-04-17 (commit f2fe33f).
+
+### 2026-04-15 — Per-priority-band ready queues added (commit 8f24c33)
+
+The ADR describes a single Ready queue per scheduler. The current scheduler has 4 priority bands ([src/scheduler/mod.rs:187](../../src/scheduler/mod.rs#L187), `NUM_PRIORITY_BANDS`, ARCHITECTURAL per Convention 8) — Idle / Low / Normal / High+Critical — with a `VecDeque<TaskId>` per band. `schedule()` checks bands 3 → 0. Band mapping: `priority / 64`. This is purely additive to the migration / wake / load-balancing primitives in the ADR; the load metric `active_runnable_count()` counts across all bands.
+
+### 2026-04-05 through 2026-05-04 — Lock hierarchy expanded from 7 to 10 levels
+
+Three locks were inserted into the hierarchy by subsequent ADRs, preserving the relative order of the original seven:
+
+- **OBJECT_STORE** (position 10) — added 2026-04-05 (commit 41ed98c) per [ADR-003](003-content-addressed-storage-and-identity.md). Innermost; touched only via FS syscalls.
+- **CHANNEL_MANAGER** (position 6, was 5) — added 2026-04-10 (commit b57b19d) per [ADR-005](005-ipc-primitives-control-and-bulk.md). Per-channel teardown sits between capability checks and process-table lookups.
+- **CLUSTER_MANAGER** (position 5) — added 2026-05-04 (commit b887604) per [ADR-027](027-service-clusters.md). Cluster bookkeeping. Strictly downward into CAPABILITY_MANAGER → CHANNEL_MANAGER → PROCESS_TABLE → FRAME_ALLOCATOR.
+
+Current canonical ordering ([src/lib.rs:67-79](../../src/lib.rs#L67-L79)):
+
+```
+PER_CPU_SCHEDULER(1)* → PER_CPU_TIMER(2)* → IPC_MANAGER(3) →
+CAPABILITY_MANAGER(4) → CLUSTER_MANAGER(5) → CHANNEL_MANAGER(6) →
+PROCESS_TABLE(7) → FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) →
+OBJECT_STORE(10)
+```
+
+`*` = IrqSpinlock. Positions 3–10 use plain Spinlock; none of them are acquired from ISR context. The "Seven-Lock Hierarchy" framing in the original section is therefore numerically obsolete, but the per-position rationale for the original seven still applies — new locks slot in per their own ADRs.
+
+Additional lock domains independent of this hierarchy (`PER_CPU_FRAME_CACHE`, `SHARDED_IPC.shards`, `BOOTSTRAP_PRINCIPAL`, `AUDIT_RING`, `PER_CPU_AUDIT_BUFFER`) are catalogued in [CLAUDE.md § Lock Ordering](../../CLAUDE.md).
+
+### 2026-04-XX — AArch64 + RISC-V backends landed; per-CPU/SMP design is portable
+
+The ADR's examples (GS base, `IA32_GS_BASE`, TSS.RSP0, APIC timer, naked-ASM `iretq` stub) are x86_64-specific. The portable scheduler logic (`on_timer_isr()`, `ContextSwitchHint`, `wake_task_on_cpu`, `block_local_task`, `TASK_CPU_MAP`, `try_load_balance`, the migration primitives) survived the AArch64 port and the RISC-V port without modification. AArch64 uses `TPIDR_EL1` instead of GS base; RISC-V uses an `sscratch`-routed `PerCpu` per [ADR-013](013-riscv64-architecture-support.md). The cross-CPU lock rule (ascending CPU index) and the per-CPU array shape are architecture-independent.
+
+### Status of "Future Work" items
+
+- **IRQ affinity** — partial. `TASK_CPU_MAP` plus `wake_task_on_cpu` already gives registered device IRQs a targeted single-CPU wake (see [CLAUDE.md § Platform Gotchas](../../CLAUDE.md) on `SYS_WAIT_IRQ`). The unregistered-IRQ fallback retains the iterate-and-try-lock pattern.
+- **Work stealing** — not pursued. Push-based balancer remains adequate at current core counts.
+- **NUMA awareness** — not pursued. No ACPI SRAT parsing yet.
+- **Priority-aware migration** — not pursued. `pick_migratable_task()` still returns the first Ready non-idle task.
