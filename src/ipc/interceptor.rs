@@ -6,13 +6,16 @@
 //! Policy enforcement layer that sits between capability checks and actual IPC
 //! operations. Provides defense-in-depth: even if a process holds a valid
 //! capability, the interceptor can deny operations based on runtime policy
-//! (payload validation, endpoint bounds, delegation rules, syscall filtering).
+//! (payload validation, endpoint bounds, delegation rules).
+//!
+//! Per-syscall policy lives outside this trait — see `src/policy/` and
+//! ADR-006. The kernel-side syscall dispatcher calls `policy::policy_check`
+//! directly; `IpcInterceptor` is the seam for IPC-layer enforcement only.
 //!
 //! Design mirrors the `BinaryVerifier` trait in the loader — trait-based
 //! abstraction with a `DefaultInterceptor` that enforces baseline policies.
 
 use crate::ipc::{EndpointId, ProcessId, Message, MAX_ENDPOINTS};
-use crate::syscalls::SyscallNumber;
 use crate::ipc::CapabilityRights;
 use core::fmt;
 
@@ -76,7 +79,6 @@ impl fmt::Display for DenyReason {
 /// - `on_send`: before message enqueue (async) or deposit (sync)
 /// - `on_recv`: before message dequeue / pickup
 /// - `on_delegate`: before capability delegation between processes
-/// - `on_syscall`: before syscall dispatch (pre-handler filter)
 pub trait IpcInterceptor: Send + Sync {
     /// Called before a message is sent (async or sync).
     ///
@@ -108,16 +110,6 @@ pub trait IpcInterceptor: Send + Sync {
         endpoint: EndpointId,
         rights: CapabilityRights,
     ) -> InterceptDecision;
-
-    /// Called before a syscall is dispatched.
-    ///
-    /// Receives the calling process and the syscall number. Can be used
-    /// to enforce per-process syscall allowlists.
-    fn on_syscall(
-        &self,
-        caller: ProcessId,
-        syscall: SyscallNumber,
-    ) -> InterceptDecision;
 }
 
 // ============================================================================
@@ -131,7 +123,6 @@ pub trait IpcInterceptor: Send + Sync {
 /// 2. **Endpoint bounds**: target endpoint < MAX_ENDPOINTS
 /// 3. **No self-send**: process cannot send IPC to its own endpoint ID
 /// 4. **No self-delegation**: process cannot delegate capabilities to itself
-/// 5. **Syscall allowlist**: all defined syscalls permitted (extensible)
 pub struct DefaultInterceptor {
     /// Maximum allowed payload size (bytes)
     pub max_payload: usize,
@@ -159,26 +150,20 @@ impl DefaultInterceptor {
 // `IpcInterceptorBackend` is the *impl shim* used at the kernel-side
 // `IpcManager.interceptor` and `ShardedIpcManager.interceptor` fields. It
 // exists to satisfy CLAUDE.md's Formal Verification rule against `dyn`
-// dispatch on kernel hot paths (interceptor runs on every IPC send/recv
-// and every syscall pre-dispatch). See ADR-002 § Divergence for the full
-// decision rationale (and the reconciliation with ADR-006's reframe of
-// runtime extensibility into the userspace policy-service).
+// dispatch on kernel hot paths (interceptor runs on every IPC send/recv).
+// See ADR-002 § Divergence for the full decision rationale.
 //
 // In-kernel impl set is closed-world by construction:
 //   - Default: permissive baseline (current).
-//   - PolicyService: thin upcall client (future, when ADR-006 lands).
-// Adding a new variant = one new arm in each of the 4 trait methods.
+// Adding a new variant = one new arm in each of the 3 trait methods.
 
 /// Enum-dispatch shim for `IpcInterceptor` backends installed at the
 /// `IpcManager.interceptor` and `ShardedIpcManager.interceptor` fields.
 /// See module-level note above and ADR-002 § Divergence.
 pub enum IpcInterceptorBackend {
     /// Permissive baseline interceptor — endpoint bounds, payload size,
-    /// no self-send, all syscalls allowed.
+    /// no self-send, no self-delegation.
     Default(DefaultInterceptor),
-    // Future: PolicyService(PolicyServiceInterceptor) — lands when ADR-006's
-    // userspace policy-service IPC path is built. Until then, this enum has
-    // exactly one variant.
 }
 
 impl IpcInterceptor for IpcInterceptorBackend {
@@ -212,16 +197,6 @@ impl IpcInterceptor for IpcInterceptorBackend {
     ) -> InterceptDecision {
         match self {
             Self::Default(i) => i.on_delegate(source, target, endpoint, rights),
-        }
-    }
-
-    fn on_syscall(
-        &self,
-        caller: ProcessId,
-        syscall: SyscallNumber,
-    ) -> InterceptDecision {
-        match self {
-            Self::Default(i) => i.on_syscall(caller, syscall),
         }
     }
 }
@@ -281,16 +256,6 @@ impl IpcInterceptor for DefaultInterceptor {
             return InterceptDecision::Deny(DenyReason::SelfDelegation);
         }
 
-        InterceptDecision::Allow
-    }
-
-    fn on_syscall(
-        &self,
-        _caller: ProcessId,
-        _syscall: SyscallNumber,
-    ) -> InterceptDecision {
-        // Default: all defined syscalls are permitted.
-        // Extended interceptors can enforce per-process allowlists.
         InterceptDecision::Allow
     }
 }
@@ -430,21 +395,6 @@ mod tests {
         );
     }
 
-    // --- DefaultInterceptor syscall tests ---
-
-    #[test]
-    fn test_syscall_allows_all_by_default() {
-        let interceptor = DefaultInterceptor::new();
-        assert_eq!(
-            interceptor.on_syscall(ProcessId::new(1, 0), SyscallNumber::Write),
-            InterceptDecision::Allow,
-        );
-        assert_eq!(
-            interceptor.on_syscall(ProcessId::new(1, 0), SyscallNumber::GetPid),
-            InterceptDecision::Allow,
-        );
-    }
-
     // --- Custom interceptor test ---
 
     #[test]
@@ -458,9 +408,6 @@ mod tests {
                 InterceptDecision::Allow
             }
             fn on_delegate(&self, _: ProcessId, _: ProcessId, _: EndpointId, _: CapabilityRights) -> InterceptDecision {
-                InterceptDecision::Allow
-            }
-            fn on_syscall(&self, _: ProcessId, _: SyscallNumber) -> InterceptDecision {
                 InterceptDecision::Allow
             }
         }
