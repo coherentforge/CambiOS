@@ -38,3 +38,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 026 | [Identity Transcription at the Kernel Ring](026-identity-transcription-at-the-kernel-ring.md) | Accepted | 2026-05-02 |
 | 027 | [Service Clusters — Identity-Bound Channel Meshes](027-service-clusters.md) | Proposed | 2026-05-03 |
 | 028 | [Three Storage Models: Kernel-API Type Discipline and Seam Syscalls](028-three-storage-models.md) | Proposed | 2026-05-11 |
+| 029 | [POSIX File Storage Model](029-posix-file-storage-model.md) | Proposed | 2026-05-12 |

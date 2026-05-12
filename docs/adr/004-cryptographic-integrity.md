@@ -221,3 +221,86 @@ New tests to add:
 - `ed25519-compact` crate: https://crates.io/crates/ed25519-compact
 - Bernstein et al., "High-speed high-security signatures" (2012) — Ed25519 specification
 - O'Connor et al., "BLAKE3: one function, fast everywhere" (2020)
+
+## Divergence
+
+### 2026-04-06 — Signed-ELF format: `.note.cambios.sig` proposal → ARCSIG binary trailer
+
+- **Implementation:** commit `391aa4e` (`Crypto Phase 1B/1C: Blake3 + Ed25519 signatures, key-store service, signed ELF loading`)
+- **Trigger:** Implementation of the §Signed ELF Modules subsection. The ADR offered two options ("appended as an ELF note section (`.note.cambios.sig`) or stored as a detached signature alongside the binary"); a third option — a binary trailer — was chosen because it is parser-free at the loader. No ELF section-header walk, no detached-file lookup, no path resolution before the trust check fires.
+
+#### What changed
+
+Signatures are an 8-byte-header binary trailer appended after the last byte of the ELF, not an ELF note section:
+
+```text
+[original ELF bytes][sig: 64 bytes]["ARCSIG"][version: u8 = 1][algo: u8 = 0]
+```
+
+Constants and the inspection helper live in [src/loader/mod.rs:287-360](../../src/loader/mod.rs#L287-L360):
+- `SIGNATURE_TRAILER_PREFIX = b"ARCSIG"`
+- `TRAILER_VERSION_V1 = 1`, `TRAILER_ALGO_ED25519 = 0`
+- `SIGNATURE_TRAILER_V1_ED25519_SIZE = 72` (64-byte signature + 8-byte header)
+- `inspect_signature_trailer()` is the version/algo dispatch point — adding ML-DSA-65 later is a new `(version, algo)` arm, not a format revision.
+
+The host-side tool that produces the trailer is [tools/sign-elf/](../../tools/sign-elf/); the signed payload is `blake3(elf_bytes)`, not the raw bytes, so verification is constant-cost regardless of binary size.
+
+#### What did *not* change
+
+- **The §Verification property** holds: a binary that fails the trailer check causes zero side effects. The trailer is inspected before any frame allocation or page mapping.
+- **The trusted-set model** described in §Signed ELF Modules: trust anchor is still the bootstrap Principal at boot; configurable signer set is still a later step.
+
+#### Why not `.note.cambios.sig`
+
+| Considered | Why rejected |
+|---|---|
+| ELF note section (`.note.cambios.sig`) | Requires the loader to parse the section header table *before* it has decided to trust the binary. Trailer parsing is a single suffix compare against `"ARCSIG"` — strictly less surface than walking section headers, which is a verifier-friendly cost. |
+| Detached `.sig` file alongside the binary | Requires path resolution and a second I/O path. Boot modules arrive as in-memory blobs from Limine; there is no "alongside" at the point the verifier runs. |
+
+### 2026-04-06 — `ObjPut` verification split into `SYS_OBJ_PUT` (unsigned) + `SYS_OBJ_PUT_SIGNED` (verified)
+
+- **Implementation:** commit `391aa4e` (same Phase 1B/1C landing)
+- **Trigger:** Implementation surfaced two distinct call patterns that the ADR's unified §Signature Verification on ObjectStore Operations description collapsed into one. The unified path was unworkable: in-process content production (e.g., a service hashing its own working buffer into the store) has no externally producible signature, and forcing it through a signed path would mean either round-tripping every put through the key-store service or stamping a no-op signature.
+
+#### What changed
+
+Two syscalls instead of one:
+
+- **`SYS_OBJ_PUT`** ([dispatcher.rs:1404](../../src/syscalls/dispatcher.rs#L1404)) — unsigned put. The kernel hashes content with Blake3 and stores it. Provenance is carried by `sender_principal` (kernel-stamped, unforgeable on the local node), not by an object signature. This is the right shape for service-local content where the producer's identity is already attested by the IPC frame.
+- **`SYS_OBJ_PUT_SIGNED`** ([dispatcher.rs:1666](../../src/syscalls/dispatcher.rs#L1666)) — signed put. The caller supplies an Ed25519 signature over the content; the kernel verifies against the caller's Principal via `crypto::verify` before storing. This is the right shape for content that will outlive the IPC frame (replication, cross-node transfer, audit-log entries).
+
+The two paths share the Blake3 hashing step and the store insert; they differ only on whether `signature` is required and verified.
+
+#### What did *not* change
+
+- **The CambiObject signature field** still exists and is still semantically "Ed25519 signature over content by owner." Unsigned puts carry a zero-filled signature field, which is observably distinct from a verified one — readers can tell the two apart.
+- **`ObjGet` defense-in-depth re-verification** as described in the ADR remains an open option, now keyed off "signature is non-zero" rather than "signature always present."
+
+### 2026-05-01 — Bootstrap entropy plan superseded by compile-time CKEY pubkey (Frame-B via ADR-025/026)
+
+- **Implementation:** commit `d41a16e` (`kernel+tool: Principal-as-AID + crypto-agility plumbing (ADR-025)`)
+- **Superseded by:** [ADR-025](025-principal-as-aid.md) (Principal as 32-byte AID) and [ADR-026](026-identity-transcription-at-the-kernel-ring.md) (kernel transcribes identity events without interpreting them).
+- **Trigger:** ADR-004's §Bootstrap Principal Upgrade proposed runtime entropy (`RDRAND` / `RNDR`) producing a real Ed25519 keypair held in a kernel static, later migrating to the key-store service. The Frame-B identity resolution (kernel is arbiter, not Principal; user holds keys) ratified by ADR-025/026 makes the kernel-owned private key the wrong primitive entirely: there is no role for the kernel to *be* a signing identity. The bootstrap key needs to be a verification anchor the kernel can recognize, not a keypair the kernel can use.
+
+#### What changed
+
+The bootstrap path is no longer "kernel generates a keypair on boot." It is "kernel compiles in a public key file produced offline by the operator's signing tool":
+
+- **`bootstrap_pubkey.bin`** ships in-tree, generated by `sign-elf --export-pubkey bootstrap_pubkey.bin` from either a YubiKey-resident private key (production) or a `--seed <hex>` value (CI/test).
+- **CKEY v1 envelope** wraps the 32-byte Ed25519 public key with an 8-byte header (`"CKEY" + version:1 + algo:1 + aid_prefix:2`). Parsed at compile time by `parse_bootstrap_pubkey_v1()` in [src/microkernel/main.rs:1963-2010](../../src/microkernel/main.rs#L1963-L2010) — wrong magic / version / algo is a `const fn` panic at build, not a runtime check.
+- **`BOOTSTRAP_PRINCIPAL`** is populated from the parsed pubkey at boot ([main.rs:1929-1943](../../src/microkernel/main.rs#L1929-L1943)). No `RDRAND`, no `RNDR`, no kernel-side key generation, no kernel-resident private key.
+
+#### Vestigial surface
+
+- **`BOOTSTRAP_SECRET_KEY` static** is preserved at the kernel-static site but is unreferenced by any write — `claim()` always returns `None` and any caller of `SYS_CLAIM_BOOTSTRAP_KEY` receives `PermissionDenied`. Kept so the syscall number and the named static survive for Frame-B reuse (e.g., a future signing-attestation flow that the kernel transcribes without performing).
+- **`SYS_CLAIM_BOOTSTRAP_KEY`** ([dispatcher.rs:1617-1656](../../src/syscalls/dispatcher.rs#L1617-L1656)) likewise survives as a documented vestige. Removal is not safe — the ABI slot must remain stable until the post-v1 handle-table refactor lands.
+
+#### What this means for the §Key Store Service subsection
+
+The ADR's §Key Store Service describes a forward path where "the private key for the bootstrap identity moves from a kernel static to a user-space capability-gated service." Under Frame-B, the private key was never in the kernel static in production — it has always lived on the YubiKey (or behind `--seed` for CI). The key-store service ([user/key-store-service/](../../user/key-store-service/)) is still real and still the correct primitive, but its job is to mediate *user-owned* signing keys, not to receive a key the kernel was holding.
+
+#### What did *not* change
+
+- **Ed25519 + Blake3 as the chosen primitives** stand. ADR-025 reframes what the 32 bytes *mean* (AID, not necessarily a public key) but keeps the algorithm choices made here.
+- **The trust anchor at boot** is still "the bootstrap Principal," just sourced from a compile-time file instead of runtime entropy. The verifier-side properties (collision-resistance, non-forgeability of the signing identity) are unchanged.
+- **The `SignatureAlgo` enum + variable-length signature field** anticipated in §What This Does Not Cover for the post-quantum upgrade survives as the right shape under ADR-025's crypto-agility plumbing.
