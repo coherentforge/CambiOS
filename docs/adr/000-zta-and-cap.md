@@ -68,35 +68,45 @@ pub struct CapabilityRights {
 Capabilities are:
 
 - **Unforgeable.** Only the kernel can create or modify them. User processes cannot fabricate a capability — there is no syscall to "grant yourself access."
-- **Per-process.** Each process holds up to 32 capabilities in a kernel-managed table (`ProcessCapabilities`). The table is not accessible from userspace.
+- **Per-process.** Each process holds up to 32 capabilities in a kernel-managed table (`ProcessCapabilities`). The 32 is a compile-time fixed array size, not a tier-policy value; replacement criteria are tracked in [ASSUMPTIONS.md](../ASSUMPTIONS.md) (SCAFFOLDING). The table is not accessible from userspace.
 - **Checked on every operation.** Every IPC send checks `SEND` rights. Every IPC recv checks `RECV` rights. Every delegation checks `DELEGATE` rights and that the delegator holds at least the rights being delegated (no escalation).
 - **Revocable.** The kernel can revoke a capability at any time, immediately cutting off a compromised process's access.
 
 ### Enforcement points
 
-Access control is enforced at three layers (defense-in-depth):
+Access control is enforced at four layers (defense-in-depth). The identity gate was added 2026-04-13 (see Divergence); the diagram below reflects current behavior:
 
 ```
 Syscall entry
     │
     ▼
 ┌──────────────────────────────┐
-│  1. IpcInterceptor::on_syscall()  │  Pre-dispatch: syscall allowlist
+│  0. Identity gate (dispatcher)         │  Non-zero Principal required for any
+│                                        │  capability-bearing / IPC / memory /
+│                                        │  device syscall. Exempt: Exit, Yield,
+│                                        │  GetPid, GetTime, Print, GetPrincipal.
 └──────────────────────────────┘
     │
     ▼
 ┌──────────────────────────────┐
-│  2. CapabilityManager::verify_access()  │  Capability check: unforgeable token
+│  1. IpcInterceptor::on_syscall()       │  Pre-dispatch: syscall allowlist
 └──────────────────────────────┘
     │
     ▼
 ┌──────────────────────────────┐
-│  3. IpcInterceptor::on_send/recv()  │  Runtime policy: payload, bounds, self-send
+│  2. CapabilityManager::verify_access() │  Capability check: unforgeable token
 └──────────────────────────────┘
     │
     ▼
-  IPC operation proceeds
+┌──────────────────────────────┐
+│  3. IpcInterceptor::on_send/recv()     │  Runtime policy: payload, bounds, self-send
+└──────────────────────────────┘
+    │
+    ▼
+  IPC operation proceeds (kernel stamps `sender_principal` on outbound messages)
 ```
+
+0. **Identity gate** (dispatcher): A process without a bound Principal can only Exit, Yield, GetPid, GetTime, Print, and GetPrincipal. Every capability-bearing path requires identity first — a kernel fork that strips Principal stamping renders userspace inert (services use `recv_verified`), not merely "less secure."
 
 1. **Pre-dispatch interceptor** (`on_syscall`): Per-process syscall allowlists. A driver that only needs `Write` and `WaitIrq` cannot invoke `Allocate` or `RegisterEndpoint`.
 
@@ -104,7 +114,7 @@ Syscall entry
 
 3. **Post-capability interceptor** (`on_send`, `on_recv`, `on_delegate`): Runtime policy enforcement even after capability verification. Guards against payload overflow, endpoint-out-of-bounds, self-send, delegation escalation, and custom policy violations.
 
-A compromised process must bypass all three layers to perform an unauthorized operation. Each layer is independent.
+A compromised process must bypass the identity gate **and** all three capability-enforcement layers to perform an unauthorized operation. The three enforcement layers are the original defense-in-depth design (Design Principle 5); the identity gate (layer 0) is a precondition that gates entry into the capability-bearing syscall surface at all.
 
 ### ELF verification gate
 
@@ -112,6 +122,7 @@ Zero trust extends to code loading. Every ELF binary passes through a `BinaryVer
 
 | Check | Purpose |
 |---|---|
+| Ed25519 signature (ARCSIG trailer) | Reject any binary not signed by a trusted key. The load-bearing check — without it, the structural checks below verify that an attacker-supplied binary is *well-formed*, not that it is *trusted*. See [ADR-004](004-cryptographic-integrity.md). |
 | Entry point in LOAD segment | Prevent jumping into unmapped memory |
 | All segments in user space | Prevent mapping into kernel address space |
 | W^X enforcement | No page is both writable and executable |
@@ -120,6 +131,25 @@ Zero trust extends to code loading. Every ELF binary passes through a `BinaryVer
 
 The verifier runs before the loader allocates frames or maps pages. A binary that fails verification causes zero side effects — no resources to clean up, no partial state.
 
+### Verified properties
+
+The capability-model claims above are not just argued — they are proved mechanically against the implementation. `verification/capability-proofs/` contains Kani harnesses that `#[path]`-include `src/ipc/capability.rs` verbatim (no shim, no model — the proofs target real production code) and prove, under bounded but symbolic inputs, the following properties:
+
+| Property | What is proved |
+|---|---|
+| Least-privilege default | `verify_access` on a fresh `ProcessCapabilities` denies every (endpoint, rights) combination |
+| Grant composition | `grant(ep, rights)` followed by `verify_access(ep, rights)` returns success for exactly the granted rights |
+| Atomic revocation | `revoke(ep)` leaves no residual access — no rights survive in any other slot |
+| Capacity invariant | `count ≤ 32` is preserved across any sequence of grant / revoke operations, including at full capacity |
+| Monotone delegation | `delegate_capability` denies delegation when the source lacks the `delegate` right, and refuses to escalate rights the source does not own |
+| Generation safety | Stale `ProcessId` references (wrong generation) are rejected by `lookup`, closing the slot-reuse identity-confusion gap |
+| Full process revocation | `revoke_all_for_process` clears every endpoint capability and every system-cap flag |
+| Bootstrap-gated revocation | `revoke` invoked without bootstrap authority returns `AccessDenied` with no state change |
+
+Tier-B harnesses (cross-process scenarios) use a 3-slot `Box::leak`'d manager — properties are quantified over state, not over state size, so the reduced bound is load-bearing for tractability without weakening the claim. Run via `make verify`. Harness-level specs (mapping each `#[kani::proof]` to the property it covers) live in [verification/capability-proofs/src/lib.rs](../../verification/capability-proofs/src/lib.rs).
+
+These properties are the formal expression of the Decision section above: the ADR states *what* the capability model guarantees; the proofs state *how we know* the implementation actually delivers it. A future fork that weakens any of these properties is observable as a Kani failure in CI, not just a prose-vs-code drift the next reviewer has to catch.
+
 ## Threat Model
 
 ### What CambiOS protects against
@@ -127,21 +157,28 @@ The verifier runs before the loader allocates frames or maps pages. A binary tha
 | Threat | Mitigation |
 |---|---|
 | Compromised user process | Capabilities limit blast radius to explicitly granted endpoints |
-| Compromised driver | Runs in Ring 3 with per-device capabilities only |
+| Compromised driver | Runs in Ring 3, subject to all four enforcement layers. *Aspirational:* per-device endpoint capabilities. *Today:* boot modules are trusted by the kernel boot path and receive send/recv on every endpoint at startup (see [src/microkernel/main.rs](../../src/microkernel/main.rs) `setup_caps_for_boot_module`); tightening to per-device endpoint grants is policy-service work tracked in [ADR-006](006-policy-service.md). The capability-bearing system caps (`LegacyPortIo`, `MapFramebuffer`, `LargeChannel`) *are* granted individually per process. |
 | Privilege escalation | No ambient authority; capabilities are unforgeable and non-inheritable |
 | Confused deputy | Capabilities travel with the operation, not the identity |
 | Malicious binary | ELF verifier rejects before any execution or allocation |
 | IPC-based attack | Interceptor validates payload, bounds, and policy on every message |
 | Capability leakage | Delegation requires explicit `delegate` right; no escalation allowed |
 
+### Out of scope
+
+Microarchitectural side channels — Spectre / Meltdown-class transient-execution attacks, cache-timing attacks, Rowhammer — are not addressed by the ZTA + capability model. The model is about structural authority enforcement; side-channel resistance is a separate problem requiring CPU-level mitigations (KPTI-style page-table isolation, indirect-branch hardening, retpolines) and physical/electromagnetic countermeasures that are out of scope for this ADR. Future work in this space will live in its own ADR.
+
 ### What the microkernel trusts
 
 The TCB (trusted computing base) is intentionally minimal:
 
 - **Scheduler** — task state transitions, context switch
-- **IPC dispatcher** — message routing between endpoints
+- **IPC dispatcher** — message routing between endpoints, including the `sender_principal` stamping that makes [`recv_verified`](../../user/libsys/src/lib.rs) load-bearing for receivers
 - **Capability manager** — capability creation, verification, revocation
+- **Interceptor dispatch hook** — the *mechanism* that fires `on_syscall` / `on_send` / `on_recv` / `on_delegate` is TCB; the *policy* loaded into it (see [ADR-006](006-policy-service.md)) is not
+- **Signed-ELF verifier** — `SignedBinaryVerifier` and the compiled-in bootstrap public key; a wrong verifier means signed-boot is wrong (see [ADR-004](004-cryptographic-integrity.md))
 - **Page table management** — Ring 0 mapping operations
+- **Identity gate** — the dispatcher check that requires a non-zero Principal for any capability-bearing syscall (see [Divergence § Identity gate](#divergence))
 
 Everything not in this list — drivers, networking, filesystem, application logic — runs outside the trust boundary under capability enforcement.
 
@@ -176,12 +213,9 @@ For the current implementation status of each item (enforced vs. scaffolding vs.
 
 ### Lock ordering (security-critical globals)
 
-```
-SCHEDULER(1) → TIMER(2) → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7)
-```
+`CAPABILITY_MANAGER` sits at position 4 in the kernel-wide lock hierarchy — capabilities are verified after IPC state is consistent but before process metadata or memory operations. This ordering ensures that a capability revocation cannot race with an in-flight IPC that already passed its check.
 
-`CAPABILITY_MANAGER` at position 4 means capabilities are verified after IPC state is consistent but before process metadata or memory operations. This ordering ensures that a capability revocation cannot race with an in-flight IPC that already passed its check.
+The full hierarchy is the authoritative one in [CLAUDE.md § Lock Ordering](../../CLAUDE.md); the ADR does not restate it here, because the hierarchy has grown (cluster manager, channel manager, object store) and a duplicated copy would drift.
 
 ## Design Principles
 
@@ -199,6 +233,10 @@ PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) → INTERRUPT_ROUTER(7)
 
 7. **No telemetry.** CambiOS does not phone home, report analytics, or exfiltrate any data. Security monitoring is local and under the operator's control.
 
+### A note on the root of trust
+
+"No ambient authority" is a structural property of the *running* system: no Principal can bypass a capability check by virtue of who it is. It is not a claim that *every* Principal is equivalent. The bootstrap Principal — established at boot from a hardware-backed root of trust (Phase 1.5 design target: two YubiKeys; current bootstrap path: a compiled-in public key, see [ADR-004](004-cryptographic-integrity.md)) — holds the initial `revoke` right on the capability manager and is the only authority that can revoke until Phase 3.4 (grantor + explicit `revoke` right) lands. This is ambient *by construction*, not by accident — every capability-based system needs a root from which the first grants flow. The structural enforcement is that the bootstrap Principal still goes through the same `verify_access` path; nothing bypasses the capability check, the bootstrap Principal just *holds* the cap that other Principals don't.
+
 ## Future Work
 
 The architectural extensions to the capability model have been moved into their own ADRs so that each can be debated, accepted, and implemented independently:
@@ -207,9 +245,11 @@ The architectural extensions to the capability model have been moved into their 
 - **Capability revocation, audit logging, AI-assisted anomaly detection (advisory only)** — see [ADR-007: Capability Revocation and Audit Telemetry](007-capability-revocation-and-telemetry.md).
 - **Bulk-data IPC path that does not weaken the capability model** — see [ADR-005: IPC Primitives — Control Path and Bulk Path](005-ipc-primitives-control-and-bulk.md).
 
-The remaining open item not yet captured in its own ADR:
+The remaining open items not yet captured in their own ADRs:
 
-**Cryptographic capabilities.** Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked CambiOS nodes without a central authority. Only relevant once mesh networking lands.
+- **Grantor / `revoke`-right delegation paths (Phase 3.4).** Phase 3.1 implements revocation gated to the bootstrap Principal. The grantor path (a process can revoke a capability it granted) and the explicit `revoke` right (a process can be granted the authority to revoke a third party's capability) are designed but deferred. See [STATUS.md](../../STATUS.md) and [ADR-007](007-capability-revocation-and-telemetry.md). Without these, the only authority that can revoke is bootstrap, which is enough to demonstrate the model but not enough for general policy-service-driven revocation.
+- **Delegation graph for forensic revocation.** When capability X is delegated A → B → C and B is later compromised, the kernel currently has no record that C's authority traces through B. Tracking the delegation edge — who-granted-what-to-whom — is the substrate for "revoke everything derived from this compromised process." Deferred; not in any ADR yet.
+- **Cryptographic capabilities.** Replace kernel-managed capability tables with cryptographically signed tokens (HMAC or Ed25519). Enables distributed capability verification across networked CambiOS nodes without a central authority. Only relevant once mesh networking lands.
 
 ## Divergence
 
@@ -217,7 +257,7 @@ The remaining open item not yet captured in its own ADR:
 
 **Unsigned object storage removed (2026-04-13).** fs-service no longer falls back to unsigned `ObjPut` when the key-store is unavailable. All object storage now requires a valid Ed25519 signature via `ObjPutSigned`. If the key-store is degraded, storage operations are denied rather than permitted without cryptographic integrity.
 
-**Formal backing for capability soundness (2026-04-21).** The ADR describes the *intent* of the capability model — least privilege, grant/revoke semantics, no ambient authority, no cross-process bleed. Those claims are now proved mechanically, not just argued. `verification/capability-proofs/` contains twelve `#[kani::proof]` harnesses that `#[path]`-include `src/ipc/capability.rs` verbatim and prove, under bounded but symbolic inputs, that: (a) `verify_access` on a fresh table denies every endpoint/rights combination (least-privilege default); (b) `grant(ep, rights)` composes with `verify_access(ep, rights)` correctly; (c) `revoke(ep)` is atomic and leaves no residual access; (d) the capability-count invariant (`count ≤ 32`) is preserved across any grant/revoke sequence and at full capacity; (e) `delegate_capability` denies delegation when the source lacks the `delegate` right and refuses to escalate rights the source does not own (monotone-shrinking delegation); (f) stale `ProcessId` references (wrong generation) are rejected by `lookup`, closing the slot-reuse identity-confusion gap from Phase 3.2c; (g) `revoke_all_for_process` clears every endpoint capability and every system-cap flag; (h) `revoke` without bootstrap authority returns `AccessDenied` with no state change. The ADR's original decision text stays immutable; the proofs are the "how we know this is actually true" receipt rather than a change of intent. Tier-B harnesses (cross-process) use a 3-slot `Box::leak`'d manager — properties are quantified over state, not over state size, so the reduced bound is load-bearing. Run via `make verify`. See `verification/capability-proofs/src/lib.rs` for harness-level specs (P3.1–P3.12 mapping from the landing plan).
+**Formal backing for capability soundness (2026-04-21).** Twelve `#[kani::proof]` harnesses landed in `verification/capability-proofs/` mechanically proving the capability model's intent — least-privilege default, grant/revoke composition, monotone delegation, capacity invariant, generation safety, bootstrap-gated revocation. The substance has been promoted into the Architecture section: see [Verified Properties](#verified-properties). This entry is preserved as the landing record; the canonical reference for what is proved lives in the Architecture subsection so future readers find it before the prose drifts.
 
 ## References
 
