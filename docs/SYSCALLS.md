@@ -297,7 +297,7 @@ ssize_t sys_recv_msg(uint32_t endpoint_id, void *buf, size_t buf_len);
 
 ### SYS_OBJ_PUT (14)
 
-Store an CambiObject in the kernel object store. The caller's Principal becomes both author and owner. Content is hashed (FNV-1a, Phase 0) and stored.
+Store a CambiObject in the kernel object store. The caller's Principal becomes both author and owner. Content is hashed (FNV-1a, Phase 0) and stored.
 
 ```
 ssize_t sys_obj_put(const void *content, size_t content_len, void *out_hash);

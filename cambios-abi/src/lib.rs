@@ -99,7 +99,7 @@ pub enum SyscallNumber {
     RecvMsg = 13,
 
     /// obj_put(content_ptr: *const u8, content_len: usize, out_hash: *mut u8) -> isize
-    /// Store an CambiObject. Author/owner = caller's Principal.
+    /// Store a CambiObject. Author/owner = caller's Principal.
     /// Writes 32-byte content hash to out_hash. Returns 0 or negative error.
     ObjPut = 14,
 

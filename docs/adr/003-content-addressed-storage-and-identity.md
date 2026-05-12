@@ -21,7 +21,7 @@ CambiOS needs a storage model where every object is self-describing: it carries 
 
 ## Decision
 
-CambiOS adopts a **content-addressed object store** as its native storage model and **cryptographic Principals** (Ed25519 public keys) as its identity primitive. Every stored object (an CambiObject) is identified by the hash of its content, carries immutable authorship and transferable ownership, and is signed by its owner. Identity is established by key generation, not by registration with an authority.
+CambiOS adopts a **content-addressed object store** as its native storage model and **cryptographic Principals** (Ed25519 public keys) as its identity primitive. Every stored object (a CambiObject) is identified by the hash of its content, carries immutable authorship and transferable ownership, and is signed by its owner. Identity is established by key generation, not by registration with an authority.
 
 These two decisions — content-addressing and cryptographic identity — are co-dependent. Content-addressing without identity produces anonymous blobs. Identity without content-addressing produces signed bytes that can be silently swapped. Together they produce **signed artifacts with unforgeable provenance**.
 
@@ -51,7 +51,7 @@ This provides **zero-cost unforgeable identity for local IPC**. Receiving proces
 
 ### CambiObject: The Storage Unit
 
-Every stored object in CambiOS is an CambiObject:
+Every stored object in CambiOS is a CambiObject:
 
 ```rust
 pub struct CambiObject {
@@ -112,7 +112,7 @@ Seven new syscalls support identity and storage:
 | 11 | BindPrincipal | Bind a 32-byte Principal to a process (restricted to bootstrap Principal) |
 | 12 | GetPrincipal | Read the calling process's bound Principal |
 | 13 | RecvMsg | Identity-aware receive: returns `[sender_principal:32][from_endpoint:4][payload:N]` |
-| 14 | ObjPut | Store an CambiObject, returns 32-byte content hash |
+| 14 | ObjPut | Store a CambiObject, returns 32-byte content hash |
 | 15 | ObjGet | Retrieve object content by hash |
 | 16 | ObjDelete | Delete object (ownership enforced — only owner can delete) |
 | 17 | ObjList | List all object hashes (packed 32-byte hashes) |
@@ -178,6 +178,8 @@ Test counts and what each test covers (Principal construction, IPC sender stampi
 
 - [ADR-000](000-zta-and-cap.md): Zero-Trust Architecture and Capability-Based Access Control
 - [ADR-004](004-cryptographic-integrity.md): Cryptographic integrity (Blake3 + Ed25519)
+- [ADR-025](025-principal-as-aid.md): Principal as 32-byte AID (decouples Principal from key bytes; supersedes the implementation contract above)
+- [ADR-027](027-service-clusters.md): Service clusters (inserted `CLUSTER_MANAGER` into the lock hierarchy that this ADR's Lock Ordering section enumerates)
 - [identity.md](../identity.md): Identity architecture (authoritative design document)
 - [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md): Phase intent for identity + storage
 - `src/fs/mod.rs`, `src/fs/ram.rs`: CambiObject and RamObjectStore
@@ -271,3 +273,48 @@ The `Principal` struct in [src/ipc/mod.rs](../../src/ipc/mod.rs) renames `public
 ### Note on the original Principal definition above
 
 The struct shown in this ADR's "Principal: The Identity Primitive" section ([line 35](#principal-the-identity-primitive)) lists a `key_hash: [u8; 16]` FNV-1a fast-comparison field that was never implemented in the actual code (the kernel-side `Principal` only ever carried `public_key: [u8; 32]`). That field is dropped under ADR-025; comparison is by full 32-byte AID equality. Documenting here so the historical drift between the original ADR and the kernel code does not propagate further.
+
+## Divergence: 2026-05-12 — Trait shape, struct fields, lock position, phase rows
+
+- **Trigger:** Review of ADR-003 against the live code surfaced five structural drifts accumulated since the 2026-04-05 original and the 2026-04-30 AID divergence. None of the decisions in the original ADR are reversed; the body's *illustrative code and tables* no longer match what shipped. Recording the drift here rather than editing the original prose, per the immutable-history rule.
+
+### What changed
+
+**1. Lock position: `OBJECT_STORE` is at 10, not 8.** The hierarchy shown in "Lock Ordering" ([line 151](#lock-ordering)) lists seven entries with `OBJECT_STORE` at position 8. [ADR-027](027-service-clusters.md) inserted `CLUSTER_MANAGER` at position 5; the live hierarchy is now ten entries. The current canonical ordering lives in [CLAUDE.md § Lock Ordering](../../CLAUDE.md#lock-ordering) and [src/lib.rs:74-79](../../src/lib.rs#L74-L79). ADR-003's claim that `OBJECT_STORE` is "the highest-numbered lock" remains true; only the number changed.
+
+**2. `ObjectStore` trait signature.** The trait body shown at [line 82](#objectstore-trait) is no longer accurate. The shipped trait in [src/fs/mod.rs:380-397](../../src/fs/mod.rs#L380-L397) is:
+
+```rust
+pub trait ObjectStore {
+    fn get(&mut self, hash: &[u8; 32]) -> Result<CambiObject, StoreError>;
+    fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError>;
+    fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError>;
+    fn list(&mut self) -> Result<Vec<([u8; 32], ObjectMeta)>, StoreError>;
+    fn count(&self) -> usize;
+}
+```
+
+Two changes from the original: `get` returns an owned `CambiObject` (not a reference) and takes `&mut self` — required so the `DiskObjectStore` backend can lend through an LRU cache; and `list` returns `(hash, ObjectMeta)` pairs rather than bare hashes, so callers don't have to round-trip every entry to display directory listings. This makes [line 118](#syscalls)'s description of `ObjList` ("packed 32-byte hashes") stale — the syscall payload now carries metadata alongside each hash.
+
+**3. `CambiObject` struct fields.** The struct shown at [line 57](#cambiobject-the-storage-unit) differs from the shipped struct in [src/fs/mod.rs:242-261](../../src/fs/mod.rs#L242-L261):
+
+- `signature: [u8; 64]` is now `sig_algo: SignatureAlgo` + `signature: SignatureBytes` — typed and algorithm-agnostic. Tracks the same algorithm-agility posture as ADR-025's AID decoupling. The Ed25519/Blake3 wire details are owned by [ADR-004](004-cryptographic-integrity.md).
+- `acl: [(Principal, ObjectRights); 8]` is now `capabilities: ObjectCapSet` — same intent (an access set carried by the object), abstracted behind a type.
+- A `created_at: u64` field (monotonic ticks) was added.
+
+The author-immutable / owner-transferable / content-addressed properties documented in the original Key properties table are unchanged.
+
+**4. Phase Progression rows are mostly shipped.** The table at [line 163](#phase-progression) frames content hashing and signatures as future work ("Stub → Blake3", "Placeholder field → Ed25519"). Both shipped: `content_hash()` is Blake3 ([src/fs/mod.rs:244](../../src/fs/mod.rs#L244) docstring), and the struct carries typed `sig_algo: Ed25519` + `signature` per item 3 above. The bootstrap-identity row (deterministic seed → YubiKey root of trust) is still accurate as written. The remaining unshipped pieces — block-device backing and signed `OwnershipTransfer` objects — are in flight; STATUS.md is the authoritative index.
+
+**5. References block.** [ADR-025](025-principal-as-aid.md) is cited in the body of the 2026-04-30 divergence but missing from the References list; [ADR-027](027-service-clusters.md) (the cause of item 1) is missing entirely. Both belong in References for any future reader walking the citation graph.
+
+### What did *not* change
+
+- **Decisions.** Content-addressing as the storage model, cryptographic Principals as identity, author-vs-owner separation, the spec/impl-separation framing that treats the trait as the verification spec and backends as implementations — all still hold.
+- **Syscall numbers 11–17.** Unchanged. The wire format of `RecvMsg` (32-byte sender principal + 4-byte from_endpoint + payload) is unchanged.
+- **Bootstrap Principal trust model.** Still compile-time embedded; pending Frame-B identity rewrite per the project-memory pin, but no change ratified here.
+- **The 2026-04-17 (`ObjectStoreBackend` enum dispatch) and 2026-04-30 (Principal as AID) divergences.** Both stand. This appendix is additive.
+
+### Out of scope for this divergence
+
+- The Frame-B bootstrap-identity rewrite. Lives in identity.md when that lands; ADR-003 picks up the change via a future Divergence at that time.

@@ -1393,11 +1393,11 @@ impl SyscallDispatcher {
     // ObjectStore syscalls
     // ========================================================================
 
-    /// SYS_OBJ_PUT: Store an CambiObject in the object store.
+    /// SYS_OBJ_PUT: Store a CambiObject in the object store.
     ///
     /// Args: arg1 = content_ptr (user vaddr), arg2 = content_len, arg3 = out_hash (user vaddr)
     ///
-    /// Creates an CambiObject with author/owner = caller's Principal.
+    /// Creates a CambiObject with author/owner = caller's Principal.
     /// Writes 32-byte content hash to out_hash. Returns 0 on success.
     ///
     /// Lock ordering: CAPABILITY_MANAGER(4) then OBJECT_STORE(9) — sequential, not nested.

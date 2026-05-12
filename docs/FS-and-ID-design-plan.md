@@ -39,7 +39,7 @@ These are the load-bearing decisions for the identity and storage layers. They c
 
 **Every file has an owner AND an author** — two distinct roles at the object level. Author is the Ed25519 public key of whoever created the object — immutable, set at creation, never changes. Owner is the Ed25519 public key of whoever currently controls the object — transferable via signed ownership transfer objects. The owner signs the object (tying content to controller). Example: an employee creates a document at work — they are the author, but the employer is the owner. An independent contractor creates a document — they are both author and owner unless a contract transfers ownership. Files are signed artifacts, not bytes at a path.
 
-**Content-addressed object store** — files are CambiObjects identified by Blake3 content hash. Names/paths are a separate layer (a "directory" is itself an CambiObject mapping names to hashes). This is the native storage model.
+**Content-addressed object store** — files are CambiObjects identified by Blake3 content hash. Names/paths are a separate layer (a "directory" is itself a CambiObject mapping names to hashes). This is the native storage model.
 
 **ObjectStore trait as the VFS abstraction** — not a traditional block-device VFS. Local storage, sovereign cloud, P2P logs, and RAM are all backing store implementations behind the same trait. The seams are in the right place from day one.
 
