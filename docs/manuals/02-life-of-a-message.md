@@ -24,9 +24,11 @@ The assembly stub saves every register the user was using, builds a `SyscallFram
 
 ## The First Question: "Are You Allowed to Be Here?"
 
-The syscall dispatcher's first act is to check whether this process is even allowed to make this kind of syscall. The zero-trust interceptor fires: `interceptor.on_syscall(process_id, SyscallNumber::Write)`.
+The syscall dispatcher's first act is to check whether this process is even allowed to make this kind of syscall. The kernel calls `policy::policy_check(process_id, task_id, cr3, SyscallNumber::Write as u32)` directly from the top of `SyscallDispatcher::dispatch`.
 
-Today, this check is permissive — it always allows. But the hook is wired. The architecture anticipates a world where each process has a syscall profile: a serial driver might only be allowed Write, WaitIrq, and Yield. A process that tries to call Allocate when its profile doesn't include it gets `PermissionDenied` before any work begins. The policy is missing, but the enforcement point is real.
+Today, this check is permissive — it returns `Allow` until the userspace policy service registers. But the transport is wired. The architecture anticipates a world where each process has a syscall profile: a serial driver might only be allowed Write, WaitIrq, and Yield. A process that tries to call Allocate when its profile doesn't include it gets `PermissionDenied` before any work begins. The policy lives outside the kernel; the enforcement point is real.
+
+(Earlier drafts of this manual described the check as `interceptor.on_syscall(...)`. The hook was removed from the trait when its trait-surface dead-code was cleaned up; see [ADR-002 § Divergence 2026-05-12](../adr/002-three-layer-enforcement-pipeline.md#divergence). The kernel-side enforcement is unchanged; only the call site moved out of the interceptor trait.)
 
 ## Reading the Sender's Words
 

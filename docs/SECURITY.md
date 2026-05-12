@@ -8,7 +8,7 @@ This document maps the zero-trust enforcement points in the CambiOS microkernel 
 - Content-addressed storage and identity: [ADR-003](adr/003-content-addressed-storage-and-identity.md)
 - Cryptographic integrity (signed binaries, signed objects): [ADR-004](adr/004-cryptographic-integrity.md)
 - IPC primitives — control path and bulk-data channels: [ADR-005](adr/005-ipc-primitives-control-and-bulk.md)
-- Policy service — externalized `on_syscall` decisions: [ADR-006](adr/006-policy-service.md)
+- Policy service — externalized syscall policy decisions: [ADR-006](adr/006-policy-service.md)
 - Capability revocation and audit telemetry: [ADR-007](adr/007-capability-revocation-and-telemetry.md)
 
 ---
@@ -28,7 +28,7 @@ This table maps every enforcement point to its code location and *what* it does.
 | Capability check (IPC send) | **Enforced** | `PermissionDenied` | `ipc/mod.rs` |
 | Capability check (IPC recv) | **Enforced** | `PermissionDenied` | `ipc/mod.rs` |
 | Capability delegation validation | **Enforced** | `AccessDenied` | `ipc/capability.rs` |
-| Interceptor: syscall pre-dispatch | **Scaffolding** (designed in [ADR-006](adr/006-policy-service.md)) | Always allows; policy externalization pending | `syscalls/dispatcher.rs` |
+| Layer 1 syscall pre-dispatch check | **Scaffolding** (transport via `policy::policy_check`; decision designed in [ADR-006](adr/006-policy-service.md)) | Allows by default until policy service registers; deny → `PermissionDenied` | `syscalls/dispatcher.rs`, `policy/mod.rs` |
 | Interceptor: IPC send policy | **Enforced** | `PermissionDenied` | `ipc/mod.rs`, `ipc/interceptor.rs` |
 | Interceptor: IPC recv policy | **Enforced** | `PermissionDenied` | `ipc/mod.rs`, `ipc/interceptor.rs` |
 | Interceptor: delegation policy | **Enforced** | `AccessDenied` | `ipc/capability.rs` |
@@ -42,7 +42,7 @@ This table maps every enforcement point to its code location and *what* it does.
 | Audit telemetry channel | **Enforced** (per-CPU SPSC buffers → BSP drain → `AUDIT_RING`; consumer reads via `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO`) | N/A (best-effort, drops counted) | `audit/{mod,buffer,drain}.rs`, `syscalls/dispatcher.rs` |
 | Audit on input focus transition (T-7 Phase A) | **Enforced** (compositor emits `InputFocusChange` via `SYS_AUDIT_EMIT_INPUT_FOCUS`; capability narrowed to compositor only) | `PermissionDenied` if non-compositor | `syscalls/dispatcher.rs::handle_audit_emit_input_focus`, `microkernel/main.rs::register_process_capabilities` |
 | Audit drain-skip counter (T-8) | **Enforced** (lock-free `AUDIT_DRAIN_SKIPS` atomic; surfaced through `SYS_AUDIT_INFO` offset 44..48) | N/A (visibility primitive) | `audit/drain.rs`, `syscalls/dispatcher.rs::handle_audit_info` |
-| Externalized policy service | **Scaffolding** (boot-module identified at `POLICY_SERVICE_PID`; `on_syscall` hook still permissive — see [ADR-006](adr/006-policy-service.md)) | Always allows | `microkernel/main.rs`, `ipc/interceptor.rs` |
+| Externalized policy service | **Scaffolding** (boot-module identified at `POLICY_SERVICE_PID`; `policy::policy_check` falls back to Allow until the service registers — see [ADR-006](adr/006-policy-service.md)) | Always allows pre-registration | `microkernel/main.rs`, `policy/mod.rs` |
 | Per-process syscall allowlists | **Designed in [ADR-006](adr/006-policy-service.md)**, not implemented | — | — |
 | Runtime behavioral AI (advisory only) | **Designed in [ADR-007](adr/007-capability-revocation-and-telemetry.md)**, not implemented | — | — |
 | Cryptographic capabilities (cross-node) | Planned (post-v1) | — | — |
@@ -62,11 +62,12 @@ Process makes SYS_WRITE or SYS_READ syscall
     |
     v
 +-----------------------------------------------+
-|  Layer 1: Interceptor pre-dispatch             |
-|  IpcInterceptor::on_syscall()                  |
+|  Layer 1: Pre-dispatch policy                  |
+|  policy::policy_check()                        |
 |  - Per-process syscall allowlist               |
-|  - Status: SCAFFOLDING (always allows)         |
-|  - File: syscalls/dispatcher.rs:182            |
+|  - Status: SCAFFOLDING (allows until policy   |
+|    service registers; see ADR-006)             |
+|  - File: syscalls/dispatcher.rs                |
 +-----------------------------------------------+
     |
     v
@@ -76,7 +77,7 @@ Process makes SYS_WRITE or SYS_READ syscall
 |  - Process must hold correct rights for        |
 |    the target endpoint (SEND or RECV)          |
 |  - Status: ENFORCED                            |
-|  - File: ipc/capability.rs:114-128             |
+|  - File: ipc/capability.rs                     |
 +-----------------------------------------------+
     |
     v
@@ -87,12 +88,14 @@ Process makes SYS_WRITE or SYS_READ syscall
 |  - Payload size limit (256 bytes)              |
 |  - No self-send                                |
 |  - Status: ENFORCED                            |
-|  - File: ipc/interceptor.rs:145-212            |
+|  - File: ipc/interceptor.rs                    |
 +-----------------------------------------------+
     |
     v
   IPC operation proceeds
 ```
+
+Layer 1 used to be wired through `IpcInterceptor::on_syscall`; the actual transport in shipping code is `policy::policy_check` ([ADR-002 § Divergence 2026-05-12](adr/002-three-layer-enforcement-pipeline.md#divergence) records the trait-surface cleanup that made the divergence permanent).
 
 ### Why Three Layers Instead of One
 
@@ -275,20 +278,22 @@ This is defense-in-depth: the FS service rejects obviously unauthorized requests
 
 ## Interceptor Details
 
-The `IpcInterceptor` trait defines four hooks. The `DefaultInterceptor` provides baseline policy. Custom interceptors can be substituted for stricter enforcement.
+The `IpcInterceptor` trait defines three hooks (`on_send`, `on_recv`, `on_delegate`). The `DefaultInterceptor` provides baseline policy. Custom interceptors can be substituted for stricter enforcement.
 
-### Hook: on_syscall (Layer 1)
+Layer 1 (pre-dispatch policy) is not one of the interceptor's hooks — see [ADR-002 § Divergence 2026-05-12](adr/002-three-layer-enforcement-pipeline.md#divergence). The Layer 1 transport is documented below for completeness.
 
-**Current status: Scaffolding.** Always returns `Allow`.
+### Layer 1 transport: policy::policy_check
 
-This hook fires before the syscall dispatcher routes to a handler. It receives the caller's process ID and the syscall number. The intended use is per-process syscall allowlists:
+**Current status: Scaffolding.** Returns `Allow` until the policy service registers; thereafter the per-CPU cache + userspace upcall path described in [ADR-006](adr/006-policy-service.md) governs the decision.
+
+Called at the top of `SyscallDispatcher::dispatch` after the identity gate and before any handler runs. Receives `(process_id, task_id, cr3, syscall_number)`. The intended use is per-process syscall allowlists:
 
 ```
 Serial driver profile: [Write, WaitIrq, Yield, GetPid]
 Filesystem driver profile: [Read, Write, Allocate, Free, RegisterEndpoint, Yield]
 ```
 
-A process that attempts a syscall outside its profile gets `PermissionDenied` before any work happens. The hook is wired at `dispatcher.rs:182` — only the policy logic is missing.
+A process that attempts a syscall outside its profile gets `PermissionDenied` before any work happens. The transport is wired; only the policy decisions live outside the kernel (in the userspace policy service).
 
 ### Hook: on_send (Layer 3)
 
@@ -348,7 +353,7 @@ Three architectural moves shift how security policy is decided and observed with
 
 **Audit telemetry ([ADR-007](adr/007-capability-revocation-and-telemetry.md)) — shipped.** Capability grant / revocation / denial, IPC send/recv (sampled), channel create/attach/close, syscall denial, binary load/reject, process create/exit, and (T-7 Phase A, 2026-04-25) input focus transitions all produce audit events. Events flow through per-CPU lock-free SPSC staging buffers → BSP-driven `drain_tick` → a global `AUDIT_RING`. User-space consumers attach via `SYS_AUDIT_ATTACH` (bootstrap-only) and read offsets via `SYS_AUDIT_INFO`. Best-effort delivery: dropped events are counted both per-buffer (`AuditDropped` synthetic event) and at drain time (T-8 `AUDIT_DRAIN_SKIPS` lock-free counter, `SYS_AUDIT_INFO` offset 44..48). The audit channel is the *only* way the AI security service learns what's happening on the system — there is no kernel hook the AI can call directly, no capability the AI holds to suspend a process, no out-of-band introspection. The AI is a user-space process that reads an event stream and emits recommendations into the policy service's input queue.
 
-**Policy externalization ([ADR-006](adr/006-policy-service.md)) — still scaffolding.** The `IpcInterceptor::on_syscall` hook is wired into the kernel and the policy service boot module is identified at `POLICY_SERVICE_PID`, but the decision path is still permissive (`POLICY_SERVICE_READY` enables enforcement only after the service registers; the default decision today is `Allow`). The plan is to move the *decision* into the user-space `policy-service` while keeping the *enforcement* in the kernel. The kernel asks "is process P allowed to call syscall N with these args?" via a fast per-CPU cache; the policy service answers and the kernel acts. Cache invalidation, fail-open semantics on policy-service crash, and the bootstrap order that allows the policy service to load *before* it gates other services are all spelled out in the ADR. Critically: the AI is never the policy service. The policy service is deterministic Rust code; the AI is an *advisor* that can recommend changes to policy-service rules through its own audit channel. The AI watches, the policy service decides, the kernel enforces.
+**Policy externalization ([ADR-006](adr/006-policy-service.md)) — still scaffolding.** The Layer 1 transport (`policy::policy_check`, called directly from `SyscallDispatcher::dispatch`) is wired into the kernel and the policy service boot module is identified at `POLICY_SERVICE_PID`, but the decision path is still permissive (`POLICY_SERVICE_READY` enables enforcement only after the service registers; the default decision today is `Allow`). The plan is to move the *decision* into the user-space `policy-service` while keeping the *enforcement* in the kernel. The kernel asks "is process P allowed to call syscall N with these args?" via a fast per-CPU cache; the policy service answers and the kernel acts. Cache invalidation, fail-open semantics on policy-service crash, and the bootstrap order that allows the policy service to load *before* it gates other services are all spelled out in the ADR. Critically: the AI is never the policy service. The policy service is deterministic Rust code; the AI is an *advisor* that can recommend changes to policy-service rules through its own audit channel. The AI watches, the policy service decides, the kernel enforces. (Earlier versions of this document described the transport as `IpcInterceptor::on_syscall`; that hook was removed from the trait when its trait-surface dead-code was cleaned up in [ADR-002 § Divergence 2026-05-12](adr/002-three-layer-enforcement-pipeline.md#divergence).)
 
 ---
 
@@ -360,7 +365,7 @@ The gaps below are organized by whether they have a design (ADR drafted) or are 
 
 | Gap | Impact | Where It's Designed |
 |---|---|---|
-| **Per-process syscall allowlists** | A compromised process can invoke any syscall it has arguments for | [ADR-006](adr/006-policy-service.md) — `on_syscall` hook routed through policy service |
+| **Per-process syscall allowlists** | A compromised process can invoke any syscall it has arguments for | [ADR-006](adr/006-policy-service.md) — `policy::policy_check` consults the policy service |
 | **Externalized policy decisions** | All policy lives inside the kernel; cannot be updated without a kernel rebuild | [ADR-006](adr/006-policy-service.md) |
 | **Capability revocation — broader authority** | Today only the bootstrap Principal can call `SYS_REVOKE_CAPABILITY`. ADR-007 calls for the original grantor, any process holding the new `revoke` right, and the policy service to also be able to revoke; that authority surface is queued for Phase 3.4. | [ADR-007](adr/007-capability-revocation-and-telemetry.md) |
 | **Runtime behavioral AI (advisory)** | No detection of anomalous capability usage patterns | [ADR-007](adr/007-capability-revocation-and-telemetry.md) — AI consumes the audit channel, recommends to policy service, never decides directly |
@@ -392,7 +397,7 @@ Items 1–3 below have shipped (see "Done (Historical)"); items 4–6 are what's
 1. ~~**Capability revocation** — every other Phase 3 item depended on this.~~ Shipped (bootstrap-only authority in Phase 3.1; broader authority surface tracked under Gap Analysis).
 2. ~~**Audit telemetry channel**~~ — shipped (per-CPU buffers + drain + ring + `SYS_AUDIT_*` consumer surface).
 3. ~~**Channels** — bulk-data path.~~ Shipped (control-path: create/attach/close/revoke through capabilities; bulk pages flow user-to-user).
-4. **Policy service** — boot-module shipped and identified at `POLICY_SERVICE_PID`; the `on_syscall` decision path is still permissive scaffolding. Externalizing the actual decisions is what's left.
+4. **Policy service** — boot-module shipped and identified at `POLICY_SERVICE_PID`; the `policy::policy_check` decision path is still permissive scaffolding. Externalizing the actual decisions is what's left.
 5. **Privileged audit consumer** — the audit ring + drain-skip counter are observable but nothing kernel-side polls them and escalates. Required for T-7 / T-8 to graduate from "visibility" to "structural defense."
 6. **Behavioral AI** — sits on top of policy + audit consumer. Watches the audit channel, emits recommendations into the policy service's input.
 

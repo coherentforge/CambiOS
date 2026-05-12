@@ -351,3 +351,67 @@ When implementing the changes specified by this ADR, the following CLAUDE.md sec
 - **§ "Syscall Numbers"** — no new syscall numbers (the upcall is implemented internally as a kernel-initiated IPC)
 - **§ "Required Reading by Subsystem"** (when added) — under "If you are touching capability/policy code"
 - **§ "Post-Change Review Protocol" Step 8** (when added) — adding policy questions requires updating SECURITY.md's enforcement status table
+
+## Divergence
+
+### 2026-04-13 — In-kernel client is `policy::policy_check`, not `IpcInterceptor::on_syscall`
+
+- **Implementation:** commit `11340ff` (`Phase 3.4 + services cleanup: policy service, syscall allowlists, Linux-model logging`).
+- **Trigger:** The original ADR named `IpcInterceptor::on_syscall` as the in-kernel slot that the policy service would plug into (see "How a policy decision happens" lines 67/94, "What the policy service decides" line 112, the Threat Model table line 254, and the Cross-References entry for ADR-002). The 3.4 implementation routed Layer 1 a different way — `SyscallDispatcher::dispatch` calls `crate::policy::policy_check(...)` directly. The trait hook was never the call site. This entry records the architectural realignment; ADR-002's [2026-05-12 Divergence](002-three-layer-enforcement-pipeline.md#divergence) records the matching trait-surface removal.
+
+#### What changed
+
+The Layer 1 transport is a free function, not a trait method:
+
+```rust
+// src/syscalls/dispatcher.rs (excerpt — replaces the "on_syscall" path
+// the original ADR-006 narrative described)
+let decision = crate::policy::policy_check(
+    ctx.process_id,
+    ctx.task_id,
+    ctx.cr3,
+    syscall_num as u32,
+);
+if let InterceptDecision::Deny(_) = decision {
+    crate::audit::emit(crate::audit::RawAuditEvent::syscall_denied(
+        ctx.process_id, syscall_num, crate::audit::now(), 0,
+    ));
+    return Err(SyscallError::PermissionDenied);
+}
+```
+
+`policy::policy_check` is the in-kernel half of this ADR. It encapsulates the per-CPU cache, the upcall to the userspace policy service on miss, and the `BlockReason::PolicyWait` wait-state. Returning an `InterceptDecision` keeps the decision type aligned with the original ADR-002 vocabulary and with `DenyReason::SyscallNotPermitted` (which `policy_check` emits on the deny path).
+
+#### What did *not* change
+
+- **The reframe.** Policy decisions still live in a user-space service; the kernel still enforces. ADR-006's separation of decision (userspace, mutable, AI-advised) from enforcement (kernel, immutable, deterministic) is intact.
+- **The cache + upcall architecture.** Per-CPU `PolicyCache` with TTL, `PolicyRouter` for pending queries, `BlockReason::PolicyWait` for cache misses, fail-open semantics when the service is unavailable — all as designed.
+- **The threat-model story.** Compromised processes attempting unauthorized syscalls are still blocked by the policy decision; the deny reason on the wire is `DenyReason::SyscallNotPermitted`. Only the kernel-side call site changed.
+- **The userspace policy service boundary.** Endpoint, message format, audit consumption, AI-advisor role — unchanged.
+
+#### Why direct call instead of going through the trait
+
+Two reasons emerged during the Phase 3.4 implementation:
+
+1. **There would only ever be one in-kernel Layer 1 backend.** The closed-world set the 2026-04-17 ADR-002 entry projected was `Default` (permissive, used in tests only) and `PolicyService` (used in production). A trait+enum-dispatch shim over a single concrete production client is indirection without separation. The function signature `fn policy_check(...) -> InterceptDecision` is the type contract; nothing about going through the trait adds verifier-visible structure.
+2. **`policy_check` colocates state with code.** Per-CPU cache, pending-query router, upcall machinery, and wait-state management are all in `src/policy/`. Threading them through an interceptor trait that lives in `src/ipc/` would split state across two modules to satisfy a contract that has no second implementor.
+
+Going through the trait was preserved as an option through 2026-05-12. The 2026-05-12 trait surface cleanup made the divergence permanent: the `on_syscall` method was removed because no kernel path called it.
+
+#### Effect on this ADR's narrative
+
+The following parts of the original ADR-006 text describe a route that the implementation did not take:
+
+- Line 19's claim that the `IpcInterceptor::on_syscall` hook "exists at `src/syscalls/dispatcher.rs`." After 2026-05-12 the method has been removed from the trait entirely. The dispatcher's entry point for policy decisions is `policy::policy_check`.
+- The "How a policy decision happens" diagram (line 67 step 1, line 94 step 7) lists `IpcInterceptor::on_syscall` as the kernel-side entry and exit point. Substitute `policy::policy_check` as both the entry and the exit.
+- The "What the policy service decides" table (line 112) describes `should_allow_syscall` as wired "via the existing `on_syscall` hook." Substitute "via `policy::policy_check`."
+- The Threat Model table (line 254) describes unauthorized syscalls as "Blocked by `on_syscall` returning `PermissionDenied`." Substitute "Blocked by `policy::policy_check` returning `Deny`, which the dispatcher maps to `SyscallError::PermissionDenied`."
+- The Cross-References entry for ADR-002 calls the `on_syscall` hook "the slot that's getting filled." The slot moved from the interceptor trait to a free function; otherwise the framing holds.
+
+These are narrative drift, not decision drift. The decision this ADR makes — externalize policy, keep enforcement in the kernel, fail-open on service unavailability, AI advises but does not decide — stands as written.
+
+#### Verification
+
+- `grep -rn "on_syscall" src/ user/` after the 2026-05-12 cleanup: zero callers; only the historical-context comments in `src/policy/mod.rs` and `src/syscalls/dispatcher.rs` reference the old name.
+- `src/policy/mod.rs:379-384` carries the matching code-comment: *"Replaces the old `IpcInterceptor::on_syscall()` path."* The architectural change is documented at the call site.
+- `make check-all` clean across the trait-surface cleanup commit (`34b4342`).
