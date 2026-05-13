@@ -173,3 +173,37 @@ The first implementation of `VirtioBlkDevice::call` mirrored the `src/policy/mod
 The fix adopted: `VirtioBlkDevice::call` polls `SHARDED_IPC.recv_message(25)` with cooperative `yield_save_and_switch` between attempts, up to `MAX_WAIT_ITERATIONS`. Uncontended case costs one yield round-trip vs the block+wake design. The kernel's caller task eventually hits idle, QEMU's TCG event loop advances the virtio-blk request, the driver replies, the reply lands in `SHARDED_IPC.shard[25]` via the `handle_write` intercept (which now does NOT call `wake_message_waiters`), and the kernel's next poll iteration finds it.
 
 Documented here because future work (e.g. switching to interrupt-driven virtio-blk completion — the right long-term fix — or reusing this kernel↔user IPC pattern for other drivers) will need to revisit the decision. The `handle_write` intercept's `// NO scheduler wake —` comment names this ADR.
+
+### 3. Shared block-allocation bitmap + journaled allocations + multi-block content (forecast for ADR-029 step 5)
+
+- **Date:** 2026-05-12
+- **Trigger:** [ADR-029](029-posix-file-storage-model.md) Decision 1 and Decision 5 establish a shared block-allocation bitmap and a journal-owned-bitmap invariant: every bitmap mutation, regardless of which backend triggered it, is journaled in the POSIX journal. For ADR-010 to remain coherent with this invariant, the CambiObject backend's allocation path must route through the shared journal. Without this Divergence, the invariant has a CambiObject-side hole, and ADR-029's Verification Stance claim "bitmap state is the projection of committed journal records" is false.
+
+This Divergence is forecast (not yet implemented). It lands concurrently with [ADR-029](029-posix-file-storage-model.md) migration step 5 - the simultaneous landing is what keeps the journal-owned-bitmap invariant whole from the moment the shared bitmap exists. Listed in the ADR before code so future readers reach for ADR-010 and find the planned trajectory rather than re-deriving it from ADR-029's migration path.
+
+#### What changes
+
+1. **Allocation routing.** CambiObject `put` operations no longer perform direct on-disk bitmap mutations for content-block allocation. The allocation is recorded in a journal record of type `ExtentUpdate + BitmapMutation` (per ADR-029 Decision 5), atomically with the CambiObject record's header commit. Until the journal record is durable, the bitmap is in-memory-only and the allocation is not visible on disk. The `BLOCK_BITMAP_LOCK` (hierarchy position 12 per ADR-029) governs the in-memory bitmap; the CambiObject backend acquires `OBJECT_STORE → BLOCK_BITMAP_LOCK` for allocation operations.
+
+2. **Multi-block content layout.** The `content_len <= BLOCK_SIZE` SCAFFOLDING constraint from "What is explicitly not in scope" is lifted. CambiObject records gain a header-resident bounded-extent array (up to 16 extents per object, each `(start_lba: u64, block_count: u32)`, matching ADR-029's inode extent shape). Content data blocks live in the shared data region and are referenced by the extent array, replacing the single per-slot content block.
+
+3. **Layout restructuring.** v1's slot pattern was "header block + content block, slot stride = 2 blocks." For v2 records, the slot stride remains 2 blocks but the second block changes role from "content" to "reserved tail" (zero-filled in v1, reserved for the ML-DSA signature tail when PQ signing lands - matching ADR-029's inode layout). The header block's existing 3520-byte reserved region is partitioned: 192 bytes (offset 568..760) for the extent array, 3328 bytes (760..4088) retained for ML-DSA + future extensions. Actual content bytes live in the shared data region per the extent array. Mount distinguishes v1 records (`version = 1`, content in slot's second block) from v2 records (`version = 2`, content via extents) and reads both indefinitely.
+
+4. **Format version handling.** New puts default to v2 once this Divergence lands. v1 records remain readable forever; because CambiObjects are immutable, there is no "next write that updates the record" - v1 records stay v1 unless an explicit migration utility runs. A migration tool for storage-density reasons may land later but is not a v1 requirement.
+
+#### What does not change
+
+- **CambiObject identity.** Content-addressed, signed-by-owner, immutable author, transferable owner, lineage chain - all preserved.
+- **Signature verification.** Blake3 + Ed25519 verification on every read, preserved unchanged.
+- **ACL model.** `ObjectCapSet` (up to 8 entries) per ADR-003 unchanged.
+- **Magic-byte commit pattern.** `ARCOREC1` magic at offset 0 still distinguishes occupied vs. free records. The header still commits via the existing pattern; what is new is the *allocation* of data blocks under that header, which now flows through the shared journal.
+- **No-write-after-put semantics.** CambiObjects remain immutable. The extent array is determined at put time and never mutates.
+- **Plan/execute/commit decomposition.** Still not implemented (per Divergence 1). Shared-bitmap allocation does not change this; the existing single-phase `put` continues to suffice, with the journal record now bundling extent-list + bitmap mutations as ADR-029 Decision 5 specifies.
+
+#### Sequencing
+
+Forecast for landing with [ADR-029](029-posix-file-storage-model.md) migration step 5. Until that step lands, ADR-010 v1's `content_len <= BLOCK_SIZE` constraint and direct bitmap writes remain in force. The CambiObject backend's allocation path crosses over to journaled bitmap mutations as a single coordinated change with the POSIX backend's step-5 implementation; the same commit (or commit pair) lands both backends' allocation routing through the shared journal.
+
+#### Why a Divergence rather than a superseding ADR
+
+The CambiObject model, the on-disk record's existing fields, the magic-byte commit pattern, and the signature verification are ADR-010's core decisions and remain unchanged. What changes is the *allocation mechanism* (now journaled), the *content layout* (extent-based multi-block), and the *slot composition* (header block + reserved tail; content in shared data region). A Divergence appendix captures the implementation-shape change without rewriting the immutable decision text. A superseding ADR would imply ADR-010's decisions are being walked back, which they are not.
