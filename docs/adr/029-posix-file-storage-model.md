@@ -218,7 +218,7 @@ Journal record kinds:
 - **DirectoryEntry insert/delete/rewrite** - directory contents.
 - **Rename** - covers both directory-entry changes (source delete, destination insert) atomically.
 - **ACL grant / revoke** - inode ACL changes.
-- **LinkCount delta** - hard-link bookkeeping.
+- **LinkCount Set** - hard-link bookkeeping. Records the new absolute `link_count` value (not a delta), so the record is idempotent under repeated replay. Relative-mutation records (delta semantics) would break the journal-replay idempotency invariant.
 
 Records are appended on operation completion; the operation is only acknowledged to userspace after the journal record is durable (single fsync of the journal region). On mount, the recovery loop replays uncommitted records from the journal's last checkpoint forward:
 
@@ -365,6 +365,7 @@ No new `CapabilityKind`. Permission is sourced from the inode's per-Principal AC
 | Side-channel between two Principals via the shared block-allocation bitmap | An attacker observing block-allocation patterns may infer write activity by an unrelated Principal. Out of scope; the bitmap is shared by construction and bitmap-allocation patterns are global state. Future hardening could partition the bitmap per Principal; not in v1. |
 | Symlink-following into the canonical /co/ namespace by a confused POSIX consumer | Symlinks under POSIX paths can target `/co/<hash>` paths; resolution passes through the canonical mount logic (read-only). Write attempts via a symlink still hit step 1 of resolve and fail. Acceptable. |
 | Time-of-check / time-of-use between path resolve and inode operation | POSIX has this inherently; CambiOS does not solve it at the syscall boundary. Sandboxed callers per win-compat operate on their own per-sandbox subtree where the attacker has no concurrent access. |
+| Large-file write or CAMBIO fails with `EFRAGMENTED` on an aged disk | The 16-extent cap per inode (Decision 1) creates an upper bound on file fragmentation; aged disks with many allocate-delete-reallocate cycles may exceed it. v1 has no defragmenter; the failing syscall returns `EFRAGMENTED` and the user must invoke a future out-of-band compaction tool. Open Questions names this deferred. Not silent corruption; explicit failure mode. |
 
 ### Impact on existing threats
 
@@ -437,7 +438,7 @@ Documentation + reservation first, implementation in dependency order. This ADR'
 2. **`cambios-abi` syscall reservations.** Reserve numbers 51-70 for the POSIX syscall family. Reservation only; no handlers - same posture as ADR-022 / ADR-028.
 3. **`PosixInode`, `Extent`, `AclEntry`, `FrozenInodeView` types added to `cambios-abi`.** Opaque newtypes around kernel-issued IDs (e.g., `InodeId`); no public field access. No behavior change.
 4. **PosixFsBackend skeleton + on-disk format reader.** Implements Mount (superblock parse, inode scan, journal replay) but no write path. Tests for the format on a synthetic disk image.
-5. **Block-bitmap allocator + journal record format + `BLOCK_BITMAP_LOCK` introduction.** Bounded scan; sub-lock established at hierarchy position 12.
+5. **Block-bitmap allocator + journal record format + `BLOCK_BITMAP_LOCK` introduction + ADR-010 Divergence appendix.** Both backends adopt the shared journal record format simultaneously; sub-lock established at hierarchy position 12. The ADR-010 Divergence lands here (not later) because the journal-owned-bitmap invariant requires the CambiObject backend's allocation path to route through the shared journal from the moment the shared bitmap exists; deferring the Divergence would create a window where the invariant is partially broken.
 6. **Inode CRUD + ACL operations.** `SYS_FILE_CREATE`, `SYS_FILE_OPEN` (read), `SYS_STAT`, `SYS_ACL_GRANT/REVOKE/LIST`. Journal records cover the metadata changes.
 7. **Data path + CoW.** `SYS_FILE_READ`, `SYS_FILE_WRITE`, `SYS_FILE_SEEK`, `SYS_FILE_TRUNCATE`, `SYS_FSYNC`. Per-inode CoW with refcounted extents. FrozenInodeView introduced.
 8. **Directory operations.** `SYS_MKDIR`, `SYS_RMDIR`, `SYS_OPENDIR`, `SYS_READDIR`, `SYS_FILE_LINK`, `SYS_FILE_UNLINK`, `SYS_FILE_SYMLINK`.
@@ -445,11 +446,10 @@ Documentation + reservation first, implementation in dependency order. This ADR'
 10. **Path resolver + canonical mount + REGALO alias table.** ADR-028's migration step 7 lands here, sharing this ADR's resolver code.
 11. **CAMBIO handler.** ADR-028's migration step 6 lands here; depends on FrozenInodeView (step 7 above) and ObjectStore (existing).
 12. **posix-fs-service.** Userspace boot module at endpoint 18; ACL policy layer; per-sandbox path-namespace mappings for win-compat. If a v1 workload demands cluster-scoped file access at this point, an ADR-027 Divergence appendix lands here adding storage-ACL grants to the cluster cap-delegation set (see Open Questions / Deferred).
-13. **ADR-010 Divergence appendix.** Adopts the shared `BLOCK_BITMAP_LOCK` and the journal record format for CambiObject-side allocations from this ADR's Decision 1 / Decision 5. **Stability gate**: after migration step 7 (data path + CoW) has landed and passed `make check-all` on all three arches.
-14. **ADR-003 Divergence appendix.** Per ADR-028 migration step 9.
-15. **win-compat.md edit pass** per ADR-028 migration step 10.
+13. **ADR-003 Divergence appendix.** Per ADR-028 migration step 9.
+14. **win-compat.md edit pass** per ADR-028 migration step 10.
 
-Each step independently bisectable. Steps 1-3 are pre-implementation; steps 4-15 chain through actual code.
+Each step independently bisectable. Steps 1-3 are pre-implementation; steps 4-14 chain through actual code.
 
 ## Cross-References
 
@@ -490,3 +490,15 @@ When this ADR's implementation lands, the following CLAUDE.md sections must be u
 > **Deferred decision.** ACL extension blocks (for inodes that legitimately need >16 ACL entries without going through cluster delegation). v1 does not support this; the architectural answer for multi-Principal access is cluster delegation per Decision 3. **Revisit when:** a workload appears where cluster delegation is structurally wrong for the access pattern (the natural example would be public commentary on a shared document, but ADR-027 clusters may handle that case adequately).
 
 > **Deferred decision (cross-ADR).** ADR-027 currently specifies cluster cap-delegation for IPC and channel rights (Channel-create, channel-attach pre-authorization, endpoint send/recv, optional `ClusterRevoke`). Decision 3 of this ADR asserts that multi-Principal POSIX file access routes through the same delegation mechanism, but ADR-027 has not yet been extended with storage-ACL grant types in its per-role cap set. This ADR forecasts an ADR-027 Divergence appendix that adds `(file_acl_grant: ACL.Read | ACL.Write)` to the cluster manifest's per-role policy. **Revisit when:** the first workload that requires cluster-scoped file access appears; ADR-027 Divergence appendix lands at that point, and this ADR's migration step 12 (posix-fs-service) is the natural trigger.
+
+> **Deferred decision.** Defragmenter / compaction tool for the data region. The 16-extent cap on inode extents creates a real failure mode (`EFRAGMENTED` on `SYS_FILE_WRITE` or `SYS_CAMBIO`) on aged disks that have exceeded the cap through repeated allocate-delete-reallocate cycles. v1 ships without a defrag pass; recovery is currently "user invokes the future out-of-band compaction tool," which is unspecified. **Revisit when:** the first observed `EFRAGMENTED` failure in a production workload, or proactively before v1 ships if disk-stress testing surfaces it.
+
+> **Deferred decision.** POSIX advisory file locking (`fcntl(F_SETLK)`, `flock`, `lockf`). Many POSIX consumers - SQLite, Postgres, application-level mutual exclusion via lockfiles - depend on advisory locking; v1 does not implement it. The libposix shim stubs calls or returns `ENOSYS`. **Revisit when:** the first win-compat target app fails because of missing file-locking semantics (likely the first database-backed Windows app: QuickBooks, an embedded-SQLite app). The natural shape is a per-inode lock-record list plus two new syscalls (`SYS_FILE_LOCK`, `SYS_FILE_UNLOCK`); fits as an ADR-029 Divergence appendix rather than a separate ADR.
+
+> **Deferred decision.** Memory-mapped files (`mmap`) and how they compose with per-inode CoW (Decision 2). A writer that mmaps a page and stores into it does per-byte writes that bypass `SYS_FILE_WRITE`, which means the CoW + journal mechanism does not fire. v1 has no mmap support; libposix calls return `ENOSYS`. The composition is non-trivial: page-fault-triggered CoW with a journal record at first-dirtying of each mapped page is the likely shape, but it interacts with the FrozenInodeView mechanism in ways that need explicit design. **Revisit when:** mmap support is in scope (compilers, debuggers, language runtimes, databases, GPU drivers, X-shared-memory all want it; deferred until a v1 workload demands it). Probably warrants its own ADR rather than a Divergence appendix, given the CoW interaction surface.
+
+> **Deferred decision.** Sparse files, `fallocate`-style preallocation, and explicit holes. The current extent-based format represents contiguous runs of data only; it has no way to express "block N is logically zero, no allocation." VM disk images, Postgres WAL preallocation, large logfiles with skipped regions, and any app using `posix_fallocate` use sparse semantics. v1 does not support sparse files; a 1 TB sparse file would actually allocate 1 TB of blocks. **Revisit when:** Postgres or a comparable database lands as a v1 target; the natural extension is a per-extent `is_hole` flag plus `SYS_FILE_FALLOCATE`. Fits as an ADR-029 Divergence appendix.
+
+> **Deferred decision.** File-change notifications (POSIX inotify, Windows `ReadDirectoryChangesW`). Many native apps and language tooling (Cargo file watchers, language servers, build systems, IDEs) watch directories for changes. v1 emits audit events on file mutations but does not expose a userspace notification channel suitable for polling-replacement. **Revisit when:** the first userspace consumer needs change-detection without polling; the natural mechanism is a per-watcher subscription channel (riding on ADR-005 channels) that emits ChannelManager-routed events on inode-modified, dir-entry-added, dir-entry-removed.
+
+> **Deferred decision.** Behavior of a long-lived `FileDescriptor` when the inode's ACL changes (the owner revokes the descriptor-holder's Principal-keyed entry). v1 adopts standard POSIX semantics: permissions are checked at `file_open` time, not on every operation, so the descriptor remains valid for its declared rights. Cluster revoke per ADR-027 handles cluster-scoped cap teardown; individual ACL revoke on a held FD does not propagate. **Revisit when:** a Stream-containment use case (NDA review, content protection) requires guarantees stronger than "cluster revoke is the only way to invalidate held descriptors." The natural extension is per-inode generation counters checked on each `SYS_FILE_READ`/`_WRITE`, paid for by a per-op cap-check on a hot path.

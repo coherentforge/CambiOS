@@ -81,15 +81,33 @@ pub struct StreamCapShape {
     /// closes the stream when (now - stream_opened_at) >= bound.
     pub lifetime_duration: u64,
 
-    /// Emit AUDIT_STREAM_OPEN / AUDIT_STREAM_CLOSE events. Per-byte audit is
-    /// structurally absent (that would defeat ephemerality). Open / attach /
-    /// close are auditable; the flow is not.
-    pub audit_lifecycle: bool,
+    /// Audit policy for Stream lifecycle events. Per-byte audit is structurally
+    /// absent (that would defeat ephemerality); this knob controls the granularity
+    /// of lifecycle-event emission. `Off` keeps the minimum-compliance footprint
+    /// (STREAM_OPENED is always emitted regardless); `Lifecycle` is the standard
+    /// four events; `Detailed` adds richer per-event payload context. Tri-state
+    /// rather than boolean so forensics/compliance workloads can opt into more
+    /// signal without a future ABI change.
+    pub audit_lifecycle: AuditLifecyclePolicy,
 
     /// If true, the kernel verifies sender_principal == cap creator's Principal
     /// on each SYS_CHANNEL_WRITE. Used for signed-carrier flows where the sender's
     /// identity is load-bearing per byte. Adds a per-send cap check; off by default.
     pub sender_principal_required: bool,
+}
+
+pub enum AuditLifecyclePolicy {
+    /// Only STREAM_OPENED fires. STREAM_ATTACHED / _DETACHED / _CLOSED are suppressed.
+    /// Minimum-compliance footprint; STREAM_OPENED is always emitted because the
+    /// open event is the load-bearing audit signal for any cap-shape granted.
+    Off,
+    /// Standard lifecycle events: STREAM_OPENED, STREAM_ATTACHED, STREAM_DETACHED,
+    /// STREAM_CLOSED. Default for v1 workloads.
+    Lifecycle,
+    /// Lifecycle events plus richer per-event payload (cap-shape diff against the
+    /// receiver's expected shape at attach, sender's cluster membership at the time,
+    /// drain statistics at close). For forensics or compliance-heavy workloads.
+    Detailed,
 }
 ```
 
@@ -172,7 +190,7 @@ Audit events fire at lifecycle boundaries, not per-byte:
 
 The `CloseReason` enum on `STREAM_CLOSED` carries the distinction between sender-driven close, lifetime exhaustion (either bound), all-receivers-detached, and kernel-forced close. One event covers all close paths; no separate `STREAM_LIFETIME_EXHAUSTED` or `STREAM_FORCE_CLOSED` events.
 
-Per-byte-flow audit is structurally absent. Auditing every write would defeat the ephemerality property by making the audit ring a parallel record of the stream's contents. The cap shape's `audit_lifecycle` field is the on/off switch for the events above; if false, only `STREAM_OPENED` is forced (an open event is always auditable for compliance) and the rest are suppressed.
+Per-byte-flow audit is structurally absent. Auditing every write would defeat the ephemerality property by making the audit ring a parallel record of the stream's contents. The cap shape's `audit_lifecycle` field controls lifecycle-event granularity per Decision 1's `AuditLifecyclePolicy` enum: `Off` emits only `STREAM_OPENED` (the open event is always auditable for compliance); `Lifecycle` emits all four standard events; `Detailed` adds per-event payload context (cap-shape diff at attach, cluster membership, drain statistics). The cap-creator picks the policy at open time; it cannot be changed for the stream's lifetime (per Decision 1 immutability).
 
 **Cluster cap inventories** ([ADR-027](027-service-clusters.md)): a Stream cap held by a cluster member is part of the member's cap inventory. Cluster revoke ([ADR-027](027-service-clusters.md) § Decision 3) walks the cluster's member list and revokes their caps, which for Stream caps means the stream is force-closed (the channel revoke runs the unmap, audit event fires, sender and receivers see `EPIPE`). The cluster-revoke and Stream-close mechanisms share the same kernel paths; no new code beyond Stream's cap-table integration.
 
@@ -248,7 +266,7 @@ No new `CapabilityKind`. The composition is the discipline - Stream's `consume` 
 | Sender extends a Stream beyond its declared lifetime | `lifetime_bytes` + `lifetime_duration` checked at every write; kernel force-closes when exceeded, emits audit event. |
 | Receiver count exceeds the cap-declared bound | `fan_out_count` checked at every attach; rejected when full. |
 | Sender impersonates a different Principal mid-stream | `sender_principal_required` flag verifies kernel-stamped `sender_principal` per write when the workload requires per-byte sender identity (signed-carrier flows). |
-| Per-byte traffic leaks via the audit ring | Audit fires only at lifecycle events; per-byte audit is structurally absent. The cap shape's `audit_lifecycle` flag controls everything except `STREAM_OPENED` (which is always audited for compliance). |
+| Per-byte traffic leaks via the audit ring | Audit fires only at lifecycle events; per-byte audit is structurally absent. The cap shape's `audit_lifecycle` field controls lifecycle-event granularity per Decision 1's `AuditLifecyclePolicy` enum; `STREAM_OPENED` is always emitted regardless of the policy. |
 | Bidirectional Stream re-introduces capture via the reverse direction | `SYS_STREAM` rejects Bidirectional channels with `EINVAL`. A Stream is structurally one-way; the reverse direction does not exist as a kernel surface. |
 | Process-fault leaves a Stream half-open | The existing process-fault reaping per ADR-019 detects sender or receiver exit; the close path runs automatically; pages unmap; audit fires. |
 
