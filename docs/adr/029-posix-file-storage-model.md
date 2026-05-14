@@ -153,7 +153,7 @@ Twenty new syscalls cover the POSIX-shaped surface. They fall into three groups:
 | 69 | `SYS_ACL_REVOKE` | yes | Removes a row by Principal; owner-only. |
 | 70 | `SYS_ACL_LIST` | yes | Returns the ACL contents for inspection. |
 
-Numbers 51-70 reserved (ADR-022's wallclock and ADR-027's cluster syscalls already occupied 41-47; ADR-028 reserves 48-50).
+Numbers 51-70 reserved (ADR-022's wallclock and ADR-027's cluster syscalls already occupied 41-47; ADR-028 reserves 50-52 — renumbered from the original 48-50 draft per ADR-028 § Decision 3 because slots 48/49 shipped as the two-phase channel teardown pair).
 
 **`posix-fs-service`** is a new boot module at endpoint 18 (the next free endpoint after the existing services). Same pattern as fs-service: kernel exposes the syscalls; posix-fs-service runs the policy layer for sandboxed callers (win-compat sandboxes, audit, future userland services that want path-shape access without direct kernel calls). Per-sandbox path-namespace mappings (`C:\` → `/var/win-compat/<sandbox>/c-drive/`) live in the shim, not in the kernel.
 

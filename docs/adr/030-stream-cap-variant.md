@@ -5,7 +5,7 @@
 - **Depends on:** [ADR-028](028-three-storage-models.md) (Three Storage Models - the kernel-API discipline this ADR provides the Stream cap shape for), [ADR-005](005-ipc-primitives-control-and-bulk.md) (channel substrate Stream rides on as a cap variant), [storage-planning.md](../storage-planning.md) (the synthesis that named Stream as the third storage model)
 - **Related:** [ADR-026](026-identity-transcription-at-the-kernel-ring.md) (sender_principal stamping carries unchanged into Stream traffic), [ADR-027](027-service-clusters.md) (cluster cap inventories scope Stream caps; cluster revoke composes with Stream's force-close), [ADR-007](007-capability-revocation-and-telemetry.md) (audit ring carries the Stream lifecycle events; tombstone-on-revoke pattern composes with Stream force-close), [ADR-024](024-syscall-abi-crate.md) (`StreamCapShape` lives in `cambios-abi`), [ADR-014](014-compositor-scanout-driver-protocol.md) (rendering pipeline is the v1 Stream consumer; § Divergence 2026-04-20's double-copy pixel path is structurally a Stream)
 - **Supersedes:** N/A
-- **Context:** [ADR-028](028-three-storage-models.md) committed to three co-equal storage models and three seam syscalls; [ADR-029](029-posix-file-storage-model.md) provided the POSIX backend. This ADR provides the third leg: the Stream model's full kernel mechanics. ADR-028 reserved `SYS_STREAM = 50` and committed to "the Stream cap shape's full structure is deferred to ADR-030" - this ADR fills in `StreamCapShape`'s knobs (`consume`, `rewind_window`, `buffer_max`, `fan_out_count`, `lifetime_bytes`, `lifetime_duration`), specifies how each is checked at the kernel boundary, and ratifies the composition of Stream with [ADR-005](005-ipc-primitives-control-and-bulk.md) channels. The synthesis's Stream model is the architectural primitive behind the rendering pipeline ([ADR-014](014-compositor-scanout-driver-protocol.md) § Divergence 2026-04-20), signed-carrier input flows, NDA-bound document review, and IPC-layer ephemerality for content-protection workloads. This ADR makes that primitive load-bearing rather than implicit.
+- **Context:** [ADR-028](028-three-storage-models.md) committed to three co-equal storage models and three seam syscalls; [ADR-029](029-posix-file-storage-model.md) provided the POSIX backend. This ADR provides the third leg: the Stream model's full kernel mechanics. ADR-028 reserved `SYS_STREAM = 52` (renumbered from the original 50 draft per ADR-028 § Decision 3 — slots 48/49 already shipped as the two-phase channel teardown pair, pushing the storage-seam reservations to 50/51/52) and committed to "the Stream cap shape's full structure is deferred to ADR-030" - this ADR fills in `StreamCapShape`'s knobs (`consume`, `rewind_window`, `buffer_max`, `fan_out_count`, `lifetime_bytes`, `lifetime_duration`), specifies how each is checked at the kernel boundary, and ratifies the composition of Stream with [ADR-005](005-ipc-primitives-control-and-bulk.md) channels. The synthesis's Stream model is the architectural primitive behind the rendering pipeline ([ADR-014](014-compositor-scanout-driver-protocol.md) § Divergence 2026-04-20), signed-carrier input flows, NDA-bound document review, and IPC-layer ephemerality for content-protection workloads. This ADR makes that primitive load-bearing rather than implicit.
 
 ## Problem
 
@@ -339,7 +339,7 @@ ADR-014's rendering pipeline is the canonical v1 Stream consumer; the audio-driv
 
 **Why considered.** YAGNI. The kernel surface stays smaller; verification budget stays smaller.
 
-**Why rejected.** ADR-028 already named `SYS_STREAM = 50` and committed to the cap-shape concept. Shipping without ADR-030 leaves `SYS_STREAM` partially specified - a `StreamCapShape` argument with no structure, no validity rules, no enforcement semantics. The kernel cannot accept the syscall in a meaningful way. Either ADR-028's `SYS_STREAM` commitment is walked back (the ADR is amended to drop the cap shape concept), or ADR-030 lands to give the cap shape a structure. ADR-028 already shipped; ADR-030 lands.
+**Why rejected.** ADR-028 already named `SYS_STREAM = 52` and committed to the cap-shape concept. Shipping without ADR-030 leaves `SYS_STREAM` partially specified - a `StreamCapShape` argument with no structure, no validity rules, no enforcement semantics. The kernel cannot accept the syscall in a meaningful way. Either ADR-028's `SYS_STREAM` commitment is walked back (the ADR is amended to drop the cap shape concept), or ADR-030 lands to give the cap shape a structure. ADR-028 already shipped; ADR-030 lands.
 
 ## Migration Path
 
@@ -361,7 +361,7 @@ Each step independently bisectable. Steps 1-3 are pre-implementation; steps 4-11
 
 ## Cross-References
 
-- **[ADR-028](028-three-storage-models.md)** - The kernel-API discipline this ADR provides the Stream cap shape for; `SYS_STREAM = 50` reservation lives there.
+- **[ADR-028](028-three-storage-models.md)** - The kernel-API discipline this ADR provides the Stream cap shape for; `SYS_STREAM = 52` reservation lives there.
 - **[ADR-005](005-ipc-primitives-control-and-bulk.md)** - Channel substrate Stream rides on; ADR-030 extends `ChannelRecord` with `stream_cap_shape`.
 - **[storage-planning.md](../storage-planning.md)** - The synthesis the Stream model comes from; ADR-030 fills in the cap-shape structure the synthesis sketched.
 - **[ADR-024](024-syscall-abi-crate.md)** - `cambios-abi` is where `StreamCapShape` and related types live.
@@ -377,7 +377,7 @@ Each step independently bisectable. Steps 1-3 are pre-implementation; steps 4-11
 When this ADR's implementation lands, the following CLAUDE.md sections must be updated:
 
 - **§ "Required Reading by Subsystem"** - add a row for "Stream cap shape / ephemerality / cap-bounded byte flow" pointing at this ADR, storage-planning.md, ADR-028.
-- **§ "Syscall Numbers"** - `SYS_STREAM` (50) already reserved per ADR-028; gains its handler when this ADR's migration step 4 lands.
+- **§ "Syscall Numbers"** - `SYS_STREAM` (52) already reserved per ADR-028; gains its handler when this ADR's migration step 4 lands.
 - **§ "Lock Ordering"** - no changes (Stream lives under `CHANNEL_MANAGER(6)` per ADR-005's existing placement).
 - **§ "Design Documents"** - already updated when ADR-028 landed; no additional entries needed.
 

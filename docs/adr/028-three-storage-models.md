@@ -88,13 +88,15 @@ POSIX paths that are neither `/co/...` nor an active REGALO alias resolve to POS
 
 ### 3. Three new seam syscalls
 
-Reserve the next three syscall numbers (current reservations end at 47 per [ADR-027 § Divergence](027-service-clusters.md#divergence); next free is 48). "Identity-required: yes" in the table below means the caller must be Principal-bound per [ADR-025](025-principal-as-aid.md) before invoking the syscall; the kernel reads `sender_principal` from the calling task's capability record. The convention is inherited from ADR-027's syscall table.
+Reserve the next three syscall numbers. The original ADR draft assumed reservations ended at 47 per [ADR-027 § Divergence](027-service-clusters.md#divergence), with 48 as the next free slot. Between drafting and ratification the two-phase channel-teardown pair (`SYS_CHANNEL_BEGIN_TEARDOWN = 48` / `SYS_CHANNEL_COMPLETE_TEARDOWN = 49`, commit `f21d667`) consumed slots 48 and 49, so the actual next free is 50. The renumber is mechanical (slot reservation only — no handlers written against the original 48/49/50 numbers); the semantics in the table below are unchanged from the original draft.
+
+"Identity-required: yes" in the table below means the caller must be Principal-bound per [ADR-025](025-principal-as-aid.md) before invoking the syscall; the kernel reads `sender_principal` from the calling task's capability record. The convention is inherited from ADR-027's syscall table.
 
 | Number | Name | Identity-required | Inputs | Outputs | Caps consumed |
 |---|---|---|---|---|---|
-| 48 | `SYS_CAMBIO` | yes | `FileDescriptor` (source POSIX file), optional `Principal` (delegated signing identity, defaults to caller), optional `lineage: [u8; 32]` (parent object hash), optional flag `AndDelete` | `[u8; 32]` content hash | Read on source file; sign-as-Principal (implicit via Principal binding); CreateObject |
-| 49 | `SYS_REGALO` | yes | `[u8; 32]` object hash, path string (user-chosen alias) | mount handle `RegaloId` (revocable) | Read on object; path-namespace write under per-process mount root |
-| 50 | `SYS_STREAM` | yes | Source spec `StreamSource::{Object([u8;32]), File(FileDescriptor)}`, `peer_principal`, cap-shape `StreamCapShape` (defined by ADR-030) | `StreamEndpoint` (sender side) + channel ID for the peer to attach | Read on source; channel-create rights; cap-shape bound enforcement |
+| 50 | `SYS_CAMBIO` | yes | `FileDescriptor` (source POSIX file), optional `Principal` (delegated signing identity, defaults to caller), optional `lineage: [u8; 32]` (parent object hash), optional flag `AndDelete` | `[u8; 32]` content hash | Read on source file; sign-as-Principal (implicit via Principal binding); CreateObject |
+| 51 | `SYS_REGALO` | yes | `[u8; 32]` object hash, path string (user-chosen alias) | mount handle `RegaloId` (revocable) | Read on object; path-namespace write under per-process mount root |
+| 52 | `SYS_STREAM` | yes | Source spec `StreamSource::{Object([u8;32]), File(FileDescriptor)}`, `peer_principal`, cap-shape `StreamCapShape` (defined by ADR-030) | `StreamEndpoint` (sender side) + channel ID for the peer to attach | Read on source; channel-create rights; cap-shape bound enforcement |
 
 Each handler is a single atomic transaction at the kernel ABI level (atomic-or-fail from the caller's perspective). CAMBIO obtains a snapshot-consistent view of the source, hashes and signs streaming over that view, installs a `CambiObject` via the existing `ObjectStoreBackend::put` path. REGALO writes one row into the REGALO alias table. STREAM creates a channel record per [ADR-005](005-ipc-primitives-control-and-bulk.md) with a `StreamCapShape` attached, returning the producer-side endpoint to the caller and queuing the consumer-side handle for `SYS_CHANNEL_ATTACH` by the peer.
 
@@ -293,7 +295,7 @@ A "Stream-only mode" syscall (e.g., `SYS_ENTER_STREAM_ONLY_MODE`) puts the calli
 Documentation + reservation first, implementation per follow-on ADRs.
 
 1. **Land this ADR as `Proposed`.** No code touched. The three-handle-type, three-seam-syscall, path-namespace-convention shape is now citeable for any storage work that wants to "leave room" for the model split.
-2. **`cambios-abi` syscall reservations.** Reserve numbers 48–50 for `SYS_CAMBIO` / `SYS_REGALO` / `SYS_STREAM`. Reservation only; no handlers - same posture as [ADR-022](022-wall-clock-time.md)'s wallclock reservation.
+2. **`cambios-abi` syscall reservations.** Reserve numbers 50–52 for `SYS_CAMBIO` / `SYS_REGALO` / `SYS_STREAM` (renumber from the original 48–50 draft per the note at § Decision 3 — slots 48/49 already shipped as `SYS_CHANNEL_BEGIN_TEARDOWN` / `SYS_CHANNEL_COMPLETE_TEARDOWN`). Reservation only; no handlers - same posture as [ADR-022](022-wall-clock-time.md)'s wallclock reservation.
 3. **`ObjectHandle`, `FileDescriptor`, `StreamEndpoint` types added to `cambios-abi`.** Opaque newtypes around kernel-issued IDs with no public field access. `FileDescriptor` carries a `backing: FileBacking` tag. No behavior change; preparing the type discipline.
 4. **ADR-029 lands** (POSIX file backend on-disk format + handler surface + per-inode COW for CAMBIO snapshot-consistency + REGALO size bound). FileDescriptor gets a backend.
 5. **ADR-030 lands** (Stream cap shape). StreamEndpoint gets cap-shape bounds.
@@ -322,7 +324,7 @@ Each step independently bisectable. Steps 1–3 are cheap and pre-implementation
 When this ADR's implementation lands, the following CLAUDE.md sections must be updated:
 
 - **§ "Required Reading by Subsystem"** - add a row for "Storage models / object / POSIX file / stream" pointing at storage-planning.md, this ADR, ADR-029, ADR-030.
-- **§ "Syscall Numbers"** - add `SYS_CAMBIO` (48), `SYS_REGALO` (49), `SYS_STREAM` (50) when handlers land. Per-syscall behavior notes go under the same convention as existing entries.
+- **§ "Syscall Numbers"** - add `SYS_CAMBIO` (50), `SYS_REGALO` (51), `SYS_STREAM` (52) when handlers land. Per-syscall behavior notes go under the same convention as existing entries.
 - **§ "Design Documents"** - add storage-planning.md to the list once this ADR is `Proposed` (the synthesis is no longer an isolated draft; it's the design context for a ratified ADR chain).
 
 ## Open Questions / Deferred

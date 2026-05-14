@@ -283,6 +283,14 @@ impl SyscallDispatcher {
             SyscallNumber::ClusterJoin => Self::handle_cluster_join(args, &ctx),
             SyscallNumber::ClusterRevoke => Self::handle_cluster_revoke(args, &ctx),
             SyscallNumber::ClusterInfo => Self::handle_cluster_info(args, &ctx),
+
+            // ADR-028 storage seam syscalls — slots 50/51/52 reserved.
+            // Handlers are stubs returning Enosys until the seam-syscall
+            // migration steps land (ADR-028 § Migration Path steps 6-8);
+            // the cap-shape semantics for Stream are deferred to ADR-030.
+            SyscallNumber::Cambio => Self::handle_cambio(args, &ctx),
+            SyscallNumber::Regalo => Self::handle_regalo(args, &ctx),
+            SyscallNumber::Stream => Self::handle_stream(args, &ctx),
         }
     }
 
@@ -3670,6 +3678,38 @@ impl SyscallDispatcher {
         let info_slice = UserWriteSlice::validate(ctx, out_buf, CLUSTER_INFO_BYTES)?;
         info_slice.write_from(&info)?;
         Ok(0)
+    }
+
+    // ========================================================================
+    // ADR-028 storage seam syscall stubs
+    // ========================================================================
+    //
+    // SYS_CAMBIO (50), SYS_REGALO (51), and SYS_STREAM (52) are reserved
+    // at the ABI surface but not yet implemented. The handlers return
+    // Enosys until the seam-syscall migration steps land:
+    //   - SYS_CAMBIO depends on ADR-029's FrozenInodeView (CoW snapshot)
+    //     and the existing ObjectStore put path.
+    //   - SYS_REGALO depends on ADR-029's path resolver + per-process
+    //     REGALO alias table.
+    //   - SYS_STREAM depends on ADR-030's StreamCapShape validity checks
+    //     + ChannelRecord extension.
+
+    /// Stub for SYS_CAMBIO. Returns `Enosys` until ADR-028 § Migration
+    /// Path step 6 lands the seal-and-install handler.
+    fn handle_cambio(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Err(SyscallError::Enosys)
+    }
+
+    /// Stub for SYS_REGALO. Returns `Enosys` until ADR-028 § Migration
+    /// Path step 7 lands the alias-table writer + path resolver.
+    fn handle_regalo(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Err(SyscallError::Enosys)
+    }
+
+    /// Stub for SYS_STREAM. Returns `Enosys` until ADR-028 § Migration
+    /// Path step 8 lands the cap-shape attach + channel-record extension.
+    fn handle_stream(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Err(SyscallError::Enosys)
     }
 
     /// Drive a cluster's teardown — used by SYS_CLUSTER_REVOKE and by

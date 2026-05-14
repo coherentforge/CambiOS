@@ -26,6 +26,17 @@
 //! `no_std`, no dependencies. Permissively licensed (MPL-2.0) so
 //! non-Rust / non-AGPL clients can consume the contract without
 //! licensing friction.
+//!
+//! # `[u8; 32]` for Principal values
+//!
+//! Several ABI types in this crate carry Principal-shaped fields as raw
+//! `[u8; 32]` rather than a typed `Principal` newtype. The kernel's
+//! `Principal` lives in `src/ipc/mod.rs` and has not yet been promoted
+//! to this crate per ADR-024 § Open Questions row 2 ("a stable
+//! Principal representation"). Until that promotion lands, content
+//! hashes and Principal AIDs share the same raw shape; the field name
+//! (`hash` vs `principal` vs `owner`) is the distinguisher. Replace
+//! when ADR-024 Open Questions row 2 closes.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -540,6 +551,74 @@ pub enum SyscallNumber {
     /// Returns: 0 on success, `InvalidArg` for stale id / wrong
     /// state / kind-mismatch.
     ChannelCompleteTeardown = 49,
+
+    /// SYS_CAMBIO (50): seal a POSIX file as a content-addressed
+    /// CambiObject (ADR-028 § Decision 3 — the file → object seam).
+    ///
+    /// Slot reserved here; handler not yet wired. The dispatcher
+    /// returns `Enosys` until the seam-syscall migration step lands
+    /// per ADR-028 § Migration Path step 6. Same pre-implementation
+    /// posture as ADR-022's wallclock pair (commit f045e44).
+    ///
+    /// Args (per ADR-028 § Decision 3 table): arg1 = `FileDescriptor`
+    /// of the source POSIX file, arg2 = optional delegated signing
+    /// Principal (0 = caller, current-Principal default per ADR-028
+    /// § Open Questions row 3), arg3 = optional parent-hash for
+    /// lineage (zero bytes = no lineage), arg4 = flags (bit 0 =
+    /// `AndDelete` — non-destructive default per ADR-028 § Open
+    /// Questions).
+    ///
+    /// Returns: 32-byte content hash on success, negative error
+    /// otherwise. Snapshot-consistent view of the source per ADR-029's
+    /// per-inode CoW (Decision 2); concurrent writes during the seal
+    /// go to new blocks via CoW.
+    ///
+    /// Identity-required: yes. Original ADR draft placed this at slot
+    /// 48; renumbered to 50 because ADR-027 two-phase channel teardown
+    /// (commit f21d667) landed slots 48/49 between ADR-028's drafting
+    /// and ratification.
+    Cambio = 50,
+
+    /// SYS_REGALO (51): publish a CambiObject at a user-chosen POSIX
+    /// path as a read-only alias (ADR-028 § Decision 3 — the object →
+    /// file-view seam).
+    ///
+    /// Slot reserved here; handler not yet wired (returns `Enosys`).
+    /// Sequenced after ADR-029 (the path resolver lives in the POSIX
+    /// path-namespace surface per ADR-028 § Migration Path step 7).
+    ///
+    /// Args (per ADR-028 § Decision 3 table): arg1 = 32-byte object
+    /// hash ptr, arg2 = user-chosen path ptr, arg3 = path length.
+    ///
+    /// Returns: `RegaloId` (revocable, per-process namespace) on
+    /// success, negative error otherwise.
+    ///
+    /// Identity-required: yes. Original ADR draft placed this at slot
+    /// 49; renumbered to 51 per the same f21d667 reservation pressure
+    /// noted on `Cambio`.
+    Regalo = 51,
+
+    /// SYS_STREAM (52): open a Stream cap on a {CambiObject,
+    /// FileDescriptor} source per ADR-028 § Decision 3 and ADR-030's
+    /// full cap-shape structure.
+    ///
+    /// Slot reserved here; handler not yet wired (returns `Enosys`).
+    /// Sequenced after ADR-030 cap-shape definitions (ADR-028 §
+    /// Migration Path step 8).
+    ///
+    /// Args (per ADR-028 § Decision 3 + ADR-030 § Decision 2):
+    /// arg1 = `StreamSource` discriminant + payload (object hash or
+    /// FileDescriptor), arg2 = peer Principal ptr, arg3 = pointer to
+    /// caller-built `StreamCapShape`.
+    ///
+    /// Returns: `StreamEndpoint` (Producer side, per ADR-030 §
+    /// Decision 3 — Stream is one-way; Bidirectional is structurally
+    /// absent) on success, negative error otherwise.
+    ///
+    /// Identity-required: yes. Original ADR draft placed this at slot
+    /// 50; renumbered to 52 per the same f21d667 reservation pressure
+    /// noted on `Cambio`.
+    Stream = 52,
 }
 
 impl SyscallNumber {
@@ -576,7 +655,8 @@ impl SyscallNumber {
             Self::ChannelQuiesceAck |
             Self::ChannelBeginTeardown | Self::ChannelCompleteTeardown |
             Self::ClusterCreate | Self::ClusterJoin |
-            Self::ClusterRevoke | Self::ClusterInfo
+            Self::ClusterRevoke | Self::ClusterInfo |
+            Self::Cambio | Self::Regalo | Self::Stream
         )
     }
 
@@ -634,6 +714,9 @@ impl SyscallNumber {
             47 => Some(Self::ClusterInfo),
             48 => Some(Self::ChannelBeginTeardown),
             49 => Some(Self::ChannelCompleteTeardown),
+            50 => Some(Self::Cambio),
+            51 => Some(Self::Regalo),
+            52 => Some(Self::Stream),
             _ => None,
         }
     }
@@ -748,6 +831,197 @@ impl SyscallError {
 pub type SyscallResult = Result<u64, SyscallError>;
 
 // ============================================================================
+// Storage-stack handle types (ADR-028 § Decision 1)
+// ============================================================================
+//
+// Three distinct handle types — no polymorphic `Storage` trait, no
+// `From` impls between handle types. The kernel returns one of these
+// three from any syscall whose return shape is "a storage handle";
+// userspace cannot reconstruct one type from another's bits. See
+// ADR-028 § Decision 1 and § Verification Stance.
+
+/// CambiObject handle. Returned by `SYS_OBJ_PUT` / `SYS_OBJ_GET` /
+/// `SYS_OBJ_LIST` (per ADR-003) and by `SYS_CAMBIO` (per ADR-028
+/// § Decision 3).
+///
+/// Opaque newtype around the kernel-issued identifiers — userspace
+/// cannot construct one without going through the syscall ABI.
+/// Generation counter rejects stale or fabricated handles at use per
+/// ADR-028 § Threat Model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectHandle {
+    hash: [u8; 32],
+    rights: ObjectRights,
+    generation: u32,
+}
+
+impl ObjectHandle {
+    /// Kernel-only constructor. Userspace receives `ObjectHandle`
+    /// values across the syscall ABI but cannot synthesize them — the
+    /// type discipline (handle-type-decided-at-syscall) is a static
+    /// property of the API surface per ADR-028 § Verification Stance.
+    pub const fn new(hash: [u8; 32], rights: ObjectRights, generation: u32) -> Self {
+        Self { hash, rights, generation }
+    }
+
+    pub const fn hash(&self) -> [u8; 32] { self.hash }
+    pub const fn rights(&self) -> ObjectRights { self.rights }
+    pub const fn generation(&self) -> u32 { self.generation }
+}
+
+/// POSIX file descriptor. Returned by `SYS_FILE_OPEN` / `SYS_FILE_CREATE`
+/// (per ADR-029) and by the path resolver when a path resolves to the
+/// canonical `/co/<hex-hash>` mount or a REGALO alias (per ADR-028
+/// § Decision 2).
+///
+/// Opaque newtype, kernel-only constructor. Carries a `FileBacking` tag
+/// set at open time and immutable for the handle's lifetime, indicating
+/// whether the descriptor points at a mutable POSIX file (ADR-029) or
+/// an immutable CambiObject view. Writes against an `ObjectView`
+/// backing terminate uniformly in `EROFS` before any backend operation
+/// runs; the path-shaped contract is uniform across backings. See
+/// ADR-028 § Decision 1 for why two backings on one descriptor type is
+/// *not* the cross-model polymorphism the synthesis excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileDescriptor {
+    fd: u32,
+    rights: FileRights,
+    backing: FileBacking,
+    generation: u32,
+}
+
+impl FileDescriptor {
+    /// Kernel-only constructor; see `ObjectHandle::new`.
+    pub const fn new(fd: u32, rights: FileRights, backing: FileBacking, generation: u32) -> Self {
+        Self { fd, rights, backing, generation }
+    }
+
+    pub const fn fd(&self) -> u32 { self.fd }
+    pub const fn rights(&self) -> FileRights { self.rights }
+    pub const fn backing(&self) -> FileBacking { self.backing }
+    pub const fn generation(&self) -> u32 { self.generation }
+}
+
+/// Stream cap endpoint. Returned by `SYS_STREAM` per ADR-028 + ADR-030.
+///
+/// Per ADR-028 § Decision 5 (the asymmetry): no `From` impl to or from
+/// `ObjectHandle` / `FileDescriptor`, and no inverse seam syscall reads
+/// a `StreamEndpoint` back into addressable storage. The structural
+/// one-way property of Stream is encoded in the type discipline as
+/// well as in the runtime dispatch table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamEndpoint {
+    stream_id: u32,
+    role: StreamRole,
+    generation: u32,
+}
+
+impl StreamEndpoint {
+    /// Kernel-only constructor; see `ObjectHandle::new`.
+    pub const fn new(stream_id: u32, role: StreamRole, generation: u32) -> Self {
+        Self { stream_id, role, generation }
+    }
+
+    pub const fn stream_id(&self) -> u32 { self.stream_id }
+    pub const fn role(&self) -> StreamRole { self.role }
+    pub const fn generation(&self) -> u32 { self.generation }
+}
+
+/// Rights bitfield on `ObjectHandle`. Bit 0 = Read, bit 1 = Write,
+/// bit 2 = Execute.
+///
+/// Hand-rolled `repr(transparent)` newtype to keep `cambios-abi`
+/// zero-dep. Same pattern is reused for `FileRights` (ADR-028
+/// § Decision 1) and `Rights` (ADR-029 § Decision 3 inode ACL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ObjectRights(u8);
+
+impl ObjectRights {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    pub const NONE: Self = Self(0);
+
+    pub const fn from_bits(bits: u8) -> Self { Self(bits) }
+    pub const fn bits(&self) -> u8 { self.0 }
+    pub const fn contains(&self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub const fn union(&self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+
+/// Rights bitfield on `FileDescriptor`. Same bit layout as
+/// `ObjectRights`. Hand-rolled per the pattern set on `ObjectRights`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct FileRights(u8);
+
+impl FileRights {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    pub const NONE: Self = Self(0);
+
+    pub const fn from_bits(bits: u8) -> Self { Self(bits) }
+    pub const fn bits(&self) -> u8 { self.0 }
+    pub const fn contains(&self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub const fn union(&self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+
+/// Stream cap role per ADR-030 § Decision 3. Stream is one-way by
+/// construction — ADR-005's `Bidirectional` channel role is
+/// structurally absent on Streams. `SYS_STREAM` rejects an attempt to
+/// base a Stream on a Bidirectional channel with `InvalidArg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamRole {
+    Producer = 0,
+    Consumer = 1,
+}
+
+/// `FileDescriptor` backing per ADR-028 § Decision 1. Resolved at
+/// `SYS_FILE_OPEN` / path-resolve time and immutable for the
+/// descriptor's lifetime; subsequent operations branch on this tag
+/// without re-resolving.
+///
+/// Writes against `ObjectView` backings terminate uniformly in `EROFS`
+/// before any backend operation runs (ADR-028 § Threat Model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileBacking {
+    /// Mutable POSIX file in the POSIX file backend (ADR-029).
+    Posix,
+    /// Immutable CambiObject view; bytes resolved via the ObjectStore
+    /// on each read. The `hash` field is a content hash, not a
+    /// Principal AID (see top-of-file note on `[u8; 32]` shape).
+    ObjectView { hash: [u8; 32], source: ViewSource },
+}
+
+/// How a CambiObject view was reached. Discriminates the two
+/// path-resolution outcomes that produce a `FileBacking::ObjectView`
+/// per ADR-028 § Decision 2 path-namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSource {
+    /// Reached via the `/co/<hex-hash>` canonical mount. Path is
+    /// content-derived; the resolver hex-decodes the hash and looks
+    /// up the object directly.
+    Canonical,
+    /// Reached via a REGALO alias. Path is user-chosen and lives in
+    /// the calling process's REGALO alias table.
+    Regalo(RegaloId),
+}
+
+/// REGALO alias identifier. Per-process namespace, kernel-issued,
+/// revocable per ADR-028 § Decision 2. Opaque newtype matching the
+/// `ChannelId` / `ClusterId` pattern already in the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct RegaloId(u32);
+
+impl RegaloId {
+    pub const fn new(raw: u32) -> Self { Self(raw) }
+    pub const fn raw(&self) -> u32 { self.0 }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -816,6 +1090,9 @@ mod tests {
             SyscallNumber::ClusterRevoke, SyscallNumber::ClusterInfo,
             SyscallNumber::ChannelBeginTeardown,
             SyscallNumber::ChannelCompleteTeardown,
+            SyscallNumber::Cambio,
+            SyscallNumber::Regalo,
+            SyscallNumber::Stream,
         ];
 
         for &num in &all {
@@ -844,14 +1121,13 @@ mod tests {
     fn all_syscall_numbers_covered() {
         // Verify from_u64 round-trips for all defined values, ensuring
         // no gap in the requires_identity() match. ADR-022 wallclock
-        // pair (39/40) lands inside the contiguous 0..=49 sweep.
-        // ADR-027 cluster-handle reservations (44..=47) and the
-        // two-phase channel-teardown pair (48 ChannelBeginTeardown,
-        // 49 ChannelCompleteTeardown) round out the current high-water
-        // mark. The two-phase pair is the kernel-side substrate for
-        // the resize / cluster-revoke / forced-teardown family;
-        // userspace consumers wire in via the libsys wrappers.
-        for i in 0..=49u64 {
+        // pair (39/40) lands inside the contiguous 0..=52 sweep.
+        // ADR-027 cluster-handle reservations (44..=47), the two-phase
+        // channel-teardown pair (48 ChannelBeginTeardown, 49
+        // ChannelCompleteTeardown), and ADR-028 storage seam syscalls
+        // (50 Cambio, 51 Regalo, 52 Stream) round out the current
+        // high-water mark.
+        for i in 0..=52u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
