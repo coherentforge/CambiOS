@@ -12,8 +12,10 @@
 //!
 //! The interfaces defined here are permanent. The implementations evolve.
 
+pub mod bitmap;
 pub mod block;
 pub mod disk;
+pub mod journal;
 #[cfg(not(test))]
 pub mod lazy_disk;
 pub mod posix;

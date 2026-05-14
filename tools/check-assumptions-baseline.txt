@@ -171,7 +171,7 @@ src/fs/disk.rs:98:CAP_RIGHT_READ
 src/fs/disk.rs:99:CAP_RIGHT_WRITE
 src/fs/disk.rs:100:CAP_RIGHT_EXECUTE
 src/fs/disk.rs:103:SUPERBLOCK_LBA
-src/fs/mod.rs:133:MAX_OBJECT_CAPS
+src/fs/mod.rs:135:MAX_OBJECT_CAPS
 src/fs/posix/mod.rs:136:SB_OFF_MAGIC
 src/fs/posix/mod.rs:137:SB_OFF_VERSION
 src/fs/posix/mod.rs:138:SB_OFF_CAPACITY_INODES
