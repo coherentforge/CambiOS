@@ -21,6 +21,7 @@
 //! for the design.
 
 use alloc::vec::Vec;
+use cambios_abi::{StreamCapShape, StreamState};
 use crate::ipc::{ProcessId, Principal};
 
 // ============================================================================
@@ -34,8 +35,10 @@ use crate::ipc::{ProcessId, Principal};
 ///      command/memory channels + non-GUI services (current 7 boot modules
 ///      × ~2 data paths each) = ~60 active channels at v1 endgame. 4×
 ///      headroom over that estimate puts the ceiling at 256.
-///      Memory cost: 256 × size_of::<Option<ChannelRecord>>() ≈ 256 × ~160 B
-///      ≈ 40 KiB. Negligible.
+///      Memory cost: 256 × size_of::<Option<ChannelRecord>>() ≈ 256 × ~272 B
+///      ≈ 70 KiB. ADR-030's optional stream_cap_shape + stream_state fields
+///      added ~112 B per record vs the pre-ADR-030 ~160 B figure. Still
+///      negligible vs the ~40 MiB MAX_FRAMES bitmap or per-process heaps.
 /// Replace when: the first service needs more than ~4 simultaneous
 ///      channels and the table fills up, OR when multi-monitor + many-client
 ///      graphics workloads exceed 60 active channels. See docs/ASSUMPTIONS.md.
@@ -350,6 +353,22 @@ pub struct ChannelRecord {
     pub peer_vaddr: u64,
     /// Tick at which the channel was created (for telemetry).
     pub created_at_tick: u64,
+    /// ADR-030 Stream cap shape, if this channel is a Stream. `None`
+    /// for plain ADR-005 channels (control-IPC, audio driver, etc.);
+    /// `Some` iff this channel was created via `SYS_STREAM` with a
+    /// `StreamCapShape` attached. Existing channel paths ignore
+    /// `None` and execute their existing logic; Stream-aware paths
+    /// (lifetime checks, rewind validation, audit emission) branch
+    /// on `stream_cap_shape.is_some()`.
+    ///
+    /// Immutable post-create per ADR-030 § Why Not Other Options
+    /// option B (mutable cap shapes break the cap-shape invariant).
+    pub stream_cap_shape: Option<StreamCapShape>,
+    /// ADR-030 Stream runtime bookkeeping. `None` for plain channels;
+    /// `Some` iff `stream_cap_shape.is_some()`. Updated by Stream-
+    /// aware code paths: bytes_sent on each write, active_receiver_count
+    /// on attach/detach, state on close.
+    pub stream_state: Option<StreamState>,
 }
 
 /// Parameters for [`ChannelManager::create`].
@@ -523,6 +542,10 @@ impl ChannelManager {
             creator_vaddr: params.creator_vaddr,
             peer_vaddr: 0,
             created_at_tick: params.created_at_tick,
+            // ADR-030: plain channels default to None; SYS_STREAM
+            // will populate both fields when it lands.
+            stream_cap_shape: None,
+            stream_state: None,
         });
         self.count += 1;
 

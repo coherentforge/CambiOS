@@ -208,8 +208,8 @@ src/io/mod.rs:123:LSR_THRE
 src/io/mod.rs:125:LSR_DR
 src/io/mod.rs:161:NS16550_PHYS_BASE
 src/io/mod.rs:291:UARTFR_RXFE
-src/ipc/channel.rs:42:MAX_CHANNELS
-src/ipc/channel.rs:58:MAX_CHANNEL_PAGES
+src/ipc/channel.rs:45:MAX_CHANNELS
+src/ipc/channel.rs:61:MAX_CHANNEL_PAGES
 src/lib.rs:397:BALANCE_INTERVAL_TICKS
 src/loader/elf.rs:15:ELF_CLASS_64BIT
 src/loader/elf.rs:16:ELF_DATA_LITTLE_ENDIAN

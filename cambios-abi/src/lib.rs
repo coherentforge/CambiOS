@@ -1317,6 +1317,151 @@ pub struct FrozenInodeView {
 }
 
 // ============================================================================
+// Stream cap-shape types (ADR-030)
+// ============================================================================
+//
+// A Stream is what an ADR-005 channel is when its cap shape declares
+// it ephemeral. The substrate carries bytes through the existing
+// memory-mapped page ring; this cap-shape annotation parameterizes
+// the substrate at open time (fan-out cap, buffer-max watermark,
+// rewind window, lifetime bounds) and constrains the runtime path at
+// boundary events (open / attach / send-permission / close). There is
+// no per-byte kernel check on the data path; the kernel touches bytes
+// only at boundary events.
+//
+// `StreamCapShape` is the cap-shape annotation; `StreamState` is the
+// kernel-side bookkeeping; `StreamLifecycleState` + `CloseReason`
+// drive the close path. All five types are ABI-visible because the
+// channel record (kernel state) and userspace cap-shape builders both
+// reference them.
+
+/// Stream cap shape per ADR-030 § Decision 1. Carries the ephemerality
+/// bounds the kernel enforces at boundary events. Validity constraints
+/// (§ Decision 1) are checked at `SYS_STREAM` open; userspace builders
+/// (`libstream` per ADR-028) run the same checks at compile/link time.
+///
+/// Once attached to a channel record, the cap shape is immutable for
+/// the stream's lifetime per ADR-030 § Why Not Other Options option B
+/// (mutable cap shapes break the cap-shape-invariant property).
+///
+/// Fields are public — userspace builds these from caller-side
+/// arguments. The kernel inspects them at open time but does not
+/// modify them after attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCapShape {
+    /// Required for any Stream cap. A `StreamCapShape` with
+    /// `consume = false` is not a Stream cap and is rejected with
+    /// `InvalidArg` per ADR-030 § Decision 1.
+    pub consume: bool,
+
+    /// Maximum backward-seek window in bytes from the receiver's
+    /// current read position. 0 = pure forward-only; >0 = receiver
+    /// may re-read up to N bytes back. Bounded by
+    /// `MAX_STREAM_RECEIVER_BUFFER` SCAFFOLDING at open time (bound
+    /// lands kernel-side with the handler in a later session).
+    pub rewind_window: u64,
+
+    /// Maximum receiver-side buffering, in bytes. Parameterizes the
+    /// channel substrate's flow-control watermark (per ADR-005).
+    /// 0 = zero-buffer flow control (sender blocks until previous
+    /// write fully drained); >0 = bounded in-flight headroom. When
+    /// `buffer_max == 0`, `rewind_window` must also be 0 per
+    /// § Decision 1 (zero-buffer flow control retains no history).
+    pub buffer_max: u64,
+
+    /// Maximum simultaneous receivers per ADR-030 § Decision 1.
+    /// 1 = one-shot stream; >1 = fan-out. Slot reclaimed on detach.
+    /// Bounded by `MAX_STREAM_FAN_OUT` SCAFFOLDING at open time.
+    pub fan_out_count: u32,
+
+    /// Total bytes the sender may transmit before kernel force-close.
+    /// 0 = unbounded (use `lifetime_duration` or sender-driven close).
+    /// Bounded by `MAX_STREAM_LIFETIME_BYTES` SCAFFOLDING.
+    pub lifetime_bytes: u64,
+
+    /// Maximum stream duration in monotonic ticks before force-close.
+    /// 0 = unbounded. Bounded by `MAX_STREAM_LIFETIME_DURATION_TICKS`
+    /// SCAFFOLDING.
+    pub lifetime_duration: u64,
+
+    /// Lifecycle-event granularity per ADR-030 § Decision 1. Tri-state
+    /// (`Off` / `Lifecycle` / `Detailed`) rather than boolean so
+    /// forensics workloads can opt into richer signal without a future
+    /// ABI change. `STREAM_OPENED` is always emitted regardless of
+    /// this knob (compliance baseline).
+    pub audit_lifecycle: AuditLifecyclePolicy,
+
+    /// If true, the kernel verifies `sender_principal` equals the cap
+    /// creator's Principal on every `SYS_CHANNEL_WRITE`. Used for
+    /// signed-carrier flows where the sender's identity is per-byte
+    /// load-bearing. Off by default — leaves the per-write 32-byte
+    /// equality check out of the data path for non-signed-carrier
+    /// workloads (ADR-030 § Decision 2 row 3 + § Threat Model).
+    pub sender_principal_required: bool,
+}
+
+/// Audit policy for Stream lifecycle events per ADR-030 § Decision 1.
+/// Per-byte audit is structurally absent (auditing every write would
+/// defeat the ephemerality property); this knob controls the
+/// granularity of lifecycle-event emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditLifecyclePolicy {
+    /// Only `STREAM_OPENED` fires. Minimum-compliance footprint —
+    /// the open event is the load-bearing audit signal for any
+    /// cap-shape granted.
+    Off = 0,
+    /// Standard lifecycle events: `STREAM_OPENED`, `STREAM_ATTACHED`,
+    /// `STREAM_DETACHED`, `STREAM_CLOSED`. Default for v1 workloads.
+    Lifecycle = 1,
+    /// Lifecycle events plus richer per-event payload (cap-shape diff
+    /// at attach, cluster membership at the time, drain statistics at
+    /// close). For forensics or compliance-heavy workloads.
+    Detailed = 2,
+}
+
+/// Per-stream runtime bookkeeping attached to the channel record per
+/// ADR-030 § Architecture. Updated on every `SYS_CHANNEL_WRITE`
+/// (bytes_sent), every attach/detach (active_receiver_count), and
+/// when the lifecycle transitions (state).
+#[derive(Debug, Clone, Copy)]
+pub struct StreamState {
+    pub opened_at_tick: u64,
+    pub bytes_sent: u64,
+    pub active_receiver_count: u32,
+    pub state: StreamLifecycleState,
+}
+
+/// Stream lifecycle state machine per ADR-030 § Decision 4.
+/// Strictly forward: `Active → Closing → Closed`. No backward
+/// transitions; the `Closing` arm carries the close reason and the
+/// drain-deadline tick for the passive drain wait.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamLifecycleState {
+    Active,
+    Closing { reason: CloseReason, drain_deadline_tick: u64 },
+    Closed,
+}
+
+/// Reason a Stream transitioned to `Closing`. Carried in the
+/// `STREAM_CLOSED` audit event payload per ADR-030 § Decision 5.
+/// One event covers all close paths; no separate
+/// `STREAM_LIFETIME_EXHAUSTED` / `STREAM_FORCE_CLOSED` events.
+///
+/// `audit_ref` in `KernelForce` is `u64` rather than a typed
+/// `AuditEventId` per ADR-007 — the audit-ID type has not yet been
+/// promoted to `cambios-abi`. Replace when: a second ABI consumer of
+/// AuditEventId appears, or ADR-007 promotes the type.
+#[derive(Debug, Clone, Copy)]
+pub enum CloseReason {
+    SenderClosed,
+    LifetimeBytesExhausted,
+    LifetimeDurationExhausted,
+    AllReceiversDetached,
+    KernelForce { audit_ref: u64 },
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
