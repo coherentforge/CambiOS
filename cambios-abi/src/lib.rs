@@ -619,6 +619,120 @@ pub enum SyscallNumber {
     /// 50; renumbered to 52 per the same f21d667 reservation pressure
     /// noted on `Cambio`.
     Stream = 52,
+
+    // ========================================================================
+    // ADR-029 POSIX file storage syscall reservations (slots 53-72)
+    // ========================================================================
+    //
+    // 20 syscalls per ADR-029 § Decision 4: file/directory operations
+    // (53-67), metadata (68-69), ACL (70-72). All identity-required.
+    // Original ADR draft placed these at 51-70; renumbered to 53-72
+    // per ADR-029 § Context — slots 48/49 had shipped as the two-phase
+    // channel teardown pair, and slots 50/51/52 went to ADR-028's
+    // storage seam syscalls (Cambio / Regalo / Stream), so the
+    // POSIX range shifts by 2.
+    //
+    // Slot reservations only; the dispatcher routes them to
+    // Enosys-returning stubs until the POSIX backend lands per ADR-029
+    // § Migration Path steps 4-9.
+    //
+    // The full per-syscall behavior (flags, return values, capability
+    // chain) lives in ADR-029 § Decision 4's table; rustdoc here
+    // points back rather than duplicating that table.
+
+    /// SYS_FILE_OPEN (53): open a POSIX path for read or write.
+    /// Returns a `FileDescriptor` whose `FileBacking` is set by the
+    /// path resolver (per ADR-028 § Decision 2). Flags include
+    /// `O_RDONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`,
+    /// `O_CONSISTENT_SNAPSHOT` (frozen view per ADR-029 § Decision 2).
+    /// Identity-required: yes.
+    FileOpen = 53,
+
+    /// SYS_FILE_CREATE (54): equivalent to `O_CREAT | O_EXCL`.
+    /// Returns a `FileDescriptor`. Identity-required: yes.
+    FileCreate = 54,
+
+    /// SYS_FILE_CLOSE (55): drop the descriptor; decrement
+    /// `cow_refcount` if it pointed at a frozen view.
+    /// Identity-required: yes.
+    FileClose = 55,
+
+    /// SYS_FILE_READ (56): read up to `MAX_FILE_IO_BYTES_PER_CALL = 1
+    /// MiB` (SCAFFOLDING per ADR-029 § Decision 4) bytes from the
+    /// descriptor's current offset. Identity-required: yes.
+    FileRead = 56,
+
+    /// SYS_FILE_WRITE (57): write up to `MAX_FILE_IO_BYTES_PER_CALL`
+    /// bytes; triggers per-inode CoW per ADR-029 § Decision 2 when
+    /// modifying an existing block. Identity-required: yes.
+    FileWrite = 57,
+
+    /// SYS_FILE_SEEK (58): update the descriptor's offset.
+    /// Identity-required: yes.
+    FileSeek = 58,
+
+    /// SYS_FILE_TRUNCATE (59): update `size_bytes`; free extents
+    /// beyond the new size (refcount-checked). Identity-required: yes.
+    FileTruncate = 59,
+
+    /// SYS_FILE_RENAME (60): atomic per ADR-029 § Decision 5 (single
+    /// journal record). Cross-backend rename returns `EXDEV`.
+    /// Identity-required: yes.
+    FileRename = 60,
+
+    /// SYS_FILE_UNLINK (61): decrement `link_count`; free the inode
+    /// iff `link_count == 0 && open_descriptor_count == 0`.
+    /// Identity-required: yes.
+    FileUnlink = 61,
+
+    /// SYS_FILE_LINK (62): create a new directory entry pointing at
+    /// an existing inode; increment `link_count`.
+    /// Identity-required: yes.
+    FileLink = 62,
+
+    /// SYS_FILE_SYMLINK (63): create a Symlink inode whose first
+    /// extent holds the target string. Identity-required: yes.
+    FileSymlink = 63,
+
+    /// SYS_MKDIR (64): allocate a Directory inode; initialize empty
+    /// directory contents. Identity-required: yes.
+    Mkdir = 64,
+
+    /// SYS_RMDIR (65): free a Directory inode iff it has no entries.
+    /// Identity-required: yes.
+    Rmdir = 65,
+
+    /// SYS_OPENDIR (66): open a directory; returns a `FileDescriptor`
+    /// flavor (per ADR-029 § Decision 4 — Directory backing).
+    /// Identity-required: yes.
+    Opendir = 66,
+
+    /// SYS_READDIR (67): iterate entries in a directory descriptor.
+    /// Identity-required: yes.
+    Readdir = 67,
+
+    /// SYS_STAT (68): return a `FileMetadata` struct (kind, size,
+    /// owner, mtime, ctime, link_count). Identity-required: yes.
+    Stat = 68,
+
+    /// SYS_FSYNC (69): force journal flush + data CoW commits to
+    /// durable storage. Identity-required: yes.
+    Fsync = 69,
+
+    /// SYS_ACL_GRANT (70): add a `(Principal, Rights, expiry)` row to
+    /// an inode's ACL; owner-only. Returns `ENOSPC` if the inline ACL
+    /// (capped at `MAX_INODE_ACL_ENTRIES = 16`) is full — multi-
+    /// Principal workloads route through ADR-027 cluster delegation
+    /// per ADR-029 § Decision 3. Identity-required: yes.
+    AclGrant = 70,
+
+    /// SYS_ACL_REVOKE (71): remove a row by Principal; owner-only.
+    /// Identity-required: yes.
+    AclRevoke = 71,
+
+    /// SYS_ACL_LIST (72): return the ACL contents for inspection.
+    /// Identity-required: yes.
+    AclList = 72,
 }
 
 impl SyscallNumber {
@@ -656,7 +770,15 @@ impl SyscallNumber {
             Self::ChannelBeginTeardown | Self::ChannelCompleteTeardown |
             Self::ClusterCreate | Self::ClusterJoin |
             Self::ClusterRevoke | Self::ClusterInfo |
-            Self::Cambio | Self::Regalo | Self::Stream
+            Self::Cambio | Self::Regalo | Self::Stream |
+            Self::FileOpen | Self::FileCreate | Self::FileClose |
+            Self::FileRead | Self::FileWrite | Self::FileSeek |
+            Self::FileTruncate | Self::FileRename | Self::FileUnlink |
+            Self::FileLink | Self::FileSymlink |
+            Self::Mkdir | Self::Rmdir |
+            Self::Opendir | Self::Readdir |
+            Self::Stat | Self::Fsync |
+            Self::AclGrant | Self::AclRevoke | Self::AclList
         )
     }
 
@@ -717,6 +839,26 @@ impl SyscallNumber {
             50 => Some(Self::Cambio),
             51 => Some(Self::Regalo),
             52 => Some(Self::Stream),
+            53 => Some(Self::FileOpen),
+            54 => Some(Self::FileCreate),
+            55 => Some(Self::FileClose),
+            56 => Some(Self::FileRead),
+            57 => Some(Self::FileWrite),
+            58 => Some(Self::FileSeek),
+            59 => Some(Self::FileTruncate),
+            60 => Some(Self::FileRename),
+            61 => Some(Self::FileUnlink),
+            62 => Some(Self::FileLink),
+            63 => Some(Self::FileSymlink),
+            64 => Some(Self::Mkdir),
+            65 => Some(Self::Rmdir),
+            66 => Some(Self::Opendir),
+            67 => Some(Self::Readdir),
+            68 => Some(Self::Stat),
+            69 => Some(Self::Fsync),
+            70 => Some(Self::AclGrant),
+            71 => Some(Self::AclRevoke),
+            72 => Some(Self::AclList),
             _ => None,
         }
     }
@@ -1022,6 +1164,159 @@ impl RegaloId {
 }
 
 // ============================================================================
+// POSIX file storage types (ADR-029 § Architecture)
+// ============================================================================
+//
+// On-disk inode shape (per ADR-029 § Decision 1) plus the kernel-side
+// frozen-view handle (per ADR-029 § Decision 2 — CoW snapshot for
+// CAMBIO). The on-disk byte layout in ADR-029 § Decision 1's tables is
+// packed; the Rust types here use natural alignment and the kernel
+// translates between them with explicit byte reads (per ADR-029
+// § Architecture's "on-disk vs in-memory layout" note).
+
+/// SCAFFOLDING: maximum number of contiguous extents per POSIX inode.
+/// Why: per ADR-029 § Decision 1 the inode header reserves 192 bytes
+///      for `extents` (16 entries × 12 bytes on-disk). The bound is
+///      the on-disk inode-format slot count, mirroring the
+///      MAX_OBJECT_CAPS / MAX_CONTENT_BYTES_ON_DISK precedent in
+///      docs/ASSUMPTIONS.md.
+/// Replace when: growing this requires a new inode-format version
+///      bump (the on-disk layout reserves exactly 16 slots). The
+///      observable trigger for that bump is the first widespread
+///      EFRAGMENTED failure on an aged disk per ADR-029 § Open
+///      Questions ("Defragmenter / compaction tool"). Until then,
+///      16 extents per inode is the v1 endgame bound — large files
+///      land in fewer-larger extents via the contiguous allocator,
+///      not by raising the count.
+pub const MAX_EXTENTS_PER_INODE: usize = 16;
+
+/// SCAFFOLDING: maximum number of inline ACL entries per POSIX inode.
+/// Why: per ADR-029 § Decision 1 the inode header reserves 704 bytes
+///      for `acl` (16 entries × 44 bytes packed). The bound is the
+///      inline-ACL slot count; multi-Principal workloads route
+///      through ADR-027 cluster delegation rather than wider inline
+///      ACL per ADR-029 § Decision 3. Same SCAFFOLDING shape as
+///      MAX_OBJECT_CAPS = 8 in docs/ASSUMPTIONS.md (peer on-disk
+///      ACL slot count for CambiObjects).
+/// Replace when: growing this requires a new inode-format version
+///      bump (the on-disk layout reserves exactly 16 slots). Trigger:
+///      a workload appears where cluster delegation is structurally
+///      wrong for the access pattern per ADR-029 § Open Questions
+///      ("ACL extension blocks").
+pub const MAX_INODE_ACL_ENTRIES: usize = 16;
+
+/// POSIX inode kind per ADR-029 § Decision 1. Regular file, directory,
+/// or symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InodeKind {
+    Regular = 0,
+    Directory = 1,
+    Symlink = 2,
+}
+
+/// One contiguous run of blocks on disk. ADR-029 § Decision 1 caps
+/// each inode at `MAX_EXTENTS_PER_INODE` of these.
+///
+/// On-disk layout is packed at 12 bytes; the Rust struct here is
+/// naturally aligned (16 bytes). The kernel uses explicit byte reads
+/// when serializing per ADR-029 § Architecture's "on-disk vs
+/// in-memory layout" note — `mem::transmute` is not safe across the
+/// alignment gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub start_lba: u64,
+    pub block_count: u32,
+}
+
+/// Rights bitfield on a POSIX inode ACL entry. Bit 0 = Read, bit 1 =
+/// Write, bit 2 = Execute, per ADR-029 § Decision 3.
+///
+/// Hand-rolled per the pattern set by `ObjectRights` and `FileRights`
+/// in commit 1. cambios-abi stays zero-dep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Rights(u8);
+
+impl Rights {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    pub const NONE: Self = Self(0);
+
+    pub const fn from_bits(bits: u8) -> Self { Self(bits) }
+    pub const fn bits(&self) -> u8 { self.0 }
+    pub const fn contains(&self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub const fn union(&self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+
+/// One row in a POSIX inode's inline ACL per ADR-029 § Decision 3.
+///
+/// The `principal` field is a 32-byte AID per the top-of-file note
+/// (Principal newtype promotion deferred). `expiry` is monotonic
+/// ticks; `None` means no expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AclEntry {
+    pub principal: [u8; 32],
+    pub rights: Rights,
+    pub expiry: Option<u64>,
+}
+
+/// POSIX inode (on-disk record) per ADR-029 § Decision 1.
+///
+/// Identity-keyed by `InodeId` in the kernel; this struct is the
+/// header-block contents (4 KiB on disk, header fields + extents +
+/// inline ACL). The reserved tail block (LBA `2 + 2*i + 1`) is
+/// zero-filled in v1 per ADR-029 § Decision 1.
+///
+/// `owner` is a 32-byte AID per the top-of-file note. `extents` and
+/// `acl` use `Option<T>` slots so empty positions are explicit; the
+/// active count is given by `extent_count` / `acl_count` (the kernel
+/// maintains the invariant that `Some(...)` entries are contiguous
+/// from index 0).
+#[derive(Debug, Clone, Copy)]
+pub struct PosixInode {
+    pub magic: [u8; 8],
+    pub kind: InodeKind,
+    pub size_bytes: u64,
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub owner: [u8; 32],
+    pub link_count: u32,
+    pub cow_refcount: u32,
+    pub extents: [Option<Extent>; MAX_EXTENTS_PER_INODE],
+    pub acl: [Option<AclEntry>; MAX_INODE_ACL_ENTRIES],
+}
+
+/// Kernel-issued inode identifier. Opaque newtype matching the
+/// `ChannelId` / `ClusterId` / `RegaloId` pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct InodeId(u64);
+
+impl InodeId {
+    pub const fn new(raw: u64) -> Self { Self(raw) }
+    pub const fn raw(&self) -> u64 { self.0 }
+}
+
+/// Frozen view of a POSIX inode's extent list. Per ADR-029 § Decision
+/// 2: held by CAMBIO syscall handlers and by `FileDescriptor`s opened
+/// with `O_CONSISTENT_SNAPSHOT`. Reading through the frozen extents
+/// gives snapshot-consistent bytes even while concurrent writers
+/// allocate new blocks via CoW.
+///
+/// `view_id` is unique within an inode's frozen-view set; the kernel
+/// maintains a per-inode `cow_refcount` (in `PosixInode`) tracking
+/// how many frozen views currently reference this inode.
+#[derive(Debug, Clone, Copy)]
+pub struct FrozenInodeView {
+    pub inode_id: InodeId,
+    pub frozen_extents: [Option<Extent>; MAX_EXTENTS_PER_INODE],
+    pub view_id: u32,
+    pub created_at: u64,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1093,6 +1388,17 @@ mod tests {
             SyscallNumber::Cambio,
             SyscallNumber::Regalo,
             SyscallNumber::Stream,
+            SyscallNumber::FileOpen, SyscallNumber::FileCreate,
+            SyscallNumber::FileClose, SyscallNumber::FileRead,
+            SyscallNumber::FileWrite, SyscallNumber::FileSeek,
+            SyscallNumber::FileTruncate, SyscallNumber::FileRename,
+            SyscallNumber::FileUnlink, SyscallNumber::FileLink,
+            SyscallNumber::FileSymlink,
+            SyscallNumber::Mkdir, SyscallNumber::Rmdir,
+            SyscallNumber::Opendir, SyscallNumber::Readdir,
+            SyscallNumber::Stat, SyscallNumber::Fsync,
+            SyscallNumber::AclGrant, SyscallNumber::AclRevoke,
+            SyscallNumber::AclList,
         ];
 
         for &num in &all {
@@ -1124,10 +1430,11 @@ mod tests {
         // pair (39/40) lands inside the contiguous 0..=52 sweep.
         // ADR-027 cluster-handle reservations (44..=47), the two-phase
         // channel-teardown pair (48 ChannelBeginTeardown, 49
-        // ChannelCompleteTeardown), and ADR-028 storage seam syscalls
-        // (50 Cambio, 51 Regalo, 52 Stream) round out the current
+        // ChannelCompleteTeardown), ADR-028 storage seam syscalls
+        // (50 Cambio, 51 Regalo, 52 Stream), and ADR-029 POSIX file
+        // syscalls (53..=72: FileOpen..AclList) round out the current
         // high-water mark.
-        for i in 0..=52u64 {
+        for i in 0..=72u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();

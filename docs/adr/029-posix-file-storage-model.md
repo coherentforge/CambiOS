@@ -128,32 +128,32 @@ No "group" concept and no "other" concept; the equivalents are downstream of thi
 
 ### 4. POSIX syscall surface + posix-fs-service gateway + lock-hierarchy placement
 
-Twenty new syscalls cover the POSIX-shaped surface. They fall into three groups: file and directory operations (51-65), metadata (66-67), and ACL (68-70).
+Twenty new syscalls cover the POSIX-shaped surface. They fall into three groups: file and directory operations (53-67), metadata (68-69), and ACL (70-72).
 
 | Number | Name | Identity-required | Notes |
 |---|---|---|---|
-| 51 | `SYS_FILE_OPEN` | yes | Returns `FileDescriptor`. Flags include `O_RDONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`, `O_CONSISTENT_SNAPSHOT` (opens a frozen view per Decision 2). |
-| 52 | `SYS_FILE_CREATE` | yes | Equivalent to `O_CREAT \| O_EXCL`. Returns `FileDescriptor`. |
-| 53 | `SYS_FILE_CLOSE` | yes | Drops the descriptor; if a frozen view, decrements cow_refcount. |
-| 54 | `SYS_FILE_READ` | yes | Bounded by `MAX_FILE_IO_BYTES_PER_CALL = 1 MiB` SCAFFOLDING. Subsequent calls iterate. |
-| 55 | `SYS_FILE_WRITE` | yes | Same bound. Triggers CoW per Decision 2 if the write modifies an existing block. |
-| 56 | `SYS_FILE_SEEK` | yes | Updates the descriptor's offset. |
-| 57 | `SYS_FILE_TRUNCATE` | yes | Updates `size_bytes`; frees extents beyond the new size (refcount-checked). |
-| 58 | `SYS_FILE_RENAME` | yes | Atomic per Decision 5 (single journal entry). Source and destination must be in the same backend (no cross-backend rename); cross-backend returns `EXDEV`. |
-| 59 | `SYS_FILE_UNLINK` | yes | Decrements link_count; if zero and no open descriptors, frees the inode. |
-| 60 | `SYS_FILE_LINK` | yes | Creates a new directory entry pointing at an existing inode; increments link_count. |
-| 61 | `SYS_FILE_SYMLINK` | yes | Creates a Symlink inode whose first extent holds the target string. |
-| 62 | `SYS_MKDIR` | yes | Allocates a Directory inode; initializes empty directory contents. |
-| 63 | `SYS_RMDIR` | yes | Frees a Directory inode iff it has no entries. |
-| 64 | `SYS_OPENDIR` | yes | Returns a directory descriptor (a `FileDescriptor` flavor with `backing = Directory`). |
-| 65 | `SYS_READDIR` | yes | Iterates entries in a directory descriptor. |
-| 66 | `SYS_STAT` | yes | Returns a `FileMetadata` struct (kind, size, owner, mtime, ctime, link_count). |
-| 67 | `SYS_FSYNC` | yes | Forces journal flush and data CoW commits to durable storage. |
-| 68 | `SYS_ACL_GRANT` | yes | Adds a `(Principal, Rights, expiry)` row to an inode's ACL; owner-only. Returns `ENOSPC` if the inline ACL is full (multi-Principal workloads should route through ADR-027 cluster delegation per Decision 3). |
-| 69 | `SYS_ACL_REVOKE` | yes | Removes a row by Principal; owner-only. |
-| 70 | `SYS_ACL_LIST` | yes | Returns the ACL contents for inspection. |
+| 53 | `SYS_FILE_OPEN` | yes | Returns `FileDescriptor`. Flags include `O_RDONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`, `O_CONSISTENT_SNAPSHOT` (opens a frozen view per Decision 2). |
+| 54 | `SYS_FILE_CREATE` | yes | Equivalent to `O_CREAT \| O_EXCL`. Returns `FileDescriptor`. |
+| 55 | `SYS_FILE_CLOSE` | yes | Drops the descriptor; if a frozen view, decrements cow_refcount. |
+| 56 | `SYS_FILE_READ` | yes | Bounded by `MAX_FILE_IO_BYTES_PER_CALL = 1 MiB` SCAFFOLDING. Subsequent calls iterate. |
+| 57 | `SYS_FILE_WRITE` | yes | Same bound. Triggers CoW per Decision 2 if the write modifies an existing block. |
+| 58 | `SYS_FILE_SEEK` | yes | Updates the descriptor's offset. |
+| 59 | `SYS_FILE_TRUNCATE` | yes | Updates `size_bytes`; frees extents beyond the new size (refcount-checked). |
+| 60 | `SYS_FILE_RENAME` | yes | Atomic per Decision 5 (single journal entry). Source and destination must be in the same backend (no cross-backend rename); cross-backend returns `EXDEV`. |
+| 61 | `SYS_FILE_UNLINK` | yes | Decrements link_count; if zero and no open descriptors, frees the inode. |
+| 62 | `SYS_FILE_LINK` | yes | Creates a new directory entry pointing at an existing inode; increments link_count. |
+| 63 | `SYS_FILE_SYMLINK` | yes | Creates a Symlink inode whose first extent holds the target string. |
+| 64 | `SYS_MKDIR` | yes | Allocates a Directory inode; initializes empty directory contents. |
+| 65 | `SYS_RMDIR` | yes | Frees a Directory inode iff it has no entries. |
+| 66 | `SYS_OPENDIR` | yes | Returns a directory descriptor (a `FileDescriptor` flavor with `backing = Directory`). |
+| 67 | `SYS_READDIR` | yes | Iterates entries in a directory descriptor. |
+| 68 | `SYS_STAT` | yes | Returns a `FileMetadata` struct (kind, size, owner, mtime, ctime, link_count). |
+| 69 | `SYS_FSYNC` | yes | Forces journal flush and data CoW commits to durable storage. |
+| 70 | `SYS_ACL_GRANT` | yes | Adds a `(Principal, Rights, expiry)` row to an inode's ACL; owner-only. Returns `ENOSPC` if the inline ACL is full (multi-Principal workloads should route through ADR-027 cluster delegation per Decision 3). |
+| 71 | `SYS_ACL_REVOKE` | yes | Removes a row by Principal; owner-only. |
+| 72 | `SYS_ACL_LIST` | yes | Returns the ACL contents for inspection. |
 
-Numbers 51-70 reserved (ADR-022's wallclock and ADR-027's cluster syscalls already occupied 41-47; ADR-028 reserves 50-52 — renumbered from the original 48-50 draft per ADR-028 § Decision 3 because slots 48/49 shipped as the two-phase channel teardown pair).
+Numbers 53-72 reserved. The original ADR draft placed POSIX at 51-70 because ADR-022's wallclock and ADR-027's cluster syscalls occupied 41-47 and ADR-028's seam syscalls were planned at 48-50. Between drafting and ratification the two-phase channel teardown pair (`SYS_CHANNEL_BEGIN_TEARDOWN = 48` / `SYS_CHANNEL_COMPLETE_TEARDOWN = 49`, commit `f21d667`) consumed slots 48/49, ADR-028 renumbered to 50-52, and the POSIX range shifted +2 to 53-72.
 
 **`posix-fs-service`** is a new boot module at endpoint 18 (the next free endpoint after the existing services). Same pattern as fs-service: kernel exposes the syscalls; posix-fs-service runs the policy layer for sandboxed callers (win-compat sandboxes, audit, future userland services that want path-shape access without direct kernel calls). Per-sandbox path-namespace mappings (`C:\` → `/var/win-compat/<sandbox>/c-drive/`) live in the shim, not in the kernel.
 
@@ -435,7 +435,7 @@ ADR-029a covers format, CoW, recovery. ADR-029b covers syscalls, path resolver, 
 Documentation + reservation first, implementation in dependency order. This ADR's implementation chain is the longest of the storage stack.
 
 1. **Land this ADR as `Proposed`.** No code touched. The format, CoW model, ACL semantics, syscall surface, lock placement, and path resolver shape are now citeable.
-2. **`cambios-abi` syscall reservations.** Reserve numbers 51-70 for the POSIX syscall family. Reservation only; no handlers - same posture as ADR-022 / ADR-028.
+2. **`cambios-abi` syscall reservations.** Reserve numbers 53-72 for the POSIX syscall family (renumbered from the original 51-70 draft per the note at § Decision 4 — slots 48/49 went to ADR-027's two-phase teardown, and ADR-028's seam syscalls renumbered to 50-52). Reservation only; no handlers - same posture as ADR-022 / ADR-028.
 3. **`PosixInode`, `Extent`, `AclEntry`, `FrozenInodeView` types added to `cambios-abi`.** Opaque newtypes around kernel-issued IDs (e.g., `InodeId`); no public field access. No behavior change.
 4. **PosixFsBackend skeleton + on-disk format reader.** Implements Mount (superblock parse, inode scan, journal replay) but no write path. Tests for the format on a synthetic disk image.
 5. **Block-bitmap allocator + journal record format + `BLOCK_BITMAP_LOCK` introduction + ADR-010 Divergence appendix.** Both backends adopt the shared journal record format simultaneously; sub-lock established at hierarchy position 12. The ADR-010 Divergence lands here (not later) because the journal-owned-bitmap invariant requires the CambiObject backend's allocation path to route through the shared journal from the moment the shared bitmap exists; deferring the Divergence would create a window where the invariant is partially broken.
@@ -470,7 +470,7 @@ When this ADR's implementation lands, the following CLAUDE.md sections must be u
 
 - **§ "Lock Ordering"** - insert `POSIX_STORE(11)` and `BLOCK_BITMAP_LOCK(12)` below `OBJECT_STORE(10)`. Update the `IrqSpinlock` annotations and the comment in `src/lib.rs`. Document the acquisition pattern: CAMBIO does `OBJECT_STORE → POSIX_STORE → BLOCK_BITMAP_LOCK`; POSIX-only ops do `POSIX_STORE → BLOCK_BITMAP_LOCK`; CambiObject-only ops (after the ADR-010 Divergence) do `OBJECT_STORE → BLOCK_BITMAP_LOCK`.
 - **§ "Required Reading by Subsystem"** - add a row for "POSIX file storage / mutable backend / atomic rename" pointing at this ADR, storage-planning.md, ADR-028.
-- **§ "Syscall Numbers"** - add `SYS_FILE_OPEN` through `SYS_ACL_LIST` (51-70) when handlers land.
+- **§ "Syscall Numbers"** - add `SYS_FILE_OPEN` through `SYS_ACL_LIST` (53-72) when handlers land.
 - **§ "Design Documents"** - already updated when ADR-028 landed; no additional entries needed.
 
 ## Open Questions / Deferred

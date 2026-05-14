@@ -291,6 +291,24 @@ impl SyscallDispatcher {
             SyscallNumber::Cambio => Self::handle_cambio(args, &ctx),
             SyscallNumber::Regalo => Self::handle_regalo(args, &ctx),
             SyscallNumber::Stream => Self::handle_stream(args, &ctx),
+
+            // ADR-029 POSIX file storage syscalls — slots 53-72 reserved.
+            // All 20 route through a single Enosys stub until the POSIX
+            // backend lands (ADR-029 § Migration Path steps 4-9). Per-
+            // syscall behavior is specified in ADR-029 § Decision 4's
+            // table; one stub here avoids 20 lines of boilerplate while
+            // the backend isn't written.
+            SyscallNumber::FileOpen | SyscallNumber::FileCreate
+            | SyscallNumber::FileClose | SyscallNumber::FileRead
+            | SyscallNumber::FileWrite | SyscallNumber::FileSeek
+            | SyscallNumber::FileTruncate | SyscallNumber::FileRename
+            | SyscallNumber::FileUnlink | SyscallNumber::FileLink
+            | SyscallNumber::FileSymlink
+            | SyscallNumber::Mkdir | SyscallNumber::Rmdir
+            | SyscallNumber::Opendir | SyscallNumber::Readdir
+            | SyscallNumber::Stat | SyscallNumber::Fsync
+            | SyscallNumber::AclGrant | SyscallNumber::AclRevoke
+            | SyscallNumber::AclList => Self::handle_posix_stub(args, &ctx),
         }
     }
 
@@ -3709,6 +3727,14 @@ impl SyscallDispatcher {
     /// Stub for SYS_STREAM. Returns `Enosys` until ADR-028 § Migration
     /// Path step 8 lands the cap-shape attach + channel-record extension.
     fn handle_stream(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
+        Err(SyscallError::Enosys)
+    }
+
+    /// Stub for ADR-029 POSIX file syscalls (slots 53-72). Returns
+    /// `Enosys` until the POSIX backend lands per ADR-029 § Migration
+    /// Path steps 4-9. Per-syscall semantics are in ADR-029 § Decision
+    /// 4's table.
+    fn handle_posix_stub(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
         Err(SyscallError::Enosys)
     }
 
