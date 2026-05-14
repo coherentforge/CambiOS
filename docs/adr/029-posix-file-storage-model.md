@@ -451,6 +451,37 @@ Documentation + reservation first, implementation in dependency order. This ADR'
 
 Each step independently bisectable. Steps 1-3 are pre-implementation; steps 4-14 chain through actual code.
 
+## Divergence
+
+### 1. Strict canonical-form on encode AND decode
+
+- **Date:** 2026-05-14
+- **Trigger:** ADR-029 step 4B implementation surfaced the design question "may the decoder silently accept bytes that the encoder would not have produced?" The implementation enforces "no." This appendix records the stance so future maintainers do not relax it without an explicit format-version bump.
+
+#### What changes
+
+Decision 1 declared reserved-region bytes as "zero-filled." This Divergence makes that declaration bidirectional and load-bearing:
+
+- **Encode side.** `encode_inode_header` produces canonical bytes — extents region past `extent_count` is zero, ACL region past `acl_count` is zero, the post-ACL reserved tail (bytes 976..4088) is zero. The encoder refuses (`InodeError::NonContiguousExtents`) to serialize any `PosixInode` whose `Some(...)` entries are not packed contiguously from index 0.
+- **Decode side.** `decode_inode_header` rejects any header whose padding bytes are non-zero, with `InodeError::NonZeroPadding`. The decoder also rejects `extent_count > MAX_EXTENTS_PER_INODE`, `acl_count > MAX_INODE_ACL_ENTRIES`, unknown `kind` discriminants, unknown rights bits (anything outside `Read | Write | Execute`), unknown `version` values, and checksum mismatches — each with its own typed `InodeError` variant. No silent clamping; no tolerance for "almost canonical" bytes.
+
+The superblock decoder enforces the same stance for its reserved region (`SB_LAST_FIELD_END..SB_OFF_CHECKSUM`).
+
+#### Why
+
+1. **Future-extension safety.** Reserved bytes are reserved *for the next format version*, not "ignore these for now." A v1 reader that silently tolerates non-zero reserved bytes would happily accept a malformed v2 record whose checksum was hand-crafted to match — masking what should be a loud format-mismatch. Strict decode makes the version-bump boundary the only path to repurposing those bytes.
+2. **Canonical-form for hash-keyed properties.** CambiOS uses Blake3 throughout. Same logical inode → same bytes → same `header_checksum` is a property a future feature (inode-tree hashing, audit-trail inode logging, hash-keyed dedup) can rely on, only if the format is canonical on both sides.
+3. **Two-fields-disagree class of bug.** ADR-029 § Decision 1's on-disk `extent_count: u8` field and the in-memory `extents: [Option<Extent>; MAX_EXTENTS_PER_INODE]` array carry the same information. The contiguous-Some invariant means the in-memory form unambiguously implies the count; the encoder computes `extent_count` from the array via `take_while`. There is no "two fields can disagree" failure mode.
+
+#### What does not change
+
+- The on-disk format itself (offsets, sizes, field semantics) is unchanged from Decision 1.
+- The CambiObject backend's posture (`crate::fs::disk`) is not retrofitted — its canonical-form story is separately specified by ADR-010 and is not in this ADR's scope. If a future maintainer decides ADR-010 should adopt the same stance, that lands as an ADR-010 Divergence appendix, not this one.
+
+#### Sequencing
+
+Landed alongside the inode encode/decode implementation in commit 4B (the strict-decode logic is the implementation; this appendix records the intent). No further format work is gated on this Divergence; subsequent steps (block-allocation bitmap, journal record format, write path, CoW) inherit the same canonical-form discipline by following the encode-strict / decode-strict pattern established here.
+
 ## Cross-References
 
 - **[ADR-028](028-three-storage-models.md)** - The kernel-API discipline this ADR provides the POSIX backend for.

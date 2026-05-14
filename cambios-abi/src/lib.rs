@@ -1274,7 +1274,11 @@ pub struct AclEntry {
 /// active count is given by `extent_count` / `acl_count` (the kernel
 /// maintains the invariant that `Some(...)` entries are contiguous
 /// from index 0).
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` / `Eq` are derived to support test equality and the
+/// canonical-form claim "same logical inode → same bytes → same
+/// hash" (see ADR-029 § Divergence 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PosixInode {
     pub magic: [u8; 8],
     pub kind: InodeKind,

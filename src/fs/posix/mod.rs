@@ -34,6 +34,13 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
+
+use cambios_abi::{
+    AclEntry, Extent, InodeId, InodeKind, PosixInode, Rights,
+    MAX_EXTENTS_PER_INODE, MAX_INODE_ACL_ENTRIES,
+};
+
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
 
 // ============================================================================
@@ -296,16 +303,63 @@ pub fn classify_superblock(buf: &Block) -> SuperblockState {
 }
 
 // ============================================================================
+// Inode header layout (4096 bytes per header block)
+// ============================================================================
+//
+// On-disk offsets per ADR-029 § Decision 1. The reserved tail block
+// (LBA `2 + 2*i + 1`) is always all-zero in v1; this commit's
+// encoder writes it that way and the inode-region scan does not
+// inspect it.
+
+const INODE_OFF_MAGIC: usize = 0;
+const INODE_OFF_VERSION: usize = 8;
+const INODE_OFF_KIND: usize = 12;
+const INODE_OFF_EXTENT_COUNT: usize = 13;
+const INODE_OFF_ACL_COUNT: usize = 14;
+const INODE_OFF_SIZE_BYTES: usize = 16;
+const INODE_OFF_CREATED_AT: usize = 24;
+const INODE_OFF_MODIFIED_AT: usize = 32;
+const INODE_OFF_OWNER: usize = 40;
+const INODE_OFF_LINK_COUNT: usize = 72;
+const INODE_OFF_COW_REFCOUNT: usize = 76;
+const INODE_OFF_EXTENTS: usize = 80;
+const INODE_OFF_ACL: usize = 272;
+const INODE_OFF_RESERVED: usize = 976;
+const INODE_OFF_CHECKSUM: usize = BLOCK_SIZE - 8;
+const INODE_CHECKSUM_COVER_END: usize = INODE_OFF_CHECKSUM;
+
+// Packed on-disk record sizes (different from the natural Rust
+// alignment per ADR-029 § Architecture).
+const EXTENT_PACKED_SIZE: usize = 12;
+const ACL_ENTRY_PACKED_SIZE: usize = 44;
+
+// Per-entry offsets within a packed Extent record.
+const EXTENT_OFF_START_LBA: usize = 0;
+const EXTENT_OFF_BLOCK_COUNT: usize = 8;
+
+// Per-entry offsets within a packed AclEntry record.
+const ACL_OFF_PRINCIPAL: usize = 0;
+const ACL_OFF_RIGHTS: usize = 32;
+const ACL_OFF_EXPIRY: usize = 33;
+
+// Rights bit positions (mirroring cambios_abi::Rights).
+const RIGHTS_READ_BIT: u8 = 1 << 0;
+const RIGHTS_WRITE_BIT: u8 = 1 << 1;
+const RIGHTS_EXECUTE_BIT: u8 = 1 << 2;
+const RIGHTS_VALID_MASK: u8 = RIGHTS_READ_BIT | RIGHTS_WRITE_BIT | RIGHTS_EXECUTE_BIT;
+
+// InodeKind discriminants on disk.
+const INODE_KIND_REGULAR: u8 = 0;
+const INODE_KIND_DIRECTORY: u8 = 1;
+const INODE_KIND_SYMLINK: u8 = 2;
+
+// ============================================================================
 // Errors
 // ============================================================================
 
 /// POSIX backend error type. Returned by `PosixFsBackend` methods.
 /// Wraps `BlockError` for transport-layer failures; carries typed
 /// variants for format-level invariants per ADR-029.
-///
-/// Inode-format errors (the typed variants enumerated in commit 4B)
-/// surface as `FsError::InodeFormat`. Step 4 only exposes the
-/// non-inode variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
     /// Underlying block device reported an error.
@@ -319,12 +373,293 @@ pub enum FsError {
     DeviceTooSmall,
     /// `format()` called with `desired_capacity_inodes == 0`.
     InvalidCapacity,
+    /// An inode header on disk (or a `PosixInode` value passed to
+    /// `encode_inode_header`) failed validation. Carries the typed
+    /// reason; see [`InodeError`].
+    InodeFormat(InodeError),
 }
 
 impl From<BlockError> for FsError {
     fn from(e: BlockError) -> Self {
         FsError::BlockError(e)
     }
+}
+
+impl From<InodeError> for FsError {
+    fn from(e: InodeError) -> Self {
+        FsError::InodeFormat(e)
+    }
+}
+
+/// Typed inode-format invariant violations. Surfaced when:
+/// (a) the encoder is handed a `PosixInode` that violates the
+///     contiguous-Some invariant on `extents` / `acl`;
+/// (b) the decoder reads an on-disk header whose `extent_count` /
+///     `acl_count` exceeds the inline cap, whose padding is non-zero,
+///     whose version is unknown, or whose checksum fails.
+///
+/// All variants are typed errors per CLAUDE.md's "no panics in
+/// non-test kernel code" rule. The encoder will never silently
+/// canonicalize a malformed inode; the decoder will never silently
+/// accept a non-canonical record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InodeError {
+    /// In-memory `extents` or `acl` array has `Some(...)` entries
+    /// that are not packed contiguously from index 0.
+    NonContiguousExtents,
+    /// On-disk `extent_count` exceeds `MAX_EXTENTS_PER_INODE`.
+    ExtentCountOutOfRange,
+    /// On-disk `acl_count` exceeds `MAX_INODE_ACL_ENTRIES`.
+    AclCountOutOfRange,
+    /// On-disk header has non-zero bytes in a region that the
+    /// canonical-form invariant requires to be zero: trailing
+    /// extents region past `extent_count`, trailing acl region
+    /// past `acl_count`, or the reserved region.
+    NonZeroPadding,
+    /// On-disk header has an unknown `version` field. v1 readers
+    /// refuse to interpret v2+ records rather than guessing.
+    UnknownVersion,
+    /// On-disk header `header_checksum` does not match
+    /// `Blake3(bytes[0..4088])[..8]`.
+    HeaderChecksumMismatch,
+    /// On-disk `kind` is not one of `Regular` / `Directory` /
+    /// `Symlink`.
+    UnknownKind,
+    /// On-disk ACL entry has bits set beyond `Read | Write | Execute`.
+    /// Future rights extensions are format-version bumps.
+    UnknownRightsBits,
+}
+
+/// Validate that a `PosixInode`'s `extents` and `acl` arrays satisfy
+/// the contiguous-Some invariant: `Some(...)` entries pack from index
+/// 0, `None` slots only appear after the last `Some(...)`. The encoder
+/// calls this before serializing; mutators (write-path code in a later
+/// commit) call it after every mutation.
+pub fn validate_inode(inode: &PosixInode) -> Result<(), InodeError> {
+    let mut saw_none = false;
+    for slot in inode.extents.iter() {
+        if slot.is_none() {
+            saw_none = true;
+        } else if saw_none {
+            return Err(InodeError::NonContiguousExtents);
+        }
+    }
+    let mut saw_none = false;
+    for slot in inode.acl.iter() {
+        if slot.is_none() {
+            saw_none = true;
+        } else if saw_none {
+            return Err(InodeError::NonContiguousExtents);
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Inode header encode / decode
+// ============================================================================
+
+/// Encode a `PosixInode` into a 4 KiB header block. Returns
+/// `InodeError::NonContiguousExtents` if the input violates the
+/// contiguous-Some invariant; otherwise produces a canonical-form
+/// header (extents-region padding zero past `extent_count`, acl-region
+/// padding zero past `acl_count`, reserved region all-zero, checksum
+/// computed last).
+///
+/// Per ADR-029 § Divergence 1 the encoder is the canonical-form
+/// producer. Same logical inode → same on-disk bytes → same
+/// `header_checksum`.
+pub fn encode_inode_header(buf: &mut Block, inode: &PosixInode) -> Result<(), InodeError> {
+    validate_inode(inode)?;
+
+    buf.fill(0);
+    buf[INODE_OFF_MAGIC..INODE_OFF_MAGIC + 8].copy_from_slice(&ARCINOD_MAGIC_OCCUPIED);
+    buf[INODE_OFF_VERSION..INODE_OFF_VERSION + 4]
+        .copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    buf[INODE_OFF_KIND] = match inode.kind {
+        InodeKind::Regular => INODE_KIND_REGULAR,
+        InodeKind::Directory => INODE_KIND_DIRECTORY,
+        InodeKind::Symlink => INODE_KIND_SYMLINK,
+    };
+
+    // Count Some(...) entries; the contiguous invariant guarantees
+    // `take_while` reaches them all without missing any.
+    let extent_count = inode.extents.iter().take_while(|e| e.is_some()).count();
+    let acl_count = inode.acl.iter().take_while(|e| e.is_some()).count();
+    debug_assert!(extent_count <= MAX_EXTENTS_PER_INODE);
+    debug_assert!(acl_count <= MAX_INODE_ACL_ENTRIES);
+    buf[INODE_OFF_EXTENT_COUNT] = extent_count as u8;
+    buf[INODE_OFF_ACL_COUNT..INODE_OFF_ACL_COUNT + 2]
+        .copy_from_slice(&(acl_count as u16).to_le_bytes());
+
+    buf[INODE_OFF_SIZE_BYTES..INODE_OFF_SIZE_BYTES + 8]
+        .copy_from_slice(&inode.size_bytes.to_le_bytes());
+    buf[INODE_OFF_CREATED_AT..INODE_OFF_CREATED_AT + 8]
+        .copy_from_slice(&inode.created_at.to_le_bytes());
+    buf[INODE_OFF_MODIFIED_AT..INODE_OFF_MODIFIED_AT + 8]
+        .copy_from_slice(&inode.modified_at.to_le_bytes());
+    buf[INODE_OFF_OWNER..INODE_OFF_OWNER + 32].copy_from_slice(&inode.owner);
+    buf[INODE_OFF_LINK_COUNT..INODE_OFF_LINK_COUNT + 4]
+        .copy_from_slice(&inode.link_count.to_le_bytes());
+    buf[INODE_OFF_COW_REFCOUNT..INODE_OFF_COW_REFCOUNT + 4]
+        .copy_from_slice(&inode.cow_refcount.to_le_bytes());
+
+    // Pack extents densely starting at offset 80. Trailing extent
+    // bytes stay zero (canonical form).
+    for (i, slot) in inode.extents.iter().enumerate().take(extent_count) {
+        let entry = slot.expect("contiguous invariant: take(extent_count) covers Some(...)");
+        let base = INODE_OFF_EXTENTS + i * EXTENT_PACKED_SIZE;
+        buf[base + EXTENT_OFF_START_LBA..base + EXTENT_OFF_START_LBA + 8]
+            .copy_from_slice(&entry.start_lba.to_le_bytes());
+        buf[base + EXTENT_OFF_BLOCK_COUNT..base + EXTENT_OFF_BLOCK_COUNT + 4]
+            .copy_from_slice(&entry.block_count.to_le_bytes());
+    }
+
+    // Pack ACL entries densely starting at offset 272. Same trailing-
+    // zero discipline.
+    for (i, slot) in inode.acl.iter().enumerate().take(acl_count) {
+        let entry = slot.expect("contiguous invariant: take(acl_count) covers Some(...)");
+        let base = INODE_OFF_ACL + i * ACL_ENTRY_PACKED_SIZE;
+        buf[base + ACL_OFF_PRINCIPAL..base + ACL_OFF_PRINCIPAL + 32]
+            .copy_from_slice(&entry.principal);
+        buf[base + ACL_OFF_RIGHTS] = entry.rights.bits();
+        let expiry = entry.expiry.unwrap_or(0);
+        buf[base + ACL_OFF_EXPIRY..base + ACL_OFF_EXPIRY + 8]
+            .copy_from_slice(&expiry.to_le_bytes());
+        // Trailing 3 reserved bytes per packed entry stay zero from
+        // the earlier buf.fill(0).
+    }
+
+    // INODE_OFF_RESERVED..INODE_OFF_CHECKSUM stays zero (canonical-
+    // form padding for the post-PQ-tail region).
+
+    let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+    buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+    Ok(())
+}
+
+/// Outcome of inspecting an inode header block. `Free` means the
+/// magic byte sequence does not match `ARCINOD_MAGIC_OCCUPIED` —
+/// per ADR-029 § Decision 1 absence of the occupied magic IS the
+/// "slot is free" signal. `Occupied(...)` carries the fully-validated
+/// inode contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InodeHeaderState {
+    Free,
+    Occupied(PosixInode),
+}
+
+/// Decode an on-disk inode header block. Returns `Free` on magic
+/// mismatch (the slot-occupancy signal); returns
+/// `Err(InodeError::...)` on any canonical-form violation (out-of-
+/// range counts, non-zero padding, unknown version, checksum failure,
+/// unknown kind / rights bits).
+///
+/// The decoder is the canonical-form acceptor: it refuses any record
+/// whose bytes cannot have been produced by `encode_inode_header`
+/// from a valid `PosixInode`. See ADR-029 § Divergence 1.
+pub fn decode_inode_header(buf: &Block) -> Result<InodeHeaderState, InodeError> {
+    let magic = &buf[INODE_OFF_MAGIC..INODE_OFF_MAGIC + 8];
+    if magic != ARCINOD_MAGIC_OCCUPIED {
+        return Ok(InodeHeaderState::Free);
+    }
+
+    // Header-checksum first — corrupted bytes anywhere else surface
+    // here, including any tampering with the padding regions checked
+    // below.
+    let expected_cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+    let on_disk_cs = &buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8];
+    if on_disk_cs != expected_cs {
+        return Err(InodeError::HeaderChecksumMismatch);
+    }
+
+    let version = read_u32_le(buf, INODE_OFF_VERSION);
+    if version != FORMAT_VERSION {
+        return Err(InodeError::UnknownVersion);
+    }
+
+    let kind = match buf[INODE_OFF_KIND] {
+        INODE_KIND_REGULAR => InodeKind::Regular,
+        INODE_KIND_DIRECTORY => InodeKind::Directory,
+        INODE_KIND_SYMLINK => InodeKind::Symlink,
+        _ => return Err(InodeError::UnknownKind),
+    };
+    let extent_count = buf[INODE_OFF_EXTENT_COUNT] as usize;
+    if extent_count > MAX_EXTENTS_PER_INODE {
+        return Err(InodeError::ExtentCountOutOfRange);
+    }
+    let acl_count = read_u16_le_inode(buf, INODE_OFF_ACL_COUNT) as usize;
+    if acl_count > MAX_INODE_ACL_ENTRIES {
+        return Err(InodeError::AclCountOutOfRange);
+    }
+
+    // Canonical-form: extents region past extent_count must be zero.
+    let extents_filled_end = INODE_OFF_EXTENTS + extent_count * EXTENT_PACKED_SIZE;
+    let extents_region_end = INODE_OFF_EXTENTS + MAX_EXTENTS_PER_INODE * EXTENT_PACKED_SIZE;
+    if buf[extents_filled_end..extents_region_end].iter().any(|&b| b != 0) {
+        return Err(InodeError::NonZeroPadding);
+    }
+    // Canonical-form: acl region past acl_count must be zero.
+    let acl_filled_end = INODE_OFF_ACL + acl_count * ACL_ENTRY_PACKED_SIZE;
+    let acl_region_end = INODE_OFF_ACL + MAX_INODE_ACL_ENTRIES * ACL_ENTRY_PACKED_SIZE;
+    if buf[acl_filled_end..acl_region_end].iter().any(|&b| b != 0) {
+        return Err(InodeError::NonZeroPadding);
+    }
+    // Canonical-form: reserved tail must be zero.
+    if buf[INODE_OFF_RESERVED..INODE_OFF_CHECKSUM].iter().any(|&b| b != 0) {
+        return Err(InodeError::NonZeroPadding);
+    }
+
+    let size_bytes = read_u64_le(buf, INODE_OFF_SIZE_BYTES);
+    let created_at = read_u64_le(buf, INODE_OFF_CREATED_AT);
+    let modified_at = read_u64_le(buf, INODE_OFF_MODIFIED_AT);
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(&buf[INODE_OFF_OWNER..INODE_OFF_OWNER + 32]);
+    let link_count = read_u32_le(buf, INODE_OFF_LINK_COUNT);
+    let cow_refcount = read_u32_le(buf, INODE_OFF_COW_REFCOUNT);
+
+    let mut extents = [None; MAX_EXTENTS_PER_INODE];
+    for i in 0..extent_count {
+        let base = INODE_OFF_EXTENTS + i * EXTENT_PACKED_SIZE;
+        let start_lba = read_u64_le(buf, base + EXTENT_OFF_START_LBA);
+        let block_count = read_u32_le(buf, base + EXTENT_OFF_BLOCK_COUNT);
+        extents[i] = Some(Extent { start_lba, block_count });
+    }
+
+    let mut acl = [None; MAX_INODE_ACL_ENTRIES];
+    for i in 0..acl_count {
+        let base = INODE_OFF_ACL + i * ACL_ENTRY_PACKED_SIZE;
+        let mut principal = [0u8; 32];
+        principal.copy_from_slice(&buf[base + ACL_OFF_PRINCIPAL..base + ACL_OFF_PRINCIPAL + 32]);
+        let rights_byte = buf[base + ACL_OFF_RIGHTS];
+        if rights_byte & !RIGHTS_VALID_MASK != 0 {
+            return Err(InodeError::UnknownRightsBits);
+        }
+        let rights = Rights::from_bits(rights_byte);
+        let expiry_raw = read_u64_le(buf, base + ACL_OFF_EXPIRY);
+        let expiry = if expiry_raw == 0 { None } else { Some(expiry_raw) };
+        acl[i] = Some(AclEntry { principal, rights, expiry });
+    }
+
+    let mut magic_buf = [0u8; 8];
+    magic_buf.copy_from_slice(magic);
+    Ok(InodeHeaderState::Occupied(PosixInode {
+        magic: magic_buf,
+        kind,
+        size_bytes,
+        created_at,
+        modified_at,
+        owner,
+        link_count,
+        cow_refcount,
+        extents,
+        acl,
+    }))
+}
+
+#[inline]
+const fn read_u16_le_inode(buf: &Block, offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
 
 // ============================================================================
@@ -335,11 +670,19 @@ impl From<BlockError> for FsError {
 /// format is exercisable against `MemBlockDevice` in tests and against
 /// `VirtioBlkDevice` at runtime.
 ///
-/// Commit 4A holds only the superblock; the inode index lands in
-/// commit 4B and the block-allocation bitmap in ADR-029 step 5.
+/// Commit 4B adds the inode-region scan to `mount()`; the resulting
+/// in-memory `inodes` set records which slot indices were occupied
+/// at mount time. The read path (`get_inode`) and the survives-reboot
+/// tests land in commit 4C. Block-allocation bitmap, journal, and
+/// write path are ADR-029 step 5+.
 pub struct PosixFsBackend<B: BlockDevice> {
     device: B,
     superblock: Superblock,
+    /// In-memory set of occupied inode slots, populated at mount time
+    /// by scanning every inode header in `[INODE_REGION_LBA, ...]`
+    /// per ADR-029's bounded-iteration claim. Lookup is O(log n);
+    /// scan-time iteration is `for i in 0..capacity_inodes`.
+    inodes: BTreeSet<InodeId>,
 }
 
 impl<B: BlockDevice> PosixFsBackend<B> {
@@ -437,13 +780,19 @@ impl<B: BlockDevice> PosixFsBackend<B> {
 
         device.flush()?;
 
-        Ok(Self { device, superblock: sb })
+        // Fresh format: no occupied inodes yet.
+        Ok(Self { device, superblock: sb, inodes: BTreeSet::new() })
     }
 
-    /// Mount an existing backend. Validates the declared geometry
-    /// against the device's actual size and bumps the superblock
-    /// generation counter (the same anti-stale-snapshot convention
-    /// used by the CambiObject backend per ADR-010).
+    /// Mount an existing backend. Validates the declared geometry,
+    /// scans the inode region for occupied slots (per ADR-029's
+    /// bounded-iteration claim — `for i in 0..capacity_inodes`), and
+    /// bumps the superblock generation counter (the same anti-stale-
+    /// snapshot convention used by the CambiObject backend per ADR-010).
+    ///
+    /// Journal replay sits between the geometry validation and the
+    /// inode scan in step 5+; commit 4B mounts without journal
+    /// (no records exist yet because the write path is not in tree).
     fn mount(mut device: B, sb: Superblock) -> Result<Self, FsError> {
         if sb.capacity_inodes == 0
             || sb.capacity_inodes > MAX_INODES_ON_DISK
@@ -467,9 +816,22 @@ impl<B: BlockDevice> PosixFsBackend<B> {
             return Err(FsError::InvalidSuperblock);
         }
 
-        // Bump generation so stale media swaps are detectable. The
-        // step-5 journal-replay path will sit between this generation
-        // bump and the inode-region scan (commit 4B).
+        // Inode-region scan. Bounded by `sb.capacity_inodes`, which
+        // is itself bounded above by `MAX_INODES_ON_DISK` (verifier-
+        // friendly per ADR-029 § Verification Stance).
+        let mut inodes = BTreeSet::new();
+        let mut header_buf = [0u8; BLOCK_SIZE];
+        for slot in 0..sb.capacity_inodes {
+            device.read_block(inode_header_lba(slot), &mut header_buf)?;
+            match decode_inode_header(&header_buf)? {
+                InodeHeaderState::Free => {}
+                InodeHeaderState::Occupied(_inode) => {
+                    inodes.insert(InodeId::new(slot));
+                }
+            }
+        }
+
+        // Bump generation so stale media swaps are detectable.
         let next_sb = Superblock {
             generation: sb.generation.wrapping_add(1),
             ..sb
@@ -479,7 +841,20 @@ impl<B: BlockDevice> PosixFsBackend<B> {
         device.write_block(SUPERBLOCK_HEADER_LBA, &sb_buf)?;
         device.flush()?;
 
-        Ok(Self { device, superblock: next_sb })
+        Ok(Self { device, superblock: next_sb, inodes })
+    }
+
+    /// Return `true` if `id` was observed as occupied during the most
+    /// recent mount/format. Lookups touch the in-memory set only; no
+    /// device I/O.
+    pub fn is_inode_occupied(&self, id: InodeId) -> bool {
+        self.inodes.contains(&id)
+    }
+
+    /// Iterate occupied inode IDs in sorted order. Test-oriented; the
+    /// step-5+ write path will replace this with a richer API.
+    pub fn occupied_inodes(&self) -> impl Iterator<Item = InodeId> + '_ {
+        self.inodes.iter().copied()
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -672,5 +1047,307 @@ mod tests {
         assert_eq!(inode_header_lba(1), 4);
         assert_eq!(inode_header_lba(2), 6);
         assert_eq!(inode_header_lba(1000), 2 + 2 * 1000);
+    }
+
+    // ========================================================================
+    // Inode header encode/decode (commit 4B)
+    // ========================================================================
+
+    fn make_inode(extent_count: usize, acl_count: usize) -> PosixInode {
+        let mut extents = [None; MAX_EXTENTS_PER_INODE];
+        for i in 0..extent_count {
+            extents[i] = Some(Extent {
+                start_lba: 1000 + i as u64,
+                block_count: 4 + i as u32,
+            });
+        }
+        let mut acl = [None; MAX_INODE_ACL_ENTRIES];
+        for i in 0..acl_count {
+            let mut principal = [0u8; 32];
+            principal[0] = i as u8 + 1;
+            acl[i] = Some(AclEntry {
+                principal,
+                rights: Rights::READ.union(Rights::WRITE),
+                expiry: if i == 0 { None } else { Some(9000 + i as u64) },
+            });
+        }
+        PosixInode {
+            magic: ARCINOD_MAGIC_OCCUPIED,
+            kind: InodeKind::Regular,
+            size_bytes: 4096,
+            created_at: 100,
+            modified_at: 200,
+            owner: [0xAA; 32],
+            link_count: 1,
+            cow_refcount: 0,
+            extents,
+            acl,
+        }
+    }
+
+    #[test]
+    fn inode_header_roundtrip_empty() {
+        let inode = make_inode(0, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        match decode_inode_header(&buf).unwrap() {
+            InodeHeaderState::Occupied(decoded) => {
+                assert_eq!(decoded.size_bytes, inode.size_bytes);
+                assert_eq!(decoded.kind as u8, inode.kind as u8);
+                assert!(decoded.extents.iter().all(|e| e.is_none()));
+                assert!(decoded.acl.iter().all(|e| e.is_none()));
+            }
+            other => panic!("expected Occupied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inode_header_roundtrip_populated() {
+        let inode = make_inode(3, 2);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        match decode_inode_header(&buf).unwrap() {
+            InodeHeaderState::Occupied(decoded) => {
+                for i in 0..3 {
+                    assert_eq!(decoded.extents[i], inode.extents[i]);
+                }
+                for i in 3..MAX_EXTENTS_PER_INODE {
+                    assert!(decoded.extents[i].is_none());
+                }
+                for i in 0..2 {
+                    let a = decoded.acl[i].unwrap();
+                    let b = inode.acl[i].unwrap();
+                    assert_eq!(a.principal, b.principal);
+                    assert_eq!(a.rights.bits(), b.rights.bits());
+                    assert_eq!(a.expiry, b.expiry);
+                }
+            }
+            other => panic!("expected Occupied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inode_header_full_capacity_roundtrip() {
+        // Exercise both arrays at MAX. Smoke-test that the canonical-
+        // form padding logic does not miscount when there's no padding
+        // to write.
+        let inode = make_inode(MAX_EXTENTS_PER_INODE, MAX_INODE_ACL_ENTRIES);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        match decode_inode_header(&buf).unwrap() {
+            InodeHeaderState::Occupied(decoded) => {
+                assert!(decoded.extents.iter().all(|e| e.is_some()));
+                assert!(decoded.acl.iter().all(|e| e.is_some()));
+            }
+            other => panic!("expected Occupied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inode_header_free_slot_detection() {
+        // All-zero buffer reads as Free (magic mismatch).
+        let buf = [0u8; BLOCK_SIZE];
+        assert_eq!(decode_inode_header(&buf), Ok(InodeHeaderState::Free));
+    }
+
+    #[test]
+    fn inode_header_bad_magic_reads_as_free() {
+        let mut buf = [0u8; BLOCK_SIZE];
+        buf[..8].copy_from_slice(b"WRONGMAG");
+        assert_eq!(decode_inode_header(&buf), Ok(InodeHeaderState::Free));
+    }
+
+    #[test]
+    fn inode_header_bad_checksum_is_error() {
+        let inode = make_inode(2, 1);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        buf[INODE_OFF_CHECKSUM] ^= 0xFF;
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::HeaderChecksumMismatch));
+    }
+
+    #[test]
+    fn inode_header_extent_count_out_of_range() {
+        let inode = make_inode(2, 1);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        // Set extent_count to MAX+1 and recompute checksum so the only
+        // violated invariant is the bounds check.
+        buf[INODE_OFF_EXTENT_COUNT] = (MAX_EXTENTS_PER_INODE + 1) as u8;
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::ExtentCountOutOfRange));
+    }
+
+    #[test]
+    fn inode_header_acl_count_out_of_range() {
+        let inode = make_inode(0, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        let bad = (MAX_INODE_ACL_ENTRIES as u16 + 1).to_le_bytes();
+        buf[INODE_OFF_ACL_COUNT..INODE_OFF_ACL_COUNT + 2].copy_from_slice(&bad);
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::AclCountOutOfRange));
+    }
+
+    #[test]
+    fn inode_header_unknown_version_is_error() {
+        let inode = make_inode(0, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        buf[INODE_OFF_VERSION..INODE_OFF_VERSION + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::UnknownVersion));
+    }
+
+    #[test]
+    fn inode_header_unknown_kind_is_error() {
+        let inode = make_inode(0, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        buf[INODE_OFF_KIND] = 99;
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::UnknownKind));
+    }
+
+    #[test]
+    fn inode_header_unknown_rights_bits_are_error() {
+        let inode = make_inode(0, 1);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        // Set a bit beyond Read|Write|Execute on the first ACL entry.
+        let base = INODE_OFF_ACL + ACL_OFF_RIGHTS;
+        buf[base] |= 1 << 7;
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::UnknownRightsBits));
+    }
+
+    #[test]
+    fn inode_header_nonzero_extents_padding_rejected() {
+        let inode = make_inode(2, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        // Trailing extent slot 2's first byte non-zero, while
+        // extent_count = 2 declares slots [0,2) are meaningful.
+        let trailing_slot_base = INODE_OFF_EXTENTS + 2 * EXTENT_PACKED_SIZE;
+        buf[trailing_slot_base] = 0xAB;
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::NonZeroPadding));
+    }
+
+    #[test]
+    fn inode_header_nonzero_acl_padding_rejected() {
+        let inode = make_inode(0, 1);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        let trailing_slot_base = INODE_OFF_ACL + ACL_ENTRY_PACKED_SIZE;
+        buf[trailing_slot_base + 10] = 0xCD;
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::NonZeroPadding));
+    }
+
+    #[test]
+    fn inode_header_nonzero_reserved_tail_rejected() {
+        let inode = make_inode(0, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        buf[INODE_OFF_RESERVED + 200] = 0xEF;
+        let cs = checksum8(&buf[..INODE_CHECKSUM_COVER_END]);
+        buf[INODE_OFF_CHECKSUM..INODE_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        assert_eq!(decode_inode_header(&buf), Err(InodeError::NonZeroPadding));
+    }
+
+    #[test]
+    fn validate_rejects_noncontiguous_extents() {
+        let mut inode = make_inode(0, 0);
+        // Skip slot 0, place an extent at slot 1 — violates the invariant.
+        inode.extents[1] = Some(Extent { start_lba: 100, block_count: 1 });
+        assert_eq!(
+            validate_inode(&inode),
+            Err(InodeError::NonContiguousExtents),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_noncontiguous_acl() {
+        let mut inode = make_inode(0, 0);
+        inode.acl[2] = Some(AclEntry {
+            principal: [1u8; 32],
+            rights: Rights::READ,
+            expiry: None,
+        });
+        assert_eq!(
+            validate_inode(&inode),
+            Err(InodeError::NonContiguousExtents),
+        );
+    }
+
+    #[test]
+    fn encode_refuses_invalid_inode() {
+        let mut inode = make_inode(0, 0);
+        inode.extents[5] = Some(Extent { start_lba: 1, block_count: 1 });
+        let mut buf = [0u8; BLOCK_SIZE];
+        assert_eq!(
+            encode_inode_header(&mut buf, &inode),
+            Err(InodeError::NonContiguousExtents),
+        );
+    }
+
+    // ========================================================================
+    // Mount-time inode-region scan (commit 4B)
+    // ========================================================================
+
+    /// Place an encoded inode header at `slot` on `dev`.
+    fn write_inode(dev: &mut MemBlockDevice, slot: u64, inode: &PosixInode) {
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, inode).unwrap();
+        dev.write_block(inode_header_lba(slot), &buf).unwrap();
+    }
+
+    #[test]
+    fn mount_with_empty_inode_region() {
+        let backend = fresh_backend();
+        assert_eq!(backend.occupied_inodes().count(), 0);
+    }
+
+    #[test]
+    fn mount_discovers_populated_inodes() {
+        // Format, drop, hand-populate two inode slots, then mount and
+        // confirm both are discovered.
+        let mut dev = fresh_backend().into_device();
+        let inode = make_inode(1, 0);
+        write_inode(&mut dev, 0, &inode);
+        write_inode(&mut dev, 2, &inode);
+        let backend2 = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
+        let ids: alloc::vec::Vec<InodeId> = backend2.occupied_inodes().collect();
+        assert_eq!(ids, &[InodeId::new(0), InodeId::new(2)]);
+        assert!(backend2.is_inode_occupied(InodeId::new(0)));
+        assert!(!backend2.is_inode_occupied(InodeId::new(1)));
+        assert!(backend2.is_inode_occupied(InodeId::new(2)));
+        assert!(!backend2.is_inode_occupied(InodeId::new(3)));
+    }
+
+    #[test]
+    fn mount_surfaces_corrupt_inode_as_fserror() {
+        let backend = fresh_backend();
+        let mut dev = backend.into_device();
+        // Write a header with valid magic but bad checksum.
+        let inode = make_inode(0, 0);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        buf[INODE_OFF_CHECKSUM] ^= 0xFF;
+        dev.write_block(inode_header_lba(1), &buf).unwrap();
+        let result = PosixFsBackend::open_or_format(dev, 4, 32, 0);
+        assert!(matches!(
+            result,
+            Err(FsError::InodeFormat(InodeError::HeaderChecksumMismatch)),
+        ));
     }
 }
