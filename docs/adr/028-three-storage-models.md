@@ -1,6 +1,6 @@
 # ADR-028: Three Storage Models: Kernel-API Type Discipline and Seam Syscalls
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-11
 - **Depends on:** [ADR-003](003-content-addressed-storage-and-identity.md) (CambiObject + ObjectStore - the native storage model this ADR adds two co-equal models alongside), [storage-planning.md](../storage-planning.md) (the synthesis this ADR ratifies)
 - **Related:** [ADR-005](005-ipc-primitives-control-and-bulk.md) (channel substrate the Stream model rides on), [ADR-010](010-persistent-object-store-on-disk-format.md) (CambiObject on-disk format; the POSIX backend's follow-on takes the same shape under ADR-029), [ADR-016](016-win-compat-api-ai-boundary.md) (primary downstream consumer of the POSIX model), [ADR-026](026-identity-transcription-at-the-kernel-ring.md) (the cap-shape duality this ADR generalizes from caps to storage), [ADR-027](027-service-clusters.md) (clusters can scope POSIX-file namespaces and Stream caps just as they scope CambiObjects; cluster-scoped sandboxing is the deployment-level companion to Stream's cap-level containment)

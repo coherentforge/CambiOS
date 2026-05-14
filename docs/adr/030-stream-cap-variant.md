@@ -1,6 +1,6 @@
 # ADR-030: Stream as Cap Variant on Channels
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-12
 - **Depends on:** [ADR-028](028-three-storage-models.md) (Three Storage Models - the kernel-API discipline this ADR provides the Stream cap shape for), [ADR-005](005-ipc-primitives-control-and-bulk.md) (channel substrate Stream rides on as a cap variant), [storage-planning.md](../storage-planning.md) (the synthesis that named Stream as the third storage model)
 - **Related:** [ADR-026](026-identity-transcription-at-the-kernel-ring.md) (sender_principal stamping carries unchanged into Stream traffic), [ADR-027](027-service-clusters.md) (cluster cap inventories scope Stream caps; cluster revoke composes with Stream's force-close), [ADR-007](007-capability-revocation-and-telemetry.md) (audit ring carries the Stream lifecycle events; tombstone-on-revoke pattern composes with Stream force-close), [ADR-024](024-syscall-abi-crate.md) (`StreamCapShape` lives in `cambios-abi`), [ADR-014](014-compositor-scanout-driver-protocol.md) (rendering pipeline is the v1 Stream consumer; § Divergence 2026-04-20's double-copy pixel path is structurally a Stream)

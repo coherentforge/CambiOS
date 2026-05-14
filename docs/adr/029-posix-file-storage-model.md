@@ -1,6 +1,6 @@
 # ADR-029: POSIX File Storage Model
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-12
 - **Depends on:** [ADR-028](028-three-storage-models.md) (Three Storage Models - the kernel-API discipline this ADR provides the POSIX backend for), [ADR-010](010-persistent-object-store-on-disk-format.md) (CambiObject on-disk format - the template this ADR's format mirrors, and which adopts the shared extent allocator via a Divergence appendix), [storage-planning.md](../storage-planning.md) (the synthesis)
 - **Related:** [ADR-003](003-content-addressed-storage-and-identity.md) (CambiObject + ObjectStore - the peer backend), [ADR-005](005-ipc-primitives-control-and-bulk.md) (channels - posix-fs-service uses control IPC like fs-service), [ADR-016](016-win-compat-api-ai-boundary.md) (Win32 layer - primary downstream consumer), [ADR-018](018-init-process-and-boot-manifest.md) (boot manifest - system-global REGALO aliases land here), [ADR-027](027-service-clusters.md) (clusters scope POSIX-file namespaces alongside CambiObjects; multi-Principal access routes through cluster delegation rather than wide inline ACL)
