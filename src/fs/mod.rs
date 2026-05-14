@@ -16,6 +16,7 @@ pub mod block;
 pub mod disk;
 #[cfg(not(test))]
 pub mod lazy_disk;
+pub mod posix;
 pub mod ram;
 #[cfg(not(test))]
 pub mod virtio_blk_device;
