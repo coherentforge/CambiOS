@@ -313,11 +313,22 @@ Lock ordering MUST be followed to prevent deadlock.
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
 CLUSTER_MANAGER(5) → CHANNEL_MANAGER(6) → PROCESS_TABLE(7) →
-FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) → OBJECT_STORE(10)
+FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) → OBJECT_STORE(10) →
+POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)
 ```
-`*` = IrqSpinlock (saves/disables interrupts before acquiring, prevents same-CPU deadlock when timer ISR fires while lock is held). Others use plain Spinlock — including `CLUSTER_MANAGER`, which never runs in ISR context (cluster ops are syscall-driven).
+`*` = IrqSpinlock (saves/disables interrupts before acquiring, prevents same-CPU deadlock when timer ISR fires while lock is held). Others use plain Spinlock — including `CLUSTER_MANAGER`, `POSIX_STORE`, `BLOCK_BITMAP_LOCK`, and `JOURNAL_LOCK`, which never run in ISR context (all four are syscall-driven).
 
 `CLUSTER_MANAGER(5)` inserted per [ADR-027 § Architecture](docs/adr/027-service-clusters.md). Cluster operations acquire `CLUSTER_MANAGER` → (`CAPABILITY_MANAGER` for cap promotion / revoke) → `CHANNEL_MANAGER` (per-channel teardown during cluster revoke) → `PROCESS_TABLE` (member-PID lookup) → `FRAME_ALLOCATOR` (unmap-driven frame frees). Strictly downward — no inversion.
+
+`POSIX_STORE(11)`, `BLOCK_BITMAP_LOCK(12)`, and `JOURNAL_LOCK(13)` inserted per [ADR-029 § Decision 4](docs/adr/029-posix-file-storage-model.md) (POSIX_STORE + BLOCK_BITMAP_LOCK) and [ADR-029 § Divergence 2](docs/adr/029-posix-file-storage-model.md) (JOURNAL_LOCK promotion from POSIX-internal sub-lock to top-level position 13, to support cross-backend use forecast by [ADR-010 § Divergence 3](docs/adr/010-persistent-object-store-on-disk-format.md)). Acquisition patterns are strictly downward — no inversion:
+
+- **POSIX-only write path** (e.g., `SYS_FILE_WRITE`): `POSIX_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK`. Skips `OBJECT_STORE` (no CambiObject touched).
+- **CambiObject-only write path** (post-[ADR-010 § Divergence 3](docs/adr/010-persistent-object-store-on-disk-format.md) landing in step 5D): `OBJECT_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK`. Skips `POSIX_STORE` (no POSIX inode touched).
+- **CAMBIO cross-backend transaction**: `OBJECT_STORE → POSIX_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK`. Full chain.
+
+`POSIX_STORE(11)`'s concrete `Spinlock<Option<PosixFsBackend<...>>>` is reserved in the hierarchy doc but its declaration is deferred to ADR-029 migration step 6+, when the kernel singleton wire-up picks a concrete `BlockDevice`. The slot is referenced in the hierarchy now so the invariant lands with the data structures rather than as a retrofit. Unit tests use the `PosixFsBackend` instance's struct fields directly without touching the global slot.
+
+`BLOCK_BITMAP_LOCK` and `JOURNAL_LOCK` are held only briefly — lock, mutate, journal-append, unlock. No device I/O while held; the byte writes happen with locks released, then a final commit step under-lock applies the in-memory bitmap mark (per [ADR-029 § Decision 2 step 4](docs/adr/029-posix-file-storage-model.md): journal record durable before in-memory bitmap commits).
 
 Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.rs` comment.
 

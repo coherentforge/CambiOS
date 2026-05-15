@@ -482,6 +482,52 @@ The superblock decoder enforces the same stance for its reserved region (`SB_LAS
 
 Landed alongside the inode encode/decode implementation in commit 4B (the strict-decode logic is the implementation; this appendix records the intent). No further format work is gated on this Divergence; subsequent steps (block-allocation bitmap, journal record format, write path, CoW) inherit the same canonical-form discipline by following the encode-strict / decode-strict pattern established here.
 
+### 2. JOURNAL_LOCK promoted to top-level position 13
+
+- **Date:** 2026-05-15
+- **Trigger:** ADR-029 step 5C-ii implementation surfaced an inconsistency between § Decision 4's "POSIX-internal sub-locks ... never promoted to the top-level hierarchy" wording and the cross-backend usage that [ADR-010 § Divergence 3](010-persistent-object-store-on-disk-format.md) (step 5D) commits to. The CambiObject backend, when it adopts the shared journal record format, must acquire `JOURNAL_LOCK` from code paths that are not under `POSIX_STORE`. A "POSIX-internal" lock acquired from OBJECT_STORE-side code is a cross-domain reference the hierarchy cannot express; the lock has to be top-level for the canonical downward order to hold.
+
+#### What changes
+
+`JOURNAL_LOCK` enters the top-level lock hierarchy at position 13, below `BLOCK_BITMAP_LOCK(12)`. Both backends acquire it via the canonical strictly-downward chain:
+
+```
+SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
+CLUSTER_MANAGER(5) → CHANNEL_MANAGER(6) → PROCESS_TABLE(7) →
+FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) → OBJECT_STORE(10) →
+POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)
+```
+
+Backend acquisition patterns under the new hierarchy:
+
+- **POSIX-only operation** (e.g., `SYS_FILE_WRITE`): `POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)`. Skips `OBJECT_STORE(10)` because no CambiObject is touched.
+- **CambiObject-only operation** (e.g., `SYS_OBJ_PUT` after ADR-010 § Divergence 3 lands in step 5D): `OBJECT_STORE(10) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)`. Skips `POSIX_STORE(11)` because no POSIX inode is touched.
+- **CAMBIO cross-backend transaction**: `OBJECT_STORE(10) → POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)`. Full chain.
+
+Both locks (`BLOCK_BITMAP_LOCK` and `JOURNAL_LOCK`) are plain `Spinlock` — neither runs in ISR context (all bitmap and journal mutations are syscall-driven). Held only briefly per the § Decision 4 sub-lock posture: lock, mutate, journal-append, unlock. No I/O is performed while either lock is held; the device writes happen with the locks released, then a final commit step under-lock applies the bitmap mark (per ADR-029 § Decision 2 step 4: journal record durable before in-memory bitmap commits).
+
+`POSIX_STORE(11)` is reserved in the hierarchy but its concrete `Spinlock<Option<PosixFsBackend<...>>>` is deferred to ADR-029 migration step 6+, when the kernel singleton wire-up picks a concrete `BlockDevice`. Unit tests use the `PosixFsBackend` instance's struct fields directly without touching the global slots.
+
+#### Why
+
+Two reasons, both load-bearing:
+
+1. **Avoid versioning the hierarchy twice.** Promoting `JOURNAL_LOCK` from sub-lock to top-level in 5D (when CambiObject's cross-backend usage actually lights up) would mean the hierarchy as documented in code and CLAUDE.md is wrong from step 5C until step 5D lands. That's a window in which a maintainer reading the lock-order diagram would see "JOURNAL_LOCK is POSIX-internal" while the actual `Spinlock` declaration sits at top level. Landing the promotion in 5C closes that window from the moment the global lock instance exists.
+2. **The original wording implied a cross-domain cycle.** § Decision 4 said sub-locks "never promoted to the top-level hierarchy" — but if `JOURNAL_LOCK` stayed POSIX-internal, the CambiObject backend's allocation path would acquire it from outside the POSIX_STORE-rooted chain, which the strictly-downward rule cannot express. The cycle is "OBJECT_STORE-side code reaches into POSIX_STORE-internal state." Promoting `JOURNAL_LOCK` to top-level resolves the cycle without retrofitting the wording later.
+
+Both `INODE_LOCK[i]` and other POSIX-internal sub-locks from § Decision 4 remain genuinely POSIX-internal — they are touched only by code paths that have already acquired `POSIX_STORE`, so they do not cross the backend boundary. This Divergence promotes only `JOURNAL_LOCK`, not the other sub-locks.
+
+#### What does not change
+
+- The journal record format, the wrap-around behavior, the replay semantics, the journal-owned-bitmap invariant — all unchanged from § Decision 5.
+- The `BLOCK_BITMAP_LOCK(12)` position from § Decision 4 — unchanged.
+- The acquisition order for `INODE_LOCK[i]` and other POSIX-internal sub-locks — they remain below `POSIX_STORE(11)` in the POSIX-internal sub-hierarchy and outside the top-level chain.
+- The CambiObject backend's pre-5D state — until ADR-010 § Divergence 3 lands, the CambiObject backend does not acquire `JOURNAL_LOCK` at all. This Divergence forecasts the cross-backend usage; the cross-backend code is 5D's work.
+
+#### Sequencing
+
+Landed alongside the `BLOCK_BITMAP_LOCK` and `JOURNAL_LOCK` static declarations in commits 5C-ii (the lock instances) and 5C-iii (this appendix + CLAUDE.md § Lock Ordering update). The implementation precedes the appendix by one commit so the bitmap+journal integration is bisectable independently from the hierarchy-documentation update. No further work is gated on this Divergence; step 5D (CambiObject backend adopting the shared bitmap + journal) consumes the now-top-level `JOURNAL_LOCK` directly.
+
 ## Cross-References
 
 - **[ADR-028](028-three-storage-models.md)** - The kernel-API discipline this ADR provides the POSIX backend for.
