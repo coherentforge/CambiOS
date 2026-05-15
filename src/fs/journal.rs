@@ -246,6 +246,19 @@ pub enum JournalRecord {
     /// flushed to their respective on-disk regions; mount-time
     /// replay starts from the checkpoint and applies later records.
     Checkpoint { tick: u64 },
+    /// Wrap-around padding emitted by the circular-log writer when a
+    /// record would not fit before the journal-region end (per
+    /// ADR-029 § Decision 5 wrap semantics, implemented in step 5C).
+    /// `total_bytes` is the pad's complete on-disk byte length
+    /// (`RECORD_HEADER_BYTES + payload + RECORD_CHECKSUM_BYTES`) and
+    /// equals the byte distance from the pad's start offset to the
+    /// journal region end.
+    ///
+    /// Pads carry no semantic state; replay treats them as a
+    /// "wrap to offset 0" signal (see
+    /// [`Journal::replay_from_checkpoint`]). The payload bytes are
+    /// strict-canonical zero per ADR-029 § Divergence 1.
+    Pad { total_bytes: u32 },
 }
 
 // ============================================================================
@@ -822,6 +835,396 @@ mod tests {
         });
         assert_eq!(result, Err(JournalError::MalformedPayload));
     }
+
+    // ========================================================================
+    // KIND_PAD codec (commit 5C-i)
+    // ========================================================================
+
+    #[test]
+    fn roundtrip_pad_minimum_size() {
+        // Smallest possible pad: header + zero-byte payload + checksum.
+        let rec = JournalRecord::Pad {
+            total_bytes: (super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES) as u32,
+        };
+        let encoded = super::encode_record(&rec).unwrap();
+        assert_eq!(encoded.len(), super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES);
+        let (decoded, consumed) = super::decode_record(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn roundtrip_pad_typical_size() {
+        // ~500-byte pad — representative of the gap left when an
+        // ExtentUpdate-sized record won't fit before region end.
+        let rec = JournalRecord::Pad { total_bytes: 500 };
+        let encoded = super::encode_record(&rec).unwrap();
+        assert_eq!(encoded.len(), 500);
+        let (decoded, _) = super::decode_record(&encoded).unwrap();
+        assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn decode_pad_rejects_nonzero_payload() {
+        let rec = JournalRecord::Pad { total_bytes: 50 };
+        let mut encoded = super::encode_record(&rec).unwrap();
+        // Poke a non-zero byte into the payload (strict canonical
+        // form violation).
+        encoded[super::RECORD_HEADER_BYTES + 10] = 0x42;
+        let cs = super::checksum8(&encoded[..encoded.len() - 8]);
+        let end = encoded.len();
+        encoded[end - 8..].copy_from_slice(&cs);
+        let result = super::decode_record(&encoded);
+        assert_eq!(result, Err(JournalError::MalformedPayload));
+    }
+
+    #[test]
+    fn encode_pad_rejects_below_minimum() {
+        let rec = JournalRecord::Pad {
+            total_bytes: (super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES - 1) as u32,
+        };
+        let result = super::encode_record(&rec);
+        assert_eq!(result, Err(JournalError::MalformedPayload));
+    }
+
+    // ========================================================================
+    // Journal struct: append + wrap-around (commit 5C-i)
+    // ========================================================================
+
+    /// Journal region large enough for several typical-sized records.
+    const SMALL_REGION_BYTES: u64 = 256;
+
+    fn small_journal() -> super::Journal {
+        super::Journal::new(SMALL_REGION_BYTES).unwrap()
+    }
+
+    #[test]
+    fn journal_new_fresh_state() {
+        let j = small_journal();
+        assert_eq!(j.region_bytes(), SMALL_REGION_BYTES);
+        assert_eq!(j.head_offset(), 0);
+        assert_eq!(j.last_checkpoint_offset(), 0);
+    }
+
+    #[test]
+    fn journal_new_rejects_tiny_region() {
+        let result = super::Journal::new(1);
+        assert_eq!(result, Err(JournalError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn journal_append_no_wrap_advances_head() {
+        let mut j = small_journal();
+        let rec = JournalRecord::InodeAllocate { inode: InodeId::new(7) };
+        let encoded = super::encode_record(&rec).unwrap();
+        let len = encoded.len() as u64;
+
+        let result = j.append(&encoded).unwrap();
+        assert_eq!(result.pad_at, None);
+        assert_eq!(result.real_at, 0);
+        assert_eq!(j.head_offset(), len);
+
+        // Second append continues from head.
+        let result2 = j.append(&encoded).unwrap();
+        assert_eq!(result2.pad_at, None);
+        assert_eq!(result2.real_at, len);
+        assert_eq!(j.head_offset(), 2 * len);
+    }
+
+    #[test]
+    fn journal_append_rejects_oversized_record() {
+        let mut j = super::Journal::new(40).unwrap();
+        // A 100-byte fake "record" can't fit in a 40-byte region.
+        let fake = alloc::vec![0x01u8; 100]; // kind=0x01 (InodeAllocate)
+        let result = j.append(&fake);
+        assert_eq!(result, Err(JournalError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn journal_append_rejects_pad_input() {
+        let mut j = small_journal();
+        let pad_bytes = super::encode_record(&JournalRecord::Pad { total_bytes: 20 }).unwrap();
+        let result = j.append(&pad_bytes);
+        assert_eq!(result, Err(JournalError::MalformedPayload));
+    }
+
+    #[test]
+    fn journal_append_rejects_empty_record() {
+        let mut j = small_journal();
+        let result = j.append(&[]);
+        assert_eq!(result, Err(JournalError::MalformedPayload));
+    }
+
+    #[test]
+    fn journal_append_wraps_when_record_does_not_fit() {
+        // Construct a journal sized so the second InodeAllocate
+        // record would overflow if no wrap occurred.
+        let rec = JournalRecord::InodeAllocate { inode: InodeId::new(1) };
+        let encoded = super::encode_record(&rec).unwrap();
+        let len = encoded.len() as u64;
+        // Region holds exactly one record plus a sub-minimum gap,
+        // forcing the second append to wrap.
+        let region = len + (super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES) as u64;
+        let mut j = super::Journal::new(region).unwrap();
+
+        // First append: fits at offset 0.
+        let r1 = j.append(&encoded).unwrap();
+        assert_eq!(r1.pad_at, None);
+        assert_eq!(r1.real_at, 0);
+        let head_after_first = j.head_offset();
+        assert_eq!(head_after_first, len);
+
+        // Second append: wraps. Pad covers [head_after_first, region),
+        // real lands at offset 0.
+        let r2 = j.append(&encoded).unwrap();
+        let (pad_at, pad_bytes) = r2.pad_at.expect("expected wrap");
+        assert_eq!(pad_at, head_after_first);
+        assert_eq!(pad_bytes.len() as u64, region - head_after_first);
+        assert_eq!(r2.real_at, 0);
+        assert_eq!(j.head_offset(), len);
+
+        // Verify the emitted pad decodes as KIND_PAD with canonical form.
+        let (pad_rec, _) = super::decode_record(&pad_bytes).unwrap();
+        match pad_rec {
+            JournalRecord::Pad { total_bytes } => {
+                assert_eq!(total_bytes as u64, region - head_after_first);
+            }
+            _ => panic!("expected Pad, got {:?}", pad_rec),
+        }
+    }
+
+    #[test]
+    fn journal_append_wraps_when_remaining_below_min_pad() {
+        // After the first record, remaining = region - len. To force
+        // the second append to wrap via the "sub-pad gap" rule (not
+        // because the record overflows), arrange:
+        //   record_len <= remaining
+        //   remaining - record_len < min_pad
+        // i.e., remaining ∈ [record_len, record_len + min_pad).
+        let rec = JournalRecord::InodeAllocate { inode: InodeId::new(1) };
+        let encoded = super::encode_record(&rec).unwrap();
+        let len = encoded.len() as u64;
+        let min_pad = (super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES) as u64;
+        // After append 1, head = len. Pick region so remaining is in
+        // [len, len + min_pad): region - len = len + 5, i.e.
+        // region = 2*len + 5. Sub-pad gap = 5 < min_pad.
+        let region = 2 * len + 5;
+        let mut j = super::Journal::new(region).unwrap();
+
+        let r1 = j.append(&encoded).unwrap();
+        assert_eq!(r1.pad_at, None);
+        assert_eq!(j.head_offset(), len);
+
+        // Second append: would fit arithmetically (remaining = len + 5
+        // >= len = record_len) but leaves a sub-pad gap of 5 bytes, so
+        // the wrap rule fires.
+        let r2 = j.append(&encoded).unwrap();
+        assert!(r2.pad_at.is_some(), "expected sub-pad-gap wrap");
+        let (pad_at, pad_bytes) = r2.pad_at.as_ref().unwrap();
+        assert_eq!(*pad_at, len);
+        assert_eq!(pad_bytes.len() as u64, region - len);
+        assert_eq!(r2.real_at, 0);
+    }
+
+    // ========================================================================
+    // Journal::replay_from_checkpoint (commit 5C-i)
+    // ========================================================================
+
+    /// Simulate disk by tracking the bytes the caller would have
+    /// written. Returns a `Vec<u8>` of size `region_bytes` populated
+    /// from a sequence of records appended via `Journal::append`.
+    fn simulate_writes(j: &mut super::Journal, records: &[JournalRecord]) -> alloc::vec::Vec<u8> {
+        let mut disk = alloc::vec![0u8; j.region_bytes() as usize];
+        for r in records {
+            let encoded = super::encode_record(r).unwrap();
+            let app = j.append(&encoded).unwrap();
+            if let Some((pad_at, pad_bytes)) = app.pad_at {
+                let start = pad_at as usize;
+                disk[start..start + pad_bytes.len()].copy_from_slice(&pad_bytes);
+            }
+            let start = app.real_at as usize;
+            disk[start..start + encoded.len()].copy_from_slice(&encoded);
+        }
+        disk
+    }
+
+    #[test]
+    fn replay_from_checkpoint_no_wrap() {
+        let records = alloc::vec![
+            JournalRecord::InodeAllocate { inode: InodeId::new(1) },
+            JournalRecord::InodeAllocate { inode: InodeId::new(2) },
+            JournalRecord::Checkpoint { tick: 10 },
+            JournalRecord::InodeFree { inode: InodeId::new(1) },
+        ];
+        let mut writer = small_journal();
+        let disk = simulate_writes(&mut writer, &records);
+        let writer_head = writer.head_offset();
+
+        let mut replayer = small_journal();
+        let mut seen = alloc::vec::Vec::new();
+        replayer
+            .replay_from_checkpoint(&disk, |r| {
+                seen.push(r.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, records);
+        assert_eq!(replayer.head_offset(), writer_head);
+    }
+
+    #[test]
+    fn replay_from_checkpoint_starts_after_checkpoint() {
+        let pre_cp = alloc::vec![
+            JournalRecord::InodeAllocate { inode: InodeId::new(1) },
+            JournalRecord::InodeAllocate { inode: InodeId::new(2) },
+        ];
+        let post_cp = alloc::vec![
+            JournalRecord::InodeFree { inode: InodeId::new(1) },
+            JournalRecord::InodeAllocate { inode: InodeId::new(3) },
+        ];
+
+        // Build the journal: pre_cp records, then Checkpoint, then
+        // post_cp records. Note the checkpoint's byte offset.
+        let mut writer = small_journal();
+        let mut disk = alloc::vec![0u8; writer.region_bytes() as usize];
+        let mut write = |w: &mut super::Journal, d: &mut [u8], r: &JournalRecord| {
+            let encoded = super::encode_record(r).unwrap();
+            let app = w.append(&encoded).unwrap();
+            if let Some((pad_at, pad_bytes)) = app.pad_at {
+                d[pad_at as usize..pad_at as usize + pad_bytes.len()]
+                    .copy_from_slice(&pad_bytes);
+            }
+            d[app.real_at as usize..app.real_at as usize + encoded.len()]
+                .copy_from_slice(&encoded);
+        };
+        for r in &pre_cp {
+            write(&mut writer, &mut disk, r);
+        }
+        // Capture the checkpoint's byte position: it's the head right
+        // before we append the checkpoint record. Set the replayer's
+        // last_checkpoint_offset to the offset AFTER the checkpoint
+        // record, so post-checkpoint replay starts there.
+        write(&mut writer, &mut disk, &JournalRecord::Checkpoint { tick: 100 });
+        let cp_end = writer.head_offset();
+        for r in &post_cp {
+            write(&mut writer, &mut disk, r);
+        }
+
+        // Replay starting from cp_end: should see only post_cp records.
+        let mut replayer = super::Journal::from_disk_state(
+            SMALL_REGION_BYTES,
+            cp_end,
+            0, // head will be overwritten by replay
+        )
+        .unwrap();
+        let mut seen = alloc::vec::Vec::new();
+        replayer
+            .replay_from_checkpoint(&disk, |r| {
+                seen.push(r.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, post_cp);
+        assert_eq!(replayer.head_offset(), writer.head_offset());
+    }
+
+    #[test]
+    fn replay_from_checkpoint_handles_wrap() {
+        // Single-wrap scenario with checkpoint > 0 (the realistic
+        // case — bound by the ADR-029 § Decision 5 checkpoint
+        // cadence). Pre-wrap byte order on disk after the writes:
+        //   [post-cp records overwriting pre-cp][Cp][post-cp records][Pad]
+        //
+        // Replay from cp_end (offset after the Checkpoint record)
+        // walks pre-wrap [cp_end..end-of-region] → hits Pad → wraps
+        // to 0 → walks [0..cp_end] → wrap-stop at cp_end. Callback
+        // sees the post-cp records in byte order, plus the Cp marker
+        // (idempotent re-application per ADR-029 § Verification
+        // Stance row 3).
+        let inode = |id: u64| JournalRecord::InodeAllocate { inode: InodeId::new(id) };
+        let encoded_len = super::encode_record(&inode(1)).unwrap().len() as u64;
+        let min_pad = (super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES) as u64;
+        // Region sized so:
+        //   appends A(20), Cp(20), B(20) all fit cleanly (head=60).
+        //   append C(20) wraps because remaining=12 < record_len=20.
+        // The wrap thus occurs AFTER cp_end is captured (cp_end=40).
+        // region = 3*encoded_len + min_pad = 72.
+        let region = 3 * encoded_len + min_pad;
+
+        let mut writer = super::Journal::new(region).unwrap();
+        let mut disk = alloc::vec![0u8; region as usize];
+        let mut commit = |w: &mut super::Journal, d: &mut [u8], r: &JournalRecord| {
+            let encoded = super::encode_record(r).unwrap();
+            let app = w.append(&encoded).unwrap();
+            if let Some((pad_at, pad_bytes)) = app.pad_at {
+                d[pad_at as usize..pad_at as usize + pad_bytes.len()]
+                    .copy_from_slice(&pad_bytes);
+            }
+            d[app.real_at as usize..app.real_at as usize + encoded.len()]
+                .copy_from_slice(&encoded);
+        };
+
+        // Pre-checkpoint write: record A.
+        commit(&mut writer, &mut disk, &inode(1)); // A
+        commit(&mut writer, &mut disk, &JournalRecord::Checkpoint { tick: 100 });
+        let cp_end = writer.head_offset();
+        // Post-checkpoint writes: B fits, C wraps and overwrites A.
+        commit(&mut writer, &mut disk, &inode(2)); // B
+        commit(&mut writer, &mut disk, &inode(3)); // C (wraps)
+        // Wrap must have occurred for this test to exercise the wrap path.
+        assert!(writer.head_offset() < cp_end, "test setup must force a wrap");
+
+        let mut replayer = super::Journal::from_disk_state(region, cp_end, 0).unwrap();
+        let mut seen = alloc::vec::Vec::new();
+        replayer
+            .replay_from_checkpoint(&disk, |r| {
+                seen.push(r.clone());
+                Ok(())
+            })
+            .unwrap();
+        // Expected callback order:
+        //   pre-wrap [cp_end..end-of-region]: B
+        //   post-wrap [0..cp_end]: C (overwrote A at offset 0), Cp marker
+        let expected = alloc::vec![
+            inode(2), // B
+            inode(3), // C
+            JournalRecord::Checkpoint { tick: 100 }, // Cp re-applied (idempotent)
+        ];
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn replay_from_checkpoint_rejects_wrong_region_size() {
+        let mut j = small_journal();
+        let disk = alloc::vec![0u8; (SMALL_REGION_BYTES + 1) as usize];
+        let result = j.replay_from_checkpoint(&disk, |_| Ok(()));
+        assert_eq!(result, Err(JournalError::MalformedPayload));
+    }
+
+    #[test]
+    fn replay_from_checkpoint_propagates_callback_error() {
+        let mut writer = small_journal();
+        let disk = simulate_writes(
+            &mut writer,
+            &[JournalRecord::InodeAllocate { inode: InodeId::new(1) }],
+        );
+        let mut replayer = small_journal();
+        let result = replayer.replay_from_checkpoint(&disk, |_| {
+            Err(JournalError::MalformedPayload)
+        });
+        assert_eq!(result, Err(JournalError::MalformedPayload));
+    }
+
+    #[test]
+    fn note_checkpoint_advances_replay_origin() {
+        let mut j = small_journal();
+        let rec = JournalRecord::InodeAllocate { inode: InodeId::new(1) };
+        let encoded = super::encode_record(&rec).unwrap();
+        j.append(&encoded).unwrap();
+        let head = j.head_offset();
+        j.note_checkpoint();
+        assert_eq!(j.last_checkpoint_offset(), head);
+    }
 }
 
 // ============================================================================
@@ -1037,6 +1440,20 @@ fn encode_payload(rec: &JournalRecord, out: &mut Vec<u8>) -> Result<u8, JournalE
             out.extend_from_slice(&tick.to_le_bytes());
             Ok(KIND_CHECKPOINT)
         }
+        JournalRecord::Pad { total_bytes } => {
+            let total = *total_bytes as usize;
+            if total < RECORD_HEADER_BYTES + RECORD_CHECKSUM_BYTES {
+                return Err(JournalError::MalformedPayload);
+            }
+            let payload_size = total - RECORD_HEADER_BYTES - RECORD_CHECKSUM_BYTES;
+            if payload_size > u16::MAX as usize {
+                return Err(JournalError::PayloadTooLarge);
+            }
+            // Pad payload is `payload_size` zero bytes; strict-canonical
+            // form on decode requires this (ADR-029 § Divergence 1).
+            out.resize(out.len() + payload_size, 0);
+            Ok(KIND_PAD)
+        }
     }
 }
 
@@ -1122,6 +1539,17 @@ fn decode_payload(kind: u8, payload: &[u8]) -> Result<JournalRecord, JournalErro
             }
             let tick = u64::from_le_bytes(payload[0..8].try_into().unwrap());
             Ok(JournalRecord::Checkpoint { tick })
+        }
+        KIND_PAD => {
+            // Strict canonical form: pad payload must be all-zero
+            // (ADR-029 § Divergence 1). The total byte length of the
+            // pad on disk equals header + payload + checksum.
+            if payload.iter().any(|&b| b != 0) {
+                return Err(JournalError::MalformedPayload);
+            }
+            let total_bytes =
+                (RECORD_HEADER_BYTES + payload.len() + RECORD_CHECKSUM_BYTES) as u32;
+            Ok(JournalRecord::Pad { total_bytes })
         }
         _ => Err(JournalError::UnknownKind),
     }
@@ -1409,4 +1837,285 @@ where
         last_committed = cursor.offset();
     }
     Ok(last_committed)
+}
+
+// ============================================================================
+// Circular-log journal (step 5C)
+// ============================================================================
+//
+// The pure-function codec above describes a single record. The
+// `Journal` struct below is the circular-log writer: it owns the
+// region geometry (`region_bytes`, `head_offset`, `last_checkpoint_offset`)
+// and emits the byte-stream layout for the caller to write to disk.
+//
+// `Journal` does NOT perform device I/O. It returns an `Append`
+// describing what bytes to write where; the caller (e.g.,
+// `PosixFsBackend`) does the block-level writes and the
+// post-write flush. This keeps the journal layer host-testable
+// against an in-memory byte buffer and confines kernel-side I/O
+// to the backend wrapper (ADR-029 § Verification Stance).
+//
+// Wrap semantics per ADR-029 § Decision 5: when a record would not
+// fit before the journal-region end, `append` emits a `KIND_PAD`
+// record covering the tail and reports `real_at = 0` for the
+// caller to write the real record at the region start. The pad's
+// payload is strict-canonical zero per ADR-029 § Divergence 1.
+
+/// Locations the caller must write to commit an `append`. The
+/// caller writes `pad_at` first (if present), then `real_at`. The
+/// `Journal` struct has already advanced `head_offset` to the
+/// post-write position; the caller MUST perform both writes before
+/// the next `append` or `head_offset` will not match on-disk state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Append {
+    /// `Some((byte_offset, pad_bytes))` when the record would not
+    /// fit before the journal-region end. The pad is a full
+    /// `KIND_PAD` record covering `[byte_offset, region_bytes)`.
+    pub pad_at: Option<(u64, Vec<u8>)>,
+    /// Byte offset where the caller writes the real record. Equals
+    /// `0` after a wrap, otherwise the pre-call `head_offset`.
+    pub real_at: u64,
+}
+
+/// Circular-log journal writer. Owns the region geometry and head
+/// position; does not own disk I/O.
+///
+/// Constructed at mount time via [`Journal::new`] (fresh format)
+/// or [`Journal::from_disk_state`] (post-replay). The
+/// [`Journal::replay_from_checkpoint`] helper reconstructs the
+/// in-memory `head_offset` from on-disk records before the
+/// backend completes mount.
+///
+/// Owned by the kernel-instance behind `JOURNAL_LOCK` at lock-
+/// hierarchy position 13 (per ADR-029 § Divergence 2, landing in
+/// step 5C). This module exposes the unsynchronized struct; the
+/// lock wrapper is one level up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Journal {
+    /// Total bytes in the journal region. Constant after construction;
+    /// matches the superblock's `journal_capacity_bytes`.
+    region_bytes: u64,
+    /// Byte offset of the next-write position within the region.
+    /// `0 <= head_offset < region_bytes`. Maintained such that
+    /// `region_bytes - head_offset` is either 0 (head snapped to
+    /// region end, next append wraps) or `>= RECORD_HEADER_BYTES +
+    /// RECORD_CHECKSUM_BYTES` (room for at least a minimum pad).
+    head_offset: u64,
+    /// Byte offset of the most-recent committed checkpoint. Replay
+    /// starts here on mount. Equal to `0` for a freshly-formatted
+    /// journal.
+    last_checkpoint_offset: u64,
+}
+
+/// ARCHITECTURAL: minimum on-disk size of any journal record.
+/// Mechanically equals `RECORD_HEADER_BYTES + RECORD_CHECKSUM_BYTES`;
+/// derived from two ARCHITECTURAL constants and inherits their
+/// invariance. Centralizes the bound for the sub-pad-gap rule in
+/// `Journal::append` so every successful append leaves room for at
+/// least a minimum pad on the subsequent wrap.
+const MIN_RECORD_BYTES: u64 = (RECORD_HEADER_BYTES + RECORD_CHECKSUM_BYTES) as u64;
+
+impl Journal {
+    /// Construct a fresh journal for a region of `region_bytes`
+    /// bytes. Head and checkpoint both start at offset 0.
+    /// `region_bytes` must be at least `MIN_RECORD_BYTES`; smaller
+    /// regions cannot fit any record.
+    pub fn new(region_bytes: u64) -> Result<Self, JournalError> {
+        if region_bytes < MIN_RECORD_BYTES {
+            return Err(JournalError::PayloadTooLarge);
+        }
+        Ok(Self {
+            region_bytes,
+            head_offset: 0,
+            last_checkpoint_offset: 0,
+        })
+    }
+
+    /// Construct a journal from on-disk state. The superblock's
+    /// `last_checkpoint_offset` is the source of `cp_offset`;
+    /// `head_offset` is the position the replay loop stopped at
+    /// (returned by [`Journal::replay_from_checkpoint`]).
+    pub fn from_disk_state(
+        region_bytes: u64,
+        last_checkpoint_offset: u64,
+        head_offset: u64,
+    ) -> Result<Self, JournalError> {
+        if region_bytes < MIN_RECORD_BYTES {
+            return Err(JournalError::PayloadTooLarge);
+        }
+        if head_offset >= region_bytes || last_checkpoint_offset >= region_bytes {
+            return Err(JournalError::MalformedPayload);
+        }
+        Ok(Self {
+            region_bytes,
+            head_offset,
+            last_checkpoint_offset,
+        })
+    }
+
+    /// Total bytes in the journal region.
+    pub fn region_bytes(&self) -> u64 {
+        self.region_bytes
+    }
+
+    /// Current head byte offset (next-write position).
+    pub fn head_offset(&self) -> u64 {
+        self.head_offset
+    }
+
+    /// Most-recent committed checkpoint byte offset.
+    pub fn last_checkpoint_offset(&self) -> u64 {
+        self.last_checkpoint_offset
+    }
+
+    /// Append the pre-encoded `record_bytes` to the journal. Returns
+    /// an [`Append`] describing the byte locations the caller must
+    /// write. Updates `head_offset` to the post-write position; the
+    /// caller MUST perform the indicated writes before the next
+    /// `append` call.
+    ///
+    /// Wrap behavior: when the record would not fit before the
+    /// region end, a `KIND_PAD` record covering the entire tail is
+    /// emitted as `pad_at`, and `real_at` is `0`. The caller writes
+    /// the pad first, then the real record, then flushes.
+    ///
+    /// Errors:
+    /// - `MalformedPayload`: `record_bytes` is empty or is itself a
+    ///   `KIND_PAD` record (pads are emitted internally only).
+    /// - `PayloadTooLarge`: record exceeds the region size.
+    pub fn append(&mut self, record_bytes: &[u8]) -> Result<Append, JournalError> {
+        if record_bytes.is_empty() {
+            return Err(JournalError::MalformedPayload);
+        }
+        if record_bytes[0] == KIND_PAD {
+            return Err(JournalError::MalformedPayload);
+        }
+        let record_len = record_bytes.len() as u64;
+        if record_len > self.region_bytes {
+            return Err(JournalError::PayloadTooLarge);
+        }
+        let remaining = self.region_bytes - self.head_offset;
+        // Fit without wrap iff the record fits AND either exactly
+        // fills the remainder or leaves at least a minimum-pad-sized
+        // gap. The latter ensures the next wrap can emit a pad.
+        let fits_without_wrap = record_len <= remaining
+            && (record_len == remaining || remaining - record_len >= MIN_RECORD_BYTES);
+
+        if !fits_without_wrap {
+            // Wrap: emit pad covering [head, region_end), write real
+            // record at offset 0.
+            let pad_record = encode_record(&JournalRecord::Pad {
+                total_bytes: remaining
+                    .try_into()
+                    .map_err(|_| JournalError::PayloadTooLarge)?,
+            })?;
+            debug_assert_eq!(pad_record.len() as u64, remaining);
+            let pad_at = self.head_offset;
+            self.head_offset = record_len;
+            if self.head_offset == self.region_bytes {
+                self.head_offset = 0;
+            }
+            return Ok(Append {
+                pad_at: Some((pad_at, pad_record)),
+                real_at: 0,
+            });
+        }
+        let real_at = self.head_offset;
+        self.head_offset += record_len;
+        if self.head_offset == self.region_bytes {
+            self.head_offset = 0;
+        }
+        Ok(Append { pad_at: None, real_at })
+    }
+
+    /// Advance `last_checkpoint_offset` to the current head. The
+    /// caller is responsible for having durably written a
+    /// `Checkpoint` record at the old head before invoking this
+    /// (ADR-029 § Decision 5 ordering: append the checkpoint, then
+    /// update the superblock).
+    pub fn note_checkpoint(&mut self) {
+        self.last_checkpoint_offset = self.head_offset;
+    }
+
+    /// Replay the journal records starting from
+    /// `last_checkpoint_offset`, calling `callback` for each
+    /// non-pad record. Handles a single wrap-around: when a
+    /// `JournalRecord::Pad` is encountered, replay re-cursors from
+    /// offset 0 and continues. After the second cursor stops
+    /// (blank region or torn write), `head_offset` is set to that
+    /// position.
+    ///
+    /// Per the ADR-029 § Verification Stance row 4 ("bitmap state
+    /// is the projection of committed journal records"), this is
+    /// the source of truth for reconstructing post-checkpoint
+    /// in-memory state at mount.
+    ///
+    /// Errors propagate from the callback or from the cursor's
+    /// decode path. A `ChecksumMismatch` or `BufferTooShort` from
+    /// the cursor is surfaced as `Err`; callers that want to treat
+    /// torn writes as "stop here, no error" should match on the
+    /// returned error.
+    ///
+    /// Multi-wrap recovery (two pads in a single replay) is not
+    /// supported in v1 — replay stops at the second pad.
+    /// Revisit when: a production workload's metadata-churn rate
+    /// approaches the journal-wrap cadence between mounts.
+    ///
+    /// Wrap-stop semantics: when the post-wrap cursor reaches
+    /// `last_checkpoint_offset`, replay stops. This prevents
+    /// re-applying pre-checkpoint stale records that the post-wrap
+    /// writes did not fully overwrite (the bytes at
+    /// `[head_offset..last_checkpoint_offset]` are stale-pre-wrap
+    /// records left over from the previous revolution). For
+    /// `last_checkpoint_offset == 0` the wrap-stop is suppressed —
+    /// the journal is "all post-checkpoint" by definition, and the
+    /// "second pad = stop" rule alone bounds iteration.
+    pub fn replay_from_checkpoint<F>(
+        &mut self,
+        region_bytes: &[u8],
+        mut callback: F,
+    ) -> Result<(), JournalError>
+    where
+        F: FnMut(&JournalRecord) -> Result<(), JournalError>,
+    {
+        if region_bytes.len() as u64 != self.region_bytes {
+            return Err(JournalError::MalformedPayload);
+        }
+        let start = self.last_checkpoint_offset as usize;
+        let mut cursor = JournalRecordCursor::new(region_bytes, start);
+        let mut wrapped = false;
+
+        loop {
+            // Wrap-stop: post-wrap cursor must not walk back into
+            // pre-checkpoint territory. Suppressed when cp == 0
+            // (no pre-checkpoint region exists).
+            if wrapped
+                && self.last_checkpoint_offset != 0
+                && cursor.offset() as u64 >= self.last_checkpoint_offset
+            {
+                break;
+            }
+            match cursor.next() {
+                None => break,
+                Some(Err(e)) => return Err(e),
+                Some(Ok(JournalRecord::Pad { .. })) => {
+                    if wrapped {
+                        // Second pad in a single replay = multi-wrap;
+                        // v1 stops here (see method doc).
+                        break;
+                    }
+                    wrapped = true;
+                    cursor = JournalRecordCursor::new(region_bytes, 0);
+                }
+                Some(Ok(rec)) => {
+                    callback(&rec)?;
+                }
+            }
+        }
+        self.head_offset = cursor.offset() as u64;
+        if self.head_offset == self.region_bytes {
+            self.head_offset = 0;
+        }
+        Ok(())
+    }
 }
