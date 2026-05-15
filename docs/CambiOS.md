@@ -14,9 +14,7 @@ Operating systems were designed in an era when the threat model was "keep users 
 
 Modern operating systems are layers of compromise stacked on top of assumptions that stopped being true decades ago. Monolithic kernels run hundreds of millions of lines of code at the highest privilege level. Security is bolted on after the fact — antivirus software that runs with the same privileges as the threats it's trying to stop. Identity is still passwords. Networking still assumes a trusted infrastructure layer. Updates still require reboots.
 
-Every patch is damage control. The architecture itself is the vulnerability.
-
-CambiOS starts from the position that **the only way to build a secure system is to design one**, not to retrofit security onto a system that was never designed for it.
+Under this model, every patch is damage control and the architecture itself is the vulnerability. CambiOS starts from the position that **the only way to build a secure system is to design one**, and that you cannot retrofit robust security onto systems that were never designed for it.
 
 ---
 
@@ -24,9 +22,9 @@ CambiOS starts from the position that **the only way to build a secure system is
 
 These are non-negotiable. They constrain every design decision. When two goals conflict, these principles break the tie.
 
-### 1. Security as Architecture (Not Policy)
+### 1. Security is Architecture Not Policy
 
-Security isn't a feature that gets added. We're making security a structural property of the system. Every component — the kernel, the scheduler, the IPC mechanism, the driver model, the networking stack — is designed so that compromise of any single component cannot propagate to others. This is achieved through signing (keys), isolation (IPC), verification (pre-execution analysis), and least privilege (capabilities).
+Security isn't an added feature, and it doesn't originate with RWX permission policy. Security is a structural property of the system and ensures the outcome meets the intent. Every component — the kernel, the scheduler, the IPC mechanism, the driver model, the networking stack — is designed so that compromise of any single component cannot propagate to others. This is achieved through signing (keys), isolation (IPC), verification (pre-execution analysis), and least privilege (capabilities).
 
 ### 2. Minimal Kernel, Maximal Isolation
 
@@ -36,21 +34,21 @@ A smaller kernel means a smaller attack surface. A smaller attack surface means 
 
 ### 3. No Telemetry. No Backdoors. No Exceptions.
 
-CambiOS will never phone home - there is no home to phone. It will never collect usage data. It will never contain a mechanism — hidden or documented — that allows remote access without the explicit, informed, per-session consent of the machine's owner. This is not a privacy "feature." It is a guarantee that is architecturally enforced: there is no telemetry subsystem to compromise because there is no telemetry subsystem.
+CambiOS will never phone home - there is no home to phone. By design it will never collect usage data. It will never contain a mechanism — hidden or documented — that allows remote access without the explicit, informed, per-session consent of the machine's owner. This isn't a privacy "feature"; it's a fundamental guarantee architecturally enforced: there is no telemetry subsystem to compromise because there is no telemetry subsystem. We explicitly reject monetizing user data.
 
 ### 4. AI as Infrastructure, Not Application
 
-We aren't strapping a little chat-boy on the desktop here. AI/LLM compose a structural component of the operating system — the same way virtual memory or preemptive scheduling is a structural component. Checking code before execution, detecting anomalous behavior at runtime, adapting legacy applications to run on unfamiliar hardware, live-patching if and when updates are needed - all supervised by fast and light specialized models. These are capabilities that the system depends on to function, to safeguard user data and ensure malicious code is caught and sandboxed, and to truly improve overall UX.
+CambiOS is intended to run in multiple environments and we will offer tiered deployments to our users. Where you elect to include it, we won't be strapping a little chat-bot on the desktop here. AI/LLM compose a structural reinforcement of the operating system — not in a system-critical way but in a system *highly complementary* way. Checking code before execution, detecting anomalous behavior at runtime, adapting legacy applications to run on unfamiliar hardware, live-patching if and when updates are needed - all supervised by fast and light specialized models. These are capabilities that the system depends on for increased function, to safeguard user data and ensure malicious code is caught and sandboxed, and to truly improve overall UX.
 
-This applies at the tiers of CambiOS that include AI components (see [ADR-009 § Deployment Tiers](adr/009-purpose-tiers-scope.md)). CambiOS is delivered in three tiers: an embedded tier with no AI, a standard tier with no AI but with the full non-AI feature set, and a full tier with all AI components. On tiers without AI, the features described above degrade gracefully to non-AI alternatives where they exist or are absent where they do not. The architecture is the same across all tiers; the set of user-space services compiled into the boot image is what differs.
+CambiOS is delivered in three tiers: an embedded tier with no AI, a standard tier with no AI but with the full non-AI feature set, and a full tier with all AI components. On tiers without AI, the features described above degrade gracefully to non-AI alternatives where they exist or are absent where they do not. The architecture is the same across all tiers; the set of user-space services compiled into the boot image is what differs.
 
 ### 5. Identity Is Cryptographic, Not Secret-Based
 
-If a passwords is a shared secrets, we all know what happens when two people try to keep one. Shared secrets are almost always compromised in the end. CambiOS replaces password-based authentication with cryptographic identity — key pairs, attestation, zero-knowledge proofs. You don't prove who you are by knowing a secret. You prove who you are by demonstrating possession of a key that only you control. Identity is decentralized: no central authority can revoke your existence.
+If a password is a shared secret, we all know what happens when two people try to keep one. Shared secrets are almost always compromised in the end. CambiOS replaces password-based authentication with cryptographic identity — key pairs, attestation, zero-knowledge proofs. You don't prove who you are by knowing a secret. You prove who you are by demonstrating possession of a key that only you control. Identity is decentralized: no central authority can revoke your existence. How this works is the topic of on-going discussion.
 
 ### 6. The Network Is Hostile
 
-CambiOS does not assume a trusted network. It does not assume DNS is honest. It does not assume IP addresses are stable or meaningful. Networking is built on cryptographic overlays where every connection is authenticated, every packet is encrypted, and routing does not depend on infrastructure that can be compromised, censored, or surveilled.
+CambiOS does not assume: a trusted network. Honest DNS. Stable or meaningful IP addresses. Network routing is built on cryptographic overlays where every connection is authenticated, all packets are encrypted, and routing doesn't depend on infrastructure that can be compromised, censored, or surveilled.
 
 ### 7. The System Evolves Without Stopping
 
@@ -58,7 +56,7 @@ Reboots are an admission that the system cannot maintain its own integrity acros
 
 ### 8. Platform Is an Implementation Detail
 
-CambiOS runs on x86_64 and AArch64. The architecture abstraction boundary is sharp and explicit. Portable code never touches hardware directly. Architecture-specific code lives behind a defined interface. Adding a new platform means implementing that interface, not rewriting the OS.
+CambiOS runs in QEMU on x86_64, AArch64, and RISC-V. The architecture abstraction boundary is sharp and explicit. Portable code never touches hardware directly. Architecture-specific code lives behind a defined interface. Adding a new platform means implementing that interface, not rewriting the OS. Thus, we remain open to opportunities to expand your ability to deploy our systems on differing configurations of hardware.
 
 ---
 
