@@ -5,9 +5,9 @@
 CLAUDE.md:11:eventually
 CLAUDE.md:353:eventually
 CLAUDE.md:368:deferred
-docs/CambiOS.md:226:deferred
-docs/CambiOS.md:365:deferred
-docs/CambiOS.md:446:deferred
+docs/CambiOS.md:224:deferred
+docs/CambiOS.md:363:deferred
+docs/CambiOS.md:444:deferred
 docs/adr/001-smp-scheduling-and-lock-hierarchy.md:119:deferred
 docs/adr/003-content-addressed-storage-and-identity.md:238:deferred
 docs/adr/005-ipc-primitives-control-and-bulk.md:116:eventually
