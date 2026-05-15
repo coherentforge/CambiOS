@@ -35,13 +35,19 @@
 extern crate alloc;
 
 use alloc::collections::BTreeSet;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use cambios_abi::{
     AclEntry, Extent, InodeId, InodeKind, PosixInode, Rights,
     MAX_EXTENTS_PER_INODE, MAX_INODE_ACL_ENTRIES,
 };
 
+use crate::fs::bitmap::{decode_from_blocks, encode_to_blocks, BitmapError, BlockBitmap};
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
+use crate::fs::journal::{
+    encode_record, Append, BitmapMutation, Journal, JournalError, JournalRecord,
+};
 
 // ============================================================================
 // Format identification
@@ -384,6 +390,29 @@ pub enum FsError {
     /// the caller's perspective; future write-path code may
     /// distinguish if a workload demands it.
     InodeNotFound,
+    /// Journal-side codec / replay error. See [`JournalError`].
+    Journal(JournalError),
+    /// Bitmap-side encode / decode / mutation error. See [`BitmapError`].
+    Bitmap(BitmapError),
+    /// Defense-in-depth check at mount: the bitmap reconstructed by
+    /// replaying the journal does not match the bitmap region read
+    /// from disk. Per ADR-029 § Verification Stance row 4 the bitmap
+    /// is the projection of committed journal records, so divergence
+    /// means either a journal-replay bug or on-disk corruption.
+    /// Mount refuses to proceed; the kernel-singleton wire-up
+    /// (step 6+) will emit an audit event before surfacing this
+    /// error. Recovery requires manual fsck.
+    BitmapDivergence,
+    /// `allocate_block()` found no free block in the bitmap. The
+    /// caller's transaction cannot proceed; userspace receives
+    /// `ENOSPC` after this propagates upward.
+    OutOfSpace,
+    /// `free_block(block)` called with a block index that is either
+    /// out of range or already free. Distinguished from
+    /// `Bitmap(BitmapError::OutOfBounds)` so future write-path code
+    /// can react differently to "tried to double-free a known block"
+    /// versus "tried to address a block past capacity."
+    NotAllocated,
 }
 
 impl From<BlockError> for FsError {
@@ -395,6 +424,18 @@ impl From<BlockError> for FsError {
 impl From<InodeError> for FsError {
     fn from(e: InodeError) -> Self {
         FsError::InodeFormat(e)
+    }
+}
+
+impl From<JournalError> for FsError {
+    fn from(e: JournalError) -> Self {
+        FsError::Journal(e)
+    }
+}
+
+impl From<BitmapError> for FsError {
+    fn from(e: BitmapError) -> Self {
+        FsError::Bitmap(e)
     }
 }
 
@@ -670,6 +711,45 @@ const fn read_u16_le_inode(buf: &Block, offset: usize) -> u16 {
 }
 
 // ============================================================================
+// Bitmap geometry + journal-replay helpers
+// ============================================================================
+
+/// Number of 4 KiB blocks the bitmap region occupies for a backend
+/// declaring `capacity_blocks` data blocks. Mirrors the calculation
+/// in `format()` so `mount()` and the kernel-singleton path use the
+/// same derivation. Pure function over the superblock-stored capacity.
+#[inline]
+const fn bitmap_region_blocks_for(capacity_blocks: u64) -> u64 {
+    capacity_blocks.div_ceil(8 * BLOCK_SIZE as u64)
+}
+
+/// Apply the bitmap-side effect of a single journal record to an
+/// in-memory bitmap. Records that don't mutate the bitmap
+/// (`Checkpoint`, `InodeAllocate`, `InodeFree`, `DirectoryEntry`,
+/// `Rename`, `AclGrant`, `AclRevoke`, `LinkCountSet`, `Pad`) are
+/// no-ops on the bitmap; only `ExtentUpdate` carries bitmap
+/// mutations.
+///
+/// Used as the replay callback in `mount()` and as a forward-looking
+/// reference for the kernel-singleton replay path. Returns the
+/// `JournalError` shape the callback contract requires; bitmap
+/// errors flow through the `From<BitmapError>` impl on `JournalError`.
+fn apply_bitmap_mutations(
+    bitmap: &mut BlockBitmap,
+    rec: &JournalRecord,
+) -> Result<(), JournalError> {
+    if let JournalRecord::ExtentUpdate(eu) = rec {
+        for m in &eu.mutations {
+            match m {
+                BitmapMutation::Set(b) => bitmap.mark_occupied(*b)?,
+                BitmapMutation::Clear(b) => bitmap.mark_free(*b)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // PosixFsBackend
 // ============================================================================
 
@@ -677,11 +757,19 @@ const fn read_u16_le_inode(buf: &Block, offset: usize) -> u16 {
 /// format is exercisable against `MemBlockDevice` in tests and against
 /// `VirtioBlkDevice` at runtime.
 ///
-/// Commit 4B adds the inode-region scan to `mount()`; the resulting
-/// in-memory `inodes` set records which slot indices were occupied
-/// at mount time. The read path (`get_inode`) and the survives-reboot
-/// tests land in commit 4C. Block-allocation bitmap, journal, and
-/// write path are ADR-029 step 5+.
+/// Commit 4B added the inode-region scan to `mount()`; commit 4C added
+/// `get_inode()`. Commit 5C-ii (this commit) adds the in-memory
+/// `bitmap` and `journal` fields plus `allocate_block` / `free_block`.
+/// Mount-time journal replay reconstructs the bitmap before the
+/// inode scan; a defense-in-depth comparison against the on-disk
+/// bitmap region surfaces divergence per ADR-029 § Verification
+/// Stance row 4.
+///
+/// The kernel-singleton wire-up (post-5D, ADR-029 migration step 6+)
+/// will publish `bitmap` and `journal` into the global lock slots
+/// declared in `src/lib.rs` (`BLOCK_BITMAP_LOCK(12)` and
+/// `JOURNAL_LOCK(13)`); for now those slots stay `None` and unit
+/// tests work with the struct fields directly.
 pub struct PosixFsBackend<B: BlockDevice> {
     device: B,
     superblock: Superblock,
@@ -690,6 +778,19 @@ pub struct PosixFsBackend<B: BlockDevice> {
     /// per ADR-029's bounded-iteration claim. Lookup is O(log n);
     /// scan-time iteration is `for i in 0..capacity_inodes`.
     inodes: BTreeSet<InodeId>,
+    /// Block-allocation bitmap. At mount, reconstructed by replaying
+    /// the journal over a fresh all-free bitmap; the on-disk bitmap
+    /// region is a defense-in-depth cross-check, not the source of
+    /// truth (per ADR-029 § Decision 2 step 5 + § Verification Stance
+    /// row 4: "bitmap state is the projection of committed journal
+    /// records").
+    bitmap: BlockBitmap,
+    /// Metadata journal. At mount, initialized from the superblock's
+    /// `last_checkpoint_offset`; `head_offset` is reconstructed by
+    /// `replay_from_checkpoint`. Mutations (allocate_block /
+    /// free_block / inode CRUD in step 6+) append records before
+    /// committing in-memory state.
+    journal: Journal,
 }
 
 impl<B: BlockDevice> PosixFsBackend<B> {
@@ -785,21 +886,51 @@ impl<B: BlockDevice> PosixFsBackend<B> {
         let zero_block = [0u8; BLOCK_SIZE];
         device.write_block(SUPERBLOCK_RESERVED_LBA, &zero_block)?;
 
+        // Initialize the in-memory bitmap as all-free and write it to
+        // the bitmap region so a subsequent mount's defense-in-depth
+        // check sees the canonical-form on-disk image.
+        let bitmap = BlockBitmap::new_all_free(desired_capacity_blocks);
+        let bitmap_buffers = encode_to_blocks(&bitmap)?;
+        for (i, block) in bitmap_buffers.iter().enumerate() {
+            device.write_block(bitmap_region_lba + i as u64, block)?;
+        }
+
+        // Zero-fill the journal region. Fresh format = empty journal;
+        // every byte is zero. Mount's blank-region detector relies on
+        // this (a leading zero byte stops the cursor cleanly).
+        for i in 0..JOURNAL_BLOCKS {
+            device.write_block(journal_region_lba + i, &zero_block)?;
+        }
+
+        let journal = Journal::new(JOURNAL_BYTES)?;
+
         device.flush()?;
 
         // Fresh format: no occupied inodes yet.
-        Ok(Self { device, superblock: sb, inodes: BTreeSet::new() })
+        Ok(Self {
+            device,
+            superblock: sb,
+            inodes: BTreeSet::new(),
+            bitmap,
+            journal,
+        })
     }
 
     /// Mount an existing backend. Validates the declared geometry,
-    /// scans the inode region for occupied slots (per ADR-029's
-    /// bounded-iteration claim — `for i in 0..capacity_inodes`), and
-    /// bumps the superblock generation counter (the same anti-stale-
-    /// snapshot convention used by the CambiObject backend per ADR-010).
+    /// replays the journal to reconstruct the in-memory bitmap,
+    /// cross-checks against the on-disk bitmap region (defense in
+    /// depth), scans the inode region, and bumps the superblock
+    /// generation counter.
     ///
-    /// Journal replay sits between the geometry validation and the
-    /// inode scan in step 5+; commit 4B mounts without journal
-    /// (no records exist yet because the write path is not in tree).
+    /// Ordering per ADR-029 § Decision 2 step 5 + § Verification
+    /// Stance row 4: the bitmap is the projection of committed
+    /// journal records, so journal replay precedes the inode scan
+    /// and the on-disk bitmap region is consulted only as a
+    /// cross-check. Divergence between the journal-reconstructed
+    /// bitmap and the on-disk bitmap surfaces as
+    /// `FsError::BitmapDivergence` and refuses mount; the
+    /// kernel-singleton wire-up (step 6+) will emit an audit event
+    /// before surfacing this error.
     fn mount(mut device: B, sb: Superblock) -> Result<Self, FsError> {
         if sb.capacity_inodes == 0
             || sb.capacity_inodes > MAX_INODES_ON_DISK
@@ -809,6 +940,9 @@ impl<B: BlockDevice> PosixFsBackend<B> {
             return Err(FsError::InvalidSuperblock);
         }
         if sb.inode_region_lba != INODE_REGION_LBA {
+            return Err(FsError::InvalidSuperblock);
+        }
+        if sb.journal_capacity_bytes != JOURNAL_BYTES {
             return Err(FsError::InvalidSuperblock);
         }
         // Sanity-check region ordering; corrupt geometry rejected.
@@ -823,9 +957,52 @@ impl<B: BlockDevice> PosixFsBackend<B> {
             return Err(FsError::InvalidSuperblock);
         }
 
-        // Inode-region scan. Bounded by `sb.capacity_inodes`, which
-        // is itself bounded above by `MAX_INODES_ON_DISK` (verifier-
-        // friendly per ADR-029 § Verification Stance).
+        // -- Journal replay ---------------------------------------
+        // Load the entire journal region into memory. 16 MiB; the
+        // kernel-singleton wire-up (step 6+) will replace this with
+        // a `FrameAllocator::allocate_contiguous` allocation
+        // HHDM-mapped from the boot frame pool. Tests use Vec.
+        let mut journal_buf = vec![0u8; JOURNAL_BYTES as usize];
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        for i in 0..JOURNAL_BLOCKS {
+            device.read_block(sb.journal_region_lba + i, &mut block_buf)?;
+            let start = (i as usize) * BLOCK_SIZE;
+            journal_buf[start..start + BLOCK_SIZE].copy_from_slice(&block_buf);
+        }
+
+        let mut journal = Journal::from_disk_state(
+            JOURNAL_BYTES,
+            sb.last_checkpoint_offset,
+            0, // head reconstructed by replay
+        )?;
+        let mut bitmap = BlockBitmap::new_all_free(sb.capacity_blocks);
+        journal.replay_from_checkpoint(&journal_buf, |rec| {
+            apply_bitmap_mutations(&mut bitmap, rec)
+        })?;
+
+        // -- Defense-in-depth bitmap cross-check ------------------
+        // Compare the journal-reconstructed bitmap against the
+        // on-disk bitmap region. The bitmap region is authoritative
+        // for kernel-singleton consumers that need to read the
+        // free-pool without scanning the journal; the journal is
+        // authoritative for correctness. A mismatch means either a
+        // journal-replay bug or on-disk corruption; refuse to mount.
+        let bitmap_blocks = bitmap_region_blocks_for(sb.capacity_blocks);
+        let mut disk_bitmap_blocks: Vec<Block> = Vec::with_capacity(bitmap_blocks as usize);
+        for i in 0..bitmap_blocks {
+            let mut block = [0u8; BLOCK_SIZE];
+            device.read_block(sb.bitmap_region_lba + i, &mut block)?;
+            disk_bitmap_blocks.push(block);
+        }
+        let disk_bitmap = decode_from_blocks(&disk_bitmap_blocks, sb.capacity_blocks)?;
+        if bitmap != disk_bitmap {
+            return Err(FsError::BitmapDivergence);
+        }
+
+        // -- Inode-region scan ------------------------------------
+        // Bounded by `sb.capacity_inodes`, which is itself bounded
+        // above by `MAX_INODES_ON_DISK` (verifier-friendly per
+        // ADR-029 § Verification Stance).
         let mut inodes = BTreeSet::new();
         let mut header_buf = [0u8; BLOCK_SIZE];
         for slot in 0..sb.capacity_inodes {
@@ -848,7 +1025,13 @@ impl<B: BlockDevice> PosixFsBackend<B> {
         device.write_block(SUPERBLOCK_HEADER_LBA, &sb_buf)?;
         device.flush()?;
 
-        Ok(Self { device, superblock: next_sb, inodes })
+        Ok(Self {
+            device,
+            superblock: next_sb,
+            inodes,
+            bitmap,
+            journal,
+        })
     }
 
     /// Return `true` if `id` was observed as occupied during the most
@@ -899,6 +1082,158 @@ impl<B: BlockDevice> PosixFsBackend<B> {
 
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// Read-only view of the in-memory bitmap. Test-friendly accessor;
+    /// production callers (step 6+) acquire `BLOCK_BITMAP_LOCK` via
+    /// the kernel-singleton path.
+    pub fn bitmap(&self) -> &BlockBitmap {
+        &self.bitmap
+    }
+
+    /// Read-only view of the in-memory journal. Test-friendly accessor;
+    /// production callers (step 6+) acquire `JOURNAL_LOCK` via the
+    /// kernel-singleton path.
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// Allocate a fresh data block. Per ADR-029 § Decision 2 step 4:
+    /// the journal record describing the bitmap mutation lands
+    /// durably on disk BEFORE the in-memory bitmap commits the mark.
+    /// On crash between journal flush and the in-memory mark, the
+    /// next mount's replay re-applies the mutation; on crash before
+    /// journal flush, the block stays free (no journal record, no
+    /// effect on the projected bitmap state).
+    ///
+    /// The journal record is an `ExtentUpdate` with an empty extent
+    /// list and a single `BitmapMutation::Set`. The empty extent
+    /// list signals "no inode-side effect, bitmap-only transaction"
+    /// — the inode association happens in the caller's higher-level
+    /// transaction (step 6+). Returns the allocated block index, or
+    /// `FsError::OutOfSpace` when the bitmap is full.
+    ///
+    /// After the in-memory mark, the affected bitmap-region block is
+    /// flushed to disk so the mount-time defense-in-depth check sees
+    /// a coherent on-disk image. Production (step 7+ checkpoint
+    /// cadence) may batch the bitmap-region flush at checkpoint
+    /// boundaries rather than per-mutation; for 5C-ii the write-
+    /// through cost is acceptable and keeps the divergence check
+    /// meaningful as a corruption detector.
+    pub fn allocate_block(&mut self) -> Result<u64, FsError> {
+        let block = self.bitmap.first_free().ok_or(FsError::OutOfSpace)?;
+        let record = JournalRecord::extent_update(
+            InodeId::new(0),
+            [None; MAX_EXTENTS_PER_INODE],
+            alloc::vec![BitmapMutation::Set(block)],
+        )?;
+        let encoded = encode_record(&record)?;
+        let append = self.journal.append(&encoded)?;
+        self.commit_journal_append(&append, &encoded)?;
+        // Journal flush is durable; safe to update in-memory bitmap.
+        self.bitmap.mark_occupied(block)?;
+        self.flush_bitmap_region_for(block)?;
+        Ok(block)
+    }
+
+    /// Free a previously-allocated data block. Symmetric with
+    /// `allocate_block` — journals an `ExtentUpdate` with empty
+    /// extent list + `BitmapMutation::Clear`, then commits the
+    /// in-memory mark and flushes the affected bitmap-region block.
+    ///
+    /// Returns `FsError::NotAllocated` if the block is out of range
+    /// or already free (caller's logic bug; not idempotent —
+    /// double-free is loud per ADR-029 § Verification Stance).
+    pub fn free_block(&mut self, block: u64) -> Result<(), FsError> {
+        if !self.bitmap.is_occupied(block) {
+            return Err(FsError::NotAllocated);
+        }
+        let record = JournalRecord::extent_update(
+            InodeId::new(0),
+            [None; MAX_EXTENTS_PER_INODE],
+            alloc::vec![BitmapMutation::Clear(block)],
+        )?;
+        let encoded = encode_record(&record)?;
+        let append = self.journal.append(&encoded)?;
+        self.commit_journal_append(&append, &encoded)?;
+        self.bitmap.mark_free(block)?;
+        self.flush_bitmap_region_for(block)?;
+        Ok(())
+    }
+
+    /// Write the on-disk bitmap-region block that contains the bit
+    /// for `block`. Re-encodes the in-memory bitmap and copies the
+    /// one affected block onto disk; the remaining bitmap blocks are
+    /// left untouched.
+    ///
+    /// Deferred: re-encoding the entire bitmap on every mutation is
+    /// O(capacity_blocks); the per-mutation cost is acceptable for
+    /// the v1 SCAFFOLDING capacity (≤4 TiB → 1 GiB bitmap region).
+    /// Revisit when: a per-block encoder lands or the per-mutation
+    /// I/O cost surfaces in profiling.
+    fn flush_bitmap_region_for(&mut self, block: u64) -> Result<(), FsError> {
+        let bitmap_block_idx = block / (BLOCK_SIZE as u64 * 8);
+        let all_blocks = encode_to_blocks(&self.bitmap)?;
+        let lba = self.superblock.bitmap_region_lba + bitmap_block_idx;
+        self.device
+            .write_block(lba, &all_blocks[bitmap_block_idx as usize])?;
+        self.device.flush()?;
+        Ok(())
+    }
+
+    /// Execute the device writes described by an [`Append`] and
+    /// flush. Writes the pad first (if present), then the real
+    /// record, mirroring ADR-029 § Decision 5's "pad covers tail
+    /// before real lands at offset 0" ordering. The pad write must
+    /// commit before the real write so a crash between the two
+    /// leaves the cursor stoppable at the pad without partial
+    /// real-record visibility.
+    fn commit_journal_append(
+        &mut self,
+        append: &Append,
+        real_bytes: &[u8],
+    ) -> Result<(), FsError> {
+        if let Some((pad_at, pad_bytes)) = &append.pad_at {
+            self.write_journal_bytes(*pad_at, pad_bytes)?;
+            self.device.flush()?;
+        }
+        self.write_journal_bytes(append.real_at, real_bytes)?;
+        self.device.flush()?;
+        Ok(())
+    }
+
+    /// Write `bytes` into the journal region starting at byte
+    /// `byte_offset`. Spans block boundaries via read-modify-write
+    /// on the partial-tail block; bounded loop over
+    /// `bytes.len().div_ceil(BLOCK_SIZE) + 1` iterations.
+    fn write_journal_bytes(
+        &mut self,
+        byte_offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), FsError> {
+        let region_lba = self.superblock.journal_region_lba;
+        let mut cursor = byte_offset;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let block_idx = cursor / BLOCK_SIZE as u64;
+            let block_off = (cursor % BLOCK_SIZE as u64) as usize;
+            let lba = region_lba + block_idx;
+
+            // Read-modify-write: preserve neighbor bytes in the
+            // same block. For a full-block write this is wasteful;
+            // step 6+ can optimize the full-block fast path once
+            // the workload profile is measurable.
+            let mut block = [0u8; BLOCK_SIZE];
+            self.device.read_block(lba, &mut block)?;
+            let copy = core::cmp::min(BLOCK_SIZE - block_off, bytes.len() - written);
+            block[block_off..block_off + copy]
+                .copy_from_slice(&bytes[written..written + copy]);
+            self.device.write_block(lba, &block)?;
+
+            cursor += copy as u64;
+            written += copy;
+        }
+        Ok(())
     }
 
     /// Consume the backend and return the underlying device. Test-only
@@ -1531,5 +1866,181 @@ mod tests {
         let mut buf2 = [0u8; BLOCK_SIZE];
         encode_inode_header(&mut buf2, &decoded).unwrap();
         assert_eq!(buf1, buf2, "decode then encode must produce identical bytes");
+    }
+
+    // ========================================================================
+    // Bitmap + journal integration (commit 5C-ii)
+    // ========================================================================
+
+    #[test]
+    fn fresh_backend_bitmap_all_free() {
+        let backend = fresh_backend();
+        let bm = backend.bitmap();
+        assert_eq!(bm.capacity(), 32);
+        assert_eq!(bm.free_count(), 32);
+    }
+
+    #[test]
+    fn fresh_backend_journal_empty() {
+        let backend = fresh_backend();
+        let j = backend.journal();
+        assert_eq!(j.region_bytes(), JOURNAL_BYTES);
+        assert_eq!(j.head_offset(), 0);
+        assert_eq!(j.last_checkpoint_offset(), 0);
+    }
+
+    #[test]
+    fn allocate_block_marks_and_journals() {
+        let mut backend = fresh_backend();
+        let initial_head = backend.journal().head_offset();
+
+        let block = backend.allocate_block().unwrap();
+        assert_eq!(block, 0, "first allocation should return lowest free block");
+        assert!(backend.bitmap().is_occupied(block));
+        assert_eq!(backend.bitmap().free_count(), 31);
+        assert!(
+            backend.journal().head_offset() > initial_head,
+            "journal head must advance past the new record"
+        );
+    }
+
+    #[test]
+    fn allocate_block_returns_distinct_blocks_in_order() {
+        let mut backend = fresh_backend();
+        let a = backend.allocate_block().unwrap();
+        let b = backend.allocate_block().unwrap();
+        let c = backend.allocate_block().unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(c, 2);
+        assert_eq!(backend.bitmap().free_count(), 29);
+    }
+
+    #[test]
+    fn allocate_until_exhausted_returns_out_of_space() {
+        let mut backend = fresh_backend();
+        for _ in 0..32 {
+            backend.allocate_block().unwrap();
+        }
+        assert_eq!(backend.bitmap().free_count(), 0);
+        assert_eq!(backend.allocate_block(), Err(FsError::OutOfSpace));
+    }
+
+    #[test]
+    fn free_block_round_trips_through_bitmap_and_journal() {
+        let mut backend = fresh_backend();
+        let b = backend.allocate_block().unwrap();
+        let head_after_alloc = backend.journal().head_offset();
+        backend.free_block(b).unwrap();
+        assert!(backend.bitmap().is_free(b));
+        assert!(
+            backend.journal().head_offset() > head_after_alloc,
+            "free must also emit a journal record"
+        );
+    }
+
+    #[test]
+    fn free_block_rejects_already_free() {
+        let mut backend = fresh_backend();
+        assert_eq!(backend.free_block(5), Err(FsError::NotAllocated));
+    }
+
+    #[test]
+    fn free_block_rejects_out_of_range() {
+        let mut backend = fresh_backend();
+        // capacity_blocks = 32 in fresh_backend.
+        assert_eq!(backend.free_block(100), Err(FsError::NotAllocated));
+    }
+
+    #[test]
+    fn mount_replays_journal_to_reconstruct_bitmap() {
+        // Allocate three blocks, drop the backend, remount. The
+        // post-remount bitmap must match the pre-drop state — the
+        // journal replay (NOT the on-disk bitmap region alone) is
+        // the source of truth.
+        let mut backend = fresh_backend();
+        for _ in 0..3 {
+            backend.allocate_block().unwrap();
+        }
+        let pre_drop_free = backend.bitmap().free_count();
+        assert_eq!(pre_drop_free, 29);
+
+        let dev = backend.into_device();
+        let remounted = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
+        assert_eq!(remounted.bitmap().free_count(), pre_drop_free);
+        for b in 0..3 {
+            assert!(remounted.bitmap().is_occupied(b));
+        }
+        for b in 3..32 {
+            assert!(remounted.bitmap().is_free(b));
+        }
+    }
+
+    #[test]
+    fn mount_replays_allocate_then_free_sequence() {
+        // Allocate blocks 0, 1, 2; free 1. Remount must reconstruct
+        // the same bitmap (0 and 2 occupied, 1 free).
+        let mut backend = fresh_backend();
+        backend.allocate_block().unwrap();
+        backend.allocate_block().unwrap();
+        backend.allocate_block().unwrap();
+        backend.free_block(1).unwrap();
+
+        let dev = backend.into_device();
+        let remounted = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
+        assert!(remounted.bitmap().is_occupied(0));
+        assert!(remounted.bitmap().is_free(1));
+        assert!(remounted.bitmap().is_occupied(2));
+        assert_eq!(remounted.bitmap().free_count(), 30);
+    }
+
+    #[test]
+    fn mount_rejects_bitmap_divergence() {
+        // After allocating, corrupt the on-disk bitmap region so it
+        // disagrees with what the journal replay would reconstruct.
+        // Mount must surface FsError::BitmapDivergence.
+        let mut backend = fresh_backend();
+        backend.allocate_block().unwrap();
+        let bitmap_region_lba = backend.superblock().bitmap_region_lba;
+        let mut dev = backend.into_device();
+        // Read the bitmap region's first block, flip a free bit
+        // (block 5: currently free per the journal, but on-disk
+        // we'll mark it occupied so disk-vs-journal disagree).
+        let mut block = [0u8; BLOCK_SIZE];
+        dev.read_block(bitmap_region_lba, &mut block).unwrap();
+        // First byte: bit 5 = 0x20. "1 = free" convention so clear
+        // bit 5 to claim block 5 is occupied on disk.
+        block[0] &= !0x20;
+        dev.write_block(bitmap_region_lba, &block).unwrap();
+
+        let result = PosixFsBackend::open_or_format(dev, 4, 32, 0);
+        assert_eq!(result.err().unwrap(), FsError::BitmapDivergence);
+    }
+
+    #[test]
+    fn allocate_returns_first_free_after_free_in_middle() {
+        // Bitmap's first_free is the lowest-indexed free block. After
+        // allocate 0,1,2,3 then free 1, the next allocate should reuse
+        // block 1.
+        let mut backend = fresh_backend();
+        for _ in 0..4 {
+            backend.allocate_block().unwrap();
+        }
+        backend.free_block(1).unwrap();
+        let reused = backend.allocate_block().unwrap();
+        assert_eq!(reused, 1);
+    }
+
+    #[test]
+    fn mount_inode_scan_still_works_with_journal_replay() {
+        // Regression test: 5C-ii reordered mount() to journal-replay
+        // first, then inode scan. Verify the inode scan still
+        // discovers occupied slots.
+        let mut dev = fresh_backend().into_device();
+        write_inode(&mut dev, 1, &make_inode(1, 0));
+        write_inode(&mut dev, 3, &make_inode(2, 1));
+        let backend = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
+        let occupied: Vec<InodeId> = backend.occupied_inodes().collect();
+        assert_eq!(occupied, alloc::vec![InodeId::new(1), InodeId::new(3)]);
     }
 }

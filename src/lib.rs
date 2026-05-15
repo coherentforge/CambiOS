@@ -77,6 +77,15 @@ use memory::frame_allocator::FrameAllocator;
 // 8.  FRAME_ALLOCATOR (physical page allocation)            [was 7]
 // 9.  INTERRUPT_ROUTER (interrupt routing)                  [was 8]
 // 10. OBJECT_STORE (filesystem — highest-level subsystem)   [was 9]
+// 11. POSIX_STORE (POSIX backend — ADR-029 § Decision 4)
+//                   [reserved; concrete static lands in step 6+ when
+//                    the kernel-singleton wire-up picks a BlockDevice]
+// 12. BLOCK_BITMAP_LOCK (shared free-pool bitmap; ADR-029 § Decision 4)
+//                   [populated by kernel-singleton mount; tests use
+//                    the PosixFsBackend struct field directly]
+// 13. JOURNAL_LOCK (metadata journal; ADR-029 § Divergence 2)
+//                   [promoted to top-level for cross-backend access
+//                    per ADR-010 § Divergence 3 forecast]
 //
 // Per-CPU lock rule: NEVER hold two different CPUs' scheduler (or timer) locks
 // simultaneously. If cross-CPU access is required (e.g., task migration), acquire
@@ -657,6 +666,40 @@ pub static AUDIT_DRAIN_SKIPS: core::sync::atomic::AtomicU64 =
 /// [src/fs/lazy_disk.rs](crate::fs::lazy_disk) is preserved by reassigning
 /// the variant under the lock.
 pub static OBJECT_STORE: Spinlock<Option<fs::ObjectStoreBackend>> = Spinlock::new(None);
+
+/// Shared block-allocation bitmap — lock-hierarchy position 12.
+///
+/// Owned at runtime by the kernel-singleton POSIX backend (ADR-029
+/// step 6+); the CambiObject backend adopts the same lock when
+/// ADR-010 § Divergence 3 lands (step 5D). Per ADR-029 § Decision 4
+/// the lock is acquired strictly below `POSIX_STORE(11)` and
+/// `OBJECT_STORE(10)` — both backends' write paths chain downward
+/// from their top-level locks.
+///
+/// Initialized to `None`. Populated when the kernel-singleton
+/// PosixFsBackend mounts (step 6+); for ADR-029 step 5C the slot
+/// stays `None` and unit tests work with the backend instance's
+/// `bitmap` struct field directly. Same posture as `OBJECT_STORE`:
+/// the lock declaration registers the hierarchy position now so
+/// the lock-ordering invariant lands with the data structure
+/// rather than as a later retrofit.
+pub static BLOCK_BITMAP_LOCK: Spinlock<Option<fs::bitmap::BlockBitmap>> =
+    Spinlock::new(None);
+
+/// Shared metadata journal — lock-hierarchy position 13.
+///
+/// Promoted from "POSIX-internal sub-lock" to a top-level entry by
+/// ADR-029 § Divergence 2 (this commit) so the CambiObject backend
+/// can route its allocations through the same journal-owned-bitmap
+/// invariant when ADR-010 § Divergence 3 lands. Acquired strictly
+/// below `BLOCK_BITMAP_LOCK(12)` so allocation transactions
+/// (bitmap mutation → journal append) follow the canonical downward
+/// chain: `OBJECT_STORE / POSIX_STORE → BLOCK_BITMAP_LOCK →
+/// JOURNAL_LOCK`.
+///
+/// Same null-init posture as `BLOCK_BITMAP_LOCK`: populated at
+/// kernel-singleton mount time, `None` until then.
+pub static JOURNAL_LOCK: Spinlock<Option<fs::journal::Journal>> = Spinlock::new(None);
 
 /// Boot module registry — maps module names to Limine module memory.
 /// Read-only after boot. Used by the Spawn syscall to find modules by name.
