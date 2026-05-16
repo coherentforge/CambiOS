@@ -174,12 +174,13 @@ The fix adopted: `VirtioBlkDevice::call` polls `SHARDED_IPC.recv_message(25)` wi
 
 Documented here because future work (e.g. switching to interrupt-driven virtio-blk completion — the right long-term fix — or reusing this kernel↔user IPC pattern for other drivers) will need to revisit the decision. The `handle_write` intercept's `// NO scheduler wake —` comment names this ADR.
 
-### 3. Shared block-allocation bitmap + journaled allocations + multi-block content (forecast for ADR-029 step 5)
+### 3. Shared block-allocation bitmap + journaled allocations + multi-block content
 
-- **Date:** 2026-05-12
+- **Date forecast:** 2026-05-12
+- **Date landed:** 2026-05-16
 - **Trigger:** [ADR-029](029-posix-file-storage-model.md) Decision 1 and Decision 5 establish a shared block-allocation bitmap and a journal-owned-bitmap invariant: every bitmap mutation, regardless of which backend triggered it, is journaled in the POSIX journal. For ADR-010 to remain coherent with this invariant, the CambiObject backend's allocation path must route through the shared journal. Without this Divergence, the invariant has a CambiObject-side hole, and ADR-029's Verification Stance claim "bitmap state is the projection of committed journal records" is false.
 
-This Divergence is forecast (not yet implemented). It lands concurrently with [ADR-029](029-posix-file-storage-model.md) migration step 5 - the simultaneous landing is what keeps the journal-owned-bitmap invariant whole from the moment the shared bitmap exists. Listed in the ADR before code so future readers reach for ADR-010 and find the planned trajectory rather than re-deriving it from ADR-029's migration path.
+This Divergence landed in the 5D chain of commits, alongside [ADR-029](029-posix-file-storage-model.md) migration step 5's 5C chain — the simultaneous landing is what keeps the journal-owned-bitmap invariant whole from the moment the shared bitmap exists in either backend. Listed in the ADR before code so future readers reach for ADR-010 and find the planned trajectory rather than re-deriving it from ADR-029's migration path.
 
 #### What changes
 
@@ -202,7 +203,15 @@ This Divergence is forecast (not yet implemented). It lands concurrently with [A
 
 #### Sequencing
 
-Forecast for landing with [ADR-029](029-posix-file-storage-model.md) migration step 5. Until that step lands, ADR-010 v1's `content_len <= BLOCK_SIZE` constraint and direct bitmap writes remain in force. The CambiObject backend's allocation path crosses over to journaled bitmap mutations as a single coordinated change with the POSIX backend's step-5 implementation; the same commit (or commit pair) lands both backends' allocation routing through the shared journal.
+Landed in the 5D chain of commits, mirroring ADR-029 step 5's 5C decomposition:
+
+- **5D-i** (codec): the v2 record header `encode` / `decode` pair and the magic-dispatched `decode_record_header_any` enter `src/fs/disk.rs` as pure functions. `ARCOREC_MAGIC_V2 = "ARCOREC2"` distinguishes v2 records from v1 (`ARCOREC1`).
+- **5D-ii** (superblock + geometry): `FORMAT_VERSION` bumps to 2; the superblock gains `capacity_data_blocks`, `bitmap_region_lba`, `journal_region_lba`, `data_region_lba`, `journal_capacity_bytes`, `last_checkpoint_offset`. `DiskObjectStore` gains in-memory `bitmap` and `journal` struct fields; mount runs journal-replay to reconstruct the bitmap and cross-checks against the on-disk bitmap region (defense-in-depth, same posture as `PosixFsBackend`).
+- **5D-iii** (integration): `put` writes v2 records via single-extent allocation; `get` dispatches on record magic to handle both v1 and v2 records; `delete` extends to journal a `BitmapMutation::Clear` for the freed data-region blocks.
+
+v1 records remain readable forever via the magic-byte dispatch — the slot-scan at mount and the `get` path both accept either version. New puts default to v2 unconditionally; there is no path that produces a new v1 record post-5D. v1 disks (`FORMAT_VERSION = 1` superblock) are rejected at mount via `SuperblockState::UnknownVersion`; an explicit migration utility, when one exists, will format the disk as v2 in place. No v1-disk migration was required by the v1 deployment surface so far.
+
+Single-extent allocation is the v1 strategy; multi-extent fallback (find smaller contiguous runs when no single run fits) is documented as `Revisit when:` on `allocate_data_blocks_single_extent` and lands when a workload surfaces the limitation.
 
 #### Why a Divergence rather than a superseding ADR
 
