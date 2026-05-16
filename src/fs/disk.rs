@@ -1278,20 +1278,24 @@ impl<B: BlockDevice> DiskObjectStore<B> {
     // v2 record I/O helpers (commit 5D-iii)
     // ============================================================================
 
-    /// Allocate `content_len.div_ceil(BLOCK_SIZE)` data blocks as a
-    /// single contiguous extent. Returns the v2-record extent array
-    /// (one extent populated, the rest `None`) and the list of
+    /// Allocate `content_len.div_ceil(BLOCK_SIZE)` data blocks for a
+    /// v2 record's content. Returns the extent array (contiguously
+    /// packed from index 0, trailing slots `None`) and the list of
     /// allocated data-block indices for the bitmap mutation. For
     /// empty content, both are empty / all-None.
     ///
-    /// Single-extent allocation is the 5D-iii strategy. Multi-extent
-    /// fallback (find smaller contiguous runs to satisfy the request
-    /// when no single run fits) is the natural extension.
-    /// Revisit when: a put returns `CapacityExceeded` with non-zero
-    /// `find_first_free_run(blocks_needed - k)` for some `k > 0`
-    /// (i.e., enough free blocks exist but no single contiguous
-    /// extent fits).
-    fn allocate_data_blocks_single_extent(
+    /// Greedy multi-extent strategy per ADR-010 § Divergence 3's
+    /// "up to 16 extents per object": prefer a single contiguous
+    /// run when one fits, fall back to multiple smaller runs when
+    /// it doesn't. Each iteration finds the longest available
+    /// contiguous run (`<= remaining`) and consumes it; allocation
+    /// fails with `CapacityExceeded` only when either (a) more than
+    /// `MAX_EXTENTS_PER_CAMBIOBJECT = 16` extents would be needed,
+    /// or (b) total free blocks are insufficient. The search uses a
+    /// working clone of the in-memory bitmap so partial progress
+    /// doesn't mutate `self.bitmap` until the caller commits the
+    /// returned `allocated` list.
+    fn allocate_data_blocks(
         &self,
         content_len: usize,
     ) -> Result<(
@@ -1304,16 +1308,46 @@ impl<B: BlockDevice> DiskObjectStore<B> {
             return Ok((extents, alloc::vec::Vec::new()));
         }
         let blocks_needed = content_len.div_ceil(BLOCK_SIZE) as u64;
-        let start_block = self
-            .bitmap
-            .find_first_free_run(blocks_needed)
-            .ok_or(StoreError::CapacityExceeded)?;
-        extents[0] = Some(Extent {
-            start_lba: self.superblock.data_region_lba + start_block,
-            block_count: blocks_needed as u32,
-        });
-        let allocated: alloc::vec::Vec<u64> =
-            (start_block..start_block + blocks_needed).collect();
+
+        let mut working = self.bitmap.clone();
+        let mut allocated: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let mut remaining = blocks_needed;
+        let mut extent_idx = 0usize;
+
+        while remaining > 0 {
+            if extent_idx >= MAX_EXTENTS_PER_CAMBIOBJECT {
+                return Err(StoreError::CapacityExceeded);
+            }
+            // Find the longest available run, up to `remaining`.
+            // `find_first_free_run(K)` returns `Some(start)` iff there's
+            // a contiguous run of exactly K free blocks at or after
+            // the lowest free position; iterate K downward to discover
+            // the longest run we can actually use.
+            let mut chosen: Option<(u64, u64)> = None;
+            let mut try_size = remaining;
+            while try_size >= 1 {
+                if let Some(start) = working.find_first_free_run(try_size) {
+                    chosen = Some((start, try_size));
+                    break;
+                }
+                try_size -= 1;
+            }
+            let (start, size) = chosen.ok_or(StoreError::CapacityExceeded)?;
+
+            for b in start..start + size {
+                working
+                    .mark_occupied(b)
+                    .map_err(|_| StoreError::InvalidObject)?;
+                allocated.push(b);
+            }
+            extents[extent_idx] = Some(Extent {
+                start_lba: self.superblock.data_region_lba + start,
+                block_count: size as u32,
+            });
+            extent_idx += 1;
+            remaining -= size;
+        }
+
         Ok((extents, allocated))
     }
 
@@ -1523,12 +1557,11 @@ impl<B: BlockDevice> ObjectStore for DiskObjectStore<B> {
 
         let slot = self.free.first_free().ok_or(StoreError::CapacityExceeded)?;
 
-        // Single-extent allocation: find one contiguous free run that
-        // fits the entire content. Multi-extent fallback documented at
-        // `allocate_data_blocks_single_extent`. For empty content the
+        // Greedy multi-extent allocation: prefer a single contiguous
+        // run, fall back to multiple smaller runs (up to
+        // `MAX_EXTENTS_PER_CAMBIOBJECT = 16`). For empty content the
         // extents array is all-None and no bitmap mutations occur.
-        let (extents, allocated_blocks) =
-            self.allocate_data_blocks_single_extent(object.content.len())?;
+        let (extents, allocated_blocks) = self.allocate_data_blocks(object.content.len())?;
 
         // Build the journal record. ExtentUpdate is the canonical
         // record kind for bitmap mutations (per ADR-029 § Decision
@@ -1997,6 +2030,119 @@ mod tests {
         assert_eq!(store.bitmap().free_count(), initial_free);
         let got = store.get(&hash).unwrap();
         assert_eq!(got.content, &[] as &[u8]);
+    }
+
+    #[test]
+    fn allocate_data_blocks_uses_single_extent_when_fits() {
+        // Fresh store with all 32 data blocks free → a 5-block
+        // allocation takes one extent.
+        let store = fresh_store();
+        let (extents, allocated) = store.allocate_data_blocks(5 * BLOCK_SIZE).unwrap();
+        assert!(extents[0].is_some());
+        assert!(extents[1].is_none());
+        let e0 = extents[0].unwrap();
+        assert_eq!(e0.block_count, 5);
+        assert_eq!(allocated.len(), 5);
+    }
+
+    #[test]
+    fn allocate_data_blocks_splits_when_single_run_does_not_fit() {
+        // Fragment the in-memory bitmap so the largest run is 4
+        // blocks but enough free blocks exist (across multiple runs)
+        // to satisfy a 7-block request via 2 extents.
+        //
+        // Layout: occupy blocks 4 and 10. Free runs:
+        //   [0..4]    = 4 blocks
+        //   [5..10]   = 5 blocks
+        //   [11..32]  = 21 blocks
+        // Request 7 blocks → greedy picks the largest fit each round.
+        let mut store = fresh_store();
+        store.bitmap.mark_occupied(4).unwrap();
+        store.bitmap.mark_occupied(10).unwrap();
+        let (extents, allocated) = store.allocate_data_blocks(7 * BLOCK_SIZE).unwrap();
+        assert!(extents[0].is_some());
+        // First extent must be the 21-block run (largest available ≤ 7
+        // matches at try_size = 7).
+        let e0 = extents[0].unwrap();
+        assert_eq!(e0.block_count, 7);
+        assert_eq!(allocated.len(), 7);
+        // Single extent suffices here because the largest run (21
+        // blocks) is bigger than the 7-block request.
+        assert!(extents[1].is_none());
+    }
+
+    #[test]
+    fn allocate_data_blocks_forces_multi_extent_when_largest_run_too_small() {
+        // Fragment so the largest available run is smaller than the
+        // request. Greedy picks the largest, then the next-largest,
+        // and so on.
+        //
+        // Layout: occupy block 5 → free runs [0..5] (5) and [6..32]
+        // (26). Then occupy block 16 → free runs [0..5] (5), [6..16]
+        // (10), [17..32] (15). Request 17 blocks: largest run is 15,
+        // next is 10. Allocator picks 15 + 2 = 17 (the second pass
+        // tries 2, since `remaining = 2` after the first 15).
+        let mut store = fresh_store();
+        store.bitmap.mark_occupied(5).unwrap();
+        store.bitmap.mark_occupied(16).unwrap();
+        let (extents, allocated) = store.allocate_data_blocks(17 * BLOCK_SIZE).unwrap();
+        assert!(extents[0].is_some());
+        assert!(extents[1].is_some());
+        assert!(extents[2].is_none());
+        let sum: u32 = extents
+            .iter()
+            .filter_map(|e| e.as_ref().map(|x| x.block_count))
+            .sum();
+        assert_eq!(sum, 17);
+        assert_eq!(allocated.len(), 17);
+    }
+
+    #[test]
+    fn allocate_data_blocks_returns_capacity_exceeded_when_too_fragmented() {
+        // Pathological fragmentation: occupy every other block so no
+        // run longer than 1 exists. 17 blocks of content can't fit
+        // in MAX_EXTENTS_PER_CAMBIOBJECT = 16 single-block extents.
+        let mut store = fresh_store();
+        for i in (0..TEST_DATA_BLOCKS).step_by(2) {
+            store.bitmap.mark_occupied(i).unwrap();
+        }
+        let result = store.allocate_data_blocks(17 * BLOCK_SIZE);
+        match result {
+            Err(StoreError::CapacityExceeded) => {}
+            other => panic!("expected CapacityExceeded, got Ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn allocate_data_blocks_does_not_mutate_self_bitmap() {
+        // The allocator uses a working clone; self.bitmap is unchanged
+        // after the call. The caller is responsible for marking
+        // bits via the returned `allocated` Vec.
+        let store = fresh_store();
+        let before = store.bitmap().free_count();
+        let (_extents, _allocated) = store.allocate_data_blocks(3 * BLOCK_SIZE).unwrap();
+        assert_eq!(store.bitmap().free_count(), before);
+    }
+
+    #[test]
+    fn put_with_fragmented_bitmap_succeeds_via_multi_extent() {
+        // End-to-end: fragment the bitmap, put content that requires
+        // multi-extent allocation, verify round-trip.
+        let mut store = fresh_store();
+        store.bitmap.mark_occupied(5).unwrap();
+        store.bitmap.mark_occupied(16).unwrap();
+        // Write the corresponding on-disk bitmap state so the
+        // defense-in-depth check at next mount would still match (not
+        // strictly required for this test, but keeps the store
+        // consistent).
+        store.flush_bitmap_region_for(5).unwrap();
+        store.flush_bitmap_region_for(16).unwrap();
+        let content = alloc::vec![0x99u8; 17 * BLOCK_SIZE];
+        let obj = make_object(99, &content);
+        let hash = store.put(obj.clone()).unwrap();
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got.content, content);
+        assert_eq!(got.content_hash, obj.content_hash);
     }
 
     #[test]

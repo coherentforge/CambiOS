@@ -211,7 +211,20 @@ Landed in the 5D chain of commits, mirroring ADR-029 step 5's 5C decomposition:
 
 v1 records remain readable forever via the magic-byte dispatch — the slot-scan at mount and the `get` path both accept either version. New puts default to v2 unconditionally; there is no path that produces a new v1 record post-5D. v1 disks (`FORMAT_VERSION = 1` superblock) are rejected at mount via `SuperblockState::UnknownVersion`; an explicit migration utility, when one exists, will format the disk as v2 in place. No v1-disk migration was required by the v1 deployment surface so far.
 
-Single-extent allocation is the v1 strategy; multi-extent fallback (find smaller contiguous runs when no single run fits) is documented as `Revisit when:` on `allocate_data_blocks_single_extent` and lands when a workload surfaces the limitation.
+Greedy multi-extent allocation is the implementation strategy: prefer a single contiguous run when one fits, fall back to multiple smaller runs (up to `MAX_EXTENTS_PER_CAMBIOBJECT = 16`) when fragmentation forbids it. The greedy search uses a working clone of the in-memory bitmap so partial-progress doesn't mutate `self.bitmap`; allocation either fully succeeds or returns `CapacityExceeded` with no mutation.
+
+#### Known implementation drift: crash-safety atomicity
+
+ADR-010 § Divergence 3 § What changes states *"The allocation is recorded in a journal record … atomically with the CambiObject record's header commit."* The 5D-iii implementation does not deliver this atomicity literally: the write order is content → header → journal → on-disk bitmap, with each step independently flushed. The window between header-write and journal-record-write can leave orphan data blocks on crash (the header references them; the journal doesn't record the allocation; replay-reconstructed bitmap marks them as free; defense-in-depth check sees the divergence and rejects mount).
+
+This is a known correctness gap, not an unconscious omission. Closing it requires an ADR-level choice between two fix shapes:
+
+1. **Mount-side slot-scan augmentation.** Mount runs journal replay AND scans the slot table, with each v2 record's extents marked in the in-memory bitmap during the scan. Fixes the orphan-block reachability problem but softens the defense-in-depth invariant (the journal-projected bitmap is no longer the sole authority; the slot table also contributes).
+2. **Fat journal record.** The `ExtentUpdate` record gains the slot index + content_hash so replay can commit the header from the journal without a separate header write. Preserves the journal-as-source-of-truth invariant but duplicates header state in the journal and changes the record format.
+
+Both options are non-trivial. The implementation drift is documented here rather than masked because v1 deployment does not exercise crash-recovery on this path (the test suite does not simulate mid-`put` crashes), but the contract gap should be closed before the disk-backed CambiObject store sees adversarial-crash workloads.
+
+**Revisit when:** an ADR-010 amendment ratifies one of the two fix shapes above. The implementation change follows the ADR decision, not the other way around.
 
 #### Why a Divergence rather than a superseding ADR
 

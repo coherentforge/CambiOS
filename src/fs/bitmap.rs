@@ -57,7 +57,7 @@ pub enum BitmapError {
 /// `Debug + PartialEq + Eq` derived to support `assert_eq!` on
 /// `Result<BlockBitmap, BitmapError>` in tests and the
 /// canonical-form claim ("same logical bitmap → same bytes").
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBitmap {
     /// One bit per block. `words[i]` covers blocks `i*64 .. (i+1)*64`,
     /// little-endian within each word: bit 0 of `words[i]` is block
