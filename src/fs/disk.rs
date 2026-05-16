@@ -28,7 +28,9 @@ use alloc::vec::Vec;
 
 use cambios_abi::Extent;
 
+use crate::fs::bitmap::{decode_from_blocks, encode_to_blocks, BlockBitmap};
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
+use crate::fs::journal::{Journal, JournalRecord};
 use crate::fs::{
     content_hash, CambiObject, ObjectCapSet, ObjectMeta, ObjectRights, ObjectStore,
     SignatureAlgo, SignatureBytes, StoreError, MAX_OBJECT_CAPS,
@@ -57,8 +59,13 @@ pub const ARCOREC_MAGIC_OCCUPIED: [u8; 8] = *b"ARCOREC1";
 pub const ARCOREC_MAGIC_V2: [u8; 8] = *b"ARCOREC2";
 
 /// ARCHITECTURAL: current format version. Mount rejects unknown versions.
-/// Version 2 lands when ML-DSA signatures or multi-block content arrives.
-pub const FORMAT_VERSION: u32 = 1;
+/// Version 2 lands per [ADR-010 § Divergence 3](../../docs/adr/010-persistent-object-store-on-disk-format.md)
+/// with the shared block-allocation bitmap, the metadata journal,
+/// and the multi-block content layout. v1 disks are rejected at
+/// mount; new puts default to v2 records (per § Divergence 3 "New
+/// puts default to v2 once this Divergence lands"). v1 *records*
+/// remain decodable forever on v2 disks via magic-byte dispatch.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// ARCHITECTURAL: maximum data-region extents per v2 CambiObject record.
 /// Matches `cambios_abi::MAX_EXTENTS_PER_INODE` (= 16) so journal records
@@ -78,19 +85,52 @@ pub const MAX_EXTENTS_PER_CAMBIOBJECT: usize = cambios_abi::MAX_EXTENTS_PER_INOD
 ///      update docs/ASSUMPTIONS.md.
 pub const MAX_OBJECTS_ON_DISK: u64 = 4096;
 
-/// SCAFFOLDING: maximum content length per object on disk. Matches
-/// `BLOCK_SIZE` — one block per content. Raised to multi-block content when
-/// channel-based bulk IPC lands and the format goes to version 2.
+/// SCAFFOLDING: maximum content length per object on disk. For v1
+/// records this is the inline content block (one `BLOCK_SIZE` per
+/// slot). For v2 records (post-ADR-010 § Divergence 3) the content
+/// can span up to `MAX_EXTENTS_PER_CAMBIOBJECT × MAX_EXTENT_BLOCKS`
+/// blocks; this constant is the v1 cap and stays here for v1 record
+/// validation.
 pub const MAX_CONTENT_BYTES_ON_DISK: usize = BLOCK_SIZE;
 
-// Superblock field offsets (LBA 0)
+/// SCAFFOLDING: maximum data-region blocks the v2 superblock can
+/// declare. The bitmap region grows linearly with this value
+/// (`MAX_DATA_BLOCKS_ON_DISK / 32768` blocks). 1B blocks × 4 KiB
+/// per block = 4 TiB of addressable v2 content; matches POSIX's
+/// `MAX_BLOCKS_ON_DISK` so cross-backend reasoning carries.
+/// Replace when: a v1+ deployment wants >4 TiB CambiObject region;
+/// tiered/sparse bitmap representations land first.
+pub const MAX_DATA_BLOCKS_ON_DISK: u64 = 1_073_741_824;
+
+// Superblock field offsets (LBA 0). v2 superblock per
+// ADR-010 § Divergence 3: the fixed-field region grows to declare
+// the bitmap, journal, and data regions. v1 superblocks (version=1)
+// are rejected at mount; new disks are formatted as v2.
 const SB_OFF_MAGIC: usize = 0;
 const SB_OFF_VERSION: usize = 8;
-const SB_OFF_CAPACITY: usize = 12;
-const SB_OFF_GENERATION: usize = 20;
-const SB_OFF_CREATED_AT: usize = 28;
+const SB_OFF_CAPACITY_SLOTS: usize = 12;
+const SB_OFF_CAPACITY_DATA_BLOCKS: usize = 20;
+const SB_OFF_BITMAP_REGION_LBA: usize = 28;
+const SB_OFF_JOURNAL_REGION_LBA: usize = 36;
+const SB_OFF_DATA_REGION_LBA: usize = 44;
+const SB_OFF_JOURNAL_CAPACITY_BYTES: usize = 52;
+const SB_OFF_LAST_CHECKPOINT_OFFSET: usize = 60;
+const SB_OFF_GENERATION: usize = 68;
+const SB_OFF_CREATED_AT: usize = 76;
+const SB_LAST_FIELD_END: usize = 84;
 const SB_OFF_CHECKSUM: usize = 4088;
 const SB_CHECKSUM_COVER_END: usize = 4088;
+
+/// ARCHITECTURAL: journal region size in bytes. Matches POSIX backend's
+/// `JOURNAL_BYTES` per ADR-029 § Decision 5 — both backends use the
+/// same 16 MiB circular log. The shared journal record format (see
+/// `src/fs/journal.rs`) is what makes cross-backend allocation
+/// transactions possible.
+pub const JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// ARCHITECTURAL: journal region size in blocks. Derived from
+/// `JOURNAL_BYTES` and `BLOCK_SIZE`.
+pub const JOURNAL_BLOCKS: u64 = JOURNAL_BYTES / BLOCK_SIZE as u64;
 
 // Record-header field offsets (LBA 1 + 2*slot)
 const HDR_OFF_MAGIC: usize = 0;
@@ -139,9 +179,25 @@ fn header_lba(slot: u64) -> u64 {
 fn content_lba(slot: u64) -> u64 {
     2 + 2 * slot
 }
+
+/// Number of bitmap-region blocks required to track `capacity_data_blocks`
+/// bits. Mirrors `bitmap_region_blocks_for` in `crate::fs::posix` so
+/// both backends compute the same shape from the same input.
 #[inline]
-fn total_blocks_for_capacity(capacity_slots: u64) -> u64 {
+const fn bitmap_region_blocks_for(capacity_data_blocks: u64) -> u64 {
+    capacity_data_blocks.div_ceil(8 * BLOCK_SIZE as u64)
+}
+
+/// Total blocks required to hold a v2 disk with the given geometry:
+/// superblock (1) + slot region (`2*capacity_slots`) + bitmap region
+/// (`bitmap_region_blocks_for(capacity_data_blocks)`) + journal region
+/// (`JOURNAL_BLOCKS`) + data region (`capacity_data_blocks`).
+#[inline]
+fn total_blocks_for_capacity(capacity_slots: u64, capacity_data_blocks: u64) -> u64 {
     1 + 2 * capacity_slots
+        + bitmap_region_blocks_for(capacity_data_blocks)
+        + JOURNAL_BLOCKS
+        + capacity_data_blocks
 }
 
 /// Blake3 truncated to 8 bytes, used as a torn-write detector on disk
@@ -205,28 +261,46 @@ impl FreeMap {
 // Superblock encoding
 // ============================================================================
 
-fn encode_superblock(
-    buf: &mut Block,
-    capacity_slots: u64,
-    generation: u64,
-    created_at: u64,
-) {
+/// Encode the v2 superblock. Caller writes the result to LBA 0. The
+/// `Superblock` struct carries the geometry; the encoder writes it to
+/// the fixed offsets defined above and appends the Blake3 checksum.
+fn encode_superblock(buf: &mut Block, sb: &Superblock) {
     buf.fill(0);
     buf[SB_OFF_MAGIC..SB_OFF_MAGIC + 8].copy_from_slice(&ARCOBJ_MAGIC);
     buf[SB_OFF_VERSION..SB_OFF_VERSION + 4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-    buf[SB_OFF_CAPACITY..SB_OFF_CAPACITY + 8].copy_from_slice(&capacity_slots.to_le_bytes());
-    buf[SB_OFF_GENERATION..SB_OFF_GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
-    buf[SB_OFF_CREATED_AT..SB_OFF_CREATED_AT + 8].copy_from_slice(&created_at.to_le_bytes());
+    buf[SB_OFF_CAPACITY_SLOTS..SB_OFF_CAPACITY_SLOTS + 8]
+        .copy_from_slice(&sb.capacity_slots.to_le_bytes());
+    buf[SB_OFF_CAPACITY_DATA_BLOCKS..SB_OFF_CAPACITY_DATA_BLOCKS + 8]
+        .copy_from_slice(&sb.capacity_data_blocks.to_le_bytes());
+    buf[SB_OFF_BITMAP_REGION_LBA..SB_OFF_BITMAP_REGION_LBA + 8]
+        .copy_from_slice(&sb.bitmap_region_lba.to_le_bytes());
+    buf[SB_OFF_JOURNAL_REGION_LBA..SB_OFF_JOURNAL_REGION_LBA + 8]
+        .copy_from_slice(&sb.journal_region_lba.to_le_bytes());
+    buf[SB_OFF_DATA_REGION_LBA..SB_OFF_DATA_REGION_LBA + 8]
+        .copy_from_slice(&sb.data_region_lba.to_le_bytes());
+    buf[SB_OFF_JOURNAL_CAPACITY_BYTES..SB_OFF_JOURNAL_CAPACITY_BYTES + 8]
+        .copy_from_slice(&sb.journal_capacity_bytes.to_le_bytes());
+    buf[SB_OFF_LAST_CHECKPOINT_OFFSET..SB_OFF_LAST_CHECKPOINT_OFFSET + 8]
+        .copy_from_slice(&sb.last_checkpoint_offset.to_le_bytes());
+    buf[SB_OFF_GENERATION..SB_OFF_GENERATION + 8].copy_from_slice(&sb.generation.to_le_bytes());
+    buf[SB_OFF_CREATED_AT..SB_OFF_CREATED_AT + 8].copy_from_slice(&sb.created_at.to_le_bytes());
+    // SB_LAST_FIELD_END..SB_OFF_CHECKSUM stays zero from buf.fill(0).
     let cs = checksum8(&buf[..SB_CHECKSUM_COVER_END]);
     buf[SB_OFF_CHECKSUM..SB_OFF_CHECKSUM + 8].copy_from_slice(&cs);
 }
 
-struct SuperblockFields {
+/// In-memory representation of the v2 superblock. Carries the full
+/// geometry; encoder reconstitutes the on-disk magic + checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Superblock {
     capacity_slots: u64,
+    capacity_data_blocks: u64,
+    bitmap_region_lba: u64,
+    journal_region_lba: u64,
+    data_region_lba: u64,
+    journal_capacity_bytes: u64,
+    last_checkpoint_offset: u64,
     generation: u64,
-    version: u32,
-    // created_at is read but not consumed today; keep for future use.
-    #[allow(dead_code)]
     created_at: u64,
 }
 
@@ -277,15 +351,10 @@ const fn read_u64_le(buf: &Block, offset: usize) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuperblockState {
     Blank,
-    Valid(SuperblockSnapshot),
+    Valid(Superblock),
+    /// Magic matches, version doesn't. v1 disks land here under v2 code.
+    UnknownVersion(u32),
     Corrupt,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SuperblockSnapshot {
-    capacity_slots: u64,
-    generation: u64,
-    version: u32,
 }
 
 fn classify_superblock(buf: &Block) -> SuperblockState {
@@ -303,12 +372,28 @@ fn classify_superblock(buf: &Block) -> SuperblockState {
         return SuperblockState::Corrupt;
     }
     let version = read_u32_le(buf, SB_OFF_VERSION);
-    let capacity_slots = read_u64_le(buf, SB_OFF_CAPACITY);
+    if version != FORMAT_VERSION {
+        return SuperblockState::UnknownVersion(version);
+    }
+    let capacity_slots = read_u64_le(buf, SB_OFF_CAPACITY_SLOTS);
+    let capacity_data_blocks = read_u64_le(buf, SB_OFF_CAPACITY_DATA_BLOCKS);
+    let bitmap_region_lba = read_u64_le(buf, SB_OFF_BITMAP_REGION_LBA);
+    let journal_region_lba = read_u64_le(buf, SB_OFF_JOURNAL_REGION_LBA);
+    let data_region_lba = read_u64_le(buf, SB_OFF_DATA_REGION_LBA);
+    let journal_capacity_bytes = read_u64_le(buf, SB_OFF_JOURNAL_CAPACITY_BYTES);
+    let last_checkpoint_offset = read_u64_le(buf, SB_OFF_LAST_CHECKPOINT_OFFSET);
     let generation = read_u64_le(buf, SB_OFF_GENERATION);
-    SuperblockState::Valid(SuperblockSnapshot {
+    let created_at = read_u64_le(buf, SB_OFF_CREATED_AT);
+    SuperblockState::Valid(Superblock {
         capacity_slots,
+        capacity_data_blocks,
+        bitmap_region_lba,
+        journal_region_lba,
+        data_region_lba,
+        journal_capacity_bytes,
+        last_checkpoint_offset,
         generation,
-        version,
+        created_at,
     })
 }
 
@@ -480,6 +565,77 @@ fn rebuild_cambi_object(header: HeaderDecoded, content_block: &Block) -> Result<
         created_at: header.created_at,
         content,
     })
+}
+
+// ============================================================================
+// Format-time geometry + journal-replay helpers
+// ============================================================================
+
+/// Geometry picked by `open_or_format` when it has to format a blank
+/// device. `desired_capacity_slots` is clamped by both the device size
+/// and `MAX_OBJECTS_ON_DISK`; `capacity_data_blocks` fills the
+/// remaining device space (minus the bitmap, journal, and a small
+/// headroom block).
+struct FormatGeometry {
+    capacity_slots: u64,
+    capacity_data_blocks: u64,
+}
+
+fn pick_format_geometry(
+    dev_blocks: u64,
+    desired_capacity_slots: u64,
+) -> Result<FormatGeometry, StoreError> {
+    if dev_blocks < 1 + 2 + 1 + JOURNAL_BLOCKS + 1 {
+        return Err(StoreError::InvalidObject);
+    }
+    let capacity_slots = desired_capacity_slots.min(MAX_OBJECTS_ON_DISK).max(1);
+    let used_by_slots = 1 + 2 * capacity_slots + JOURNAL_BLOCKS;
+    if used_by_slots + 2 > dev_blocks {
+        // Need at least 1 bitmap block + 1 data block remaining.
+        return Err(StoreError::InvalidObject);
+    }
+    // Remaining blocks split between bitmap and data. Each bitmap
+    // block tracks 32768 data blocks, so the bitmap overhead is
+    // ~1/32769 of the data region — tiny. We approximate by
+    // reserving `ceil(remaining / 32769)` for the bitmap and the
+    // rest for data, then verify the total fits.
+    let remaining = dev_blocks - used_by_slots;
+    let mut data_blocks = remaining - 1; // reserve at least 1 bitmap block
+    let bitmap_blocks = bitmap_region_blocks_for(data_blocks);
+    if used_by_slots + bitmap_blocks + data_blocks > dev_blocks {
+        // Shrink data_blocks by the bitmap overhead and re-check.
+        let overhead = used_by_slots + bitmap_blocks + data_blocks - dev_blocks;
+        data_blocks = data_blocks.saturating_sub(overhead);
+    }
+    if data_blocks == 0 {
+        return Err(StoreError::InvalidObject);
+    }
+    Ok(FormatGeometry {
+        capacity_slots,
+        capacity_data_blocks: data_blocks.min(MAX_DATA_BLOCKS_ON_DISK),
+    })
+}
+
+/// Apply the bitmap-side effect of a single journal record to an
+/// in-memory bitmap. Records that don't mutate the bitmap are no-ops;
+/// only `ExtentUpdate` carries bitmap mutations. Mirrors
+/// `crate::fs::posix::apply_bitmap_mutations` — both backends use the
+/// same record-shape so cross-backend journal records (which the
+/// step 6+ kernel singleton will see) apply consistently regardless
+/// of which side created them.
+fn apply_bitmap_mutations(
+    bitmap: &mut BlockBitmap,
+    rec: &JournalRecord,
+) -> Result<(), crate::fs::journal::JournalError> {
+    if let JournalRecord::ExtentUpdate(eu) = rec {
+        for m in &eu.mutations {
+            match m {
+                crate::fs::journal::BitmapMutation::Set(b) => bitmap.mark_occupied(*b)?,
+                crate::fs::journal::BitmapMutation::Clear(b) => bitmap.mark_free(*b)?,
+            }
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -757,19 +913,29 @@ fn block_err_to_store(_e: BlockError) -> StoreError {
 
 pub struct DiskObjectStore<B: BlockDevice> {
     device: B,
-    capacity_slots: u64,
+    superblock: Superblock,
     index: BTreeMap<[u8; 32], u64>,
     free: FreeMap,
     count: usize,
-    #[allow(dead_code)]
-    generation: u64,
+    /// Shared block-allocation bitmap per ADR-010 § Divergence 3. v2
+    /// records (post-5D-iii) allocate content blocks here; v1 records
+    /// (legacy puts) bypass it. For 5D-ii the bitmap is initialized
+    /// all-free at format time, reconstructed by journal replay at
+    /// mount, and not yet mutated by put — that integration is 5D-iii.
+    bitmap: BlockBitmap,
+    /// Shared metadata journal per ADR-029 § Decision 5. Initialized
+    /// empty at format; reconstructed from the on-disk region at mount.
+    /// 5D-iii populates put/delete with journal-append flows.
+    journal: Journal,
 }
 
 impl<B: BlockDevice> DiskObjectStore<B> {
-    /// Open an existing store, or format a blank device, or fail if the
-    /// device looks corrupt. On format, `desired_capacity_slots` is the
-    /// slot count written to the new superblock — clamped by device
-    /// capacity and the `MAX_OBJECTS_ON_DISK` SCAFFOLDING bound.
+    /// Open an existing v2 store, format a blank device as v2, or fail
+    /// if the device looks corrupt or carries a different format
+    /// version. v2 disks gain bitmap + journal + data regions per
+    /// ADR-010 § Divergence 3; this entry point picks reasonable
+    /// region sizes that fill the device (the kernel boot path and
+    /// most tests use this default sizing).
     pub fn open_or_format(
         mut device: B,
         desired_capacity_slots: u64,
@@ -787,46 +953,83 @@ impl<B: BlockDevice> DiskObjectStore<B> {
             // "free" (magic != ARCOREC_MAGIC_OCCUPIED). Skip the
             // per-slot zero-write loop; writing zeros over zeros is a
             // no-op that costs `capacity_slots` IPC round-trips.
-            SuperblockState::Blank => Self::format(device, desired_capacity_slots, 0, false),
-            SuperblockState::Valid(snap) => {
-                if snap.version != FORMAT_VERSION {
-                    return Err(StoreError::InvalidObject);
-                }
-                Self::mount(device, snap)
+            SuperblockState::Blank => {
+                let geometry = pick_format_geometry(
+                    device.capacity_blocks(),
+                    desired_capacity_slots,
+                )?;
+                Self::format(
+                    device,
+                    geometry.capacity_slots,
+                    geometry.capacity_data_blocks,
+                    0,
+                    false,
+                )
             }
+            SuperblockState::Valid(sb) => Self::mount(device, sb),
+            // v1 disks (pre-Divergence-3) and any other unknown
+            // version land here. Recovery requires an explicit
+            // migration utility (out of scope for 5D); mount refuses.
+            SuperblockState::UnknownVersion(_) => Err(StoreError::InvalidObject),
             SuperblockState::Corrupt => Err(StoreError::InvalidObject),
         }
     }
 
-    /// Format the device. Existing data is discarded.
+    /// Format the device as a fresh v2 disk. Existing data is discarded.
     ///
-    /// `erase_headers = true` zeros every record header slot — use when
-    /// re-formatting a disk with unknown prior contents (explicit user
-    /// erase, or reformat of a previously-valid store). `false` trusts
-    /// that the underlying storage is already zero-initialized, which is
-    /// the common case for first-boot on freshly-provisioned media.
+    /// `desired_capacity_slots` and `desired_capacity_data_blocks` are
+    /// clamped to fit the device and the `MAX_OBJECTS_ON_DISK` /
+    /// `MAX_DATA_BLOCKS_ON_DISK` SCAFFOLDING bounds. `erase_headers =
+    /// true` zeros every record header slot — use when re-formatting
+    /// a disk with unknown prior contents; `false` trusts that the
+    /// underlying storage is already zero-initialized.
     pub fn format(
         mut device: B,
         desired_capacity_slots: u64,
+        desired_capacity_data_blocks: u64,
         created_at: u64,
         erase_headers: bool,
     ) -> Result<Self, StoreError> {
         let dev_blocks = device.capacity_blocks();
-        if dev_blocks < 3 {
-            // Must hold superblock + at least one slot (2 blocks).
+        // v2 disks need superblock + at least one slot + bitmap (1) +
+        // journal (JOURNAL_BLOCKS) + one data block. The journal
+        // region dominates: any device smaller than `JOURNAL_BLOCKS +
+        // 4` cannot host a v2 layout.
+        let min_required = 1 + 2 + 1 + JOURNAL_BLOCKS + 1;
+        if dev_blocks < min_required {
             return Err(StoreError::InvalidObject);
         }
-        let max_by_device = (dev_blocks - 1) / 2;
         let capacity_slots = desired_capacity_slots
-            .min(max_by_device)
-            .min(MAX_OBJECTS_ON_DISK);
-        if capacity_slots == 0 {
+            .min(MAX_OBJECTS_ON_DISK)
+            .max(1);
+        let capacity_data_blocks = desired_capacity_data_blocks
+            .min(MAX_DATA_BLOCKS_ON_DISK)
+            .max(1);
+        if total_blocks_for_capacity(capacity_slots, capacity_data_blocks) > dev_blocks {
             return Err(StoreError::InvalidObject);
         }
 
+        // Compute region offsets.
+        let bitmap_region_lba = 1 + 2 * capacity_slots;
+        let bitmap_blocks = bitmap_region_blocks_for(capacity_data_blocks);
+        let journal_region_lba = bitmap_region_lba + bitmap_blocks;
+        let data_region_lba = journal_region_lba + JOURNAL_BLOCKS;
+
+        let sb = Superblock {
+            capacity_slots,
+            capacity_data_blocks,
+            bitmap_region_lba,
+            journal_region_lba,
+            data_region_lba,
+            journal_capacity_bytes: JOURNAL_BYTES,
+            last_checkpoint_offset: 0,
+            generation: 1,
+            created_at,
+        };
+
         // Write superblock with generation = 1 (fresh format).
         let mut sb_buf = [0u8; BLOCK_SIZE];
-        encode_superblock(&mut sb_buf, capacity_slots, 1, created_at);
+        encode_superblock(&mut sb_buf, &sb);
         device
             .write_block(SUPERBLOCK_LBA, &sb_buf)
             .map_err(block_err_to_store)?;
@@ -843,34 +1046,127 @@ impl<B: BlockDevice> DiskObjectStore<B> {
                     .map_err(block_err_to_store)?;
             }
         }
+
+        // Initialize the in-memory bitmap as all-free and write it to
+        // the bitmap region so a subsequent mount's defense-in-depth
+        // check sees the canonical-form on-disk image (mirrors
+        // PosixFsBackend::format).
+        let bitmap = BlockBitmap::new_all_free(capacity_data_blocks);
+        let bitmap_buffers = encode_to_blocks(&bitmap).map_err(|_| StoreError::InvalidObject)?;
+        for (i, block) in bitmap_buffers.iter().enumerate() {
+            device
+                .write_block(bitmap_region_lba + i as u64, block)
+                .map_err(block_err_to_store)?;
+        }
+
+        // Zero-fill the journal region. Fresh format = empty journal;
+        // mount's blank-region detector relies on a zero leading byte
+        // to stop the replay cursor cleanly.
+        let zero_block = [0u8; BLOCK_SIZE];
+        for i in 0..JOURNAL_BLOCKS {
+            device
+                .write_block(journal_region_lba + i, &zero_block)
+                .map_err(block_err_to_store)?;
+        }
+
+        let journal = Journal::new(JOURNAL_BYTES).map_err(|_| StoreError::InvalidObject)?;
+
         device.flush().map_err(block_err_to_store)?;
 
         Ok(Self {
             device,
-            capacity_slots,
+            superblock: sb,
             index: BTreeMap::new(),
             free: FreeMap::new(capacity_slots),
             count: 0,
-            generation: 1,
+            bitmap,
+            journal,
         })
     }
 
-    fn mount(mut device: B, snap: SuperblockSnapshot) -> Result<Self, StoreError> {
-        let capacity_slots = snap.capacity_slots;
-        if capacity_slots == 0 || capacity_slots > MAX_OBJECTS_ON_DISK {
+    /// Mount an existing v2 store. Geometry validation → journal
+    /// replay (reconstructing the bitmap) → defense-in-depth bitmap
+    /// cross-check → slot-table scan → generation bump.
+    ///
+    /// Ordering mirrors `PosixFsBackend::mount` for the same reason:
+    /// per ADR-029 § Verification Stance row 4 the bitmap is the
+    /// projection of committed journal records, and the on-disk
+    /// bitmap is a defense-in-depth cross-check rather than the
+    /// source of truth.
+    fn mount(mut device: B, sb: Superblock) -> Result<Self, StoreError> {
+        if sb.capacity_slots == 0
+            || sb.capacity_slots > MAX_OBJECTS_ON_DISK
+            || sb.capacity_data_blocks == 0
+            || sb.capacity_data_blocks > MAX_DATA_BLOCKS_ON_DISK
+        {
             return Err(StoreError::InvalidObject);
         }
-        // Check the device actually has space for this declared capacity.
-        if device.capacity_blocks() < total_blocks_for_capacity(capacity_slots) {
+        if sb.journal_capacity_bytes != JOURNAL_BYTES {
+            return Err(StoreError::InvalidObject);
+        }
+        // Sanity-check region ordering; corrupt geometry rejected.
+        let expected_bitmap_lba = 1 + 2 * sb.capacity_slots;
+        let expected_journal_lba =
+            expected_bitmap_lba + bitmap_region_blocks_for(sb.capacity_data_blocks);
+        let expected_data_lba = expected_journal_lba + JOURNAL_BLOCKS;
+        if sb.bitmap_region_lba != expected_bitmap_lba
+            || sb.journal_region_lba != expected_journal_lba
+            || sb.data_region_lba != expected_data_lba
+        {
+            return Err(StoreError::InvalidObject);
+        }
+        if device.capacity_blocks()
+            < total_blocks_for_capacity(sb.capacity_slots, sb.capacity_data_blocks)
+        {
             return Err(StoreError::InvalidObject);
         }
 
+        // -- Journal replay -----------------------------------------
+        let mut journal_buf = vec![0u8; JOURNAL_BYTES as usize];
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        for i in 0..JOURNAL_BLOCKS {
+            device
+                .read_block(sb.journal_region_lba + i, &mut block_buf)
+                .map_err(block_err_to_store)?;
+            let start = (i as usize) * BLOCK_SIZE;
+            journal_buf[start..start + BLOCK_SIZE].copy_from_slice(&block_buf);
+        }
+        let mut journal = Journal::from_disk_state(
+            JOURNAL_BYTES,
+            sb.last_checkpoint_offset,
+            0,
+        )
+        .map_err(|_| StoreError::InvalidObject)?;
+        let mut bitmap = BlockBitmap::new_all_free(sb.capacity_data_blocks);
+        journal
+            .replay_from_checkpoint(&journal_buf, |rec| {
+                apply_bitmap_mutations(&mut bitmap, rec)
+            })
+            .map_err(|_| StoreError::InvalidObject)?;
+
+        // -- Defense-in-depth bitmap cross-check --------------------
+        let bitmap_blocks = bitmap_region_blocks_for(sb.capacity_data_blocks);
+        let mut disk_bitmap_blocks: Vec<Block> = Vec::with_capacity(bitmap_blocks as usize);
+        for i in 0..bitmap_blocks {
+            let mut block = [0u8; BLOCK_SIZE];
+            device
+                .read_block(sb.bitmap_region_lba + i, &mut block)
+                .map_err(block_err_to_store)?;
+            disk_bitmap_blocks.push(block);
+        }
+        let disk_bitmap = decode_from_blocks(&disk_bitmap_blocks, sb.capacity_data_blocks)
+            .map_err(|_| StoreError::InvalidObject)?;
+        if bitmap != disk_bitmap {
+            return Err(StoreError::InvalidObject);
+        }
+
+        // -- Slot-table scan ----------------------------------------
         let mut index = BTreeMap::new();
-        let mut free = FreeMap::new(capacity_slots);
+        let mut free = FreeMap::new(sb.capacity_slots);
         let mut count = 0usize;
 
         let mut header_buf = [0u8; BLOCK_SIZE];
-        for slot in 0..capacity_slots {
+        for slot in 0..sb.capacity_slots {
             device
                 .read_block(header_lba(slot), &mut header_buf)
                 .map_err(block_err_to_store)?;
@@ -888,15 +1184,12 @@ impl<B: BlockDevice> DiskObjectStore<B> {
 
         // Bump generation on successful mount so stale snapshots are
         // detectable. Write-back the superblock.
-        let next_generation = snap.generation.wrapping_add(1);
+        let next_sb = Superblock {
+            generation: sb.generation.wrapping_add(1),
+            ..sb
+        };
         let mut sb_buf = [0u8; BLOCK_SIZE];
-        // Preserve original created_at by re-reading the superblock block;
-        // encode_superblock rewrites every field so we need to supply it.
-        device
-            .read_block(SUPERBLOCK_LBA, &mut sb_buf)
-            .map_err(block_err_to_store)?;
-        let created_at = read_u64_le(&sb_buf, SB_OFF_CREATED_AT);
-        encode_superblock(&mut sb_buf, capacity_slots, next_generation, created_at);
+        encode_superblock(&mut sb_buf, &next_sb);
         device
             .write_block(SUPERBLOCK_LBA, &sb_buf)
             .map_err(block_err_to_store)?;
@@ -904,11 +1197,12 @@ impl<B: BlockDevice> DiskObjectStore<B> {
 
         Ok(Self {
             device,
-            capacity_slots,
+            superblock: next_sb,
             index,
             free,
             count,
-            generation: next_generation,
+            bitmap,
+            journal,
         })
     }
 
@@ -920,7 +1214,27 @@ impl<B: BlockDevice> DiskObjectStore<B> {
     }
 
     pub fn capacity_slots(&self) -> u64 {
-        self.capacity_slots
+        self.superblock.capacity_slots
+    }
+
+    /// Total data-region blocks declared by the superblock. Used by the
+    /// kernel-singleton wire-up and by tests that need to sanity-check
+    /// the disk geometry.
+    pub fn capacity_data_blocks(&self) -> u64 {
+        self.superblock.capacity_data_blocks
+    }
+
+    /// Read-only view of the in-memory bitmap. Test-friendly accessor;
+    /// production callers (5D-iii integration + kernel-singleton wire-up)
+    /// acquire `BLOCK_BITMAP_LOCK` via the global slot.
+    pub fn bitmap(&self) -> &BlockBitmap {
+        &self.bitmap
+    }
+
+    /// Read-only view of the in-memory journal. Same posture as
+    /// [`Self::bitmap`].
+    pub fn journal(&self) -> &Journal {
+        &self.journal
     }
 }
 
@@ -1035,13 +1349,37 @@ mod tests {
     use crate::fs::keypair_from_seed;
 
     // Capacity sized so tests cover both "fill the store" and "reboot with
-    // known state" scenarios without eating test-runner memory.
+    // known state" scenarios without eating test-runner memory. v2 disks
+    // include the 16 MiB journal region (`JOURNAL_BLOCKS`) plus a small
+    // bitmap + data region.
     const TEST_CAP: u64 = 8;
-    const TEST_DEV_BLOCKS: u64 = 1 + 2 * TEST_CAP;
+    const TEST_DATA_BLOCKS: u64 = 32;
+    const TEST_DEV_BLOCKS: u64 = 1 + 2 * TEST_CAP + 1 + JOURNAL_BLOCKS + TEST_DATA_BLOCKS;
 
     fn fresh_store() -> DiskObjectStore<MemBlockDevice> {
         let dev = MemBlockDevice::new(TEST_DEV_BLOCKS);
         DiskObjectStore::open_or_format(dev, TEST_CAP).unwrap()
+    }
+
+    /// Build a synthetic v2 superblock with reasonable defaults so tests
+    /// can exercise `encode_superblock` / `classify_superblock` without
+    /// reaching into the full backend.
+    fn test_superblock(capacity_slots: u64, generation: u64) -> Superblock {
+        let bitmap_region_lba = 1 + 2 * capacity_slots;
+        let bitmap_blocks = bitmap_region_blocks_for(TEST_DATA_BLOCKS);
+        let journal_region_lba = bitmap_region_lba + bitmap_blocks;
+        let data_region_lba = journal_region_lba + JOURNAL_BLOCKS;
+        Superblock {
+            capacity_slots,
+            capacity_data_blocks: TEST_DATA_BLOCKS,
+            bitmap_region_lba,
+            journal_region_lba,
+            data_region_lba,
+            journal_capacity_bytes: JOURNAL_BYTES,
+            last_checkpoint_offset: 0,
+            generation,
+            created_at: 0,
+        }
     }
 
     fn make_object(author_seed: u8, content: &[u8]) -> CambiObject {
@@ -1053,14 +1391,11 @@ mod tests {
 
     #[test]
     fn superblock_roundtrip() {
+        let sb = test_superblock(128, 7);
         let mut buf = [0u8; BLOCK_SIZE];
-        encode_superblock(&mut buf, 128, 7, 0xDEAD_BEEF);
+        encode_superblock(&mut buf, &sb);
         match classify_superblock(&buf) {
-            SuperblockState::Valid(snap) => {
-                assert_eq!(snap.capacity_slots, 128);
-                assert_eq!(snap.generation, 7);
-                assert_eq!(snap.version, FORMAT_VERSION);
-            }
+            SuperblockState::Valid(decoded) => assert_eq!(decoded, sb),
             other => panic!("expected Valid, got {:?}", other),
         }
     }
@@ -1080,10 +1415,28 @@ mod tests {
 
     #[test]
     fn superblock_bad_checksum_is_corrupt() {
+        let sb = test_superblock(TEST_CAP, 1);
         let mut buf = [0u8; BLOCK_SIZE];
-        encode_superblock(&mut buf, 64, 1, 0);
+        encode_superblock(&mut buf, &sb);
         buf[100] ^= 0xFF; // flip a middle byte, checksum now wrong
         assert_eq!(classify_superblock(&buf), SuperblockState::Corrupt);
+    }
+
+    #[test]
+    fn superblock_v1_disk_rejected_as_unknown_version() {
+        // Craft a v1-shaped superblock (version=1) so the dispatcher
+        // recognizes the magic but rejects the version. The exact v1
+        // field layout doesn't matter; only the magic + version byte
+        // matter to classify_superblock.
+        let mut buf = [0u8; BLOCK_SIZE];
+        buf[SB_OFF_MAGIC..SB_OFF_MAGIC + 8].copy_from_slice(&ARCOBJ_MAGIC);
+        buf[SB_OFF_VERSION..SB_OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
+        let cs = checksum8(&buf[..SB_CHECKSUM_COVER_END]);
+        buf[SB_OFF_CHECKSUM..SB_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        match classify_superblock(&buf) {
+            SuperblockState::UnknownVersion(v) => assert_eq!(v, 1),
+            other => panic!("expected UnknownVersion, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1364,11 +1717,11 @@ mod tests {
     fn reboot_bumps_generation_counter() {
         let dev = MemBlockDevice::new(TEST_DEV_BLOCKS);
         let store = DiskObjectStore::open_or_format(dev, TEST_CAP).unwrap();
-        let gen_first_mount = store.generation;
+        let gen_first_mount = store.superblock.generation;
 
         let dev = store.into_device();
         let store2 = DiskObjectStore::open_or_format(dev, TEST_CAP).unwrap();
-        assert!(store2.generation > gen_first_mount);
+        assert!(store2.superblock.generation > gen_first_mount);
     }
 
     // ------------------- Corruption paths -------------------
@@ -1377,9 +1730,10 @@ mod tests {
     fn mount_rejects_corrupt_superblock() {
         let mut dev = MemBlockDevice::new(TEST_DEV_BLOCKS);
         // Write a plausible-but-corrupt superblock: right magic, wrong checksum.
+        let sb = test_superblock(TEST_CAP, 1);
         let mut buf = [0u8; BLOCK_SIZE];
-        encode_superblock(&mut buf, TEST_CAP, 1, 0);
-        buf[60] ^= 0x01;
+        encode_superblock(&mut buf, &sb);
+        buf[100] ^= 0x01;
         dev.write_block(SUPERBLOCK_LBA, &buf).unwrap();
         assert_eq!(
             DiskObjectStore::open_or_format(dev, TEST_CAP).err(),
@@ -1451,7 +1805,13 @@ mod tests {
         assert_eq!(content_lba(0), 2);
         assert_eq!(header_lba(5), 11);
         assert_eq!(content_lba(5), 12);
-        assert_eq!(total_blocks_for_capacity(10), 21);
+        // v2 disk total: 1 sb + 2*slots + bitmap_blocks + journal + data.
+        // For slots=10, data=64: bitmap = ceil(64 / 32768) = 1.
+        // Total = 1 + 20 + 1 + JOURNAL_BLOCKS + 64 = JOURNAL_BLOCKS + 86.
+        assert_eq!(
+            total_blocks_for_capacity(10, 64),
+            1 + 20 + 1 + JOURNAL_BLOCKS + 64,
+        );
     }
 
     // ========================================================================
@@ -1635,6 +1995,78 @@ mod tests {
             Err(StoreError::InvalidObject) => {}
             other => panic!("expected InvalidObject, got {:?}", other.is_ok()),
         }
+    }
+
+    // ========================================================================
+    // v2 superblock + disk geometry (commit 5D-ii)
+    // ========================================================================
+
+    #[test]
+    fn fresh_v2_store_bitmap_all_free() {
+        let store = fresh_store();
+        let bm = store.bitmap();
+        assert_eq!(bm.capacity(), TEST_DATA_BLOCKS);
+        assert_eq!(bm.free_count(), TEST_DATA_BLOCKS);
+    }
+
+    #[test]
+    fn fresh_v2_store_journal_empty() {
+        let store = fresh_store();
+        let j = store.journal();
+        assert_eq!(j.region_bytes(), JOURNAL_BYTES);
+        assert_eq!(j.head_offset(), 0);
+        assert_eq!(j.last_checkpoint_offset(), 0);
+    }
+
+    #[test]
+    fn fresh_v2_store_geometry_consistent() {
+        let store = fresh_store();
+        let sb = &store.superblock;
+        assert_eq!(sb.capacity_slots, TEST_CAP);
+        assert_eq!(sb.capacity_data_blocks, TEST_DATA_BLOCKS);
+        assert_eq!(sb.bitmap_region_lba, 1 + 2 * TEST_CAP);
+        assert_eq!(
+            sb.journal_region_lba,
+            sb.bitmap_region_lba + bitmap_region_blocks_for(TEST_DATA_BLOCKS),
+        );
+        assert_eq!(sb.data_region_lba, sb.journal_region_lba + JOURNAL_BLOCKS);
+        assert_eq!(sb.journal_capacity_bytes, JOURNAL_BYTES);
+    }
+
+    #[test]
+    fn mount_rejects_bitmap_divergence() {
+        // Format then corrupt the on-disk bitmap: claim block 5 is
+        // occupied on disk while the journal (still empty) reconstructs
+        // an all-free bitmap. Mount must surface the divergence.
+        let mut store = fresh_store();
+        let bitmap_lba = store.superblock.bitmap_region_lba;
+        // Take ownership of the device through into_device.
+        let mut dev = store.into_device();
+        let mut block = [0u8; BLOCK_SIZE];
+        dev.read_block(bitmap_lba, &mut block).unwrap();
+        // bit 5 of byte 0 = 0x20. Bitmap convention is `1 = free`,
+        // so clear bit 5 to claim block 5 is occupied on disk.
+        block[0] &= !0x20;
+        dev.write_block(bitmap_lba, &block).unwrap();
+
+        let result = DiskObjectStore::open_or_format(dev, TEST_CAP);
+        assert_eq!(result.err(), Some(StoreError::InvalidObject));
+    }
+
+    #[test]
+    fn mount_rejects_unknown_version_superblock() {
+        // Synthesize a v1-shaped superblock and confirm
+        // open_or_format rejects it (matches the
+        // SuperblockState::UnknownVersion path).
+        let mut dev = MemBlockDevice::new(TEST_DEV_BLOCKS);
+        let mut buf = [0u8; BLOCK_SIZE];
+        buf[SB_OFF_MAGIC..SB_OFF_MAGIC + 8].copy_from_slice(&ARCOBJ_MAGIC);
+        buf[SB_OFF_VERSION..SB_OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
+        let cs = checksum8(&buf[..SB_CHECKSUM_COVER_END]);
+        buf[SB_OFF_CHECKSUM..SB_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        dev.write_block(SUPERBLOCK_LBA, &buf).unwrap();
+        let result = DiskObjectStore::open_or_format(dev, TEST_CAP);
+        assert_eq!(result.err(), Some(StoreError::InvalidObject));
     }
 
     #[test]
