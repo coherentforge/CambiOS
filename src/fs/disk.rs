@@ -899,6 +899,40 @@ fn decode_record_header_v2(buf: &Block) -> Result<Option<HeaderDecodedV2>, Store
     }))
 }
 
+/// Magic-dispatched record-header decode. Returns `Some(V1)` for
+/// `ARCOREC1` records, `Some(V2)` for `ARCOREC2` records, `None`
+/// for any other 8-byte magic (free slot). Per ADR-010 § Divergence
+/// 3 "v1 records remain readable forever" — the dispatcher is the
+/// load-bearing structural commitment to backward compatibility:
+/// any future record version adds an arm here, and existing
+/// versions keep their decode paths.
+enum DecodedHeader {
+    V1(HeaderDecoded),
+    V2(HeaderDecodedV2),
+}
+
+impl DecodedHeader {
+    /// Content hash — present in both versions at the same on-disk
+    /// offset.
+    fn content_hash(&self) -> [u8; 32] {
+        match self {
+            Self::V1(h) => h.content_hash,
+            Self::V2(h) => h.content_hash,
+        }
+    }
+}
+
+fn decode_record_header_any(buf: &Block) -> Result<Option<DecodedHeader>, StoreError> {
+    let magic = &buf[HDR_OFF_MAGIC..HDR_OFF_MAGIC + 8];
+    if magic == ARCOREC_MAGIC_OCCUPIED {
+        Ok(decode_record_header(buf)?.map(DecodedHeader::V1))
+    } else if magic == ARCOREC_MAGIC_V2 {
+        Ok(decode_record_header_v2(buf)?.map(DecodedHeader::V2))
+    } else {
+        Ok(None)
+    }
+}
+
 // ============================================================================
 // DiskObjectStore
 // ============================================================================
@@ -1170,12 +1204,15 @@ impl<B: BlockDevice> DiskObjectStore<B> {
             device
                 .read_block(header_lba(slot), &mut header_buf)
                 .map_err(block_err_to_store)?;
-            if let Some(hdr) = decode_record_header(&header_buf)? {
+            if let Some(hdr) = decode_record_header_any(&header_buf)? {
                 // Dedup safety: if two slots claim the same content hash,
                 // only the first registers — the later occurrence is orphaned
                 // and will be reclaimed on next put (its slot is treated as
-                // occupied, but the index never points at it).
-                if index.insert(hdr.content_hash, slot).is_none() {
+                // occupied, but the index never points at it). v1 and v2
+                // records share the same content-hash space (Blake3 of
+                // content is the address), so the dedup check is
+                // version-agnostic.
+                if index.insert(hdr.content_hash(), slot).is_none() {
                     free.mark_occupied(slot);
                     count += 1;
                 }
@@ -1236,6 +1273,191 @@ impl<B: BlockDevice> DiskObjectStore<B> {
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
+
+    // ============================================================================
+    // v2 record I/O helpers (commit 5D-iii)
+    // ============================================================================
+
+    /// Allocate `content_len.div_ceil(BLOCK_SIZE)` data blocks as a
+    /// single contiguous extent. Returns the v2-record extent array
+    /// (one extent populated, the rest `None`) and the list of
+    /// allocated data-block indices for the bitmap mutation. For
+    /// empty content, both are empty / all-None.
+    ///
+    /// Single-extent allocation is the 5D-iii strategy. Multi-extent
+    /// fallback (find smaller contiguous runs to satisfy the request
+    /// when no single run fits) is the natural extension.
+    /// Revisit when: a put returns `CapacityExceeded` with non-zero
+    /// `find_first_free_run(blocks_needed - k)` for some `k > 0`
+    /// (i.e., enough free blocks exist but no single contiguous
+    /// extent fits).
+    fn allocate_data_blocks_single_extent(
+        &self,
+        content_len: usize,
+    ) -> Result<(
+        [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT],
+        alloc::vec::Vec<u64>,
+    ), StoreError> {
+        let mut extents: [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT] =
+            [None; MAX_EXTENTS_PER_CAMBIOBJECT];
+        if content_len == 0 {
+            return Ok((extents, alloc::vec::Vec::new()));
+        }
+        let blocks_needed = content_len.div_ceil(BLOCK_SIZE) as u64;
+        let start_block = self
+            .bitmap
+            .find_first_free_run(blocks_needed)
+            .ok_or(StoreError::CapacityExceeded)?;
+        extents[0] = Some(Extent {
+            start_lba: self.superblock.data_region_lba + start_block,
+            block_count: blocks_needed as u32,
+        });
+        let allocated: alloc::vec::Vec<u64> =
+            (start_block..start_block + blocks_needed).collect();
+        Ok((extents, allocated))
+    }
+
+    /// Write `content` bytes into the data-region blocks referenced by
+    /// `extents`. Iterates extents in order; each extent contributes
+    /// `block_count` contiguous blocks starting at `start_lba`. The
+    /// content is split across blocks with the trailing block
+    /// zero-padded (canonical-form posture: only the meaningful
+    /// content bytes are non-zero, padding is zero).
+    fn write_content_to_extents(
+        &mut self,
+        extents: &[Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT],
+        content: &[u8],
+    ) -> Result<(), StoreError> {
+        let mut written = 0usize;
+        for slot in extents.iter() {
+            let extent = match slot {
+                Some(e) => *e,
+                None => break,
+            };
+            for j in 0..extent.block_count as u64 {
+                let remaining = content.len() - written;
+                if remaining == 0 {
+                    // No more content to write; remaining blocks would
+                    // be entirely padding, no need to issue the writes.
+                    return Ok(());
+                }
+                let copy = core::cmp::min(BLOCK_SIZE, remaining);
+                let mut block_buf = [0u8; BLOCK_SIZE];
+                block_buf[..copy].copy_from_slice(&content[written..written + copy]);
+                self.device
+                    .write_block(extent.start_lba + j, &block_buf)
+                    .map_err(block_err_to_store)?;
+                written += copy;
+            }
+        }
+        if written != content.len() {
+            // Allocated extents undercount content blocks — bug in
+            // allocate_data_blocks_single_extent.
+            return Err(StoreError::InvalidObject);
+        }
+        Ok(())
+    }
+
+    /// Read up to `content_len` bytes from the data-region blocks
+    /// referenced by `extents`. Iterates extents in order; the
+    /// returned vector is exactly `content_len` bytes (trailing
+    /// padding from the last block is dropped).
+    fn read_content_from_extents(
+        &mut self,
+        extents: &[Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT],
+        content_len: usize,
+    ) -> Result<alloc::vec::Vec<u8>, StoreError> {
+        let mut content = alloc::vec::Vec::with_capacity(content_len);
+        for slot in extents.iter() {
+            let extent = match slot {
+                Some(e) => *e,
+                None => break,
+            };
+            for j in 0..extent.block_count as u64 {
+                let remaining = content_len - content.len();
+                if remaining == 0 {
+                    return Ok(content);
+                }
+                let mut block_buf = [0u8; BLOCK_SIZE];
+                self.device
+                    .read_block(extent.start_lba + j, &mut block_buf)
+                    .map_err(block_err_to_store)?;
+                let copy = core::cmp::min(BLOCK_SIZE, remaining);
+                content.extend_from_slice(&block_buf[..copy]);
+            }
+        }
+        if content.len() != content_len {
+            // Extents undercount content blocks — corrupt record.
+            return Err(StoreError::InvalidObject);
+        }
+        Ok(content)
+    }
+
+    /// Execute the device writes described by an [`Append`] and
+    /// flush. Writes the pad first (if present), then the real
+    /// record. Mirrors `PosixFsBackend::commit_journal_append`.
+    fn commit_journal_append(
+        &mut self,
+        append: &crate::fs::journal::Append,
+        real_bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        if let Some((pad_at, pad_bytes)) = &append.pad_at {
+            self.write_journal_bytes(*pad_at, pad_bytes)?;
+            self.device.flush().map_err(block_err_to_store)?;
+        }
+        self.write_journal_bytes(append.real_at, real_bytes)?;
+        self.device.flush().map_err(block_err_to_store)?;
+        Ok(())
+    }
+
+    /// Write `bytes` into the journal region starting at byte
+    /// `byte_offset`. Mirrors `PosixFsBackend::write_journal_bytes` —
+    /// read-modify-write on partial-block boundaries.
+    fn write_journal_bytes(
+        &mut self,
+        byte_offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let region_lba = self.superblock.journal_region_lba;
+        let mut cursor = byte_offset;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let block_idx = cursor / BLOCK_SIZE as u64;
+            let block_off = (cursor % BLOCK_SIZE as u64) as usize;
+            let lba = region_lba + block_idx;
+
+            let mut block = [0u8; BLOCK_SIZE];
+            self.device
+                .read_block(lba, &mut block)
+                .map_err(block_err_to_store)?;
+            let copy = core::cmp::min(BLOCK_SIZE - block_off, bytes.len() - written);
+            block[block_off..block_off + copy]
+                .copy_from_slice(&bytes[written..written + copy]);
+            self.device
+                .write_block(lba, &block)
+                .map_err(block_err_to_store)?;
+
+            cursor += copy as u64;
+            written += copy;
+        }
+        Ok(())
+    }
+
+    /// Write the on-disk bitmap-region block that contains the bit
+    /// for `block`. Re-encodes the in-memory bitmap and copies the
+    /// one affected block onto disk. Mirrors
+    /// `PosixFsBackend::flush_bitmap_region_for` — write-through
+    /// keeps the defense-in-depth mount check meaningful.
+    fn flush_bitmap_region_for(&mut self, block: u64) -> Result<(), StoreError> {
+        let bitmap_block_idx = block / (BLOCK_SIZE as u64 * 8);
+        let all_blocks = encode_to_blocks(&self.bitmap).map_err(|_| StoreError::InvalidObject)?;
+        let lba = self.superblock.bitmap_region_lba + bitmap_block_idx;
+        self.device
+            .write_block(lba, &all_blocks[bitmap_block_idx as usize])
+            .map_err(block_err_to_store)?;
+        self.device.flush().map_err(block_err_to_store)?;
+        Ok(())
+    }
 }
 
 impl<B: BlockDevice> ObjectStore for DiskObjectStore<B> {
@@ -1246,19 +1468,48 @@ impl<B: BlockDevice> ObjectStore for DiskObjectStore<B> {
         self.device
             .read_block(header_lba(slot), &mut header_buf)
             .map_err(block_err_to_store)?;
-        let header = decode_record_header(&header_buf)?.ok_or(StoreError::NotFound)?;
+        let decoded =
+            decode_record_header_any(&header_buf)?.ok_or(StoreError::NotFound)?;
 
         // Sanity: the slot's on-disk hash must match the index key.
-        if &header.content_hash != hash {
+        if &decoded.content_hash() != hash {
             return Err(StoreError::InvalidObject);
         }
 
-        let mut content_buf = [0u8; BLOCK_SIZE];
-        self.device
-            .read_block(content_lba(slot), &mut content_buf)
-            .map_err(block_err_to_store)?;
-
-        rebuild_cambi_object(header, &content_buf)
+        match decoded {
+            DecodedHeader::V1(header) => {
+                // Content lives inline at the slot's second block.
+                let mut content_buf = [0u8; BLOCK_SIZE];
+                self.device
+                    .read_block(content_lba(slot), &mut content_buf)
+                    .map_err(block_err_to_store)?;
+                rebuild_cambi_object(header, &content_buf)
+            }
+            DecodedHeader::V2(header) => {
+                // Content lives in the shared data region per the
+                // extent array. Read each extent's blocks in order
+                // and concatenate up to `content_len` bytes.
+                let content = self.read_content_from_extents(
+                    &header.extents,
+                    header.content_len as usize,
+                )?;
+                let computed = content_hash(&content);
+                if computed != header.content_hash {
+                    return Err(StoreError::InvalidObject);
+                }
+                Ok(CambiObject {
+                    content_hash: header.content_hash,
+                    author: header.author,
+                    owner: header.owner,
+                    sig_algo: header.sig_algo,
+                    signature: header.signature,
+                    capabilities: header.capabilities,
+                    lineage: header.lineage,
+                    created_at: header.created_at,
+                    content,
+                })
+            }
+        }
     }
 
     fn put(&mut self, object: CambiObject) -> Result<[u8; 32], StoreError> {
@@ -1266,32 +1517,68 @@ impl<B: BlockDevice> ObjectStore for DiskObjectStore<B> {
         if computed != object.content_hash {
             return Err(StoreError::InvalidObject);
         }
-        if object.content.len() > MAX_CONTENT_BYTES_ON_DISK {
-            return Err(StoreError::CapacityExceeded);
-        }
         if self.index.contains_key(&object.content_hash) {
             return Ok(object.content_hash);
         }
 
         let slot = self.free.first_free().ok_or(StoreError::CapacityExceeded)?;
 
-        // Step 1: write content block.
-        let mut content_buf = [0u8; BLOCK_SIZE];
-        encode_content_block(&mut content_buf, &object.content);
-        self.device
-            .write_block(content_lba(slot), &content_buf)
-            .map_err(block_err_to_store)?;
-        self.device.flush().map_err(block_err_to_store)?;
+        // Single-extent allocation: find one contiguous free run that
+        // fits the entire content. Multi-extent fallback documented at
+        // `allocate_data_blocks_single_extent`. For empty content the
+        // extents array is all-None and no bitmap mutations occur.
+        let (extents, allocated_blocks) =
+            self.allocate_data_blocks_single_extent(object.content.len())?;
 
-        // Step 2: write header block (commit point).
+        // Build the journal record. ExtentUpdate is the canonical
+        // record kind for bitmap mutations (per ADR-029 § Decision
+        // 5). CambiObject puts use `InodeId::new(0)` as a placeholder
+        // — the inode field is POSIX semantics; only the mutations
+        // matter to journal-replay.
+        if !allocated_blocks.is_empty() {
+            let mutations: Vec<crate::fs::journal::BitmapMutation> = allocated_blocks
+                .iter()
+                .map(|&b| crate::fs::journal::BitmapMutation::Set(b))
+                .collect();
+            let record = JournalRecord::extent_update(
+                cambios_abi::InodeId::new(0),
+                [None; cambios_abi::MAX_EXTENTS_PER_INODE],
+                mutations,
+            )
+            .map_err(|_| StoreError::InvalidObject)?;
+            let encoded = crate::fs::journal::encode_record(&record)
+                .map_err(|_| StoreError::InvalidObject)?;
+            let append = self
+                .journal
+                .append(&encoded)
+                .map_err(|_| StoreError::InvalidObject)?;
+            self.commit_journal_append(&append, &encoded)?;
+        }
+
+        // Write content blocks to the allocated extents.
+        self.write_content_to_extents(&extents, &object.content)?;
+
+        // Write the v2 record header (commit point for the slot).
         let mut header_buf = [0u8; BLOCK_SIZE];
-        encode_record_header(&mut header_buf, &object)?;
+        encode_record_header_v2(&mut header_buf, &object, &extents)?;
         self.device
             .write_block(header_lba(slot), &header_buf)
             .map_err(block_err_to_store)?;
         self.device.flush().map_err(block_err_to_store)?;
 
-        // Step 3: update in-memory index.
+        // Commit in-memory bitmap + write through the affected
+        // bitmap-region blocks (defense-in-depth invariant: on-disk
+        // bitmap matches the journal projection after each commit).
+        for &block in &allocated_blocks {
+            self.bitmap
+                .mark_occupied(block)
+                .map_err(|_| StoreError::InvalidObject)?;
+        }
+        for &block in &allocated_blocks {
+            self.flush_bitmap_region_for(block)?;
+        }
+
+        // Step 7: update in-memory index.
         self.index.insert(object.content_hash, slot);
         self.free.mark_occupied(slot);
         self.count += 1;
@@ -1301,8 +1588,60 @@ impl<B: BlockDevice> ObjectStore for DiskObjectStore<B> {
     fn delete(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
         let slot = self.index.remove(hash).ok_or(StoreError::NotFound)?;
 
-        // Overwrite the header block with zeros. Content block is left as-is
-        // per ADR-010 (unlink semantics, not secure erase).
+        // Read the header to determine whether it's v1 (no bitmap
+        // mutations needed) or v2 (free the data-region blocks).
+        let mut header_buf = [0u8; BLOCK_SIZE];
+        self.device
+            .read_block(header_lba(slot), &mut header_buf)
+            .map_err(block_err_to_store)?;
+        let decoded = decode_record_header_any(&header_buf)?;
+
+        // For v2 records: free the data-region blocks via a journal
+        // record before zeroing the header. Single bitmap-mutation
+        // record per ADR-029 § Decision 5.
+        if let Some(DecodedHeader::V2(header)) = decoded {
+            let data_region_lba = self.superblock.data_region_lba;
+            let mut freed_blocks: Vec<u64> = Vec::new();
+            let mut mutations: Vec<crate::fs::journal::BitmapMutation> = Vec::new();
+            for slot_opt in header.extents.iter() {
+                if let Some(extent) = slot_opt {
+                    for j in 0..extent.block_count as u64 {
+                        let block = extent.start_lba + j - data_region_lba;
+                        freed_blocks.push(block);
+                        mutations.push(crate::fs::journal::BitmapMutation::Clear(block));
+                    }
+                }
+            }
+            if !mutations.is_empty() {
+                let record = JournalRecord::extent_update(
+                    cambios_abi::InodeId::new(0),
+                    [None; cambios_abi::MAX_EXTENTS_PER_INODE],
+                    mutations,
+                )
+                .map_err(|_| StoreError::InvalidObject)?;
+                let encoded = crate::fs::journal::encode_record(&record)
+                    .map_err(|_| StoreError::InvalidObject)?;
+                let append = self
+                    .journal
+                    .append(&encoded)
+                    .map_err(|_| StoreError::InvalidObject)?;
+                self.commit_journal_append(&append, &encoded)?;
+
+                for &block in &freed_blocks {
+                    self.bitmap
+                        .mark_free(block)
+                        .map_err(|_| StoreError::InvalidObject)?;
+                }
+                for &block in &freed_blocks {
+                    self.flush_bitmap_region_for(block)?;
+                }
+            }
+        }
+
+        // Overwrite the header block with zeros. Content blocks are
+        // left as-is per ADR-010 (unlink semantics, not secure erase);
+        // for v2 records the underlying data-region blocks are now
+        // free and will be overwritten on next allocation.
         let zero_block = [0u8; BLOCK_SIZE];
         self.device
             .write_block(header_lba(slot), &zero_block)
@@ -1556,12 +1895,108 @@ mod tests {
     }
 
     #[test]
-    fn put_content_too_large() {
+    fn put_content_exceeding_data_region_fails() {
+        // v2 records support multi-block content, so the old v1 cap
+        // (MAX_CONTENT_BYTES_ON_DISK = 1 block) no longer applies.
+        // Content failure happens when the request exceeds the
+        // single-extent allocator's largest available contiguous run.
+        // For fresh_store() that's TEST_DATA_BLOCKS = 32 blocks.
         let mut store = fresh_store();
         let author = Principal::from_public_key([1u8; 32]);
-        let big = alloc::vec![42u8; MAX_CONTENT_BYTES_ON_DISK + 1];
-        let obj = CambiObject::new(author, big, 0);
+        let too_big = alloc::vec![42u8; (TEST_DATA_BLOCKS as usize + 1) * BLOCK_SIZE];
+        let obj = CambiObject::new(author, too_big, 0);
         assert_eq!(store.put(obj), Err(StoreError::CapacityExceeded));
+    }
+
+    #[test]
+    fn put_multi_block_content_round_trips() {
+        // v2 records can hold content spanning multiple data blocks
+        // (single-extent allocation). Verify a 3-block payload
+        // round-trips through put → get.
+        let mut store = fresh_store();
+        let author = Principal::from_public_key([2u8; 32]);
+        // 3 blocks of content with a recognizable pattern at each
+        // block boundary so off-by-block errors surface as content
+        // mismatches.
+        let mut content = alloc::vec::Vec::with_capacity(3 * BLOCK_SIZE);
+        for i in 0..3 {
+            for j in 0..BLOCK_SIZE {
+                content.push((i * 251 + j as usize) as u8);
+            }
+        }
+        let obj = CambiObject::new(author, content.clone(), 100);
+        let hash = store.put(obj.clone()).unwrap();
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got.content, content);
+        assert_eq!(got.content_hash, obj.content_hash);
+    }
+
+    #[test]
+    fn put_writes_v2_record_with_extent() {
+        // Confirm the on-disk record's magic is ARCOREC2 (v2) post-put.
+        let mut store = fresh_store();
+        let obj = make_object(1, b"new v2 record");
+        store.put(obj).unwrap();
+        let mut dev = store.into_device();
+        let mut header_buf = [0u8; BLOCK_SIZE];
+        dev.read_block(header_lba(0), &mut header_buf).unwrap();
+        assert_eq!(&header_buf[..8], &ARCOREC_MAGIC_V2);
+    }
+
+    #[test]
+    fn put_bitmap_marks_allocated_blocks() {
+        // After put with non-empty content, the in-memory bitmap
+        // reflects the allocation.
+        let mut store = fresh_store();
+        let initial_free = store.bitmap().free_count();
+        let obj = make_object(1, b"single-block content");
+        store.put(obj).unwrap();
+        assert_eq!(store.bitmap().free_count(), initial_free - 1);
+    }
+
+    #[test]
+    fn delete_v2_frees_data_blocks() {
+        let mut store = fresh_store();
+        let initial_free = store.bitmap().free_count();
+        let obj = make_object(1, b"to be deleted");
+        let hash = store.put(obj).unwrap();
+        assert_eq!(store.bitmap().free_count(), initial_free - 1);
+        store.delete(&hash).unwrap();
+        // Free count back to initial after delete journals the
+        // BitmapMutation::Clear.
+        assert_eq!(store.bitmap().free_count(), initial_free);
+    }
+
+    #[test]
+    fn v2_record_survives_reboot_via_journal_replay() {
+        let dev = MemBlockDevice::new(TEST_DEV_BLOCKS);
+        let mut store = DiskObjectStore::open_or_format(dev, TEST_CAP).unwrap();
+        let obj = make_object(7, b"persists across reboot");
+        let hash = store.put(obj.clone()).unwrap();
+        let bitmap_after_put = store.bitmap().free_count();
+
+        let dev = store.into_device();
+        let mut store2 = DiskObjectStore::open_or_format(dev, TEST_CAP).unwrap();
+        // Bitmap was reconstructed via journal replay; the allocated
+        // block stays occupied across remount.
+        assert_eq!(store2.bitmap().free_count(), bitmap_after_put);
+        let got = store2.get(&hash).unwrap();
+        assert_eq!(got.content, b"persists across reboot");
+        assert_eq!(got.content_hash, obj.content_hash);
+    }
+
+    #[test]
+    fn put_empty_content_allocates_no_blocks() {
+        // Empty content → no bitmap mutations, but the slot is still
+        // claimed (header written with all-None extents).
+        let mut store = fresh_store();
+        let initial_free = store.bitmap().free_count();
+        let author = Principal::from_public_key([9u8; 32]);
+        let obj = CambiObject::new(author, alloc::vec::Vec::new(), 0);
+        let hash = store.put(obj).unwrap();
+        assert_eq!(store.bitmap().free_count(), initial_free);
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got.content, &[] as &[u8]);
     }
 
     #[test]
