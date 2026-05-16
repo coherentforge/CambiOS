@@ -26,6 +26,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use cambios_abi::Extent;
+
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
 use crate::fs::{
     content_hash, CambiObject, ObjectCapSet, ObjectMeta, ObjectRights, ObjectStore,
@@ -41,12 +43,29 @@ use crate::ipc::Principal;
 /// family, not a version bump.
 pub const ARCOBJ_MAGIC: [u8; 8] = *b"ARCOBJ00";
 
-/// ARCHITECTURAL: record-header magic for an occupied slot. Absence = free.
+/// ARCHITECTURAL: v1 record-header magic for an occupied slot. Absence
+/// (or any other 8-byte value) = free / never-written. Content for v1
+/// records lives inline in the slot's second block (LBA `2 + 2*i`).
 pub const ARCOREC_MAGIC_OCCUPIED: [u8; 8] = *b"ARCOREC1";
+
+/// ARCHITECTURAL: v2 record-header magic per
+/// [ADR-010 § Divergence 3](../../docs/adr/010-persistent-object-store-on-disk-format.md).
+/// v2 records carry a 16-entry extent array at offset 568..760; content
+/// data lives in the shared data region, not inline. Mount distinguishes
+/// v1 vs v2 records by this magic byte sequence; v1 records remain
+/// readable forever per the Divergence's no-migration commitment.
+pub const ARCOREC_MAGIC_V2: [u8; 8] = *b"ARCOREC2";
 
 /// ARCHITECTURAL: current format version. Mount rejects unknown versions.
 /// Version 2 lands when ML-DSA signatures or multi-block content arrives.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// ARCHITECTURAL: maximum data-region extents per v2 CambiObject record.
+/// Matches `cambios_abi::MAX_EXTENTS_PER_INODE` (= 16) so journal records
+/// (`ExtentUpdate`, shared between POSIX and CambiObject) carry one
+/// canonical extent-array shape. ADR-010 § Divergence 3 fixes 192 bytes
+/// (offset 568..760) for the extent array at 12 bytes per entry.
+pub const MAX_EXTENTS_PER_CAMBIOBJECT: usize = cambios_abi::MAX_EXTENTS_PER_INODE;
 
 /// SCAFFOLDING: maximum number of object slots this implementation supports.
 /// Why: v1 workload is human-scale (identity attestations, small documents,
@@ -98,6 +117,17 @@ const CAP_OFF_RIGHTS: usize = 40;
 const CAP_RIGHT_READ: u8 = 0b0001;
 const CAP_RIGHT_WRITE: u8 = 0b0010;
 const CAP_RIGHT_EXECUTE: u8 = 0b0100;
+
+// v2 record-header extent array layout (ADR-010 § Divergence 3).
+// Extents start where v1's reserved region begins, occupy 192 bytes
+// (16 × 12), and leave the remaining reserved bytes for ML-DSA + future
+// extensions.
+const HDR_V2_OFF_EXTENTS: usize = 568;
+const EXTENT_PACKED_SIZE: usize = 12;
+const HDR_V2_EXTENTS_BYTES: usize = MAX_EXTENTS_PER_CAMBIOBJECT * EXTENT_PACKED_SIZE;
+const HDR_V2_OFF_EXTENT_REGION_END: usize = HDR_V2_OFF_EXTENTS + HDR_V2_EXTENTS_BYTES;
+const EXTENT_OFF_START_LBA: usize = 0;
+const EXTENT_OFF_BLOCK_COUNT: usize = 8;
 
 // LBA helpers
 const SUPERBLOCK_LBA: u64 = 0;
@@ -450,6 +480,267 @@ fn rebuild_cambi_object(header: HeaderDecoded, content_block: &Block) -> Result<
         created_at: header.created_at,
         content,
     })
+}
+
+// ============================================================================
+// v2 record codec (ADR-010 § Divergence 3)
+// ============================================================================
+//
+// v2 records share the v1 fixed-field layout (offsets 0..568) so the
+// content-addressing, signature, ACL, and lineage semantics are
+// byte-identical between versions. v2 adds a 16-entry extent array at
+// offset 568..760 (192 bytes) replacing the leading 192 bytes of v1's
+// reserved region. The remaining 3328 bytes (760..4088) stay reserved
+// for the future ML-DSA signature tail.
+//
+// Content for v2 records lives in the shared data region pointed to by
+// the extent array; the slot's second block changes role from "content"
+// to "reserved tail" (zero-filled in v1, ML-DSA-bound). Mount
+// distinguishes versions by the leading 8-byte magic — `ARCOREC1` for
+// v1, `ARCOREC2` for v2; anything else reads as a free slot.
+//
+// 5D-i lands the pure-function codec. The mount-side dispatch in
+// `decode_record_header` that recognizes `ARCOREC2` lands in 5D-iii
+// alongside the v2-aware get/put path; until then, decode_record_header
+// continues to treat v2 magic as a free slot.
+
+/// Decoded v2 record header. Mirrors `HeaderDecoded` (v1) plus the
+/// extent array. `extents` carries the on-disk extents packed
+/// contiguously from index 0; trailing slots are `None`. `content_len`
+/// is the total length across all extents (not bounded by `BLOCK_SIZE`
+/// the way v1 is).
+struct HeaderDecodedV2 {
+    content_len: u32,
+    content_hash: [u8; 32],
+    author: [u8; 32],
+    owner: [u8; 32],
+    sig_algo: SignatureAlgo,
+    lineage: Option<[u8; 32]>,
+    cap_count: u16,
+    created_at: u64,
+    signature: SignatureBytes,
+    capabilities: ObjectCapSet,
+    extents: [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT],
+}
+
+/// Validate that an extents array satisfies the contiguous-Some
+/// invariant — `Some(_)` entries pack from index 0 and the first
+/// `None` (if any) is followed by `None`s only. Mirrors
+/// `crate::fs::posix::validate_inode`'s posture on extent arrays so
+/// the on-disk canonical-form invariant is identical across backends.
+fn validate_extents(
+    extents: &[Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT],
+) -> Result<(), StoreError> {
+    let mut saw_none = false;
+    for slot in extents.iter() {
+        if slot.is_none() {
+            saw_none = true;
+        } else if saw_none {
+            return Err(StoreError::InvalidObject);
+        }
+    }
+    Ok(())
+}
+
+/// Encode a v2 record header. `obj` supplies the shared fields
+/// (content_hash, author, owner, signature, capabilities, lineage,
+/// created_at); `content_len` is taken from `obj.content.len()` for
+/// callers that pass the in-memory object. `extents` is the
+/// caller-built array of (start_lba, block_count) pairs describing
+/// where the content bytes live in the shared data region.
+///
+/// Caller invariants: `extents` must satisfy contiguous-Some (else
+/// `InvalidObject`); `obj.capabilities.len() ≤ MAX_OBJECT_CAPS`.
+/// The encoder is the canonical-form producer — trailing extent
+/// slots are zero, the post-extent reserved region (760..4088) is
+/// zero, the checksum is computed last.
+fn encode_record_header_v2(
+    buf: &mut Block,
+    obj: &CambiObject,
+    extents: &[Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT],
+) -> Result<(), StoreError> {
+    if obj.capabilities.len() > MAX_OBJECT_CAPS {
+        return Err(StoreError::InvalidObject);
+    }
+    validate_extents(extents)?;
+
+    buf.fill(0);
+    buf[HDR_OFF_MAGIC..HDR_OFF_MAGIC + 8].copy_from_slice(&ARCOREC_MAGIC_V2);
+    buf[HDR_OFF_CONTENT_LEN..HDR_OFF_CONTENT_LEN + 4]
+        .copy_from_slice(&(obj.content.len() as u32).to_le_bytes());
+    buf[HDR_OFF_CONTENT_HASH..HDR_OFF_CONTENT_HASH + 32].copy_from_slice(&obj.content_hash);
+    buf[HDR_OFF_AUTHOR..HDR_OFF_AUTHOR + 32].copy_from_slice(&obj.author);
+    buf[HDR_OFF_OWNER..HDR_OFF_OWNER + 32].copy_from_slice(&obj.owner);
+    buf[HDR_OFF_SIG_ALGO] = obj.sig_algo as u8;
+    buf[HDR_OFF_LINEAGE_PRESENT] = if obj.lineage.is_some() { 1 } else { 0 };
+    buf[HDR_OFF_CAP_COUNT..HDR_OFF_CAP_COUNT + 2]
+        .copy_from_slice(&(obj.capabilities.len() as u16).to_le_bytes());
+    buf[HDR_OFF_CREATED_AT..HDR_OFF_CREATED_AT + 8].copy_from_slice(&obj.created_at.to_le_bytes());
+    buf[HDR_OFF_SIGNATURE..HDR_OFF_SIGNATURE + 64].copy_from_slice(&obj.signature.data);
+    if let Some(lineage) = obj.lineage {
+        buf[HDR_OFF_LINEAGE..HDR_OFF_LINEAGE + 32].copy_from_slice(&lineage);
+    }
+
+    for (i, cap) in obj.capabilities.iter().enumerate() {
+        let base = HDR_OFF_CAPS + i * CAP_ENTRY_SIZE;
+        buf[base + CAP_OFF_PRINCIPAL..base + CAP_OFF_PRINCIPAL + 32]
+            .copy_from_slice(cap.principal.aid());
+        let expiry = cap.expiry.unwrap_or(0);
+        buf[base + CAP_OFF_EXPIRY..base + CAP_OFF_EXPIRY + 8]
+            .copy_from_slice(&expiry.to_le_bytes());
+        let mut rights = 0u8;
+        if cap.rights.read {
+            rights |= CAP_RIGHT_READ;
+        }
+        if cap.rights.write {
+            rights |= CAP_RIGHT_WRITE;
+        }
+        if cap.rights.execute {
+            rights |= CAP_RIGHT_EXECUTE;
+        }
+        buf[base + CAP_OFF_RIGHTS] = rights;
+    }
+
+    // Extents: 16 × 12 bytes starting at HDR_V2_OFF_EXTENTS. Unused
+    // slots stay zero (canonical form). buf.fill(0) above already
+    // zeroed the entire block, so trailing entries are correct by
+    // construction.
+    for (i, slot) in extents.iter().enumerate() {
+        if let Some(extent) = slot {
+            let base = HDR_V2_OFF_EXTENTS + i * EXTENT_PACKED_SIZE;
+            buf[base + EXTENT_OFF_START_LBA..base + EXTENT_OFF_START_LBA + 8]
+                .copy_from_slice(&extent.start_lba.to_le_bytes());
+            buf[base + EXTENT_OFF_BLOCK_COUNT..base + EXTENT_OFF_BLOCK_COUNT + 4]
+                .copy_from_slice(&extent.block_count.to_le_bytes());
+        }
+    }
+
+    let cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+    buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+    Ok(())
+}
+
+/// Decode a v2 record header. `None` means "not a v2 record" (magic
+/// mismatch or torn-write checksum failure — caller treats as free,
+/// matching the v1 mount protocol). `Err` means "v2 magic + valid
+/// checksum but malformed payload" (canonical-form violation, unknown
+/// kind/version, out-of-range counts).
+///
+/// Per ADR-029 § Divergence 1's strict-canonical posture (adopted here
+/// for v2 records): trailing extent slots past the last `Some(_)` must
+/// be zero, the post-extent reserved region (760..4088) must be zero,
+/// and extents must satisfy contiguous-Some on decode.
+fn decode_record_header_v2(buf: &Block) -> Result<Option<HeaderDecodedV2>, StoreError> {
+    let magic = &buf[HDR_OFF_MAGIC..HDR_OFF_MAGIC + 8];
+    if magic != ARCOREC_MAGIC_V2 {
+        return Ok(None);
+    }
+    let expected_cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+    if buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8] != expected_cs {
+        // Torn write at this slot. Same posture as v1: treat as free.
+        return Ok(None);
+    }
+
+    let content_len = read_u32_le(buf, HDR_OFF_CONTENT_LEN);
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(&buf[HDR_OFF_CONTENT_HASH..HDR_OFF_CONTENT_HASH + 32]);
+    let mut author = [0u8; 32];
+    author.copy_from_slice(&buf[HDR_OFF_AUTHOR..HDR_OFF_AUTHOR + 32]);
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(&buf[HDR_OFF_OWNER..HDR_OFF_OWNER + 32]);
+
+    let sig_algo = match buf[HDR_OFF_SIG_ALGO] {
+        0 => SignatureAlgo::Ed25519,
+        1 => SignatureAlgo::MlDsa65,
+        _ => return Err(StoreError::InvalidObject),
+    };
+    let lineage = if buf[HDR_OFF_LINEAGE_PRESENT] == 1 {
+        let mut l = [0u8; 32];
+        l.copy_from_slice(&buf[HDR_OFF_LINEAGE..HDR_OFF_LINEAGE + 32]);
+        Some(l)
+    } else {
+        None
+    };
+    let cap_count = read_u16_le(buf, HDR_OFF_CAP_COUNT);
+    if cap_count as usize > MAX_OBJECT_CAPS {
+        return Err(StoreError::InvalidObject);
+    }
+    let created_at = read_u64_le(buf, HDR_OFF_CREATED_AT);
+
+    let mut signature = SignatureBytes::EMPTY;
+    signature
+        .data
+        .copy_from_slice(&buf[HDR_OFF_SIGNATURE..HDR_OFF_SIGNATURE + 64]);
+
+    let mut caps = ObjectCapSet::new();
+    for i in 0..cap_count as usize {
+        let base = HDR_OFF_CAPS + i * CAP_ENTRY_SIZE;
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&buf[base + CAP_OFF_PRINCIPAL..base + CAP_OFF_PRINCIPAL + 32]);
+        let expiry_raw = read_u64_le(buf, base + CAP_OFF_EXPIRY);
+        let expiry = if expiry_raw == 0 { None } else { Some(expiry_raw) };
+        let rights_bits = buf[base + CAP_OFF_RIGHTS];
+        let rights = ObjectRights {
+            read: rights_bits & CAP_RIGHT_READ != 0,
+            write: rights_bits & CAP_RIGHT_WRITE != 0,
+            execute: rights_bits & CAP_RIGHT_EXECUTE != 0,
+        };
+        caps.grant(Principal::from_public_key(pk), rights, expiry)
+            .map_err(|_| StoreError::InvalidObject)?;
+    }
+
+    // Decode extents. An entry is "present" iff `(start_lba != 0) ||
+    // (block_count != 0)`. start_lba == 0 is impossible for a real
+    // extent (block 0 is the superblock) so this serves as the
+    // sentinel.
+    let mut extents: [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT] =
+        [None; MAX_EXTENTS_PER_CAMBIOBJECT];
+    let mut saw_none = false;
+    for i in 0..MAX_EXTENTS_PER_CAMBIOBJECT {
+        let base = HDR_V2_OFF_EXTENTS + i * EXTENT_PACKED_SIZE;
+        let start_lba = read_u64_le(buf, base + EXTENT_OFF_START_LBA);
+        let block_count = read_u32_le(buf, base + EXTENT_OFF_BLOCK_COUNT);
+        if start_lba == 0 && block_count == 0 {
+            saw_none = true;
+        } else if saw_none {
+            // Contiguous-Some violated: a real extent follows a
+            // sentinel. Canonical-form rejection per ADR-029
+            // § Divergence 1.
+            return Err(StoreError::InvalidObject);
+        } else if block_count == 0 {
+            // Half-sentinel: start_lba != 0 but block_count == 0.
+            // Not a valid extent.
+            return Err(StoreError::InvalidObject);
+        } else {
+            extents[i] = Some(Extent {
+                start_lba,
+                block_count,
+            });
+        }
+    }
+
+    // Canonical-form: the post-extent reserved region must be zero.
+    // Bytes [HDR_V2_OFF_EXTENT_REGION_END .. HDR_OFF_CHECKSUM).
+    if buf[HDR_V2_OFF_EXTENT_REGION_END..HDR_OFF_CHECKSUM]
+        .iter()
+        .any(|&b| b != 0)
+    {
+        return Err(StoreError::InvalidObject);
+    }
+
+    Ok(Some(HeaderDecodedV2 {
+        content_len,
+        content_hash,
+        author,
+        owner,
+        sig_algo,
+        lineage,
+        cap_count,
+        created_at,
+        signature,
+        capabilities: caps,
+        extents,
+    }))
 }
 
 // ============================================================================
@@ -1161,5 +1452,203 @@ mod tests {
         assert_eq!(header_lba(5), 11);
         assert_eq!(content_lba(5), 12);
         assert_eq!(total_blocks_for_capacity(10), 21);
+    }
+
+    // ========================================================================
+    // v2 record header codec (commit 5D-i, ADR-010 § Divergence 3)
+    // ========================================================================
+
+    fn empty_extents() -> [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT] {
+        [None; MAX_EXTENTS_PER_CAMBIOBJECT]
+    }
+
+    fn make_v2_extents(count: usize) -> [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT] {
+        let mut e = empty_extents();
+        for i in 0..count {
+            e[i] = Some(Extent {
+                start_lba: 1000 + i as u64,
+                block_count: 1 + i as u32,
+            });
+        }
+        e
+    }
+
+    #[test]
+    fn v2_record_roundtrip_no_extents() {
+        let obj = make_object(7, b"v2 with no allocated content");
+        let extents = empty_extents();
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        let hdr = decode_record_header_v2(&buf).unwrap().expect("v2 decode");
+        assert_eq!(hdr.content_hash, obj.content_hash);
+        assert_eq!(hdr.author, obj.author);
+        assert_eq!(hdr.owner, obj.owner);
+        assert_eq!(hdr.content_len, obj.content.len() as u32);
+        assert!(hdr.extents.iter().all(|e| e.is_none()));
+    }
+
+    #[test]
+    fn v2_record_roundtrip_populated_extents() {
+        let obj = make_object(1, b"v2 with three extents");
+        let extents = make_v2_extents(3);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        let hdr = decode_record_header_v2(&buf).unwrap().expect("v2 decode");
+        for i in 0..3 {
+            assert_eq!(hdr.extents[i], extents[i]);
+        }
+        for i in 3..MAX_EXTENTS_PER_CAMBIOBJECT {
+            assert!(hdr.extents[i].is_none());
+        }
+    }
+
+    #[test]
+    fn v2_record_roundtrip_full_capacity_extents() {
+        let obj = make_object(2, b"v2 full extents");
+        let extents = make_v2_extents(MAX_EXTENTS_PER_CAMBIOBJECT);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        let hdr = decode_record_header_v2(&buf).unwrap().expect("v2 decode");
+        for i in 0..MAX_EXTENTS_PER_CAMBIOBJECT {
+            assert_eq!(hdr.extents[i], extents[i]);
+        }
+    }
+
+    #[test]
+    fn v2_encode_rejects_non_contiguous_extents() {
+        let obj = make_object(1, b"x");
+        let mut extents = empty_extents();
+        // Skip slot 0, populate slot 1 — violates contiguous-Some.
+        extents[1] = Some(Extent {
+            start_lba: 100,
+            block_count: 1,
+        });
+        let mut buf = [0u8; BLOCK_SIZE];
+        assert_eq!(
+            encode_record_header_v2(&mut buf, &obj, &extents),
+            Err(StoreError::InvalidObject),
+        );
+    }
+
+    #[test]
+    fn v2_decode_rejects_non_contiguous_extents() {
+        // Hand-craft a buffer where extent slot 0 is sentinel and
+        // slot 1 is a real extent. Recompute checksum so the only
+        // violation is the contiguous-Some invariant.
+        let obj = make_object(1, b"y");
+        let extents = empty_extents();
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        // Poke a real extent into slot 1, leaving slot 0 zero.
+        let base = HDR_V2_OFF_EXTENTS + EXTENT_PACKED_SIZE;
+        buf[base..base + 8].copy_from_slice(&500u64.to_le_bytes());
+        buf[base + 8..base + 12].copy_from_slice(&2u32.to_le_bytes());
+        let cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+        buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        match decode_record_header_v2(&buf) {
+            Err(StoreError::InvalidObject) => {}
+            other => panic!("expected InvalidObject, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn v2_decode_rejects_half_sentinel_extent() {
+        // start_lba != 0 but block_count == 0 — neither a real extent
+        // nor a sentinel. Canonical-form rejection.
+        let obj = make_object(1, b"z");
+        let extents = empty_extents();
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        let base = HDR_V2_OFF_EXTENTS;
+        buf[base..base + 8].copy_from_slice(&100u64.to_le_bytes());
+        // block_count stays 0.
+        let cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+        buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        match decode_record_header_v2(&buf) {
+            Err(StoreError::InvalidObject) => {}
+            other => panic!("expected InvalidObject, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn v2_decode_rejects_nonzero_reserved_tail() {
+        let obj = make_object(1, b"q");
+        let extents = make_v2_extents(2);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        // Poke a byte in the post-extent reserved region.
+        buf[HDR_V2_OFF_EXTENT_REGION_END + 100] = 0x42;
+        let cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+        buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        match decode_record_header_v2(&buf) {
+            Err(StoreError::InvalidObject) => {}
+            other => panic!("expected InvalidObject, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn v2_decode_bad_magic_returns_none() {
+        // v1 magic on a buffer should not be picked up by v2 decoder.
+        let obj = make_object(3, b"v1");
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header(&mut buf, &obj).unwrap();
+        assert!(decode_record_header_v2(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn v2_decode_bad_checksum_reads_as_free() {
+        let obj = make_object(4, b"torn");
+        let extents = make_v2_extents(1);
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        buf[500] ^= 0xFF;
+        // Torn-write posture: not an error, just "treat as free."
+        assert!(decode_record_header_v2(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn v2_decode_rejects_unknown_sig_algo() {
+        let obj = make_object(5, b"x");
+        let extents = empty_extents();
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        buf[HDR_OFF_SIG_ALGO] = 99;
+        let cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+        buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        match decode_record_header_v2(&buf) {
+            Err(StoreError::InvalidObject) => {}
+            other => panic!("expected InvalidObject, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn v2_decode_rejects_cap_count_overflow() {
+        let obj = make_object(6, b"x");
+        let extents = empty_extents();
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_record_header_v2(&mut buf, &obj, &extents).unwrap();
+        let bad = (MAX_OBJECT_CAPS as u16 + 1).to_le_bytes();
+        buf[HDR_OFF_CAP_COUNT..HDR_OFF_CAP_COUNT + 2].copy_from_slice(&bad);
+        let cs = checksum8(&buf[..HDR_CHECKSUM_COVER_END]);
+        buf[HDR_OFF_CHECKSUM..HDR_OFF_CHECKSUM + 8].copy_from_slice(&cs);
+        match decode_record_header_v2(&buf) {
+            Err(StoreError::InvalidObject) => {}
+            other => panic!("expected InvalidObject, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn v2_and_v1_magic_distinct_on_disk() {
+        // Encoding the same logical object as v1 vs v2 produces
+        // distinct first 8 bytes — the magic byte sequence is the
+        // dispatch signal at decode time.
+        let obj = make_object(8, b"distinct");
+        let mut v1_buf = [0u8; BLOCK_SIZE];
+        let mut v2_buf = [0u8; BLOCK_SIZE];
+        encode_record_header(&mut v1_buf, &obj).unwrap();
+        encode_record_header_v2(&mut v2_buf, &obj, &empty_extents()).unwrap();
+        assert_eq!(&v1_buf[..8], b"ARCOREC1");
+        assert_eq!(&v2_buf[..8], b"ARCOREC2");
+        assert_ne!(&v1_buf[..8], &v2_buf[..8]);
     }
 }
