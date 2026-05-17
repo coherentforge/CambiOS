@@ -24,7 +24,7 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 012 | [Input Architecture and Device Classes](012-input-architecture-and-device-classes.md) | Accepted | 2026-04-14 |
 | 013 | [RISC-V (riscv64gc) Architecture Support](013-riscv64-architecture-support.md) | Accepted | 2026-04-15 |
 | 014 | [Compositor ↔ Scanout-Driver Protocol](014-compositor-scanout-driver-protocol.md) | Accepted | 2026-04-15 |
-| 015 | [Storage Tiers and the Commitment Ladder](015-storage-tiers-and-commitment-ladder.md) | Proposed | 2026-04-16 |
+| 015 | [Storage Tiers and the Commitment Ladder](015-storage-tiers-and-commitment-ladder.md) | Stale — superseded by [ADR-028](028-three-storage-models.md) (2026-05-11) | 2026-04-16 (frozen as historical record) |
 | 016 | [Windows Compatibility via Bounded Static Shims](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-21 |
 | 017 | [User-Directed Cloud Inference](017-user-directed-cloud-inference.md) | Proposed | 2026-04-21 |
 | 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Proposed | 2026-04-19 |
