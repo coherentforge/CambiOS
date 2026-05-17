@@ -39,14 +39,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use cambios_abi::{
-    AclEntry, Extent, InodeId, InodeKind, PosixInode, Rights,
+    AclEntry, Extent, FileMetadata, InodeId, InodeKind, PosixInode, Rights,
     MAX_EXTENTS_PER_INODE, MAX_INODE_ACL_ENTRIES,
 };
 
 use crate::fs::bitmap::{decode_from_blocks, encode_to_blocks, BitmapError, BlockBitmap};
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
 use crate::fs::journal::{
-    encode_record, Append, BitmapMutation, Journal, JournalError, JournalRecord,
+    encode_record, AclChange, Append, BitmapMutation, Journal, JournalError, JournalRecord,
 };
 use crate::ipc::Principal;
 
@@ -1302,6 +1302,235 @@ impl<B: BlockDevice> PosixFsBackend<B> {
         Err(FsError::PermissionDenied)
     }
 
+    /// Return inode metadata for `inode_id`. ADR-029 § Decision 4
+    /// SYS_STAT backend half: caller must have Read access (either
+    /// owner or an ACL.Read entry) per ADR-029 § Decision 3's auth
+    /// table. The returned `FileMetadata` carries the
+    /// userspace-visible subset of the inode header (kind / size /
+    /// owner / timestamps / link_count); `extents` and `acl` are
+    /// not exposed here — the path namespace and the ACL ops are
+    /// the routes for those.
+    ///
+    /// Read-only; mutates no backend state. Returns
+    /// `FsError::InodeNotFound` for a free slot or out-of-range
+    /// `inode_id`; `FsError::PermissionDenied` when the caller
+    /// neither owns the inode nor holds an ACL entry covering
+    /// Read.
+    pub fn stat_inode(
+        &mut self,
+        caller: Principal,
+        inode_id: InodeId,
+        now_ticks: u64,
+    ) -> Result<FileMetadata, FsError> {
+        let inode = self.get_inode(inode_id)?;
+        self.authorize_read(&inode, caller, now_ticks)?;
+        Ok(FileMetadata {
+            inode_id,
+            kind: inode.kind,
+            size_bytes: inode.size_bytes,
+            owner: inode.owner,
+            created_at: inode.created_at,
+            modified_at: inode.modified_at,
+            link_count: inode.link_count,
+        })
+    }
+
+    /// Add or replace a `(principal, rights, expiry)` row in the
+    /// ACL of `inode_id`. ADR-029 § Decision 4 SYS_ACL_GRANT
+    /// backend half: caller must be the inode owner. If an entry
+    /// for `target_principal` already exists, its rights and
+    /// expiry are overwritten (upsert per the journal's
+    /// `AclGrant` doc: "adds or replaces a row"). If no entry
+    /// exists, the lowest-numbered free slot is used; when the
+    /// inline ACL is full, returns `FsError::OutOfSpace` (maps
+    /// to userspace `ENOSPC` — workloads needing >16 distinct
+    /// grantees route through ADR-027 cluster delegation per
+    /// ADR-029 § Decision 3, not by stuffing more entries).
+    ///
+    /// Order: journal-flush -> inode-header-write per ADR-029
+    /// § Decision 5. The `AclGrant` record carries the absolute
+    /// post-state (principal + rights + expiry), so replay is
+    /// idempotent.
+    ///
+    /// `expiry: None` and `expiry: Some(0)` are both stored as
+    /// the on-disk zero sentinel = "no expiry" per ADR-029
+    /// § Decision 1.
+    pub fn acl_grant(
+        &mut self,
+        caller: Principal,
+        inode_id: InodeId,
+        target_principal: Principal,
+        rights: Rights,
+        expiry: Option<u64>,
+        _now_ticks: u64,
+    ) -> Result<(), FsError> {
+        let mut inode = self.get_inode(inode_id)?;
+        if inode.owner != *caller.aid() {
+            return Err(FsError::PermissionDenied);
+        }
+
+        let target_aid = *target_principal.aid();
+        let entry = AclEntry {
+            principal: target_aid,
+            rights,
+            expiry,
+        };
+
+        // Upsert: prefer the existing row for this principal, else
+        // the lowest free slot.
+        let existing_slot = inode
+            .acl
+            .iter()
+            .position(|e| matches!(e, Some(a) if a.principal == target_aid));
+        let target_slot = match existing_slot {
+            Some(i) => i,
+            None => inode
+                .acl
+                .iter()
+                .position(|e| e.is_none())
+                .ok_or(FsError::OutOfSpace)?,
+        };
+        inode.acl[target_slot] = Some(entry);
+        // Pack the array (slide later Some entries to fill any
+        // earlier-freed gap). For an upsert we just wrote into an
+        // already-Some position or the first-None slot, so the
+        // contiguous-Some invariant holds without compaction.
+
+        // Journal first.
+        let record = JournalRecord::AclGrant(AclChange {
+            inode: inode_id,
+            principal: target_aid,
+            rights: Some(rights),
+            expiry: expiry.unwrap_or(0),
+        });
+        let encoded = encode_record(&record)?;
+        let append = self.journal.append(&encoded)?;
+        self.commit_journal_append(&append, &encoded)?;
+
+        // Inode header durable next.
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode)?;
+        self.device.write_block(inode_header_lba(inode_id.raw()), &buf)?;
+        self.device.flush()?;
+        Ok(())
+    }
+
+    /// Remove `target_principal`'s row from `inode_id`'s ACL.
+    /// ADR-029 § Decision 4 SYS_ACL_REVOKE backend half: caller
+    /// must be the inode owner. Compacts the array (slides later
+    /// Some entries down) so the contiguous-Some invariant
+    /// declared by ADR-029 § Divergence 1 holds after the
+    /// mutation.
+    ///
+    /// Returns `Ok(())` even when no entry for `target_principal`
+    /// exists — revoke is idempotent at the API level
+    /// (POSIX-friendly: callers don't need to check-then-revoke).
+    /// A journal record is still appended in that case so the
+    /// audit trail records the attempted revoke.
+    ///
+    /// Order: journal-flush -> inode-header-write per ADR-029
+    /// § Decision 5.
+    pub fn acl_revoke(
+        &mut self,
+        caller: Principal,
+        inode_id: InodeId,
+        target_principal: Principal,
+        _now_ticks: u64,
+    ) -> Result<(), FsError> {
+        let mut inode = self.get_inode(inode_id)?;
+        if inode.owner != *caller.aid() {
+            return Err(FsError::PermissionDenied);
+        }
+
+        let target_aid = *target_principal.aid();
+        // Locate the row; compact the array if found.
+        if let Some(slot) = inode
+            .acl
+            .iter()
+            .position(|e| matches!(e, Some(a) if a.principal == target_aid))
+        {
+            // Slide later Some entries down. Bounded loop.
+            for i in slot..MAX_INODE_ACL_ENTRIES - 1 {
+                inode.acl[i] = inode.acl[i + 1];
+            }
+            inode.acl[MAX_INODE_ACL_ENTRIES - 1] = None;
+        }
+
+        // Journal the revoke regardless of whether the row
+        // existed — captures the auth-checked intent on the
+        // audit trail.
+        let record = JournalRecord::AclRevoke(AclChange {
+            inode: inode_id,
+            principal: target_aid,
+            rights: None,
+            expiry: 0,
+        });
+        let encoded = encode_record(&record)?;
+        let append = self.journal.append(&encoded)?;
+        self.commit_journal_append(&append, &encoded)?;
+
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode)?;
+        self.device.write_block(inode_header_lba(inode_id.raw()), &buf)?;
+        self.device.flush()?;
+        Ok(())
+    }
+
+    /// Return the inline ACL of `inode_id`. ADR-029 § Decision 4
+    /// SYS_ACL_LIST backend half: owner-only in step 6 (ADR-029
+    /// § Decision 3's auth table lists explicit auth for stat /
+    /// open / grant / revoke but not for list; the conservative
+    /// default for an information-disclosing op is owner-only,
+    /// matching the grant / revoke posture). A future Divergence
+    /// or libposix-side translation can widen the access set if a
+    /// workload demands it.
+    ///
+    /// Read-only; mutates no backend state.
+    pub fn acl_list(
+        &mut self,
+        caller: Principal,
+        inode_id: InodeId,
+        _now_ticks: u64,
+    ) -> Result<[Option<AclEntry>; MAX_INODE_ACL_ENTRIES], FsError> {
+        let inode = self.get_inode(inode_id)?;
+        if inode.owner != *caller.aid() {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(inode.acl)
+    }
+
+    /// Helper for `stat_inode`: authorize a Read access. Owner
+    /// always passes; else scan the ACL for a row covering
+    /// `Rights::READ` and not expired. Same logic shape as
+    /// `open_inode`; factored out so the two callers stay in
+    /// sync if the auth predicate grows.
+    fn authorize_read(
+        &self,
+        inode: &PosixInode,
+        caller: Principal,
+        now_ticks: u64,
+    ) -> Result<(), FsError> {
+        let caller_aid = *caller.aid();
+        if inode.owner == caller_aid {
+            return Ok(());
+        }
+        for entry in inode.acl.iter().flatten() {
+            if entry.principal != caller_aid {
+                continue;
+            }
+            if let Some(expiry) = entry.expiry {
+                if expiry != 0 && expiry <= now_ticks {
+                    continue;
+                }
+            }
+            if entry.rights.contains(Rights::READ) {
+                return Ok(());
+            }
+            return Err(FsError::PermissionDenied);
+        }
+        Err(FsError::PermissionDenied)
+    }
+
     /// Write the on-disk bitmap-region block that contains the bit
     /// for `block`. Re-encodes the in-memory bitmap and copies the
     /// one affected block onto disk; the remaining bitmap blocks are
@@ -2453,5 +2682,213 @@ mod tests {
             backend.open_inode(owner_p(), InodeId::new(cap), Rights::READ, 200),
             Err(FsError::InodeNotFound)
         );
+    }
+
+    // ========================================================================
+    // ADR-029 step 6-iii — stat_inode + acl_grant / revoke / list.
+    // ========================================================================
+
+    #[test]
+    fn stat_inode_owner_returns_metadata() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 12345).unwrap();
+        let meta = backend.stat_inode(owner_p(), id, 999).unwrap();
+        assert_eq!(meta.inode_id, id);
+        assert_eq!(meta.kind, InodeKind::Regular);
+        assert_eq!(meta.size_bytes, 0);
+        assert_eq!(meta.owner, *owner_p().aid());
+        assert_eq!(meta.created_at, 12345);
+        assert_eq!(meta.modified_at, 12345);
+        assert_eq!(meta.link_count, 1);
+    }
+
+    #[test]
+    fn stat_inode_without_acl_read_is_denied() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let res = backend.stat_inode(stranger_p(), id, 200);
+        assert_eq!(res, Err(FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn stat_inode_with_acl_read_is_allowed() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), Rights::READ, None, 200)
+            .unwrap();
+        let meta = backend.stat_inode(stranger_p(), id, 300).unwrap();
+        assert_eq!(meta.inode_id, id);
+    }
+
+    #[test]
+    fn stat_inode_write_only_acl_does_not_grant_read() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), Rights::WRITE, None, 200)
+            .unwrap();
+        let res = backend.stat_inode(stranger_p(), id, 300);
+        assert_eq!(res, Err(FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn stat_inode_on_free_slot_is_not_found() {
+        let mut backend = fresh_backend();
+        assert_eq!(
+            backend.stat_inode(owner_p(), InodeId::new(0), 200),
+            Err(FsError::InodeNotFound)
+        );
+    }
+
+    #[test]
+    fn acl_grant_inserts_new_entry() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), Rights::READ, None, 200)
+            .unwrap();
+        let acl = backend.acl_list(owner_p(), id, 200).unwrap();
+        assert_eq!(acl[0].unwrap().principal, *stranger_p().aid());
+        assert_eq!(acl[0].unwrap().rights.bits(), Rights::READ.bits());
+        assert_eq!(acl[0].unwrap().expiry, None);
+        assert!(acl[1].is_none());
+    }
+
+    #[test]
+    fn acl_grant_replaces_existing_entry_for_same_principal() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), Rights::READ, None, 200)
+            .unwrap();
+        let combined = Rights::READ.union(Rights::WRITE);
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), combined, Some(500), 300)
+            .unwrap();
+        let acl = backend.acl_list(owner_p(), id, 300).unwrap();
+        assert_eq!(acl[0].unwrap().rights.bits(), combined.bits());
+        assert_eq!(acl[0].unwrap().expiry, Some(500));
+        // Still only one row; the upsert did not consume a second
+        // slot.
+        assert!(acl[1].is_none());
+    }
+
+    #[test]
+    fn acl_grant_by_non_owner_is_denied() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let third = Principal::from_public_key([0xC3; 32]);
+        let res = backend.acl_grant(stranger_p(), id, third, Rights::READ, None, 200);
+        assert_eq!(res, Err(FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn acl_grant_fills_to_capacity_then_returns_out_of_space() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        for i in 0..MAX_INODE_ACL_ENTRIES as u8 {
+            let p = Principal::from_public_key([0x10 + i; 32]);
+            backend
+                .acl_grant(owner_p(), id, p, Rights::READ, None, 200)
+                .unwrap();
+        }
+        let extra = Principal::from_public_key([0xFF; 32]);
+        assert_eq!(
+            backend.acl_grant(owner_p(), id, extra, Rights::READ, None, 200),
+            Err(FsError::OutOfSpace)
+        );
+    }
+
+    #[test]
+    fn acl_revoke_removes_entry_and_compacts() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let p1 = Principal::from_public_key([0x11; 32]);
+        let p2 = Principal::from_public_key([0x22; 32]);
+        let p3 = Principal::from_public_key([0x33; 32]);
+        backend.acl_grant(owner_p(), id, p1, Rights::READ, None, 200).unwrap();
+        backend.acl_grant(owner_p(), id, p2, Rights::READ, None, 200).unwrap();
+        backend.acl_grant(owner_p(), id, p3, Rights::READ, None, 200).unwrap();
+        backend.acl_revoke(owner_p(), id, p2, 200).unwrap();
+        let acl = backend.acl_list(owner_p(), id, 200).unwrap();
+        // p2 removed; p3 should now be at slot 1 (compaction).
+        assert_eq!(acl[0].unwrap().principal, *p1.aid());
+        assert_eq!(acl[1].unwrap().principal, *p3.aid());
+        assert!(acl[2].is_none());
+    }
+
+    #[test]
+    fn acl_revoke_missing_principal_is_idempotent() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend.acl_revoke(owner_p(), id, stranger_p(), 200).unwrap();
+        let acl = backend.acl_list(owner_p(), id, 200).unwrap();
+        assert!(acl.iter().all(|e| e.is_none()));
+    }
+
+    #[test]
+    fn acl_revoke_by_non_owner_is_denied() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), Rights::READ, None, 200)
+            .unwrap();
+        let third = Principal::from_public_key([0xC3; 32]);
+        // Stranger tries to revoke their own entry via the owner
+        // check — should still fail (revoke is owner-only, not
+        // self-revoke).
+        let res = backend.acl_revoke(third, id, stranger_p(), 200);
+        assert_eq!(res, Err(FsError::PermissionDenied));
+        // ACL unchanged.
+        let acl = backend.acl_list(owner_p(), id, 200).unwrap();
+        assert_eq!(acl[0].unwrap().principal, *stranger_p().aid());
+    }
+
+    #[test]
+    fn acl_list_by_non_owner_is_denied() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let res = backend.acl_list(stranger_p(), id, 200);
+        assert_eq!(res, Err(FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn acl_list_empty_inode_returns_all_none() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let acl = backend.acl_list(owner_p(), id, 200).unwrap();
+        assert!(acl.iter().all(|e| e.is_none()));
+    }
+
+    #[test]
+    fn acl_grant_then_open_picks_up_new_rights() {
+        // Round-trip: grant Read+Write, then open via the
+        // newly-granted ACL row.
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let combined = Rights::READ.union(Rights::WRITE);
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), combined, None, 200)
+            .unwrap();
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, combined, 300),
+            Ok(combined)
+        );
+    }
+
+    #[test]
+    fn acl_grant_survives_reboot() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        backend
+            .acl_grant(owner_p(), id, stranger_p(), Rights::READ, Some(500), 200)
+            .unwrap();
+        let dev = backend.into_device();
+        let mut backend2 = PosixFsBackend::open_or_format(dev, 8, 64, 0).unwrap();
+        let acl = backend2.acl_list(owner_p(), id, 200).unwrap();
+        assert_eq!(acl[0].unwrap().principal, *stranger_p().aid());
+        assert_eq!(acl[0].unwrap().rights.bits(), Rights::READ.bits());
+        assert_eq!(acl[0].unwrap().expiry, Some(500));
     }
 }
