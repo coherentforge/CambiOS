@@ -19,6 +19,10 @@ BuddyAllocator (pure bookkeeping, host-testable) is the template; new kernel com
 
 Architectural choices — bounds, test infrastructure, abstractions, decomposition, error types — aim at the v1-endgame workload, not throwaway scaffolding. The Formal Verification list above is one application; Convention 8's SCAFFOLDING rule is another. The general form: when facing a design choice, the question is *"what does v1 need from this?"*, not *"what's cheapest now?"*. When stuck between two compromised options, widen the horizon (time, hardware, workload) until the compromise dissolves.
 
+**Sawtooth check.** Before executing a planned step, ask: *in v1, will this exact code, format, or decision still exist, or will a later step have replaced it?* If replaced, the step is about to ship scaffolding that has to be torn down. Either change the plan so the step delivers v1-shape work directly, or accept the tear-down explicitly with the trigger and cost named. The 5C/5D POSIX backend per-instance bitmap and journal — replaced by the unified storage substrate in storage step 7 — is the canonical example of what this check is meant to catch. Sawtooth is the principle being applied per-step instead of across the chain; the check operationalizes "widen the horizon" into a concrete pre-execution test.
+
+**The pre-user period is when compromise-avoidance is cheapest.** Before real users have data on disk, the "we can iterate later" reflex feels safe; once data lands, iteration costs migration tools, version skew, and backwards-compat shims. Apply the sawtooth check more aggressively pre-user, not less. The pre-user period is not a license to compromise — it is the window where the v1-shape decision is cheapest to honor.
+
 ## Project Vision
 
 CambiOS is a next-gen AI-integrated operating system built on these principles:
@@ -57,7 +61,7 @@ Before the first edit, stop and confirm when any of these apply. Questions beat 
 
 - **Unread subsystem.** About to modify a subsystem listed in the [Required Reading](#required-reading-by-subsystem) map without having read its docs *this session*. Re-read first, or flag the reading gap.
 - **New `unsafe` invariant.** About to add `unsafe` that introduces a *new kind* of safety obligation (not mechanically matching a pre-existing pattern in the same module). Mechanical copies are fine; new invariants need user sign-off so the audit trail is intentional.
-- **ADR rewrite.** About to edit an ADR's original decision text. Use a `## Divergence` appendix or a new superseding ADR instead — original reasoning is immutable history.
+- **ADR edit.** About to edit an ADR's body. Show the planned diff first; the user approves before the edit lands. The body is then rewritten to reflect the current truth; a `## Divergence` appendix at the bottom preserves the prior wording with date and commit reference for history. A reader walking the body top-to-bottom should see the current design without contradiction; the appendix is where superseded designs go to be remembered, not where new design lives. New ADRs are appropriate when content is genuinely new and doesn't fit any existing ADR's scope.
 - **Lock hierarchy change.** About to add a new lock to the hierarchy, reorder entries, or change `IrqSpinlock` vs plain `Spinlock`. Formally relevant, cross-subsystem, and exactly the class of change that breaks invariants silently.
 - **SCAFFOLDING bound without v1 math.** About to pick a `const MAX_*` value without working through Dev Convention 8's extrapolation: v1-endgame workload, ≤25% utilization, memory cost. See [ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
 - **Dynamic dispatch in kernel.** About to introduce a trait object (`Box<dyn …>`, `&dyn …`) in kernel hot paths. Violates the Formal Verification rule ("no dynamic dispatch"). Propose the monomorphized design first.
@@ -181,7 +185,7 @@ This 8-item checklist fires every change (both tiers). The category table it dra
 1. Did this change modify a subsystem listed in [STATUS.md](STATUS.md)'s subsystem table? → Update its row and bump `last_synced_to_code:`.
 2. Did this change move a phase forward (e.g., "Phase 3 in progress" → "Phase 3 done")? → Update the Phase markers table.
 3. Did this change touch the scheduler? → Re-read [SCHEDULER.md](src/scheduler/SCHEDULER.md) and update if anything in it is now wrong.
-4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments. Did this change diverge from an existing ADR's plan? → Append a `## Divergence` entry to that ADR documenting what changed and why.
+4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments. Did this change diverge from an existing ADR's plan? → Show the user the planned diff to the ADR body first; once approved, edit the body to reflect the new design and add a `## Divergence` appendix at the bottom preserving the prior wording with date + commit reference. The body is current truth; the appendix is history.
 5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference / Lock Ordering / Syscall Numbers tables.
 6. Did this change resolve a Platform Gotcha in CLAUDE.md or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
 7. Did this change cite a doc that doesn't exist yet? → Either create the doc or remove the citation.
