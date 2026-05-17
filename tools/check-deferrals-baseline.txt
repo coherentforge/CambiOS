@@ -54,10 +54,10 @@ docs/adr/022-wall-clock-time.md:167:eventually
 docs/adr/023-audit-consumer-capability.md:30:eventually
 docs/adr/027-service-clusters.md:20:eventually
 docs/adr/027-service-clusters.md:83:deferred
-docs/adr/029-posix-file-storage-model.md:94:deferred
-docs/adr/029-posix-file-storage-model.md:364:deferred
-docs/adr/029-posix-file-storage-model.md:368:deferred
-docs/adr/029-posix-file-storage-model.md:423:deferred
+docs/adr/029-posix-file-storage-model.md:97:deferred
+docs/adr/029-posix-file-storage-model.md:355:deferred
+docs/adr/029-posix-file-storage-model.md:359:deferred
+docs/adr/029-posix-file-storage-model.md:414:deferred
 docs/adr/031-unified-storage-substrate.md:24:deferred
 docs/identity-synthesis.md:124:deferred
 docs/manuals/03-signature-chain.md:67:placeholder

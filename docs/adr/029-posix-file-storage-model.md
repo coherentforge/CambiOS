@@ -37,21 +37,24 @@ The reframe matches ADR-010's "no internal pointers" goal where possible: extent
 
 Five commitments. They are co-dependent: each makes the others coherent.
 
-### 1. On-disk format - inode-based, header-resident extents, 8 KiB superblock and inode block
+### 1. On-disk format - inode-based, header-resident extents over the shared substrate
 
-The disk is a contiguous array of 4 KiB blocks (LBAs). Layout:
+The POSIX backend is a **metadata layer** over the unified storage substrate ratified by [ADR-031](031-unified-storage-substrate.md). The substrate owns the global superblock, the block-allocation bitmap, the metadata journal, and the shared data region. This ADR declares only the **POSIX inode region** — a table of fixed-size inode headers, indexed by `InodeId`, with extent lists pointing into the substrate's shared data region.
+
+Layout, from the substrate's perspective (see [ADR-031](031-unified-storage-substrate.md) § Decision 1):
 
 ```
-LBA 0..1    Superblock                          (2 blocks = 8 KiB)
-LBA 2..    Inode region                         (capacity_inodes * 2 blocks each)
-            inode i starts at LBA 2 + 2*i
-            inode i = header block + reserved block
-LBA k..    Block-allocation bitmap              (capacity_blocks / 8 / BLOCK_SIZE blocks)
-LBA m..    Journal region                       (JOURNAL_BYTES = 16 MiB)
-LBA n..    Data region                          (capacity_blocks * 1 block each)
+LBA 0..3                       Global superblock              (substrate; ADR-031)
+LBA 4..                        Block-allocation bitmap        (substrate; ADR-031)
+LBA k..                        Metadata journal               (substrate; ADR-031)
+LBA m..                        POSIX inode region             (this ADR; capacity_inodes × 2 blocks)
+                                  inode i starts at m + 2*i
+                                  inode i = header block + reserved block
+LBA n..                        CambiObject slot region        ([ADR-010](010-persistent-object-store-on-disk-format.md))
+LBA p..                        Shared data region             (substrate; ADR-031)
 ```
 
-The superblock declares region offsets, `capacity_inodes`, `capacity_blocks`, format version, and a generation counter (bumped at each mount). 8 KiB matches the path Option 1 from ADR-028's redline discussion: one header block for fields, one reserved block for future PQ signature tail and other extensions. Mount rejects unknown format versions.
+The substrate's global superblock declares `capacity_inodes` and the inode-region offset `posix_inode_region_lba`. POSIX-specific format version and ARCINOD magic live in the inode header. Mount of the POSIX metadata layer runs after [ADR-031](031-unified-storage-substrate.md)'s `STORAGE::mount` completes; it scans the inode region to reconstruct the in-memory occupancy view.
 
 **Inode (header block, 4096 bytes)**:
 
@@ -79,9 +82,9 @@ The superblock declares region offsets, `capacity_inodes`, `capacity_blocks`, fo
 
 **Symlink target** is stored inline in the inode's first extent slot (target string up to `MAX_SYMLINK_LEN = 4 KiB - inode_overhead`); no data blocks needed.
 
-**Shared block-allocation bitmap with the CambiObject backend.** Both backends allocate from the same on-disk bitmap region. The bitmap is read-only at mount time except via the journal (see Decision 5): every bitmap mutation is journaled in the POSIX journal, regardless of which backend triggered the allocation. The CambiObject backend, when it adopts this format via an ADR-010 Divergence appendix, will route its allocations through the same journal record type. The bitmap lock (`BLOCK_BITMAP_LOCK`) sits at hierarchy position 12, below both backends' top-level locks (see Decision 4).
+**Shared block-allocation substrate.** Block allocation, journaled bitmap mutations, and the shared data region are owned by [ADR-031](031-unified-storage-substrate.md)'s `STORAGE` module — the POSIX backend reaches the substrate through `BLOCK_BITMAP_LOCK(12)` and `JOURNAL_LOCK(13)`. Every bitmap mutation is journaled in the substrate's journal regardless of which metadata layer triggered it; the journal-owned-bitmap invariant holds globally. See [ADR-031](031-unified-storage-substrate.md) § Decision 2 + § Decision 3 for the substrate-side spec.
 
-**`MAX_INODES_ON_DISK`, `MAX_EXTENTS_PER_INODE`, `MAX_INODE_ACL_ENTRIES`, `MAX_FROZEN_VIEWS_PER_INODE`** are all SCAFFOLDING per Convention 8. Sizing rationale in § Architecture.
+**`MAX_INODES_ON_DISK`, `MAX_EXTENTS_PER_INODE`, `MAX_INODE_ACL_ENTRIES`, `MAX_FROZEN_VIEWS_PER_INODE`** are all SCAFFOLDING per Convention 8. Sizing rationale in § Architecture. `MAX_BLOCKS_ON_DISK` moves to [ADR-031](031-unified-storage-substrate.md) (substrate-level bound).
 
 ### 2. Per-inode copy-on-write - snapshot-consistency, concurrent writes, and the recovery substrate
 
@@ -159,21 +162,20 @@ Numbers 53-72 reserved. The original ADR draft placed POSIX at 51-70 because ADR
 
 **REGALO cap behavior at limit.** When a process holds `MAX_REGALO_PER_PROCESS = 16384` aliases and calls `SYS_REGALO` to add another, the kernel returns `ENOMEM`. Userspace chooses the fallback: LRU-evict via `SYS_REGALO_REVOKE`, refuse to spawn the consumer at boot-manifest load time, fail open with a runtime error to the legacy app, or any other policy. The kernel does not make the choice.
 
-**`POSIX_STORE` enters the lock hierarchy at position 11, above `OBJECT_STORE(10)`. `BLOCK_BITMAP_LOCK` enters at position 12, below both backends.**
+**`POSIX_STORE(11)` is the POSIX backend's top-level lock; it owns the inode-region state (in-memory occupancy set, per-inode locks). The substrate's `BLOCK_BITMAP_LOCK(12)` and `JOURNAL_LOCK(13)` are owned by `STORAGE` per [ADR-031](031-unified-storage-substrate.md); the POSIX backend acquires them via the substrate's API.**
 
 ```
 SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
 CLUSTER_MANAGER(5) → CHANNEL_MANAGER(6) → PROCESS_TABLE(7) →
 FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) → OBJECT_STORE(10) →
-POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12)
+POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)
 ```
 
-CAMBIO acquires `OBJECT_STORE → POSIX_STORE → BLOCK_BITMAP_LOCK` in canonical order. POSIX-only operations acquire `POSIX_STORE → BLOCK_BITMAP_LOCK` (skipping OBJECT_STORE). The CambiObject backend, when it adopts the shared bitmap via the ADR-010 Divergence appendix, acquires `OBJECT_STORE → BLOCK_BITMAP_LOCK` (skipping POSIX_STORE). The shared `BLOCK_BITMAP_LOCK` is always acquired last; it never acquires anything above itself. REGALO operations touch `PROCESS_TABLE(7)` for the per-process alias table and do not touch `POSIX_STORE` or below - REGALO does not materialize an inode, just a path-to-hash entry.
+CAMBIO acquires `OBJECT_STORE → POSIX_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK` in canonical order. POSIX-only operations acquire `POSIX_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK` (skipping OBJECT_STORE). CambiObject-only operations acquire `OBJECT_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK` (skipping POSIX_STORE). The substrate locks are always acquired last; they never acquire anything above themselves. REGALO operations touch `PROCESS_TABLE(7)` for the per-process alias table and do not touch `POSIX_STORE` or below — REGALO does not materialize an inode, just a path-to-hash entry.
 
-**Sub-locks within POSIX_STORE** (POSIX-internal, never promoted to the top-level hierarchy):
+**Sub-locks within POSIX_STORE** (POSIX-internal, not in the top-level hierarchy):
 
-- `INODE_LOCK[i]` - per-inode lock, acquired for any inode modification. Lock ordering across inodes is by ID ascending, to prevent rename deadlocks (rename touches two inodes).
-- `JOURNAL_LOCK` - serializes journal record appends; brief, held only during the append.
+- `INODE_LOCK[i]` — per-inode lock, acquired for any inode modification. Lock ordering across inodes is by ID ascending, to prevent rename deadlocks (rename touches two inodes).
 
 ### 5. Path-namespace integration + hybrid recovery (metadata journal + data CoW)
 
@@ -207,11 +209,11 @@ The match is closed; no fifth outcome. Step 1 fires on any write or create attem
 
 **Reverse-ACL enumeration** (`opendir("/co/")`) iterates the per-Principal index entries for the calling Principal and returns hashes. Population events per ADR-028 § Decision 2 rule 4 (initial put, ACL grant, cap-transfer via IPC capability machinery, removed on revoke). The reverse-ACL index lives on the CambiObject side per ADR-010 - this ADR's `/co/` resolver consults it; this ADR does not own it.
 
-**Recovery: hybrid metadata journal + data CoW.**
+**Recovery: hybrid metadata journal + data CoW (substrate-owned).**
 
-The journal is a fixed-size circular log in a dedicated disk region (size: `JOURNAL_BYTES = 16 MiB`, SCAFFOLDING). Each journal record covers one *metadata transaction*. Records are atomic: either the entire record applies on replay or none of it does.
+The journal is owned by [ADR-031](031-unified-storage-substrate.md)'s `STORAGE` module — fixed-size circular log, `JOURNAL_BYTES = 16 MiB`, with backend-tagged records routed at replay. Each journal record covers one *metadata transaction*. Records are atomic: either the entire record applies on replay or none of it does.
 
-Journal record kinds:
+Journal record kinds emitted by the POSIX backend (tag = `BACKEND_POSIX` per ADR-031 § Decision 3):
 
 - **InodeAllocate / InodeFree** - inode lifecycle.
 - **ExtentUpdate + BitmapMutation** - the CoW commit step from Decision 2, bundled atomically. Records the inode whose extent list changes, the new extent list, and the bitmap bits flipped (set for newly-allocated blocks, cleared for blocks now unreferenced). This bundling is what makes Decision 2 step 4 work; bitmap mutations are never separable from the extent-list changes that justify them.
@@ -219,6 +221,8 @@ Journal record kinds:
 - **Rename** - covers both directory-entry changes (source delete, destination insert) atomically.
 - **ACL grant / revoke** - inode ACL changes.
 - **LinkCount Set** - hard-link bookkeeping. Records the new absolute `link_count` value (not a delta), so the record is idempotent under repeated replay. Relative-mutation records (delta semantics) would break the journal-replay idempotency invariant.
+
+The substrate emits `ExtentUpdate` (backend tag identifies which metadata layer owns the extents) and the CambiObject backend emits its own kinds; full record taxonomy in [ADR-031](031-unified-storage-substrate.md) § Decision 3.
 
 Records are appended on operation completion; the operation is only acknowledged to userspace after the journal record is durable (single fsync of the journal region). On mount, the recovery loop replays uncommitted records from the journal's last checkpoint forward:
 
@@ -250,32 +254,19 @@ Idempotency is the constraint that makes the replay loop bounded and correct: ev
 ### Kernel state
 
 ```rust
-// In a new src/fs/posix/mod.rs:
+// In src/fs/posix/mod.rs:
 pub struct PosixFsBackend {
-    pub superblock: Superblock,
+    // Inode-region state owned by this metadata layer.
     pub inodes: PosixInodeTable,
-    pub block_bitmap: BlockBitmap,   // governed by BLOCK_BITMAP_LOCK
-    pub journal: Journal,
     pub frozen_views: FrozenViewTable,
+    // Substrate is reached through STORAGE; no per-instance
+    // bitmap or journal fields per ADR-031.
 }
 
-pub struct Superblock {
-    pub magic: [u8; 8],         // "ARCPOSX1"
-    pub version: u32,
-    pub capacity_inodes: u64,
-    pub capacity_blocks: u64,
-    // Region offsets, in on-disk layout order.
-    pub inode_region_lba: u64,
-    pub bitmap_region_lba: u64,
-    pub journal_region_lba: u64,
-    pub data_region_lba: u64,
-    // Journal state.
-    pub journal_capacity_bytes: u64,
-    pub last_checkpoint_offset: u64,
-    // Bookkeeping.
-    pub generation: u64,
-    pub created_at: u64,
-}
+// The global superblock is owned by ADR-031's STORAGE module
+// (single source of truth for all region offsets including
+// posix_inode_region_lba and capacity_inodes). No per-backend
+// superblock type lives here.
 
 pub struct PosixInode {
     pub magic: [u8; 8],         // "ARCINOD1"
@@ -528,6 +519,34 @@ Both `INODE_LOCK[i]` and other POSIX-internal sub-locks from § Decision 4 remai
 
 Landed alongside the `BLOCK_BITMAP_LOCK` and `JOURNAL_LOCK` static declarations in commits 5C-ii (the lock instances) and 5C-iii (this appendix + CLAUDE.md § Lock Ordering update). The implementation precedes the appendix by one commit so the bitmap+journal integration is bisectable independently from the hierarchy-documentation update. No further work is gated on this Divergence; step 5D (CambiObject backend adopting the shared bitmap + journal) consumes the now-top-level `JOURNAL_LOCK` directly.
 
+### 3. Substrate ownership extracted to ADR-031
+
+- **Date:** 2026-05-17
+- **Trigger:** [ADR-031](031-unified-storage-substrate.md) ratification of the unified storage substrate.
+
+#### What changes (relative to 5C-iii)
+
+5C-ii landed `PosixFsBackend<B>` with per-instance `bitmap: BlockBitmap` and `journal: Journal` struct fields. § Decision 1 declared "shared block-allocation bitmap with the CambiObject backend" but the implementation kept the bitmap+journal per-backend pending the kernel-singleton wire-up — the "shared" wording was load-bearing aspirationally, not literal.
+
+ADR-031 makes the shared substrate first-class. `PosixFsBackend` drops the `bitmap` and `journal` fields; allocation primitives (`create_inode`, `acl_grant`, `acl_revoke`, future CoW operations) route through `STORAGE` (the substrate singleton). The POSIX backend owns only its inode-region state — the in-memory `inodes: BTreeSet<InodeId>` occupancy view, per-inode locks, and frozen-view table.
+
+The body sections above reflect the substrate-owned state:
+
+- § Decision 1: layout defers global superblock + bitmap + journal + shared data region to ADR-031; this ADR declares only the inode region.
+- § Decision 4: `POSIX_STORE(11)` owns inode-region state; `BLOCK_BITMAP_LOCK(12)` + `JOURNAL_LOCK(13)` are substrate-owned. Acquisition pattern updated.
+- § Decision 5: journal record format is owned by ADR-031; POSIX-emitted records carry the `BACKEND_POSIX` tag.
+- § Architecture § Kernel state: `PosixFsBackend` struct loses `superblock`, `block_bitmap`, `journal` fields.
+
+#### What does not change
+
+Inode format (header byte layout, ACL slots, extents-per-inode bound of 16), ACL semantics (owner + ACL.Read/Write/Execute per Decision 3), POSIX syscall surface (53–72 per Decision 4), CAMBIO/REGALO seam syscalls, path namespace + REGALO alias table, per-inode CoW model (Decision 2), per-layer verification claims (inode format exhaustiveness, ACL check correctness, path resolution exhaustiveness).
+
+#### Why
+
+The "shared bitmap" claim in the original § Decision 1 was load-bearing for the v1-endgame zero-copy CAMBIO property; 5C/5D's per-backend staging carried it as aspirational. ADR-031 closes that gap with one substrate, two metadata layers. The verification surface shrinks (one bitmap-is-projection-of-journal claim instead of two) and CAMBIO becomes a pure metadata operation (no byte copies between backends).
+
+The implementation transition (drop per-instance fields, route through `STORAGE`) lands as part of ADR-031's Migration Path step 5. No format change for inode bytes; only the substrate-ownership relation changes.
+
 ## Cross-References
 
 - **[ADR-028](028-three-storage-models.md)** - The kernel-API discipline this ADR provides the POSIX backend for.
@@ -540,6 +559,7 @@ Landed alongside the `BLOCK_BITMAP_LOCK` and `JOURNAL_LOCK` static declarations 
 - **[ADR-025](025-principal-as-aid.md)** - Principal as 32-byte AID; the identity primitive this ADR's ACL is keyed on.
 - **[ADR-026](026-identity-transcription-at-the-kernel-ring.md)** - Kernel transcribes Principal values, does not interpret them - this ADR's ACL check is a Principal-equality match, consistent with the transcription invariant.
 - **[ADR-027](027-service-clusters.md)** - Clusters scope POSIX file ACLs alongside CambiObjects; multi-Principal access patterns route through cluster delegation per Decision 3.
+- **[ADR-031](031-unified-storage-substrate.md)** - The shared substrate (global superblock, block-allocation bitmap, metadata journal, shared data region) this metadata layer rides on.
 
 ## See Also in CLAUDE.md
 
