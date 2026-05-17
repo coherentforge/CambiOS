@@ -1,69 +1,60 @@
 # ADR-010: Persistent ObjectStore — on-disk format
 
 - **Status:** Accepted
-- **Date:** 2026-04-14
-- **Depends on:** [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-004](004-cryptographic-integrity.md) (Blake3 + Ed25519)
-- **Related:** [identity.md](../identity.md), [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md), [ADR-005](005-ipc-primitives-control-and-bulk.md)
+- **Date:** 2026-04-14 (original ADR landing); body rewritten 2026-05-17 alongside ADR-031 ratification
+- **Depends on:** [ADR-003](003-content-addressed-storage-and-identity.md) (Content-Addressed Storage), [ADR-004](004-cryptographic-integrity.md) (Blake3 + Ed25519), [ADR-031](031-unified-storage-substrate.md) (shared bitmap + journal + data region that this metadata layer rides on)
+- **Related:** [identity.md](../identity.md), [FS-and-ID-design-plan.md](../FS-and-ID-design-plan.md), [ADR-005](005-ipc-primitives-control-and-bulk.md), [ADR-029](029-posix-file-storage-model.md) (peer metadata layer over the same substrate)
 - **Supersedes:** N/A
 
 ## Context
 
-Phase 4 replaces the Phase 0 `RamObjectStore` with a disk-backed implementation behind the same `ObjectStore` trait. This ADR fixes the *on-disk format* that the disk-backed store reads and writes. It does not fix the transport (kernel vs fs-service, virtio-blk vs NVMe) — those are Phase 4a.iii and Phase 4b decisions. Once the format lands, it is the wire format between any pair of CambiOS instances that share storage, and between a given instance and its past self across reboot. Changing it is an ADR-level event.
+ADR-010 specifies the on-disk format for **CambiObject metadata** — the slot region that the `ObjectStore` trait reads and writes. The substrate underneath (block-allocation bitmap, metadata journal, shared data region) is owned by [ADR-031](031-unified-storage-substrate.md). This ADR is the metadata layer; ADR-031 is the substrate they sit over.
+
+The split is load-bearing: CambiObject records and POSIX inodes ([ADR-029](029-posix-file-storage-model.md)) are two metadata layers over one substrate. Content bytes live exactly once, in the substrate's shared data region; both metadata layers' extent lists point at them. CAMBIO (the seam syscall that seals a POSIX file as a signed CambiObject per [ADR-028](028-three-storage-models.md)) is therefore a pure metadata operation — copy the POSIX inode's extent list into a fresh CambiObject slot, sign, journal atomically — with no byte copy. Once the format and substrate land, the format is the wire format between any pair of CambiOS instances that share storage, and between a given instance and its past self across reboot. Changing it is an ADR-level event.
 
 The format's goals, in priority order:
 
-1. **Crash consistency without a journal.** Power loss at any point leaves every object in either its pre-commit or post-commit state. No torn writes become valid records. A separate write-ahead log would be simpler to reason about in the abstract, but doubles the write amplification and adds a journal-replay code path that is itself a verification target. A record-commit-via-header-write design reaches the same consistency guarantees with one fewer moving part.
-2. **Bounded iteration at mount.** Mount reconstructs the in-memory index by scanning every record slot once. The slot count is declared at format time and bounded by a compile-time constant, so iteration is a single for-loop with a statically-known bound — exactly the shape formal verification tools expect.
-3. **No internal pointers.** Records do not reference other records by offset. Corruption localizes to one slot. Defragmentation is not a thing — there is nothing to defrag.
+1. **Metadata-layer separation.** CambiObject records carry identity (author, owner), integrity (Blake3 + Ed25519 signature), cap inventory, lineage, and an extent list. They don't carry content bytes; those live in the substrate's shared data region. The metadata is the verification target; the substrate handles bytes.
+2. **Bounded iteration at mount.** Slot-region scan reconstructs the in-memory occupancy view over `capacity_objects` slots — a single `for` loop with a statically-known bound, matching the formal-verification shape.
+3. **No internal pointers between records.** Records do not reference other records by offset. Corruption localizes to one slot. Defragmentation is not a thing.
 4. **Content-addressed deduplication preserved.** Same content hash → same slot. `put` is idempotent at the format level, matching the `ObjectStore` trait contract.
-5. **Forward-compatible with ML-DSA signatures.** The record header reserves space for a 3293-byte post-quantum signature. The current Ed25519 signature field occupies the first 64 bytes; the remainder is reserved. The format version gate (`version: u32`) lets future records declare a different signature encoding without breaking old readers.
+5. **Forward-compatible with ML-DSA signatures.** The record header reserves space for a post-quantum signature tail. The current Ed25519 signature occupies the first 64 bytes of the `signature` field; the remainder of the slot's reserved tail block is held for ML-DSA migration.
 
 ## Decision
 
-### Layout
+### Layout (slot region)
 
-The disk is a contiguous array of 4 KiB blocks (LBAs). Block size matches the x86_64 page size and divides every common physical sector size cleanly; see `src/fs/block.rs` and ASSUMPTIONS.md for the `BLOCK_SIZE` rationale.
+The disk is a contiguous array of 4 KiB blocks. ADR-031's global superblock at LBA 0..3 declares all region offsets; this ADR concerns the **slot region**, declared by the superblock's `cambio_slot_region_lba` and `capacity_objects` fields:
 
 ```
-LBA 0       Superblock                         (1 block)
-LBA 1..     Record slots, each slot = 2 blocks
-            slot i starts at LBA 1 + 2*i
-            slot i = header block + content block
+LBA cambio_slot_region_lba..   CambiObject slots, each slot = 2 blocks
+                               slot i = header block + reserved tail block
+                               slot i header at cambio_slot_region_lba + 2*i
+                               slot i reserved tail at cambio_slot_region_lba + 2*i + 1
 ```
 
-The superblock declares the total slot capacity. There is no on-disk free-map: a slot is free iff its header block magic is not `ARCOREC1`. Mount scans every slot's header block; occupied headers are validated and added to the in-memory index. The O(n) scan is the price paid for dropping the free-map and making recovery stateless.
+A slot is free iff its header block magic is not `ARCOREC2`. Mount scans every slot's header block; occupied headers are validated and added to the in-memory index. Content bytes are not in the slot region — they live in the substrate's shared data region (per [ADR-031](031-unified-storage-substrate.md)) and are referenced by the header's extent array. Slot count and slot-region offset are bounded by `MAX_OBJECTS_ON_DISK` (SCAFFOLDING, [docs/ASSUMPTIONS.md](../ASSUMPTIONS.md)).
 
-### Superblock (LBA 0, 4096 bytes)
+### Record (slot i)
+
+**Header block** (LBA `cambio_slot_region_lba + 2*i`, 4096 bytes):
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
-| 0 | 8 | `magic` | ASCII `"ARCOBJ00"` — format-family tag |
-| 8 | 4 | `version` | u32 LE. Current = `1`. Mount rejects unknown versions. |
-| 12 | 8 | `capacity_slots` | u64 LE. Declared at format time. Slots past `capacity_slots` must be unused. |
-| 20 | 8 | `generation` | u64 LE. Bumped on every successful mount. Used to detect stale media swap (snapshot/rollback outside the OS). |
-| 28 | 8 | `created_at` | u64 LE. Monotonic ticks at format time. |
-| 36 | 4052 | *reserved* | Zero-filled. |
-| 4088 | 8 | `checksum` | Blake3 hash of bytes `[0..4088]`, first 8 bytes. Validates the superblock itself. |
-
-### Record (slot i: LBAs `1 + 2*i` and `2 + 2*i`)
-
-**Header block** (LBA `1 + 2*i`, 4096 bytes):
-
-| Offset | Size | Field | Notes |
-|---|---|---|---|
-| 0 | 8 | `magic` | `"ARCOREC1"` = occupied. Any other value = free/never-written. |
-| 8 | 4 | `content_len` | u32 LE. Length of content bytes. Must be `≤ BLOCK_SIZE`. |
+| 0 | 8 | `magic` | `"ARCOREC2"` = occupied. Any other value = free/never-written. `ARCOREC1` (v1) is recognized by `get` magic-dispatch for backward read; new puts always produce `ARCOREC2`. |
+| 8 | 4 | `content_len` | u32 LE. Length of content bytes addressed by the extent array. |
 | 12 | 32 | `content_hash` | Blake3(content). Primary identity. |
 | 44 | 32 | `author` | Ed25519 public key. |
 | 76 | 32 | `owner` | Ed25519 public key. |
-| 108 | 1 | `sig_algo` | `0 = Ed25519`, `1 = ML-DSA-65` (reserved, Phase 4b+). |
+| 108 | 1 | `sig_algo` | `0 = Ed25519`, `1 = ML-DSA-65` (reserved). |
 | 109 | 1 | `lineage_present` | `0 = no lineage`, `1 = lineage field valid`. |
 | 110 | 2 | `cap_count` | u16 LE. Number of active entries in `caps`, ≤ `MAX_OBJECT_CAPS`. |
 | 112 | 8 | `created_at` | u64 LE. Monotonic ticks at put time. |
-| 120 | 64 | `signature` | Ed25519 signature over `content`. ML-DSA migration reuses this field's *start*; the tail moves into `sig_tail` in a future version. |
+| 120 | 64 | `signature` | Ed25519 signature over `content`. ML-DSA migration extends into the reserved region. |
 | 184 | 32 | `lineage` | Parent content hash. Zero if `!lineage_present`. |
 | 216 | 352 | `caps` | `MAX_OBJECT_CAPS = 8` entries × 44 bytes each. |
-| 568 | 3520 | *reserved* | Zero-filled. Future ML-DSA signature tail lives here. |
+| 568 | 192 | `extents` | 16 entries × 12 bytes packed: `(start_lba: u64, block_count: u32)`. Points into the substrate's shared data region per [ADR-031](031-unified-storage-substrate.md). |
+| 760 | 3328 | *reserved* | Zero-filled. Future ML-DSA signature tail lives here. |
 | 4088 | 8 | `header_checksum` | Blake3 hash of bytes `[0..4088]`, first 8 bytes. |
 
 Each `caps` entry (44 bytes):
@@ -75,92 +66,76 @@ Each `caps` entry (44 bytes):
 | 40 | 1 | `rights` (bit 0 = read, bit 1 = write, bit 2 = execute) |
 | 41 | 3 | *reserved* (zero) |
 
-**Content block** (LBA `2 + 2*i`, 4096 bytes):
+**Reserved tail block** (LBA `cambio_slot_region_lba + 2*i + 1`, 4096 bytes): zero-filled. Reserved for ML-DSA signature tail when PQ signing lands. Symmetric with [ADR-029](029-posix-file-storage-model.md)'s POSIX inode reserved-tail allocation.
 
-| Offset | Size | Field |
-|---|---|---|
-| 0 | `content_len` | `content` bytes |
-| `content_len` | `4096 - content_len` | Zero padding |
+Content integrity is verified at read time by reading content through the extent array and recomputing `blake3(content[..content_len])` against `header.content_hash`. No separate content checksum — `content_hash` *is* the checksum, and it's what the `ObjectStore` trait identifies the object by.
 
-Content integrity is verified at read time by recomputing `blake3(content[..content_len])` and comparing against `header.content_hash`. No separate content checksum — `content_hash` *is* the checksum, and it's what the `ObjectStore` trait identifies the object by.
-
-### Write protocol (commit by header magic)
+### Write protocol (substrate-anchored)
 
 **`put(obj)`**:
 
 1. If `content_hash` is already in the in-memory index → return its hash (idempotent).
-2. Allocate a free slot: first index `i` where the cached slot state is `Free`. Slot state is tracked in a small bit-vector alongside the hash → slot index map; no on-disk free-map.
-3. Prepare the content block in a local 4 KiB buffer: `content[..content_len]` followed by zero padding.
-4. `block_device.write_block(content_lba, &content_buf)`.
-5. `block_device.flush()`.
-6. Prepare the header block: `magic = "ARCOREC1"`, all metadata fields, `header_checksum = blake3(bytes[0..4088])[0..8]`.
-7. `block_device.write_block(header_lba, &header_buf)`.
+2. Allocate a free slot: first index `i` where the cached slot state is `Free`. Slot state is tracked in a bit-vector alongside the hash → slot index map; no on-disk slot-free-map.
+3. Allocate data-region extents via `STORAGE::allocate_block` (one call per extent; up to `MAX_EXTENTS_PER_CAMBIOBJECT = 16`). Each call journals a substrate-tagged `ExtentUpdate + BitmapMutation::Set` record per [ADR-031](031-unified-storage-substrate.md) § Decision 3.
+4. Write content bytes through the allocated extents (`block_device.write_block` for each block, `block_device.flush()` after).
+5. Build the header in a 4 KiB buffer: magic = `ARCOREC2`, metadata fields, extent array from step 3, `header_checksum = blake3(bytes[0..4088])[0..8]`.
+6. Journal a `CambioRecordPut` record (backend-tag = `BACKEND_CAMBIO`) covering the slot index + header bytes. Per ADR-031 § Decision 3, this is the commit point for the slot-layer mutation.
+7. `block_device.write_block(slot_header_lba, &header_buf)`.
 8. `block_device.flush()`.
 
-The header write at step 7 is the *commit point*. Crash between 4 and 7 leaves the content block populated but the header reads as "free" — the slot is re-allocatable and the orphan content is overwritten on next use. Crash after 7 is a committed record.
+The journal record at step 6 is the *commit point*. Crash between 3 and 6 leaves data-region blocks allocated in the bitmap (journal replay re-applies the bitmap-set) but no slot points at them; the next mount's defense-in-depth cross-check surfaces the orphaned blocks via the [ADR-031](031-unified-storage-substrate.md) substrate replay. Crash between 6 and 7 replays the `CambioRecordPut` record on next mount, which carries the slot index + header bytes; the substrate-layer replay reconstructs the slot header from the journal record. Crash after 8 is a fully-committed record.
 
 **`delete(hash)`**:
 
 1. Look up the slot.
-2. Overwrite the header block with all zeros (magic is now not `ARCOREC1` → slot reads as free).
-3. `block_device.flush()`.
+2. Journal a `CambioRecordDelete` record (backend-tag = `BACKEND_CAMBIO`) carrying the slot index.
+3. Journal `BitmapMutation::Clear` for each block referenced by the deleted record's extent array (via `STORAGE::free_block`). The journal records and the `CambioRecordDelete` are bundled into one transaction per [ADR-031](031-unified-storage-substrate.md) § Decision 3.
+4. Overwrite the slot header block with zeros (magic is now not `ARCOREC2` → slot reads as free).
+5. `block_device.flush()`.
 
-The content block is left intact. This is not a secure erase — it is the microkernel equivalent of `unlink(2)`. Secure erase is a separate operation (not part of Phase 4a); any future secure-erase path writes the content block with a pattern before zeroing the header.
+The data-region blocks become free per substrate accounting. This is not a secure erase; it is the microkernel equivalent of `unlink(2)`. Secure erase is a separate operation; any future secure-erase path overwrites the data extents with a pattern before clearing the bitmap.
 
 ### Mount protocol
 
-1. `block_device.read_block(0, &mut superblock_buf)`.
-2. Verify `magic == "ARCOBJ00"` and `checksum` matches Blake3 of bytes `[0..4088]`.
-3. If the device is blank (all zeros), call `format()` — write a fresh superblock and declare `capacity_slots` based on device capacity.
-4. For slot `i` in `0..capacity_slots`:
-   - `block_device.read_block(1 + 2*i, &mut header_buf)`.
-   - If `magic != "ARCOREC1"` → slot is free, continue.
+ADR-031's `STORAGE::mount` runs first: parse global superblock, journal-replay, defense-in-depth bitmap cross-check. After STORAGE is mounted:
+
+1. For slot `i` in `0..capacity_objects`:
+   - `block_device.read_block(cambio_slot_region_lba + 2*i, &mut header_buf)`.
+   - If `magic` is neither `ARCOREC1` (v1, magic-dispatched for read) nor `ARCOREC2` → slot is free, continue.
    - Verify `header_checksum` matches Blake3 of bytes `[0..4088]`. Mismatch → log and treat slot as free (the record was in flight at crash). Do *not* add to index.
    - Parse fields, add `(content_hash, i)` to the index.
-5. Bump `generation` in the superblock, rewrite, flush.
 
 Mount is idempotent: running it twice on the same consistent disk produces the same index.
 
 ### What is explicitly not in scope for this ADR
 
-- **Garbage collection of orphan content blocks** (crashed puts that wrote content but not the header). These slots are allocatable again, and the next `put` to that slot overwrites the orphan. Explicit GC is not needed for correctness.
-- **On-disk free-map.** The header-magic check replaces it.
-- **Write-ahead log.** Not needed given the header-commit design.
-- **Multi-block content.** `content_len ≤ BLOCK_SIZE` is a SCAFFOLDING limit, sized to match the current syscall ceiling. Phase 4b's channel-based bulk IPC protocol will raise this; the format gets a new `version = 2` at that point and records declare their content extent explicitly.
-- **Encryption at rest.** ObjectStore stores already-signed objects — integrity is checked on every read. Confidentiality at rest is a higher-layer concern and out of scope.
-- **Snapshots / CoW.** Not needed for v1; deferred indefinitely.
-
-## Why not a write-ahead log?
-
-The alternative is the classic journal: every mutation appends to a log; commit is a log record flush; periodic checkpoint copies the log into the main format. Considered and rejected for v1 because:
-
-- **Write amplification.** Each `put` becomes two writes (log + data) instead of two writes (content + header) of the same size. The journal's write cost dominates when writes are small and numerous — which is exactly the CambiObject workload.
-- **Replay is a verification target.** Log replay is a state machine that must be proved to restore every consistent state from every possible crash trace. The header-commit design's recovery is a single scan with a single invariant (`magic == "ARCOREC1"` → committed; else → free).
-- **Throughput is not a v1 concern.** At 100 Hz audit events, a few user-space services, and human-scale object puts, the format is never write-bound. When it does become write-bound (video, AI model caches), the workload lives on the Phase 4b channel-based bulk path, not this kernel-side format.
-
-A log can be added in a future version without breaking this format: old records remain valid, new records are staged through the log. That migration is not pre-planned but is not precluded either.
+- **Garbage collection of orphan data-region blocks** (crashed puts that allocated extents but didn't commit the slot). Substrate replay surfaces these; explicit GC is a substrate concern, not metadata-layer.
+- **On-disk slot-free-map.** The header-magic check replaces it.
+- **Encryption at rest.** ObjectStore stores already-signed objects — integrity is checked on every read. Confidentiality at rest is provided by the FDE layer below the substrate (forthcoming ADR; not in this ADR's scope). At-rest integrity at the block layer is *not* provided — CambiObject Blake3 verification covers CambiObject content; POSIX-namespace content has no block-level adversarial-integrity check (see ADR-029's threat model).
+- **Snapshots / CoW.** CoW lives in [ADR-029](029-posix-file-storage-model.md) § Decision 2 (POSIX-side) and the CAMBIO seam (cross-backend). CambiObjects are immutable; no per-record CoW is needed.
 
 ## Bounded iteration claim (for verification)
 
-Mount's record scan is a `for i in 0..capacity_slots` loop. `capacity_slots` is declared in the superblock and bounded by `MAX_OBJECTS_ON_DISK` (SCAFFOLDING, documented in ASSUMPTIONS.md). No inner unbounded loop — each iteration does exactly one `read_block` + checksum check + optional index insertion. This satisfies the "no unbounded loops in kernel paths" rule in CLAUDE.md.
+Mount's slot scan is a `for i in 0..capacity_objects` loop. `capacity_objects` is declared in ADR-031's superblock and bounded by `MAX_OBJECTS_ON_DISK` (SCAFFOLDING, see [docs/ASSUMPTIONS.md](../ASSUMPTIONS.md)). No inner unbounded loop — each iteration does exactly one `read_block` + checksum check + optional index insertion. This satisfies the "no unbounded loops in kernel paths" rule in CLAUDE.md.
 
-`put`'s free-slot scan is also bounded by `capacity_slots`. `delete`'s index lookup is a BTreeMap operation (O(log n)) with n ≤ `capacity_slots`.
+`put`'s free-slot scan is also bounded by `capacity_objects`. `delete`'s index lookup is a BTreeMap operation (O(log n)) with n ≤ `capacity_objects`. Substrate-level claims (bitmap-is-projection-of-journal, bounded journal replay) live in [ADR-031](031-unified-storage-substrate.md) § Verification Stance.
 
 ## Cross-references
 
-- `src/fs/block.rs` — `BlockDevice` trait, `MemBlockDevice`, `BLOCK_SIZE`.
-- `src/fs/disk.rs` — `DiskObjectStore` (the reference reader/writer of this format).
-- `src/fs/mod.rs` — `ObjectStore` trait, `CambiObject`, `SignatureBytes`.
-- `ASSUMPTIONS.md` — `BLOCK_SIZE`, `MAX_OBJECTS_ON_DISK`, `MAX_CONTENT_BYTES_ON_DISK`, `ARCOBJ_MAGIC`, `ARCOREC_MAGIC_OCCUPIED`.
-- [FS-and-ID-design-plan.md § Phase 4](../FS-and-ID-design-plan.md) — design intent for persistent storage.
+- [`src/fs/block.rs`](../../src/fs/block.rs) — `BlockDevice` trait, `MemBlockDevice`, `BLOCK_SIZE`.
+- [`src/fs/disk.rs`](../../src/fs/disk.rs) — `DiskObjectStore` (the reference reader/writer of this format).
+- [`src/fs/mod.rs`](../../src/fs/mod.rs) — `ObjectStore` trait, `CambiObject`, `SignatureBytes`.
+- [`src/fs/storage/`](../../src/fs/storage/) (when ADR-031 lands) — the substrate module that owns bitmap + journal + data region.
+- [docs/ASSUMPTIONS.md](../ASSUMPTIONS.md) — `BLOCK_SIZE`, `MAX_OBJECTS_ON_DISK`, `MAX_CONTENT_BYTES_ON_DISK`, `ARCOREC_MAGIC_OCCUPIED`, `MAX_EXTENTS_PER_CAMBIOBJECT`.
+- [ADR-031](031-unified-storage-substrate.md) — the substrate this metadata layer rides on.
+- [ADR-029](029-posix-file-storage-model.md) — peer metadata layer (POSIX inodes) over the same substrate.
+- [FS-and-ID-design-plan.md § Phase 4](../FS-and-ID-design-plan.md) — historical design intent for persistent storage.
 
 ## Divergence
 
-Two things landed during Phase 4a.iii that deviate from the plan originally sketched alongside this ADR. Capturing them here so the ADR doesn't silently become fiction.
-
 ### 1. Plan/execute/commit decomposition not implemented
 
-The plan called for decomposing `DiskObjectStore::{get,put,delete}` into `plan_*` (in-memory bookkeeping under `OBJECT_STORE`), `execute_*` (I/O lock-free), and `commit_*` (reacquire and update indices), motivated by concern about a hierarchy violation when a disk-backed `BlockDevice` call acquires `IPC_MANAGER` (lock position 3) while `OBJECT_STORE` (position 9) is held.
+The plan called for decomposing `DiskObjectStore::{get,put,delete}` into `plan_*` (in-memory bookkeeping under `OBJECT_STORE`), `execute_*` (I/O lock-free), and `commit_*` (reacquire and update indices), motivated by concern about a hierarchy violation when a disk-backed `BlockDevice` call acquires `IPC_MANAGER` (lock position 3) while `OBJECT_STORE` (position 10) is held.
 
 On closer inspection the concern doesn't materialize for the Phase 4a.iii wiring: the kernel-side `VirtioBlkDevice` uses `SHARDED_IPC` (per-endpoint shard locks, outside the main hierarchy) rather than `IPC_MANAGER`. The other lock the path acquires is `PER_CPU_SCHEDULER` (position 1) — which is per-CPU, never held by code that also acquires `OBJECT_STORE`, so the circular-wait that hierarchy rules prevent cannot form. Holding `OBJECT_STORE` across disk I/O is therefore safe; concurrent `SYS_OBJ_*` callers spin-wait on `OBJECT_STORE` until the holder's I/O completes, which is the serialization the single virtio-blk virtqueue imposes anyway.
 
@@ -174,58 +149,40 @@ The fix adopted: `VirtioBlkDevice::call` polls `SHARDED_IPC.recv_message(25)` wi
 
 Documented here because future work (e.g. switching to interrupt-driven virtio-blk completion — the right long-term fix — or reusing this kernel↔user IPC pattern for other drivers) will need to revisit the decision. The `handle_write` intercept's `// NO scheduler wake —` comment names this ADR.
 
-### 3. Shared block-allocation bitmap + journaled allocations + multi-block content
+### 3. Shared block-allocation bitmap + journaled allocations + multi-block content (per-backend staging)
 
 - **Date forecast:** 2026-05-12
 - **Date landed:** 2026-05-16
-- **Trigger:** [ADR-029](029-posix-file-storage-model.md) Decision 1 and Decision 5 establish a shared block-allocation bitmap and a journal-owned-bitmap invariant: every bitmap mutation, regardless of which backend triggered it, is journaled in the POSIX journal. For ADR-010 to remain coherent with this invariant, the CambiObject backend's allocation path must route through the shared journal. Without this Divergence, the invariant has a CambiObject-side hole, and ADR-029's Verification Stance claim "bitmap state is the projection of committed journal records" is false.
 
-This Divergence landed in the 5D chain of commits, alongside [ADR-029](029-posix-file-storage-model.md) migration step 5's 5C chain — the simultaneous landing is what keeps the journal-owned-bitmap invariant whole from the moment the shared bitmap exists in either backend. Listed in the ADR before code so future readers reach for ADR-010 and find the planned trajectory rather than re-deriving it from ADR-029's migration path.
+The 5D commit chain (commits 0ea9c45..9c83ba3) landed v2 records with multi-block content via extents into a per-backend data region, plus per-backend `bitmap: BlockBitmap` and `journal: Journal` struct fields on `DiskObjectStore`. The "shared block-allocation bitmap" wording in this ADR's body, and in [ADR-029](029-posix-file-storage-model.md) § Decision 1, was load-bearing aspirationally — the codecs and record format anticipated shared substrate, but the *instances* of bitmap and journal stayed per-backend pending the kernel-singleton wire-up.
 
-#### What changes
+**This Divergence is now historical.** The current body describes v2 records over the shared substrate per ADR-031, which is superseded by [Divergence 4](#4-shared-substrate-per-adr-031) below. This entry is retained for the trajectory: v2 record format was specified here (Divergence 3) and substrate-ratified there (Divergence 4).
 
-1. **Allocation routing.** CambiObject `put` operations no longer perform direct on-disk bitmap mutations for content-block allocation. The allocation is recorded in a journal record of type `ExtentUpdate + BitmapMutation` (per ADR-029 Decision 5), atomically with the CambiObject record's header commit. Until the journal record is durable, the bitmap is in-memory-only and the allocation is not visible on disk. The `BLOCK_BITMAP_LOCK` (hierarchy position 12 per ADR-029) governs the in-memory bitmap; the CambiObject backend acquires `OBJECT_STORE → BLOCK_BITMAP_LOCK` for allocation operations.
+The original Divergence 3 wording's "What changes" had four items: (1) allocation routing through the shared journal, (2) multi-block content via extents, (3) layout restructuring with reserved tail and extent array, (4) format-version handling via magic-byte dispatch. Items 2-4 are unchanged in the current body. Item 1 (allocation routing) is the part [Divergence 4](#4-shared-substrate-per-adr-031) makes literal via ADR-031.
 
-2. **Multi-block content layout.** The `content_len <= BLOCK_SIZE` SCAFFOLDING constraint from "What is explicitly not in scope" is lifted. CambiObject records gain a header-resident bounded-extent array (up to 16 extents per object, each `(start_lba: u64, block_count: u32)`, matching ADR-029's inode extent shape). Content data blocks live in the shared data region and are referenced by the extent array, replacing the single per-slot content block.
+The original Divergence 3 also carried a "Known implementation drift: crash-safety atomicity" note (write order content → header → journal could orphan data blocks on crash). That gap is closed by ADR-031's `CambioRecordPut` journal-record-as-commit-point pattern (per the rewritten Write protocol in this body).
 
-3. **Layout restructuring.** v1's slot pattern was "header block + content block, slot stride = 2 blocks." For v2 records, the slot stride remains 2 blocks but the second block changes role from "content" to "reserved tail" (zero-filled in v1, reserved for the ML-DSA signature tail when PQ signing lands - matching ADR-029's inode layout). The header block's existing 3520-byte reserved region is partitioned: 192 bytes (offset 568..760) for the extent array, 3328 bytes (760..4088) retained for ML-DSA + future extensions. Actual content bytes live in the shared data region per the extent array. Mount distinguishes v1 records (`version = 1`, content in slot's second block) from v2 records (`version = 2`, content via extents) and reads both indefinitely.
+### 4. Shared substrate per ADR-031
 
-4. **Format version handling.** New puts default to v2 once this Divergence lands. v1 records remain readable forever; because CambiObjects are immutable, there is no "next write that updates the record" - v1 records stay v1 unless an explicit migration utility runs. A migration tool for storage-density reasons may land later but is not a v1 requirement.
+- **Date:** 2026-05-17
+- **Trigger:** [ADR-031](031-unified-storage-substrate.md) ratification of the unified storage substrate.
+
+#### What changes (relative to Divergence 3)
+
+Divergence 3 (5D, 2026-05-16) shipped v2 records with per-backend bitmap and journal. The "shared block-allocation bitmap" claim it made was load-bearing aspirationally but per-backend in practice — `DiskObjectStore` carried `bitmap: BlockBitmap` and `journal: Journal` struct fields.
+
+This Divergence makes the substrate first-class per ADR-031. `DiskObjectStore` drops the `bitmap` and `journal` fields; allocations route through `STORAGE` (the substrate singleton). v2 record format (`ARCOREC2` magic, header + reserved tail + extents into data region) is unchanged byte-for-byte; what changes is *which* data region the extents point into (now the shared data region per ADR-031, previously the per-backend data region) and *how* allocation is journaled (now substrate-tagged through `STORAGE`).
+
+The write-protocol body section above describes the substrate-anchored flow. The `CambioRecordPut` and `CambioRecordDelete` journal record kinds (new with this Divergence) are added to the journal record enum per ADR-031 § Decision 3.
 
 #### What does not change
 
-- **CambiObject identity.** Content-addressed, signed-by-owner, immutable author, transferable owner, lineage chain - all preserved.
-- **Signature verification.** Blake3 + Ed25519 verification on every read, preserved unchanged.
-- **ACL model.** `ObjectCapSet` (up to 8 entries) per ADR-003 unchanged.
-- **Magic-byte commit pattern.** `ARCOREC1` magic at offset 0 still distinguishes occupied vs. free records. The header still commits via the existing pattern; what is new is the *allocation* of data blocks under that header, which now flows through the shared journal.
-- **No-write-after-put semantics.** CambiObjects remain immutable. The extent array is determined at put time and never mutates.
-- **Plan/execute/commit decomposition.** Still not implemented (per Divergence 1). Shared-bitmap allocation does not change this; the existing single-phase `put` continues to suffice, with the journal record now bundling extent-list + bitmap mutations as ADR-029 Decision 5 specifies.
+v2 record format byte layout (offsets, sizes, field semantics); content addressing (Blake3); signature model (Ed25519); ObjectRights bitfield; lineage; ARCSIG trailer behavior; magic-byte commit pattern; CambiObject immutability.
 
-#### Sequencing
+#### Why
 
-Landed in the 5D chain of commits, mirroring ADR-029 step 5's 5C decomposition:
+ADR-031 closes the per-vs-shared-substrate gap by making one substrate underneath both metadata layers (CambiObject + POSIX). The CambiObject backend's v2 records become metadata-only views over the shared substrate. The plus side: zero-copy CAMBIO (per ADR-031 § Problem), one verification surface for bitmap-is-projection-of-journal (per ADR-031 § Verification Stance), and the journal-record-as-commit-point pattern closes Divergence 3's "Known implementation drift" gap.
 
-- **5D-i** (codec): the v2 record header `encode` / `decode` pair and the magic-dispatched `decode_record_header_any` enter `src/fs/disk.rs` as pure functions. `ARCOREC_MAGIC_V2 = "ARCOREC2"` distinguishes v2 records from v1 (`ARCOREC1`).
-- **5D-ii** (superblock + geometry): `FORMAT_VERSION` bumps to 2; the superblock gains `capacity_data_blocks`, `bitmap_region_lba`, `journal_region_lba`, `data_region_lba`, `journal_capacity_bytes`, `last_checkpoint_offset`. `DiskObjectStore` gains in-memory `bitmap` and `journal` struct fields; mount runs journal-replay to reconstruct the bitmap and cross-checks against the on-disk bitmap region (defense-in-depth, same posture as `PosixFsBackend`).
-- **5D-iii** (integration): `put` writes v2 records via single-extent allocation; `get` dispatches on record magic to handle both v1 and v2 records; `delete` extends to journal a `BitmapMutation::Clear` for the freed data-region blocks.
+#### What does not migrate
 
-v1 records remain readable forever via the magic-byte dispatch — the slot-scan at mount and the `get` path both accept either version. New puts default to v2 unconditionally; there is no path that produces a new v1 record post-5D. v1 disks (`FORMAT_VERSION = 1` superblock) are rejected at mount via `SuperblockState::UnknownVersion`; an explicit migration utility, when one exists, will format the disk as v2 in place. No v1-disk migration was required by the v1 deployment surface so far.
-
-Greedy multi-extent allocation is the implementation strategy: prefer a single contiguous run when one fits, fall back to multiple smaller runs (up to `MAX_EXTENTS_PER_CAMBIOBJECT = 16`) when fragmentation forbids it. The greedy search uses a working clone of the in-memory bitmap so partial-progress doesn't mutate `self.bitmap`; allocation either fully succeeds or returns `CapacityExceeded` with no mutation.
-
-#### Known implementation drift: crash-safety atomicity
-
-ADR-010 § Divergence 3 § What changes states *"The allocation is recorded in a journal record … atomically with the CambiObject record's header commit."* The 5D-iii implementation does not deliver this atomicity literally: the write order is content → header → journal → on-disk bitmap, with each step independently flushed. The window between header-write and journal-record-write can leave orphan data blocks on crash (the header references them; the journal doesn't record the allocation; replay-reconstructed bitmap marks them as free; defense-in-depth check sees the divergence and rejects mount).
-
-This is a known correctness gap, not an unconscious omission. Closing it requires an ADR-level choice between two fix shapes:
-
-1. **Mount-side slot-scan augmentation.** Mount runs journal replay AND scans the slot table, with each v2 record's extents marked in the in-memory bitmap during the scan. Fixes the orphan-block reachability problem but softens the defense-in-depth invariant (the journal-projected bitmap is no longer the sole authority; the slot table also contributes).
-2. **Fat journal record.** The `ExtentUpdate` record gains the slot index + content_hash so replay can commit the header from the journal without a separate header write. Preserves the journal-as-source-of-truth invariant but duplicates header state in the journal and changes the record format.
-
-Both options are non-trivial. The implementation drift is documented here rather than masked because v1 deployment does not exercise crash-recovery on this path (the test suite does not simulate mid-`put` crashes), but the contract gap should be closed before the disk-backed CambiObject store sees adversarial-crash workloads.
-
-**Revisit when:** an ADR-010 amendment ratifies one of the two fix shapes above. The implementation change follows the ADR decision, not the other way around.
-
-#### Why a Divergence rather than a superseding ADR
-
-The CambiObject model, the on-disk record's existing fields, the magic-byte commit pattern, and the signature verification are ADR-010's core decisions and remain unchanged. What changes is the *allocation mechanism* (now journaled), the *content layout* (extent-based multi-block), and the *slot composition* (header block + reserved tail; content in shared data region). A Divergence appendix captures the implementation-shape change without rewriting the immutable decision text. A superseding ADR would imply ADR-010's decisions are being walked back, which they are not.
+No conversion tool. v2 disks formatted by 5D code that used the per-backend substrate exist only in dev environments; reformatting under ADR-031's new global superblock is acceptable per the pre-user-period rule (see CLAUDE.md § "Build with the End in Mind"). A `DiskObjectStore::mount` that encounters a 5D-shaped per-backend superblock returns `FormatVersion` error; `format` produces the ADR-031 substrate-shaped layout.

@@ -18,8 +18,7 @@ docs/adr/007-capability-revocation-and-telemetry.md:254:eventually
 docs/adr/007-capability-revocation-and-telemetry.md:404:eventually
 docs/adr/008-boot-time-sized-object-tables.md:460:deferred
 docs/adr/008-boot-time-sized-object-tables.md:496:eventually
-docs/adr/010-persistent-object-store-on-disk-format.md:131:deferred
-docs/adr/010-persistent-object-store-on-disk-format.md:173:eventually
+docs/adr/010-persistent-object-store-on-disk-format.md:148:eventually
 docs/adr/011-graphics-architecture-and-scaling.md:117:deferred
 docs/adr/011-graphics-architecture-and-scaling.md:119:deferred
 docs/adr/011-graphics-architecture-and-scaling.md:128:deferred

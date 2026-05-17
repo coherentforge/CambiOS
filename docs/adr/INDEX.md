@@ -19,7 +19,7 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 007 | [Capability Revocation and Audit Telemetry](007-capability-revocation-and-telemetry.md) | Accepted | 2026-04-10 |
 | 008 | [Boot-Time-Sized Kernel Object Tables](008-boot-time-sized-object-tables.md) | Accepted | 2026-04-11 |
 | 009 | [Purpose, Deployment Tiers, and Scope Boundaries](009-purpose-tiers-scope.md) | Accepted | 2026-04-11 |
-| 010 | [Persistent ObjectStore — on-disk format](010-persistent-object-store-on-disk-format.md) | Accepted | 2026-04-14 |
+| 010 | [Persistent ObjectStore — on-disk format](010-persistent-object-store-on-disk-format.md) | Accepted | 2026-04-14 (original ADR landing); body rewritten 2026-05-17 alongside ADR-031 ratification |
 | 011 | [Graphics Architecture and Scaling Assumptions](011-graphics-architecture-and-scaling.md) | Accepted | 2026-04-13 |
 | 012 | [Input Architecture and Device Classes](012-input-architecture-and-device-classes.md) | Accepted | 2026-04-14 |
 | 013 | [RISC-V (riscv64gc) Architecture Support](013-riscv64-architecture-support.md) | Accepted | 2026-04-15 |
