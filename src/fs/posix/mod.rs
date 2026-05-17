@@ -48,6 +48,7 @@ use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
 use crate::fs::journal::{
     encode_record, Append, BitmapMutation, Journal, JournalError, JournalRecord,
 };
+use crate::ipc::Principal;
 
 // ============================================================================
 // Format identification
@@ -413,6 +414,12 @@ pub enum FsError {
     /// can react differently to "tried to double-free a known block"
     /// versus "tried to address a block past capacity."
     NotAllocated,
+    /// `open_inode` (or another authorization-gated op) found the
+    /// inode but the caller's Principal is neither the owner nor
+    /// a holder of an ACL entry covering the requested rights. Maps
+    /// to userspace `EACCES`. Per ADR-029 § Decision 3 — owner-or-
+    /// ACL check is the only auth source; no Unix u/g/o.
+    PermissionDenied,
 }
 
 impl From<BlockError> for FsError {
@@ -1159,6 +1166,140 @@ impl<B: BlockDevice> PosixFsBackend<B> {
         self.bitmap.mark_free(block)?;
         self.flush_bitmap_region_for(block)?;
         Ok(())
+    }
+
+    /// Find the lowest-numbered free inode slot in
+    /// `0..capacity_inodes`, or `None` when the region is full.
+    ///
+    /// Bounded loop per ADR-029 § Verification Stance row 1 ("Mount
+    /// inode scan is `for i in 0..capacity_inodes`"). Same scan
+    /// shape used at mount; the in-memory `inodes` BTreeSet carries
+    /// the post-replay state so this only walks the gaps.
+    fn find_free_inode_slot(&self) -> Option<InodeId> {
+        for slot in 0..self.superblock.capacity_inodes {
+            let id = InodeId::new(slot);
+            if !self.inodes.contains(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Allocate a fresh inode owned by `owner` and return its ID.
+    /// ADR-029 § Decision 4 `SYS_FILE_CREATE` backend half: picks the
+    /// lowest-numbered free slot, builds a regular-file inode with
+    /// the caller as owner and an empty ACL, journals an
+    /// `InodeAllocate` record, then writes the inode header block
+    /// to disk.
+    ///
+    /// Order matches ADR-029 § Decision 5: the journal record is
+    /// durable before the inode header lands and before the
+    /// in-memory occupancy set commits. A crash between journal
+    /// flush and header write replays as "inode allocated"
+    /// (mount-time replay re-inserts the ID); the next
+    /// `find_free_inode_slot` skips it and `get_inode` returns the
+    /// header bytes from disk (zero-filled = free, header valid =
+    /// occupied). The InodeAllocate record is idempotent.
+    ///
+    /// `now_ticks` stamps both `created_at` and `modified_at`. The
+    /// caller (dispatcher) reads the kernel tick counter; tests
+    /// pass a fixed value.
+    ///
+    /// Returns `FsError::OutOfSpace` when the inode region is full.
+    pub fn create_inode(
+        &mut self,
+        owner: Principal,
+        now_ticks: u64,
+    ) -> Result<InodeId, FsError> {
+        let inode_id = self.find_free_inode_slot().ok_or(FsError::OutOfSpace)?;
+
+        let inode = PosixInode {
+            magic: ARCINOD_MAGIC_OCCUPIED,
+            kind: InodeKind::Regular,
+            size_bytes: 0,
+            created_at: now_ticks,
+            modified_at: now_ticks,
+            owner: *owner.aid(),
+            link_count: 1,
+            cow_refcount: 0,
+            extents: [None; MAX_EXTENTS_PER_INODE],
+            acl: [None; MAX_INODE_ACL_ENTRIES],
+        };
+
+        // Journal first — ADR-029 § Decision 5 ordering invariant.
+        let record = JournalRecord::InodeAllocate { inode: inode_id };
+        let encoded = encode_record(&record)?;
+        let append = self.journal.append(&encoded)?;
+        self.commit_journal_append(&append, &encoded)?;
+
+        // Header block durable next.
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode)?;
+        self.device.write_block(inode_header_lba(inode_id.raw()), &buf)?;
+        self.device.flush()?;
+
+        // In-memory occupancy committed last.
+        self.inodes.insert(inode_id);
+        Ok(inode_id)
+    }
+
+    /// Authorize an open of `inode_id` for `rights_requested` by
+    /// `caller`. Returns the resolved rights (always equal to
+    /// `rights_requested` in step 6; future tier policy may
+    /// narrow) when access is granted.
+    ///
+    /// Per ADR-029 § Decision 3:
+    /// 1. If `caller`'s AID matches `inode.owner`, access is
+    ///    granted (owner authority is uncircumscribed; the inode
+    ///    creator can always read/write/execute their own files).
+    /// 2. Else scan `inode.acl` for an entry where `principal ==
+    ///    caller.aid()` and the entry's rights cover the request
+    ///    and the entry has not expired.
+    /// 3. Else `FsError::PermissionDenied`.
+    ///
+    /// Read-only — does not mutate the inode, the journal, or the
+    /// occupancy set. `cow_refcount` accounting lands in step 7
+    /// (`O_CONSISTENT_SNAPSHOT` opens) and uses a separate code
+    /// path.
+    ///
+    /// Returns `FsError::InodeNotFound` when the inode does not
+    /// exist (out-of-range or free slot per `get_inode`).
+    pub fn open_inode(
+        &mut self,
+        caller: Principal,
+        inode_id: InodeId,
+        rights_requested: Rights,
+        now_ticks: u64,
+    ) -> Result<Rights, FsError> {
+        let inode = self.get_inode(inode_id)?;
+        let caller_aid = *caller.aid();
+
+        if inode.owner == caller_aid {
+            return Ok(rights_requested);
+        }
+
+        // ACL scan — bounded by MAX_INODE_ACL_ENTRIES (16).
+        for entry in inode.acl.iter().flatten() {
+            if entry.principal != caller_aid {
+                continue;
+            }
+            if let Some(expiry) = entry.expiry {
+                if expiry != 0 && expiry <= now_ticks {
+                    continue;
+                }
+            }
+            if entry.rights.contains(rights_requested) {
+                return Ok(rights_requested);
+            }
+            // Found the caller's row but it doesn't cover the
+            // request — deny without continuing the scan. ADR-029
+            // § Decision 3 has one ACL row per principal; a second
+            // match would imply duplicate entries which the grant
+            // path (step 6-iii) rejects.
+            return Err(FsError::PermissionDenied);
+        }
+
+        Err(FsError::PermissionDenied)
     }
 
     /// Write the on-disk bitmap-region block that contains the bit
@@ -2042,5 +2183,275 @@ mod tests {
         let backend = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
         let occupied: Vec<InodeId> = backend.occupied_inodes().collect();
         assert_eq!(occupied, alloc::vec![InodeId::new(1), InodeId::new(3)]);
+    }
+
+    // ========================================================================
+    // ADR-029 step 6-ii — create_inode + open_inode handler methods.
+    // ========================================================================
+
+    fn owner_p() -> Principal {
+        Principal::from_public_key([0xA1; 32])
+    }
+
+    fn stranger_p() -> Principal {
+        Principal::from_public_key([0xB2; 32])
+    }
+
+    #[test]
+    fn create_inode_allocates_first_free_slot() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        assert_eq!(id, InodeId::new(0));
+        assert!(backend.is_inode_occupied(id));
+    }
+
+    #[test]
+    fn create_inode_populates_owner_and_timestamps() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 12345).unwrap();
+        let inode = backend.get_inode(id).unwrap();
+        assert_eq!(inode.owner, *owner_p().aid());
+        assert_eq!(inode.created_at, 12345);
+        assert_eq!(inode.modified_at, 12345);
+        assert_eq!(inode.kind, InodeKind::Regular);
+        assert_eq!(inode.link_count, 1);
+        assert_eq!(inode.cow_refcount, 0);
+        assert_eq!(inode.size_bytes, 0);
+    }
+
+    #[test]
+    fn create_inode_sequential_allocations_use_sequential_slots() {
+        let mut backend = fresh_backend();
+        let a = backend.create_inode(owner_p(), 100).unwrap();
+        let b = backend.create_inode(owner_p(), 101).unwrap();
+        let c = backend.create_inode(owner_p(), 102).unwrap();
+        assert_eq!(a, InodeId::new(0));
+        assert_eq!(b, InodeId::new(1));
+        assert_eq!(c, InodeId::new(2));
+    }
+
+    #[test]
+    fn create_inode_advances_journal_head() {
+        // Indirect check that the journal saw a record: head_offset
+        // moves forward by at least the size of a non-empty
+        // serialized record after create_inode. The reboot-replay
+        // path (see `create_inode_survives_reboot`) is what asserts
+        // *which* record was written.
+        let mut backend = fresh_backend();
+        let head_before = backend.journal.head_offset();
+        backend.create_inode(owner_p(), 100).unwrap();
+        let head_after = backend.journal.head_offset();
+        assert!(
+            head_after > head_before,
+            "journal head must advance after create_inode (was {}, now {})",
+            head_before,
+            head_after
+        );
+    }
+
+    #[test]
+    fn create_inode_survives_reboot() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 9999).unwrap();
+        let dev = backend.into_device();
+        let backend2 = PosixFsBackend::open_or_format(dev, 8, 64, 0).unwrap();
+        assert!(backend2.is_inode_occupied(id));
+        // Slot 0 is occupied; next free slot would be 1 — verify
+        // the inode region scan agrees by reading the inode back.
+        let mut backend2 = backend2;
+        let inode = backend2.get_inode(id).unwrap();
+        assert_eq!(inode.owner, *owner_p().aid());
+        assert_eq!(inode.created_at, 9999);
+    }
+
+    #[test]
+    fn create_inode_fills_capacity_then_returns_out_of_space() {
+        let mut backend = fresh_backend();
+        let cap = backend.superblock().capacity_inodes;
+        for i in 0..cap {
+            let id = backend.create_inode(owner_p(), 100 + i).unwrap();
+            assert_eq!(id, InodeId::new(i));
+        }
+        assert!(matches!(
+            backend.create_inode(owner_p(), 999),
+            Err(FsError::OutOfSpace)
+        ));
+    }
+
+    #[test]
+    fn create_inode_skips_already_occupied_slots() {
+        // Pre-populate slot 0 via direct-write, then ensure
+        // create_inode picks slot 1.
+        let mut backend = fresh_backend();
+        let mut dev = backend.into_device();
+        write_inode(&mut dev, 0, &make_inode(0, 0));
+        let mut backend = PosixFsBackend::open_or_format(dev, 8, 64, 0).unwrap();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        assert_eq!(id, InodeId::new(1));
+    }
+
+    #[test]
+    fn open_inode_owner_gets_requested_rights() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let granted = backend
+            .open_inode(owner_p(), id, Rights::READ.union(Rights::WRITE), 200)
+            .unwrap();
+        assert_eq!(granted.bits(), Rights::READ.union(Rights::WRITE).bits());
+    }
+
+    #[test]
+    fn open_inode_owner_gets_execute_too() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let granted = backend
+            .open_inode(owner_p(), id, Rights::EXECUTE, 200)
+            .unwrap();
+        assert_eq!(granted.bits(), Rights::EXECUTE.bits());
+    }
+
+    #[test]
+    fn open_inode_stranger_with_no_acl_entry_is_denied() {
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let res = backend.open_inode(stranger_p(), id, Rights::READ, 200);
+        assert_eq!(res, Err(FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn open_inode_acl_grant_authorizes_within_rights() {
+        // Owner-create, then manually plant an ACL entry granting
+        // stranger Read+Write; verify open with Read works and
+        // Read+Write works.
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let mut inode = backend.get_inode(id).unwrap();
+        inode.acl[0] = Some(AclEntry {
+            principal: *stranger_p().aid(),
+            rights: Rights::READ.union(Rights::WRITE),
+            expiry: None,
+        });
+        // Rewrite the inode header so subsequent get_inode reads
+        // the updated ACL.
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        backend
+            .device
+            .write_block(inode_header_lba(id.raw()), &buf)
+            .unwrap();
+
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, Rights::READ, 200),
+            Ok(Rights::READ)
+        );
+        let combined = Rights::READ.union(Rights::WRITE);
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, combined, 200),
+            Ok(combined)
+        );
+    }
+
+    #[test]
+    fn open_inode_acl_grant_denies_beyond_granted_rights() {
+        // Stranger has Read only; an Execute open returns
+        // PermissionDenied (not a missing-row case — the grant
+        // exists but doesn't cover Execute).
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let mut inode = backend.get_inode(id).unwrap();
+        inode.acl[0] = Some(AclEntry {
+            principal: *stranger_p().aid(),
+            rights: Rights::READ,
+            expiry: None,
+        });
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        backend
+            .device
+            .write_block(inode_header_lba(id.raw()), &buf)
+            .unwrap();
+
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, Rights::EXECUTE, 200),
+            Err(FsError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn open_inode_expired_acl_grant_is_denied() {
+        // Grant with expiry = 150; query at now = 200 → expired.
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let mut inode = backend.get_inode(id).unwrap();
+        inode.acl[0] = Some(AclEntry {
+            principal: *stranger_p().aid(),
+            rights: Rights::READ,
+            expiry: Some(150),
+        });
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        backend
+            .device
+            .write_block(inode_header_lba(id.raw()), &buf)
+            .unwrap();
+
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, Rights::READ, 200),
+            Err(FsError::PermissionDenied)
+        );
+        // But same query at now = 100 still grants (not yet expired).
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, Rights::READ, 100),
+            Ok(Rights::READ)
+        );
+    }
+
+    #[test]
+    fn open_inode_zero_expiry_means_no_expiry() {
+        // Per ADR-029 § Decision 3, `expiry: Some(0)` is treated
+        // as "no expiry" in the on-disk encoding (the encoder maps
+        // `None` to zero bytes; the decoder maps zero bytes back
+        // to `None`). The owner-or-acl auth path therefore must
+        // not treat 0 as "expired at tick 0."
+        let mut backend = fresh_backend();
+        let id = backend.create_inode(owner_p(), 100).unwrap();
+        let mut inode = backend.get_inode(id).unwrap();
+        inode.acl[0] = Some(AclEntry {
+            principal: *stranger_p().aid(),
+            rights: Rights::READ,
+            expiry: Some(0),
+        });
+        let mut buf = [0u8; BLOCK_SIZE];
+        encode_inode_header(&mut buf, &inode).unwrap();
+        backend
+            .device
+            .write_block(inode_header_lba(id.raw()), &buf)
+            .unwrap();
+
+        assert_eq!(
+            backend.open_inode(stranger_p(), id, Rights::READ, u64::MAX),
+            Ok(Rights::READ)
+        );
+    }
+
+    #[test]
+    fn open_inode_on_free_slot_is_not_found() {
+        let mut backend = fresh_backend();
+        let _id = backend.create_inode(owner_p(), 100).unwrap();
+        // Slot 1 is empty.
+        assert_eq!(
+            backend.open_inode(owner_p(), InodeId::new(1), Rights::READ, 200),
+            Err(FsError::InodeNotFound)
+        );
+    }
+
+    #[test]
+    fn open_inode_out_of_range_is_not_found() {
+        let mut backend = fresh_backend();
+        let cap = backend.superblock().capacity_inodes;
+        assert_eq!(
+            backend.open_inode(owner_p(), InodeId::new(cap), Rights::READ, 200),
+            Err(FsError::InodeNotFound)
+        );
     }
 }
