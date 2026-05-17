@@ -9,7 +9,7 @@ docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
 docs/adr/001-smp-scheduling-and-lock-hierarchy.md:119:deferred
-docs/adr/003-content-addressed-storage-and-identity.md:238:deferred
+docs/adr/003-content-addressed-storage-and-identity.md:240:deferred
 docs/adr/005-ipc-primitives-control-and-bulk.md:116:eventually
 docs/adr/006-policy-service.md:216:eventually
 docs/adr/007-capability-revocation-and-telemetry.md:205:eventually
@@ -55,8 +55,14 @@ docs/adr/022-wall-clock-time.md:167:eventually
 docs/adr/023-audit-consumer-capability.md:30:eventually
 docs/adr/027-service-clusters.md:20:eventually
 docs/adr/027-service-clusters.md:83:deferred
+docs/adr/029-posix-file-storage-model.md:94:deferred
+docs/adr/029-posix-file-storage-model.md:364:deferred
+docs/adr/029-posix-file-storage-model.md:368:deferred
+docs/adr/029-posix-file-storage-model.md:423:deferred
+docs/identity-synthesis.md:124:deferred
 docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:77:deferred
+docs/storage-planning.md:42:deferred
 src/arch/aarch64/gic.rs:130:deferred
 src/arch/aarch64/mod.rs:76:placeholder
 src/arch/aarch64/mod.rs:78:placeholder
@@ -90,8 +96,8 @@ src/microkernel/main.rs:2014:deferred
 src/microkernel/main.rs:2043:deferred
 src/microkernel/main.rs:2346:for-now
 src/platform/mod.rs:353:for-now
-src/process.rs:790:deferred
-src/process.rs:791:deferred
+src/process.rs:965:deferred
+src/process.rs:966:deferred
 src/scheduler/mod.rs:281:placeholder
 src/scheduler/mod.rs:282:placeholder
 src/syscalls/dispatcher.rs:1654:deferred

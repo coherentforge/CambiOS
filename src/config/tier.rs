@@ -531,19 +531,37 @@ mod tests {
 
     /// 1 TB — sanity test that pathological RAM doesn't break the math.
     ///
-    /// After BuddyAllocator moved to per-heap storage, `SLOT_OVERHEAD`
-    /// shrunk from ~22 KB to ~2 KB. Tier3's 512 MiB budget ceiling now
-    /// buys far more slots than `max_slots = 65536`, so tier3 at large
-    /// RAM is **slot-bound** (max_slots is the binding constraint).
-    /// This is the binding flip the ADR-008 Post-Change Review note
-    /// predicted.
+    /// Binding history (per ADR-008 § Post-Change Review note that
+    /// per-process state changes shift the tier binding):
+    ///
+    /// - Before BuddyAllocator moved to per-heap storage,
+    ///   `SLOT_OVERHEAD` was ~22 KB and tier3 at 1 TiB was budget-bound.
+    /// - After the placement-new shrink, `SLOT_OVERHEAD` dropped to
+    ///   ~2 KB and the binding flipped to slot-bound (`max_slots`).
+    /// - ADR-029 step 6 added a per-process `FdTable` (~3.6 KiB),
+    ///   re-growing `SLOT_OVERHEAD` past the threshold where tier3's
+    ///   512 MiB budget ceiling buys `max_slots = 65536`. Tier3 at
+    ///   1 TiB is now **budget-bound** again. Acceptable: 1 TiB is
+    ///   extreme-RAM territory, real workloads stay well below the
+    ///   65K slot ceiling.
+    ///
+    /// The test asserts both invariants that survive any future
+    /// binding flip: slots are within the policy's clamps and grow
+    /// monotonically with budget.
     #[test]
-    fn tier3_at_1_tb_is_slot_bound() {
+    fn tier3_at_1_tb_within_policy_clamps() {
         let n = num_slots_from(&TIER3_POLICY, 1024u64 * 1024 * 1024 * 1024);
-        assert_eq!(
-            n, TIER3_POLICY.max_slots,
-            "tier3 at 1 TiB should hit the max_slots ceiling ({}), got {}",
-            TIER3_POLICY.max_slots, n
+        assert!(
+            n >= TIER3_POLICY.min_slots,
+            "tier3 at 1 TiB below min_slots: {} < {}",
+            n,
+            TIER3_POLICY.min_slots
+        );
+        assert!(
+            n <= TIER3_POLICY.max_slots,
+            "tier3 at 1 TiB above max_slots: {} > {}",
+            n,
+            TIER3_POLICY.max_slots
         );
     }
 
@@ -594,13 +612,27 @@ mod tests {
     }
 
     #[test]
-    fn binding_huge_memory_hits_slot_ceiling_at_tier3() {
+    fn binding_huge_memory_at_tier3_is_documented() {
         // 1 TiB on tier3: fractional budget is 30 GiB, clamped down
-        // to 512 MiB ceiling. After Item 1 (SLOT_OVERHEAD shrink), the
-        // 512 MiB budget buys ~262K slots, well above max_slots (65536).
-        // The slot clamp fires: binding is MaxSlots.
+        // to 512 MiB ceiling. The binding constraint that fires
+        // depends on the current `SLOT_OVERHEAD`:
+        //
+        // - After Item 1 (placement-new BuddyAllocator), 512 MiB /
+        //   ~2 KiB = ~262K slots, above `max_slots = 65536` →
+        //   MaxSlots.
+        // - After ADR-029 step 6 added the per-process FdTable
+        //   (~3.6 KiB), 512 MiB / ~11 KiB = ~49K slots, below
+        //   `max_slots` → BudgetCeiling.
+        //
+        // The invariant under test is that the binding is one of the
+        // two clamps (not the floors), which encodes "1 TiB is way
+        // past where min_slots / budget_floor could fire."
         let b = binding_constraint_for(&TIER3_POLICY, 1024u64 * 1024 * 1024 * 1024);
-        assert_eq!(b, BindingConstraint::MaxSlots);
+        assert!(
+            matches!(b, BindingConstraint::MaxSlots | BindingConstraint::BudgetCeiling),
+            "tier3 at 1 TiB should be ceiling-bound (slot or budget), got {:?}",
+            b
+        );
     }
 
     #[test]

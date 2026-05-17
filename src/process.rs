@@ -11,6 +11,7 @@ use crate::memory::buddy_allocator::BuddyAllocator;
 use crate::memory::frame_allocator::{FrameAllocator, FrameAllocError, PAGE_SIZE};
 use crate::memory::paging;
 use crate::ipc::ProcessId;
+use cambios_abi::{FileBacking, FileRights, InodeId};
 extern crate alloc;
 use alloc::boxed::Box;
 
@@ -186,6 +187,173 @@ impl VmaTracker {
 }
 
 // ============================================================================
+// Per-process file descriptor table (ADR-029 step 6)
+// ============================================================================
+
+/// SCAFFOLDING: per-process FdTable slot count for POSIX
+/// `FileDescriptor`s per ADR-029 § Decision 4.
+/// Why: v1 endgame win-compat shim peaks ~20 open files (registry +
+///      config + app data + stdio/IPC); 64 gives the 25%-utilization
+///      4x headroom per Convention 8. Memory cost: ~3.5 KiB per
+///      process out of the kernel object-table region (ADR-008).
+/// Replace when: a single process is observed holding > 16 open
+///      fds, or posix-fs-service moves opens userside (ADR-029
+///      step 12). See docs/ASSUMPTIONS.md.
+const MAX_FDS_PER_PROCESS: usize = 64;
+
+/// One open file in a process's FdTable. Kernel-internal state behind
+/// the userspace-visible `FileDescriptor` (cambios-abi). The `fd: u32`
+/// in `FileDescriptor` is this slot's index; `generation` matches the
+/// `FileDescriptor::generation` field so a stale fd can be detected
+/// after close-and-reopen (slot reuse).
+///
+/// `offset` is unused in ADR-029 step 6 (no FILE_READ/WRITE/SEEK yet)
+/// but is part of the open-file state from the start so step 7's data
+/// path lands on a stable struct rather than retrofitting.
+#[derive(Clone, Copy)]
+pub struct OpenFile {
+    /// Inode this fd points at. `FileBacking::Posix` only in step 6;
+    /// `ObjectView` lands when the path resolver does (step 10).
+    pub inode_id: InodeId,
+    /// Byte offset into the file (current seek position). Zero at
+    /// open; mutated by FILE_SEEK / READ / WRITE in step 7.
+    pub offset: u64,
+    /// Rights granted at open time. Cached so subsequent ops do not
+    /// re-scan the inode's ACL on every byte read.
+    pub rights: FileRights,
+    /// `FileBacking` tag set at open time, immutable thereafter.
+    pub backing: FileBacking,
+    /// Generation counter; matches `FileDescriptor::generation`.
+    /// Incremented on slot reuse so a stale fd returns EBADF.
+    pub generation: u32,
+}
+
+/// Per-process file descriptor table.
+///
+/// Pure bookkeeping — the actual inode data lives in `POSIX_STORE`
+/// (deferred to ADR-029 step 7). Allocation finds the first free
+/// slot; close marks the slot `None` and bumps `next_generation` so
+/// stale fds reusing the slot index see a generation mismatch.
+///
+/// # Invariants (for formal verification)
+///
+/// - `count <= MAX_FDS_PER_PROCESS` (64).
+/// - `count` equals the number of `Some` entries in `entries`.
+/// - For every `Some(OpenFile { generation: g, .. })`, `g <
+///   next_generation` (the counter monotonically increases on close).
+pub struct FdTable {
+    entries: [Option<OpenFile>; MAX_FDS_PER_PROCESS],
+    count: usize,
+    /// Generation counter handed out on each new open. Monotonically
+    /// increases; never reused. u32 width: 4 billion opens per
+    /// process lifetime is comfortably beyond any workload.
+    next_generation: u32,
+}
+
+impl Default for FdTable {
+    fn default() -> Self { Self::new() }
+}
+
+impl FdTable {
+    /// Create an empty FdTable.
+    pub const fn new() -> Self {
+        FdTable {
+            entries: [None; MAX_FDS_PER_PROCESS],
+            count: 0,
+            next_generation: 0,
+        }
+    }
+
+    /// Allocate a new fd, returning `(slot_index, generation)` on
+    /// success. The returned slot index is the `fd: u32` field of
+    /// the userspace `FileDescriptor`; the generation must be
+    /// embedded in the same `FileDescriptor` for stale-fd detection.
+    ///
+    /// Returns `None` when the table is full.
+    pub fn allocate(
+        &mut self,
+        inode_id: InodeId,
+        rights: FileRights,
+        backing: FileBacking,
+    ) -> Option<(u32, u32)> {
+        let slot = self.entries.iter().position(|e| e.is_none())?;
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.entries[slot] = Some(OpenFile {
+            inode_id,
+            offset: 0,
+            rights,
+            backing,
+            generation,
+        });
+        self.count += 1;
+        Some((slot as u32, generation))
+    }
+
+    /// Look up an open file by slot index and generation. Returns
+    /// `None` if the slot is empty or the generation does not match
+    /// (stale fd).
+    pub fn get(&self, slot: u32, generation: u32) -> Option<&OpenFile> {
+        let s = slot as usize;
+        if s >= MAX_FDS_PER_PROCESS {
+            return None;
+        }
+        let entry = self.entries[s].as_ref()?;
+        if entry.generation != generation {
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Mutable lookup; same generation-match semantics as `get`.
+    pub fn get_mut(&mut self, slot: u32, generation: u32) -> Option<&mut OpenFile> {
+        let s = slot as usize;
+        if s >= MAX_FDS_PER_PROCESS {
+            return None;
+        }
+        let entry = self.entries[s].as_mut()?;
+        if entry.generation != generation {
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Close an open file. Returns the removed `OpenFile` if the
+    /// slot was occupied and the generation matched; `None` otherwise.
+    /// The caller is responsible for any backend-side cleanup (e.g.,
+    /// decrementing cow_refcount when ADR-029 step 7's frozen views
+    /// land); step 6 has no such cleanup.
+    pub fn close(&mut self, slot: u32, generation: u32) -> Option<OpenFile> {
+        let s = slot as usize;
+        if s >= MAX_FDS_PER_PROCESS {
+            return None;
+        }
+        let entry = self.entries[s]?;
+        if entry.generation != generation {
+            return None;
+        }
+        self.entries[s] = None;
+        self.count -= 1;
+        Some(entry)
+    }
+
+    /// Number of currently-open fds.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Iterate all open files in the table. Used by process exit to
+    /// reclaim any fds the process held; order is slot-index
+    /// ascending. The iterator yields `(slot, &OpenFile)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &OpenFile)> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|f| (i as u32, f)))
+    }
+}
+
+// ============================================================================
 // MAX_PROCESSES is no longer a compile-time constant.
 //
 // The number of process slots is now computed at boot from the active
@@ -270,6 +438,12 @@ pub struct ProcessDescriptor {
     pub cr3: u64,
     /// Tracks user-space virtual memory allocations (for SYS_ALLOCATE / SYS_FREE)
     pub vma: VmaTracker,
+    /// Per-process file descriptor table for POSIX `FileDescriptor`s
+    /// per ADR-029 § Decision 4. Empty at create; populated by
+    /// `SYS_FILE_OPEN` / `SYS_FILE_CREATE` once their handlers wire
+    /// in (ADR-029 step 6+). Reclaimed on process exit alongside the
+    /// VMA tracker.
+    pub fds: FdTable,
 }
 
 impl ProcessDescriptor {
@@ -353,6 +527,7 @@ impl ProcessDescriptor {
             heap_size: HEAP_SIZE,
             cr3: 0, // 0 = uses kernel page table (no per-process table yet)
             vma: VmaTracker::new(),
+            fds: FdTable::new(),
         })
     }
 
@@ -1023,6 +1198,7 @@ mod tests {
             heap_size: HEAP_SIZE,
             cr3: 0x2000_0000, // non-zero → has per-process PT
             vma: VmaTracker::new(),
+            fds: FdTable::new(),
         }
     }
 
@@ -1120,5 +1296,130 @@ mod tests {
         ring.push(3, 1, p_gen1);
         assert_eq!(ring.lookup(3, 0), Some(p_gen0));
         assert_eq!(ring.lookup(3, 1), Some(p_gen1));
+    }
+
+    // ========================================================================
+    // FdTable tests — per-process file descriptor table for ADR-029 § Decision 4.
+    // ========================================================================
+
+    fn dummy_open_args() -> (InodeId, FileRights, FileBacking) {
+        (InodeId::new(42), FileRights::READ, FileBacking::Posix)
+    }
+
+    #[test]
+    fn fd_table_starts_empty() {
+        let t = FdTable::new();
+        assert_eq!(t.count(), 0);
+        assert!(t.get(0, 0).is_none());
+    }
+
+    #[test]
+    fn fd_table_allocate_returns_slot_zero_first() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (slot, gen) = t.allocate(id, rights, backing).unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(gen, 0);
+        assert_eq!(t.count(), 1);
+    }
+
+    #[test]
+    fn fd_table_allocate_uses_sequential_slots() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (s0, _) = t.allocate(id, rights, backing).unwrap();
+        let (s1, _) = t.allocate(id, rights, backing).unwrap();
+        let (s2, _) = t.allocate(id, rights, backing).unwrap();
+        assert_eq!((s0, s1, s2), (0, 1, 2));
+        assert_eq!(t.count(), 3);
+    }
+
+    #[test]
+    fn fd_table_get_returns_open_file_on_match() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (slot, gen) = t.allocate(id, rights, backing).unwrap();
+        let of = t.get(slot, gen).unwrap();
+        assert_eq!(of.inode_id, id);
+        assert_eq!(of.rights, rights);
+        assert_eq!(of.offset, 0);
+    }
+
+    #[test]
+    fn fd_table_get_rejects_wrong_generation() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (slot, gen) = t.allocate(id, rights, backing).unwrap();
+        assert!(t.get(slot, gen.wrapping_add(1)).is_none());
+    }
+
+    #[test]
+    fn fd_table_get_rejects_out_of_range_slot() {
+        let t = FdTable::new();
+        assert!(t.get(MAX_FDS_PER_PROCESS as u32, 0).is_none());
+        assert!(t.get(u32::MAX, 0).is_none());
+    }
+
+    #[test]
+    fn fd_table_close_removes_entry_and_returns_it() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (slot, gen) = t.allocate(id, rights, backing).unwrap();
+        let removed = t.close(slot, gen).unwrap();
+        assert_eq!(removed.inode_id, id);
+        assert_eq!(t.count(), 0);
+        assert!(t.get(slot, gen).is_none());
+    }
+
+    #[test]
+    fn fd_table_close_rejects_wrong_generation() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (slot, gen) = t.allocate(id, rights, backing).unwrap();
+        assert!(t.close(slot, gen.wrapping_add(1)).is_none());
+        assert_eq!(t.count(), 1, "failed close must not decrement count");
+    }
+
+    #[test]
+    fn fd_table_reused_slot_has_new_generation() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (slot0, gen0) = t.allocate(id, rights, backing).unwrap();
+        t.close(slot0, gen0).unwrap();
+        let (slot1, gen1) = t.allocate(id, rights, backing).unwrap();
+        assert_eq!(slot1, slot0, "slot index reused on close+reopen");
+        assert_ne!(gen1, gen0, "generation must change on reuse");
+        // Stale fd targeting the original generation must not resolve.
+        assert!(t.get(slot0, gen0).is_none());
+        assert!(t.get(slot1, gen1).is_some());
+    }
+
+    #[test]
+    fn fd_table_fills_to_capacity_then_returns_none() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        for _ in 0..MAX_FDS_PER_PROCESS {
+            assert!(t.allocate(id, rights, backing).is_some());
+        }
+        assert_eq!(t.count(), MAX_FDS_PER_PROCESS);
+        assert!(t.allocate(id, rights, backing).is_none());
+    }
+
+    #[test]
+    fn fd_table_iter_visits_open_entries_in_slot_order() {
+        let mut t = FdTable::new();
+        let (id, rights, backing) = dummy_open_args();
+        let (s0, _) = t.allocate(id, rights, backing).unwrap();
+        let (s1, _) = t.allocate(id, rights, backing).unwrap();
+        let (s2, _) = t.allocate(id, rights, backing).unwrap();
+        t.close(s1, t.get(s1, 1).unwrap().generation).unwrap();
+        let slots: alloc::vec::Vec<u32> = t.iter().map(|(s, _)| s).collect();
+        assert_eq!(slots, alloc::vec![s0, s2]);
+    }
+
+    #[test]
+    fn process_descriptor_initializes_empty_fd_table() {
+        let desc = test_descriptor();
+        assert_eq!(desc.fds.count(), 0);
     }
 }

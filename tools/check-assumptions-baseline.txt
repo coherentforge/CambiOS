@@ -307,11 +307,11 @@ src/pci/mod.rs:36:MAX_PCI_DEVICES
 src/policy/mod.rs:75:DECISION_NONE
 src/policy/mod.rs:76:DECISION_ALLOW
 src/policy/mod.rs:77:DECISION_DENY
-src/process.rs:34:MAX_VMAS
-src/process.rs:38:VMA_ALLOC_BASE
-src/process.rs:218:HEAP_SIZE
-src/process.rs:221:HEAP_PAGES
-src/process.rs:538:RECENT_EXITS_RING_SIZE
+src/process.rs:35:MAX_VMAS
+src/process.rs:39:VMA_ALLOC_BASE
+src/process.rs:386:HEAP_SIZE
+src/process.rs:389:HEAP_PAGES
+src/process.rs:713:RECENT_EXITS_RING_SIZE
 src/syscalls/fuzz_fixture.rs:38:FIXTURE_SLOT
 src/syscalls/fuzz_fixture.rs:41:FIXTURE_GENERATION
 src/syscalls/fuzz_fixture.rs:45:FIXTURE_TASK

@@ -1320,6 +1320,30 @@ pub struct FrozenInodeView {
     pub created_at: u64,
 }
 
+/// `SYS_STAT` (68) result struct per ADR-029 § Decision 4. The
+/// metadata a POSIX `stat()`-shape consumer needs without exposing
+/// the on-disk extent list.
+///
+/// `owner` is a 32-byte AID per the top-of-file note on Principal
+/// shape. `modified_at` / `created_at` are monotonic ticks (per
+/// `PosixInode`); the libposix shim is responsible for translating
+/// them into POSIX `time_t` if a legacy consumer needs that shape.
+///
+/// `inode_id` is included for round-trip purposes: a caller that
+/// stats a `FileDescriptor` can re-open the same inode without
+/// retaining the original open. The on-disk inode itself is
+/// addressed by `InodeId`; paths arrive at ADR-029 step 10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMetadata {
+    pub inode_id: InodeId,
+    pub kind: InodeKind,
+    pub size_bytes: u64,
+    pub owner: [u8; 32],
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub link_count: u32,
+}
+
 // ============================================================================
 // Stream cap-shape types (ADR-030)
 // ============================================================================
