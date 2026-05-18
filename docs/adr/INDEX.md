@@ -41,3 +41,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 029 | [POSIX File Storage Model](029-posix-file-storage-model.md) | Accepted | 2026-05-12 |
 | 030 | [Stream as Cap Variant on Channels](030-stream-cap-variant.md) | Accepted | 2026-05-12 |
 | 031 | [Unified Storage Substrate](031-unified-storage-substrate.md) | Proposed | 2026-05-17 |
+| 032 | [Full-Disk Encryption Below the Substrate](032-full-disk-encryption-below-substrate.md) | Proposed | 2026-05-17 |
