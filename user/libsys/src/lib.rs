@@ -30,6 +30,12 @@ pub use cambios_abi::SyscallNumber;
 /// context. See [`time`] for the per-function docs.
 pub mod time;
 
+/// Key-store-service IPC wire codec for the PIV protocol. Pure
+/// encode/decode functions; no syscalls. See [`keystore`] for the
+/// command catalog and wire format. ADR-032 § Migration Path step 2
+/// is the consumer that justifies this contract.
+pub mod keystore;
+
 
 // ============================================================================
 // Raw syscall primitives — the ONLY unsafe code in user-space
