@@ -1810,14 +1810,19 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Security: reject mapping RAM regions as MMIO.
-        // MMIO should be above RAM or in known device ranges.
-        // On x86_64 QEMU, RAM is typically 0..128MB. Device MMIO is above 0xFE00_0000.
-        // We reject anything in the frame allocator's tracked range as a conservative check.
+        // Security: reject mapping RAM regions as MMIO. The check
+        // walks the recorded USABLE extents (populated from the Limine
+        // memmap by add_region) and rejects any overlap. This permits
+        // MMIO BARs that land *inside* the RAM address range — a real
+        // shape on QEMU x86_64 with -m 4G, where the 32-bit PCI MMIO
+        // hole at 0xFE000000-0xFEC00000 sits below the high RAM extent
+        // starting at 0x100000000. The previous linear-ceiling check
+        // (`phys_addr < total_count*4096`) rejected those legitimate
+        // MMIO ranges.
         {
             let fa_guard = crate::FRAME_ALLOCATOR.lock();
-            let max_ram = fa_guard.total_count() as u64 * 4096;
-            if phys_addr < max_ram {
+            let map_len = (num_pages as u64).saturating_mul(4096);
+            if fa_guard.is_ram_overlap(phys_addr, map_len) {
                 return Err(SyscallError::PermissionDenied);
             }
         }
@@ -2123,7 +2128,7 @@ impl SyscallDispatcher {
         desc[6] = dev.bus;
         desc[7] = dev.device;
         desc[8] = dev.function;
-        desc[9] = 0; // pad
+        desc[9] = dev.prog_if;
         // Count non-zero BARs
         desc[10] = dev.bars.iter().filter(|&&b| b != 0).count() as u8;
         desc[11] = 0; // pad

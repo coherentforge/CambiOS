@@ -113,6 +113,11 @@ pub struct PciDevice {
     pub class: u8,
     /// Subclass code (offset 0x0A).
     pub subclass: u8,
+    /// Programming interface (offset 0x09). Distinguishes controllers
+    /// within the same class/subclass — e.g. USB host controllers all
+    /// report class=0x0C/subclass=0x03, with prog_if=0x30 for xHCI,
+    /// 0x20 for EHCI, 0x10 for OHCI, 0x00 for UHCI.
+    pub prog_if: u8,
     /// Base Address Registers — decoded addresses (0 = unused).
     /// For MMIO BARs: physical address. For I/O BARs: port number.
     pub bars: [u64; 6],
@@ -134,6 +139,7 @@ impl PciDevice {
         device_id: 0,
         class: 0,
         subclass: 0,
+        prog_if: 0,
         bars: [0; 6],
         bar_sizes: [0; 6],
         bar_is_io: [false; 6],
@@ -881,6 +887,7 @@ pub unsafe fn scan() {
             let class_reg = unsafe { config::read32(0, dev, func, 0x08) };
             let class = ((class_reg >> 24) & 0xFF) as u8;
             let subclass = ((class_reg >> 16) & 0xFF) as u8;
+            let prog_if = ((class_reg >> 8) & 0xFF) as u8;
 
             let mut bars = [0u64; 6];
             let mut bar_sizes = [0u32; 6];
@@ -907,6 +914,7 @@ pub unsafe fn scan() {
                     device_id,
                     class,
                     subclass,
+                    prog_if,
                     bars,
                     bar_sizes,
                     bar_is_io,
@@ -1091,6 +1099,7 @@ pub unsafe fn register_virtio_mmio(phys_base: u64, size: u64) -> bool {
             device_id: synthetic_device_id,
             class: 0,
             subclass: 0,
+            prog_if: 0,
             bars,
             bar_sizes,
             bar_is_io,

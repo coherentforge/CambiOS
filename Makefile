@@ -33,6 +33,8 @@ NET_DRIVER_DIR := user/virtio-net
 NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-net
 BLK_DRIVER_DIR := user/virtio-blk
 BLK_DRIVER_ELF := $(BLK_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-blk
+USB_HOST_DIR := user/usb-host
+USB_HOST_ELF := $(USB_HOST_DIR)/target/x86_64-unknown-none/release/cambios-usb-host
 I219_DRIVER_DIR := user/i219-net
 I219_DRIVER_ELF := $(I219_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-i219-net
 UDP_STACK_DIR := user/udp-stack
@@ -70,6 +72,7 @@ AUDIT_TAIL_ELF := $(AUDIT_TAIL_DIR)/target/x86_64-unknown-none/release/cambios-a
 FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-fs-service
 KS_SERVICE_ELF_RISCV64 := $(KS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-key-store-service
 BLK_DRIVER_ELF_RISCV64 := $(BLK_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-blk
+USB_HOST_ELF_RISCV64 := $(USB_HOST_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-usb-host
 NET_DRIVER_ELF_RISCV64 := $(NET_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-net
 UDP_STACK_ELF_RISCV64 := $(UDP_STACK_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-udp-stack
 SHELL_ELF_RISCV64 := $(SHELL_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-shell
@@ -88,6 +91,7 @@ FS_SERVICE_ELF_AARCH64 := $(FS_SERVICE_DIR)/target/aarch64-unknown-none/release/
 KS_SERVICE_ELF_AARCH64 := $(KS_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-key-store-service
 NET_DRIVER_ELF_AARCH64 := $(NET_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-virtio-net
 BLK_DRIVER_ELF_AARCH64 := $(BLK_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-virtio-blk
+USB_HOST_ELF_AARCH64 := $(USB_HOST_DIR)/target/aarch64-unknown-none/release/cambios-usb-host
 I219_DRIVER_ELF_AARCH64 := $(I219_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-i219-net
 UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/cambios-udp-stack
 SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/cambios-shell
@@ -127,6 +131,15 @@ AUDIT_TAIL_ELF_RISCV64 := $(AUDIT_TAIL_DIR)/target/riscv64gc-unknown-none-elf/re
 SIGN_ELF_DIR := tools/sign-elf
 SIGN_ELF := $(SIGN_ELF_DIR)/target/aarch64-apple-darwin/release/sign-elf
 
+# Dev-PIV keypair generator (host-side). Derives Ed25519+X25519 keys from a
+# persistent per-developer seed; writes dev_bootstrap_pubkey.bin (consumed by
+# the kernel under --features dev-piv) and user/key-store-service/
+# dev_piv_secret.bin (consumed by SwPivBackend under --features dev-piv).
+GEN_DEV_PIV_DIR := tools/gen-dev-piv-keys
+GEN_DEV_PIV := $(GEN_DEV_PIV_DIR)/target/aarch64-apple-darwin/release/gen-dev-piv-keys
+DEV_BOOTSTRAP_PUBKEY := dev_bootstrap_pubkey.bin
+DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
+
 # Signing mode: "yubikey" (default) or "seed" (for CI/testing without hardware key)
 SIGN_MODE ?= seed
 
@@ -140,7 +153,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 sign-tool mkinitrd bake-font export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 sign-tool mkinitrd gen-dev-piv-keys bake-font export-pubkey
 
 all: iso
 
@@ -180,6 +193,13 @@ virtio-blk:
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Virtio-Blk driver ready ==="
+
+usb-host:
+	@echo "=== Building USB-Host driver ==="
+	cd $(USB_HOST_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== USB-Host driver ready ==="
 
 i219-net:
 	@echo "=== Building Intel I219-LM driver ==="
@@ -328,6 +348,13 @@ virtio-blk-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== Virtio-Blk driver (AArch64) ready ==="
 
+usb-host-aarch64:
+	@echo "=== Building USB-Host driver (AArch64) ==="
+	cd $(USB_HOST_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== USB-Host driver (AArch64) ready ==="
+
 i219-net-aarch64:
 	@echo "=== Building Intel I219-LM driver (AArch64) ==="
 	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -464,6 +491,13 @@ virtio-blk-riscv64:
 		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
 	@echo "=== Virtio-Blk driver (RISC-V) ready ==="
 
+usb-host-riscv64:
+	@echo "=== Building USB-Host driver (RISC-V) ==="
+	cd $(USB_HOST_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== USB-Host driver (RISC-V) ready ==="
+
 virtio-net-riscv64:
 	@echo "=== Building Virtio-Net driver (RISC-V) ==="
 	cd $(NET_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -572,6 +606,17 @@ mkinitrd:
 	cd $(MKINITRD_DIR) && cargo build --release
 	@echo "=== mkinitrd ready ==="
 
+# Builds the gen-dev-piv-keys tool (idempotent; rebuilds only on source
+# change) and runs it. Idempotent at the file-output level: same seed →
+# byte-identical dev_bootstrap_pubkey.bin and dev_piv_secret.bin.
+# Required before any build with `--features dev-piv` enabled.
+gen-dev-piv-keys:
+	@echo "=== Building dev-PIV keypair generator ==="
+	cd $(GEN_DEV_PIV_DIR) && cargo build --release
+	@echo "=== Generating dev-PIV keypair files ==="
+	$(GEN_DEV_PIV)
+	@echo "=== dev-PIV keypair files ready ==="
+
 # Re-bake the JetBrains Mono Regular TTF in assets/fonts/ into the
 # antialiased glyph table consumed by user/libgui at compile time. Run
 # only when the font, target cell size, or pixel height changes — the
@@ -618,7 +663,7 @@ $(LIMINE_DIR)/limine: $(LIMINE_DIR)/BOOTX64.EFI
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine
 
-iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input shell policy-service fb-demo compositor scanout-virtio-gpu tree worm ping sprouty terminal-window audit-tail sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input usb-host shell policy-service fb-demo compositor scanout-virtio-gpu tree worm ping sprouty terminal-window audit-tail sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -635,6 +680,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
 	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
+	cp $(USB_HOST_ELF) iso_root/boot/usb-host.elf
 	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
 	cp $(UDP_STACK_ELF) iso_root/boot/udp-stack.elf
 	cp $(SHELL_ELF) iso_root/boot/shell.elf
@@ -652,6 +698,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/usb-host.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/udp-stack.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
@@ -720,6 +767,8 @@ run: iso disk-img
 		-device virtio-net-pci,netdev=net0 \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 		-device virtio-blk-pci,drive=cambios-disk0 \
+		-device qemu-xhci,id=xhci0 \
+		-device usb-ccid,bus=xhci0.0 \
 		-vga virtio \
 		-no-reboot
 
@@ -742,6 +791,8 @@ run-quiet: iso disk-img
 			-device virtio-net-pci,netdev=net0 \
 			-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
 			-device virtio-blk-pci,drive=cambios-disk0 \
+			-device qemu-xhci,id=xhci0 \
+			-device usb-ccid,bus=xhci0.0 \
 			-vga virtio \
 			-no-reboot
 
@@ -762,6 +813,8 @@ run-gui: iso disk-img
 		-device virtio-blk-pci,drive=cambios-disk0 \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
+		-device qemu-xhci,id=xhci0 \
+		-device usb-ccid,bus=xhci0.0 \
 		-vga virtio \
 		-no-reboot \
 		-display cocoa
@@ -1175,7 +1228,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 usb-host-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1191,6 +1244,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(KS_SERVICE_ELF_AARCH64) /tmp/key-store-service-signed.elf
 	cp $(FS_SERVICE_ELF_AARCH64) /tmp/fs-service-signed.elf
 	cp $(BLK_DRIVER_ELF_AARCH64) /tmp/virtio-blk-signed.elf
+	cp $(USB_HOST_ELF_AARCH64) /tmp/usb-host-signed.elf
 	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
 	cp $(UDP_STACK_ELF_AARCH64) /tmp/udp-stack-signed.elf
 	cp $(SCANOUT_VGPU_ELF_AARCH64) /tmp/scanout-virtio-gpu-signed.elf
@@ -1207,6 +1261,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/usb-host-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-virtio-gpu-signed.elf
@@ -1223,6 +1278,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
+	mcopy -i $(IMG_AARCH64) /tmp/usb-host-signed.elf ::/boot/usb-host.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
 	mcopy -i $(IMG_AARCH64) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
 	mcopy -i $(IMG_AARCH64) /tmp/scanout-virtio-gpu-signed.elf ::/boot/scanout-virtio-gpu.elf
@@ -1235,7 +1291,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/sprouty-signed.elf ::/boot/sprouty.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
 	mcopy -i $(IMG_AARCH64) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/ping-signed.elf /tmp/sprouty-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/usb-host-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/ping-signed.elf /tmp/sprouty-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
@@ -1252,6 +1308,8 @@ run-aarch64: img-aarch64
 		-m 4G \
 		-serial mon:stdio \
 		-display none \
+		-device qemu-xhci,id=xhci0 \
+		-device usb-ccid,bus=xhci0.0 \
 		-no-reboot \
 		-bios $(EFI_FW_AARCH64) \
 		-drive file=$(IMG_AARCH64),format=raw
@@ -1271,6 +1329,8 @@ run-aarch64-gui: img-aarch64
 		-display cocoa \
 		-device virtio-gpu-pci \
 		-device virtio-keyboard-pci \
+		-device qemu-xhci,id=xhci0 \
+		-device usb-ccid,bus=xhci0.0 \
 		-no-reboot \
 		-bios $(EFI_FW_AARCH64) \
 		-drive file=$(IMG_AARCH64),format=raw
@@ -1313,7 +1373,7 @@ kernel-riscv64:
 # img-riscv64 deps, copy + sign + --module here, and pick the right
 # slot in BOOT_MODULE_ORDER (between compositor's last GUI dep and
 # shell, mirroring x86_64).
-img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
+img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64
 	mkdir -p initrd_root_riscv64
@@ -1321,6 +1381,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	cp $(KS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/key-store-service.elf
 	cp $(FS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/fs-service.elf
 	cp $(BLK_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-blk.elf
+	cp $(USB_HOST_ELF_RISCV64)       initrd_root_riscv64/usb-host.elf
 	cp $(NET_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-net.elf
 	cp $(UDP_STACK_ELF_RISCV64)      initrd_root_riscv64/udp-stack.elf
 	cp $(SHELL_ELF_RISCV64)          initrd_root_riscv64/shell.elf
@@ -1329,6 +1390,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-blk.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/usb-host.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-net.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/udp-stack.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/shell.elf
@@ -1342,6 +1404,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 		--module key-store-service=initrd_root_riscv64/key-store-service.elf \
 		--module fs-service=initrd_root_riscv64/fs-service.elf \
 		--module virtio-blk=initrd_root_riscv64/virtio-blk.elf \
+		--module usb-host=initrd_root_riscv64/usb-host.elf \
 		--module virtio-net=initrd_root_riscv64/virtio-net.elf \
 		--module udp-stack=initrd_root_riscv64/udp-stack.elf \
 		--module audit-tail=initrd_root_riscv64/audit-tail.elf \
@@ -1359,6 +1422,8 @@ run-riscv64: kernel-riscv64 img-riscv64
 		-m 4G \
 		-serial mon:stdio \
 		-display none \
+		-device qemu-xhci,id=xhci0 \
+		-device usb-ccid,bus=xhci0.0 \
 		-no-reboot \
 		-bios default \
 		-kernel $(KERNEL_RISCV64) \

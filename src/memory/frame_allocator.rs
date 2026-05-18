@@ -40,6 +40,17 @@ pub const PAGE_SIZE: u64 = 4096;
 ///      slow for allocate_contiguous of large regions. See docs/ASSUMPTIONS.md.
 const MAX_FRAMES: usize = 4194304;
 
+/// SCAFFOLDING: maximum number of distinct USABLE RAM extents the
+/// frame allocator records for the `is_ram_overlap` check used by
+/// `SYS_MAP_MMIO` to reject mappings that would alias physical RAM.
+/// Why: typical x86 PC has 2-3 extents (low DOS area, low memory,
+/// high memory above the PCI hole); a NUMA workstation with 4 nodes
+/// might have ~8. 16 covers v1-endgame workloads with headroom.
+/// Replace when: a real workload's Limine memmap reports > 12
+/// USABLE extents (75% utilization) — extents 13+ silently fall off
+/// today's table.
+const MAX_RAM_EXTENTS: usize = 16;
+
 /// Bitmap words needed: 4194304 / 64 = 65536
 const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 
@@ -64,6 +75,19 @@ pub struct FrameAllocator {
     bitmap: [u64; BITMAP_WORDS],
     /// Total number of frames tracked (up to MAX_FRAMES)
     total_frames: usize,
+    /// USABLE RAM extents recorded from Limine memmap entries via
+    /// `add_region`. Used by `is_ram_overlap` to reject MMIO mappings
+    /// that would alias physical RAM — replaces the old linear
+    /// `phys_addr < total_count*4096` check, which had a false-positive
+    /// shape on platforms where MMIO BARs land *inside* the RAM range
+    /// (e.g. QEMU x86_64 with -m 4G places the 32-bit PCI MMIO hole at
+    /// 0xFE000000-0xFEC00000, below the high RAM extent starting at
+    /// 0x100000000). Entries are `(start_paddr, end_paddr)` exclusive
+    /// on the upper bound. Adjacent / overlapping extents from
+    /// repeated `add_region` calls are accepted as-is — overlap
+    /// checks short-circuit on first match so duplication is harmless.
+    ram_extents: [(u64, u64); MAX_RAM_EXTENTS],
+    ram_extent_count: u8,
     /// Number of currently free frames
     free_frames: usize,
     /// Hint: start searching from this word index (wraps around)
@@ -117,6 +141,8 @@ impl FrameAllocator {
         FrameAllocator {
             bitmap: [u64::MAX; BITMAP_WORDS], // All frames marked used
             total_frames: 0,
+            ram_extents: [(0, 0); MAX_RAM_EXTENTS],
+            ram_extent_count: 0,
             free_frames: 0,
             search_hint: 0,
             initialized: false,
@@ -148,6 +174,47 @@ impl FrameAllocator {
                 self.total_frames = idx + 1;
             }
         }
+
+        // Record the USABLE extent for SYS_MAP_MMIO's RAM-overlap check.
+        // Overflow beyond MAX_RAM_EXTENTS is silently dropped — the
+        // SCAFFOLDING bound (16) is sized for v1-endgame topologies and
+        // a Convention 9 trigger names the regrowth condition. A dropped
+        // extent only causes false-negatives on the MMIO check (it would
+        // permit mapping that range as MMIO when it's actually RAM); the
+        // bitmap-tracked frame allocator still refuses to hand those
+        // frames out, so the practical impact is "MMIO mapping with a
+        // weird RAM-aliased view" rather than memory corruption.
+        if (self.ram_extent_count as usize) < MAX_RAM_EXTENTS && length > 0 {
+            let i = self.ram_extent_count as usize;
+            self.ram_extents[i] = (base, base.saturating_add(length));
+            self.ram_extent_count += 1;
+        }
+    }
+
+    /// Return true if any byte in `[phys_addr, phys_addr + len)` falls
+    /// inside a recorded USABLE RAM extent. Used by `SYS_MAP_MMIO` to
+    /// reject mappings that would alias RAM.
+    ///
+    /// Semantics: a strictly-positive-length request that touches a
+    /// recorded extent returns true; a zero-length request always
+    /// returns false (no bytes to overlap). Wrap-around requests
+    /// (`phys_addr + len` overflowing u64) are treated as overlapping
+    /// — conservative rejection rather than silent unsoundness.
+    pub fn is_ram_overlap(&self, phys_addr: u64, len: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let req_end = match phys_addr.checked_add(len) {
+            Some(e) => e,
+            None => return true, // overflow → conservative reject
+        };
+        for i in 0..(self.ram_extent_count as usize) {
+            let (ext_start, ext_end) = self.ram_extents[i];
+            if phys_addr < ext_end && req_end > ext_start {
+                return true;
+            }
+        }
+        false
     }
 
     /// Mark a physical region as reserved (prevents allocation).
@@ -972,5 +1039,91 @@ mod tests {
         let free_before = fa.free_count();
         assert!(fa.free_contiguous(0x100000, 0).is_ok());
         assert_eq!(fa.free_count(), free_before);
+    }
+
+    // --- is_ram_overlap (consumed by SYS_MAP_MMIO) ---
+
+    #[test]
+    fn test_is_ram_overlap_empty_allocator_no_extents() {
+        let fa = FrameAllocator::new();
+        assert!(!fa.is_ram_overlap(0x100000, 0x1000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_zero_len_never_overlaps() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000);
+        assert!(!fa.is_ram_overlap(0x100000, 0));
+        assert!(!fa.is_ram_overlap(0x108000, 0));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_request_fully_inside_extent() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000); // [0x100000, 0x110000)
+        assert!(fa.is_ram_overlap(0x105000, 0x1000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_request_straddles_extent_start() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000);
+        // request [0xFF000, 0x101000) — straddles the lower boundary
+        assert!(fa.is_ram_overlap(0xFF000, 0x2000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_request_straddles_extent_end() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000);
+        // request [0x10F000, 0x111000) — straddles the upper boundary
+        assert!(fa.is_ram_overlap(0x10F000, 0x2000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_request_below_extent_no_overlap() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000);
+        assert!(!fa.is_ram_overlap(0x80000, 0x10000)); // ends at 0x90000
+    }
+
+    #[test]
+    fn test_is_ram_overlap_request_above_extent_no_overlap() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000);
+        assert!(!fa.is_ram_overlap(0x200000, 0x1000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_inside_pci_hole_between_two_extents() {
+        // Models QEMU x86_64 -m 4G memory layout: low RAM up to 2 GiB,
+        // then the 32-bit PCI MMIO hole at 0xFE000000-0xFEC00000,
+        // then high RAM from 4 GiB. xHCI BAR at 0xFEBD0000 must NOT
+        // be flagged as RAM-overlapping.
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x7FF00000); // low RAM
+        fa.add_region(0x100000000, 0x40000000); // high RAM (1 GiB)
+        // BAR at 0xFEBD0000, 4 pages — sits in the PCI hole.
+        assert!(!fa.is_ram_overlap(0xFEBD0000, 0x4000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_overflow_returns_true_conservatively() {
+        let mut fa = FrameAllocator::new();
+        fa.add_region(0x100000, 0x10000);
+        // phys_addr + len wraps u64 → reject conservatively
+        assert!(fa.is_ram_overlap(u64::MAX - 0x100, 0x1000));
+    }
+
+    #[test]
+    fn test_is_ram_overlap_extent_table_saturates_at_max() {
+        let mut fa = FrameAllocator::new();
+        // Add MAX_RAM_EXTENTS + 4 distinct extents; the table should
+        // saturate at MAX_RAM_EXTENTS and silently drop the overflow.
+        for i in 0..(MAX_RAM_EXTENTS + 4) {
+            let base = 0x100000 + (i as u64) * 0x100000;
+            fa.add_region(base, 0x1000);
+        }
+        assert_eq!(fa.ram_extent_count as usize, MAX_RAM_EXTENTS);
     }
 }

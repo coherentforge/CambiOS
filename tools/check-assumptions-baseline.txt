@@ -296,7 +296,7 @@ src/memory/buddy_allocator.rs:25:MAX_SIZE
 src/memory/buddy_allocator.rs:28:NUM_ORDERS
 src/memory/frame_allocator.rs:18:PAGE_SIZE
 src/memory/frame_allocator.rs:41:MAX_FRAMES
-src/memory/frame_allocator.rs:44:BITMAP_WORDS
+src/memory/frame_allocator.rs:55:BITMAP_WORDS
 src/memory/heap.rs:17:MIN_BLOCK_SIZE
 src/memory/heap.rs:20:HEAP_ALIGN
 src/memory/mod.rs:77:ENTRIES_PER_TABLE
