@@ -26,7 +26,14 @@
 #![no_main]
 #![deny(unsafe_code)]
 
+use cambios_key_store_service::piv::{
+    dispatch::dispatch_piv_command, ActiveBackend,
+};
 use cambios_libsys as sys;
+use cambios_libsys::keystore::{
+    CMD_PIV_ATTEST, CMD_PIV_DECRYPT, CMD_PIV_GET_PUBKEY, CMD_PIV_HEALTH,
+    CMD_PIV_LIST_SLOTS, CMD_PIV_SIGN, CMD_PIV_VERIFY_PIN,
+};
 
 // ============================================================================
 // Panic handler
@@ -148,6 +155,20 @@ pub extern "C" fn _start() -> ! {
     // Step 2: Register our IPC endpoint
     sys::register_endpoint(KS_ENDPOINT);
 
+    // Step 3: Instantiate the active PIV backend. Cfg-driven: under
+    // `--features dev-piv` this is `SwPivBackend`; otherwise the
+    // always-NotPresent `InertPivBackend` stand-in. Stream B's
+    // `CcidPivBackend` will become a third arm here.
+    // Revisit when: stream B's `CcidPivBackend` lands and
+    // `init_piv_backend` gains a third arm.
+    let mut piv_backend = match init_piv_backend() {
+        Some(b) => Some(b),
+        None => {
+            sys::print(b"[KS] WARNING: PIV backend init failed; CMD_PIV_* will return Generic\n");
+            None
+        }
+    };
+
     if degraded {
         sys::print(b"[KS] ready on endpoint 17 (degraded mode, no secret key)\n");
     } else {
@@ -155,7 +176,7 @@ pub extern "C" fn _start() -> ! {
     }
     sys::module_ready();
 
-    // Step 3: Service loop — recv_verified rejects anonymous senders.
+    // Step 4: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];
 
@@ -176,6 +197,23 @@ pub extern "C" fn _start() -> ! {
         let resp_len = match cmd {
             CMD_SIGN => handle_sign(&keys, cmd_data, &mut resp_buf),
             CMD_GET_PUBKEY => handle_get_pubkey(&keys, &mut resp_buf),
+            // PIV commands route through dispatch_piv_command, which
+            // takes the full payload (cmd byte included).
+            CMD_PIV_HEALTH
+            | CMD_PIV_VERIFY_PIN
+            | CMD_PIV_LIST_SLOTS
+            | CMD_PIV_GET_PUBKEY
+            | CMD_PIV_SIGN
+            | CMD_PIV_DECRYPT
+            | CMD_PIV_ATTEST => match piv_backend.as_mut() {
+                Some(backend) => {
+                    dispatch_piv_command(backend, msg.payload(), &mut resp_buf)
+                }
+                None => {
+                    resp_buf[0] = STATUS_ERROR;
+                    1
+                }
+            },
             _ => {
                 resp_buf[0] = STATUS_ERROR;
                 1
@@ -184,4 +222,20 @@ pub extern "C" fn _start() -> ! {
 
         sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
     }
+}
+
+/// Initialize the active PIV backend at startup. Returns `None` if
+/// the dev-piv DPIV bundle is malformed (only possible under
+/// `--features dev-piv`); default builds always succeed.
+#[cfg(feature = "dev-piv")]
+fn init_piv_backend() -> Option<ActiveBackend> {
+    match ActiveBackend::from_compiled_in() {
+        Ok(b) => Some(b),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(feature = "dev-piv"))]
+fn init_piv_backend() -> Option<ActiveBackend> {
+    Some(ActiveBackend::new())
 }

@@ -14,5 +14,4 @@
 #[cfg(test)]
 extern crate std;
 
-#[cfg(feature = "dev-piv")]
 pub mod piv;

@@ -703,6 +703,159 @@ pub fn decode_attest_response(buf: &[u8], out: &mut [u8]) -> Result<usize, PivEr
 }
 
 // ============================================================================
+// IPC wrappers — compose codec + sys::write + sys::recv_msg
+// ============================================================================
+//
+// These are convenience wrappers around the codec. Each:
+//   1. Encodes the request into a stack-local 256-byte buffer.
+//   2. Writes it to `KEY_STORE_ENDPOINT` (17) via `sys::write`.
+//   3. Blocks on `sys::recv_msg(reply_endpoint, …)` for the response.
+//   4. Strips the 36-byte `[sender_principal:32][from_endpoint:4]`
+//      header that the kernel prepends to incoming messages.
+//   5. Decodes the response payload, returning either the typed result
+//      or a mapped `PivError`.
+//
+// **Caller contract:** the caller MUST have called
+// `sys::register_endpoint(reply_endpoint)` before invoking any of
+// these. The reply endpoint is the queue the wrapper drains for the
+// response — typically the caller's first registered endpoint, also
+// reflected in the kernel's `REPLY_ENDPOINT` table per CLAUDE.md §
+// "IPC reply-endpoint registry". Different callers should not share
+// a reply endpoint (cross-talk hazard).
+//
+// **Threading:** these block. A service-loop process cannot call them
+// from the same task that is `recv_verified`-ing on the same endpoint
+// without orchestration — both calls would race on the same queue.
+//
+// Audit-emit on key-use is deferred per Convention 9 — see
+// `user/key-store-service/src/piv/dispatch.rs`. The deferral applies
+// equally to the client side (sign / decrypt wrappers); when the
+// userspace audit-emit syscall lands, both sides gain an emit point.
+// Revisit when: userspace audit-emit syscall lands OR audit-tail
+// subscribes to key-store events.
+
+/// Bytes of IPC envelope prepended to every received message.
+const IPC_ENVELOPE_BYTES: usize = 32 + 4;
+
+fn recv_response<'a>(
+    reply_endpoint: u32,
+    buf: &'a mut [u8; 256],
+) -> Result<&'a [u8], PivError> {
+    let n = crate::recv_msg(reply_endpoint, buf);
+    if n < 0 {
+        return Err(PivError::Ipc);
+    }
+    let total = n as usize;
+    if total < IPC_ENVELOPE_BYTES {
+        return Err(PivError::Ipc);
+    }
+    Ok(&buf[IPC_ENVELOPE_BYTES..total])
+}
+
+fn send_request(req: &[u8]) -> Result<(), PivError> {
+    if crate::write(KEY_STORE_ENDPOINT, req) < 0 {
+        Err(PivError::Ipc)
+    } else {
+        Ok(())
+    }
+}
+
+/// Query the key-store's PIV health. Does not require PIN.
+pub fn piv_health(reply_endpoint: u32) -> Result<PivHealthState, PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_health_request(&mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_health_response(payload)
+}
+
+/// Verify the PIN. On success, subsequent sign / decrypt operations
+/// are unlocked for the lifetime of the key-store-service process.
+pub fn piv_verify_pin(reply_endpoint: u32, pin: &[u8]) -> Result<(), PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_verify_pin_request(pin, &mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_verify_pin_response(payload)
+}
+
+/// Enumerate the configured PIV slots and their algorithms. Does not
+/// require PIN.
+pub fn piv_list_slots(reply_endpoint: u32) -> Result<PivSlotList, PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_list_slots_request(&mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_list_slots_response(payload)
+}
+
+/// Read the public key in `slot`. Does not require PIN (PIV pubkeys
+/// are readable without auth).
+pub fn piv_get_pubkey(
+    reply_endpoint: u32,
+    slot: PivSlot,
+) -> Result<PivPubkey, PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_get_pubkey_request(slot, &mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_get_pubkey_response(payload)
+}
+
+/// Sign `msg` with the private key in `slot`. Requires prior
+/// `piv_verify_pin`. Returns a 64-byte Ed25519 signature.
+pub fn piv_sign(
+    reply_endpoint: u32,
+    slot: PivSlot,
+    msg: &[u8],
+) -> Result<Ed25519Signature, PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_sign_request(slot, msg, &mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_sign_response(payload)
+}
+
+/// Decrypt / ECDH with the private key in `slot`. For slot 9D
+/// (KeyManagement) `wrapped` is the caller's ephemeral X25519 public
+/// key; the response is the 32-byte ECDH shared secret. Writes up to
+/// `out.len()` bytes; returns the actual byte count.
+pub fn piv_decrypt(
+    reply_endpoint: u32,
+    slot: PivSlot,
+    wrapped: &[u8],
+    out: &mut [u8],
+) -> Result<usize, PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_decrypt_request(slot, wrapped, &mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_decrypt_response(payload, out)
+}
+
+/// Read the on-card attestation certificate for `slot`. The software
+/// backend returns `SlotEmpty`; `CcidPivBackend` (stream B) will
+/// return the YubiKey-signed X.509 cert.
+pub fn piv_attest(
+    reply_endpoint: u32,
+    slot: PivSlot,
+    out: &mut [u8],
+) -> Result<usize, PivError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_attest_request(slot, &mut req)?;
+    send_request(&req[..req_len])?;
+    let mut resp = [0u8; 256];
+    let payload = recv_response(reply_endpoint, &mut resp)?;
+    decode_attest_response(payload, out)
+}
+
+// ============================================================================
 // Tests — wire-format round-trips
 // ============================================================================
 

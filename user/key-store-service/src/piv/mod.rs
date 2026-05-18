@@ -17,7 +17,18 @@ use cambios_libsys::keystore::{
     Ed25519Signature, PivError, PivHealthState, PivPubkey, PivSlot, PivSlotList,
 };
 
+pub mod dispatch;
+pub mod inert;
+#[cfg(feature = "dev-piv")]
 pub mod sw;
+
+/// The backend type the service uses at runtime, chosen at compile
+/// time by feature flag. Stream B's `CcidPivBackend` becomes a third
+/// arm here when it lands.
+#[cfg(feature = "dev-piv")]
+pub type ActiveBackend = sw::SwPivBackend;
+#[cfg(not(feature = "dev-piv"))]
+pub type ActiveBackend = inert::InertPivBackend;
 
 /// Operations every PIV backend must support. Wire-format mapping is
 /// 1:1 with `cambios_libsys::keystore`'s codec.
