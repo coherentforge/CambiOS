@@ -29,6 +29,16 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["CambiOS Development Team"]
 
+[features]
+default = []
+# When set, the kernel's baked bootstrap pubkey switches from the
+# committed `bootstrap_pubkey.bin` (real YubiKey) to the per-developer
+# `dev_bootstrap_pubkey.bin` written by `make gen-dev-piv-keys`. Used
+# in tandem with `--features dev-piv` on `cambios-key-store-service`
+# so that the kernel's verification path agrees with `SwPivBackend`'s
+# signing key.
+dev-piv = []
+
 [dependencies]
 cambios-abi = { path = "cambios-abi" }
 bitflags = "2.3"

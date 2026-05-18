@@ -26,3 +26,11 @@ __pycache__/
 
 # Personal scratch notes — drafts, proposals, working memos.
 notes/
+
+# Dev-PIV keypair files. Generated per-developer by
+# `make gen-dev-piv-keys`; never committed. Production builds use the
+# committed bootstrap_pubkey.bin (real YubiKey) instead, selected by
+# the absence of `--features dev-piv`.
+dev_bootstrap_pubkey.bin
+user/key-store-service/dev_piv_secret.bin
+tools/gen-dev-piv-keys/.dev-seed.bin

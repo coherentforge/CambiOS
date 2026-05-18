@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "gen-dev-piv-keys"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS dev-PIV keypair generator (host-side) — derives Ed25519 + X25519 keypairs from a persistent per-developer seed for use with the dev-piv kernel feature and SwPivBackend."
+
+[dependencies]
+blake3 = "1.8"
+ed25519-compact = { version = "2.2", features = ["x25519"] }
+
+[profile.release]
+opt-level = "s"
