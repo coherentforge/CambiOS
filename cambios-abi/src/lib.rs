@@ -733,6 +733,29 @@ pub enum SyscallNumber {
     /// SYS_ACL_LIST (72): return the ACL contents for inspection.
     /// Identity-required: yes.
     AclList = 72,
+
+    /// SYS_VERIFY_VOLUME_HEADER (73): verify a user-supplied volume
+    /// header byte buffer against the kernel-baked bootstrap pubkey
+    /// per ADR-032 § 4. Pure verification — no mount, no decryption,
+    /// no state change. Used by stream A substage A-iv as the first
+    /// userspace consumer of `SwPivBackend`-produced signatures and
+    /// as a diagnostic / recovery-shell primitive that survives once
+    /// the kernel-as-IPC-client mount path lands at A-v.
+    ///
+    /// Args: arg1 = user ptr to header bytes,
+    ///       arg2 = byte length (must equal header's `header_length`
+    ///              field at offset 8; in [`HEADER_MIN_LEN`,
+    ///              `HEADER_MAX_LEN`]).
+    ///
+    /// Returns: 0 on successful parse + signature verify + AID match;
+    /// `InvalidArg` for malformed bytes (bad magic / out-of-range
+    /// length / slot count exceeding 16); `PermissionDenied` for
+    /// signature mismatch or `volume_uuid != bootstrap_pubkey`.
+    ///
+    /// Identity-required: yes (any caller with a bound Principal).
+    /// Does not gate on which Principal — the verification target is
+    /// the kernel-baked bootstrap pubkey, not the caller's identity.
+    VerifyVolumeHeader = 73,
 }
 
 impl SyscallNumber {
@@ -778,7 +801,8 @@ impl SyscallNumber {
             Self::Mkdir | Self::Rmdir |
             Self::Opendir | Self::Readdir |
             Self::Stat | Self::Fsync |
-            Self::AclGrant | Self::AclRevoke | Self::AclList
+            Self::AclGrant | Self::AclRevoke | Self::AclList |
+            Self::VerifyVolumeHeader
         )
     }
 
@@ -859,6 +883,7 @@ impl SyscallNumber {
             70 => Some(Self::AclGrant),
             71 => Some(Self::AclRevoke),
             72 => Some(Self::AclList),
+            73 => Some(Self::VerifyVolumeHeader),
             _ => None,
         }
     }
@@ -1572,6 +1597,7 @@ mod tests {
             SyscallNumber::Stat, SyscallNumber::Fsync,
             SyscallNumber::AclGrant, SyscallNumber::AclRevoke,
             SyscallNumber::AclList,
+            SyscallNumber::VerifyVolumeHeader,
         ];
 
         for &num in &all {
@@ -1604,10 +1630,11 @@ mod tests {
         // ADR-027 cluster-handle reservations (44..=47), the two-phase
         // channel-teardown pair (48 ChannelBeginTeardown, 49
         // ChannelCompleteTeardown), ADR-028 storage seam syscalls
-        // (50 Cambio, 51 Regalo, 52 Stream), and ADR-029 POSIX file
-        // syscalls (53..=72: FileOpen..AclList) round out the current
-        // high-water mark.
-        for i in 0..=72u64 {
+        // (50 Cambio, 51 Regalo, 52 Stream), ADR-029 POSIX file
+        // syscalls (53..=72: FileOpen..AclList), and ADR-032 §
+        // VerifyVolumeHeader (73) round out the current high-water
+        // mark.
+        for i in 0..=73u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();

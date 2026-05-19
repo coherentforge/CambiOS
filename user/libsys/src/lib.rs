@@ -388,6 +388,19 @@ pub fn obj_put_signed(content: &[u8], sig: &[u8; 64], out_hash: &mut [u8; 32]) -
     )
 }
 
+/// SYS_VERIFY_VOLUME_HEADER: verify a volume header against the
+/// kernel-baked bootstrap pubkey per ADR-032 § 4. Returns 0 on
+/// success; negative error on structural failure (`InvalidArg`) or
+/// signature/AID mismatch (`PermissionDenied`).
+pub fn verify_volume_header(header_bytes: &[u8]) -> i64 {
+    syscall_raw3(
+        SyscallNumber::VerifyVolumeHeader as u64,
+        header_bytes.as_ptr() as u64,
+        header_bytes.len() as u64,
+        0,
+    )
+}
+
 /// Claim the bootstrap secret key from the kernel (one-shot).
 /// Returns 64 on success, negative error on failure.
 pub fn claim_bootstrap_key(out_sk: &mut [u8; 64]) -> i64 {

@@ -14,6 +14,7 @@
 
 pub mod bitmap;
 pub mod block;
+pub mod crypto;
 pub mod disk;
 pub mod journal;
 #[cfg(not(test))]

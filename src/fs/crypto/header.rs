@@ -1,0 +1,421 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Jason Ricca
+
+//! Volume header parse + signature verify — ADR-032 § 4.
+//!
+//! Pure functions over a caller-provided byte buffer. No I/O, no
+//! globals, no allocation. Verification routes through
+//! [`crate::crypto::verify`] (the kernel's ed25519 wrapper) so no
+//! direct dependency on `ed25519-compact` lands here.
+//!
+//! ## Byte layout (v1)
+//!
+//! Per ADR-032 § 4 — fixed-offset prefix, then `slot_count * 256`
+//! bytes of slot table, then optional zero padding, then a 64-byte
+//! Ed25519 signature at the tail. `header_length` (offset 8) is the
+//! total byte length; the signature covers bytes `0..header_length-64`.
+//!
+//! ```text
+//!   [0..8]    magic       = "ARCVOL01"
+//!   [8..12]   header_length (u32 LE)
+//!   [12..16]  cipher_id     (u32 LE; v1: 0x01 = AES-256-XTS)
+//!   [16..48]  volume_uuid   (bootstrap AID == bootstrap pubkey bytes)
+//!   [48..52]  format_generation (u32 LE)
+//!   [52..56]  kdf_id        (u32 LE)
+//!   [56..88]  kdf_params    (32 bytes)
+//!   [88..92]  slot_count    (u32 LE; <= MAX_VOLUME_SLOTS)
+//!   [92..96]  master_rotation_progress (u32 LE)
+//!   [96..100] reserved_flags (u32 LE; zero in v1)
+//!   [100..112] reserved     (zero-filled)
+//!   [112..]   slot_table    (slot_count entries × 256 bytes each)
+//!   [..]      padding       (zero-filled, may be present)
+//!   [header_length-64..header_length] signature (Ed25519, 64 bytes)
+//! ```
+//!
+//! A-iv only exercises the parse + verify path; multi-slot construction
+//! and the rest of ADR-032 (`EncryptedBlockDevice`, mount, rotation)
+//! land at later substages.
+
+use crate::crypto::{PublicKeyRef, SignatureAlgo, SignatureRef, verify};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const VOLUME_MAGIC: &[u8; 8] = b"ARCVOL01";
+
+pub const OFF_MAGIC: usize = 0;
+pub const OFF_HEADER_LEN: usize = 8;
+pub const OFF_CIPHER_ID: usize = 12;
+pub const OFF_VOLUME_UUID: usize = 16;
+pub const OFF_FORMAT_GEN: usize = 48;
+pub const OFF_KDF_ID: usize = 52;
+pub const OFF_KDF_PARAMS: usize = 56;
+pub const OFF_SLOT_COUNT: usize = 88;
+pub const OFF_MASTER_ROT: usize = 92;
+pub const OFF_RESERVED_FLAGS: usize = 96;
+pub const OFF_RESERVED: usize = 100;
+pub const OFF_SLOT_TABLE: usize = 112;
+
+/// HARDWARE: byte count for one slot per ADR-032 § 4 slot table.
+pub const SLOT_BYTES: usize = 256;
+
+/// HARDWARE: Ed25519 signature length.
+pub const SIGNATURE_BYTES: usize = 64;
+
+/// HARDWARE: fixed-prefix length before the slot table per ADR-032 § 4.
+pub const HEADER_FIXED_PREFIX: usize = 112;
+
+/// SCAFFOLDING: maximum volume slot count per ADR-032 § 4.
+/// Why: v1 deployments use 1-3 YubiKey live slots + 1-2 Argon2id
+/// recovery slots; 16 = headroom for future N-of-1 unlock with
+/// multiple authorized YubiKeys. Memory cost: 4 KiB per header.
+/// Replace when: a deployment surfaces > 4 active live slots in practice.
+pub const MAX_VOLUME_SLOTS: usize = 16;
+
+/// HARDWARE: smallest legal header byte length (zero-slot edge case).
+pub const HEADER_MIN_LEN: usize = HEADER_FIXED_PREFIX + SIGNATURE_BYTES;
+
+/// HARDWARE: largest legal header byte length (max slots, no padding).
+pub const HEADER_MAX_LEN: usize =
+    HEADER_FIXED_PREFIX + MAX_VOLUME_SLOTS * SLOT_BYTES + SIGNATURE_BYTES;
+
+// ============================================================================
+// Error type
+// ============================================================================
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum HeaderError {
+    /// Buffer length < HEADER_MIN_LEN.
+    BadLength,
+    /// First 8 bytes != "ARCVOL01".
+    BadMagic,
+    /// header_length field out of [HEADER_MIN_LEN, HEADER_MAX_LEN], or
+    /// disagrees with the caller-supplied buffer length.
+    BadHeaderLength,
+    /// slot_count > MAX_VOLUME_SLOTS.
+    SlotCountExceeds,
+    /// volume_uuid bytes don't match the bootstrap pubkey. ADR-032 §
+    /// 3 invariant: format-time AID equals bootstrap pubkey bytes.
+    VolumeUuidMismatch,
+    /// Ed25519 signature did not verify under bootstrap_pubkey.
+    SignatureInvalid,
+}
+
+// ============================================================================
+// Parsed header view
+// ============================================================================
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct VolumeHeader {
+    pub header_length: u32,
+    pub cipher_id: u32,
+    pub volume_uuid: [u8; 32],
+    pub format_generation: u32,
+    pub kdf_id: u32,
+    pub slot_count: u32,
+    pub master_rotation_progress: u32,
+}
+
+// ============================================================================
+// Parse
+// ============================================================================
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+/// Parse the fixed-prefix fields. Validates magic, header_length
+/// range, and slot_count bound. Does **not** verify the signature
+/// (see [`verify_header`]) and does **not** require the buffer length
+/// to equal `header_length` (the syscall handler does that check
+/// before calling, so misshapen buffers fail BadHeaderLength).
+pub fn parse(bytes: &[u8]) -> Result<VolumeHeader, HeaderError> {
+    if bytes.len() < HEADER_MIN_LEN {
+        return Err(HeaderError::BadLength);
+    }
+    if &bytes[OFF_MAGIC..OFF_MAGIC + 8] != VOLUME_MAGIC {
+        return Err(HeaderError::BadMagic);
+    }
+    let header_length = read_u32_le(bytes, OFF_HEADER_LEN);
+    if (header_length as usize) < HEADER_MIN_LEN
+        || (header_length as usize) > HEADER_MAX_LEN
+    {
+        return Err(HeaderError::BadHeaderLength);
+    }
+    let slot_count = read_u32_le(bytes, OFF_SLOT_COUNT);
+    if (slot_count as usize) > MAX_VOLUME_SLOTS {
+        return Err(HeaderError::SlotCountExceeds);
+    }
+    let mut volume_uuid = [0u8; 32];
+    volume_uuid.copy_from_slice(&bytes[OFF_VOLUME_UUID..OFF_VOLUME_UUID + 32]);
+    Ok(VolumeHeader {
+        header_length,
+        cipher_id: read_u32_le(bytes, OFF_CIPHER_ID),
+        volume_uuid,
+        format_generation: read_u32_le(bytes, OFF_FORMAT_GEN),
+        kdf_id: read_u32_le(bytes, OFF_KDF_ID),
+        slot_count,
+        master_rotation_progress: read_u32_le(bytes, OFF_MASTER_ROT),
+    })
+}
+
+// ============================================================================
+// Verify
+// ============================================================================
+
+/// Parse + signature-verify a complete volume header against the
+/// kernel-baked bootstrap pubkey. Returns the parsed header on
+/// success or the first failing invariant.
+///
+/// Checks (in order):
+///   1. Parse the fixed prefix.
+///   2. `bytes.len() == header.header_length` (the signature lives
+///      at `header_length-64..header_length`).
+///   3. `volume_uuid == bootstrap_pubkey` (the AID-as-bootstrap-pubkey
+///      invariant per ADR-032 § 3).
+///   4. Ed25519 signature at `[header_length-64..header_length]`
+///      verifies under `bootstrap_pubkey` over `[0..header_length-64]`.
+pub fn verify_header(
+    bytes: &[u8],
+    bootstrap_pubkey: &[u8; 32],
+) -> Result<VolumeHeader, HeaderError> {
+    let header = parse(bytes)?;
+    let header_length = header.header_length as usize;
+    if bytes.len() != header_length {
+        return Err(HeaderError::BadHeaderLength);
+    }
+    if header.volume_uuid != *bootstrap_pubkey {
+        return Err(HeaderError::VolumeUuidMismatch);
+    }
+    let sig_offset = header_length - SIGNATURE_BYTES;
+    let signed_content = &bytes[..sig_offset];
+    let mut sig_bytes = [0u8; SIGNATURE_BYTES];
+    sig_bytes.copy_from_slice(&bytes[sig_offset..header_length]);
+
+    if !verify(
+        SignatureAlgo::Ed25519,
+        PublicKeyRef::Ed25519(bootstrap_pubkey),
+        signed_content,
+        SignatureRef::Ed25519(&sig_bytes),
+    ) {
+        return Err(HeaderError::SignatureInvalid);
+    }
+    Ok(header)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_compact::{KeyPair, Seed};
+
+    fn make_keypair(seed_byte: u8) -> KeyPair {
+        KeyPair::from_seed(Seed::new([seed_byte; 32]))
+    }
+
+    /// Build a minimal valid header (0 slots, no padding), sign it
+    /// with the given keypair, and embed its pubkey as the volume_uuid.
+    fn build_signed_header(kp: &KeyPair) -> ([u8; HEADER_MIN_LEN], [u8; 32]) {
+        let mut buf = [0u8; HEADER_MIN_LEN];
+        let pk_bytes = {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(kp.pk.as_ref());
+            b
+        };
+
+        buf[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(VOLUME_MAGIC);
+        buf[OFF_HEADER_LEN..OFF_HEADER_LEN + 4]
+            .copy_from_slice(&(HEADER_MIN_LEN as u32).to_le_bytes());
+        buf[OFF_CIPHER_ID..OFF_CIPHER_ID + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[OFF_VOLUME_UUID..OFF_VOLUME_UUID + 32].copy_from_slice(&pk_bytes);
+        buf[OFF_FORMAT_GEN..OFF_FORMAT_GEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[OFF_KDF_ID..OFF_KDF_ID + 4].copy_from_slice(&1u32.to_le_bytes());
+        // kdf_params all zero
+        // slot_count = 0
+        // master_rotation_progress = 0
+        // reserved_flags = 0
+        // reserved bytes 100..112 zero
+
+        let sig_offset = HEADER_MIN_LEN - SIGNATURE_BYTES;
+        let signed = &buf[..sig_offset];
+        let sig = kp.sk.sign(signed, None);
+        buf[sig_offset..HEADER_MIN_LEN].copy_from_slice(sig.as_ref());
+
+        (buf, pk_bytes)
+    }
+
+    #[test]
+    fn parse_minimal_header() {
+        let kp = make_keypair(0x01);
+        let (buf, _pk) = build_signed_header(&kp);
+        let header = parse(&buf).expect("parse");
+        assert_eq!(header.header_length as usize, HEADER_MIN_LEN);
+        assert_eq!(header.cipher_id, 1);
+        assert_eq!(header.format_generation, 1);
+        assert_eq!(header.kdf_id, 1);
+        assert_eq!(header.slot_count, 0);
+        assert_eq!(header.master_rotation_progress, 0);
+    }
+
+    #[test]
+    fn verify_minimal_header_under_correct_pubkey() {
+        let kp = make_keypair(0x02);
+        let (buf, pk) = build_signed_header(&kp);
+        let header = verify_header(&buf, &pk).expect("verify");
+        assert_eq!(header.volume_uuid, pk);
+    }
+
+    #[test]
+    fn verify_rejects_tampered_content() {
+        let kp = make_keypair(0x03);
+        let (mut buf, pk) = build_signed_header(&kp);
+        // Flip one byte in the cipher_id field.
+        buf[OFF_CIPHER_ID] ^= 0xFF;
+        assert_eq!(verify_header(&buf, &pk), Err(HeaderError::SignatureInvalid));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_signature() {
+        let kp = make_keypair(0x04);
+        let (mut buf, pk) = build_signed_header(&kp);
+        let sig_offset = HEADER_MIN_LEN - SIGNATURE_BYTES;
+        buf[sig_offset] ^= 0xFF;
+        assert_eq!(verify_header(&buf, &pk), Err(HeaderError::SignatureInvalid));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_pubkey() {
+        let signing_kp = make_keypair(0x05);
+        let (buf, _signing_pk) = build_signed_header(&signing_kp);
+        // verify with a different pubkey — fails first on the AID
+        // check (volume_uuid embeds the signing key's pubkey).
+        let wrong_pk = [0xAAu8; 32];
+        assert_eq!(verify_header(&buf, &wrong_pk), Err(HeaderError::VolumeUuidMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_mismatched_aid_with_correct_signing_key() {
+        let signing_kp = make_keypair(0x06);
+        let (mut buf, pk) = build_signed_header(&signing_kp);
+        // Corrupt volume_uuid (so AID != claimed pubkey), then re-sign
+        // under the same key so the signature stays valid. The AID
+        // mismatch check should still fire.
+        buf[OFF_VOLUME_UUID] ^= 0xFF;
+        let sig_offset = HEADER_MIN_LEN - SIGNATURE_BYTES;
+        let signed = &buf[..sig_offset];
+        let fresh_sig = signing_kp.sk.sign(signed, None);
+        buf[sig_offset..HEADER_MIN_LEN].copy_from_slice(fresh_sig.as_ref());
+        // pk still matches the signing key, but not the volume_uuid.
+        assert_eq!(verify_header(&buf, &pk), Err(HeaderError::VolumeUuidMismatch));
+    }
+
+    #[test]
+    fn parse_rejects_short_buffer() {
+        let buf = [0u8; HEADER_MIN_LEN - 1];
+        assert_eq!(parse(&buf), Err(HeaderError::BadLength));
+    }
+
+    #[test]
+    fn parse_rejects_bad_magic() {
+        let kp = make_keypair(0x07);
+        let (mut buf, _pk) = build_signed_header(&kp);
+        buf[0] = b'X';
+        assert_eq!(parse(&buf), Err(HeaderError::BadMagic));
+    }
+
+    #[test]
+    fn parse_rejects_header_length_below_min() {
+        let kp = make_keypair(0x08);
+        let (mut buf, _pk) = build_signed_header(&kp);
+        buf[OFF_HEADER_LEN..OFF_HEADER_LEN + 4].copy_from_slice(&100u32.to_le_bytes());
+        assert_eq!(parse(&buf), Err(HeaderError::BadHeaderLength));
+    }
+
+    #[test]
+    fn parse_rejects_header_length_above_max() {
+        let kp = make_keypair(0x09);
+        let (mut buf, _pk) = build_signed_header(&kp);
+        let too_big = (HEADER_MAX_LEN as u32) + 1;
+        buf[OFF_HEADER_LEN..OFF_HEADER_LEN + 4].copy_from_slice(&too_big.to_le_bytes());
+        assert_eq!(parse(&buf), Err(HeaderError::BadHeaderLength));
+    }
+
+    #[test]
+    fn parse_rejects_slot_count_overflow() {
+        let kp = make_keypair(0x0A);
+        let (mut buf, _pk) = build_signed_header(&kp);
+        let too_many = (MAX_VOLUME_SLOTS as u32) + 1;
+        buf[OFF_SLOT_COUNT..OFF_SLOT_COUNT + 4].copy_from_slice(&too_many.to_le_bytes());
+        assert_eq!(parse(&buf), Err(HeaderError::SlotCountExceeds));
+    }
+
+    #[test]
+    fn verify_rejects_under_min_length() {
+        // Below HEADER_MIN_LEN trips parse's first length check.
+        let buf = [0u8; HEADER_MIN_LEN - 1];
+        let pk = [0u8; 32];
+        assert_eq!(verify_header(&buf, &pk), Err(HeaderError::BadLength));
+    }
+
+    #[test]
+    fn verify_rejects_header_length_field_disagreeing_with_buffer() {
+        // Buffer is HEADER_MIN_LEN bytes but the header_length field
+        // says HEADER_MIN_LEN + 8 — parse passes (the field is in
+        // bounds) but verify catches the mismatch.
+        let kp = make_keypair(0x0B);
+        let (mut buf, pk) = build_signed_header(&kp);
+        let lying = (HEADER_MIN_LEN as u32) + 8;
+        buf[OFF_HEADER_LEN..OFF_HEADER_LEN + 4].copy_from_slice(&lying.to_le_bytes());
+        // Signature would now be invalid anyway since we mutated bytes
+        // covered by the signature, but the length mismatch is checked
+        // before the signature, so the error surfaces as BadHeaderLength.
+        assert_eq!(
+            verify_header(&buf, &pk),
+            Err(HeaderError::BadHeaderLength)
+        );
+    }
+
+    #[test]
+    fn verify_accepts_padded_header_with_one_slot() {
+        // A 1-slot header is 112 + 256 + 64 = 432 bytes when tightly
+        // packed. Pad it out to 512 bytes (extra zero bytes between
+        // slot_table and signature). The signature covers everything
+        // through byte (512-64)=448, including the padding.
+        let kp = make_keypair(0x0C);
+        const TOTAL: usize = 512;
+        let mut buf = [0u8; TOTAL];
+        let pk_bytes = {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(kp.pk.as_ref());
+            b
+        };
+
+        buf[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(VOLUME_MAGIC);
+        buf[OFF_HEADER_LEN..OFF_HEADER_LEN + 4]
+            .copy_from_slice(&(TOTAL as u32).to_le_bytes());
+        buf[OFF_CIPHER_ID..OFF_CIPHER_ID + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[OFF_VOLUME_UUID..OFF_VOLUME_UUID + 32].copy_from_slice(&pk_bytes);
+        buf[OFF_FORMAT_GEN..OFF_FORMAT_GEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[OFF_KDF_ID..OFF_KDF_ID + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[OFF_SLOT_COUNT..OFF_SLOT_COUNT + 4].copy_from_slice(&1u32.to_le_bytes());
+        // Synthetic slot at OFF_SLOT_TABLE..OFF_SLOT_TABLE+256 — leave
+        // the contents zero; parse only validates count, not entries.
+
+        let sig_offset = TOTAL - SIGNATURE_BYTES;
+        let sig = kp.sk.sign(&buf[..sig_offset], None);
+        buf[sig_offset..TOTAL].copy_from_slice(sig.as_ref());
+
+        let header = verify_header(&buf, &pk_bytes).expect("verify");
+        assert_eq!(header.slot_count, 1);
+        assert_eq!(header.header_length as usize, TOTAL);
+    }
+}

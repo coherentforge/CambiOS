@@ -196,6 +196,7 @@ fn dispatch_command(line: &[u8]) {
         b"arcobj" => cmd_arcobj(args),
         b"did-key" | b"didkey" => cmd_did_key(args),
         b"play" => cmd_play(args),
+        b"fde-test" => cmd_fde_test(),
         b"exit" => sys::exit(0),
         _ => cmd_spawn(cmd),
     }
@@ -219,6 +220,7 @@ fn cmd_help() {
     print_help_row("arcobj", "CambiObject store ops (put/get/list/delete/name/names)");
     print_help_row("did-key", "render Principal as did:key, or encode/decode one");
     print_help_row("play", "launch a game; `play` alone lists available games");
+    print_help_row("fde-test", "FDE volume header sign+verify round-trip (Stream A A-iv)");
     print_help_row("exit", "exit shell");
     sys::print(b"\r\n");
     print_help_section("External commands (boot modules):");
@@ -425,6 +427,157 @@ fn cmd_play(args: &[u8]) {
         return;
     }
     cmd_spawn(name);
+}
+
+// ============================================================================
+// `fde-test` — FDE volume header sign + verify round-trip (Stream A A-iv)
+// ============================================================================
+//
+// End-to-end exercise of the new key-store-service PIV contract +
+// `SYS_VERIFY_VOLUME_HEADER` syscall. The shell builds a minimal
+// volume header (HEADER_MIN_LEN = 176 bytes, 0 slots) per ADR-032 §
+// 4, signs it via `piv_sign(slot=Signature)`, then hands it to the
+// kernel via `sys::verify_volume_header`. The kernel parses + checks
+// `volume_uuid == bootstrap_pubkey` + ed25519-verifies the signature.
+//
+// Round-trip success requires the kernel and key-store-service both
+// built with `--features dev-piv` so SwPivBackend's slot-9C pubkey
+// matches the kernel-baked bootstrap pubkey. Default builds answer
+// the PIV health probe with `NotPresent` and the command exits
+// early — no signing attempted.
+
+// HARDWARE: mirror of `src/fs/crypto/header.rs` constants. Local copy
+// avoids pulling the whole kernel crate into the shell's dep graph,
+// matching the libfs-proto pattern. Stays in sync via the in-source
+// ADR-032 § 4 table.
+const FDE_HEADER_MIN_LEN: usize = 176;
+const FDE_OFF_MAGIC: usize = 0;
+const FDE_OFF_HEADER_LEN: usize = 8;
+const FDE_OFF_CIPHER_ID: usize = 12;
+const FDE_OFF_VOLUME_UUID: usize = 16;
+const FDE_OFF_FORMAT_GEN: usize = 48;
+const FDE_OFF_KDF_ID: usize = 52;
+const FDE_OFF_SIGNATURE: usize = FDE_HEADER_MIN_LEN - 64;
+const FDE_MAGIC: &[u8; 8] = b"ARCVOL01";
+
+fn cmd_fde_test() {
+    use cambios_libsys::keystore::PivSlot;
+
+    // Step 1: probe the PIV backend's health.
+    match cambios_libsys::keystore::piv_health(SHELL_ENDPOINT) {
+        Ok(state) => {
+            let label: &[u8] = match state {
+                cambios_libsys::keystore::PivHealthState::NotPresent => b"NotPresent",
+                cambios_libsys::keystore::PivHealthState::Ready => b"Ready",
+                cambios_libsys::keystore::PivHealthState::NotReady => b"NotReady",
+                cambios_libsys::keystore::PivHealthState::AuthRequired => b"AuthRequired",
+            };
+            sys::print(b"[fde-test] PIV health: ");
+            sys::print(label);
+            sys::print(b"\r\n");
+            if matches!(
+                state,
+                cambios_libsys::keystore::PivHealthState::NotPresent
+            ) {
+                sys::print(
+                    b"[fde-test] no PIV backend; rebuild kernel + key-store-service with `--features dev-piv`.\r\n",
+                );
+                return;
+            }
+        }
+        Err(_) => {
+            sys::print(b"[fde-test] FAIL: piv_health IPC error\r\n");
+            return;
+        }
+    }
+
+    // Step 2: verify the DEV PIN (only meaningful under --features
+    // dev-piv; matches the standard PIV factory default).
+    if let Err(err) = cambios_libsys::keystore::piv_verify_pin(SHELL_ENDPOINT, b"123456") {
+        sys::print(b"[fde-test] FAIL: piv_verify_pin returned ");
+        print_piv_error(err);
+        return;
+    }
+    sys::print(b"[fde-test] PIN verified.\r\n");
+
+    // Step 3: read the slot-9C pubkey. This is what the kernel has
+    // baked in as the bootstrap pubkey under --features dev-piv.
+    let pubkey = match cambios_libsys::keystore::piv_get_pubkey(
+        SHELL_ENDPOINT,
+        PivSlot::Signature,
+    ) {
+        Ok(pk) => pk,
+        Err(err) => {
+            sys::print(b"[fde-test] FAIL: piv_get_pubkey returned ");
+            print_piv_error(err);
+            return;
+        }
+    };
+
+    // Step 4: construct a minimal valid header (0 slots, no padding).
+    let mut header = [0u8; FDE_HEADER_MIN_LEN];
+    header[FDE_OFF_MAGIC..FDE_OFF_MAGIC + 8].copy_from_slice(FDE_MAGIC);
+    header[FDE_OFF_HEADER_LEN..FDE_OFF_HEADER_LEN + 4]
+        .copy_from_slice(&(FDE_HEADER_MIN_LEN as u32).to_le_bytes());
+    header[FDE_OFF_CIPHER_ID..FDE_OFF_CIPHER_ID + 4]
+        .copy_from_slice(&1u32.to_le_bytes()); // AES-256-XTS
+    header[FDE_OFF_VOLUME_UUID..FDE_OFF_VOLUME_UUID + 32]
+        .copy_from_slice(pubkey.as_slice());
+    header[FDE_OFF_FORMAT_GEN..FDE_OFF_FORMAT_GEN + 4]
+        .copy_from_slice(&1u32.to_le_bytes());
+    header[FDE_OFF_KDF_ID..FDE_OFF_KDF_ID + 4].copy_from_slice(&1u32.to_le_bytes());
+    // slot_count = 0, master_rotation_progress = 0, reserved_flags = 0,
+    // kdf_params + reserved bytes all stay zero.
+
+    // Step 5: sign the bytes that come before the signature slot.
+    let signed_range = &header[..FDE_OFF_SIGNATURE];
+    let sig = match cambios_libsys::keystore::piv_sign(
+        SHELL_ENDPOINT,
+        PivSlot::Signature,
+        signed_range,
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            sys::print(b"[fde-test] FAIL: piv_sign returned ");
+            print_piv_error(err);
+            return;
+        }
+    };
+    header[FDE_OFF_SIGNATURE..FDE_HEADER_MIN_LEN].copy_from_slice(&sig.0);
+
+    // Step 6: hand it to the kernel for verification.
+    let result = sys::verify_volume_header(&header);
+    if result == 0 {
+        sys::print(b"[fde-test] OK: kernel-side verify accepted the SwPivBackend-signed header.\r\n");
+    } else {
+        sys::print(b"[fde-test] FAIL: sys::verify_volume_header returned ");
+        print_i64(result);
+        sys::print(b"\r\n");
+    }
+}
+
+fn print_piv_error(err: cambios_libsys::keystore::PivError) {
+    use cambios_libsys::keystore::PivError;
+    let label: &[u8] = match err {
+        PivError::Generic => b"Generic",
+        PivError::NotPresent => b"NotPresent",
+        PivError::AuthRequired => b"AuthRequired",
+        PivError::SlotEmpty => b"SlotEmpty",
+        PivError::WrongAlgorithm => b"WrongAlgorithm",
+        PivError::PinLocked => b"PinLocked",
+        PivError::CardTransport => b"CardTransport",
+        PivError::WireFormat => b"WireFormat",
+        PivError::Ipc => b"Ipc",
+    };
+    sys::print(label);
+    sys::print(b"\r\n");
+}
+
+fn print_i64(n: i64) {
+    let mut buf = [0u8; 24];
+    let mut w = StackWriter::new(&mut buf);
+    let _ = write!(w, "{}", n);
+    sys::print(w.into_slice());
 }
 
 // ============================================================================

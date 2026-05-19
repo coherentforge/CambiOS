@@ -309,6 +309,9 @@ impl SyscallDispatcher {
             | SyscallNumber::Stat | SyscallNumber::Fsync
             | SyscallNumber::AclGrant | SyscallNumber::AclRevoke
             | SyscallNumber::AclList => Self::handle_posix_stub(args, &ctx),
+            SyscallNumber::VerifyVolumeHeader => {
+                Self::handle_verify_volume_header(args, &ctx)
+            }
         }
     }
 
@@ -3741,6 +3744,64 @@ impl SyscallDispatcher {
     /// 4's table.
     fn handle_posix_stub(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
         Err(SyscallError::Enosys)
+    }
+
+    /// SYS_VERIFY_VOLUME_HEADER (73): verify a user-supplied volume
+    /// header against the kernel-baked bootstrap pubkey per ADR-032
+    /// § 4. The signed range, signature offset, and AID-equals-pubkey
+    /// invariant all live in `crate::fs::crypto::header::verify_header`;
+    /// the handler is bytes-in, status-out plumbing around it.
+    ///
+    /// Args: arg1 = user ptr to header bytes,
+    ///       arg2 = header byte length (must equal the file's
+    ///              `header_length` field at offset 8; bounded to
+    ///              [HEADER_MIN_LEN, HEADER_MAX_LEN]).
+    /// Returns: 0 on success; `InvalidArg` for structural failures
+    ///          (bad magic, length out of bounds, slot_count > 16);
+    ///          `PermissionDenied` for `volume_uuid` mismatch or
+    ///          signature verification failure.
+    ///
+    /// Lock ordering: none — pure compute over a stack buffer.
+    fn handle_verify_volume_header(
+        args: SyscallArgs,
+        ctx: &SyscallContext,
+    ) -> SyscallResult {
+        use crate::fs::crypto::header::{
+            HeaderError, HEADER_MAX_LEN, HEADER_MIN_LEN, verify_header,
+        };
+
+        let header_ptr = args.arg1;
+        let header_len = args.arg_usize(2);
+
+        if header_len < HEADER_MIN_LEN || header_len > HEADER_MAX_LEN {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Copy the user buffer into a kernel-local stack buffer.
+        // HEADER_MAX_LEN is 4 KiB + change which is well within the
+        // 256 KiB kernel boot stack.
+        let header_slice = UserReadSlice::validate(ctx, header_ptr, header_len)?;
+        let mut kbuf = [0u8; HEADER_MAX_LEN];
+        header_slice.read_into(&mut kbuf[..header_len])?;
+
+        // Bootstrap pubkey baked into the kernel by
+        // `bootstrap_identity_init`; the BOOTSTRAP_PRINCIPAL singleton
+        // stores it under the AID-equals-pubkey invariant per ADR-025.
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        let bootstrap_pubkey = bootstrap.current_key_bytes();
+
+        match verify_header(&kbuf[..header_len], bootstrap_pubkey) {
+            Ok(_header) => Ok(0),
+            Err(HeaderError::BadLength)
+            | Err(HeaderError::BadMagic)
+            | Err(HeaderError::BadHeaderLength)
+            | Err(HeaderError::SlotCountExceeds) => Err(SyscallError::InvalidArg),
+            Err(HeaderError::VolumeUuidMismatch)
+            | Err(HeaderError::SignatureInvalid) => Err(SyscallError::PermissionDenied),
+        }
     }
 
     /// Drive a cluster's teardown — used by SYS_CLUSTER_REVOKE and by
