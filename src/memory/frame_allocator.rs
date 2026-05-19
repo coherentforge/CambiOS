@@ -395,6 +395,12 @@ impl FrameAllocator {
             self.search_hint = word_idx;
         }
 
+        // Zero-on-free (A-v.0): wipe the freed frames so a subsequent
+        // allocator cannot observe their prior contents. Closes a
+        // class of "freed-frame remnant" attacks for security-
+        // sensitive callers (e.g. fde-mount holding key material).
+        zero_frame_range(start_idx, count);
+
         Ok(())
     }
 
@@ -421,6 +427,9 @@ impl FrameAllocator {
         if word_idx < self.search_hint {
             self.search_hint = word_idx;
         }
+
+        // Zero-on-free (A-v.0): see `free_contiguous` for the rationale.
+        zero_frame_range(idx, 1);
 
         Ok(())
     }
@@ -453,6 +462,67 @@ impl FrameAllocator {
     fn is_set(&self, idx: usize) -> bool {
         (self.bitmap[idx / 64] >> (idx % 64)) & 1 == 1
     }
+}
+
+/// Zero `count` consecutive frames starting at physical-frame index
+/// `start_idx`. Writes `count * PAGE_SIZE` bytes of zeros through the
+/// HHDM map.
+///
+/// Called from `free` / `free_contiguous` after the bitmap-clear so
+/// a subsequent allocator cannot observe the freed frames' prior
+/// contents. Closes a class of "freed-frame remnant" attacks
+/// relevant to security-sensitive callers — e.g., `fde-mount`
+/// (stream A A-v.a) holds an AES-256 master key in a stack buffer;
+/// if it crashes before zeroing the buffer, this guarantees the key
+/// is gone by the time the frame is reallocated.
+///
+/// Caching note: the writes go through cacheable HHDM mappings.
+/// Future reads from the same physical address via the same HHDM
+/// stay coherent. For DMA scenarios where a peripheral might read
+/// the frame directly, callers needing cache management call into
+/// arch-specific cache-maintenance helpers separately (not the
+/// frame allocator's concern).
+///
+/// Host tests skip the write: the bitmap-state + counter assertions
+/// cover the logic this function influences; the actual zero-write
+/// is exercised by runtime integration testing under QEMU.
+#[cfg(not(test))]
+fn zero_frame_range(start_idx: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let hhdm = crate::hhdm_offset();
+    if hhdm == 0 {
+        // HHDM not yet initialized. This window is small: during
+        // early boot before `set_hhdm_offset` runs, the kernel has
+        // not yet started freeing memory it allocated post-HHDM.
+        // Skipping the zero here is acceptable since the only
+        // callers in this window would be the boot path itself.
+        return;
+    }
+    let start_phys = (start_idx as u64) * PAGE_SIZE;
+    let start_virt = start_phys + hhdm;
+    let total_bytes = (count as u64) * PAGE_SIZE;
+    // SAFETY: `start_virt` is a kernel virtual address from the
+    // HHDM map covering `total_bytes` of physical memory. The
+    // frames in `[start_idx, start_idx + count)` were just
+    // confirmed allocated (and therefore mapped via HHDM) by the
+    // caller's pre-pass, and the caller holds the
+    // FRAME_ALLOCATOR spinlock so no aliasing reader/writer can
+    // race the zero write. The bitmap has already been cleared,
+    // so the frames are conceptually owned by this function for
+    // the duration of the write.
+    unsafe {
+        core::ptr::write_bytes(start_virt as *mut u8, 0, total_bytes as usize);
+    }
+}
+
+#[cfg(test)]
+fn zero_frame_range(_start_idx: usize, _count: usize) {
+    // Host test harness has no real frame backing at the simulated
+    // physical addresses; bitmap-state assertions cover the call-site
+    // contract, and integration testing under QEMU exercises the
+    // actual zero-write.
 }
 
 impl fmt::Debug for FrameAllocator {
@@ -612,6 +682,41 @@ mod tests {
         assert_eq!(alloc.free_count(), 255);
 
         alloc.free(frame).unwrap();
+        assert_eq!(alloc.free_count(), 256);
+    }
+
+    #[test]
+    fn test_zero_on_free_wiring() {
+        // Host-test coverage of the A-v.0 zero-on-free integration is
+        // limited to the call-site wiring (the helper is a no-op in
+        // `#[cfg(test)]` since the test harness has no real backing
+        // memory at the simulated physical addresses). This test
+        // confirms the call path doesn't disturb the bitmap state
+        // or the free-frame counter — the byte-level zero behavior
+        // is verified at runtime under QEMU.
+        let mut alloc = FrameAllocator::new();
+        alloc.add_region(0x100000, 0x100000);
+        alloc.finalize();
+        let f1 = alloc.allocate().unwrap();
+        let f2 = alloc.allocate().unwrap();
+        assert_eq!(alloc.free_count(), 254);
+        alloc.free(f1).unwrap();
+        alloc.free(f2).unwrap();
+        assert_eq!(alloc.free_count(), 256);
+        // Reallocate; the path through `free` + `zero_frame_range` +
+        // `allocate` should return one of the just-freed frames.
+        let f3 = alloc.allocate().unwrap();
+        assert!(f3.addr == f1.addr || f3.addr == f2.addr);
+    }
+
+    #[test]
+    fn test_zero_on_free_contiguous_wiring() {
+        let mut alloc = FrameAllocator::new();
+        alloc.add_region(0x100000, 0x100000);
+        alloc.finalize();
+        let base = alloc.allocate_contiguous(8).unwrap();
+        assert_eq!(alloc.free_count(), 248);
+        alloc.free_contiguous(base.addr, 8).unwrap();
         assert_eq!(alloc.free_count(), 256);
     }
 
