@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 cambios-libsys = { path = "../libsys" }
 cambios-style = { path = "../cambios-style" }
+cambios-fde-proto = { path = "../../cambios-fde-proto" }
 
 [profile.release]
 opt-level = "s"        # Size-optimized (small ELF)

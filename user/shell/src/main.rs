@@ -446,22 +446,13 @@ fn cmd_play(args: &[u8]) {
 // the PIV health probe with `NotPresent` and the command exits
 // early — no signing attempted.
 
-// HARDWARE: mirror of `src/fs/crypto/header.rs` constants. Local copy
-// avoids pulling the whole kernel crate into the shell's dep graph,
-// matching the libfs-proto pattern. Stays in sync via the in-source
-// ADR-032 § 4 table.
-const FDE_HEADER_MIN_LEN: usize = 176;
-const FDE_OFF_MAGIC: usize = 0;
-const FDE_OFF_HEADER_LEN: usize = 8;
-const FDE_OFF_CIPHER_ID: usize = 12;
-const FDE_OFF_VOLUME_UUID: usize = 16;
-const FDE_OFF_FORMAT_GEN: usize = 48;
-const FDE_OFF_KDF_ID: usize = 52;
-const FDE_OFF_SIGNATURE: usize = FDE_HEADER_MIN_LEN - 64;
-const FDE_MAGIC: &[u8; 8] = b"ARCVOL01";
-
 fn cmd_fde_test() {
+    use cambios_fde_proto::{
+        HEADER_MIN_LEN, OFF_CIPHER_ID, OFF_FORMAT_GEN, OFF_HEADER_LEN, OFF_KDF_ID,
+        OFF_MAGIC, OFF_VOLUME_UUID, SIGNATURE_BYTES, VOLUME_MAGIC,
+    };
     use cambios_libsys::keystore::PivSlot;
+    const SIG_OFFSET: usize = HEADER_MIN_LEN - SIGNATURE_BYTES;
 
     // Step 1: probe the PIV backend's health.
     match cambios_libsys::keystore::piv_health(SHELL_ENDPOINT) {
@@ -515,22 +506,19 @@ fn cmd_fde_test() {
     };
 
     // Step 4: construct a minimal valid header (0 slots, no padding).
-    let mut header = [0u8; FDE_HEADER_MIN_LEN];
-    header[FDE_OFF_MAGIC..FDE_OFF_MAGIC + 8].copy_from_slice(FDE_MAGIC);
-    header[FDE_OFF_HEADER_LEN..FDE_OFF_HEADER_LEN + 4]
-        .copy_from_slice(&(FDE_HEADER_MIN_LEN as u32).to_le_bytes());
-    header[FDE_OFF_CIPHER_ID..FDE_OFF_CIPHER_ID + 4]
-        .copy_from_slice(&1u32.to_le_bytes()); // AES-256-XTS
-    header[FDE_OFF_VOLUME_UUID..FDE_OFF_VOLUME_UUID + 32]
-        .copy_from_slice(pubkey.as_slice());
-    header[FDE_OFF_FORMAT_GEN..FDE_OFF_FORMAT_GEN + 4]
-        .copy_from_slice(&1u32.to_le_bytes());
-    header[FDE_OFF_KDF_ID..FDE_OFF_KDF_ID + 4].copy_from_slice(&1u32.to_le_bytes());
+    let mut header = [0u8; HEADER_MIN_LEN];
+    header[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(VOLUME_MAGIC);
+    header[OFF_HEADER_LEN..OFF_HEADER_LEN + 4]
+        .copy_from_slice(&(HEADER_MIN_LEN as u32).to_le_bytes());
+    header[OFF_CIPHER_ID..OFF_CIPHER_ID + 4].copy_from_slice(&1u32.to_le_bytes()); // AES-256-XTS
+    header[OFF_VOLUME_UUID..OFF_VOLUME_UUID + 32].copy_from_slice(pubkey.as_slice());
+    header[OFF_FORMAT_GEN..OFF_FORMAT_GEN + 4].copy_from_slice(&1u32.to_le_bytes());
+    header[OFF_KDF_ID..OFF_KDF_ID + 4].copy_from_slice(&1u32.to_le_bytes());
     // slot_count = 0, master_rotation_progress = 0, reserved_flags = 0,
     // kdf_params + reserved bytes all stay zero.
 
     // Step 5: sign the bytes that come before the signature slot.
-    let signed_range = &header[..FDE_OFF_SIGNATURE];
+    let signed_range = &header[..SIG_OFFSET];
     let sig = match cambios_libsys::keystore::piv_sign(
         SHELL_ENDPOINT,
         PivSlot::Signature,
@@ -543,7 +531,7 @@ fn cmd_fde_test() {
             return;
         }
     };
-    header[FDE_OFF_SIGNATURE..FDE_HEADER_MIN_LEN].copy_from_slice(&sig.0);
+    header[SIG_OFFSET..HEADER_MIN_LEN].copy_from_slice(&sig.0);
 
     // Step 6: hand it to the kernel for verification.
     let result = sys::verify_volume_header(&header);
