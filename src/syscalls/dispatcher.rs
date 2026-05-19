@@ -3798,7 +3798,10 @@ impl SyscallDispatcher {
             Err(HeaderError::BadLength)
             | Err(HeaderError::BadMagic)
             | Err(HeaderError::BadHeaderLength)
-            | Err(HeaderError::SlotCountExceeds) => Err(SyscallError::InvalidArg),
+            | Err(HeaderError::SlotCountExceeds)
+            | Err(HeaderError::BadSlotType)
+            | Err(HeaderError::BadSlotClass)
+            | Err(HeaderError::BadWrappedKeyLen) => Err(SyscallError::InvalidArg),
             Err(HeaderError::VolumeUuidMismatch)
             | Err(HeaderError::SignatureInvalid) => Err(SyscallError::PermissionDenied),
         }

@@ -159,6 +159,7 @@ src/fs/crypto/header.rs:55:OFF_MASTER_ROT
 src/fs/crypto/header.rs:56:OFF_RESERVED_FLAGS
 src/fs/crypto/header.rs:57:OFF_RESERVED
 src/fs/crypto/header.rs:58:OFF_SLOT_TABLE
+src/fs/crypto/header.rs:277:SLOT_OFF_WRAPPED_KEY
 src/fs/disk.rs:109:SB_OFF_MAGIC
 src/fs/disk.rs:110:SB_OFF_VERSION
 src/fs/disk.rs:111:SB_OFF_CAPACITY_SLOTS
