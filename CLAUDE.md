@@ -289,6 +289,7 @@ make symbols
 make fs-service                  # user/fs-service — separate crate, uses CARGO_ENCODED_RUSTFLAGS to override parent .cargo/config.toml
 make sign-tool                   # tools/sign-elf — host-side, own .cargo/config.toml targeting aarch64-apple-darwin
 make gen-dev-piv-keys            # tools/gen-dev-piv-keys — derives dev Ed25519+X25519 keys from a persistent per-developer seed at tools/gen-dev-piv-keys/.dev-seed.bin (gitignored); writes dev_bootstrap_pubkey.bin (workspace root) + user/key-store-service/dev_piv_secret.bin. Idempotent; required before any `--features dev-piv` build (kernel + key-store-service must both be built with this feature for SwPivBackend's pubkey to match the kernel-baked bootstrap pubkey).
+make format-volume               # tools/format-volume — host tool that writes a fresh signed ADR-032 volume header to a raw disk image. Run as `tools/format-volume/target/aarch64-apple-darwin/release/format-volume <disk-image>`. Requires gen-dev-piv-keys to have run first. The header pairs with the dev_bootstrap_pubkey.bin baked into the kernel under `--features dev-piv`; fde-mount reads + verifies + unwraps the master key at boot. Stream A A-v.e.
 
 # Dev-PIV feature builds (Stream A; ADR-032 Migration Path step 2)
 cargo build --target x86_64-unknown-none --release --features dev-piv     # kernel uses dev_bootstrap_pubkey.bin

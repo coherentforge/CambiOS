@@ -144,6 +144,12 @@ GEN_DEV_PIV := $(GEN_DEV_PIV_DIR)/target/aarch64-apple-darwin/release/gen-dev-pi
 DEV_BOOTSTRAP_PUBKEY := dev_bootstrap_pubkey.bin
 DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 
+# Format-volume host tool (stream A A-v.e). Writes a fresh signed
+# ADR-032 § 4 volume header to a raw disk image file using the
+# DPIV bundle gen-dev-piv-keys produced. Sibling to sign-elf.
+FORMAT_VOLUME_DIR := tools/format-volume
+FORMAT_VOLUME := $(FORMAT_VOLUME_DIR)/target/aarch64-apple-darwin/release/format-volume
+
 # Signing mode: "yubikey" (default) or "seed" (for CI/testing without hardware key)
 SIGN_MODE ?= seed
 
@@ -157,7 +163,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys bake-font export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey
 
 all: iso
 
@@ -641,6 +647,15 @@ gen-dev-piv-keys:
 	@echo "=== Generating dev-PIV keypair files ==="
 	$(GEN_DEV_PIV)
 	@echo "=== dev-PIV keypair files ready ==="
+
+# Builds the format-volume host tool. Doesn't run it — invoke
+# directly with a disk image path (e.g.,
+# `$(FORMAT_VOLUME) disk.img`). Requires gen-dev-piv-keys to have
+# run at least once (consumes user/key-store-service/dev_piv_secret.bin).
+format-volume:
+	@echo "=== Building format-volume host tool ==="
+	cd $(FORMAT_VOLUME_DIR) && cargo build --release
+	@echo "=== format-volume ready: $(FORMAT_VOLUME) ==="
 
 # Re-bake the JetBrains Mono Regular TTF in assets/fonts/ into the
 # antialiased glyph table consumed by user/libgui at compile time. Run
