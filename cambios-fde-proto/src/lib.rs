@@ -92,6 +92,48 @@ pub const SLOT_OFF_WRAPPED_LEN: usize = 2;
 pub const SLOT_OFF_PRINCIPAL: usize = 4;
 pub const SLOT_OFF_WRAPPED_KEY: usize = 36;
 
+// ----------------------------------------------------------------------------
+// YubiKey-slot envelope byte layout (ADR-032 § 4 "YubiKey slot (0x01)
+// envelope byte layout"). Used by `fde-mount` (unwrap) and the
+// future `format-volume` host tool (wrap). One source of truth — no
+// mirror anywhere.
+
+/// HARDWARE: byte offset of the ephemeral X25519 pubkey inside a
+/// slot-0x01 `wrapped_key` field.
+pub const WRAP_ENV_EPHEMERAL_PK_OFF: usize = 0;
+
+/// HARDWARE: byte length of the ephemeral X25519 pubkey field.
+pub const WRAP_ENV_EPHEMERAL_PK_LEN: usize = 32;
+
+/// HARDWARE: byte offset of the ChaCha20-Poly1305 ciphertext inside
+/// a slot-0x01 `wrapped_key` field.
+pub const WRAP_ENV_CIPHERTEXT_OFF: usize = 32;
+
+/// HARDWARE: byte length of the ChaCha20-Poly1305 ciphertext —
+/// 32-byte master-key ciphertext + 16-byte Poly1305 tag.
+pub const WRAP_ENV_CIPHERTEXT_LEN: usize = 48;
+
+/// HARDWARE: total byte length of a slot-0x01 envelope.
+pub const WRAP_ENV_LEN: usize = WRAP_ENV_EPHEMERAL_PK_LEN + WRAP_ENV_CIPHERTEXT_LEN;
+
+/// HARDWARE: byte length of the AES-256 FDE master key. The
+/// ChaCha20-Poly1305 ciphertext at `WRAP_ENV_CIPHERTEXT_OFF` decrypts
+/// to exactly this many plaintext bytes.
+pub const FDE_MASTER_KEY_LEN: usize = 32;
+
+/// HARDWARE: Blake3 derive_key context string used to derive the
+/// envelope's symmetric ChaCha20-Poly1305 key from the X25519 ECDH
+/// shared secret. Globally unique per Blake3 derive_key spec. Date
+/// is the format-lock date, not a timestamp — the string is a
+/// constant.
+pub const WRAP_KDF_CONTEXT: &str = "cambios.org 2026-05-18 fde-master-key-wrap v1";
+
+/// HARDWARE: ChaCha20-Poly1305 nonce for the envelope wrap step.
+/// Twelve zero bytes — justified because the symmetric key is
+/// unique per envelope (fresh formatter ephemeral keypair drives
+/// fresh ECDH output drives fresh `derive_key` output).
+pub const WRAP_NONCE: [u8; 12] = [0u8; 12];
+
 // ============================================================================
 // Error type
 // ============================================================================
@@ -622,5 +664,61 @@ mod tests {
             assert_eq!(SlotClass::from_byte(sc as u8), Some(sc));
         }
         assert_eq!(SlotClass::from_byte(0x99), None);
+    }
+
+    #[test]
+    fn envelope_offsets_are_contiguous() {
+        assert_eq!(
+            WRAP_ENV_EPHEMERAL_PK_OFF + WRAP_ENV_EPHEMERAL_PK_LEN,
+            WRAP_ENV_CIPHERTEXT_OFF,
+            "ephemeral pubkey region must abut the ciphertext region",
+        );
+        assert_eq!(
+            WRAP_ENV_CIPHERTEXT_OFF + WRAP_ENV_CIPHERTEXT_LEN,
+            WRAP_ENV_LEN,
+            "envelope total length must equal ephemeral_pk + ciphertext",
+        );
+    }
+
+    #[test]
+    fn envelope_fits_in_slot_wrapped_key_region() {
+        // The 80-byte envelope must fit in the 220-byte wrapped_key
+        // field; the slot table can't carry an envelope it can't
+        // serialize.
+        assert!(WRAP_ENV_LEN <= SLOT_WRAPPED_KEY_MAX);
+    }
+
+    #[test]
+    fn envelope_ciphertext_size_matches_aead_overhead() {
+        // ChaCha20-Poly1305 over a 32-byte plaintext produces 32
+        // ciphertext bytes + 16 Poly1305 tag = 48 bytes. Encoding
+        // the invariant as a test guards against accidental changes
+        // to either constant.
+        const POLY1305_TAG_LEN: usize = 16;
+        assert_eq!(
+            WRAP_ENV_CIPHERTEXT_LEN,
+            FDE_MASTER_KEY_LEN + POLY1305_TAG_LEN,
+            "ChaCha20-Poly1305(32-byte plaintext) = 32 ciphertext + 16 tag = 48 bytes",
+        );
+    }
+
+    #[test]
+    fn wrap_kdf_context_is_nonempty() {
+        // Blake3 derive_key requires a globally-unique constant
+        // context. Empty would still compile but would silently
+        // weaken the derivation; guard explicitly.
+        assert!(!WRAP_KDF_CONTEXT.is_empty());
+        assert!(WRAP_KDF_CONTEXT.contains("cambios"));
+        assert!(WRAP_KDF_CONTEXT.contains("v1"));
+    }
+
+    #[test]
+    fn wrap_nonce_is_twelve_zero_bytes() {
+        // ChaCha20-Poly1305 nonce is 12 bytes per RFC 8439. The
+        // all-zero choice is justified by per-envelope uniqueness
+        // of the symmetric key; if this constant ever turns into
+        // anything non-zero the spec assumptions need re-checking.
+        assert_eq!(WRAP_NONCE.len(), 12);
+        assert_eq!(WRAP_NONCE, [0u8; 12]);
     }
 }

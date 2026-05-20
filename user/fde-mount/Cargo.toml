@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-fde-mount"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS FDE-mount orchestrator boot module (stream A A-v.a). Reads the on-disk volume header via SYS_READ_VOLUME_HEADER, verifies its bootstrap signature via SYS_VERIFY_VOLUME_HEADER, walks the slot table to find the live YubiKey slot, calls piv_decrypt for the ECDH shared secret, derives the AES-256 FDE master key via Blake3 + ChaCha20-Poly1305 per ADR-032 § 4, and stubs the install (SYS_INSTALL_MASTER_KEY lands at A-v.d)."
+
+[dependencies]
+cambios-libsys = { path = "../libsys" }
+cambios-fde-proto = { path = "../../cambios-fde-proto" }
+blake3 = { version = "1.8", default-features = false, features = ["pure"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+zeroize = { version = "1.7", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

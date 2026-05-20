@@ -312,6 +312,9 @@ impl SyscallDispatcher {
             SyscallNumber::VerifyVolumeHeader => {
                 Self::handle_verify_volume_header(args, &ctx)
             }
+            SyscallNumber::ReadVolumeHeader => {
+                Self::handle_read_volume_header(args, &ctx)
+            }
         }
     }
 
@@ -3805,6 +3808,95 @@ impl SyscallDispatcher {
             Err(HeaderError::VolumeUuidMismatch)
             | Err(HeaderError::SignatureInvalid) => Err(SyscallError::PermissionDenied),
         }
+    }
+
+    /// SYS_READ_VOLUME_HEADER (74): copy LBA 0..=3 (16 KiB) of the
+    /// on-disk FDE volume header into a user buffer via the kernel's
+    /// virtio-blk kernel-cmd path per ADR-032 § Architecture. First
+    /// step of stream A A-v.a's `fde-mount` unlock flow.
+    ///
+    /// Args: arg1 = user ptr to output buffer,
+    ///       arg2 = output buffer byte length (must be >= 16384).
+    /// Returns: 16384 (bytes written) on success;
+    ///          `PermissionDenied` if caller is not the bootstrap
+    ///          Principal; `InvalidArg` for buf_len too small or
+    ///          missing user-space cr3; `Enosys` if virtio-blk's
+    ///          kernel-cmd path isn't initialized yet (e.g., on
+    ///          AArch64 with no virtio-blk device); `OutOfMemory`
+    ///          if a block read fails mid-read.
+    ///
+    /// Authority: bootstrap-Principal-only. Reads raw disk bytes
+    /// before any volume layer has authenticated them, so it must
+    /// be tightly scoped to the signed `fde-mount` boot module.
+    /// Same gating shape as `ClaimBootstrapKey` and `BindPrincipal`.
+    ///
+    /// Lock ordering: none directly. `VirtioBlkDevice::call`
+    /// yields the calling task via `yield_save_and_switch` while
+    /// waiting for the virtio-blk driver's reply — no kernel locks
+    /// are held across the yield.
+    fn handle_read_volume_header(
+        args: SyscallArgs,
+        ctx: &SyscallContext,
+    ) -> SyscallResult {
+        use crate::fs::block::{BLOCK_SIZE, Block, BlockDevice};
+        use crate::fs::virtio_blk_device::VirtioBlkDevice;
+
+        /// HARDWARE: ADR-032 § 4 reserves LBA 0..=3 (4 × 4 KiB = 16 KiB)
+        /// for the volume header, even when the header_length field
+        /// addresses fewer bytes. Reading the full reserved extent
+        /// once means consumers don't need a multi-syscall protocol.
+        const HEADER_BLOCKS: u64 = 4;
+        const HEADER_BYTES: usize = (HEADER_BLOCKS as usize) * BLOCK_SIZE;
+
+        let buf_ptr = args.arg1;
+        let buf_len = args.arg_usize(2);
+
+        if buf_len < HEADER_BYTES {
+            return Err(SyscallError::InvalidArg);
+        }
+        if ctx.cr3 == 0 {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Bootstrap-Principal-only — same gating shape as
+        // ClaimBootstrapKey / BindPrincipal.
+        let caller = ctx
+            .caller_principal
+            .as_ref()
+            .ok_or(SyscallError::PermissionDenied)?;
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        if *caller != bootstrap {
+            return Err(SyscallError::PermissionDenied);
+        }
+
+        // Open the virtio-blk kernel-cmd channel. Per the
+        // `lazy_disk` precedent, we do this without holding any
+        // kernel locks (the IPC dance yields).
+        let mut device = VirtioBlkDevice::new();
+        if device.ensure_handshake().is_err() {
+            return Err(SyscallError::Enosys);
+        }
+
+        // Read 16 KiB into a kernel-local stack buffer. 16 KiB is
+        // well within the 256 KiB boot stack budget; per the
+        // CLAUDE.md kernel stack guidance, we avoid heap allocation
+        // for boot-path one-shots.
+        let mut kbuf = [0u8; HEADER_BYTES];
+        for lba in 0..HEADER_BLOCKS {
+            let mut block: Block = [0u8; BLOCK_SIZE];
+            if device.read_block(lba, &mut block).is_err() {
+                return Err(SyscallError::OutOfMemory);
+            }
+            let start = (lba as usize) * BLOCK_SIZE;
+            kbuf[start..start + BLOCK_SIZE].copy_from_slice(&block);
+        }
+
+        // Copy to user. UserWriteSlice handles cr3-aware page-walk
+        // copy + length validation.
+        let slice = UserWriteSlice::validate(ctx, buf_ptr, HEADER_BYTES)?;
+        slice.write_from(&kbuf)?;
+
+        Ok(HEADER_BYTES as u64)
     }
 
     /// Drive a cluster's teardown — used by SYS_CLUSTER_REVOKE and by

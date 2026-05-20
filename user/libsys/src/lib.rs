@@ -401,6 +401,21 @@ pub fn verify_volume_header(header_bytes: &[u8]) -> i64 {
     )
 }
 
+/// SYS_READ_VOLUME_HEADER: copy LBA 0..=3 (16 KiB) of the on-disk
+/// FDE volume header into `out` via the kernel's virtio-blk
+/// kernel-cmd path per ADR-032 § Architecture. Bootstrap-Principal-
+/// only; used by `fde-mount` (stream A A-v.a) as the first step of
+/// the unlock flow. Returns the number of bytes written on success
+/// (16384), or a negative `SyscallError` value.
+pub fn read_volume_header(out: &mut [u8]) -> i64 {
+    syscall_raw3(
+        SyscallNumber::ReadVolumeHeader as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+    )
+}
+
 /// Claim the bootstrap secret key from the kernel (one-shot).
 /// Returns 64 on success, negative error on failure.
 pub fn claim_bootstrap_key(out_sk: &mut [u8; 64]) -> i64 {

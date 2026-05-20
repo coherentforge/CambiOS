@@ -756,6 +756,30 @@ pub enum SyscallNumber {
     /// Does not gate on which Principal — the verification target is
     /// the kernel-baked bootstrap pubkey, not the caller's identity.
     VerifyVolumeHeader = 73,
+
+    /// SYS_READ_VOLUME_HEADER (74): copy the on-disk FDE volume
+    /// header (LBA 0..3, 16 KiB) into a user buffer via the kernel's
+    /// existing virtio-blk kernel-cmd path per ADR-032 § Architecture
+    /// boot sequence. Used by stream A substage A-v.a's `fde-mount`
+    /// boot module as the first step of the unlock flow.
+    ///
+    /// Args: arg1 = user ptr to output buffer,
+    ///       arg2 = output buffer byte length (must be >=
+    ///              HEADER_MIN_LEN = 176; the handler reads up to
+    ///              `min(buf_len, HEADER_MAX_LEN = 4272)` bytes).
+    ///
+    /// Returns: number of bytes written on success (always 4096-byte
+    /// aligned since virtio-blk reads in 4 KiB units); `InvalidArg`
+    /// for buf_len out of range; `PermissionDenied` if the caller is
+    /// not the bootstrap Principal; `Enosys` if virtio-blk's
+    /// kernel-cmd path isn't initialized yet.
+    ///
+    /// Identity-required: yes. Authority is bootstrap-Principal-only
+    /// — the syscall reads raw disk bytes before any volume layer
+    /// has authenticated them, so it must be tightly scoped to the
+    /// signed `fde-mount` boot module. Same gating shape as
+    /// `ClaimBootstrapKey` and `BindPrincipal`.
+    ReadVolumeHeader = 74,
 }
 
 impl SyscallNumber {
@@ -802,7 +826,8 @@ impl SyscallNumber {
             Self::Opendir | Self::Readdir |
             Self::Stat | Self::Fsync |
             Self::AclGrant | Self::AclRevoke | Self::AclList |
-            Self::VerifyVolumeHeader
+            Self::VerifyVolumeHeader |
+            Self::ReadVolumeHeader
         )
     }
 
@@ -884,6 +909,7 @@ impl SyscallNumber {
             71 => Some(Self::AclRevoke),
             72 => Some(Self::AclList),
             73 => Some(Self::VerifyVolumeHeader),
+            74 => Some(Self::ReadVolumeHeader),
             _ => None,
         }
     }
@@ -1598,6 +1624,7 @@ mod tests {
             SyscallNumber::AclGrant, SyscallNumber::AclRevoke,
             SyscallNumber::AclList,
             SyscallNumber::VerifyVolumeHeader,
+            SyscallNumber::ReadVolumeHeader,
         ];
 
         for &num in &all {
@@ -1632,9 +1659,9 @@ mod tests {
         // ChannelCompleteTeardown), ADR-028 storage seam syscalls
         // (50 Cambio, 51 Regalo, 52 Stream), ADR-029 POSIX file
         // syscalls (53..=72: FileOpen..AclList), and ADR-032 §
-        // VerifyVolumeHeader (73) round out the current high-water
-        // mark.
-        for i in 0..=73u64 {
+        // FDE-related syscalls (73 VerifyVolumeHeader, 74
+        // ReadVolumeHeader) round out the current high-water mark.
+        for i in 0..=74u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
