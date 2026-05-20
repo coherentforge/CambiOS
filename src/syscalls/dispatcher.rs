@@ -3834,6 +3834,13 @@ impl SyscallDispatcher {
     /// yields the calling task via `yield_save_and_switch` while
     /// waiting for the virtio-blk driver's reply — no kernel locks
     /// are held across the yield.
+    ///
+    /// Gated `#[cfg(not(test))]` because the kernel-side
+    /// `crate::fs::virtio_blk_device` module is itself gated out of
+    /// host test builds (see `src/fs/mod.rs`). The matching
+    /// `#[cfg(test)]` stub below returns `Enosys`, so host syscall
+    /// tests that route to dispatcher don't break.
+    #[cfg(not(test))]
     fn handle_read_volume_header(
         args: SyscallArgs,
         ctx: &SyscallContext,
@@ -3897,6 +3904,22 @@ impl SyscallDispatcher {
         slice.write_from(&kbuf)?;
 
         Ok(HEADER_BYTES as u64)
+    }
+
+    /// Test-mode stub for `handle_read_volume_header`.
+    ///
+    /// The kernel-side `crate::fs::virtio_blk_device` module is gated
+    /// out of host test builds (`#[cfg(not(test))]` on its declaration
+    /// in `src/fs/mod.rs`) because the real adapter speaks IPC to the
+    /// user-space virtio-blk driver — a runtime that doesn't exist
+    /// under `cargo test`. Returning `Enosys` matches the behavior
+    /// real callers see on a target without a virtio-blk device.
+    #[cfg(test)]
+    fn handle_read_volume_header(
+        _args: SyscallArgs,
+        _ctx: &SyscallContext,
+    ) -> SyscallResult {
+        Err(SyscallError::Enosys)
     }
 
     /// Drive a cluster's teardown — used by SYS_CLUSTER_REVOKE and by
