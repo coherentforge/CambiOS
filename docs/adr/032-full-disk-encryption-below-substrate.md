@@ -94,6 +94,39 @@ Header byte layout (v1 target; ~16 KiB total to leave room for slot table growth
 
 The wrapped key for slot type 0x01 is a PIV-decrypt envelope holding the AES-256 master key. The wrapped key for slot type 0x02 is the AES-256 master key encrypted under an Argon2id-derived key (using the KDF parameters from the header).
 
+#### YubiKey slot (0x01) envelope byte layout
+
+The slot-0x01 `wrapped_key` field carries an 80-byte envelope:
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 32 | `ephemeral_pk` | The formatter's ephemeral X25519 public key. |
+| 32 | 48 | `ciphertext` | `ChaCha20-Poly1305(symmetric_key, [0u8; 12], aad=empty, plaintext=master_key)` — 32 bytes of ciphertext followed by a 16-byte Poly1305 tag. |
+
+`symmetric_key` is derived from the X25519 ECDH shared secret:
+
+```
+shared_secret  = ECDH(formatter_ephemeral_sk, slot_9d_pk)        // 32 bytes
+symmetric_key  = blake3::derive_key(
+                     "cambios.org 2026-05-18 fde-master-key-wrap v1",
+                     shared_secret)                              // 32 bytes
+```
+
+The nonce is fixed at twelve zero bytes — justified because the symmetric key is unique per envelope (a fresh formatter ephemeral keypair per format operation drives a fresh ECDH output drives a fresh `symmetric_key`). The AAD is empty in v1; binding the envelope to the slot's `slot_principal` field via AAD is a forward-additive change (new `cipher_id` discriminator), reserved for a future Divergence if the threat model warrants.
+
+The unwrap procedure (`fde-mount` boot module, stream A A-v.a):
+
+1. Read `ephemeral_pk = wrapped_key[..32]`.
+2. Call `piv_decrypt(slot=KeyManagement, ephemeral_pk)` → 32-byte `shared_secret` (the kernel-side ECDH performed by `SwPivBackend` or `CcidPivBackend` against the slot-9D X25519 private key).
+3. `symmetric_key = blake3::derive_key("cambios.org 2026-05-18 fde-master-key-wrap v1", &shared_secret)`.
+4. `master_key = ChaCha20-Poly1305-decrypt(symmetric_key, [0u8; 12], aad=empty, &wrapped_key[32..80])`.
+
+ChaCha20-Poly1305 (vs AES-256-GCM) is chosen for the wrap step specifically to avoid forcing AES code into userspace — `fde-mount` runs in ring 3 and only the kernel (XTS path at A-v.c) needs AES code. Pure-software ChaCha20-Poly1305 via the audited RustCrypto `chacha20poly1305` crate is well within `fde-mount`'s budget; the kernel's eventual AES path is unaffected.
+
+#### Argon2id slot (0x02) envelope byte layout
+
+Reserved for the recovery-slot Divergence that lands when recovery enrollment ships (see § Open Questions). The v1 sketch: 48-byte ChaCha20-Poly1305 ciphertext over the same master key, keyed under the Argon2id-derived bytes from the header's KDF params — no ephemeral pubkey field (the KDF input *is* the passphrase). Locked when the recovery boot path (a future stream A substage or a separate recovery-design ADR) is ratified.
+
 `MAX_SLOTS = 16` is SCAFFOLDING per Convention 8. Rationale: a v1 device hosts 1-3 YubiKey live slots (primary + backup) plus 1-2 recovery slots, with headroom for future N-of-1 unlock with multiple authorized YubiKeys. Memory cost: 256 bytes × 16 = 4 KiB inline in the header. Replace when a deployment surfaces > 4 active live slots in practice.
 
 ### 5. Slot policy: YubiKey-primary live, Argon2id-recovery, signed mutations
