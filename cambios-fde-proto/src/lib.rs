@@ -110,23 +110,28 @@ pub const WRAP_ENV_EPHEMERAL_PK_LEN: usize = 32;
 pub const WRAP_ENV_CIPHERTEXT_OFF: usize = 32;
 
 /// HARDWARE: byte length of the ChaCha20-Poly1305 ciphertext —
-/// 32-byte master-key ciphertext + 16-byte Poly1305 tag.
-pub const WRAP_ENV_CIPHERTEXT_LEN: usize = 48;
+/// 64-byte master-key ciphertext + 16-byte Poly1305 tag.
+pub const WRAP_ENV_CIPHERTEXT_LEN: usize = 80;
 
 /// HARDWARE: total byte length of a slot-0x01 envelope.
 pub const WRAP_ENV_LEN: usize = WRAP_ENV_EPHEMERAL_PK_LEN + WRAP_ENV_CIPHERTEXT_LEN;
 
-/// HARDWARE: byte length of the AES-256 FDE master key. The
-/// ChaCha20-Poly1305 ciphertext at `WRAP_ENV_CIPHERTEXT_OFF` decrypts
-/// to exactly this many plaintext bytes.
-pub const FDE_MASTER_KEY_LEN: usize = 32;
+/// HARDWARE: byte length of the XTS-AES-256 FDE master key — the
+/// concatenated `K1 || K2` per NIST SP 800-38E (two distinct AES-256
+/// keys). The ChaCha20-Poly1305 ciphertext at
+/// `WRAP_ENV_CIPHERTEXT_OFF` decrypts to exactly this many plaintext
+/// bytes. See ADR-032 § 2 and § Divergence 2026-05-20 for the
+/// 32-byte interim spec this replaces.
+pub const FDE_MASTER_KEY_LEN: usize = 64;
 
 /// HARDWARE: Blake3 derive_key context string used to derive the
 /// envelope's symmetric ChaCha20-Poly1305 key from the X25519 ECDH
 /// shared secret. Globally unique per Blake3 derive_key spec. Date
-/// is the format-lock date, not a timestamp — the string is a
-/// constant.
-pub const WRAP_KDF_CONTEXT: &str = "cambios.org 2026-05-18 fde-master-key-wrap v1";
+/// marks the envelope-spec lock, not a timestamp — the string is a
+/// constant. Bumped 2026-05-18 → 2026-05-20 when the master key was
+/// widened to 64 bytes (ADR-032 § Divergence 2026-05-20); the
+/// derivation procedure itself was unchanged.
+pub const WRAP_KDF_CONTEXT: &str = "cambios.org 2026-05-20 fde-master-key-wrap v1";
 
 /// HARDWARE: ChaCha20-Poly1305 nonce for the envelope wrap step.
 /// Twelve zero bytes — justified because the symmetric key is
@@ -682,7 +687,7 @@ mod tests {
 
     #[test]
     fn envelope_fits_in_slot_wrapped_key_region() {
-        // The 80-byte envelope must fit in the 220-byte wrapped_key
+        // The 112-byte envelope must fit in the 220-byte wrapped_key
         // field; the slot table can't carry an envelope it can't
         // serialize.
         assert!(WRAP_ENV_LEN <= SLOT_WRAPPED_KEY_MAX);
@@ -690,16 +695,25 @@ mod tests {
 
     #[test]
     fn envelope_ciphertext_size_matches_aead_overhead() {
-        // ChaCha20-Poly1305 over a 32-byte plaintext produces 32
-        // ciphertext bytes + 16 Poly1305 tag = 48 bytes. Encoding
+        // ChaCha20-Poly1305 over a 64-byte plaintext produces 64
+        // ciphertext bytes + 16 Poly1305 tag = 80 bytes. Encoding
         // the invariant as a test guards against accidental changes
         // to either constant.
         const POLY1305_TAG_LEN: usize = 16;
         assert_eq!(
             WRAP_ENV_CIPHERTEXT_LEN,
             FDE_MASTER_KEY_LEN + POLY1305_TAG_LEN,
-            "ChaCha20-Poly1305(32-byte plaintext) = 32 ciphertext + 16 tag = 48 bytes",
+            "ChaCha20-Poly1305(64-byte plaintext) = 64 ciphertext + 16 tag = 80 bytes",
         );
+    }
+
+    #[test]
+    fn master_key_is_xts_aes_256_keying_width() {
+        // XTS-AES-256 per NIST SP 800-38E requires 2 × 256-bit keys
+        // (K1 || K2 = 64 bytes). Encoding the invariant catches any
+        // future drift in either direction (e.g., accidental shrink
+        // back to a single-AES-key width).
+        assert_eq!(FDE_MASTER_KEY_LEN, 64);
     }
 
     #[test]
@@ -710,6 +724,7 @@ mod tests {
         assert!(!WRAP_KDF_CONTEXT.is_empty());
         assert!(WRAP_KDF_CONTEXT.contains("cambios"));
         assert!(WRAP_KDF_CONTEXT.contains("v1"));
+        assert!(WRAP_KDF_CONTEXT.contains("2026-05-20"));
     }
 
     #[test]

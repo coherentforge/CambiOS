@@ -15,10 +15,11 @@
 //! - `--dpiv-secret <path>`: path to the 168-byte DPIV v1 bundle
 //!   produced by `gen-dev-piv-keys`. Default:
 //!   `<workspace>/user/key-store-service/dev_piv_secret.bin`.
-//! - `--master-key-hex <64hex>`: optional override for the
-//!   AES-256 master key. Default: 32 random bytes from
-//!   `/dev/urandom`. Hex argument lets dev-loop scripts use a
-//!   deterministic master key for reproducible runs.
+//! - `--master-key-hex <128hex>`: optional override for the
+//!   XTS-AES-256 master key (the concatenated `K1 || K2` per NIST
+//!   SP 800-38E). Default: 64 random bytes from `/dev/urandom`. Hex
+//!   argument lets dev-loop scripts use a deterministic master key
+//!   for reproducible runs.
 //! - `--print-only`: do everything except write the disk image
 //!   (sanity check the inputs + dump the would-be header layout).
 //!
@@ -44,11 +45,12 @@
 //!   slot[0]:
 //!     slot_type   = 0x01 (YubiKey)
 //!     slot_class  = 0x00 (Live)
-//!     wrapped_key_len = 80
+//!     wrapped_key_len = 112
 //!     slot_principal  = bootstrap AID (slot-9C pubkey from DPIV)
 //!     wrapped_key:
-//!       [0..32]  ephemeral_pk (fresh per format operation)
-//!       [32..80] ChaCha20-Poly1305 ciphertext + tag
+//!       [0..32]   ephemeral_pk (fresh per format operation)
+//!       [32..112] ChaCha20-Poly1305 ciphertext + tag
+//!                 (80 = 64 plaintext bytes + 16 Poly1305 tag)
 //! ```
 
 use std::env;
@@ -58,6 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use cambios_fde_proto as proto;
+use cambios_fde_proto::FDE_MASTER_KEY_LEN;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 
@@ -109,8 +112,9 @@ fn print_usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --dpiv-secret <path>     Path to DPIV bundle. Default:");
     eprintln!("                           <workspace>/{DEFAULT_DPIV_RELATIVE}");
-    eprintln!("  --master-key-hex <hex>   Override master key (64 hex chars = 32 bytes).");
-    eprintln!("                           Default: read 32 bytes from /dev/urandom.");
+    eprintln!("  --master-key-hex <hex>   Override master key (128 hex chars = 64 bytes,");
+    eprintln!("                           the XTS-AES-256 K1 || K2 concatenation).");
+    eprintln!("                           Default: read 64 bytes from /dev/urandom.");
     eprintln!("  --print-only             Do everything except write the disk image.");
     eprintln!("  -h, --help               Show this help.");
 }
@@ -188,7 +192,9 @@ fn workspace_root() -> PathBuf {
     }
 }
 
-/// Read exactly 32 bytes of entropy from /dev/urandom.
+/// Read exactly 32 bytes of entropy from /dev/urandom — used for
+/// the ephemeral Ed25519 seed that drives the per-format X25519
+/// keypair. 32 bytes regardless of master-key width.
 fn random_32() -> [u8; 32] {
     let mut f = fs::File::open("/dev/urandom").expect("open /dev/urandom");
     let mut out = [0u8; 32];
@@ -196,13 +202,26 @@ fn random_32() -> [u8; 32] {
     out
 }
 
-fn parse_hex_32(hex: &str) -> [u8; 32] {
-    if hex.len() != 64 {
-        eprintln!("error: --master-key-hex must be exactly 64 hex chars (32 bytes); got {}", hex.len());
+/// Read exactly 64 bytes of entropy from /dev/urandom — the
+/// XTS-AES-256 master key (K1 || K2 per NIST SP 800-38E).
+fn random_master() -> [u8; FDE_MASTER_KEY_LEN] {
+    let mut f = fs::File::open("/dev/urandom").expect("open /dev/urandom");
+    let mut out = [0u8; FDE_MASTER_KEY_LEN];
+    f.read_exact(&mut out).expect("read FDE_MASTER_KEY_LEN bytes from /dev/urandom");
+    out
+}
+
+fn parse_hex_master(hex: &str) -> [u8; FDE_MASTER_KEY_LEN] {
+    let expected_hex_len = FDE_MASTER_KEY_LEN * 2;
+    if hex.len() != expected_hex_len {
+        eprintln!(
+            "error: --master-key-hex must be exactly {} hex chars ({} bytes); got {}",
+            expected_hex_len, FDE_MASTER_KEY_LEN, hex.len()
+        );
         process::exit(1);
     }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
+    let mut out = [0u8; FDE_MASTER_KEY_LEN];
+    for i in 0..FDE_MASTER_KEY_LEN {
         let byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
             eprintln!("error: --master-key-hex contains non-hex char at index {}", i * 2);
             process::exit(1);
@@ -264,9 +283,9 @@ fn load_dpiv_bundle(path: &Path) -> DpivKeys {
 /// Build the 432-byte signed volume header for a 1-slot YubiKey-live
 /// configuration. Returns the header bytes + the master-key fingerprint
 /// for the summary print.
-fn build_signed_header(keys: &DpivKeys, master_key: &[u8; 32]) -> Vec<u8> {
+fn build_signed_header(keys: &DpivKeys, master_key: &[u8; FDE_MASTER_KEY_LEN]) -> Vec<u8> {
     use proto::{
-        FDE_MASTER_KEY_LEN, HEADER_FIXED_PREFIX, OFF_CIPHER_ID, OFF_FORMAT_GEN, OFF_HEADER_LEN,
+        HEADER_FIXED_PREFIX, OFF_CIPHER_ID, OFF_FORMAT_GEN, OFF_HEADER_LEN,
         OFF_KDF_ID, OFF_MAGIC, OFF_RESERVED_FLAGS, OFF_SLOT_COUNT, OFF_SLOT_TABLE,
         OFF_VOLUME_UUID, SIGNATURE_BYTES, SLOT_BYTES, SLOT_OFF_CLASS, SLOT_OFF_PRINCIPAL,
         SLOT_OFF_TYPE, SLOT_OFF_WRAPPED_KEY, SLOT_OFF_WRAPPED_LEN, SlotClass, SlotType,
@@ -395,8 +414,8 @@ fn main() {
     let dpiv = load_dpiv_bundle(&dpiv_path);
 
     let master_key = match &args.master_key_hex {
-        Some(hex) => parse_hex_32(hex),
-        None => random_32(),
+        Some(hex) => parse_hex_master(hex),
+        None => random_master(),
     };
 
     let header = build_signed_header(&dpiv, &master_key);

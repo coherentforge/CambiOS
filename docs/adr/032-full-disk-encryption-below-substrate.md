@@ -44,6 +44,8 @@ The XTS-AES-256 transform is length-preserving: a 4 KiB plaintext block encrypts
 
 One cipher, one mode, one key schedule to reason about. No runtime cipher selection at v1. Dell 3630 has AES-NI; QEMU x86_64 has AES support; aarch64 v8.2+ targets we support have ARMv8 Crypto Extensions; RISC-V boards without Zk* extensions get software-AES (slower but uniform).
 
+The master key is 64 bytes, the concatenated `K1 || K2` per NIST SP 800-38E. `K1 = master_key[..32]` is the data cipher key; `K2 = master_key[32..]` is the tweak cipher key. The format-volume tool generates 64 random bytes per volume; `EncryptedBlockDevice` keys directly from the unwrapped 64-byte buffer with no KDF derivation step. (See § Divergence 2026-05-20 for the interim 32-byte spec this replaces.)
+
 The volume header carries `cipher_id: u32` for future additivity — Adiantum or post-quantum block ciphers land as `cipher_id = 0x02` / `0x03` / etc. without changing any v1 byte layout. The cipher-selection-at-format-time path is **not** built in v1; one transform is one verification target.
 
 ### 3. Volume UUID = bootstrap AID at format time
@@ -96,19 +98,19 @@ The wrapped key for slot type 0x01 is a PIV-decrypt envelope holding the AES-256
 
 #### YubiKey slot (0x01) envelope byte layout
 
-The slot-0x01 `wrapped_key` field carries an 80-byte envelope:
+The slot-0x01 `wrapped_key` field carries a 112-byte envelope:
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 32 | `ephemeral_pk` | The formatter's ephemeral X25519 public key. |
-| 32 | 48 | `ciphertext` | `ChaCha20-Poly1305(symmetric_key, [0u8; 12], aad=empty, plaintext=master_key)` — 32 bytes of ciphertext followed by a 16-byte Poly1305 tag. |
+| 32 | 80 | `ciphertext` | `ChaCha20-Poly1305(symmetric_key, [0u8; 12], aad=empty, plaintext=master_key)` — 64 bytes of ciphertext followed by a 16-byte Poly1305 tag. The 64-byte master is the concatenated XTS-AES-256 key (`K1 \|\| K2`); see § 2. |
 
 `symmetric_key` is derived from the X25519 ECDH shared secret:
 
 ```
 shared_secret  = ECDH(formatter_ephemeral_sk, slot_9d_pk)        // 32 bytes
 symmetric_key  = blake3::derive_key(
-                     "cambios.org 2026-05-18 fde-master-key-wrap v1",
+                     "cambios.org 2026-05-20 fde-master-key-wrap v1",
                      shared_secret)                              // 32 bytes
 ```
 
@@ -118,8 +120,8 @@ The unwrap procedure (`fde-mount` boot module, stream A A-v.a):
 
 1. Read `ephemeral_pk = wrapped_key[..32]`.
 2. Call `piv_decrypt(slot=KeyManagement, ephemeral_pk)` → 32-byte `shared_secret` (the kernel-side ECDH performed by `SwPivBackend` or `CcidPivBackend` against the slot-9D X25519 private key).
-3. `symmetric_key = blake3::derive_key("cambios.org 2026-05-18 fde-master-key-wrap v1", &shared_secret)`.
-4. `master_key = ChaCha20-Poly1305-decrypt(symmetric_key, [0u8; 12], aad=empty, &wrapped_key[32..80])`.
+3. `symmetric_key = blake3::derive_key("cambios.org 2026-05-20 fde-master-key-wrap v1", &shared_secret)`.
+4. `master_key = ChaCha20-Poly1305-decrypt(symmetric_key, [0u8; 12], aad=empty, &wrapped_key[32..112])` → 64 bytes (`K1 \|\| K2` for XTS-AES-256).
 
 ChaCha20-Poly1305 (vs AES-256-GCM) is chosen for the wrap step specifically to avoid forcing AES code into userspace — `fde-mount` runs in ring 3 and only the kernel (XTS path at A-v.c) needs AES code. Pure-software ChaCha20-Poly1305 via the audited RustCrypto `chacha20poly1305` crate is well within `fde-mount`'s budget; the kernel's eventual AES path is unaffected.
 
@@ -331,3 +333,19 @@ When this ADR's implementation lands:
 > **Deferred decision.** Multi-YubiKey enrollment UX. v1 spec supports N-of-1 unlock with multiple live YubiKey slots; the *operational tooling* for enrolling additional keys (interactive prompts, key-presence verification, slot accounting) lands when the first multi-YubiKey workflow appears. **Revisit when:** a user (Jason) wants to enroll a backup YubiKey alongside the primary.
 
 > **Deferred decision.** YubiKey-rotation operational protocol. When the bootstrap YubiKey is replaced, the kernel binary needs to be rebuilt with the new pubkey baked in (Phase 1B per ADR-004). The transition (boot once with old kernel + old header signature → re-sign header with new YubiKey → rebuild kernel with new pubkey → reboot with new kernel + new header signature) needs an explicit operational sequence. **Revisit when:** the first bootstrap YubiKey rotation is needed in real life.
+
+## Divergence
+
+### 2026-05-20: Master key widened from 32 to 64 bytes
+
+**Prior wording** (committed at 7398c00, "adr-032: lock wrapped_key envelope format", stream A A-v.b.1 prep):
+
+> The slot-0x01 `wrapped_key` field carries an 80-byte envelope. ... ciphertext (48 bytes) = `ChaCha20-Poly1305(symm_key, ..., plaintext=master_key)` — 32 bytes of ciphertext followed by a 16-byte Poly1305 tag. ... `master_key = ChaCha20-Poly1305-decrypt(..., &wrapped_key[32..80])` (32 bytes). Symmetric-key derivation: `blake3::derive_key("cambios.org 2026-05-18 fde-master-key-wrap v1", &shared_secret)`.
+
+**Current wording** (this body, § 2 + § 4): envelope is 112 bytes; ciphertext is 80 bytes (64 plaintext + 16 Poly1305 tag); plaintext master is 64 bytes = `K1 || K2` for XTS-AES-256 keyed directly with no KDF derivation step. WRAP_KDF_CONTEXT date bumped to `2026-05-20` to mark the re-locked envelope spec.
+
+**Reason:** XTS-AES-256 per NIST SP 800-38E requires 64 bytes of keying (two distinct AES-256 keys). The interim 32-byte spec would have required a KDF derivation step (`blake3::derive_key("...xts-key v1", &master)`) at every mount to produce the 64-byte cipher key. That step had no security benefit — the entropy ceiling was the 32-byte master regardless — and added a non-standard derivation that every external review would have flagged. Widening the master directly is what every production FDE does (dm-crypt, FileVault, BitLocker), keeps the format auditor-familiar, and removes a constant-string drift hazard.
+
+**Constants moved in lockstep** (`cambios-fde-proto`): `FDE_MASTER_KEY_LEN: 32 → 64`, `WRAP_ENV_CIPHERTEXT_LEN: 48 → 80`, `WRAP_ENV_LEN: 80 → 112`. `WRAP_KDF_CONTEXT` date `2026-05-18 → 2026-05-20` (the derivation procedure itself is unchanged — same Blake3-derive of ECDH-shared into a 32-byte ChaCha20-Poly1305 key; the date marker tracks envelope-spec lock).
+
+**cipher_id = 0x01** is reused for the corrected shape. No formatted volumes exist in production at the time of this Divergence (pre-user); the interim spec has zero on-disk presence. Future cipher additions land at 0x02+.

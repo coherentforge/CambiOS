@@ -20,14 +20,14 @@
 //! 5. Walk the slot table via `cambios_fde_proto::parse_slot_table`
 //!    and `find_first_live_yubikey` (A-v.b).
 //! 6. Extract the envelope: `ephemeral_pk` at bytes 0..32,
-//!    ChaCha20-Poly1305 ciphertext at bytes 32..80 per ADR-032 § 4.
+//!    ChaCha20-Poly1305 ciphertext at bytes 32..112 per ADR-032 § 4.
 //! 7. Call `piv_decrypt(slot=KeyManagement, ephemeral_pk)` to get
 //!    the 32-byte X25519 ECDH shared secret.
 //! 8. Derive the symmetric ChaCha20-Poly1305 key via
 //!    `blake3::derive_key(WRAP_KDF_CONTEXT, shared_secret)`.
 //! 9. Decrypt the envelope ciphertext in-place under the symmetric
-//!    key with the fixed twelve-zero nonce. Plaintext is the 32-byte
-//!    AES-256 FDE master key.
+//!    key with the fixed twelve-zero nonce. Plaintext is the 64-byte
+//!    XTS-AES-256 FDE master key (K1 || K2 per NIST SP 800-38E).
 //! 10. **Stub install** — A-v.d will add `SYS_INSTALL_MASTER_KEY`;
 //!     until then this module logs success and exits. The master
 //!     key + shared secret + symmetric key are zeroized via
@@ -115,7 +115,7 @@ pub extern "C" fn _start() -> ! {
     match unlock_flow() {
         UnlockOutcome::Success => {
             sys::print(
-                b"[FDE-MOUNT] OK: master key derived (32 bytes); install stub awaits A-v.d\n",
+                b"[FDE-MOUNT] OK: master key derived (64 bytes); install stub awaits A-v.d\n",
             );
         }
         UnlockOutcome::NoPiv => {
@@ -216,7 +216,7 @@ fn unlock_flow() -> UnlockOutcome {
 
     // Step 9: ChaCha20-Poly1305 decrypt in-place.
     //
-    // The envelope's ciphertext field is 48 bytes = 32 ciphertext +
+    // The envelope's ciphertext field is 80 bytes = 64 ciphertext +
     // 16 Poly1305 tag. `decrypt_in_place_detached` takes
     // ciphertext and tag separately and writes plaintext over the
     // ciphertext buffer.
