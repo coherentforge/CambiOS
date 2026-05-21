@@ -11,4 +11,5 @@
 //! because A-iv's first-consumer flow needs it as a runtime test of
 //! the new SwPivBackend-produced signatures.
 
+pub mod aes_soft;
 pub mod header;
