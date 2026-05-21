@@ -12,4 +12,5 @@
 //! the new SwPivBackend-produced signatures.
 
 pub mod aes_soft;
+pub mod encrypted_device;
 pub mod header;
