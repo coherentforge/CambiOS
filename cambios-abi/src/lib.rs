@@ -780,6 +780,47 @@ pub enum SyscallNumber {
     /// signed `fde-mount` boot module. Same gating shape as
     /// `ClaimBootstrapKey` and `BindPrincipal`.
     ReadVolumeHeader = 74,
+
+    /// SYS_INSTALL_MASTER_KEY (75): hand the kernel the unwrapped
+    /// XTS-AES-256 FDE master key. The kernel uses it to construct
+    /// an `EncryptedBlockDevice<VirtioBlkDevice>`, builds a
+    /// `DiskObjectStore` on top of the encrypted wrapper, and
+    /// installs the result as the kernel's data-storage backend.
+    /// From this point forward, every substrate I/O on the disk
+    /// flows through XTS-AES-256. Stream A substage A-v.d per
+    /// [ADR-032 § Architecture](../../docs/adr/032-full-disk-encryption-below-substrate.md).
+    ///
+    /// Args: arg1 = user ptr to the 64-byte master key
+    ///              (`K1 || K2` per NIST SP 800-38E; the
+    ///              concatenated 32-byte AES-256 data key and
+    ///              32-byte AES-256 tweak key).
+    ///       arg2 = byte length (must equal
+    ///              `FDE_MASTER_KEY_LEN` = 64).
+    ///
+    /// Returns: 0 on success;
+    ///          `InvalidArg` if `arg2 != 64` or the user pointer
+    ///          is unreadable; `PermissionDenied` if the caller is
+    ///          not the bootstrap Principal or if the storage
+    ///          backend has already been installed (one-shot);
+    ///          `Enosys` if the virtio-blk kernel-cmd path can't
+    ///          handshake (no device, driver not running);
+    ///          `OutOfMemory` if `DiskObjectStore::open_or_format`
+    ///          fails to allocate kernel-side state.
+    ///
+    /// Identity-required: yes. Authority is bootstrap-Principal-
+    /// only — the master key is the load-bearing secret guarding
+    /// every block of persistent state; it must be tightly scoped
+    /// to the signed `fde-mount` boot module. Same gating shape as
+    /// `ClaimBootstrapKey`, `BindPrincipal`, `VerifyVolumeHeader`,
+    /// and `ReadVolumeHeader`.
+    ///
+    /// Idempotency: one-shot. After the first successful call, all
+    /// subsequent calls fail `PermissionDenied`. The kernel does not
+    /// expose a "rotate master key" path here — credential rotation
+    /// per [ADR-032 § 7](../../docs/adr/032-full-disk-encryption-below-substrate.md#7-rotation-operations)
+    /// rotates the *wrapped* envelope under the *same* master key
+    /// without re-installing.
+    InstallMasterKey = 75,
 }
 
 impl SyscallNumber {
@@ -827,7 +868,8 @@ impl SyscallNumber {
             Self::Stat | Self::Fsync |
             Self::AclGrant | Self::AclRevoke | Self::AclList |
             Self::VerifyVolumeHeader |
-            Self::ReadVolumeHeader
+            Self::ReadVolumeHeader |
+            Self::InstallMasterKey
         )
     }
 
@@ -910,6 +952,7 @@ impl SyscallNumber {
             72 => Some(Self::AclList),
             73 => Some(Self::VerifyVolumeHeader),
             74 => Some(Self::ReadVolumeHeader),
+            75 => Some(Self::InstallMasterKey),
             _ => None,
         }
     }
@@ -1625,6 +1668,7 @@ mod tests {
             SyscallNumber::AclList,
             SyscallNumber::VerifyVolumeHeader,
             SyscallNumber::ReadVolumeHeader,
+            SyscallNumber::InstallMasterKey,
         ];
 
         for &num in &all {
@@ -1660,8 +1704,9 @@ mod tests {
         // (50 Cambio, 51 Regalo, 52 Stream), ADR-029 POSIX file
         // syscalls (53..=72: FileOpen..AclList), and ADR-032 §
         // FDE-related syscalls (73 VerifyVolumeHeader, 74
-        // ReadVolumeHeader) round out the current high-water mark.
-        for i in 0..=74u64 {
+        // ReadVolumeHeader, 75 InstallMasterKey) round out the
+        // current high-water mark.
+        for i in 0..=75u64 {
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();

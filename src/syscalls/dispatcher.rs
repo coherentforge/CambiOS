@@ -315,6 +315,9 @@ impl SyscallDispatcher {
             SyscallNumber::ReadVolumeHeader => {
                 Self::handle_read_volume_header(args, &ctx)
             }
+            SyscallNumber::InstallMasterKey => {
+                Self::handle_install_master_key(args, &ctx)
+            }
         }
     }
 
@@ -3920,6 +3923,161 @@ impl SyscallDispatcher {
         _ctx: &SyscallContext,
     ) -> SyscallResult {
         Err(SyscallError::Enosys)
+    }
+
+    /// SYS_INSTALL_MASTER_KEY (75): receive the 64-byte XTS-AES-256
+    /// FDE master key from `fde-mount` and install the
+    /// `DiskObjectStore<EncryptedBlockDevice<VirtioBlkDevice>>` as
+    /// the kernel's persistent ObjectStore backend. Stream A
+    /// substage A-v.d per ADR-032 § Architecture.
+    ///
+    /// Args: arg1 = user ptr to master key (64 bytes);
+    ///       arg2 = byte length (must equal 64).
+    /// Returns: 0 on success.
+    ///
+    /// Authority: bootstrap-Principal-only. The master key
+    /// unlocks every block of persistent state; gating must be
+    /// as tight as `ClaimBootstrapKey` / `BindPrincipal`.
+    ///
+    /// Idempotency: one-shot. If `OBJECT_STORE` already holds a
+    /// `LazyDisk` variant, the call fails `PermissionDenied`. The
+    /// `Ram` initial-boot variant is upgraded; subsequent calls
+    /// after a successful install also fail.
+    ///
+    /// Lock ordering: acquires `OBJECT_STORE(10)` at the end to
+    /// install; `VirtioBlkDevice::ensure_handshake` and
+    /// `DiskObjectStore::open_or_format` both yield (IPC + page-
+    /// walk), so the lock is *not* held across either. Same
+    /// pattern as `lazy_disk::ensure_disk_store` had.
+    ///
+    /// Master key hygiene: copied once from userspace into a
+    /// kernel stack buffer; consumed by `EncryptedBlockDevice::new`
+    /// (which materializes the AES round-key schedules);
+    /// explicitly zeroed via `core::sync::atomic::compiler_fence`
+    /// + volatile write before the function returns. The plaintext
+    /// master never lives in any persistent kernel slot.
+    #[cfg(not(test))]
+    fn handle_install_master_key(
+        args: SyscallArgs,
+        ctx: &SyscallContext,
+    ) -> SyscallResult {
+        use crate::fs::crypto::encrypted_device::{
+            EncryptedBlockDevice, XTS_MASTER_KEY_LEN,
+        };
+        use crate::fs::disk::DiskObjectStore;
+        use crate::fs::virtio_blk_device::VirtioBlkDevice;
+
+        // Bootstrap-Principal-only — same gating shape as
+        // ClaimBootstrapKey / BindPrincipal / ReadVolumeHeader.
+        let caller = ctx
+            .caller_principal
+            .as_ref()
+            .ok_or(SyscallError::PermissionDenied)?;
+        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
+        if *caller != bootstrap {
+            return Err(SyscallError::PermissionDenied);
+        }
+
+        let master_ptr = args.arg1;
+        let master_len = args.arg_usize(2);
+        if master_len != XTS_MASTER_KEY_LEN {
+            return Err(SyscallError::InvalidArg);
+        }
+
+        // Idempotency check: refuse if a LazyDisk variant is
+        // already installed. Reading the OBJECT_STORE state under
+        // its lock; release before doing IPC work.
+        {
+            let guard = crate::OBJECT_STORE.lock();
+            if matches!(*guard, Some(crate::fs::ObjectStoreBackend::LazyDisk(_))) {
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
+
+        // Copy the master key from userspace into a kernel stack
+        // buffer via UserReadSlice (handles cr3-aware page-walk +
+        // length validation).
+        let mut master_key = [0u8; XTS_MASTER_KEY_LEN];
+        let slice = UserReadSlice::validate(ctx, master_ptr, XTS_MASTER_KEY_LEN)?;
+        slice.read_into(&mut master_key)?;
+
+        // Construct the inner virtio-blk device + handshake. No
+        // kernel locks held; the IPC dance yields.
+        let mut device = VirtioBlkDevice::new();
+        if device.ensure_handshake().is_err() {
+            Self::zeroize_master(&mut master_key);
+            return Err(SyscallError::Enosys);
+        }
+        let capacity = device.capacity_blocks_cached();
+
+        // Wrap inner in XTS-AES-256. After this line, the master
+        // key has been folded into the AES round-key schedules
+        // inside `cipher`; the original 64 bytes can be wiped.
+        let encrypted = EncryptedBlockDevice::new(device, &master_key);
+        Self::zeroize_master(&mut master_key);
+
+        // Build the substrate on top of the encrypted device.
+        // open_or_format may issue further virtio-blk reads; still
+        // no kernel locks held.
+        let store = match DiskObjectStore::open_or_format(encrypted, capacity) {
+            Ok(s) => s,
+            Err(_) => return Err(SyscallError::OutOfMemory),
+        };
+
+        // Install under OBJECT_STORE lock (fast — no IPC, no
+        // yield). The match arm catches a TOCTOU race where two
+        // installs could try to install concurrently; we already
+        // checked above but re-check here for safety.
+        {
+            let mut guard = crate::OBJECT_STORE.lock();
+            if matches!(*guard, Some(crate::fs::ObjectStoreBackend::LazyDisk(_))) {
+                return Err(SyscallError::PermissionDenied);
+            }
+            *guard = Some(crate::fs::ObjectStoreBackend::LazyDisk(
+                alloc::boxed::Box::new(store),
+            ));
+        }
+
+        // Flag the lazy-disk gate as ready so the legacy
+        // ensure_disk_store() call sites become unconditional
+        // fast-paths.
+        crate::fs::lazy_disk::mark_disk_store_installed();
+
+        Ok(0)
+    }
+
+    /// Test-mode stub for `handle_install_master_key`. The kernel-
+    /// side `crate::fs::virtio_blk_device` module is gated out of
+    /// host test builds (`#[cfg(not(test))]` on its declaration in
+    /// `src/fs/mod.rs`); returning `Enosys` matches the no-virtio-blk
+    /// behavior real callers see.
+    #[cfg(test)]
+    fn handle_install_master_key(
+        _args: SyscallArgs,
+        _ctx: &SyscallContext,
+    ) -> SyscallResult {
+        Err(SyscallError::Enosys)
+    }
+
+    /// Best-effort secure-zero of the master-key stack buffer.
+    /// Volatile writes prevent dead-store elimination; the compiler
+    /// fence forces the writes to happen-before any subsequent
+    /// memory operation. Standard CRYPTO-301 hygiene pattern for
+    /// kernels that don't carry the `zeroize` crate.
+    #[cfg(not(test))]
+    fn zeroize_master(buf: &mut [u8; 64]) {
+        for b in buf.iter_mut() {
+            // SAFETY: `b` is a unique mutable reference to a u8
+            // that we own (kernel stack), and we write a fixed
+            // valid value (0). The volatile attribute is the
+            // load-bearing property here — preventing the
+            // optimizer from eliding what looks like a dead store
+            // to a buffer about to go out of scope.
+            unsafe {
+                core::ptr::write_volatile(b as *mut u8, 0);
+            }
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 
     /// Drive a cluster's teardown — used by SYS_CLUSTER_REVOKE and by

@@ -426,10 +426,24 @@ pub enum ObjectStoreBackend {
     /// the kernel's lifetime.
     Ram(alloc::boxed::Box<ram::RamObjectStore>),
 
-    /// Disk-backed store fronted by the user-space virtio-blk driver. Swapped
-    /// in by `lazy_disk::ensure_disk_store` on first `SYS_OBJ_*` call.
+    /// Disk-backed store fronted by the user-space virtio-blk driver,
+    /// transparently encrypted under XTS-AES-256 via
+    /// [`crate::fs::crypto::encrypted_device::EncryptedBlockDevice`].
+    /// Swapped in by `SYS_INSTALL_MASTER_KEY` (ADR-032 § Architecture,
+    /// stream A A-v.d) — the master key is unwrapped by `fde-mount`,
+    /// handed to the kernel via the syscall, and the wrapper is
+    /// constructed at that point. From the moment this variant is
+    /// installed, every substrate I/O flows through XTS-AES-256.
     #[cfg(not(test))]
-    LazyDisk(alloc::boxed::Box<disk::DiskObjectStore<virtio_blk_device::VirtioBlkDevice>>),
+    LazyDisk(
+        alloc::boxed::Box<
+            disk::DiskObjectStore<
+                crate::fs::crypto::encrypted_device::EncryptedBlockDevice<
+                    virtio_blk_device::VirtioBlkDevice,
+                >,
+            >,
+        >,
+    ),
 }
 
 impl ObjectStore for ObjectStoreBackend {

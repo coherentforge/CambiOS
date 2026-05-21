@@ -1,81 +1,57 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Lazy-initialized disk-backed ObjectStore swap.
+//! Lazy disk-store gate — vestigial after ADR-032 stream A A-v.d.
 //!
-//! At boot, `OBJECT_STORE` holds a `RamObjectStore` (in-memory, fast, no IPC).
-//! On the first `SYS_OBJ_*` syscall, `ensure_disk_store()` is called **before**
-//! acquiring the `OBJECT_STORE` lock. It handshakes with the user-space
-//! virtio-blk driver over IPC (which yields the calling task), creates a
-//! `DiskObjectStore`, and swaps it in under the lock. Subsequent calls see
-//! the disk store and skip the handshake (atomic fast path).
+//! Pre-A-v.d, this module ran the virtio-blk handshake on the first
+//! `SYS_OBJ_*` syscall and swapped `OBJECT_STORE` from RAM to a
+//! disk-backed store. With FDE-by-default per [ADR-032
+//! § Architecture](../../../docs/adr/032-full-disk-encryption-below-substrate.md),
+//! that swap moved into `SYS_INSTALL_MASTER_KEY`'s handler — disk
+//! mount requires the master key, which has to come through that
+//! syscall, so the lazy trigger is no longer load-bearing.
 //!
-//! ## Why not hold OBJECT_STORE across the handshake?
+//! What stays:
 //!
-//! `VirtioBlkDevice::call` yields the calling task via `yield_save_and_switch`.
-//! Holding a `Spinlock` across a yield violates the spinlock contract — the
-//! scheduler may migrate the lock holder or allow another task to spin on the
-//! same lock indefinitely. In practice, holding `OBJECT_STORE` across the
-//! handshake caused a permanent stall: the calling task yielded inside the
-//! IPC poll loop, virtio-blk processed the message and replied, but the
-//! calling task was never re-scheduled because the spinlock interaction
-//! prevented the scheduler from picking it up correctly.
+//! - [`ensure_disk_store`] still exists so the five `SYS_OBJ_*`
+//!   call sites in [crate::syscalls::dispatcher] don't need to
+//!   change; calling it is now a cheap atomic fast-path check.
+//! - [`mark_disk_store_installed`] is called by
+//!   `handle_install_master_key` after it installs the
+//!   `LazyDisk` variant; flips the readiness flag so future
+//!   `ensure_disk_store` calls early-out.
 //!
-//! The fix: handshake first (no locks held), then install under lock (fast,
-//! no IPC, no yield).
+//! Without `SYS_INSTALL_MASTER_KEY`, `OBJECT_STORE` stays on its
+//! boot-initialized `Ram` variant indefinitely (degraded mode —
+//! objects exist but don't persist across reboots). This is the
+//! correct FDE-by-default posture: if no master key has been
+//! handed to the kernel, the kernel does **not** mount the raw
+//! disk unencrypted.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::fs::disk::DiskObjectStore;
-use crate::fs::virtio_blk_device::VirtioBlkDevice;
-
-/// Atomic flag: `true` once the disk store has been successfully installed
-/// in `OBJECT_STORE`. Fast-path check — avoids re-entering the handshake
-/// on every subsequent syscall.
+/// Atomic flag: `true` once `SYS_INSTALL_MASTER_KEY` has installed
+/// the disk-backed `LazyDisk` variant of `OBJECT_STORE`. Toggled
+/// only by [`mark_disk_store_installed`]; observed by
+/// [`ensure_disk_store`] as a cheap fast-path gate.
 static DISK_STORE_READY: AtomicBool = AtomicBool::new(false);
 
-/// Ensure the disk-backed `ObjectStore` is installed. Must be called
-/// **without** holding `OBJECT_STORE`. No-op after the first successful
-/// call (atomic fast path).
+/// Cheap fast-path: returns immediately if the disk store has been
+/// installed, or unconditionally if it hasn't (no work to do —
+/// kernel stays on RAM). The five `SYS_OBJ_*` dispatcher arms call
+/// this before acquiring `OBJECT_STORE`; pre-A-v.d the call did
+/// work, post-A-v.d it's a fence.
 ///
-/// On failure (driver not available, device error, format failure), the
-/// existing `RamObjectStore` remains — arcobj commands work but objects
-/// don't persist across reboots.
+/// Left in place rather than removed so the dispatcher call sites
+/// don't need to change in lockstep with this commit — they can
+/// be cleaned up at a future tidy pass once the FDE flow is
+/// fully landed.
 pub fn ensure_disk_store() {
-    if DISK_STORE_READY.load(Ordering::Acquire) {
-        return;
-    }
+    let _ = DISK_STORE_READY.load(Ordering::Acquire);
+}
 
-    // Step 1: handshake + open, no locks held. IPC yields are safe here.
-    let mut device = VirtioBlkDevice::new();
-    if device.ensure_handshake().is_err() {
-        // Driver not available (e.g., AArch64 with no virtio-blk device).
-        // Mark ready so we don't retry on every syscall.
-        DISK_STORE_READY.store(true, Ordering::Release);
-        crate::println!("  [ObjectStore] disk handshake failed, staying on RAM store");
-        return;
-    }
-
-    let capacity = device.capacity_blocks_cached();
-    let store = match DiskObjectStore::open_or_format(device, capacity) {
-        Ok(s) => s,
-        Err(e) => {
-            DISK_STORE_READY.store(true, Ordering::Release);
-            crate::println!("  [ObjectStore] disk open/format failed ({:?}), staying on RAM store", e);
-            return;
-        }
-    };
-
-    // Step 2: install under lock (fast — no IPC, no yield).
-    // Wraps the disk store in the `LazyDisk` variant of `ObjectStoreBackend`
-    // (enum-dispatch shim per ADR-003 § Divergence) — no `dyn` trait object.
-    {
-        let mut guard = crate::OBJECT_STORE.lock();
-        *guard = Some(crate::fs::ObjectStoreBackend::LazyDisk(
-            alloc::boxed::Box::new(store),
-        ));
-    }
-
+/// Flip the readiness flag. Called by `handle_install_master_key`
+/// after the `LazyDisk` variant is in place.
+pub fn mark_disk_store_installed() {
     DISK_STORE_READY.store(true, Ordering::Release);
-    crate::println!("  [ObjectStore] disk store active (capacity {} blocks)", capacity);
 }

@@ -416,6 +416,30 @@ pub fn read_volume_header(out: &mut [u8]) -> i64 {
     )
 }
 
+/// SYS_INSTALL_MASTER_KEY: hand the kernel the 64-byte XTS-AES-256
+/// FDE master key (`K1 || K2` per NIST SP 800-38E). The kernel
+/// constructs an `EncryptedBlockDevice<VirtioBlkDevice>`, builds a
+/// `DiskObjectStore` on top, and installs the result as the
+/// kernel's persistent ObjectStore backend. One-shot,
+/// bootstrap-Principal-only. Stream A substage A-v.d per ADR-032
+/// § Architecture.
+///
+/// Returns 0 on success; negative `SyscallError` on
+/// `InvalidArg` (key length not 64),
+/// `PermissionDenied` (caller is not the bootstrap Principal, or
+/// the backend was already installed),
+/// `Enosys` (virtio-blk handshake failed),
+/// `OutOfMemory` (DiskObjectStore::open_or_format allocation
+/// failure).
+pub fn install_master_key(master_key: &[u8; 64]) -> i64 {
+    syscall_raw3(
+        SyscallNumber::InstallMasterKey as u64,
+        master_key.as_ptr() as u64,
+        master_key.len() as u64,
+        0,
+    )
+}
+
 /// Claim the bootstrap secret key from the kernel (one-shot).
 /// Returns 64 on success, negative error on failure.
 pub fn claim_bootstrap_key(out_sk: &mut [u8; 64]) -> i64 {
