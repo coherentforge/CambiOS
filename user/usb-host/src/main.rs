@@ -1,34 +1,43 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! CambiOS USB Host Driver — Stream B, substage B-i.
+//! CambiOS USB Host Driver — Stream B, substages B-i + B-ii.
 //!
-//! Userspace xHCI bring-up skeleton. Discovers an xHCI controller via the
-//! `DeviceInfo` syscall (PCI class=0x0C, subclass=0x03, prog_if=0x30), maps
-//! its MMIO BAR, parses the capability register block per xHCI 1.2 § 5.3,
-//! logs the result, and idles on endpoint 31.
+//! Userspace xHCI bring-up. Discovers an xHCI controller via the
+//! `DeviceInfo` syscall (PCI class=0x0C, subclass=0x03, prog_if=0x30),
+//! maps its MMIO BAR, parses the capability register block per xHCI
+//! 1.2 § 5.3, resets the controller, sets up the Device Context Base
+//! Address Array + command ring + event ring + ERST, starts the
+//! controller, and idles on endpoint 31.
 //!
-//! ## Scope — B-i
+//! ## Scope — B-ii
 //!
-//! Capability discovery only. The crate does NOT yet touch operational
-//! registers (HCRESET / Run-Stop), command/event rings, or any port.
-//! Those land in B-ii.
+//! End state: the controller is running (USBSTS.HCH=0), command and
+//! event rings are live in DMA-allocated pages, DCBAA is installed,
+//! CONFIG.MaxSlotsEn is set, and interrupter 0's ERST + ERDP are
+//! programmed. B-iii layers on top:
+//!   - Port enumeration (walk PORTSC, detect CCS, drive port reset)
+//!   - Slot enable / Address Device command issuance
+//!   - GET_DESCRIPTOR control transfer
 //!
 //! On platforms where no xHCI controller is discovered (e.g. aarch64 /
 //! riscv64 QEMU without `-device qemu-xhci`), the driver logs a single
-//! line and idles cleanly so the boot gate still releases the next module.
+//! line and idles cleanly so the boot gate still releases the next
+//! module.
 //!
 //! ## IPC protocol
 //!
-//! Endpoint 31 is registered but accepts no commands at B-i. Incoming
-//! messages are read and dropped (B-i validation does not exercise IPC).
-//! Command surface lands at B-iii / B-v as the stack grows.
+//! Endpoint 31 is registered but accepts no commands yet. Incoming
+//! messages are read and dropped. Command surface lands at B-iii /
+//! B-v as the stack grows.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
 
 mod pci;
+#[allow(unsafe_code)]
+mod ring;
 #[allow(unsafe_code)]
 mod xhci;
 
@@ -151,12 +160,46 @@ pub extern "C" fn _start() -> ! {
     log_hex64(b"[USB-HOST]   DBOFF      = ", caps.doorbell_offset as u64);
     log_hex64(b"[USB-HOST]   RTSOFF     = ", caps.runtime_offset as u64);
 
-    // Step 6: register IPC endpoint and release boot gate.
+    // Step 6 (B-ii): HCRESET → CONFIG → DCBAA → command ring →
+    // event ring → ERST → RUN. Either the full sequence succeeds and
+    // we land at HCH=0 with rings live, or we log the failure mode
+    // and idle. Idle-on-fail keeps the boot gate happy so downstream
+    // modules still load.
+    match xhci::XhciController::bring_up(mmio_vaddr, caps) {
+        Ok(ctl) => {
+            sys::print(b"[USB-HOST] controller bring-up OK\n");
+            log_hex64(b"[USB-HOST]   DCBAA paddr      = ", ctl.dcbaa_paddr);
+            log_hex64(b"[USB-HOST]   command ring     = ", ctl.command_ring.paddr);
+            log_hex64(b"[USB-HOST]   event ring       = ", ctl.event_ring.paddr);
+            log_hex64(b"[USB-HOST]   ERST paddr       = ", ctl.erst.paddr);
+            log_hex64(b"[USB-HOST]   USBSTS post-RUN  = ", ctl.read_usbsts() as u64);
+        }
+        Err(e) => {
+            log_bringup_error(e);
+        }
+    }
+
+    // Step 7: register IPC endpoint and release boot gate.
     sys::register_endpoint(USB_HOST_ENDPOINT);
     sys::print(b"[USB-HOST] ready on endpoint 31\n");
     sys::module_ready();
 
     idle_loop();
+}
+
+fn log_bringup_error(e: xhci::XhciError) {
+    match e {
+        xhci::XhciError::HaltTimeout =>
+            sys::print(b"[USB-HOST] ERROR: HCH never set; controller did not halt\n"),
+        xhci::XhciError::ResetTimeout =>
+            sys::print(b"[USB-HOST] ERROR: HCRST never cleared; controller did not reset\n"),
+        xhci::XhciError::NotReadyTimeout =>
+            sys::print(b"[USB-HOST] ERROR: CNR never cleared; controller stayed not-ready\n"),
+        xhci::XhciError::RunTimeout =>
+            sys::print(b"[USB-HOST] ERROR: HCH never cleared after RUN; controller did not start\n"),
+        xhci::XhciError::DmaAllocFailed =>
+            sys::print(b"[USB-HOST] ERROR: alloc_dma failed during ring setup\n"),
+    }
 }
 
 fn idle_loop() -> ! {
