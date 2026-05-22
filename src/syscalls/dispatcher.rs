@@ -3963,11 +3963,19 @@ impl SyscallDispatcher {
         args: SyscallArgs,
         ctx: &SyscallContext,
     ) -> SyscallResult {
+        use crate::fs::block::{BlockDevice, OffsetBlockDevice, BLOCK_SIZE};
         use crate::fs::crypto::encrypted_device::{
             EncryptedBlockDevice, XTS_MASTER_KEY_LEN,
         };
         use crate::fs::disk::DiskObjectStore;
         use crate::fs::virtio_blk_device::VirtioBlkDevice;
+
+        /// HARDWARE: ADR-032 § 4 reserves LBA 0..=3 (16 KiB) on the
+        /// raw disk for the unencrypted, signed volume header. The
+        /// substrate lives at LBA 4 and above; `OffsetBlockDevice`
+        /// applies that shift so the substrate's `SUPERBLOCK_LBA = 0`
+        /// addresses raw LBA 4, never aliasing the header.
+        const FDE_SUBSTRATE_LBA_OFFSET: u64 = 4;
 
         // Bootstrap-Principal-only — same gating shape as
         // ClaimBootstrapKey / BindPrincipal / ReadVolumeHeader.
@@ -4010,20 +4018,53 @@ impl SyscallDispatcher {
             Self::zeroize_master(&mut master_key);
             return Err(SyscallError::Enosys);
         }
-        let capacity = device.capacity_blocks_cached();
 
-        // Wrap inner in XTS-AES-256. After this line, the master
-        // key has been folded into the AES round-key schedules
-        // inside `cipher`; the original 64 bytes can be wiped.
-        let encrypted = EncryptedBlockDevice::new(device, &master_key);
+        // Peek raw bytes at the substrate's data offset *before*
+        // wrapping with the encrypted layer. ADR-032 § Architecture
+        // stream A A-v.d.4: distinguishes "fresh-wrap, never
+        // substrate-formatted" (zeros at raw FDE_SUBSTRATE_LBA_OFFSET)
+        // from "previously substrate-formatted" (encrypted data
+        // present). The wrong-master case is handled below by
+        // `open_strict`'s loud refusal on Corrupt classify.
+        let mut sb_raw = [0u8; BLOCK_SIZE];
+        if device
+            .read_block(FDE_SUBSTRATE_LBA_OFFSET, &mut sb_raw)
+            .is_err()
+        {
+            Self::zeroize_master(&mut master_key);
+            return Err(SyscallError::Enosys);
+        }
+        let is_fresh_wrap = sb_raw.iter().all(|&b| b == 0);
+
+        // Wrap inner: OffsetBlockDevice shifts past the volume
+        // header reserved region, then EncryptedBlockDevice
+        // encrypts the substrate's view. After this line, the
+        // master key has been folded into the AES round-key
+        // schedules inside `cipher`; the original 64 bytes can
+        // be wiped.
+        let offset_dev = OffsetBlockDevice::new(device, FDE_SUBSTRATE_LBA_OFFSET);
+        let substrate_capacity = offset_dev.capacity_blocks();
+        let encrypted = EncryptedBlockDevice::new(offset_dev, &master_key);
         Self::zeroize_master(&mut master_key);
 
         // Build the substrate on top of the encrypted device.
-        // open_or_format may issue further virtio-blk reads; still
-        // no kernel locks held.
-        let store = match DiskObjectStore::open_or_format(encrypted, capacity) {
-            Ok(s) => s,
-            Err(_) => return Err(SyscallError::OutOfMemory),
+        // Fresh-wrap → format(). Previously-formatted → open_strict()
+        // which mounts on Valid superblock and refuses loudly on
+        // Corrupt (= wrong master attempt). Either path may issue
+        // further virtio-blk reads/writes; no kernel locks held.
+        let store = if is_fresh_wrap {
+            match DiskObjectStore::format_with_auto_geometry(encrypted, substrate_capacity) {
+                Ok(s) => s,
+                Err(_) => return Err(SyscallError::OutOfMemory),
+            }
+        } else {
+            match DiskObjectStore::open_strict(encrypted) {
+                Ok(s) => s,
+                // Corrupt classify on a non-fresh wrap = wrong master
+                // (or genuinely corrupt persistent data). Either way,
+                // refuse loudly rather than silently overwrite.
+                Err(_) => return Err(SyscallError::PermissionDenied),
+            }
         };
 
         // Install under OBJECT_STORE lock (fast — no IPC, no

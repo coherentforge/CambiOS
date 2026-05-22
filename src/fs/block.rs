@@ -102,6 +102,68 @@ pub trait BlockDevice: Send {
 }
 
 // ============================================================================
+// OffsetBlockDevice — logical-to-physical LBA shift wrapper
+// ============================================================================
+
+/// Wraps any `BlockDevice` and shifts every LBA by a fixed offset, so
+/// substrates that want to skip a reserved prefix of the underlying
+/// device can address from logical LBA 0 onward.
+///
+/// Used by the FDE path: the substrate sits on top of
+/// `EncryptedBlockDevice<OffsetBlockDevice<VirtioBlkDevice>>` with
+/// `offset = 4`, hiding LBA 0..=3 (the volume header per ADR-032 § 4)
+/// from substrate reads/writes. Without this shim, the substrate's
+/// `SUPERBLOCK_LBA = 0` would alias the volume header.
+///
+/// Lock ordering: none. Forwards every call to inner with the LBA
+/// adjusted. Capacity reports `inner.capacity_blocks() - offset`
+/// (saturating to 0 if the inner device is smaller than the offset).
+pub struct OffsetBlockDevice<B: BlockDevice> {
+    inner: B,
+    offset: u64,
+}
+
+impl<B: BlockDevice> OffsetBlockDevice<B> {
+    /// Construct a new offset wrapper. `offset` is the number of inner
+    /// blocks to skip; logical LBA 0 maps to inner LBA `offset`.
+    pub fn new(inner: B, offset: u64) -> Self {
+        Self { inner, offset }
+    }
+
+    /// Borrow the underlying device. Useful for diagnostic reads of
+    /// the reserved prefix (e.g., the FDE path peeks raw bytes at
+    /// inner LBA `offset` to detect a fresh-wrap volume).
+    pub fn inner(&self) -> &B {
+        &self.inner
+    }
+
+    /// The offset this wrapper applies, in inner-LBA units.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
+impl<B: BlockDevice> BlockDevice for OffsetBlockDevice<B> {
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks().saturating_sub(self.offset)
+    }
+
+    fn read_block(&mut self, lba: u64, buf: &mut Block) -> Result<(), BlockError> {
+        let phys = lba.checked_add(self.offset).ok_or(BlockError::OutOfBounds)?;
+        self.inner.read_block(phys, buf)
+    }
+
+    fn write_block(&mut self, lba: u64, buf: &Block) -> Result<(), BlockError> {
+        let phys = lba.checked_add(self.offset).ok_or(BlockError::OutOfBounds)?;
+        self.inner.write_block(phys, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        self.inner.flush()
+    }
+}
+
+// ============================================================================
 // MemBlockDevice — in-RAM backend for unit tests and bring-up
 // ============================================================================
 
@@ -297,5 +359,87 @@ mod tests {
         assert_eq!(format!("{}", BlockError::OutOfBounds), "LBA out of bounds");
         assert_eq!(format!("{}", BlockError::DeviceError), "block device error");
         assert_eq!(format!("{}", BlockError::NotReady), "block device not ready");
+    }
+
+    // --- OffsetBlockDevice ---
+
+    #[test]
+    fn offset_device_logical_to_physical_mapping() {
+        // Inner has 10 blocks; offset 3 → wrapper exposes 7 logical
+        // blocks (logical 0..=6 → inner 3..=9). Write to logical 0
+        // should land at inner 3.
+        let inner = MemBlockDevice::new(10);
+        let mut dev = OffsetBlockDevice::new(inner, 3);
+
+        let pattern = [0xa5u8; BLOCK_SIZE];
+        dev.write_block(0, &pattern).unwrap();
+
+        let mut read = [0u8; BLOCK_SIZE];
+        // Read through wrapper at logical 0 → should see the pattern.
+        dev.read_block(0, &mut read).unwrap();
+        assert_eq!(read, pattern);
+
+        // Inner LBA 3 should match the pattern; inner LBA 0..=2 stays zero.
+        let mut raw = [0u8; BLOCK_SIZE];
+        dev.inner_mut_for_test().read_block(3, &mut raw).unwrap();
+        assert_eq!(raw, pattern);
+        dev.inner_mut_for_test().read_block(0, &mut raw).unwrap();
+        assert!(raw.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn offset_device_capacity_reflects_offset() {
+        let inner = MemBlockDevice::new(10);
+        let dev = OffsetBlockDevice::new(inner, 3);
+        assert_eq!(dev.capacity_blocks(), 7);
+
+        let inner_smaller = MemBlockDevice::new(2);
+        let dev_smaller = OffsetBlockDevice::new(inner_smaller, 3);
+        assert_eq!(dev_smaller.capacity_blocks(), 0, "saturating sub when inner < offset");
+    }
+
+    #[test]
+    fn offset_device_out_of_bounds() {
+        let inner = MemBlockDevice::new(10);
+        let mut dev = OffsetBlockDevice::new(inner, 3);
+
+        let mut buf = [0u8; BLOCK_SIZE];
+        // logical 7 → inner 10 → out of bounds (capacity is 10, valid 0..=9).
+        assert_eq!(dev.read_block(7, &mut buf), Err(BlockError::OutOfBounds));
+        assert_eq!(dev.write_block(7, &buf), Err(BlockError::OutOfBounds));
+
+        // logical u64::MAX + offset overflows → checked_add returns None → OutOfBounds.
+        assert_eq!(dev.read_block(u64::MAX, &mut buf), Err(BlockError::OutOfBounds));
+    }
+
+    #[test]
+    fn offset_device_zero_offset_is_transparent() {
+        let inner = MemBlockDevice::new(4);
+        let mut dev = OffsetBlockDevice::new(inner, 0);
+
+        assert_eq!(dev.capacity_blocks(), 4);
+        let pattern = [0x5au8; BLOCK_SIZE];
+        dev.write_block(2, &pattern).unwrap();
+        let mut read = [0u8; BLOCK_SIZE];
+        dev.read_block(2, &mut read).unwrap();
+        assert_eq!(read, pattern);
+    }
+
+    #[test]
+    fn offset_device_inner_and_offset_accessors() {
+        let inner = MemBlockDevice::new(8);
+        let dev = OffsetBlockDevice::new(inner, 4);
+        assert_eq!(dev.offset(), 4);
+        assert_eq!(dev.inner().capacity_blocks(), 8);
+    }
+}
+
+#[cfg(test)]
+impl<B: BlockDevice> OffsetBlockDevice<B> {
+    /// Mutable inner access for tests only. The non-test API
+    /// intentionally exposes only `&inner` to keep the offset
+    /// abstraction load-bearing.
+    fn inner_mut_for_test(&mut self) -> &mut B {
+        &mut self.inner
     }
 }

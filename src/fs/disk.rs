@@ -1009,6 +1009,58 @@ impl<B: BlockDevice> DiskObjectStore<B> {
         }
     }
 
+    /// Strict-mount: read the superblock and mount if Valid; refuse
+    /// for any other state (Blank, Corrupt, UnknownVersion). Unlike
+    /// [`open_or_format`], this never silently formats — it's the
+    /// "I know this device is supposed to have valid substrate
+    /// state; if it doesn't, fail loud" variant.
+    ///
+    /// The FDE first-mount path uses this: after [`OffsetBlockDevice`]
+    /// + [`crate::fs::crypto::encrypted_device::EncryptedBlockDevice`]
+    /// wrapping, the kernel checks the underlying disk's raw bytes
+    /// at the substrate's data offset *before* wrapping. If those
+    /// bytes are all zero, the volume is fresh-wrapped (never
+    /// substrate-formatted) and the kernel calls [`format`]. If
+    /// they're non-zero, the volume *has* been formatted previously
+    /// — calling [`open_strict`] then distinguishes "valid +
+    /// correct master" (Valid → mount) from "valid + wrong master"
+    /// (decrypted bytes are Corrupt → refuse loudly, not silently
+    /// overwrite the user's data). ADR-032 § Architecture stream A
+    /// A-v.d.4.
+    pub fn open_strict(mut device: B) -> Result<Self, StoreError> {
+        let mut sb_buf = [0u8; BLOCK_SIZE];
+        device
+            .read_block(SUPERBLOCK_LBA, &mut sb_buf)
+            .map_err(block_err_to_store)?;
+        match classify_superblock(&sb_buf) {
+            SuperblockState::Valid(sb) => Self::mount(device, sb),
+            SuperblockState::Blank
+            | SuperblockState::UnknownVersion(_)
+            | SuperblockState::Corrupt => Err(StoreError::InvalidObject),
+        }
+    }
+
+    /// Format with auto-sized geometry derived from the device's
+    /// capacity. Convenience wrapper around [`format`] for callers
+    /// that don't want to compute slot / data-block counts manually.
+    /// Used by the FDE install path when the underlying volume is
+    /// detected as fresh-wrap (zeros at the substrate's data
+    /// offset). `desired_capacity_slots` is clamped to fit.
+    pub fn format_with_auto_geometry(
+        device: B,
+        desired_capacity_slots: u64,
+    ) -> Result<Self, StoreError> {
+        let dev_blocks = device.capacity_blocks();
+        let geometry = pick_format_geometry(dev_blocks, desired_capacity_slots)?;
+        Self::format(
+            device,
+            geometry.capacity_slots,
+            geometry.capacity_data_blocks,
+            0,
+            false,
+        )
+    }
+
     /// Format the device as a fresh v2 disk. Existing data is discarded.
     ///
     /// `desired_capacity_slots` and `desired_capacity_data_blocks` are

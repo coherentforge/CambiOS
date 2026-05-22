@@ -428,18 +428,20 @@ pub enum ObjectStoreBackend {
 
     /// Disk-backed store fronted by the user-space virtio-blk driver,
     /// transparently encrypted under XTS-AES-256 via
-    /// [`crate::fs::crypto::encrypted_device::EncryptedBlockDevice`].
-    /// Swapped in by `SYS_INSTALL_MASTER_KEY` (ADR-032 § Architecture,
-    /// stream A A-v.d) — the master key is unwrapped by `fde-mount`,
-    /// handed to the kernel via the syscall, and the wrapper is
-    /// constructed at that point. From the moment this variant is
-    /// installed, every substrate I/O flows through XTS-AES-256.
+    /// [`crate::fs::crypto::encrypted_device::EncryptedBlockDevice`],
+    /// and offset by 4 blocks to skip the ADR-032 § 4 volume-header
+    /// reserved extent (LBA 0..=3 on the raw disk). Swapped in by
+    /// `SYS_INSTALL_MASTER_KEY` (stream A A-v.d) — the master key is
+    /// unwrapped by `fde-mount`, handed to the kernel via the
+    /// syscall, and the wrapper stack is constructed at that point.
+    /// From the moment this variant is installed, every substrate
+    /// I/O flows through XTS-AES-256 over the post-header region.
     #[cfg(not(test))]
     LazyDisk(
         alloc::boxed::Box<
             disk::DiskObjectStore<
                 crate::fs::crypto::encrypted_device::EncryptedBlockDevice<
-                    virtio_blk_device::VirtioBlkDevice,
+                    block::OffsetBlockDevice<virtio_blk_device::VirtioBlkDevice>,
                 >,
             >,
         >,
