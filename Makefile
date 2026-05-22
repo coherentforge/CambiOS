@@ -159,16 +159,46 @@ BOOTSTRAP_SEED_HEX := 4172634f532d426f6f7473747261702d4964656e746974792d50686173
 # Resolve sign-elf flags based on signing mode
 ifeq ($(SIGN_MODE),seed)
   SIGN_FLAGS := --seed $(BOOTSTRAP_SEED_HEX)
+else ifeq ($(SIGN_MODE),dev-piv)
+  # Sign ELFs with the dev-PIV slot-9C Ed25519 seed (matches the
+  # bootstrap pubkey baked into a kernel built with `--features
+  # dev-piv`). Requires `make gen-dev-piv-keys` to have produced
+  # dev_slot_9c_seed.bin. NOTE: this is the *derived* slot-9C
+  # seed (blake3(.dev-seed.bin || "cambios-dev-piv:slot-9c-
+  # ed25519")), not .dev-seed.bin itself — the bootstrap pubkey
+  # under `--features dev-piv` is the slot-9C public key, so
+  # sign-elf needs the slot-9C secret to produce signatures the
+  # kernel accepts.
+  DEV_PIV_SEED_HEX := $(shell xxd -p -c 32 dev_slot_9c_seed.bin)
+  SIGN_FLAGS := --seed $(DEV_PIV_SEED_HEX)
 else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-adrs check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
 kernel:
 	cargo build --target x86_64-unknown-none --release
+
+# Kernel built with `--features dev-piv` — replaces the committed
+# bootstrap pubkey with the per-developer dev one from
+# tools/gen-dev-piv-keys/.dev-seed.bin. Used end-to-end by
+# `run-dev-piv` for the stream A FDE unlock smoke test.
+kernel-dev-piv:
+	cargo build --target x86_64-unknown-none --release --features dev-piv
+
+# Key-store-service built with `--features dev-piv` — loads
+# SwPivBackend with the slot-9C/9D keys from
+# user/key-store-service/dev_piv_secret.bin so the kernel's PIV
+# IPC clients can talk to a virtual YubiKey without real hardware.
+key-store-service-dev-piv:
+	@echo "=== Building Key Store service (--features dev-piv) ==="
+	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release --features dev-piv
+	@echo "=== Key Store service ready (dev-piv) ==="
 
 user-elf:
 	@echo "=== Building user-space ELF ==="
@@ -703,6 +733,15 @@ $(LIMINE_DIR)/limine: $(LIMINE_DIR)/BOOTX64.EFI
 
 limine: $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine
 
+# `iso-dev-piv` produces the same ISO as `iso`, but with the kernel
+# and key-store-service binaries built under `--features dev-piv`
+# (stream A FDE end-to-end). Approach: build the dev-piv variants
+# first, then re-invoke `iso` with `--assume-old` so make doesn't
+# clobber them with the default (non-dev-piv) cargo build.
+iso-dev-piv: kernel-dev-piv key-store-service-dev-piv gen-dev-piv-keys format-volume fde-mount sign-tool
+	@echo "=== Re-assembling ISO with --features dev-piv binaries ==="
+	$(MAKE) --assume-old=kernel --assume-old=key-store-service SIGN_MODE=dev-piv iso
+
 iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input usb-host shell policy-service fb-demo compositor scanout-virtio-gpu tree worm ping sprouty terminal-window audit-tail fde-mount sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
@@ -821,6 +860,35 @@ run: iso disk-img
 # override for pre-shell testing:  make run-quiet SUCCESS="virtio-net ready"
 # Keep this QEMU command in sync with `run:` above.
 run-quiet: iso disk-img
+	python3 tools/qemu-run-quiet.py \
+		$(if $(TIMEOUT),--timeout $(TIMEOUT),) \
+		$(if $(SUCCESS),--success "$(SUCCESS)",) \
+		-- qemu-system-x86_64 \
+			-cdrom $(ISO) \
+			-serial mon:stdio \
+			-smp 2 \
+			-m 4G \
+			-netdev user,id=net0 \
+			-device virtio-net-pci,netdev=net0 \
+			-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
+			-device virtio-blk-pci,drive=cambios-disk0 \
+			-device qemu-xhci,id=xhci0 \
+			-device usb-ccid,bus=xhci0.0 \
+			-vga virtio \
+			-no-reboot
+
+# Quiet run under `--features dev-piv` — the stream A FDE end-to-end
+# smoke test. Formats the disk image with a fresh signed volume
+# header (idempotent under a constant master via --master-key-hex
+# would be possible, but the default random master is what matches
+# production semantics). Boots; fde-mount unwraps the master key
+# via SwPivBackend; SYS_INSTALL_MASTER_KEY installs
+# EncryptedBlockDevice<VirtioBlkDevice> as OBJECT_STORE; substrate
+# now lives on XTS-AES-256. Success sentinel default
+# `cambios> ` indicates the boot reached the shell.
+run-quiet-dev-piv: iso-dev-piv disk-img
+	@echo "=== Formatting cambios-disk.img with fresh signed FDE header ==="
+	$(FORMAT_VOLUME) $(DISK_IMG)
 	python3 tools/qemu-run-quiet.py \
 		$(if $(TIMEOUT),--timeout $(TIMEOUT),) \
 		$(if $(SUCCESS),--success "$(SUCCESS)",) \

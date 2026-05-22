@@ -28,10 +28,17 @@
 //! 9. Decrypt the envelope ciphertext in-place under the symmetric
 //!    key with the fixed twelve-zero nonce. Plaintext is the 64-byte
 //!    XTS-AES-256 FDE master key (K1 || K2 per NIST SP 800-38E).
-//! 10. **Stub install** — A-v.d will add `SYS_INSTALL_MASTER_KEY`;
-//!     until then this module logs success and exits. The master
-//!     key + shared secret + symmetric key are zeroized via
-//!     `zeroize` before the function returns.
+//! 10. **Install** — `sys::install_master_key(&plaintext)` hands
+//!     the 64 bytes to the kernel. The kernel constructs
+//!     `EncryptedBlockDevice<VirtioBlkDevice>` wrapping the master,
+//!     builds a `DiskObjectStore` on top, and installs it as
+//!     `OBJECT_STORE`'s `LazyDisk` variant. From that point every
+//!     substrate I/O on the disk is XTS-AES-256-encrypted. Stream A
+//!     A-v.d.1 landed the syscall + kernel-side mount; this module
+//!     is the userspace half.
+//! 11. The master key + shared secret + symmetric key are zeroized
+//!     via `zeroize` before the function returns; the kernel
+//!     retains only the AES round-key schedules inside the wrapper.
 //!
 //! Recovery slots (Argon2id, slot_type=0x02) and the recovery boot
 //! path are out of scope — recovery is a future ADR per the in-
@@ -89,8 +96,10 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // ============================================================================
 
 enum UnlockOutcome {
-    /// Master key derived; stub install printed; A-v.d will replace
-    /// the stub with `SYS_INSTALL_MASTER_KEY`.
+    /// Master key derived and installed via `sys::install_master_key`;
+    /// kernel-side `OBJECT_STORE` is now backed by
+    /// `EncryptedBlockDevice<VirtioBlkDevice>` per ADR-032 §
+    /// Architecture.
     Success,
     /// PIV backend reported `NotPresent`. Default-build kernel +
     /// key-store-service produce this; rebuild both with
@@ -115,7 +124,7 @@ pub extern "C" fn _start() -> ! {
     match unlock_flow() {
         UnlockOutcome::Success => {
             sys::print(
-                b"[FDE-MOUNT] OK: master key derived (64 bytes); install stub awaits A-v.d\n",
+                b"[FDE-MOUNT] OK: master key installed; substrate now mounted on XTS-AES-256\n",
             );
         }
         UnlockOutcome::NoPiv => {
@@ -143,7 +152,7 @@ fn unlock_flow() -> UnlockOutcome {
     // Step 1: PIV health probe.
     let health = match sys::keystore::piv_health(FDE_MOUNT_ENDPOINT) {
         Ok(h) => h,
-        Err(_) => return UnlockOutcome::Failure(b"piv_health (IPC)", -1),
+        Err(e) => return UnlockOutcome::Failure(b"piv_health", piv_error_code(e)),
     };
     if matches!(health, PivHealthState::NotPresent) {
         return UnlockOutcome::NoPiv;
@@ -237,16 +246,23 @@ fn unlock_flow() -> UnlockOutcome {
         return UnlockOutcome::Failure(b"chacha20-poly1305 decrypt", -1);
     }
 
-    // Step 10: Stub install.
-    //
-    // A-v.d will replace this with `SYS_INSTALL_MASTER_KEY(plaintext,
-    // header_bytes)` — the kernel will accept the master key only
-    // after re-verifying the header signature and confirming
-    // verify-by-decryption against a known LBA. Until A-v.d lands,
-    // we print success and exit.
-    let _master_key_len = plaintext.len(); // touched so zeroize isn't DCE'd
+    // Step 10: Install. Hand the master key to the kernel; from
+    // this point the kernel constructs
+    // `EncryptedBlockDevice<VirtioBlkDevice>` + DiskObjectStore on
+    // top and installs `OBJECT_STORE = LazyDisk(...)`. Every
+    // subsequent SYS_OBJ_* / substrate I/O on the disk flows
+    // through XTS-AES-256. Stream A A-v.d.1 landed the syscall
+    // and the kernel-side plumbing.
+    let install_rc = sys::install_master_key(&plaintext);
+    if install_rc != 0 {
+        shared.zeroize();
+        symm_key.zeroize();
+        plaintext.zeroize();
+        return UnlockOutcome::Failure(b"install_master_key", install_rc);
+    }
 
-    // Step 11: Key hygiene.
+    // Step 11: Key hygiene. The kernel has folded the master into
+    // its AES round-key schedules; userspace's copy is dead weight.
     shared.zeroize();
     symm_key.zeroize();
     plaintext.zeroize();

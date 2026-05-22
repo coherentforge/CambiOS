@@ -59,6 +59,15 @@ const DEV_BOOTSTRAP_PUBKEY_FILE: &str = "dev_bootstrap_pubkey.bin";
 const DEV_PIV_SECRET_FILE: &str = "dev_piv_secret.bin";
 const KEY_STORE_SERVICE_DIR: &str = "user/key-store-service";
 
+/// 32-byte raw Ed25519 seed for slot 9C — written alongside the
+/// other outputs so `sign-elf --seed <hex>` (and any future ELF-
+/// signing path) can sign with the same private key that the
+/// kernel under `--features dev-piv` expects signatures *from*.
+/// The seed is `blake3(.dev-seed.bin || SLOT_9C_LABEL)` — derived
+/// here for once at generation time so consumers don't have to
+/// duplicate the derivation. Gitignored alongside the secret.
+const DEV_SLOT_9C_SEED_FILE: &str = "dev_slot_9c_seed.bin";
+
 // CKEY v1 constants (must match tools/sign-elf and src/microkernel/main.rs).
 const CKEY_MAGIC: &[u8; 4] = b"CKEY";
 const CKEY_VERSION_V1: u8 = 1;
@@ -152,6 +161,13 @@ struct DevKeys {
     ed25519_pk: [u8; 32],
     x25519_sk: [u8; 32],
     x25519_pk: [u8; 32],
+    /// 32-byte Ed25519 seed for slot 9C — the seed that
+    /// `KeyPair::from_seed` consumed to produce `ed25519_sk`/
+    /// `ed25519_pk`. Materialized for downstream tools (sign-elf
+    /// via `--seed <hex>`) that need to reproduce the same
+    /// signing keypair without re-running the Blake3 derivation
+    /// from `.dev-seed.bin`.
+    slot_9c_seed: [u8; 32],
 }
 
 fn derive_dev_keys(seed: &[u8; 32]) -> DevKeys {
@@ -186,6 +202,7 @@ fn derive_dev_keys(seed: &[u8; 32]) -> DevKeys {
         ed25519_pk,
         x25519_sk,
         x25519_pk,
+        slot_9c_seed: slot_9c_seed_bytes,
     }
 }
 
@@ -271,6 +288,7 @@ fn main() {
         .join(SEED_FILE);
     let pubkey_path = workspace.join(DEV_BOOTSTRAP_PUBKEY_FILE);
     let secret_path = workspace.join(KEY_STORE_SERVICE_DIR).join(DEV_PIV_SECRET_FILE);
+    let slot_9c_seed_path = workspace.join(DEV_SLOT_9C_SEED_FILE);
 
     let seed = read_or_generate_seed(&seed_path, force);
     let keys = derive_dev_keys(&seed);
@@ -292,12 +310,18 @@ fn main() {
         eprintln!("failed to write {}: {}", secret_path.display(), e);
         process::exit(1);
     });
+    write_file_atomic(&slot_9c_seed_path, &keys.slot_9c_seed).unwrap_or_else(|e| {
+        eprintln!("failed to write {}: {}", slot_9c_seed_path.display(), e);
+        process::exit(1);
+    });
 
     println!("dev-PIV keypair files written.");
-    println!("  pubkey:  {} (40 bytes, CKEY v1)", pubkey_path.display());
-    println!("  secret:  {} (168 bytes, DPIV v1)", secret_path.display());
-    println!("  seed:    {} (32 bytes, persistent)", seed_path.display());
+    println!("  pubkey:        {} (40 bytes, CKEY v1)", pubkey_path.display());
+    println!("  secret:        {} (168 bytes, DPIV v1)", secret_path.display());
+    println!("  9C-sign seed:  {} (32 bytes, raw Ed25519 seed)", slot_9c_seed_path.display());
+    println!("  master seed:   {} (32 bytes, persistent)", seed_path.display());
     println!();
     println!("Kernel must be built with `--features dev-piv` to pick up the new bootstrap pubkey.");
     println!("key-store-service must be built with `--features dev-piv` to load SwPivBackend.");
+    println!("sign-elf must use --seed $(xxd -p -c 32 {}) to sign ELFs the dev-piv kernel accepts.", DEV_SLOT_9C_SEED_FILE);
 }

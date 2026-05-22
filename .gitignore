@@ -32,5 +32,6 @@ notes/
 # committed bootstrap_pubkey.bin (real YubiKey) instead, selected by
 # the absence of `--features dev-piv`.
 dev_bootstrap_pubkey.bin
+dev_slot_9c_seed.bin
 user/key-store-service/dev_piv_secret.bin
 tools/gen-dev-piv-keys/.dev-seed.bin
