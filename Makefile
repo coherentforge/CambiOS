@@ -887,6 +887,17 @@ run-quiet: iso disk-img
 # now lives on XTS-AES-256. Success sentinel default
 # `cambios> ` indicates the boot reached the shell.
 run-quiet-dev-piv: iso-dev-piv disk-img
+	@echo "=== Zeroing substrate superblock (LBA 4) for fresh-wrap detection ==="
+	@# format-volume randomizes the master key each invocation, so any
+	@# substrate state at LBA 4+ from a prior boot decrypts to garbage
+	@# under the new master — kernel's open_strict refuses (correct
+	@# wrong-master behavior, see A-v.d.4 design). Smoke test wants the
+	@# fresh-wrap → format() path each run, so we zero just LBA 4 (the
+	@# substrate's SUPERBLOCK_LBA after the FDE_SUBSTRATE_LBA_OFFSET = 4
+	@# shift) to force the kernel's `is_fresh_wrap` check to fire.
+	@# Leaves LBA 5+ untouched; persistence semantics are unchanged when
+	@# the master is held stable (e.g., via --master-key-hex).
+	dd if=/dev/zero of=$(DISK_IMG) bs=4096 count=1 seek=4 conv=notrunc status=none
 	@echo "=== Formatting cambios-disk.img with fresh signed FDE header ==="
 	$(FORMAT_VOLUME) $(DISK_IMG)
 	python3 tools/qemu-run-quiet.py \

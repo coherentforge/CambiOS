@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "cambios"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bitflags 2.11.0",
  "blake3",

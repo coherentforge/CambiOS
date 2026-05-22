@@ -24,7 +24,7 @@ missing_safety_doc = "deny"
 
 [package]
 name = "cambios"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["CambiOS Development Team"]

@@ -224,7 +224,7 @@ unsafe extern "C" fn kmain() -> ! {
         cambios_core::halt();
     }
 
-    println!("=== CambiOS Microkernel [v0.2.0] ===");
+    println!("=== CambiOS Microkernel [v0.3.0] ===");
     println!("Booted via Limine\n");
 
     // Populate kernel-owned BootInfo from the Limine response statics.
@@ -643,7 +643,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // regions + reservations.
     unsafe { cambios_core::boot::riscv::populate(dtb_phys); }
 
-    println!("=== CambiOS Microkernel [v0.2.0] (RISC-V) ===");
+    println!("=== CambiOS Microkernel [v0.3.0] (RISC-V) ===");
     println!(
         "Booted via OpenSBI on hart {}, DTB @ {:#x}",
         hart_id, dtb_phys

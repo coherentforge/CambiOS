@@ -126,23 +126,7 @@ impl XtsAes256 {
     /// sequence number used as the XTS tweak per NIST SP 800-38E
     /// § 5.3. Sector size is fixed at [`BLOCK_SIZE`] (4 KiB).
     pub fn encrypt_sector(&self, sector: &mut Block, lba: u64) {
-        // Compute initial tweak T_0 = AES_K2(LBA as 128-bit LE).
-        let mut tweak = initial_tweak_bytes(lba);
-        self.k2.encrypt_block(&mut tweak);
-
-        for chunk in sector.chunks_exact_mut(XTS_INNER_BLOCK_LEN) {
-            let block: &mut [u8; XTS_INNER_BLOCK_LEN] = chunk
-                .try_into()
-                .expect("chunks_exact_mut yields XTS_INNER_BLOCK_LEN slices");
-
-            // C_j = AES_K1(P_j XOR T_j) XOR T_j
-            xts_xor_inplace(&mut *block, &tweak);
-            self.k1.encrypt_block(&mut *block);
-            xts_xor_inplace(&mut *block, &tweak);
-
-            // T_(j+1) = T_j * alpha mod (x^128 + x^7 + x^2 + x + 1)
-            advance_tweak(&mut tweak);
-        }
+        self.encrypt_data_unit(sector, initial_tweak_bytes(lba));
     }
 
     /// Decrypt one full sector in place. Inverse of
@@ -150,20 +134,70 @@ impl XtsAes256 {
     /// encryption (it only depends on `lba` + K2); only the inner
     /// AES operation is inverted.
     pub fn decrypt_sector(&self, sector: &mut Block, lba: u64) {
-        let mut tweak = initial_tweak_bytes(lba);
-        self.k2.encrypt_block(&mut tweak);
+        self.decrypt_data_unit(sector, initial_tweak_bytes(lba));
+    }
 
-        for chunk in sector.chunks_exact_mut(XTS_INNER_BLOCK_LEN) {
+    /// Encrypt a single XTS data unit of arbitrary size in place,
+    /// taking the raw 16-byte tweak directly per NIST SP 800-38E
+    /// § 5.3.1 (`i` parameter). Buffer length must be a non-zero
+    /// multiple of [`XTS_INNER_BLOCK_LEN`] (16). Used by the
+    /// substrate's [`encrypt_sector`] (with `tweak =
+    /// initial_tweak_bytes(lba)`) and by NIST CAVP KAT tests
+    /// (with arbitrary tweaks and data-unit sizes from the
+    /// XTSGenAES256 vector set).
+    ///
+    /// Panics if `buf.len()` is zero or not a multiple of 16 —
+    /// callers above the substrate already guarantee whole-block
+    /// sizes; the panic is a development-time assertion, not a
+    /// runtime check on attacker-controlled input.
+    pub fn encrypt_data_unit(&self, buf: &mut [u8], tweak: [u8; XTS_INNER_BLOCK_LEN]) {
+        assert!(
+            !buf.is_empty() && buf.len() % XTS_INNER_BLOCK_LEN == 0,
+            "XTS data-unit length must be a non-zero multiple of AES block size"
+        );
+
+        // Compute initial tweak T_0 = AES_K2(tweak).
+        let mut t = tweak;
+        self.k2.encrypt_block(&mut t);
+
+        for chunk in buf.chunks_exact_mut(XTS_INNER_BLOCK_LEN) {
+            let block: &mut [u8; XTS_INNER_BLOCK_LEN] = chunk
+                .try_into()
+                .expect("chunks_exact_mut yields XTS_INNER_BLOCK_LEN slices");
+
+            // C_j = AES_K1(P_j XOR T_j) XOR T_j
+            xts_xor_inplace(&mut *block, &t);
+            self.k1.encrypt_block(&mut *block);
+            xts_xor_inplace(&mut *block, &t);
+
+            // T_(j+1) = T_j * alpha mod (x^128 + x^7 + x^2 + x + 1)
+            advance_tweak(&mut t);
+        }
+    }
+
+    /// Decrypt a single XTS data unit of arbitrary size in place.
+    /// Inverse of [`encrypt_data_unit`]; same shape, K1 inverse
+    /// applied in place of K1 forward.
+    pub fn decrypt_data_unit(&self, buf: &mut [u8], tweak: [u8; XTS_INNER_BLOCK_LEN]) {
+        assert!(
+            !buf.is_empty() && buf.len() % XTS_INNER_BLOCK_LEN == 0,
+            "XTS data-unit length must be a non-zero multiple of AES block size"
+        );
+
+        let mut t = tweak;
+        self.k2.encrypt_block(&mut t);
+
+        for chunk in buf.chunks_exact_mut(XTS_INNER_BLOCK_LEN) {
             let block: &mut [u8; XTS_INNER_BLOCK_LEN] = chunk
                 .try_into()
                 .expect("chunks_exact_mut yields XTS_INNER_BLOCK_LEN slices");
 
             // P_j = AES_K1^(-1)(C_j XOR T_j) XOR T_j
-            xts_xor_inplace(&mut *block, &tweak);
+            xts_xor_inplace(&mut *block, &t);
             self.k1.decrypt_block(&mut *block);
-            xts_xor_inplace(&mut *block, &tweak);
+            xts_xor_inplace(&mut *block, &t);
 
-            advance_tweak(&mut tweak);
+            advance_tweak(&mut t);
         }
     }
 }
@@ -519,65 +553,250 @@ mod tests {
         assert_eq!(dev.read_block(4, &mut buf), Err(BlockError::OutOfBounds));
     }
 
-    /// Self-vector regression fingerprint.
-    ///
-    /// Locks in a Blake3 fingerprint of the ciphertext produced for
-    /// a fixed (master, LBA, plaintext) triple. Catches accidental
-    /// impl drift across commits.
-    ///
-    /// External cross-check via IEEE 1619-2007 Annex B vectors is
-    /// the eventual goal:
-    /// Replace when: `make run` boots end-to-end under
-    /// `--features dev-piv` and fde-mount logs successful decrypt
-    /// of a real disk's data extent — the full chain (format-volume
-    /// writes ciphertext at LBA k under the same master, fde-mount
-    /// unwraps it, kernel mounts the EncryptedBlockDevice with that
-    /// master) uses this same XTS-AES-256 impl; an end-to-end boot
-    /// is the load-bearing observational ground truth. At that
-    /// point this regression fingerprint can be replaced with the
-    /// matching IEEE 1619 vector.
+    // ----------------------------------------------------------------
+    // NIST CAVP XTSGenAES256 Known-Answer Tests
+    // ----------------------------------------------------------------
+    //
+    // Source: NIST CAVP XTSTestVectors archive, file XTSGenAES256.rsp.
+    // CAVS 11.0, generated 2011-03-01. Same numerical vectors that
+    // every FIPS-validated XTS-AES-256 implementation tests against
+    // (a re-publication of IEEE Std 1619-2007 Annex B; the vectors
+    // are deterministic outputs of the math and not copyrightable).
+    //
+    // CAVP wire format → our API mapping:
+    //   `Key`           (128 hex chars = 64 bytes) → master = K1 || K2
+    //   `i`             (32 hex chars = 16 bytes)  → tweak: [u8; 16]
+    //   `DataUnitLen`   (256 bits)                  → buf.len() = 32
+    //   `PT` / `CT`     (64 hex chars = 32 bytes)   → plaintext / expected ciphertext
+    //
+    // Two vectors covered: COUNT=1 and COUNT=2, each tested in both
+    // encrypt and decrypt direction (four total assertions per vector
+    // beyond the obvious roundtrip).
+
+    /// NIST CAVS 11.0 XTSGen AES-256, COUNT = 1, DataUnitLen = 256 bits.
+    const CAVP_C1_MASTER: [u8; XTS_MASTER_KEY_LEN] = [
+        // K1: 1ea661c58d943a0e4801e42f4b0947149e7f9f8e3e68d0c7505210bd311a0e7c
+        0x1e, 0xa6, 0x61, 0xc5, 0x8d, 0x94, 0x3a, 0x0e,
+        0x48, 0x01, 0xe4, 0x2f, 0x4b, 0x09, 0x47, 0x14,
+        0x9e, 0x7f, 0x9f, 0x8e, 0x3e, 0x68, 0xd0, 0xc7,
+        0x50, 0x52, 0x10, 0xbd, 0x31, 0x1a, 0x0e, 0x7c,
+        // K2: d6e13ffdf2418d8d1911c004cda58da3d619b7e2b9141e58318eea392cf41b08
+        0xd6, 0xe1, 0x3f, 0xfd, 0xf2, 0x41, 0x8d, 0x8d,
+        0x19, 0x11, 0xc0, 0x04, 0xcd, 0xa5, 0x8d, 0xa3,
+        0xd6, 0x19, 0xb7, 0xe2, 0xb9, 0x14, 0x1e, 0x58,
+        0x31, 0x8e, 0xea, 0x39, 0x2c, 0xf4, 0x1b, 0x08,
+    ];
+    /// CAVP COUNT=1 `i`: adf8d92627464ad2f0428e84a9f87564
+    const CAVP_C1_TWEAK: [u8; XTS_INNER_BLOCK_LEN] = [
+        0xad, 0xf8, 0xd9, 0x26, 0x27, 0x46, 0x4a, 0xd2,
+        0xf0, 0x42, 0x8e, 0x84, 0xa9, 0xf8, 0x75, 0x64,
+    ];
+    /// CAVP COUNT=1 `PT`: 2eedea52cd8215e1acc647e810bbc3642e87287f8d2e57e36c0a24fbc12a202e
+    const CAVP_C1_PT: [u8; 32] = [
+        0x2e, 0xed, 0xea, 0x52, 0xcd, 0x82, 0x15, 0xe1,
+        0xac, 0xc6, 0x47, 0xe8, 0x10, 0xbb, 0xc3, 0x64,
+        0x2e, 0x87, 0x28, 0x7f, 0x8d, 0x2e, 0x57, 0xe3,
+        0x6c, 0x0a, 0x24, 0xfb, 0xc1, 0x2a, 0x20, 0x2e,
+    ];
+    /// CAVP COUNT=1 `CT`: cbaad0e2f6cea3f50b37f934d46a9b130b9d54f07e34f36af793e86f73c6d7db
+    const CAVP_C1_CT: [u8; 32] = [
+        0xcb, 0xaa, 0xd0, 0xe2, 0xf6, 0xce, 0xa3, 0xf5,
+        0x0b, 0x37, 0xf9, 0x34, 0xd4, 0x6a, 0x9b, 0x13,
+        0x0b, 0x9d, 0x54, 0xf0, 0x7e, 0x34, 0xf3, 0x6a,
+        0xf7, 0x93, 0xe8, 0x6f, 0x73, 0xc6, 0xd7, 0xdb,
+    ];
+
+    /// NIST CAVS 11.0 XTSGen AES-256, COUNT = 2, DataUnitLen = 256 bits.
+    const CAVP_C2_MASTER: [u8; XTS_MASTER_KEY_LEN] = [
+        // K1: e149be00177d76b7c1d85bcbb6b5054ee10b9f51cd73f59e0840628b9e7d854e
+        0xe1, 0x49, 0xbe, 0x00, 0x17, 0x7d, 0x76, 0xb7,
+        0xc1, 0xd8, 0x5b, 0xcb, 0xb6, 0xb5, 0x05, 0x4e,
+        0xe1, 0x0b, 0x9f, 0x51, 0xcd, 0x73, 0xf5, 0x9e,
+        0x08, 0x40, 0x62, 0x8b, 0x9e, 0x7d, 0x85, 0x4e,
+        // K2: 2e1c0ab0537186a2a7c314bbc5eb23b6876a26bcdbf9e6b758d1cae053c2f278
+        0x2e, 0x1c, 0x0a, 0xb0, 0x53, 0x71, 0x86, 0xa2,
+        0xa7, 0xc3, 0x14, 0xbb, 0xc5, 0xeb, 0x23, 0xb6,
+        0x87, 0x6a, 0x26, 0xbc, 0xdb, 0xf9, 0xe6, 0xb7,
+        0x58, 0xd1, 0xca, 0xe0, 0x53, 0xc2, 0xf2, 0x78,
+    ];
+    /// CAVP COUNT=2 `i`: 0ea18818fab95289b1caab4e61349501
+    const CAVP_C2_TWEAK: [u8; XTS_INNER_BLOCK_LEN] = [
+        0x0e, 0xa1, 0x88, 0x18, 0xfa, 0xb9, 0x52, 0x89,
+        0xb1, 0xca, 0xab, 0x4e, 0x61, 0x34, 0x95, 0x01,
+    ];
+    /// CAVP COUNT=2 `PT`: f5f101d8e3a7681b1ddb21bd2826b24e32990bca49b39291b5369a9bca277d75
+    const CAVP_C2_PT: [u8; 32] = [
+        0xf5, 0xf1, 0x01, 0xd8, 0xe3, 0xa7, 0x68, 0x1b,
+        0x1d, 0xdb, 0x21, 0xbd, 0x28, 0x26, 0xb2, 0x4e,
+        0x32, 0x99, 0x0b, 0xca, 0x49, 0xb3, 0x92, 0x91,
+        0xb5, 0x36, 0x9a, 0x9b, 0xca, 0x27, 0x7d, 0x75,
+    ];
+    /// CAVP COUNT=2 `CT`: 5bf2479393cc673306fbb15e72600598e33d4d8a470727ce098730fd80afa959
+    const CAVP_C2_CT: [u8; 32] = [
+        0x5b, 0xf2, 0x47, 0x93, 0x93, 0xcc, 0x67, 0x33,
+        0x06, 0xfb, 0xb1, 0x5e, 0x72, 0x60, 0x05, 0x98,
+        0xe3, 0x3d, 0x4d, 0x8a, 0x47, 0x07, 0x27, 0xce,
+        0x09, 0x87, 0x30, 0xfd, 0x80, 0xaf, 0xa9, 0x59,
+    ];
+
     #[test]
-    fn self_vector_blake3_fingerprint_stable() {
-        let cipher = XtsAes256::new(&master_key_pattern());
-        let mut sector = plaintext_pattern();
-        cipher.encrypt_sector(&mut sector, 0xdeadbeef);
-
-        let fp = blake3::hash(&sector);
-        let fp_bytes: [u8; 32] = *fp.as_bytes();
-
-        // First 8 bytes of the fingerprint — locking in current
-        // impl as the regression baseline. If this test starts
-        // failing on a future commit, either (a) the cipher impl
-        // changed (regression — investigate) or (b) the
-        // fingerprint was intentionally updated alongside the
-        // change (rotate the constant).
-        let actual_prefix: [u8; 8] = [
-            fp_bytes[0], fp_bytes[1], fp_bytes[2], fp_bytes[3],
-            fp_bytes[4], fp_bytes[5], fp_bytes[6], fp_bytes[7],
-        ];
-
-        // This constant is whatever our impl currently produces —
-        // a stake in the ground, refreshed when external
-        // validation lands.
-        let recorded_prefix: [u8; 8] = SELF_VECTOR_FP_PREFIX;
-        assert_eq!(
-            actual_prefix, recorded_prefix,
-            "XTS self-vector fingerprint changed — \
-             investigate cipher impl drift",
-        );
+    fn nist_cavp_xtsgen_aes256_count1_encrypt() {
+        let cipher = XtsAes256::new(&CAVP_C1_MASTER);
+        let mut buf = CAVP_C1_PT;
+        cipher.encrypt_data_unit(&mut buf, CAVP_C1_TWEAK);
+        assert_eq!(buf, CAVP_C1_CT, "NIST CAVP XTSGenAES256 COUNT=1 encrypt mismatch");
     }
 
-    /// HARDWARE: Blake3 fingerprint prefix of our XTS-AES-256 impl's
-    /// output for the locked (master_key_pattern, LBA=0xdeadbeef,
-    /// plaintext_pattern) triple. Acts as a self-vector regression
-    /// fingerprint; replaced on intentional impl change, otherwise
-    /// stable.
-    const SELF_VECTOR_FP_PREFIX: [u8; 8] = SELF_VECTOR_FP_PREFIX_VALUE;
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count1_decrypt() {
+        let cipher = XtsAes256::new(&CAVP_C1_MASTER);
+        let mut buf = CAVP_C1_CT;
+        cipher.decrypt_data_unit(&mut buf, CAVP_C1_TWEAK);
+        assert_eq!(buf, CAVP_C1_PT, "NIST CAVP XTSGenAES256 COUNT=1 decrypt mismatch");
+    }
 
-    // Captured 2026-05-21 from the impl as initially landed.
-    // Cross-validation against IEEE 1619-2007 Annex B vectors
-    // deferred per the Convention 9 trigger on
-    // `self_vector_blake3_fingerprint_stable` rustdoc.
-    const SELF_VECTOR_FP_PREFIX_VALUE: [u8; 8] =
-        [0x56, 0x92, 0xf1, 0x13, 0x36, 0xe0, 0x02, 0xe5];
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count2_encrypt() {
+        let cipher = XtsAes256::new(&CAVP_C2_MASTER);
+        let mut buf = CAVP_C2_PT;
+        cipher.encrypt_data_unit(&mut buf, CAVP_C2_TWEAK);
+        assert_eq!(buf, CAVP_C2_CT, "NIST CAVP XTSGenAES256 COUNT=2 encrypt mismatch");
+    }
+
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count2_decrypt() {
+        let cipher = XtsAes256::new(&CAVP_C2_MASTER);
+        let mut buf = CAVP_C2_CT;
+        cipher.decrypt_data_unit(&mut buf, CAVP_C2_TWEAK);
+        assert_eq!(buf, CAVP_C2_PT, "NIST CAVP XTSGenAES256 COUNT=2 decrypt mismatch");
+    }
+
+    /// NIST CAVS 11.0 XTSGen AES-256, COUNT = 499, DataUnitLen = 384 bits.
+    /// Listed in the .rsp file's [DECRYPT] section — same math, just
+    /// NIST's documentation convention. 48-byte data unit = 3 inner
+    /// blocks, exercising two advance_tweak transitions per direction.
+    const CAVP_C499_MASTER: [u8; XTS_MASTER_KEY_LEN] = [
+        // K1: 22a0a371842832d8706388e94533f3df997d749f48503a1ad38dad9791ce14fe
+        0x22, 0xa0, 0xa3, 0x71, 0x84, 0x28, 0x32, 0xd8,
+        0x70, 0x63, 0x88, 0xe9, 0x45, 0x33, 0xf3, 0xdf,
+        0x99, 0x7d, 0x74, 0x9f, 0x48, 0x50, 0x3a, 0x1a,
+        0xd3, 0x8d, 0xad, 0x97, 0x91, 0xce, 0x14, 0xfe,
+        // K2: 9ccaa3f3ab5c7546fd019bdf997cb3abd6cb22edece35349237ebe289708ce9d
+        0x9c, 0xca, 0xa3, 0xf3, 0xab, 0x5c, 0x75, 0x46,
+        0xfd, 0x01, 0x9b, 0xdf, 0x99, 0x7c, 0xb3, 0xab,
+        0xd6, 0xcb, 0x22, 0xed, 0xec, 0xe3, 0x53, 0x49,
+        0x23, 0x7e, 0xbe, 0x28, 0x97, 0x08, 0xce, 0x9d,
+    ];
+    /// CAVP COUNT=499 `i`: 01d23862799e6295c0041bbaec5109a7
+    const CAVP_C499_TWEAK: [u8; XTS_INNER_BLOCK_LEN] = [
+        0x01, 0xd2, 0x38, 0x62, 0x79, 0x9e, 0x62, 0x95,
+        0xc0, 0x04, 0x1b, 0xba, 0xec, 0x51, 0x09, 0xa7,
+    ];
+    /// CAVP COUNT=499 `PT`: 6169b219ca37a2f7ccd2d8581d621d3c1bff888dac080364f2b9c702d01a9574b55bc4f045bfa04d1851e58c21ea7f55
+    const CAVP_C499_PT: [u8; 48] = [
+        0x61, 0x69, 0xb2, 0x19, 0xca, 0x37, 0xa2, 0xf7,
+        0xcc, 0xd2, 0xd8, 0x58, 0x1d, 0x62, 0x1d, 0x3c,
+        0x1b, 0xff, 0x88, 0x8d, 0xac, 0x08, 0x03, 0x64,
+        0xf2, 0xb9, 0xc7, 0x02, 0xd0, 0x1a, 0x95, 0x74,
+        0xb5, 0x5b, 0xc4, 0xf0, 0x45, 0xbf, 0xa0, 0x4d,
+        0x18, 0x51, 0xe5, 0x8c, 0x21, 0xea, 0x7f, 0x55,
+    ];
+    /// CAVP COUNT=499 `CT`: 0e2b93cc892b22b5dbba9d32f50aeafe9de0ee66dffccaa6063679be69dd606c7d71a446333f9e5c36755896f4d8e16f
+    const CAVP_C499_CT: [u8; 48] = [
+        0x0e, 0x2b, 0x93, 0xcc, 0x89, 0x2b, 0x22, 0xb5,
+        0xdb, 0xba, 0x9d, 0x32, 0xf5, 0x0a, 0xea, 0xfe,
+        0x9d, 0xe0, 0xee, 0x66, 0xdf, 0xfc, 0xca, 0xa6,
+        0x06, 0x36, 0x79, 0xbe, 0x69, 0xdd, 0x60, 0x6c,
+        0x7d, 0x71, 0xa4, 0x46, 0x33, 0x3f, 0x9e, 0x5c,
+        0x36, 0x75, 0x58, 0x96, 0xf4, 0xd8, 0xe1, 0x6f,
+    ];
+
+    /// NIST CAVS 11.0 XTSGen AES-256, COUNT = 500, DataUnitLen = 384 bits.
+    const CAVP_C500_MASTER: [u8; XTS_MASTER_KEY_LEN] = [
+        // K1: 88dfd7c83cb121968feb417520555b36c0f63b662570eac12ea96cbe188ad5b1
+        0x88, 0xdf, 0xd7, 0xc8, 0x3c, 0xb1, 0x21, 0x96,
+        0x8f, 0xeb, 0x41, 0x75, 0x20, 0x55, 0x5b, 0x36,
+        0xc0, 0xf6, 0x3b, 0x66, 0x25, 0x70, 0xea, 0xc1,
+        0x2e, 0xa9, 0x6c, 0xbe, 0x18, 0x8a, 0xd5, 0xb1,
+        // K2: a44db23ac6470316cba0041cadf248f6d9a7713f454e663f3e3987585cebbf96
+        0xa4, 0x4d, 0xb2, 0x3a, 0xc6, 0x47, 0x03, 0x16,
+        0xcb, 0xa0, 0x04, 0x1c, 0xad, 0xf2, 0x48, 0xf6,
+        0xd9, 0xa7, 0x71, 0x3f, 0x45, 0x4e, 0x66, 0x3f,
+        0x3e, 0x39, 0x87, 0x58, 0x5c, 0xeb, 0xbf, 0x96,
+    ];
+    /// CAVP COUNT=500 `i`: 0ee84632b838dd528f1d96c76439805c
+    const CAVP_C500_TWEAK: [u8; XTS_INNER_BLOCK_LEN] = [
+        0x0e, 0xe8, 0x46, 0x32, 0xb8, 0x38, 0xdd, 0x52,
+        0x8f, 0x1d, 0x96, 0xc7, 0x64, 0x39, 0x80, 0x5c,
+    ];
+    /// CAVP COUNT=500 `PT`: ec36551c70efcdf85de7a39988978263ad261e83996dad219a0058e02187384f2d0754ff9cfa000bec448fafd2cfa738
+    const CAVP_C500_PT: [u8; 48] = [
+        0xec, 0x36, 0x55, 0x1c, 0x70, 0xef, 0xcd, 0xf8,
+        0x5d, 0xe7, 0xa3, 0x99, 0x88, 0x97, 0x82, 0x63,
+        0xad, 0x26, 0x1e, 0x83, 0x99, 0x6d, 0xad, 0x21,
+        0x9a, 0x00, 0x58, 0xe0, 0x21, 0x87, 0x38, 0x4f,
+        0x2d, 0x07, 0x54, 0xff, 0x9c, 0xfa, 0x00, 0x0b,
+        0xec, 0x44, 0x8f, 0xaf, 0xd2, 0xcf, 0xa7, 0x38,
+    ];
+    /// CAVP COUNT=500 `CT`: a55d533c9c5885562b92d4582ea69db8e2ba9c0b967a9f0167700b043525a47bafe7d630774eaf4a1dc9fbcf94a1fda4
+    const CAVP_C500_CT: [u8; 48] = [
+        0xa5, 0x5d, 0x53, 0x3c, 0x9c, 0x58, 0x85, 0x56,
+        0x2b, 0x92, 0xd4, 0x58, 0x2e, 0xa6, 0x9d, 0xb8,
+        0xe2, 0xba, 0x9c, 0x0b, 0x96, 0x7a, 0x9f, 0x01,
+        0x67, 0x70, 0x0b, 0x04, 0x35, 0x25, 0xa4, 0x7b,
+        0xaf, 0xe7, 0xd6, 0x30, 0x77, 0x4e, 0xaf, 0x4a,
+        0x1d, 0xc9, 0xfb, 0xcf, 0x94, 0xa1, 0xfd, 0xa4,
+    ];
+
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count499_encrypt_48byte() {
+        let cipher = XtsAes256::new(&CAVP_C499_MASTER);
+        let mut buf = CAVP_C499_PT;
+        cipher.encrypt_data_unit(&mut buf, CAVP_C499_TWEAK);
+        assert_eq!(buf, CAVP_C499_CT, "NIST CAVP XTSGenAES256 COUNT=499 encrypt mismatch");
+    }
+
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count499_decrypt_48byte() {
+        let cipher = XtsAes256::new(&CAVP_C499_MASTER);
+        let mut buf = CAVP_C499_CT;
+        cipher.decrypt_data_unit(&mut buf, CAVP_C499_TWEAK);
+        assert_eq!(buf, CAVP_C499_PT, "NIST CAVP XTSGenAES256 COUNT=499 decrypt mismatch");
+    }
+
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count500_encrypt_48byte() {
+        let cipher = XtsAes256::new(&CAVP_C500_MASTER);
+        let mut buf = CAVP_C500_PT;
+        cipher.encrypt_data_unit(&mut buf, CAVP_C500_TWEAK);
+        assert_eq!(buf, CAVP_C500_CT, "NIST CAVP XTSGenAES256 COUNT=500 encrypt mismatch");
+    }
+
+    #[test]
+    fn nist_cavp_xtsgen_aes256_count500_decrypt_48byte() {
+        let cipher = XtsAes256::new(&CAVP_C500_MASTER);
+        let mut buf = CAVP_C500_CT;
+        cipher.decrypt_data_unit(&mut buf, CAVP_C500_TWEAK);
+        assert_eq!(buf, CAVP_C500_PT, "NIST CAVP XTSGenAES256 COUNT=500 decrypt mismatch");
+    }
+
+    #[test]
+    fn encrypt_sector_matches_encrypt_data_unit_with_lba_tweak() {
+        // Internal consistency: the existing `encrypt_sector(buf, lba)`
+        // path is exactly `encrypt_data_unit(buf, initial_tweak_bytes(lba))`.
+        // This test pins the equivalence so the refactor that introduced
+        // `encrypt_data_unit` can't silently diverge `encrypt_sector` later.
+        let cipher = XtsAes256::new(&master_key_pattern());
+        let mut a = plaintext_pattern();
+        let mut b = plaintext_pattern();
+
+        let lba = 0xdeadbeefu64;
+        cipher.encrypt_sector(&mut a, lba);
+
+        let mut tweak_bytes = [0u8; XTS_INNER_BLOCK_LEN];
+        tweak_bytes[..8].copy_from_slice(&lba.to_le_bytes());
+        cipher.encrypt_data_unit(&mut b, tweak_bytes);
+
+        assert_eq!(a, b);
+    }
 }
