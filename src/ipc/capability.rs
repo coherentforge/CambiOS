@@ -124,21 +124,26 @@ pub struct Capability {
 
 /// Capability table for a single process.
 ///
-/// SCAFFOLDING: 32 capabilities per process.
+/// SCAFFOLDING: 64 capabilities per process.
 /// Why: bounded set for verification; cache-line-friendly linear scan. Originally
 ///      chosen to match `MAX_PROCESSES` and `MAX_ENDPOINTS` (a process can
 ///      typically hold capabilities for ~half the system's endpoints).
 ///      `MAX_PROCESSES` is now runtime-computed (`config::num_slots()`), but
-///      this per-process cap is still a fixed compile-time 32.
+///      this per-process cap stays a fixed compile-time bound. Bumped
+///      32 → 64 in lockstep with `MAX_ENDPOINTS` at A-v.d.3 — the boot
+///      manifest grants every boot module one cap per endpoint, so the
+///      two constants must match or the trailing endpoints silently fail
+///      their grant (which is how the fde-mount=32 IPC bug originally
+///      surfaced).
 /// Replace when: the policy service hits this — it holds one capability per
 ///      service it mediates, the audit consumer holds one per producer.
-///      32 will get tight fast. See docs/ASSUMPTIONS.md.
+///      64 buys some headroom but isn't open-ended. See docs/ASSUMPTIONS.md.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessCapabilities {
     /// Process ID
     pub process_id: ProcessId,
     /// Capabilities held by this process
-    capabilities: [Option<Capability>; 32],
+    capabilities: [Option<Capability>; 64],
     /// Number of active capabilities
     count: u8,
     /// Cryptographic identity bound to this process.
@@ -194,7 +199,7 @@ impl ProcessCapabilities {
     pub fn new(process_id: ProcessId) -> Self {
         ProcessCapabilities {
             process_id,
-            capabilities: [None; 32],
+            capabilities: [None; 64],
             count: 0,
             principal: None,
             create_process: false,
@@ -225,7 +230,7 @@ impl ProcessCapabilities {
             }
         }
 
-        if self.count >= 32 {
+        if self.count >= 64 {
             return Err(CapabilityError::CapabilityFull);
         }
 
@@ -326,7 +331,7 @@ impl ProcessCapabilities {
     }
 
     /// List all capabilities held by this process
-    pub fn list(&self) -> &[Option<Capability>; 32] {
+    pub fn list(&self) -> &[Option<Capability>; 64] {
         &self.capabilities
     }
 
@@ -1031,8 +1036,8 @@ mod tests {
     fn test_capability_limit() {
         let mut caps = ProcessCapabilities::new(ProcessId::new(1, 0));
 
-        // Grant 32 capabilities (the limit)
-        for i in 0..32 {
+        // Grant 64 capabilities (the limit)
+        for i in 0..64 {
             let rights = CapabilityRights {
                 send: true,
                 receive: false,
@@ -1042,9 +1047,9 @@ mod tests {
             caps.grant(EndpointId(i), rights).unwrap();
         }
 
-        // 33rd capability should fail
+        // 65th capability should fail
         assert!(caps.grant(
-            EndpointId(32),
+            EndpointId(64),
             CapabilityRights {
                 send: true,
                 receive: false,

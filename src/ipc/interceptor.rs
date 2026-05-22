@@ -352,7 +352,7 @@ mod tests {
     fn test_recv_denies_endpoint_out_of_bounds() {
         let interceptor = DefaultInterceptor::new();
         assert_eq!(
-            interceptor.on_recv(ProcessId::new(1, 0), EndpointId(50)),
+            interceptor.on_recv(ProcessId::new(1, 0), EndpointId(MAX_ENDPOINTS as u32 + 1)),
             InterceptDecision::Deny(DenyReason::EndpointOutOfBounds),
         );
     }

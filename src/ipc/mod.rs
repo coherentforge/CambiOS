@@ -22,17 +22,17 @@ use core::fmt;
 // because dispatch is monomorphized through the enum.
 use interceptor::IpcInterceptor as _;
 
-/// SCAFFOLDING: maximum number of IPC endpoints in the system.
-/// Why: one endpoint per service in the simple case. Sharded IPC has one
-///      shard per endpoint; the per-shard message queues are sized from this.
-///      Historically matched `MAX_PROCESSES = 32`; `MAX_PROCESSES` is now
-///      runtime-computed (the process table scales with tier policy via
-///      `config::num_slots()`), but `MAX_ENDPOINTS` remains a fixed cap.
-/// Replace when: a service needs more than 32 endpoints, or the IPC shard
-///      array becomes a contention point at higher process counts.
-///      Eventually this should track `config::num_slots()` the same way.
-///      See docs/ASSUMPTIONS.md.
-pub const MAX_ENDPOINTS: usize = 32;
+/// SCAFFOLDING: maximum number of IPC endpoints in the system. Bumped 32 → 64
+/// at A-v.d.3 — `fde-mount` claims endpoint 32 and `register_endpoint(32)`
+/// failed at the prior 32-exclusive bound, blocking the stream A FDE unlock.
+/// One endpoint per service in the simple case; sharded IPC has one shard per
+/// endpoint and the per-shard message queues are sized from this. Historically
+/// matched `MAX_PROCESSES = 32`; `MAX_PROCESSES` is now runtime-computed via
+/// `config::num_slots()`, but `MAX_ENDPOINTS` stays a fixed cap.
+/// Replace when: a service needs more than 64 endpoints, or the IPC shard
+/// array becomes a contention point at higher process counts; eventually this
+/// should track `config::num_slots()` the same way. See docs/ASSUMPTIONS.md.
+pub const MAX_ENDPOINTS: usize = 64;
 
 /// Message endpoint identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

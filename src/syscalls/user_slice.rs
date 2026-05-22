@@ -43,16 +43,16 @@ use super::dispatcher::SyscallContext;
 // Bounds — shared with sibling modules via pub(super).
 // ============================================================================
 
-/// SCAFFOLDING: maximum user buffer size for a single syscall (4 KiB).
-/// Why: bounds `copy_from_user_pages` / `copy_to_user_pages`; safety
-///      net against accidentally mapping huge ranges through the
-///      page-table-walk helpers.
-/// Replace when: a user-space service needs to read or write > 4 KiB
-///      in one syscall and gets a confusing failure at exactly the
-///      boundary. Channels (ADR-005) are the long-term answer for
-///      bulk data; until then this needs to grow on demand. See
-///      docs/ASSUMPTIONS.md.
-pub(super) const MAX_USER_BUFFER: usize = 4096;
+/// SCAFFOLDING: maximum user buffer size for a single syscall (16 KiB). Bumped
+/// 4 KiB → 16 KiB at A-v.d.3 because `SYS_READ_VOLUME_HEADER` copies the full
+/// LBA 0..=3 reserved extent (16 KiB) in one shot. Bounds `copy_from_user_pages`
+/// / `copy_to_user_pages`; safety net against accidentally mapping huge ranges
+/// through the page-table-walk helpers.
+/// Replace when: a user-space service needs to read or write > 16 KiB in one
+/// syscall and gets a confusing failure at exactly the boundary. Channels
+/// (ADR-005) are the long-term answer for bulk data; until then this needs to
+/// grow on demand. See docs/ASSUMPTIONS.md.
+pub(super) const MAX_USER_BUFFER: usize = 16384;
 
 /// HARDWARE: canonical user-space address ceiling.
 /// x86_64: lower-half canonical addresses end at bit 47
