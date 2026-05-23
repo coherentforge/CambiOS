@@ -156,6 +156,7 @@ pub extern "C" fn _start() -> ! {
     log_dec(b"[USB-HOST]   MaxSlots   = ", caps.max_slots as u32);
     log_dec(b"[USB-HOST]   MaxIntrs   = ", caps.max_intrs as u32);
     log_dec(b"[USB-HOST]   MaxPorts   = ", caps.max_ports as u32);
+    log_dec(b"[USB-HOST]   MaxScrPads = ", caps.max_scratchpad_bufs);
     log_dec(b"[USB-HOST]   AC64       = ", caps.ac64 as u32);
     log_hex64(b"[USB-HOST]   DBOFF      = ", caps.doorbell_offset as u64);
     log_hex64(b"[USB-HOST]   RTSOFF     = ", caps.runtime_offset as u64);
@@ -166,13 +167,16 @@ pub extern "C" fn _start() -> ! {
     // and idle. Idle-on-fail keeps the boot gate happy so downstream
     // modules still load.
     match xhci::XhciController::bring_up(mmio_vaddr, caps) {
-        Ok(ctl) => {
+        Ok(mut ctl) => {
             sys::print(b"[USB-HOST] controller bring-up OK\n");
             log_hex64(b"[USB-HOST]   DCBAA paddr      = ", ctl.dcbaa_paddr);
             log_hex64(b"[USB-HOST]   command ring     = ", ctl.command_ring.paddr);
             log_hex64(b"[USB-HOST]   event ring       = ", ctl.event_ring.paddr);
             log_hex64(b"[USB-HOST]   ERST paddr       = ", ctl.erst.paddr);
             log_hex64(b"[USB-HOST]   USBSTS post-RUN  = ", ctl.read_usbsts() as u64);
+
+            // B-iii: port enumeration + first commands.
+            run_b3(&mut ctl);
         }
         Err(e) => {
             log_bringup_error(e);
@@ -187,6 +191,97 @@ pub extern "C" fn _start() -> ! {
     idle_loop();
 }
 
+// ---------------------------------------------------------------------------
+// B-iii sequence: port enumeration + NoOp + Enable Slot
+// ---------------------------------------------------------------------------
+
+fn run_b3(ctl: &mut xhci::XhciController) {
+    use xhci::regs::{PORTSC_CCS, PORTSC_PED, PORTSC_PP, PORTSC_PR,
+                     PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT};
+
+    // Step 1: walk the root hub ports, log each.
+    let max_ports = ctl.cap.max_ports;
+    sys::print(b"[USB-HOST] port enumeration:\n");
+    let mut first_connected: Option<u8> = None;
+    for i in 0..max_ports {
+        let portsc = ctl.read_portsc(i);
+        let ccs = portsc & PORTSC_CCS != 0;
+        let ped = portsc & PORTSC_PED != 0;
+        let pp  = portsc & PORTSC_PP  != 0;
+        let pr  = portsc & PORTSC_PR  != 0;
+        let speed = ((portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+
+        sys::print(b"[USB-HOST]   port ");
+        log_dec(b"", (i + 1) as u32);
+        sys::print(b"[USB-HOST]     PORTSC = ");
+        log_hex64(b"", portsc as u64);
+        if ccs {
+            sys::print(b"[USB-HOST]     CCS=1 PED=");
+            log_dec(b"", ped as u32);
+            sys::print(b"[USB-HOST]     PP=");
+            log_dec(b"", pp as u32);
+            sys::print(b"[USB-HOST]     PR=");
+            log_dec(b"", pr as u32);
+            sys::print(b"[USB-HOST]     speed=");
+            log_dec(b"", speed as u32);
+            if first_connected.is_none() {
+                first_connected = Some(i);
+            }
+        }
+    }
+
+    // Step 2: reset the first connected port (if any).
+    let port_idx = match first_connected {
+        Some(idx) => idx,
+        None => {
+            sys::print(b"[USB-HOST] no connected port; skipping reset + slot ops\n");
+            return;
+        }
+    };
+
+    sys::print(b"[USB-HOST] resetting port ");
+    log_dec(b"", (port_idx + 1) as u32);
+    match ctl.reset_port(port_idx) {
+        Ok(post_portsc) => {
+            let ped = post_portsc & PORTSC_PED != 0;
+            let speed = ((post_portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+            sys::print(b"[USB-HOST]   reset OK; PED=");
+            log_dec(b"", ped as u32);
+            sys::print(b"[USB-HOST]   port speed = ");
+            log_dec(b"", speed as u32);
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] reset_port:", e);
+            return;
+        }
+    }
+
+    // Step 3: NoOp Command smoke test — proves command/event flow
+    // independently of slot semantics. xHCI 1.2 § 4.6.2.
+    sys::print(b"[USB-HOST] NoOp Command...\n");
+    match ctl.noop_command() {
+        Ok(()) => sys::print(b"[USB-HOST]   NoOp OK\n"),
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] noop_command:", e);
+            return;
+        }
+    }
+
+    // Step 4: Enable Slot Command → log returned Slot ID.
+    sys::print(b"[USB-HOST] Enable Slot Command...\n");
+    match ctl.enable_slot() {
+        Ok(slot_id) => {
+            sys::print(b"[USB-HOST]   Enable Slot OK; slot_id = ");
+            log_dec(b"", slot_id as u32);
+            // B-iv consumes this via XhciController state.
+            ctl.slot_id = Some(slot_id);
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] enable_slot:", e);
+        }
+    }
+}
+
 fn log_bringup_error(e: xhci::XhciError) {
     match e {
         xhci::XhciError::HaltTimeout =>
@@ -199,6 +294,31 @@ fn log_bringup_error(e: xhci::XhciError) {
             sys::print(b"[USB-HOST] ERROR: HCH never cleared after RUN; controller did not start\n"),
         xhci::XhciError::DmaAllocFailed =>
             sys::print(b"[USB-HOST] ERROR: alloc_dma failed during ring setup\n"),
+        // B-iii variants can't reach this path — `bring_up` doesn't
+        // issue commands or touch ports. Handled explicitly so future
+        // bring-up additions don't silently fall through.
+        xhci::XhciError::PortResetTimeout |
+        xhci::XhciError::CommandRingFull |
+        xhci::XhciError::CommandTimeout |
+        xhci::XhciError::CommandFailed(_) =>
+            sys::print(b"[USB-HOST] ERROR: unexpected B-iii error during bring-up\n"),
+    }
+}
+
+fn log_b3_error(prefix: &[u8], e: xhci::XhciError) {
+    sys::print(prefix);
+    match e {
+        xhci::XhciError::PortResetTimeout =>
+            sys::print(b" port reset timeout (PRC never set)\n"),
+        xhci::XhciError::CommandRingFull =>
+            sys::print(b" command ring full (Link-wrap unimplemented)\n"),
+        xhci::XhciError::CommandTimeout =>
+            sys::print(b" command timeout (no completion event)\n"),
+        xhci::XhciError::CommandFailed(code) => {
+            sys::print(b" command failed, completion code = ");
+            log_dec(b"", code as u32);
+        }
+        _ => sys::print(b" unexpected bring-up error during B-iii\n"),
     }
 }
 

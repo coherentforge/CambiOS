@@ -114,6 +114,79 @@ pub struct CommandRing {
 }
 
 impl CommandRing {
+    /// Enqueue a Command TRB at the current producer slot, return the
+    /// physical address of the slot the TRB was written to (callers
+    /// match completion events on this address via the
+    /// `command_trb_pointer` field of `CommandCompletionEvent`).
+    ///
+    /// The caller-supplied `trb.control` should already have the TRB
+    /// type + type-specific bits set; this method ORs in the current
+    /// producer cycle bit before the write so the controller treats
+    /// the slot as freshly produced.
+    ///
+    /// Returns `None` if the next write would land in the Link TRB
+    /// slot (slot `COMMAND_RING_TRBS - 1`). Link-wrap (rewriting Link
+    /// TRB cycle + toggling producer cycle + resetting producer to 0)
+    /// is deferred — Stream B issues commands from explicit driver
+    /// code paths today, max ~10 commands per boot; the ring's 255
+    /// usable slots are unreachable.
+    /// Revisit when: a port-status-change-event handler (or any
+    /// runtime event source) auto-issues commands without explicit
+    /// driver code at the call site — that's when command count
+    /// stops being bounded by hand-written code and wrap becomes
+    /// reachable. Architectural shift expected around B-vi (runtime
+    /// device discovery).
+    pub fn enqueue(&mut self, trb: Trb) -> Option<u64> {
+        // Reserve the last slot for the Link TRB.
+        if self.producer >= COMMAND_RING_TRBS - 1 {
+            return None;
+        }
+
+        let trb_paddr = self.paddr + (self.producer * core::mem::size_of::<Trb>()) as u64;
+        let trb_vaddr = self.vaddr + (self.producer * core::mem::size_of::<Trb>()) as u64;
+
+        // Two-step write to commit the TRB atomically from the
+        // controller's perspective:
+        //
+        //   1. Write parameter + status + control-without-cycle.
+        //      This populates the body but the cycle bit (control[0])
+        //      stays at its old value (0 on a fresh-zeroed ring), so
+        //      the controller still treats the slot as "not produced."
+        //   2. Compiler fence (Release) to keep the body write ahead
+        //      of the cycle-bit write under reordering.
+        //   3. Write the control dword (offset 12, naturally aligned)
+        //      with the cycle bit set. This is a single 4-byte store
+        //      and acts as the "commit" — the controller sees the
+        //      full TRB the instant cycle flips.
+        //
+        // Doing a single 16-byte `write_volatile<Trb>` would let the
+        // compiler split into smaller stores in any order; the
+        // controller can then observe a cycle-matched TRB with stale
+        // body fields and assert USBSTS.HCE.
+        let body = Trb {
+            parameter: trb.parameter,
+            status: trb.status,
+            control: trb.control & !0x1, // cycle bit cleared
+        };
+        let control_with_cycle = (trb.control & !0x1) | (self.cycle as u32 & 0x1);
+
+        // SAFETY: `trb_vaddr` points into the DMA page allocated by
+        // `CommandRing::new`; we own it exclusively. The slot is
+        // 16-byte aligned (producer * 16 from a 4 KiB-aligned base);
+        // the +12 offset is u32-aligned (16-byte aligned + 12).
+        unsafe {
+            core::ptr::write_volatile(trb_vaddr as *mut Trb, body);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(
+                (trb_vaddr + 12) as *mut u32,
+                control_with_cycle,
+            );
+        }
+
+        self.producer += 1;
+        Some(trb_paddr)
+    }
+
     /// Allocate one page of DMA memory, zero it, install the Link TRB
     /// at the last slot. Returns `None` on `sys::alloc_dma` failure.
     pub fn new() -> Option<Self> {
@@ -176,6 +249,47 @@ pub struct EventRing {
 }
 
 impl EventRing {
+    /// Read the next TRB if the controller has produced one. Returns
+    /// `Some(trb)` when the TRB at the consumer slot has its cycle
+    /// bit matching the driver's current consumer cycle (the
+    /// controller has written there); `None` otherwise.
+    ///
+    /// On consumption, the consumer index advances; at end-of-segment
+    /// it wraps to 0 and the consumer cycle bit toggles. Callers must
+    /// update ERDP after consuming one or more events so the
+    /// controller knows how far the driver has caught up.
+    pub fn poll_next(&mut self) -> Option<Trb> {
+        let slot_offset = self.consumer * core::mem::size_of::<Trb>();
+        let trb_vaddr = self.vaddr + slot_offset as u64;
+
+        // SAFETY: `trb_vaddr` is within the DMA page allocated by
+        // `EventRing::new`. 16-byte aligned. The volatile read forces
+        // the load to observe the controller's most recent write.
+        let trb = unsafe { core::ptr::read_volatile(trb_vaddr as *const Trb) };
+
+        // Cycle bit at control[0]; if it doesn't match the consumer's
+        // current expected cycle, no event has been written here yet.
+        if (trb.control & 0x1) as u8 != self.cycle {
+            return None;
+        }
+
+        // Advance the consumer. End-of-segment → wrap to 0 + toggle
+        // cycle (controller flips its producer cycle on wrap, so the
+        // next batch of events arrives with the toggled cycle bit).
+        self.consumer += 1;
+        if self.consumer >= EVENT_RING_TRBS {
+            self.consumer = 0;
+            self.cycle ^= 1;
+        }
+        Some(trb)
+    }
+
+    /// Physical address of the next slot the consumer will read from
+    /// (used to compute the new ERDP value the caller writes back).
+    pub fn dequeue_paddr(&self) -> u64 {
+        self.paddr + (self.consumer * core::mem::size_of::<Trb>()) as u64
+    }
+
     pub fn new() -> Option<Self> {
         let mut paddr: u64 = 0;
         let ret = sys::alloc_dma(1, &mut paddr);

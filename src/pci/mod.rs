@@ -903,6 +903,30 @@ pub unsafe fn scan() {
             // SAFETY: Device confirmed present; cap walk is side-effect-free.
             let virtio_modern = unsafe { walk_virtio_modern_caps(0, dev, func) };
 
+            // Enable device. PCI Command Register at config offset 0x04
+            // (16-bit value in low half of the dword at 0x04):
+            //   bit 0: I/O Space Enable
+            //   bit 1: Memory Space Enable
+            //   bit 2: Bus Master Enable (required for the device to DMA)
+            // SeaBIOS initializes these for devices it recognizes, but
+            // the set isn't guaranteed across firmwares — making the
+            // kernel do it post-scan keeps the boot semantics uniform
+            // (xHCI controllers in particular HCE on first command when
+            // BME is unset, because their command-ring fetch is a DMA
+            // read). Status is the high 16 bits of the same dword and
+            // is RW1C; reading the dword and writing it back unchanged
+            // preserves status bits (writes of 0 are no-ops on RW1C).
+            // SAFETY: Device confirmed present; offset 0x04 is the
+            // standard PCI command/status register; this is a
+            // read-modify-write of architecturally-defined bits.
+            unsafe {
+                let cmd_status = config::read32(0, dev, func, 0x04);
+                let want = cmd_status | 0x7; // I/O + Memory + Bus Master
+                if want != cmd_status {
+                    config::write32(0, dev, func, 0x04, want);
+                }
+            }
+
             // SAFETY: `count < MAX_PCI_DEVICES` guaranteed by the check above.
             // This is the only writer (called once at boot).
             unsafe {
