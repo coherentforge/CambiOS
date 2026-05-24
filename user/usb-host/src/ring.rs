@@ -340,8 +340,8 @@ impl EventRing {
 /// Link TRB at the last slot with TC=1, cycle=1 at fresh init.
 ///
 /// B-iv allocates one for EP0 of the addressed device and installs its
-/// base into the EP0 Endpoint Context's TR Dequeue Pointer field. No
-/// enqueue path here yet — that's B-v's GET_DESCRIPTOR work.
+/// base into the EP0 Endpoint Context's TR Dequeue Pointer field. B-v
+/// enqueues the 3-TRB Setup/Data/Status sequence for GET_DESCRIPTOR.
 /// Revisit when: a second transfer ring lands (bulk endpoint at B-vi)
 /// and the duplication with `CommandRing` becomes concrete enough to
 /// justify a shared `TrbRing` underlying type.
@@ -352,11 +352,59 @@ pub struct TransferRing {
     /// Initial cycle bit (1 at fresh init). Producer toggles on each
     /// wrap; consumer (controller) tracks its own copy.
     pub cycle: u8,
-    /// Next-write index. Reserved for B-v — B-iv does not enqueue.
+    /// Next-write index.
     pub producer: usize,
 }
 
 impl TransferRing {
+    /// Enqueue a Transfer TRB at the current producer slot. Same shape
+    /// as `CommandRing::enqueue`: two-step write (body without cycle
+    /// → compiler_fence(Release) → control DWord with cycle bit) so
+    /// the controller cannot observe a cycle-matched TRB with stale
+    /// body fields under compiler-split single-write reordering.
+    ///
+    /// Returns the physical address of the TRB slot written, so
+    /// callers can match Transfer Events on the TRB pointer field.
+    /// Returns `None` if the next write would land in the Link TRB
+    /// slot (slot `TRANSFER_RING_TRBS - 1`). Link-wrap is
+    /// unimplemented — see [`CommandRing::enqueue`] for the same
+    /// rationale; transfer rings are bounded by hand-written EP0
+    /// transfers in B-v (3 TRBs per GET_DESCRIPTOR).
+    /// Revisit when: a runtime path (bulk endpoints with IRQ-driven
+    /// queue refill at B-vi) auto-issues transfers beyond hand-written
+    /// driver call sites.
+    pub fn enqueue(&mut self, trb: Trb) -> Option<u64> {
+        if self.producer >= TRANSFER_RING_TRBS - 1 {
+            return None;
+        }
+
+        let trb_paddr = self.paddr + (self.producer * core::mem::size_of::<Trb>()) as u64;
+        let trb_vaddr = self.vaddr + (self.producer * core::mem::size_of::<Trb>()) as u64;
+
+        let body = Trb {
+            parameter: trb.parameter,
+            status: trb.status,
+            control: trb.control & !0x1, // cycle bit cleared
+        };
+        let control_with_cycle = (trb.control & !0x1) | (self.cycle as u32 & 0x1);
+
+        // SAFETY: `trb_vaddr` points into the DMA page allocated by
+        // `TransferRing::new`; we own it exclusively. The slot is
+        // 16-byte aligned (producer * 16 from a 4 KiB-aligned base);
+        // the +12 offset is u32-aligned (16-byte aligned + 12).
+        unsafe {
+            core::ptr::write_volatile(trb_vaddr as *mut Trb, body);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(
+                (trb_vaddr + 12) as *mut u32,
+                control_with_cycle,
+            );
+        }
+
+        self.producer += 1;
+        Some(trb_paddr)
+    }
+
     /// Allocate one page of DMA memory, zero it, install the Link TRB
     /// at the last slot pointing back to the ring's base. Returns
     /// `None` on `sys::alloc_dma` failure.

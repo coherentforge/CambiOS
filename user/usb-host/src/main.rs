@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! CambiOS USB Host Driver — Stream B, substages B-i through B-iv.
+//! CambiOS USB Host Driver — Stream B, substages B-i through B-v.
 //!
 //! Userspace xHCI bring-up. Discovers an xHCI controller via the
 //! `DeviceInfo` syscall (PCI class=0x0C, subclass=0x03, prog_if=0x30),
@@ -9,16 +9,16 @@
 //! 1.2 § 5.3, resets the controller, sets up the Device Context Base
 //! Address Array + command ring + event ring + ERST, starts the
 //! controller, enumerates ports, addresses the first attached device,
-//! and idles on endpoint 31.
+//! issues a GET_DESCRIPTOR(Device) on EP0, and idles on endpoint 31.
 //!
-//! ## Scope — B-iv
+//! ## Scope — B-v
 //!
-//! End state: the addressed slot transitions Enabled → Addressed.
-//! Input Context + Device Context + EP0 transfer ring live in
-//! DMA-allocated pages; Device Context paddr is installed in
-//! DCBAA[slot_id]. B-v layers on top:
-//!   - GET_DESCRIPTOR via EP0 control transfer
-//!   - SET_CONFIGURATION + bulk endpoints + IRQ (B-vi)
+//! End state: the addressed slot has answered a GET_DESCRIPTOR(Device)
+//! over the EP0 control endpoint. The 18-byte Device Descriptor is in
+//! a DMA buffer and parsed for logging. B-vi layers on top:
+//!   - Config + interface + endpoint descriptors
+//!   - SET_CONFIGURATION + Configure Endpoint command
+//!   - Bulk endpoints + IRQ delivery
 //!
 //! On platforms where no xHCI controller is discovered (e.g. aarch64 /
 //! riscv64 QEMU without `-device qemu-xhci`), the driver logs a single
@@ -28,8 +28,8 @@
 //! ## IPC protocol
 //!
 //! Endpoint 31 is registered but accepts no commands yet. Incoming
-//! messages are read and dropped. Command surface lands at B-v / B-vii
-//! as the stack grows.
+//! messages are read and dropped. Command surface lands at B-vii
+//! (CCID class driver split) as the stack grows.
 
 #![no_std]
 #![no_main]
@@ -294,8 +294,75 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] address_device:", e);
+            return;
         }
     }
+
+    // Step 6 (B-v): GET_DESCRIPTOR(Device) on EP0 — 3-TRB control
+    // transfer (Setup / Data / Status). USB 2.0 § 9.4.3 + xHCI 1.2
+    // § 4.11.2.
+    sys::print(b"[USB-HOST] GET_DESCRIPTOR(Device)...\n");
+    match ctl.get_descriptor_device() {
+        Ok(desc) => log_device_descriptor(&desc),
+        Err(e) => log_b3_error(b"[USB-HOST] get_descriptor_device:", e),
+    }
+}
+
+/// Pretty-print the 18-byte Device Descriptor (USB 2.0 § 9.6.1).
+///
+/// Field layout (offsets):
+///   0   bLength
+///   1   bDescriptorType
+///   2-3 bcdUSB           (little-endian)
+///   4   bDeviceClass
+///   5   bDeviceSubClass
+///   6   bDeviceProtocol
+///   7   bMaxPacketSize0
+///   8-9 idVendor         (little-endian)
+///   10-11 idProduct      (little-endian)
+///   12-13 bcdDevice      (little-endian)
+///   14  iManufacturer
+///   15  iProduct
+///   16  iSerialNumber
+///   17  bNumConfigurations
+///
+/// `bMaxPacketSize0` is compared against the speed-default the
+/// driver set in `address_device`. If the device reports a different
+/// MPS, an Evaluate Context command is required to update the EP0
+/// context — not implemented today; for QEMU usb-ccid at Full Speed
+/// the default of 8 is spec-correct, so the warning won't fire in
+/// the bring-up path.
+/// Revisit when: a device reports `bMaxPacketSize0` != the
+/// driver's address_device default (warn-log fires), at which
+/// point Evaluate Context implementation becomes load-bearing.
+fn log_device_descriptor(desc: &[u8; 18]) {
+    let bcd_usb = u16::from_le_bytes([desc[2], desc[3]]);
+    let id_vendor = u16::from_le_bytes([desc[8], desc[9]]);
+    let id_product = u16::from_le_bytes([desc[10], desc[11]]);
+    let bcd_device = u16::from_le_bytes([desc[12], desc[13]]);
+
+    sys::print(b"[USB-HOST]   bLength = ");
+    log_dec(b"", desc[0] as u32);
+    sys::print(b"[USB-HOST]   bDescriptorType = ");
+    log_dec(b"", desc[1] as u32);
+    sys::print(b"[USB-HOST]   bcdUSB = ");
+    log_hex64(b"", bcd_usb as u64);
+    sys::print(b"[USB-HOST]   bDeviceClass = ");
+    log_dec(b"", desc[4] as u32);
+    sys::print(b"[USB-HOST]   bDeviceSubClass = ");
+    log_dec(b"", desc[5] as u32);
+    sys::print(b"[USB-HOST]   bDeviceProtocol = ");
+    log_dec(b"", desc[6] as u32);
+    sys::print(b"[USB-HOST]   bMaxPacketSize0 = ");
+    log_dec(b"", desc[7] as u32);
+    sys::print(b"[USB-HOST]   idVendor = ");
+    log_hex64(b"", id_vendor as u64);
+    sys::print(b"[USB-HOST]   idProduct = ");
+    log_hex64(b"", id_product as u64);
+    sys::print(b"[USB-HOST]   bcdDevice = ");
+    log_hex64(b"", bcd_device as u64);
+    sys::print(b"[USB-HOST]   bNumConfigurations = ");
+    log_dec(b"", desc[17] as u32);
 }
 
 fn log_bringup_error(e: xhci::XhciError) {
@@ -310,14 +377,19 @@ fn log_bringup_error(e: xhci::XhciError) {
             sys::print(b"[USB-HOST] ERROR: HCH never cleared after RUN; controller did not start\n"),
         xhci::XhciError::DmaAllocFailed =>
             sys::print(b"[USB-HOST] ERROR: alloc_dma failed during ring setup\n"),
-        // B-iii / B-iv variants can't reach this path — `bring_up`
-        // doesn't issue commands or touch ports. Handled explicitly
-        // so future bring-up additions don't silently fall through.
+        // B-iii / B-iv / B-v variants can't reach this path —
+        // `bring_up` doesn't issue commands, touch ports, or run
+        // transfers. Handled explicitly so future bring-up additions
+        // don't silently fall through.
         xhci::XhciError::PortResetTimeout |
         xhci::XhciError::CommandRingFull |
         xhci::XhciError::CommandTimeout |
         xhci::XhciError::CommandFailed(_) |
-        xhci::XhciError::SlotNotEnabled =>
+        xhci::XhciError::SlotNotEnabled |
+        xhci::XhciError::EpNotReady |
+        xhci::XhciError::TransferRingFull |
+        xhci::XhciError::TransferTimeout |
+        xhci::XhciError::TransferFailed(_) =>
             sys::print(b"[USB-HOST] ERROR: unexpected post-bring-up error during bring-up\n"),
     }
 }
@@ -337,7 +409,17 @@ fn log_b3_error(prefix: &[u8], e: xhci::XhciError) {
         }
         xhci::XhciError::SlotNotEnabled =>
             sys::print(b" slot not enabled (Address Device before Enable Slot)\n"),
-        _ => sys::print(b" unexpected bring-up error during B-iii/B-iv\n"),
+        xhci::XhciError::EpNotReady =>
+            sys::print(b" EP0 not ready (GET_DESCRIPTOR before Address Device)\n"),
+        xhci::XhciError::TransferRingFull =>
+            sys::print(b" EP0 transfer ring full (Link-wrap unimplemented)\n"),
+        xhci::XhciError::TransferTimeout =>
+            sys::print(b" transfer timeout (no Transfer Event)\n"),
+        xhci::XhciError::TransferFailed(code) => {
+            sys::print(b" transfer failed, completion code = ");
+            log_dec(b"", code as u32);
+        }
+        _ => sys::print(b" unexpected bring-up error during B-iii/B-iv/B-v\n"),
     }
 }
 

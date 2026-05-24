@@ -242,9 +242,13 @@ pub mod regs {
 /// TRB type values used at command/event level (xHCI 1.2 § 6.4.6).
 /// `pub` so main.rs can match on these without re-importing.
 pub mod trb_type {
+    pub const SETUP_STAGE: u8 = 2;
+    pub const DATA_STAGE: u8 = 3;
+    pub const STATUS_STAGE: u8 = 4;
     pub const ENABLE_SLOT_COMMAND: u8 = 9;
     pub const ADDRESS_DEVICE_COMMAND: u8 = 11;
     pub const NOOP_COMMAND: u8 = 23;
+    pub const TRANSFER_EVENT: u8 = 32;
     pub const COMMAND_COMPLETION_EVENT: u8 = 33;
 }
 
@@ -291,6 +295,17 @@ pub enum XhciError {
     /// Address Device called before Enable Slot — controller has no
     /// slot ID for the input/device context to live under.
     SlotNotEnabled,
+    /// EP0 control transfer attempted before Address Device set up
+    /// the slot's EP0 transfer ring + Device Context.
+    EpNotReady,
+    /// EP0 transfer ring overflowed (would write into the Link TRB slot).
+    /// Link-wrap is unimplemented — see `TransferRing::enqueue`.
+    TransferRingFull,
+    /// No matching Transfer Event arrived within the poll budget.
+    TransferTimeout,
+    /// Transfer completed with a non-Success completion code.
+    /// The inner `u8` carries the actual code (see `completion_code`).
+    TransferFailed(u8),
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +763,181 @@ impl XhciController {
             ((dw3 >> 27) & 0x1F) as u8
         };
         Ok(slot_state)
+    }
+
+    // -----------------------------------------------------------------
+    // B-v: GET_DESCRIPTOR via EP0 control transfer
+    // -----------------------------------------------------------------
+
+    /// Issue a GET_DESCRIPTOR(Device) on EP0 and return the 18-byte
+    /// Device Descriptor per USB 2.0 § 9.6.1. Walks the standard
+    /// 3-TRB control-transfer sequence (Setup / Data / Status) on the
+    /// slot's EP0 transfer ring; xHCI 1.2 § 4.11.2 + § 6.4.1.2.
+    ///
+    /// Requires that `address_device` has run successfully (slot_id +
+    /// ep0_transfer_ring populated). The caller observes the returned
+    /// `bMaxPacketSize0` against the speed-default used in
+    /// `address_device`; mismatch will need an Evaluate Context (not
+    /// implemented — see Convention 9 trigger in main.rs).
+    pub fn get_descriptor_device(&mut self) -> Result<[u8; 18], XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+        // The EP0 ring lives on `self`; take a brief move-out to enqueue
+        // on it without mutably borrowing the whole controller for the
+        // wait-for-event loop. Restored before return on every path.
+        let mut ring = self.ep0_transfer_ring.take().ok_or(XhciError::EpNotReady)?;
+
+        // Allocate the descriptor response buffer (one page is far
+        // more than the 18 bytes we'll read; alloc_dma's granularity
+        // is the page).
+        // Buffer pool lands when bulk endpoints land (B-vi); EP0
+        // GET_DESCRIPTOR runs once at enumeration so per-transfer
+        // alloc is acceptable.
+        // Revisit when: bulk IN/OUT endpoints land (B-vi) and the
+        // per-transfer alloc count becomes a hot path.
+        let (buf_paddr, buf_vaddr) = match Self::alloc_zeroed_page() {
+            Ok(p) => p,
+            Err(e) => {
+                self.ep0_transfer_ring = Some(ring);
+                return Err(e);
+            }
+        };
+
+        // Pack the 8-byte SETUP packet (USB 2.0 § 9.3) into the
+        // u64 parameter field of the Setup Stage TRB. Little-endian
+        // on x86_64; field order:
+        //   byte 0 : bmRequestType = 0x80 (D=IN | type=Standard | recipient=Device)
+        //   byte 1 : bRequest      = 0x06 (GET_DESCRIPTOR)
+        //   bytes 2-3 : wValue     = 0x0100 (high=descriptor type 1=DEVICE, low=index 0)
+        //   bytes 4-5 : wIndex     = 0x0000 (language ID; 0 for device descriptor)
+        //   bytes 6-7 : wLength    = 0x0012 (18 bytes — device descriptor size)
+        let setup_packet: u64 =
+            0x80u64                  // bmRequestType
+            | (0x06u64 << 8)         // bRequest
+            | (0x0100u64 << 16)      // wValue
+            | (0x0000u64 << 32)      // wIndex
+            | (0x0012u64 << 48);     // wLength
+
+        // Setup Stage TRB (xHCI 1.2 § 6.4.1.2.1).
+        //   parameter : 8-byte SETUP packet (IDT means TRB-resident)
+        //   status    : Interrupter Target [31:22]=0, TRB Transfer Length [16:0]=8
+        //   control   : Cycle (filled by enqueue), IOC=0, IDT [6]=1,
+        //               TRB Type [15:10]=2 (Setup Stage),
+        //               TRT (Transfer Type) [17:16]=3 (IN Data Stage)
+        let setup_trb = Trb {
+            parameter: setup_packet,
+            status: 8, // TRB Transfer Length = 8 (the SETUP packet)
+            control:
+                (1u32 << 6)                                  // IDT
+                | (3u32 << 16)                               // TRT = IN
+                | ((trb_type::SETUP_STAGE as u32) << 10),
+        };
+
+        // Data Stage TRB (xHCI 1.2 § 6.4.1.2.2).
+        //   parameter : buffer paddr (controller DMAs descriptor here)
+        //   status    : TRB Transfer Length = 18 (max bytes to receive)
+        //   control   : Cycle (enqueue), IOC=0, CH=0, DIR [16]=1 (IN),
+        //               TRB Type [15:10]=3 (Data Stage)
+        let data_trb = Trb {
+            parameter: buf_paddr,
+            status: 18,
+            control:
+                (1u32 << 16)                                 // DIR = IN
+                | ((trb_type::DATA_STAGE as u32) << 10),
+        };
+
+        // Status Stage TRB (xHCI 1.2 § 6.4.1.2.3).
+        //   parameter : 0 (no buffer)
+        //   status    : 0
+        //   control   : Cycle (enqueue), IOC [5]=1 (we want completion),
+        //               DIR [16]=0 (OUT — opposite of IN Data Stage),
+        //               TRB Type [15:10]=4 (Status Stage)
+        // Only this TRB sets IOC, so the controller emits one
+        // Transfer Event when the full 3-TRB sequence completes; the
+        // event's TRB Pointer matches the Status TRB's paddr.
+        let status_trb = Trb {
+            parameter: 0,
+            status: 0,
+            control:
+                (1u32 << 5)                                  // IOC
+                | ((trb_type::STATUS_STAGE as u32) << 10),
+        };
+
+        // Enqueue the three TRBs. On any failure, restore the ring
+        // and bail (the DMA buffer leaks — single-shot at boot, not
+        // worth a frame-allocator return path before B-vi).
+        let status_paddr = match (
+            ring.enqueue(setup_trb),
+            ring.enqueue(data_trb),
+            ring.enqueue(status_trb),
+        ) {
+            (Some(_), Some(_), Some(p)) => p,
+            _ => {
+                self.ep0_transfer_ring = Some(ring);
+                return Err(XhciError::TransferRingFull);
+            }
+        };
+
+        // Restore the ring on self before the wait — wait_for_*
+        // borrows the event ring through &mut self.
+        self.ep0_transfer_ring = Some(ring);
+
+        // Ring the device's EP0 doorbell. Target = slot_id; value =
+        // endpoint ID (1 = DCI 1 = EP0 bidirectional control endpoint).
+        // xHCI 1.2 § 6.4.5: doorbell value [7:0] = DB Target.
+        self.ring_doorbell(slot_id, 1);
+
+        // Wait for the matching Transfer Event. The Status TRB is the
+        // only one with IOC=1, so we expect exactly one event whose
+        // TRB pointer matches `status_paddr`.
+        self.wait_for_transfer_event(status_paddr)?;
+
+        // Copy the 18-byte device descriptor out of the DMA buffer.
+        // SAFETY: buf_vaddr is the page we allocated above (still
+        // mapped, owned exclusively); the device descriptor fits in
+        // 18 bytes well inside the page. Volatile reads make the
+        // controller's writes visible.
+        let mut desc = [0u8; 18];
+        unsafe {
+            let src = buf_vaddr as *const u8;
+            for (i, slot) in desc.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile(src.add(i));
+            }
+        }
+        Ok(desc)
+    }
+
+    /// Poll the event ring until a Transfer Event arrives whose TRB
+    /// pointer matches `expected_trb_paddr`. Non-matching events
+    /// (stray Port Status Change, Command Completion) are consumed
+    /// and dropped. Same shape as `wait_for_command_completion` —
+    /// duplication kept narrow for now.
+    /// Revisit when: a third consumer of the event-ring poll loop
+    /// appears (B-vi bulk transfers); refactor into
+    /// `wait_for_event(predicate)` then.
+    fn wait_for_transfer_event(
+        &mut self,
+        expected_trb_paddr: u64,
+    ) -> Result<Trb, XhciError> {
+        for _ in 0..MAX_POLL_ITERATIONS {
+            if let Some(event) = self.event_ring.poll_next() {
+                let trb_type_ = ((event.control >> 10) & 0x3F) as u8;
+                if trb_type_ == trb_type::TRANSFER_EVENT
+                    && event.parameter == expected_trb_paddr
+                {
+                    self.write_erdp_to_current();
+                    let code = (event.status >> 24) as u8;
+                    if code == completion_code::SUCCESS {
+                        return Ok(event);
+                    } else {
+                        return Err(XhciError::TransferFailed(code));
+                    }
+                }
+                continue;
+            }
+            sys::yield_now();
+        }
+        self.write_erdp_to_current();
+        Err(XhciError::TransferTimeout)
     }
 
     /// Allocate one 4 KiB DMA page and zero it. Returns (paddr, vaddr).
