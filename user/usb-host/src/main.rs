@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! CambiOS USB Host Driver — Stream B, substages B-i + B-ii.
+//! CambiOS USB Host Driver — Stream B, substages B-i through B-iv.
 //!
 //! Userspace xHCI bring-up. Discovers an xHCI controller via the
 //! `DeviceInfo` syscall (PCI class=0x0C, subclass=0x03, prog_if=0x30),
 //! maps its MMIO BAR, parses the capability register block per xHCI
 //! 1.2 § 5.3, resets the controller, sets up the Device Context Base
 //! Address Array + command ring + event ring + ERST, starts the
-//! controller, and idles on endpoint 31.
+//! controller, enumerates ports, addresses the first attached device,
+//! and idles on endpoint 31.
 //!
-//! ## Scope — B-ii
+//! ## Scope — B-iv
 //!
-//! End state: the controller is running (USBSTS.HCH=0), command and
-//! event rings are live in DMA-allocated pages, DCBAA is installed,
-//! CONFIG.MaxSlotsEn is set, and interrupter 0's ERST + ERDP are
-//! programmed. B-iii layers on top:
-//!   - Port enumeration (walk PORTSC, detect CCS, drive port reset)
-//!   - Slot enable / Address Device command issuance
-//!   - GET_DESCRIPTOR control transfer
+//! End state: the addressed slot transitions Enabled → Addressed.
+//! Input Context + Device Context + EP0 transfer ring live in
+//! DMA-allocated pages; Device Context paddr is installed in
+//! DCBAA[slot_id]. B-v layers on top:
+//!   - GET_DESCRIPTOR via EP0 control transfer
+//!   - SET_CONFIGURATION + bulk endpoints + IRQ (B-vi)
 //!
 //! On platforms where no xHCI controller is discovered (e.g. aarch64 /
 //! riscv64 QEMU without `-device qemu-xhci`), the driver logs a single
@@ -28,8 +28,8 @@
 //! ## IPC protocol
 //!
 //! Endpoint 31 is registered but accepts no commands yet. Incoming
-//! messages are read and dropped. Command surface lands at B-iii /
-//! B-v as the stack grows.
+//! messages are read and dropped. Command surface lands at B-v / B-vii
+//! as the stack grows.
 
 #![no_std]
 #![no_main]
@@ -241,7 +241,7 @@ fn run_b3(ctl: &mut xhci::XhciController) {
 
     sys::print(b"[USB-HOST] resetting port ");
     log_dec(b"", (port_idx + 1) as u32);
-    match ctl.reset_port(port_idx) {
+    let port_speed: u8 = match ctl.reset_port(port_idx) {
         Ok(post_portsc) => {
             let ped = post_portsc & PORTSC_PED != 0;
             let speed = ((post_portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
@@ -249,12 +249,13 @@ fn run_b3(ctl: &mut xhci::XhciController) {
             log_dec(b"", ped as u32);
             sys::print(b"[USB-HOST]   port speed = ");
             log_dec(b"", speed as u32);
+            speed
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] reset_port:", e);
             return;
         }
-    }
+    };
 
     // Step 3: NoOp Command smoke test — proves command/event flow
     // independently of slot semantics. xHCI 1.2 § 4.6.2.
@@ -278,6 +279,21 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] enable_slot:", e);
+            return;
+        }
+    }
+
+    // Step 5 (B-iv): Address Device — set up Input/Device Contexts +
+    // EP0 transfer ring, install Device Context into DCBAA, issue
+    // Address Device. xHCI 1.2 § 4.6.5.
+    sys::print(b"[USB-HOST] Address Device Command...\n");
+    match ctl.address_device(port_idx, port_speed) {
+        Ok(slot_state) => {
+            sys::print(b"[USB-HOST]   Address Device OK; slot state = ");
+            log_dec(b"", slot_state as u32);
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] address_device:", e);
         }
     }
 }
@@ -294,14 +310,15 @@ fn log_bringup_error(e: xhci::XhciError) {
             sys::print(b"[USB-HOST] ERROR: HCH never cleared after RUN; controller did not start\n"),
         xhci::XhciError::DmaAllocFailed =>
             sys::print(b"[USB-HOST] ERROR: alloc_dma failed during ring setup\n"),
-        // B-iii variants can't reach this path — `bring_up` doesn't
-        // issue commands or touch ports. Handled explicitly so future
-        // bring-up additions don't silently fall through.
+        // B-iii / B-iv variants can't reach this path — `bring_up`
+        // doesn't issue commands or touch ports. Handled explicitly
+        // so future bring-up additions don't silently fall through.
         xhci::XhciError::PortResetTimeout |
         xhci::XhciError::CommandRingFull |
         xhci::XhciError::CommandTimeout |
-        xhci::XhciError::CommandFailed(_) =>
-            sys::print(b"[USB-HOST] ERROR: unexpected B-iii error during bring-up\n"),
+        xhci::XhciError::CommandFailed(_) |
+        xhci::XhciError::SlotNotEnabled =>
+            sys::print(b"[USB-HOST] ERROR: unexpected post-bring-up error during bring-up\n"),
     }
 }
 
@@ -318,7 +335,9 @@ fn log_b3_error(prefix: &[u8], e: xhci::XhciError) {
             sys::print(b" command failed, completion code = ");
             log_dec(b"", code as u32);
         }
-        _ => sys::print(b" unexpected bring-up error during B-iii\n"),
+        xhci::XhciError::SlotNotEnabled =>
+            sys::print(b" slot not enabled (Address Device before Enable Slot)\n"),
+        _ => sys::print(b" unexpected bring-up error during B-iii/B-iv\n"),
     }
 }
 

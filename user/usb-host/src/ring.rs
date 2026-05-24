@@ -48,6 +48,17 @@ pub const COMMAND_RING_TRBS: usize = 256;
 /// fast enough, B-iv IRQ handling tightens this.
 pub const EVENT_RING_TRBS: usize = 256;
 
+/// SCAFFOLDING: 16-byte TRB count per transfer ring (per endpoint).
+/// One 4 KiB page = 256 TRBs (255 usable + Link). EP0 control transfers
+/// are short — 3 TRBs per setup/data/status sequence; v1-endgame
+/// CCID workload + a handful of HID devices is well under 256 in-flight.
+/// Why: bounded → verifier-tractable; one-page allocations match
+/// `sys::alloc_dma`'s native granularity.
+/// Replace when: bulk IN/OUT endpoints land (B-vi) and per-endpoint
+/// queue-depth instrumentation shows pressure — separate constant per
+/// endpoint class may be warranted then.
+pub const TRANSFER_RING_TRBS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // TRB
 // ---------------------------------------------------------------------------
@@ -317,6 +328,77 @@ impl EventRing {
 
     pub fn capacity_trbs(&self) -> u32 {
         EVENT_RING_TRBS as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TransferRing
+// ---------------------------------------------------------------------------
+
+/// A producer-owned ring of Transfer TRBs (one per endpoint). Single
+/// segment, one 4 KiB page. Structurally identical to [`CommandRing`]:
+/// Link TRB at the last slot with TC=1, cycle=1 at fresh init.
+///
+/// B-iv allocates one for EP0 of the addressed device and installs its
+/// base into the EP0 Endpoint Context's TR Dequeue Pointer field. No
+/// enqueue path here yet — that's B-v's GET_DESCRIPTOR work.
+/// Revisit when: a second transfer ring lands (bulk endpoint at B-vi)
+/// and the duplication with `CommandRing` becomes concrete enough to
+/// justify a shared `TrbRing` underlying type.
+#[allow(dead_code)]
+pub struct TransferRing {
+    pub paddr: u64,
+    pub vaddr: u64,
+    /// Initial cycle bit (1 at fresh init). Producer toggles on each
+    /// wrap; consumer (controller) tracks its own copy.
+    pub cycle: u8,
+    /// Next-write index. Reserved for B-v — B-iv does not enqueue.
+    pub producer: usize,
+}
+
+impl TransferRing {
+    /// Allocate one page of DMA memory, zero it, install the Link TRB
+    /// at the last slot pointing back to the ring's base. Returns
+    /// `None` on `sys::alloc_dma` failure.
+    pub fn new() -> Option<Self> {
+        let mut paddr: u64 = 0;
+        let ret = sys::alloc_dma(1, &mut paddr);
+        if ret < 0 {
+            return None;
+        }
+        let vaddr = ret as u64;
+
+        // SAFETY: alloc_dma returned a fresh 4 KiB region uniquely
+        // owned by this process; zero-initialize the whole page so
+        // every TRB slot starts with cycle=0 (the controller treats
+        // mismatched-cycle TRBs as "not yet produced").
+        unsafe {
+            core::ptr::write_bytes(vaddr as *mut u8, 0, 4096);
+        }
+
+        // Install the Link TRB at the last slot pointing back to the
+        // ring's base with TC=1 (toggle cycle on wrap) and Cycle=1
+        // (controller's initial cycle bit, matches our `cycle`).
+        let link = Trb {
+            parameter: paddr,
+            status: 0,
+            // Cycle=1, TC=1 (bit 1), Type=Link (bits 10..15)
+            control: 0x1 | (1 << 1) | ((trb_type::LINK as u32) << 10),
+        };
+        let link_offset = (TRANSFER_RING_TRBS - 1) * core::mem::size_of::<Trb>();
+        // SAFETY: link_offset = 255 * 16 = 4080; the 16-byte Link TRB
+        // ends at 4096, exactly the page boundary. The cast is to a
+        // naturally-aligned location (multiple of 16).
+        unsafe {
+            core::ptr::write_volatile((vaddr + link_offset as u64) as *mut Trb, link);
+        }
+
+        Some(Self {
+            paddr,
+            vaddr,
+            cycle: 1,
+            producer: 0,
+        })
     }
 }
 

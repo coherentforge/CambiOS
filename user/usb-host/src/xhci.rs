@@ -3,19 +3,28 @@
 
 //! xHCI controller bring-up per xHCI 1.2 § 4.2 + § 5.
 //!
-//! B-i shipped capability-register parsing. B-ii adds:
+//! B-i shipped capability-register parsing. B-ii added:
 //!   - Operational + runtime register accessors
 //!   - HCRESET sequence (§ 4.22.1)
 //!   - DCBAA / command-ring / event-ring + ERST setup (§ 4.2)
 //!   - USBCMD.RUN + HCH-clears assertion
 //!
+//! B-iii added port enumeration, the command/event flow (doorbell +
+//! `wait_for_command_completion`), and the first commands (NoOp +
+//! Enable Slot).
+//!
+//! B-iv adds Address Device — Input Context + Device Context + EP0
+//! transfer ring allocation, DCBAA slot installation, and the Address
+//! Device Command that transitions the slot to Addressed state.
+//!
 //! `XhciController` is the post-init handle: holds the MMIO base, the
-//! parsed capabilities, the derived op + runtime virtual addresses, and
-//! the in-DMA ring buffers. B-iii commands flow through this handle.
+//! parsed capabilities, the derived op + runtime virtual addresses, the
+//! in-DMA ring buffers, and (post-Address Device) the per-slot
+//! input/device context + EP0 transfer ring.
 
 use cambios_libsys as sys;
 
-use crate::ring::{CommandRing, EventRing, Erst, Trb};
+use crate::ring::{CommandRing, EventRing, Erst, TransferRing, Trb};
 
 // ---------------------------------------------------------------------------
 // Bound: poll iteration ceiling for HCRESET / RUN waits
@@ -233,8 +242,9 @@ pub mod regs {
 /// TRB type values used at command/event level (xHCI 1.2 § 6.4.6).
 /// `pub` so main.rs can match on these without re-importing.
 pub mod trb_type {
-    pub const NOOP_COMMAND: u8 = 23;
     pub const ENABLE_SLOT_COMMAND: u8 = 9;
+    pub const ADDRESS_DEVICE_COMMAND: u8 = 11;
+    pub const NOOP_COMMAND: u8 = 23;
     pub const COMMAND_COMPLETION_EVENT: u8 = 33;
 }
 
@@ -278,6 +288,9 @@ pub enum XhciError {
     /// Command completed with a non-Success completion code.
     /// The inner `u8` carries the actual code (see `completion_code` module).
     CommandFailed(u8),
+    /// Address Device called before Enable Slot — controller has no
+    /// slot ID for the input/device context to live under.
+    SlotNotEnabled,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +325,20 @@ pub struct XhciController {
     /// Slot ID returned by Enable Slot Command (B-iii). Threaded
     /// forward to B-iv's Address Device + B-v's GET_DESCRIPTOR.
     pub slot_id: Option<u8>,
+    /// Input Context (xHCI 1.2 § 6.2.5) — scratch structure passed to
+    /// Address Device and Configure Endpoint commands. Single-slot
+    /// today; allocated lazily in `address_device`.
+    /// Revisit when: multi-device discovery lands (B-vi) — these +
+    /// the device context + EP0 ring belong in a slot-indexed table.
+    pub input_context_paddr: Option<u64>,
+    pub input_context_vaddr: Option<u64>,
+    /// Device Context (xHCI 1.2 § 6.2.1) — controller writes here;
+    /// installed in DCBAA at slot_id.
+    pub device_context_paddr: Option<u64>,
+    pub device_context_vaddr: Option<u64>,
+    /// EP0 transfer ring — set up by Address Device, used by B-v
+    /// GET_DESCRIPTOR control transfers.
+    pub ep0_transfer_ring: Option<TransferRing>,
 }
 
 impl XhciController {
@@ -393,6 +420,11 @@ impl XhciController {
             event_ring,
             erst,
             slot_id: None,
+            input_context_paddr: None,
+            input_context_vaddr: None,
+            device_context_paddr: None,
+            device_context_vaddr: None,
+            ep0_transfer_ring: None,
         })
     }
 
@@ -583,6 +615,155 @@ impl XhciController {
         // Slot ID is in DWord 3 bits 24-31 of the completion event.
         let slot_id = ((event.control >> 24) & 0xFF) as u8;
         Ok(slot_id)
+    }
+
+    // -----------------------------------------------------------------
+    // B-iv: Address Device
+    // -----------------------------------------------------------------
+
+    /// Set up the Input Context + Device Context + EP0 transfer ring
+    /// for the slot allocated by Enable Slot, install the Device
+    /// Context into DCBAA, and issue Address Device (xHCI 1.2 §
+    /// 6.4.3.4). On success the slot transitions Enabled → Addressed
+    /// and the controller has issued SET_ADDRESS over the bus.
+    ///
+    /// `port_idx` is 0-indexed (spec port = port_idx + 1).
+    /// `speed` is the PORTSC Speed field value from the post-reset
+    /// PORTSC read (1 = FS, 2 = LS, 3 = HS, 4 = SS, 5 = SS+).
+    ///
+    /// Returns the post-Address-Device Slot State from the device
+    /// context (2 = Addressed on success). EP0 Max Packet Size is set
+    /// to a speed-appropriate default (FS/LS = 8, HS = 64, SS/SS+ =
+    /// 512); B-v's GET_DESCRIPTOR may refine via Evaluate Context if
+    /// the device descriptor disagrees.
+    pub fn address_device(&mut self, port_idx: u8, speed: u8) -> Result<u8, XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::SlotNotEnabled)?;
+
+        // Allocate Input Context + Device Context (one page each).
+        let (ic_paddr, ic_vaddr) = Self::alloc_zeroed_page()?;
+        let (dc_paddr, dc_vaddr) = Self::alloc_zeroed_page()?;
+        let ep0_ring = TransferRing::new().ok_or(XhciError::DmaAllocFailed)?;
+
+        // Context size selector (xHCI 1.2 § 4.5.1): CSZ=0 → 32 B per
+        // context, CSZ=1 → 64 B. Affects offsets in both Input Context
+        // and Device Context. ICC + Slot + EP0 = 3 contexts; one page
+        // (4 KiB) holds either 32 B × 33 = 1056 B or 64 B × 33 = 2112 B.
+        let ctx_size: u64 = if self.cap.csz { 64 } else { 32 };
+
+        // Fill Input Context. Layout (xHCI 1.2 § 6.2.5):
+        //   offset 0           : Input Control Context (one ctx_size)
+        //   offset ctx_size    : Slot Context (one ctx_size)
+        //   offset 2*ctx_size  : EP0 Endpoint Context (one ctx_size)
+        // SAFETY: ic_vaddr is the freshly allocated, zero-initialized
+        // 4 KiB DMA page owned exclusively by this driver. All offsets
+        // below stay within the first 3*ctx_size ≤ 192 bytes of the
+        // page; u32 writes at 4-byte multiples of a 4 KiB-aligned base
+        // are naturally aligned. Volatile writes ensure the controller
+        // observes the populated context when the command TRB is
+        // committed (the doorbell write in submit_command provides the
+        // ordering barrier on the bus side).
+        unsafe {
+            // Input Control Context (xHCI 1.2 § 6.2.5.1):
+            //   DWord 0: Drop Context flags D[31:2] (all zero — we add)
+            //   DWord 1: Add Context flags A[31:0] — A0=Slot, A1=EP0
+            let icc = ic_vaddr as *mut u32;
+            core::ptr::write_volatile(icc.add(1), 0x3); // A0|A1
+
+            // Slot Context (xHCI 1.2 § 6.2.2) at offset ctx_size.
+            //   DWord 0: Route String [19:0]=0, Speed [23:20]=speed,
+            //            Context Entries [31:27] = 1 (only EP0 valid)
+            //   DWord 1: Root Hub Port Number [23:16] = port_idx + 1
+            //   DWords 2,3: zero (TT info / device-address slot
+            //               state filled by controller)
+            let slot = (ic_vaddr + ctx_size) as *mut u32;
+            let slot_dw0 =
+                ((speed as u32 & 0xF) << 20) | (1u32 << 27);
+            let slot_dw1 = ((port_idx as u32 + 1) & 0xFF) << 16;
+            core::ptr::write_volatile(slot.add(0), slot_dw0);
+            core::ptr::write_volatile(slot.add(1), slot_dw1);
+
+            // EP0 Endpoint Context (xHCI 1.2 § 6.2.3) at offset
+            // 2 * ctx_size.
+            //   DWord 0: EP State [2:0]=0, all other fields 0
+            //   DWord 1: CErr [2:1] = 3, EP Type [5:3] = 4 (Control),
+            //            Max Packet Size [31:16] = speed-default
+            //   DWords 2,3: TR Dequeue Pointer (LO|DCS=1, HI)
+            //   DWord 4: Average TRB Length [15:0] = 8 (control EPs)
+            let ep0 = (ic_vaddr + 2 * ctx_size) as *mut u32;
+            let mps: u32 = match speed {
+                3 => 64,            // High Speed
+                4 | 5 => 512,       // SuperSpeed / SuperSpeedPlus
+                _ => 8,             // FS / LS / unknown — safe minimum
+            };
+            let ep0_dw1 =
+                (3u32 << 1) |       // CErr = 3
+                (4u32 << 3) |       // EP Type = Control
+                (mps << 16);
+            let dq = ep0_ring.paddr | 0x1; // DCS = 1
+            core::ptr::write_volatile(ep0.add(1), ep0_dw1);
+            core::ptr::write_volatile(ep0.add(2), dq as u32);
+            core::ptr::write_volatile(ep0.add(3), (dq >> 32) as u32);
+            core::ptr::write_volatile(ep0.add(4), 8); // Avg TRB Len
+        }
+
+        // Install Device Context into DCBAA[slot_id]. DCBAA entries
+        // are 8 bytes (u64 paddr) per xHCI 1.2 § 6.1.
+        // SAFETY: dcbaa_vaddr is the freshly allocated, zeroed DMA
+        // page owned by this driver. `slot_id` is bounded by
+        // MAX_SLOTS_ENABLED (8); slot_id * 8 ≤ 64 bytes, well inside
+        // the 4 KiB page. 8-byte write at a u64-aligned offset
+        // (multiple of 8 from a 4 KiB-aligned base).
+        unsafe {
+            let slot_entry = (self.dcbaa_vaddr + (slot_id as u64) * 8) as *mut u64;
+            core::ptr::write_volatile(slot_entry, dc_paddr);
+        }
+
+        // Submit Address Device command. BSR (Block Set Address
+        // Request) [9] = 0 → controller issues SET_ADDRESS on the
+        // bus. Slot ID in [31:24]. xHCI 1.2 § 6.4.3.4.
+        let trb = Trb {
+            parameter: ic_paddr,
+            status: 0,
+            control:
+                ((trb_type::ADDRESS_DEVICE_COMMAND as u32) << 10)
+                | ((slot_id as u32) << 24),
+        };
+        self.submit_command(trb)?;
+
+        // Stash handles for downstream substages.
+        self.input_context_paddr = Some(ic_paddr);
+        self.input_context_vaddr = Some(ic_vaddr);
+        self.device_context_paddr = Some(dc_paddr);
+        self.device_context_vaddr = Some(dc_vaddr);
+        self.ep0_transfer_ring = Some(ep0_ring);
+
+        // Read back the Device Context's Slot Context DWord 3 to
+        // report Slot State. Slot State is bits [31:27]. On success
+        // it should be 2 (Addressed).
+        // SAFETY: dc_vaddr is the freshly allocated DMA page; Slot
+        // Context lives at offset 0 in the Device Context (xHCI 1.2
+        // § 6.2.1). DWord 3 is 4 bytes at offset 12.
+        let slot_state = unsafe {
+            let dw3 = core::ptr::read_volatile((dc_vaddr + 12) as *const u32);
+            ((dw3 >> 27) & 0x1F) as u8
+        };
+        Ok(slot_state)
+    }
+
+    /// Allocate one 4 KiB DMA page and zero it. Returns (paddr, vaddr).
+    fn alloc_zeroed_page() -> Result<(u64, u64), XhciError> {
+        let mut paddr: u64 = 0;
+        let ret = sys::alloc_dma(1, &mut paddr);
+        if ret < 0 {
+            return Err(XhciError::DmaAllocFailed);
+        }
+        let vaddr = ret as u64;
+        // SAFETY: alloc_dma returned a fresh 4 KiB region uniquely
+        // owned by this process; zeroing initializes the entire page.
+        unsafe {
+            core::ptr::write_bytes(vaddr as *mut u8, 0, 4096);
+        }
+        Ok((paddr, vaddr))
     }
 
     // -----------------------------------------------------------------
