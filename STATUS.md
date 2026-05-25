@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-05-25 (USB host stack Stream B substage B-vii — CCID class driver split into user/ccid + cambios-ccid-proto wire-format crate; usb-host now stays controller-only and exposes BULK_OUT / BULK_IN IPC for any future smart-card-class consumer)
+last_synced_to_code: 2026-05-25 (docs: Dell 3630 references swept from code comments + STATUS / threat-model / ASSUMPTIONS as the bare-metal target gets re-chosen; ADR bodies left intact as historical record)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so
@@ -23,7 +23,7 @@ belongs in the linked ADR, not here.
 - **Security model live end-to-end**: cryptographic identity, signed-ELF verification, capability-gated IPC, content-addressed ObjectStore, audit ring, kernel identity gate, userspace `recv_verified`.
 - **GUI stack live on x86_64 + aarch64**: scanout-virtio-gpu drives QEMU virtio-gpu-pci; compositor composites; virtio-input forwards HID keyboard/pointer events into the focused window; first-party app `pong` (continuous-motion 1-player vs AI) runs as the default GUI boot module on x86_64, and `worm` renders on aarch64 via `make run-aarch64-gui` now that the kernel has an ECAM-based PCI enumerator. `tree` (Minesweeper) stays buildable for regression.
 - **Persistent storage live**: virtio-blk + disk-backed ObjectStore + `arcobj` shell CLI; objects survive reboot.
-- **Bare metal**: USB boot tooling complete, untested on target hardware (Dell Precision 3630).
+- **Bare metal**: USB boot tooling complete, untested on hardware.
 - **Formal verification**: Kani proofs live on BuddyAllocator + ELF parser + FrameAllocator + CapabilityManager + UserSlice + DTB parser (1 + 7 + 10 + 12 + 12 + 5 = 47 harnesses across 6 proof crates; proof authoring fixed 6 overflow sites in `src/loader/elf.rs`, 2 in `src/memory/frame_allocator.rs`, and 2 in `src/boot/riscv.rs`). [verification/CLAIMS.md](verification/CLAIMS.md) tracks the gap between proven and aspirational claims.
 
 ## Recent landings
@@ -168,7 +168,7 @@ Source: [identity.md](docs/identity.md), [FS-and-ID-design-plan.md](docs/FS-and-
 
 ### v1 target
 
-*Interactive, network-capable, identity-rooted OS running on real hardware with persistent storage.* Items are dependency-ordered. Blocker = Intel I219-LM real-hardware bring-up on Dell 3630.
+*Interactive, network-capable, identity-rooted OS running on real hardware with persistent storage.* Items are dependency-ordered. Blocker = bare-metal hardware bring-up.
 
 | # | Item | Status |
 |---|---|---|

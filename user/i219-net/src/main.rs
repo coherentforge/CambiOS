@@ -4,7 +4,7 @@
 //! CambiOS Intel I219-LM Network Driver — user-space, MMIO-based.
 //!
 //! Targets the Intel I219-LM Ethernet controller integrated into 100/200/300
-//! /400-series PCH chipsets (e.g., the Dell Precision 3630). Discovers the
+//! /400-series PCH chipsets (Cannon Point and similar). Discovers the
 //! device via the DeviceInfo PCI syscall, maps BAR0, initializes the MAC and
 //! Lewisville PHY, sets up TX/RX descriptor rings backed by DMA bounce
 //! buffers, and exposes packet send/receive over the same IPC protocol as

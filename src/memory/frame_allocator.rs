@@ -20,15 +20,15 @@ pub const PAGE_SIZE: u64 = 4096;
 /// SCAFFOLDING: physical frame allocator covers the first 16 GiB.
 /// (4194304 frames × 4 KiB = 16 GiB; bitmap is 512 KiB in `.bss`.)
 ///
-/// Fits both QEMU targets and the Dell 3630 bare-metal target:
+/// Fits both QEMU targets and v1-target bare-metal workstation hardware:
 /// - x86_64 QEMU: RAM at 0x0, typically ≤ 512 MiB
 /// - AArch64 QEMU virt: RAM at 0x40000000 (1 GiB), needs frames up to ~1.25 GiB
-/// - Dell 3630 bare metal: 16 GiB RAM — this is why the ceiling was raised
+/// - Bare-metal x86_64 workstation: 16 GiB RAM — the ceiling target
 ///
 /// Why: bitmap-based allocator with .bss-sized bitmap is the simplest correct
 ///      implementation. The old 2 GiB ceiling was a documented bare-metal
-///      blocker (Dell 3630 has 16 GiB); bumping to 16 GiB resolves that and
-///      gives headroom for the v1 endgame graphics workload (ADR-011) which
+///      blocker (target hardware has 16 GiB); bumping to 16 GiB resolves that
+///      and gives headroom for the v1 endgame graphics workload (ADR-011) which
 ///      can hold multi-GiB GPU textures, backing stores, and framebuffers.
 ///      Bitmap grows from 64 KiB to 512 KiB in .bss — a 448 KiB increase
 ///      in the kernel's runtime memory footprint, no impact on binary size.

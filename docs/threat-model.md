@@ -9,7 +9,7 @@ authoritative_for: ranked adversarial attack surfaces against CambiOS, what each
 
 Companion to [SECURITY.md](SECURITY.md), which describes *posture* and *enforcement points*. This document describes *attacks* — ranked by yield against CambiOS as it exists today, with current mitigations and the observable trigger that should cause each to be re-audited.
 
-A threat listed here is not a bug report. Some are live (exploitable today), some are latent (need future code to become live), some are out-of-scope-today (depend on environmental assumptions that haven't been resolved, e.g. physical access on the Dell). The ledger's purpose is twofold:
+A threat listed here is not a bug report. Some are live (exploitable today), some are latent (need future code to become live), some are out-of-scope-today (depend on environmental assumptions that haven't been resolved, e.g. physical access on bare metal). The ledger's purpose is twofold:
 
 1. **No threat gets forgotten.** When something is mitigated or deleted, the entry moves to `Status: Mitigated` / `Removed`, it does not disappear.
 2. **External review has a starting point.** Post-HN, this is the document a security researcher reads first to understand what has and has not been audited.
@@ -51,17 +51,17 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 ## T-2 — Pre-kernel attacker on boot media
 
-**Threat.** An adversary with brief physical access to the Dell 3630 (evil maid), or with pre-boot malware persistence, modifies the Limine config or the kernel ELF on the boot partition. The modified kernel boots, ARCSIG verification is irrelevant because *the verifier is the kernel itself* and no measurement exists below the kernel.
+**Threat.** An adversary with brief physical access to a bare-metal CambiOS install (evil maid), or with pre-boot malware persistence, modifies the Limine config or the kernel ELF on the boot partition. The modified kernel boots, ARCSIG verification is irrelevant because *the verifier is the kernel itself* and no measurement exists below the kernel.
 
-**Why it matters for CambiOS.** The project's identity model anchors at the bootstrap Principal, which is generated inside the already-booted kernel. Nothing in firmware measures the kernel before it runs. On QEMU this is abstract. On the Dell it's physical reality.
+**Why it matters for CambiOS.** The project's identity model anchors at the bootstrap Principal, which is generated inside the already-booted kernel. Nothing in firmware measures the kernel before it runs. On QEMU this is abstract. On real hardware it's physical reality.
 
-**Current mitigation.** None on the Dell. UEFI image validates in QEMU; bare-metal boot pending.
+**Current mitigation.** None on bare metal. UEFI image validates in QEMU; bare-metal boot pending.
 
-**Gap.** Secure Boot / BitLocker decision unresolved (see project memory: `dell_bare_metal_gate`). TPM measured boot not integrated. Firmware-level anchor does not exist.
+**Gap.** Secure Boot / TPM measured-boot integration not decided. Firmware-level anchor does not exist.
 
-**Severity.** Critical (attacker with physical access). **Status.** Out-of-scope-today pending the Dell boot-gate decision; Live the moment physical deployment begins without a firmware anchor.
+**Severity.** Critical (attacker with physical access). **Status.** Out-of-scope-today pending the bare-metal boot story; Live the moment physical deployment begins without a firmware anchor.
 
-**Revisit when:** Jason picks one of the three Secure Boot / BitLocker options in `dell_bare_metal_gate`; or when `docs/camBIOS.md` (project memory: `cambios_firmware`) firmware roadmap produces a measurable boot anchor.
+**Revisit when:** the bare-metal target and its boot anchor (Secure Boot, TPM, or `docs/camBIOS.md` per project memory `cambios_firmware`) are chosen.
 
 ---
 

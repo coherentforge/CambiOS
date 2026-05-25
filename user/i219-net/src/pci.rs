@@ -14,16 +14,16 @@ pub const INTEL_VENDOR_ID: u16 = 0x8086;
 
 /// Known I219-LM device IDs.
 ///
-/// The 300-series PCH (Cannon Point, used by the Dell Precision 3630)
-/// most likely uses 0x15BB (I219-LM v10) or 0x15BE (I219-LM v11), but
-/// Dell ships minor stepping variants across SKUs. We probe the broader
-/// I219-LM family — register layout is essentially identical across
-/// v8-v13, only PHY firmware quirks differ.
+/// The 300-series PCH (Cannon Point) most commonly uses 0x15BB (I219-LM
+/// v10) or 0x15BE (I219-LM v11), but OEMs ship minor stepping variants
+/// across SKUs. We probe the broader I219-LM family — register layout
+/// is essentially identical across v8-v13, only PHY firmware quirks
+/// differ.
 ///
 /// To find the exact ID on your machine, boot a Linux live USB and run:
 ///   `lspci -nn | grep Ethernet`
 pub const I219_DEVICE_IDS: &[u16] = &[
-    // Cannon Point (300-series, Dell 3630 candidates)
+    // Cannon Point (300-series)
     0x15BB, // I219-LM v10
     0x15BC, // I219-V v10
     0x15BD, // I219-V v11

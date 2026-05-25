@@ -520,8 +520,8 @@ mod tests {
         assert!(n <= TIER2_POLICY.max_slots);
     }
 
-    /// 32 GB — high-end Tier 3 workstation (e.g. Dell 3630 target at
-    /// 16 GB gets scaled up for headroom testing).
+    /// 32 GB — high-end Tier 3 workstation (the v1 16 GB bare-metal
+    /// target scaled up for headroom testing).
     #[test]
     fn tier3_at_32_gb() {
         let n = num_slots_from(&TIER3_POLICY, 32u64 * 1024 * 1024 * 1024);

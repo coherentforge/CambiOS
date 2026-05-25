@@ -977,7 +977,7 @@ run-uefi: iso
 		-m 4G \
 		-no-reboot
 
-# x86_64 FAT32 UEFI image — for USB boot on bare metal (Dell 3630 etc.)
+# x86_64 FAT32 UEFI image — for USB boot on bare-metal x86_64 hardware.
 # Usage: make img-x86 && sudo dd if=cambios-x86.img of=/dev/diskN bs=1M
 IMG_X86 := cambios-x86.img
 
@@ -1057,8 +1057,7 @@ run-img-x86: img-x86
 #
 # Builds a GPT-partitioned disk image with a single EFI System Partition
 # (ESP) containing all kernel + signed user-space modules. Suitable for
-# `dd`-ing to a USB stick and booting on bare-metal UEFI systems
-# (Dell 3630, etc.).
+# `dd`-ing to a USB stick and booting on bare-metal UEFI systems.
 #
 # Layout:
 #   LBA 0:        Protective MBR (created by sgdisk)

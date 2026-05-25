@@ -192,8 +192,7 @@ pub fn evdev_to_hid(code: u16) -> u32 {
 /// negotiation protocol lands (boot-time setting, runtime selector, or
 /// server-driven layout via the future Input Hub). Until then every
 /// keyboard the driver binds is treated as US QWERTY — fine for the
-/// QEMU virtio-keyboard demo target and the Dell 3630 development
-/// machine, both physically US-layout.
+/// QEMU virtio-keyboard demo target and US-layout bare-metal hardware.
 ///
 /// CapsLock is intentionally ignored in v0: the modifier bit isn't
 /// tracked in `dev.modifiers` (only Shift/Ctrl/Alt/Meta are), so even if
