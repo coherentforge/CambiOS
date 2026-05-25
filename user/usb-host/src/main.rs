@@ -35,6 +35,7 @@
 #![no_main]
 #![deny(unsafe_code)]
 
+mod descriptors;
 mod pci;
 #[allow(unsafe_code)]
 mod ring;
@@ -302,10 +303,83 @@ fn run_b3(ctl: &mut xhci::XhciController) {
     // transfer (Setup / Data / Status). USB 2.0 § 9.4.3 + xHCI 1.2
     // § 4.11.2.
     sys::print(b"[USB-HOST] GET_DESCRIPTOR(Device)...\n");
-    match ctl.get_descriptor_device() {
-        Ok(desc) => log_device_descriptor(&desc),
-        Err(e) => log_b3_error(b"[USB-HOST] get_descriptor_device:", e),
+    let device_desc = match ctl.get_descriptor_device() {
+        Ok(desc) => {
+            log_device_descriptor(&desc);
+            desc
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] get_descriptor_device:", e);
+            return;
+        }
+    };
+
+    // Reconcile EP0 Max Packet Size with the device's actual value.
+    // `address_device` set a speed-default (FS=8, HS=64, SS/SS+=512)
+    // because the real value can't be known until GET_DESCRIPTOR
+    // returns. xHCI 1.2 § 4.6.7's Evaluate Context Command updates
+    // the EP0 endpoint context in place.
+    let speed_default_mps = match port_speed {
+        3 => 64,
+        4 | 5 => 512,
+        _ => 8,
+    };
+    let actual_mps = device_desc[7] as u16;
+    if actual_mps != speed_default_mps {
+        sys::print(b"[USB-HOST] Evaluate Context: EP0 MPS ");
+        log_dec(b"", speed_default_mps as u32);
+        sys::print(b"[USB-HOST]                  -> ");
+        log_dec(b"", actual_mps as u32);
+        match ctl.evaluate_ep0_context(actual_mps) {
+            Ok(()) => sys::print(b"[USB-HOST]   Evaluate Context OK\n"),
+            Err(e) => {
+                log_b3_error(b"[USB-HOST] evaluate_ep0_context:", e);
+                return;
+            }
+        }
     }
+
+    // GET_DESCRIPTOR(Configuration): two-pass read of the full nested
+    // descriptor blob (Configuration + Interface + Endpoint + class-
+    // specific). USB 2.0 § 9.4.3.
+    sys::print(b"[USB-HOST] GET_DESCRIPTOR(Configuration)...\n");
+    let mut blob = [0u8; xhci::MAX_CONFIG_DESCRIPTOR_SIZE];
+    let blob_len = match ctl.get_descriptor_configuration(&mut blob) {
+        Ok(n) => {
+            sys::print(b"[USB-HOST]   wTotalLength = ");
+            log_dec(b"", n as u32);
+            n
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] get_descriptor_configuration:", e);
+            return;
+        }
+    };
+
+    // Walk the blob for the CCID interface and its bulk IN + OUT
+    // endpoints. CCID 1.1 § 4: bInterfaceClass = 0x0B identifies the
+    // smart-card / CCID class; the interface is followed by class-
+    // specific descriptors then the bulk endpoint pair.
+    match descriptors::find_ccid_interface(&blob[..blob_len]) {
+        Ok(ccid) => log_ccid_endpoints(&ccid),
+        Err(_) => sys::print(b"[USB-HOST]   no CCID interface found in config blob\n"),
+    }
+}
+
+fn log_ccid_endpoints(ccid: &descriptors::CcidEndpoints) {
+    sys::print(b"[USB-HOST]   CCID interface found:\n");
+    sys::print(b"[USB-HOST]     bConfigurationValue = ");
+    log_dec(b"", ccid.configuration_value as u32);
+    sys::print(b"[USB-HOST]     bInterfaceNumber = ");
+    log_dec(b"", ccid.interface_number as u32);
+    sys::print(b"[USB-HOST]     bulk IN  addr = ");
+    log_hex64(b"", ccid.bulk_in.address as u64);
+    sys::print(b"[USB-HOST]              MPS  = ");
+    log_dec(b"", ccid.bulk_in.max_packet_size_bytes() as u32);
+    sys::print(b"[USB-HOST]     bulk OUT addr = ");
+    log_hex64(b"", ccid.bulk_out.address as u64);
+    sys::print(b"[USB-HOST]              MPS  = ");
+    log_dec(b"", ccid.bulk_out.max_packet_size_bytes() as u32);
 }
 
 /// Pretty-print the 18-byte Device Descriptor (USB 2.0 § 9.6.1).

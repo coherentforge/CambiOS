@@ -55,6 +55,22 @@ const MAX_POLL_ITERATIONS: u32 = 1000;
 /// CCID, signed-carrier input device + keyboard + mouse + …).
 pub const MAX_SLOTS_ENABLED: u8 = 8;
 
+/// SCAFFOLDING: max bytes the driver will read for a single
+/// configuration-descriptor blob (config + nested interface +
+/// endpoint + class-specific descriptors). The USB 2.0 spec gives
+/// `wTotalLength` 16 bits, so the protocol max is 65535; in practice
+/// config descriptors for a CCID + a couple of HID-class devices stay
+/// well under 256 bytes. 512 covers the v1-endgame device set with
+/// 4-8× headroom while keeping the response buffer fitting in a
+/// single 4 KiB DMA page along with the controller's transfer
+/// metadata.
+/// Why: bounded → verifier-tractable; smaller is a memory win
+/// (per-enumeration, freed when the device is reconfigured).
+/// Replace when: a target device's `wTotalLength` exceeds this cap
+/// (would show up as a truncated read; the parser already validates
+/// the blob fits its own internal length).
+pub const MAX_CONFIG_DESCRIPTOR_SIZE: usize = 512;
+
 // ---------------------------------------------------------------------------
 // Capability register block (xHCI 1.2 § 5.3)
 // ---------------------------------------------------------------------------
@@ -247,6 +263,7 @@ pub mod trb_type {
     pub const STATUS_STAGE: u8 = 4;
     pub const ENABLE_SLOT_COMMAND: u8 = 9;
     pub const ADDRESS_DEVICE_COMMAND: u8 = 11;
+    pub const EVALUATE_CONTEXT_COMMAND: u8 = 13;
     pub const NOOP_COMMAND: u8 = 23;
     pub const TRANSFER_EVENT: u8 = 32;
     pub const COMMAND_COMPLETION_EVENT: u8 = 33;
@@ -766,56 +783,33 @@ impl XhciController {
     }
 
     // -----------------------------------------------------------------
-    // B-v: GET_DESCRIPTOR via EP0 control transfer
+    // EP0 control transfers + standard requests
     // -----------------------------------------------------------------
 
-    /// Issue a GET_DESCRIPTOR(Device) on EP0 and return the 18-byte
-    /// Device Descriptor per USB 2.0 § 9.6.1. Walks the standard
-    /// 3-TRB control-transfer sequence (Setup / Data / Status) on the
-    /// slot's EP0 transfer ring; xHCI 1.2 § 4.11.2 + § 6.4.1.2.
+    /// Run a 3-TRB IN control transfer on EP0: Setup Stage → Data
+    /// Stage (IN) → Status Stage (OUT, IOC=1). Returns once the
+    /// matching Transfer Event arrives. The caller owns the response
+    /// buffer at `buf_paddr` and reads it back via the mapped vaddr.
     ///
-    /// Requires that `address_device` has run successfully (slot_id +
-    /// ep0_transfer_ring populated). The caller observes the returned
-    /// `bMaxPacketSize0` against the speed-default used in
-    /// `address_device`; mismatch will need an Evaluate Context (not
-    /// implemented — see Convention 9 trigger in main.rs).
-    pub fn get_descriptor_device(&mut self) -> Result<[u8; 18], XhciError> {
+    /// `setup_packet` packs the 8-byte SETUP packet into a u64 in
+    /// little-endian order (USB 2.0 § 9.3): byte 0 = bmRequestType,
+    /// byte 1 = bRequest, bytes 2-3 = wValue, bytes 4-5 = wIndex,
+    /// bytes 6-7 = wLength. xHCI 1.2 § 6.4.1.2.1 calls this the
+    /// "TRB-resident" SETUP form, signalled by IDT=1 in the Setup
+    /// Stage TRB.
+    ///
+    /// `length` is the Data Stage transfer length (≤ `wLength`).
+    fn control_transfer_in(
+        &mut self,
+        setup_packet: u64,
+        buf_paddr: u64,
+        length: u16,
+    ) -> Result<(), XhciError> {
         let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
         // The EP0 ring lives on `self`; take a brief move-out to enqueue
         // on it without mutably borrowing the whole controller for the
         // wait-for-event loop. Restored before return on every path.
         let mut ring = self.ep0_transfer_ring.take().ok_or(XhciError::EpNotReady)?;
-
-        // Allocate the descriptor response buffer (one page is far
-        // more than the 18 bytes we'll read; alloc_dma's granularity
-        // is the page).
-        // Buffer pool lands when bulk endpoints land (B-vi); EP0
-        // GET_DESCRIPTOR runs once at enumeration so per-transfer
-        // alloc is acceptable.
-        // Revisit when: bulk IN/OUT endpoints land (B-vi) and the
-        // per-transfer alloc count becomes a hot path.
-        let (buf_paddr, buf_vaddr) = match Self::alloc_zeroed_page() {
-            Ok(p) => p,
-            Err(e) => {
-                self.ep0_transfer_ring = Some(ring);
-                return Err(e);
-            }
-        };
-
-        // Pack the 8-byte SETUP packet (USB 2.0 § 9.3) into the
-        // u64 parameter field of the Setup Stage TRB. Little-endian
-        // on x86_64; field order:
-        //   byte 0 : bmRequestType = 0x80 (D=IN | type=Standard | recipient=Device)
-        //   byte 1 : bRequest      = 0x06 (GET_DESCRIPTOR)
-        //   bytes 2-3 : wValue     = 0x0100 (high=descriptor type 1=DEVICE, low=index 0)
-        //   bytes 4-5 : wIndex     = 0x0000 (language ID; 0 for device descriptor)
-        //   bytes 6-7 : wLength    = 0x0012 (18 bytes — device descriptor size)
-        let setup_packet: u64 =
-            0x80u64                  // bmRequestType
-            | (0x06u64 << 8)         // bRequest
-            | (0x0100u64 << 16)      // wValue
-            | (0x0000u64 << 32)      // wIndex
-            | (0x0012u64 << 48);     // wLength
 
         // Setup Stage TRB (xHCI 1.2 § 6.4.1.2.1).
         //   parameter : 8-byte SETUP packet (IDT means TRB-resident)
@@ -825,7 +819,7 @@ impl XhciController {
         //               TRT (Transfer Type) [17:16]=3 (IN Data Stage)
         let setup_trb = Trb {
             parameter: setup_packet,
-            status: 8, // TRB Transfer Length = 8 (the SETUP packet)
+            status: 8,
             control:
                 (1u32 << 6)                                  // IDT
                 | (3u32 << 16)                               // TRT = IN
@@ -833,13 +827,13 @@ impl XhciController {
         };
 
         // Data Stage TRB (xHCI 1.2 § 6.4.1.2.2).
-        //   parameter : buffer paddr (controller DMAs descriptor here)
-        //   status    : TRB Transfer Length = 18 (max bytes to receive)
+        //   parameter : buffer paddr (controller DMAs response here)
+        //   status    : TRB Transfer Length = response buffer size
         //   control   : Cycle (enqueue), IOC=0, CH=0, DIR [16]=1 (IN),
         //               TRB Type [15:10]=3 (Data Stage)
         let data_trb = Trb {
             parameter: buf_paddr,
-            status: 18,
+            status: length as u32,
             control:
                 (1u32 << 16)                                 // DIR = IN
                 | ((trb_type::DATA_STAGE as u32) << 10),
@@ -862,9 +856,6 @@ impl XhciController {
                 | ((trb_type::STATUS_STAGE as u32) << 10),
         };
 
-        // Enqueue the three TRBs. On any failure, restore the ring
-        // and bail (the DMA buffer leaks — single-shot at boot, not
-        // worth a frame-allocator return path before B-vi).
         let status_paddr = match (
             ring.enqueue(setup_trb),
             ring.enqueue(data_trb),
@@ -890,6 +881,39 @@ impl XhciController {
         // only one with IOC=1, so we expect exactly one event whose
         // TRB pointer matches `status_paddr`.
         self.wait_for_transfer_event(status_paddr)?;
+        Ok(())
+    }
+
+    /// Issue a GET_DESCRIPTOR(Device) on EP0 and return the 18-byte
+    /// Device Descriptor per USB 2.0 § 9.6.1.
+    ///
+    /// Requires that `address_device` has run successfully (slot_id +
+    /// ep0_transfer_ring populated). The caller compares the
+    /// returned `bMaxPacketSize0` against the speed-default used in
+    /// `address_device`; mismatch requires `evaluate_ep0_context`
+    /// to be issued before subsequent EP0 transfers.
+    pub fn get_descriptor_device(&mut self) -> Result<[u8; 18], XhciError> {
+        // Per-transfer DMA buffer alloc (alloc_dma's granularity is
+        // one page; we only read 18 bytes from it). EP0 control
+        // transfers are infrequent; a buffer pool would be premature
+        // optimization at this layer.
+        // Revisit when: bulk IN/OUT endpoints land (B-vi) and the
+        // per-transfer alloc count becomes a hot path.
+        let (buf_paddr, buf_vaddr) = Self::alloc_zeroed_page()?;
+
+        // SETUP packet for GET_DESCRIPTOR(Device):
+        //   bmRequestType = 0x80 (D=IN | type=Standard | recipient=Device)
+        //   bRequest      = 0x06 (GET_DESCRIPTOR)
+        //   wValue        = 0x0100 (descriptor type 1=DEVICE, index 0)
+        //   wIndex        = 0x0000 (language ID; 0 for device)
+        //   wLength       = 0x0012 (18 bytes — device descriptor size)
+        let setup_packet: u64 =
+            0x80u64
+            | (0x06u64 << 8)
+            | (0x0100u64 << 16)
+            | (0x0012u64 << 48);
+
+        self.control_transfer_in(setup_packet, buf_paddr, 18)?;
 
         // Copy the 18-byte device descriptor out of the DMA buffer.
         // SAFETY: buf_vaddr is the page we allocated above (still
@@ -904,6 +928,135 @@ impl XhciController {
             }
         }
         Ok(desc)
+    }
+
+    /// Issue GET_DESCRIPTOR(Configuration) on EP0 and copy the full
+    /// nested blob (Configuration + Interface + Endpoint + class-
+    /// specific descriptors) into `out`. Returns the number of bytes
+    /// the device actually delivered.
+    ///
+    /// Two-pass per USB 2.0 § 9.4.3: first request reads 9 bytes
+    /// (Configuration Descriptor only) to learn `wTotalLength`; the
+    /// second request reads the full blob. `out` must be at least as
+    /// large as the device's declared `wTotalLength`, capped at
+    /// `MAX_CONFIG_DESCRIPTOR_SIZE`; oversized devices return
+    /// `TransferFailed` so the caller knows to raise the cap.
+    pub fn get_descriptor_configuration(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
+        if out.len() < 9 {
+            return Err(XhciError::TransferRingFull); // out-of-band misuse signal
+        }
+
+        let (buf_paddr, buf_vaddr) = Self::alloc_zeroed_page()?;
+
+        // Pass 1: read the Configuration Descriptor's 9 bytes to get
+        // wTotalLength.
+        //   bmRequestType = 0x80
+        //   bRequest      = 0x06 (GET_DESCRIPTOR)
+        //   wValue        = 0x0200 (descriptor type 2=CONFIGURATION, index 0)
+        //   wIndex        = 0x0000
+        //   wLength       = 0x0009
+        let setup_short: u64 =
+            0x80u64
+            | (0x06u64 << 8)
+            | (0x0200u64 << 16)
+            | (0x0009u64 << 48);
+        self.control_transfer_in(setup_short, buf_paddr, 9)?;
+
+        // SAFETY: buf_vaddr is the page we allocated. The 9-byte
+        // Configuration Descriptor lives at offset 0; bytes 2-3 hold
+        // wTotalLength (little-endian).
+        let total_length = unsafe {
+            let src = buf_vaddr as *const u8;
+            let lo = core::ptr::read_volatile(src.add(2));
+            let hi = core::ptr::read_volatile(src.add(3));
+            u16::from_le_bytes([lo, hi]) as usize
+        };
+        if total_length > MAX_CONFIG_DESCRIPTOR_SIZE || total_length > out.len() {
+            return Err(XhciError::TransferFailed(0));
+        }
+
+        // Pass 2: read the full blob.
+        //   wLength = total_length
+        let setup_full: u64 =
+            0x80u64
+            | (0x06u64 << 8)
+            | (0x0200u64 << 16)
+            | ((total_length as u64) << 48);
+        self.control_transfer_in(setup_full, buf_paddr, total_length as u16)?;
+
+        // SAFETY: as above; the page is at least total_length bytes
+        // wide because total_length ≤ MAX_CONFIG_DESCRIPTOR_SIZE
+        // (512) << 4096.
+        unsafe {
+            let src = buf_vaddr as *const u8;
+            for (i, slot) in out.iter_mut().take(total_length).enumerate() {
+                *slot = core::ptr::read_volatile(src.add(i));
+            }
+        }
+        Ok(total_length)
+    }
+
+    /// Issue an Evaluate Context Command to refresh EP0's Max Packet
+    /// Size after GET_DESCRIPTOR(Device) revealed the device's actual
+    /// `bMaxPacketSize0`. xHCI 1.2 § 4.6.7.
+    ///
+    /// Reuses the Input Context page allocated during `address_device`.
+    /// Add Context flags: A1=1 (EP0), A0=0 (Slot Context untouched).
+    /// Drop flags: all zero. The Slot Context region is left zeroed
+    /// from `address_device`'s allocation; the controller ignores it
+    /// when A0=0.
+    pub fn evaluate_ep0_context(&mut self, new_mps: u16) -> Result<(), XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+        let ic_paddr = self.input_context_paddr.ok_or(XhciError::EpNotReady)?;
+        let ic_vaddr = self.input_context_vaddr.ok_or(XhciError::EpNotReady)?;
+
+        let ctx_size: u64 = if self.cap.csz { 64 } else { 32 };
+
+        // Re-fill the Input Context. We zero the page first so the
+        // previous Address Device payload doesn't leak into the
+        // controller's read.
+        // SAFETY: ic_vaddr is the page allocated by address_device;
+        // we own it exclusively until the slot exits.
+        unsafe {
+            core::ptr::write_bytes(ic_vaddr as *mut u8, 0, 4096);
+
+            // Input Control Context: A1 = 1 (EP0). A0 stays 0.
+            let icc = ic_vaddr as *mut u32;
+            core::ptr::write_volatile(icc.add(1), 0x2);
+
+            // EP0 Endpoint Context: same shape as address_device's
+            // fill but with the new MPS. CErr=3, EP Type=4 (Control),
+            // TR Dequeue Pointer | DCS=1, Avg TRB Length = 8.
+            let ep0_ring = self
+                .ep0_transfer_ring
+                .as_ref()
+                .ok_or(XhciError::EpNotReady)?;
+            let ep0 = (ic_vaddr + 2 * ctx_size) as *mut u32;
+            let ep0_dw1 =
+                (3u32 << 1)                  // CErr = 3
+                | (4u32 << 3)                // EP Type = Control
+                | ((new_mps as u32) << 16);
+            let dq = ep0_ring.paddr | 0x1;
+            core::ptr::write_volatile(ep0.add(1), ep0_dw1);
+            core::ptr::write_volatile(ep0.add(2), dq as u32);
+            core::ptr::write_volatile(ep0.add(3), (dq >> 32) as u32);
+            core::ptr::write_volatile(ep0.add(4), 8); // Avg TRB Len
+        }
+
+        // Submit Evaluate Context Command. Same TRB layout as Address
+        // Device — Input Context pointer + Slot ID — but TRB type 13.
+        let trb = Trb {
+            parameter: ic_paddr,
+            status: 0,
+            control:
+                ((trb_type::EVALUATE_CONTEXT_COMMAND as u32) << 10)
+                | ((slot_id as u32) << 24),
+        };
+        self.submit_command(trb)?;
+        Ok(())
     }
 
     /// Poll the event ring until a Transfer Event arrives whose TRB
