@@ -259,6 +259,7 @@ pub mod regs {
 /// TRB type values used at command/event level (xHCI 1.2 § 6.4.6).
 /// `pub` so main.rs can match on these without re-importing.
 pub mod trb_type {
+    pub const NORMAL: u8 = 1;
     pub const SETUP_STAGE: u8 = 2;
     pub const DATA_STAGE: u8 = 3;
     pub const STATUS_STAGE: u8 = 4;
@@ -279,6 +280,11 @@ pub mod completion_code {
     pub const USB_TRANSACTION_ERROR: u8 = 4;
     pub const TRB_ERROR: u8 = 5;
     pub const STALL_ERROR: u8 = 6;
+    /// Device returned fewer bytes than requested. Carried in
+    /// Transfer Event status [31:24]; the event's TRB Transfer
+    /// Length [23:0] reports the residual (requested - actual).
+    /// Semantically a success for IN transfers on bulk endpoints.
+    pub const SHORT_PACKET: u8 = 13;
     // others on demand
 }
 
@@ -398,6 +404,14 @@ pub struct CcidBulkRings {
     pub out_dci: u8,
     pub out_mps: u16,
     pub out_ring: TransferRing,
+}
+
+/// Direction selector for `bulk_transfer` — picks which CCID bulk
+/// ring + DCI the transfer rides.
+#[derive(Clone, Copy, Debug)]
+pub enum BulkDir {
+    In,
+    Out,
 }
 
 impl XhciController {
@@ -1234,12 +1248,17 @@ impl XhciController {
             core::ptr::write_volatile(slot.add(0), slot_dw0);
             core::ptr::write_volatile(slot.add(1), slot_dw1);
 
-            // Bulk IN Endpoint Context at offset (in_dci) * ctx_size.
+            // Bulk IN Endpoint Context at offset (in_dci + 1) *
+            // ctx_size — ICC takes the first ctx_size slot, then
+            // Slot Context, then EP contexts indexed by DCI (xHCI
+            // 1.2 § 6.2.5). DCI 1 (EP0) lives at offset 2*ctx_size;
+            // DCI N at offset (N+1)*ctx_size.
             //   DWord 1: CErr=3, EP Type=6 (Bulk IN), MPS
             //   DWord 2-3: TR Dequeue Pointer | DCS=1
-            //   DWord 4: Avg TRB Length = 1024 (bulk default per
-            //            xHCI 1.2 § 4.14)
-            let in_ep = (ic_vaddr + (in_dci as u64) * ctx_size) as *mut u32;
+            //   DWord 4: Avg TRB Length = MPS (Linux convention for
+            //            FS/HS bulk; xHCI 1.2 § 4.14 says it's a
+            //            hint).
+            let in_ep = (ic_vaddr + (in_dci as u64 + 1) * ctx_size) as *mut u32;
             let in_ep_dw1 =
                 (3u32 << 1)                  // CErr = 3
                 | (6u32 << 3)                // EP Type = Bulk IN
@@ -1248,11 +1267,12 @@ impl XhciController {
             core::ptr::write_volatile(in_ep.add(1), in_ep_dw1);
             core::ptr::write_volatile(in_ep.add(2), in_dq as u32);
             core::ptr::write_volatile(in_ep.add(3), (in_dq >> 32) as u32);
-            core::ptr::write_volatile(in_ep.add(4), 1024); // Avg TRB Len
+            core::ptr::write_volatile(in_ep.add(4), in_mps as u32);
 
-            // Bulk OUT Endpoint Context at offset (out_dci) * ctx_size.
+            // Bulk OUT Endpoint Context at offset (out_dci + 1) *
+            // ctx_size.
             //   EP Type = 2 (Bulk OUT)
-            let out_ep = (ic_vaddr + (out_dci as u64) * ctx_size) as *mut u32;
+            let out_ep = (ic_vaddr + (out_dci as u64 + 1) * ctx_size) as *mut u32;
             let out_ep_dw1 =
                 (3u32 << 1)
                 | (2u32 << 3)                // EP Type = Bulk OUT
@@ -1261,7 +1281,7 @@ impl XhciController {
             core::ptr::write_volatile(out_ep.add(1), out_ep_dw1);
             core::ptr::write_volatile(out_ep.add(2), out_dq as u32);
             core::ptr::write_volatile(out_ep.add(3), (out_dq >> 32) as u32);
-            core::ptr::write_volatile(out_ep.add(4), 1024);
+            core::ptr::write_volatile(out_ep.add(4), out_mps as u32);
         }
 
         // Configure Endpoint Command TRB (xHCI 1.2 § 6.4.3.5).
@@ -1298,14 +1318,90 @@ impl XhciController {
         Ok(slot_state)
     }
 
+    // -----------------------------------------------------------------
+    // Bulk endpoint transfers
+    // -----------------------------------------------------------------
+
+    /// Issue a single bulk transfer on one of the CCID bulk endpoints.
+    /// xHCI 1.2 § 4.10 + § 6.4.1.1 (Normal TRB).
+    ///
+    /// Direction is implicit in the endpoint context the controller
+    /// established during Configure Endpoint — the caller picks
+    /// `BulkDir::In` or `BulkDir::Out` to select which ring the TRB
+    /// goes on. Buffer ownership is the caller's: for OUT, fill the
+    /// buffer with payload bytes before calling; for IN, the
+    /// controller writes into the buffer.
+    ///
+    /// Returns the number of bytes the transfer actually moved (=
+    /// `requested_len - residual`). Short packets are treated as
+    /// success; the caller decides whether a short read is an error
+    /// in context. `requested_len` is capped at 17 bits per the
+    /// Normal TRB's TRB Transfer Length field (xHCI 1.2 § 6.4.1.1).
+    ///
+    /// Callers allocate the DMA buffer per-transfer today via
+    /// `alloc_zeroed_page`; the CCID class layer is one-shot per
+    /// boot so the allocation cost is irrelevant.
+    /// Revisit when: a high-rate consumer (CCID PPS, or extended
+    /// APDU chains with multi-block ICC ↔ CPU exchange) makes
+    /// per-transfer DMA-page allocation a measurable cost.
+    pub fn bulk_transfer(
+        &mut self,
+        dir: BulkDir,
+        buf_paddr: u64,
+        requested_len: u32,
+    ) -> Result<u32, XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+
+        // Normal TRB:
+        //   parameter : buffer paddr
+        //   status    : TRB Transfer Length [16:0]
+        //   control   : Cycle (enqueue), IOC [5]=1, Type [15:10]=1
+        let trb = Trb {
+            parameter: buf_paddr,
+            status: requested_len & 0x0001_FFFF,
+            control:
+                (1u32 << 5)                                  // IOC
+                | ((trb_type::NORMAL as u32) << 10),
+        };
+
+        // Enqueue on the requested direction's ring, capture DCI for
+        // the doorbell. The inner block releases the &mut borrow on
+        // self.ccid_bulk before we call &mut-self methods below.
+        let (dci, trb_paddr) = {
+            let ccid = self.ccid_bulk.as_mut().ok_or(XhciError::EpNotReady)?;
+            let (dci, ring) = match dir {
+                BulkDir::In => (ccid.in_dci, &mut ccid.in_ring),
+                BulkDir::Out => (ccid.out_dci, &mut ccid.out_ring),
+            };
+            let paddr = ring.enqueue(trb).ok_or(XhciError::TransferRingFull)?;
+            (dci, paddr)
+        };
+
+        // Ring the bulk endpoint's doorbell (target = slot_id, value
+        // = DCI). xHCI 1.2 § 6.4.5.
+        self.ring_doorbell(slot_id, dci as u32);
+
+        // Wait for the Transfer Event. wait_for_transfer_event treats
+        // SHORT_PACKET as success; the residual is bottom 24 bits of
+        // the event's status field (xHCI 1.2 § 6.4.2.1).
+        let event = self.wait_for_transfer_event(trb_paddr)?;
+        let residual = event.status & 0x00FF_FFFF;
+        Ok(requested_len - residual)
+    }
+
     /// Poll the event ring until a Transfer Event arrives whose TRB
     /// pointer matches `expected_trb_paddr`. Non-matching events
     /// (stray Port Status Change, Command Completion) are consumed
     /// and dropped. Same shape as `wait_for_command_completion` —
-    /// duplication kept narrow for now.
-    /// Revisit when: a third consumer of the event-ring poll loop
-    /// appears (B-vi bulk transfers); refactor into
-    /// `wait_for_event(predicate)` then.
+    /// kept duplicated rather than refactored into a shared
+    /// `wait_for_event(predicate)` because the two predicates differ
+    /// in shape (Transfer Event matches both completion codes; command
+    /// completion only matches Success) and consolidating would
+    /// trade clarity for one less function.
+    /// Revisit when: IRQ-driven completion lands and the poll loops
+    /// get replaced by event-handler dispatch — at that point the
+    /// shared dispatcher is the natural home for the predicate
+    /// matching.
     fn wait_for_transfer_event(
         &mut self,
         expected_trb_paddr: u64,
@@ -1318,7 +1414,15 @@ impl XhciController {
                 {
                     self.write_erdp_to_current();
                     let code = (event.status >> 24) as u8;
-                    if code == completion_code::SUCCESS {
+                    // Bulk IN transfers commonly complete with
+                    // SHORT_PACKET when the device returns fewer
+                    // bytes than the host requested; the residual
+                    // is carried in the event's TRB Transfer Length
+                    // field. Treat both as success and let callers
+                    // inspect the residual.
+                    if code == completion_code::SUCCESS
+                        || code == completion_code::SHORT_PACKET
+                    {
                         return Ok(event);
                     } else {
                         return Err(XhciError::TransferFailed(code));
@@ -1333,7 +1437,11 @@ impl XhciController {
     }
 
     /// Allocate one 4 KiB DMA page and zero it. Returns (paddr, vaddr).
-    fn alloc_zeroed_page() -> Result<(u64, u64), XhciError> {
+    /// Public so `main.rs` can prepare per-transfer bulk buffers
+    /// without re-implementing the alloc + zero pattern. Buffer pool
+    /// lands when bulk endpoints get a real hot path; see Convention
+    /// 9 trigger at the `bulk_transfer` site.
+    pub fn alloc_zeroed_page() -> Result<(u64, u64), XhciError> {
         let mut paddr: u64 = 0;
         let ret = sys::alloc_dma(1, &mut paddr);
         if ret < 0 {

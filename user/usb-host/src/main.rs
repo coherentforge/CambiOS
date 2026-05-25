@@ -392,11 +392,149 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         Ok(slot_state) => {
             sys::print(b"[USB-HOST]   Configure Endpoint OK; slot state = ");
             log_dec(b"", slot_state as u32);
+            if let Some(bulk) = ctl.ccid_bulk.as_ref() {
+                sys::print(b"[USB-HOST]   bulk IN  DCI=");
+                log_dec(b"", bulk.in_dci as u32);
+                sys::print(b"[USB-HOST]   bulk OUT DCI=");
+                log_dec(b"", bulk.out_dci as u32);
+            }
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] configure_endpoint:", e);
+            return;
         }
     }
+
+    // First bulk transfer end-to-end — proves the bulk path bytes
+    // flow round-trip. We use CCID's smallest standard exchange
+    // (PC_to_RDR_GetSlotStatus → RDR_to_PC_SlotStatus, 10 bytes each
+    // way per CCID 1.1 § 6.1.6 + § 6.2.2) because it has no APDU
+    // payload — we're not validating CCID semantics here, only that
+    // the bulk OUT + bulk IN endpoints actually carry data. CCID
+    // semantics get a proper home in B-vii.
+    run_ccid_get_slot_status_smoke(ctl);
+}
+
+/// Send `PC_to_RDR_GetSlotStatus` on bulk OUT and read the matching
+/// `RDR_to_PC_SlotStatus` response on bulk IN. Logs the parsed CCID
+/// response fields. Proves the bulk path; does not pretend to be a
+/// CCID class driver.
+#[allow(unsafe_code)]
+fn run_ccid_get_slot_status_smoke(ctl: &mut xhci::XhciController) {
+    sys::print(b"[USB-HOST] CCID PC_to_RDR_GetSlotStatus...\n");
+
+    // Allocate two DMA pages, one each for OUT and IN. Per-transfer
+    // alloc; the buffer-pool Convention 9 trigger lives at the
+    // bulk_transfer site.
+    let (out_paddr, out_vaddr) = match xhci::XhciController::alloc_zeroed_page() {
+        Ok(p) => p,
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] alloc OUT buffer:", e);
+            return;
+        }
+    };
+    let (in_paddr, in_vaddr) = match xhci::XhciController::alloc_zeroed_page() {
+        Ok(p) => p,
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] alloc IN buffer:", e);
+            return;
+        }
+    };
+
+    // CCID 1.1 § 6.1.6 PC_to_RDR_GetSlotStatus — 10-byte command
+    // block, no abData payload.
+    //   byte 0      : bMessageType = 0x65
+    //   bytes 1-4   : dwLength     = 0 (little-endian)
+    //   byte 5      : bSlot        = 0
+    //   byte 6      : bSeq         = 0 (sequence number)
+    //   bytes 7-9   : abRFU        = 0
+    let cmd: [u8; 10] = [0x65, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // SAFETY: out_vaddr is the freshly allocated, owned DMA page;
+    // 10 bytes well inside the 4 KiB page.
+    #[allow(unsafe_code)]
+    unsafe {
+        let dst = out_vaddr as *mut u8;
+        for (i, b) in cmd.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), *b);
+        }
+    }
+
+    // Bulk OUT — write the command to the device.
+    match ctl.bulk_transfer(xhci::BulkDir::Out, out_paddr, 10) {
+        Ok(n) => {
+            sys::print(b"[USB-HOST]   bulk OUT bytes written = ");
+            log_dec(b"", n);
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] bulk OUT:", e);
+            return;
+        }
+    }
+
+    // Bulk IN — read the response. CCID `RDR_to_PC_SlotStatus` is
+    // 10 bytes (no abData when bStatus reports an empty slot).
+    let bytes_in = match ctl.bulk_transfer(xhci::BulkDir::In, in_paddr, 10) {
+        Ok(n) => {
+            sys::print(b"[USB-HOST]   bulk IN bytes read = ");
+            log_dec(b"", n);
+            n
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] bulk IN:", e);
+            return;
+        }
+    };
+
+    if bytes_in < 10 {
+        sys::print(b"[USB-HOST]   short response, expected 10 bytes\n");
+        return;
+    }
+
+    // Parse the 10-byte RDR_to_PC_SlotStatus response (CCID 1.1
+    // § 6.2.2). bStatus is the field we want to surface — bits [1:0]
+    // report ICC presence: 0=present/active, 1=present/inactive,
+    // 2=no ICC.
+    let mut resp = [0u8; 10];
+    #[allow(unsafe_code)]
+    unsafe {
+        let src = in_vaddr as *const u8;
+        for (i, slot) in resp.iter_mut().enumerate() {
+            *slot = core::ptr::read_volatile(src.add(i));
+        }
+    }
+    log_ccid_slot_status(&resp);
+}
+
+/// Pretty-print the 10-byte RDR_to_PC_SlotStatus response (CCID 1.1
+/// § 6.2.2):
+///   0      bMessageType  (expect 0x81)
+///   1-4    dwLength      (LE)
+///   5      bSlot
+///   6      bSeq
+///   7      bStatus       (bits [1:0] = ICC presence)
+///   8      bError
+///   9      bClockStatus
+fn log_ccid_slot_status(resp: &[u8; 10]) {
+    sys::print(b"[USB-HOST]   bMessageType = ");
+    log_hex64(b"", resp[0] as u64);
+    sys::print(b"[USB-HOST]   bSlot = ");
+    log_dec(b"", resp[5] as u32);
+    sys::print(b"[USB-HOST]   bSeq = ");
+    log_dec(b"", resp[6] as u32);
+    sys::print(b"[USB-HOST]   bStatus = ");
+    log_hex64(b"", resp[7] as u64);
+    let icc = resp[7] & 0x03;
+    sys::print(b"[USB-HOST]     ICC presence = ");
+    match icc {
+        0 => sys::print(b"present, active\n"),
+        1 => sys::print(b"present, inactive\n"),
+        2 => sys::print(b"absent\n"),
+        _ => sys::print(b"RFU\n"),
+    }
+    sys::print(b"[USB-HOST]   bError = ");
+    log_dec(b"", resp[8] as u32);
+    sys::print(b"[USB-HOST]   bClockStatus = ");
+    log_dec(b"", resp[9] as u32);
 }
 
 fn log_ccid_endpoints(ccid: &descriptors::CcidEndpoints) {
