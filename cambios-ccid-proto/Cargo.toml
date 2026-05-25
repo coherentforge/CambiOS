@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-ccid-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "USB CCID 1.1 message format encoders + decoders for CambiOS — shared by user/ccid (frame producer/consumer), user/key-store-service (PivBackend::CcidPiv consumer), and any future smart-card-class consumer. Pure data formatting; no transport assumptions."
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies beyond `core`. This crate is the wire-format
+# contract layer; kernel and userspace consumers both depend on it,
+# and it depends on nothing else.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

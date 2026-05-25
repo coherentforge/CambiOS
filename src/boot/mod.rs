@@ -75,7 +75,10 @@ pub const MAX_FRAMEBUFFERS: usize = 8;
 /// the spawn syscall queries).
 /// Why: same accounting; BootInfo holds the boot-protocol view, the
 ///      registry holds the spawnable view.
-pub const MAX_BOOT_MODULES: usize = 16;
+/// Replace when: v1 module count crosses 24 (75% utilization), e.g.,
+///      a USB HID stack for bare-metal keyboards/mice lands alongside
+///      the current CCID stream.
+pub const MAX_BOOT_MODULES: usize = 32;
 
 /// SCAFFOLDING: max virtio-mmio device regions discovered from the boot
 /// protocol. RISC-V QEMU virt populates from DTB `/soc/virtio_mmio@*`

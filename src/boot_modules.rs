@@ -8,8 +8,12 @@
 //! Module memory (EXECUTABLE_AND_MODULES) persists via HHDM for the
 //! kernel's lifetime.
 
-/// Maximum number of boot modules the registry can track.
-pub(crate) const MAX_MODULES: usize = 16;
+/// SCAFFOLDING: maximum number of boot modules the registry can track.
+/// Mirrors `MAX_BOOT_MODULES` in [src/boot/mod.rs] — same accounting,
+/// the registry is the spawnable view of what the boot adapter populated.
+/// Replace when: bumping this requires bumping `MAX_BOOT_MODULES` in
+/// lockstep (and vice versa); the two constants must stay equal.
+pub(crate) const MAX_MODULES: usize = 32;
 
 /// Maximum length of a module name (bytes).
 const MAX_NAME_LEN: usize = 64;

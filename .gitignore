@@ -4,6 +4,8 @@ tools/*/target/
 verification/*/target/
 fuzz/target/
 cambios-abi/target/
+cambios-fde-proto/target/
+cambios-ccid-proto/target/
 fuzz/artifacts/
 fuzz/corpus/
 *.iso

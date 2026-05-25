@@ -27,9 +27,12 @@
 //!
 //! ## IPC protocol
 //!
-//! Endpoint 31 is registered but accepts no commands yet. Incoming
-//! messages are read and dropped. Command surface lands at B-vii
-//! (CCID class driver split) as the stack grows.
+//! Endpoint 31 carries two opcodes for bulk-endpoint access:
+//! `BULK_OUT` (0x01) and `BULK_IN` (0x02). Wire format:
+//! `[opcode:1][slot_id:1][...payload]`; replies are
+//! `[status:1][...result]`. Full details in `serve_loop` below.
+//! usb-host owns the xHCI transport and stays protocol-agnostic;
+//! CCID semantics live in `user/ccid`.
 
 #![no_std]
 #![no_main]
@@ -167,7 +170,7 @@ pub extern "C" fn _start() -> ! {
     // we land at HCH=0 with rings live, or we log the failure mode
     // and idle. Idle-on-fail keeps the boot gate happy so downstream
     // modules still load.
-    match xhci::XhciController::bring_up(mmio_vaddr, caps) {
+    let live_ctl = match xhci::XhciController::bring_up(mmio_vaddr, caps) {
         Ok(mut ctl) => {
             sys::print(b"[USB-HOST] controller bring-up OK\n");
             log_hex64(b"[USB-HOST]   DCBAA paddr      = ", ctl.dcbaa_paddr);
@@ -178,18 +181,23 @@ pub extern "C" fn _start() -> ! {
 
             // B-iii: port enumeration + first commands.
             run_b3(&mut ctl);
+            Some(ctl)
         }
         Err(e) => {
             log_bringup_error(e);
+            None
         }
-    }
+    };
 
     // Step 7: register IPC endpoint and release boot gate.
     sys::register_endpoint(USB_HOST_ENDPOINT);
     sys::print(b"[USB-HOST] ready on endpoint 31\n");
     sys::module_ready();
 
-    idle_loop();
+    match live_ctl {
+        Some(mut ctl) => serve_loop(&mut ctl),
+        None => idle_loop(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,136 +413,9 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     }
 
-    // First bulk transfer end-to-end — proves the bulk path bytes
-    // flow round-trip. We use CCID's smallest standard exchange
-    // (PC_to_RDR_GetSlotStatus → RDR_to_PC_SlotStatus, 10 bytes each
-    // way per CCID 1.1 § 6.1.6 + § 6.2.2) because it has no APDU
-    // payload — we're not validating CCID semantics here, only that
-    // the bulk OUT + bulk IN endpoints actually carry data. CCID
-    // semantics get a proper home in B-vii.
-    run_ccid_get_slot_status_smoke(ctl);
-}
-
-/// Send `PC_to_RDR_GetSlotStatus` on bulk OUT and read the matching
-/// `RDR_to_PC_SlotStatus` response on bulk IN. Logs the parsed CCID
-/// response fields. Proves the bulk path; does not pretend to be a
-/// CCID class driver.
-#[allow(unsafe_code)]
-fn run_ccid_get_slot_status_smoke(ctl: &mut xhci::XhciController) {
-    sys::print(b"[USB-HOST] CCID PC_to_RDR_GetSlotStatus...\n");
-
-    // Allocate two DMA pages, one each for OUT and IN. Per-transfer
-    // alloc; the buffer-pool Convention 9 trigger lives at the
-    // bulk_transfer site.
-    let (out_paddr, out_vaddr) = match xhci::XhciController::alloc_zeroed_page() {
-        Ok(p) => p,
-        Err(e) => {
-            log_b3_error(b"[USB-HOST] alloc OUT buffer:", e);
-            return;
-        }
-    };
-    let (in_paddr, in_vaddr) = match xhci::XhciController::alloc_zeroed_page() {
-        Ok(p) => p,
-        Err(e) => {
-            log_b3_error(b"[USB-HOST] alloc IN buffer:", e);
-            return;
-        }
-    };
-
-    // CCID 1.1 § 6.1.6 PC_to_RDR_GetSlotStatus — 10-byte command
-    // block, no abData payload.
-    //   byte 0      : bMessageType = 0x65
-    //   bytes 1-4   : dwLength     = 0 (little-endian)
-    //   byte 5      : bSlot        = 0
-    //   byte 6      : bSeq         = 0 (sequence number)
-    //   bytes 7-9   : abRFU        = 0
-    let cmd: [u8; 10] = [0x65, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    // SAFETY: out_vaddr is the freshly allocated, owned DMA page;
-    // 10 bytes well inside the 4 KiB page.
-    #[allow(unsafe_code)]
-    unsafe {
-        let dst = out_vaddr as *mut u8;
-        for (i, b) in cmd.iter().enumerate() {
-            core::ptr::write_volatile(dst.add(i), *b);
-        }
-    }
-
-    // Bulk OUT — write the command to the device.
-    match ctl.bulk_transfer(xhci::BulkDir::Out, out_paddr, 10) {
-        Ok(n) => {
-            sys::print(b"[USB-HOST]   bulk OUT bytes written = ");
-            log_dec(b"", n);
-        }
-        Err(e) => {
-            log_b3_error(b"[USB-HOST] bulk OUT:", e);
-            return;
-        }
-    }
-
-    // Bulk IN — read the response. CCID `RDR_to_PC_SlotStatus` is
-    // 10 bytes (no abData when bStatus reports an empty slot).
-    let bytes_in = match ctl.bulk_transfer(xhci::BulkDir::In, in_paddr, 10) {
-        Ok(n) => {
-            sys::print(b"[USB-HOST]   bulk IN bytes read = ");
-            log_dec(b"", n);
-            n
-        }
-        Err(e) => {
-            log_b3_error(b"[USB-HOST] bulk IN:", e);
-            return;
-        }
-    };
-
-    if bytes_in < 10 {
-        sys::print(b"[USB-HOST]   short response, expected 10 bytes\n");
-        return;
-    }
-
-    // Parse the 10-byte RDR_to_PC_SlotStatus response (CCID 1.1
-    // § 6.2.2). bStatus is the field we want to surface — bits [1:0]
-    // report ICC presence: 0=present/active, 1=present/inactive,
-    // 2=no ICC.
-    let mut resp = [0u8; 10];
-    #[allow(unsafe_code)]
-    unsafe {
-        let src = in_vaddr as *const u8;
-        for (i, slot) in resp.iter_mut().enumerate() {
-            *slot = core::ptr::read_volatile(src.add(i));
-        }
-    }
-    log_ccid_slot_status(&resp);
-}
-
-/// Pretty-print the 10-byte RDR_to_PC_SlotStatus response (CCID 1.1
-/// § 6.2.2):
-///   0      bMessageType  (expect 0x81)
-///   1-4    dwLength      (LE)
-///   5      bSlot
-///   6      bSeq
-///   7      bStatus       (bits [1:0] = ICC presence)
-///   8      bError
-///   9      bClockStatus
-fn log_ccid_slot_status(resp: &[u8; 10]) {
-    sys::print(b"[USB-HOST]   bMessageType = ");
-    log_hex64(b"", resp[0] as u64);
-    sys::print(b"[USB-HOST]   bSlot = ");
-    log_dec(b"", resp[5] as u32);
-    sys::print(b"[USB-HOST]   bSeq = ");
-    log_dec(b"", resp[6] as u32);
-    sys::print(b"[USB-HOST]   bStatus = ");
-    log_hex64(b"", resp[7] as u64);
-    let icc = resp[7] & 0x03;
-    sys::print(b"[USB-HOST]     ICC presence = ");
-    match icc {
-        0 => sys::print(b"present, active\n"),
-        1 => sys::print(b"present, inactive\n"),
-        2 => sys::print(b"absent\n"),
-        _ => sys::print(b"RFU\n"),
-    }
-    sys::print(b"[USB-HOST]   bError = ");
-    log_dec(b"", resp[8] as u32);
-    sys::print(b"[USB-HOST]   bClockStatus = ");
-    log_dec(b"", resp[9] as u32);
+    // CCID semantics + first bulk exchange live in the `user/ccid`
+    // module; usb-host serves bulk OUT / bulk IN requests via the
+    // IPC dispatch in `serve_loop` once boot completes.
 }
 
 fn log_ccid_endpoints(ccid: &descriptors::CcidEndpoints) {
@@ -668,14 +549,233 @@ fn log_b3_error(prefix: &[u8], e: xhci::XhciError) {
     }
 }
 
-fn idle_loop() -> ! {
-    // B-i has no IPC command surface yet. Drain any incoming message and
-    // sleep; commands arrive at B-iii / B-v.
-    let mut recv_buf = [0u8; 256];
+// ---------------------------------------------------------------------------
+// IPC ABI on USB_HOST_ENDPOINT (31)
+// ---------------------------------------------------------------------------
+//
+// Wire format on every incoming message:
+//
+//     [opcode:1][slot_id:1][...payload]
+//
+// Reply (sent to the caller's reply endpoint):
+//
+//     [status:1][...result]
+//
+// Opcodes:
+//
+//   OP_BULK_OUT (0x01):
+//     request payload  = bytes to send on the slot's bulk OUT
+//                        endpoint (up to MAX_BULK_PAYLOAD)
+//     reply            = [status:1][bytes_written:2] (LE u16)
+//
+//   OP_BULK_IN (0x02):
+//     request payload  = [requested_len:2] (LE u16, ≤ MAX_BULK_PAYLOAD)
+//     reply            = [status:1][actual_len:2][bytes:N]
+//
+// Status bytes (one byte, distinct from the controller's
+// XhciError set so clients don't need to track xhci internals):
+//
+//   STATUS_OK              = 0
+//   STATUS_INVALID_OPCODE  = 1
+//   STATUS_TRUNCATED       = 2  (request payload too short)
+//   STATUS_PAYLOAD_TOO_BIG = 3
+//   STATUS_DEVICE_NOT_READY = 4 (no controller / no bulk endpoints)
+//   STATUS_XHCI_ERROR      = 5  (any XhciError; details in serial log)
+//
+// Slot ID is currently always 1 (the single device usb-host knows
+// about), but the field is present from day one so multi-device
+// support doesn't need an ABI change.
+// Revisit when: usb-host enumerates a second attached device and
+// the slot_id field starts carrying non-trivial values.
+
+const OP_BULK_OUT: u8 = 0x01;
+const OP_BULK_IN: u8 = 0x02;
+
+const STATUS_OK: u8 = 0;
+const STATUS_INVALID_OPCODE: u8 = 1;
+const STATUS_TRUNCATED: u8 = 2;
+const STATUS_PAYLOAD_TOO_BIG: u8 = 3;
+const STATUS_DEVICE_NOT_READY: u8 = 4;
+const STATUS_XHCI_ERROR: u8 = 5;
+
+/// SCAFFOLDING: max bytes a single bulk OUT request or IN response
+/// can carry inline in an IPC message. The kernel IPC control
+/// message budget is 256 bytes; minus 36-byte recv_msg envelope
+/// (sender_principal:32 + from_endpoint:4) minus our [opcode][slot]
+/// header (2 bytes) minus the reply's [status][actual_len] header
+/// (3 bytes), we have ~215 bytes of headroom. 192 = round-down to
+/// the next power of two below that, comfortably above CCID
+/// PC_to_RDR_GetSlotStatus (10 bytes) + extended APDU (~270 bytes
+/// is over budget but extended APDUs need the channel substrate
+/// regardless, so no point pushing this higher).
+/// Replace when: extended APDUs land and ccid switches to the
+/// channel substrate for >MAX_BULK_PAYLOAD transfers.
+const MAX_BULK_PAYLOAD: usize = 192;
+
+/// Receive-buffer size: 36-byte envelope + 2-byte header + up to
+/// MAX_BULK_PAYLOAD inline data, rounded up. The kernel IPC layer
+/// caps recv_msg at 256 anyway.
+const RECV_BUF_SIZE: usize = 256;
+
+#[allow(unsafe_code)]
+fn serve_loop(ctl: &mut xhci::XhciController) -> ! {
+    let mut recv_buf = [0u8; RECV_BUF_SIZE];
     loop {
         let n = sys::try_recv_msg(USB_HOST_ENDPOINT, &mut recv_buf);
         if n <= 0 {
             sys::yield_now();
+            continue;
+        }
+        // recv_msg layout: [sender_principal:32][from_endpoint:4][payload:N]
+        let n = n as usize;
+        if n < 36 {
+            // Malformed envelope; drop.
+            continue;
+        }
+        let from_ep = u32::from_le_bytes([
+            recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
+        ]);
+        let payload = &recv_buf[36..n];
+        handle_request(ctl, from_ep, payload);
+    }
+}
+
+#[allow(unsafe_code)]
+fn handle_request(
+    ctl: &mut xhci::XhciController,
+    reply_ep: u32,
+    payload: &[u8],
+) {
+    if payload.len() < 2 {
+        reply_status(reply_ep, STATUS_TRUNCATED);
+        return;
+    }
+    let opcode = payload[0];
+    let _slot = payload[1]; // reserved for multi-device (see Revisit-when above)
+    let rest = &payload[2..];
+    match opcode {
+        OP_BULK_OUT => handle_bulk_out(ctl, reply_ep, rest),
+        OP_BULK_IN => handle_bulk_in(ctl, reply_ep, rest),
+        _ => reply_status(reply_ep, STATUS_INVALID_OPCODE),
+    }
+}
+
+#[allow(unsafe_code)]
+fn handle_bulk_out(
+    ctl: &mut xhci::XhciController,
+    reply_ep: u32,
+    bytes: &[u8],
+) {
+    if bytes.len() > MAX_BULK_PAYLOAD {
+        reply_status(reply_ep, STATUS_PAYLOAD_TOO_BIG);
+        return;
+    }
+    if ctl.ccid_bulk.is_none() {
+        reply_status(reply_ep, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    // Copy payload into a DMA page, then issue bulk OUT.
+    let (paddr, vaddr) = match xhci::XhciController::alloc_zeroed_page() {
+        Ok(p) => p,
+        Err(_) => {
+            reply_status(reply_ep, STATUS_XHCI_ERROR);
+            return;
+        }
+    };
+    // SAFETY: vaddr is the freshly-allocated DMA page, owned
+    // exclusively here; bytes.len() ≤ MAX_BULK_PAYLOAD ≪ 4 KiB.
+    unsafe {
+        let dst = vaddr as *mut u8;
+        for (i, b) in bytes.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), *b);
+        }
+    }
+    let written = match ctl.bulk_transfer(xhci::BulkDir::Out, paddr, bytes.len() as u32) {
+        Ok(n) => n,
+        Err(_) => {
+            reply_status(reply_ep, STATUS_XHCI_ERROR);
+            return;
+        }
+    };
+    // Reply: [status:1][bytes_written:2 LE].
+    let mut reply = [0u8; 3];
+    reply[0] = STATUS_OK;
+    reply[1] = (written & 0xFF) as u8;
+    reply[2] = ((written >> 8) & 0xFF) as u8;
+    sys::write(reply_ep, &reply);
+}
+
+#[allow(unsafe_code)]
+fn handle_bulk_in(
+    ctl: &mut xhci::XhciController,
+    reply_ep: u32,
+    args: &[u8],
+) {
+    if args.len() < 2 {
+        reply_status(reply_ep, STATUS_TRUNCATED);
+        return;
+    }
+    let requested_len = u16::from_le_bytes([args[0], args[1]]) as usize;
+    if requested_len > MAX_BULK_PAYLOAD {
+        reply_status(reply_ep, STATUS_PAYLOAD_TOO_BIG);
+        return;
+    }
+    if ctl.ccid_bulk.is_none() {
+        reply_status(reply_ep, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    let (paddr, vaddr) = match xhci::XhciController::alloc_zeroed_page() {
+        Ok(p) => p,
+        Err(_) => {
+            reply_status(reply_ep, STATUS_XHCI_ERROR);
+            return;
+        }
+    };
+    let actual = match ctl.bulk_transfer(xhci::BulkDir::In, paddr, requested_len as u32) {
+        Ok(n) => n as usize,
+        Err(_) => {
+            reply_status(reply_ep, STATUS_XHCI_ERROR);
+            return;
+        }
+    };
+    // Reply: [status:1][actual_len:2 LE][bytes:actual]
+    let mut reply = [0u8; 3 + MAX_BULK_PAYLOAD];
+    reply[0] = STATUS_OK;
+    reply[1] = (actual & 0xFF) as u8;
+    reply[2] = ((actual >> 8) & 0xFF) as u8;
+    // SAFETY: vaddr is the DMA page the controller wrote into;
+    // `actual` ≤ requested_len ≤ MAX_BULK_PAYLOAD ≪ 4 KiB.
+    unsafe {
+        let src = vaddr as *const u8;
+        for i in 0..actual {
+            reply[3 + i] = core::ptr::read_volatile(src.add(i));
+        }
+    }
+    sys::write(reply_ep, &reply[..3 + actual]);
+}
+
+fn reply_status(reply_ep: u32, status: u8) {
+    sys::write(reply_ep, &[status]);
+}
+
+/// Idle for boots where no xHCI controller was found / bring-up
+/// failed. usb-host still registers its endpoint so the boot gate
+/// can release downstream modules, but every incoming request gets
+/// `STATUS_DEVICE_NOT_READY`.
+fn idle_loop() -> ! {
+    let mut recv_buf = [0u8; RECV_BUF_SIZE];
+    loop {
+        let n = sys::try_recv_msg(USB_HOST_ENDPOINT, &mut recv_buf);
+        if n <= 0 {
+            sys::yield_now();
+            continue;
+        }
+        let n = n as usize;
+        if n >= 36 {
+            let from_ep = u32::from_le_bytes([
+                recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
+            ]);
+            reply_status(from_ep, STATUS_DEVICE_NOT_READY);
         }
     }
 }
