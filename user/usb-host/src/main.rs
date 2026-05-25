@@ -360,9 +360,42 @@ fn run_b3(ctl: &mut xhci::XhciController) {
     // endpoints. CCID 1.1 § 4: bInterfaceClass = 0x0B identifies the
     // smart-card / CCID class; the interface is followed by class-
     // specific descriptors then the bulk endpoint pair.
-    match descriptors::find_ccid_interface(&blob[..blob_len]) {
-        Ok(ccid) => log_ccid_endpoints(&ccid),
-        Err(_) => sys::print(b"[USB-HOST]   no CCID interface found in config blob\n"),
+    let ccid = match descriptors::find_ccid_interface(&blob[..blob_len]) {
+        Ok(ccid) => {
+            log_ccid_endpoints(&ccid);
+            ccid
+        }
+        Err(_) => {
+            sys::print(b"[USB-HOST]   no CCID interface found in config blob\n");
+            return;
+        }
+    };
+
+    // SET_CONFIGURATION standard request — 2-TRB no-data control
+    // transfer that puts the device in Configured state. USB 2.0
+    // § 9.4.7.
+    sys::print(b"[USB-HOST] SET_CONFIGURATION; bConfigurationValue = ");
+    log_dec(b"", ccid.configuration_value as u32);
+    match ctl.set_configuration(ccid.configuration_value) {
+        Ok(()) => sys::print(b"[USB-HOST]   SET_CONFIGURATION OK\n"),
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] set_configuration:", e);
+            return;
+        }
+    }
+
+    // Configure Endpoint Command — installs the CCID bulk IN + bulk
+    // OUT endpoint contexts in the Device Context and allocates the
+    // per-endpoint transfer rings. xHCI 1.2 § 4.6.6.
+    sys::print(b"[USB-HOST] Configure Endpoint Command...\n");
+    match ctl.configure_endpoint(&ccid) {
+        Ok(slot_state) => {
+            sys::print(b"[USB-HOST]   Configure Endpoint OK; slot state = ");
+            log_dec(b"", slot_state as u32);
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] configure_endpoint:", e);
+        }
     }
 }
 

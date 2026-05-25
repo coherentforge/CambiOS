@@ -24,6 +24,7 @@
 
 use cambios_libsys as sys;
 
+use crate::descriptors::CcidEndpoints;
 use crate::ring::{CommandRing, EventRing, Erst, TransferRing, Trb};
 
 // ---------------------------------------------------------------------------
@@ -371,6 +372,32 @@ pub struct XhciController {
     /// EP0 transfer ring — set up by Address Device, used by B-v
     /// GET_DESCRIPTOR control transfers.
     pub ep0_transfer_ring: Option<TransferRing>,
+    /// Root hub port the slot lives on (0-indexed). Populated by
+    /// `address_device`; reused by Configure Endpoint when the Input
+    /// Context's Slot Context needs to be re-filled with current
+    /// state (xHCI 1.2 § 4.6.6 requires A0=1 + Slot Context valid
+    /// when adding endpoints that bump Context Entries).
+    pub port_idx: Option<u8>,
+    /// PORTSC speed field captured at port reset (1=FS, 3=HS,
+    /// 4=SS, 5=SS+). Same purpose as `port_idx`.
+    pub port_speed: Option<u8>,
+    /// CCID bulk endpoint pair (IN + OUT) + their transfer rings,
+    /// installed by Configure Endpoint. Consumed by B-vi.c's first
+    /// bulk transfer.
+    pub ccid_bulk: Option<CcidBulkRings>,
+}
+
+/// Per-slot bulk endpoint state for the CCID interface — DCIs +
+/// transfer rings + Max Packet Sizes. Populated by
+/// `configure_endpoint` once the endpoints are live.
+#[allow(dead_code)]
+pub struct CcidBulkRings {
+    pub in_dci: u8,
+    pub in_mps: u16,
+    pub in_ring: TransferRing,
+    pub out_dci: u8,
+    pub out_mps: u16,
+    pub out_ring: TransferRing,
 }
 
 impl XhciController {
@@ -457,6 +484,9 @@ impl XhciController {
             device_context_paddr: None,
             device_context_vaddr: None,
             ep0_transfer_ring: None,
+            port_idx: None,
+            port_speed: None,
+            ccid_bulk: None,
         })
     }
 
@@ -768,6 +798,8 @@ impl XhciController {
         self.device_context_paddr = Some(dc_paddr);
         self.device_context_vaddr = Some(dc_vaddr);
         self.ep0_transfer_ring = Some(ep0_ring);
+        self.port_idx = Some(port_idx);
+        self.port_speed = Some(speed);
 
         // Read back the Device Context's Slot Context DWord 3 to
         // report Slot State. Slot State is bits [31:27]. On success
@@ -1057,6 +1089,213 @@ impl XhciController {
         };
         self.submit_command(trb)?;
         Ok(())
+    }
+
+    /// Run a 2-TRB control transfer on EP0 with no Data Stage (used
+    /// for SET_CONFIGURATION + other "no payload" standard requests).
+    /// xHCI 1.2 § 6.4.1.2: when TRT = 0 (No Data Stage), only Setup
+    /// + Status TRBs are issued; the Status Stage direction is IN.
+    fn control_transfer_no_data(
+        &mut self,
+        setup_packet: u64,
+    ) -> Result<(), XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+        let mut ring = self.ep0_transfer_ring.take().ok_or(XhciError::EpNotReady)?;
+
+        // Setup Stage TRB: IDT=1, TRT=0 (No Data Stage), Type=2.
+        let setup_trb = Trb {
+            parameter: setup_packet,
+            status: 8,
+            control:
+                (1u32 << 6)                                  // IDT
+                | ((trb_type::SETUP_STAGE as u32) << 10),
+            // TRT = 0 (No Data Stage) is the implicit zero.
+        };
+
+        // Status Stage TRB: IOC=1, DIR=1 (IN — control transfers
+        // without a Data Stage always Status-IN per USB 2.0 § 8.5.3),
+        // Type=4.
+        let status_trb = Trb {
+            parameter: 0,
+            status: 0,
+            control:
+                (1u32 << 5)                                  // IOC
+                | (1u32 << 16)                               // DIR = IN
+                | ((trb_type::STATUS_STAGE as u32) << 10),
+        };
+
+        let status_paddr = match (
+            ring.enqueue(setup_trb),
+            ring.enqueue(status_trb),
+        ) {
+            (Some(_), Some(p)) => p,
+            _ => {
+                self.ep0_transfer_ring = Some(ring);
+                return Err(XhciError::TransferRingFull);
+            }
+        };
+
+        self.ep0_transfer_ring = Some(ring);
+
+        // Doorbell + wait for completion (Status TRB is the only one
+        // with IOC=1, so the matching Transfer Event carries its paddr).
+        self.ring_doorbell(slot_id, 1);
+        self.wait_for_transfer_event(status_paddr)?;
+        Ok(())
+    }
+
+    /// Issue a SET_CONFIGURATION standard request on EP0 (USB 2.0
+    /// § 9.4.7). After this completes successfully the device is in
+    /// the Configured state and the host can issue Configure
+    /// Endpoint to bring up data endpoints.
+    pub fn set_configuration(&mut self, config_value: u8) -> Result<(), XhciError> {
+        // SETUP packet for SET_CONFIGURATION:
+        //   bmRequestType = 0x00 (host-to-device, standard, recipient=device)
+        //   bRequest      = 0x09 (SET_CONFIGURATION)
+        //   wValue        = config_value
+        //   wIndex        = 0
+        //   wLength       = 0
+        let setup_packet: u64 =
+            0x00u64
+            | (0x09u64 << 8)
+            | ((config_value as u64) << 16);
+        self.control_transfer_no_data(setup_packet)
+    }
+
+    // -----------------------------------------------------------------
+    // Configure Endpoint + bulk transfer rings
+    // -----------------------------------------------------------------
+
+    /// Build an Input Context describing the CCID bulk IN + bulk OUT
+    /// endpoint pair, issue Configure Endpoint (xHCI 1.2 § 4.6.6,
+    /// TRB type 12), and allocate per-endpoint transfer rings. After
+    /// this completes the slot transitions Addressed → Configured
+    /// and the bulk endpoints can be driven via their doorbells.
+    ///
+    /// Returns the post-command Slot State from the Device Context
+    /// for logging (3 = Configured on success per xHCI 1.2 § 6.2.2
+    /// Slot State enum).
+    pub fn configure_endpoint(&mut self, ccid: &CcidEndpoints) -> Result<u8, XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+        let ic_paddr = self.input_context_paddr.ok_or(XhciError::EpNotReady)?;
+        let ic_vaddr = self.input_context_vaddr.ok_or(XhciError::EpNotReady)?;
+        let dc_vaddr = self.device_context_vaddr.ok_or(XhciError::EpNotReady)?;
+        let port_idx = self.port_idx.ok_or(XhciError::EpNotReady)?;
+        let speed = self.port_speed.ok_or(XhciError::EpNotReady)?;
+
+        // DCI mapping (xHCI 1.2 § 4.5.1): DCI = 2 * ep_num + dir_bit
+        // (dir_bit = 1 for IN, 0 for OUT). Endpoint number is the
+        // low 4 bits of bEndpointAddress.
+        let in_ep_num = ccid.bulk_in.endpoint_number();
+        let out_ep_num = ccid.bulk_out.endpoint_number();
+        let in_dci = (in_ep_num as u32) * 2 + 1;
+        let out_dci = (out_ep_num as u32) * 2;
+        // Context Entries field in the Slot Context = max DCI used.
+        let max_dci = core::cmp::max(in_dci, out_dci);
+
+        let in_mps = ccid.bulk_in.max_packet_size_bytes();
+        let out_mps = ccid.bulk_out.max_packet_size_bytes();
+
+        // Allocate per-endpoint transfer rings before building the
+        // Input Context (we need their paddrs for the TR Dequeue
+        // Pointer fields).
+        let in_ring = TransferRing::new().ok_or(XhciError::DmaAllocFailed)?;
+        let out_ring = TransferRing::new().ok_or(XhciError::DmaAllocFailed)?;
+
+        let ctx_size: u64 = if self.cap.csz { 64 } else { 32 };
+
+        // Re-fill the Input Context. We zero the page so the
+        // previous Address Device / Evaluate Context payload doesn't
+        // leak into the controller's read.
+        // SAFETY: ic_vaddr is the page allocated by address_device;
+        // we own it exclusively until the slot exits. All offsets
+        // below stay inside the 4 KiB page (Input Control + Slot +
+        // up to DCI 31 endpoint contexts = 33 × ctx_size ≤ 2112 B).
+        unsafe {
+            core::ptr::write_bytes(ic_vaddr as *mut u8, 0, 4096);
+
+            // Input Control Context (xHCI 1.2 § 6.2.5.1):
+            //   DWord 0: Drop Context flags = 0
+            //   DWord 1: Add Context flags — A0 (Slot, required when
+            //            Context Entries changes), A<in_dci>, A<out_dci>
+            let icc = ic_vaddr as *mut u32;
+            let add_flags = 0x1u32 | (1u32 << in_dci) | (1u32 << out_dci);
+            core::ptr::write_volatile(icc.add(1), add_flags);
+
+            // Slot Context (xHCI 1.2 § 6.2.2) at offset ctx_size.
+            // Re-populated from retained port_idx + port_speed; the
+            // only field that changes vs. address_device is Context
+            // Entries (1 → max_dci).
+            let slot = (ic_vaddr + ctx_size) as *mut u32;
+            let slot_dw0 =
+                ((speed as u32 & 0xF) << 20)
+                | ((max_dci & 0x1F) << 27);
+            let slot_dw1 = ((port_idx as u32 + 1) & 0xFF) << 16;
+            core::ptr::write_volatile(slot.add(0), slot_dw0);
+            core::ptr::write_volatile(slot.add(1), slot_dw1);
+
+            // Bulk IN Endpoint Context at offset (in_dci) * ctx_size.
+            //   DWord 1: CErr=3, EP Type=6 (Bulk IN), MPS
+            //   DWord 2-3: TR Dequeue Pointer | DCS=1
+            //   DWord 4: Avg TRB Length = 1024 (bulk default per
+            //            xHCI 1.2 § 4.14)
+            let in_ep = (ic_vaddr + (in_dci as u64) * ctx_size) as *mut u32;
+            let in_ep_dw1 =
+                (3u32 << 1)                  // CErr = 3
+                | (6u32 << 3)                // EP Type = Bulk IN
+                | ((in_mps as u32) << 16);
+            let in_dq = in_ring.paddr | 0x1;
+            core::ptr::write_volatile(in_ep.add(1), in_ep_dw1);
+            core::ptr::write_volatile(in_ep.add(2), in_dq as u32);
+            core::ptr::write_volatile(in_ep.add(3), (in_dq >> 32) as u32);
+            core::ptr::write_volatile(in_ep.add(4), 1024); // Avg TRB Len
+
+            // Bulk OUT Endpoint Context at offset (out_dci) * ctx_size.
+            //   EP Type = 2 (Bulk OUT)
+            let out_ep = (ic_vaddr + (out_dci as u64) * ctx_size) as *mut u32;
+            let out_ep_dw1 =
+                (3u32 << 1)
+                | (2u32 << 3)                // EP Type = Bulk OUT
+                | ((out_mps as u32) << 16);
+            let out_dq = out_ring.paddr | 0x1;
+            core::ptr::write_volatile(out_ep.add(1), out_ep_dw1);
+            core::ptr::write_volatile(out_ep.add(2), out_dq as u32);
+            core::ptr::write_volatile(out_ep.add(3), (out_dq >> 32) as u32);
+            core::ptr::write_volatile(out_ep.add(4), 1024);
+        }
+
+        // Configure Endpoint Command TRB (xHCI 1.2 § 6.4.3.5).
+        //   parameter: Input Context paddr
+        //   control  : Type=12, Slot ID [31:24], DC [9]=0 (configure,
+        //              not deconfigure)
+        let trb = Trb {
+            parameter: ic_paddr,
+            status: 0,
+            control:
+                (12u32 << 10)
+                | ((slot_id as u32) << 24),
+        };
+        self.submit_command(trb)?;
+
+        // Stash bulk ring state for downstream substages.
+        self.ccid_bulk = Some(CcidBulkRings {
+            in_dci: in_dci as u8,
+            in_mps,
+            in_ring,
+            out_dci: out_dci as u8,
+            out_mps,
+            out_ring,
+        });
+
+        // Read back Slot State from the Device Context's Slot Context
+        // (offset 0, DWord 3, bits [31:27]). Should be 3 (Configured).
+        // SAFETY: dc_vaddr is the Device Context page allocated by
+        // address_device; Slot Context lives at offset 0.
+        let slot_state = unsafe {
+            let dw3 = core::ptr::read_volatile((dc_vaddr + 12) as *const u32);
+            ((dw3 >> 27) & 0x1F) as u8
+        };
+        Ok(slot_state)
     }
 
     /// Poll the event ring until a Transfer Event arrives whose TRB
