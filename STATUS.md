@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-05-25 (docs: Dell 3630 references swept from code comments + STATUS / threat-model / ASSUMPTIONS as the bare-metal target gets re-chosen; ADR bodies left intact as historical record)
+last_synced_to_code: 2026-05-25 (docs/identity.md rewrite: hardware-key-as-personhood-and-identity-in-one-motion framing; vault simplified to AID → hardware-key-slot directory; biometric/social demoted to recovery-tier; bootstrap Principal reframed as platform identity)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so

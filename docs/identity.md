@@ -15,6 +15,23 @@ Identity is primitive and the system is built on that.
 
 ---
 
+## Identity, Concretely: The Hardware Key
+
+The user-facing identity primitive is a **hardware security key**. Presenting the key — physically inserting it and confirming with a touch or PIN — is the personhood-and-identity proof, both established in a single motion. The signature the key produces *is* the identity assertion; possession-plus-presentation *is* the proof that you are the holder. There is no separate authentication step, no password, no "log in" before "act as."
+
+This collapses two questions that conventional systems answer separately:
+
+- **Are you a person?** (Are you not a script, a stolen credential file, a leaked password?)
+- **Which person are you?** (Which Principal is making this assertion?)
+
+The hardware key answers both, simultaneously, every time. A YubiKey-class device cannot sign without a physical touch (or a separate biometric, depending on the model and slot policy). A stolen private key blob doesn't exist to steal — the key never leaves the silicon. Coerced presentation is a separate threat with its own mitigation track (see [Open Questions § Hardware-key presentation under coercion](#open-questions)); this primitive doesn't pretend to solve it.
+
+The system does the rest of the work behind the scenes. The vault maps your key to the right Principal for the current spawn context. The kernel transcribes the Principal onto outgoing IPC and authored objects. The cap layer gates what the Principal can do. None of this is user-visible. You touch the key; you're you.
+
+This is the v1+ target architecture for user identity. The current implementation uses a software bootstrap key for platform signing (see [Implementation Roadmap § Phase 0](#phase-0-bootstrap-identity)); hardware-rooted bootstrap lands when distribution becomes concrete, and is gated on hardware-vendor support for the cryptographic algorithms the rest of the stack uses (see [Open Questions](#open-questions)).
+
+---
+
 ## What Identity Is Not
 
 Briefly:
@@ -35,7 +52,9 @@ Briefly:
 
 Daily access vs. identity establishment.
 
-Daily use should be frictionless. The user authenticates to their **vault** (biometric, hardware key, or a combination — see [The Vault](#the-vault) below); the vault selects which Principal each newly-spawned process should act under. Identity establishment — generating a new Principal, witnessing an enrollment, recovering a lost vault — is ceremonial and explicit. The two paths share machinery but are distinct in the user experience.
+Daily use is hardware-key authentication. The user touches their key; the vault unlocks; the vault selects which Principal each newly-spawned process should act under. There is no separate password step and no biometric step on the daily-use path — the hardware key is the personhood proof, the signature is the identity assertion, and the vault's role is to map "which key, which slot, which context" to "which Principal" (see [The Vault](#the-vault) below).
+
+Identity establishment — generating a new Principal, witnessing an enrollment, recovering a lost vault — is ceremonial and explicit. Biometric proofs and social attestation participate in the recovery and witnessing paths (see [Recovery, Biology, and Community](#recovery-biology-and-community) below), not in daily authentication. The two paths share machinery but are distinct in the user experience.
 
 ---
 
@@ -169,28 +188,45 @@ The 32-byte AID stays fixed across all modes — algorithm-agnosticism applies t
 
 ## The Vault
 
-The vault is a userspace service that holds the user's Principals. It is the answer to "where do private keys live, and how do they map to running processes?"
+The vault is a userspace service that maps the user's Principals to their hardware key slots. It is the answer to "where do private keys live, and how do they map to running processes?" — and the answer to both halves is *the hardware key holds them; the vault holds the directory.*
 
-In v0–1B, the vault is implicit — the bootstrap private key sits in a kernel static, signing happens in the host-side `sign-elf` tool, and there is no runtime key management. **Phase 1C** (below) is where the vault becomes a real service, extending the existing `key-store-service` slot at endpoint 17.
+In v0–1B, the vault is implicit — a software bootstrap key sits in a kernel static (used for platform signing only), and there is no runtime key management for user Principals. **Phase 1C** (below) is where the vault becomes a real service, extending the existing `key-store-service` slot at endpoint 17.
 
 ### What the vault holds
+
+The vault is a **directory of `AID → hardware-key-slot` bindings**, not a key store. Private keys never live in software; they live in the hardware tokens (YubiKey PIV slots) and are exercised in-place via the CCID transport (see [ADR-032](adr/032-full-disk-encryption-below-substrate.md)'s `PivBackend::CcidPiv`). The vault knows *which device, which slot* holds the key for *which Principal*; it never holds the key bytes themselves.
 
 ```
 Vault {
     principals:    Vec<VaultEntry>,             // many, by design
-    unlock_state:  TransientUnlockMaterial,     // never persisted in plaintext
     context_map:   HashMap<ContextLabel, AID>,  // local-only "social_app → Principal_X"
 }
 
 VaultEntry {
     aid:                 [u8; 32],
-    encrypted_keys:      Vec<u8>,        // sealed at rest under the vault key
-    inception_record:    Option<...>,    // KERI-style provenance, post-v1
-    rotation_history:    Vec<...>,       // append-only, post-v1
+    key_handle:          KeyHandle,             // (device_id, slot_id) — points into hardware
+    inception_record:    Option<...>,           // KERI-style provenance, post-v1
+    rotation_history:    Vec<...>,              // append-only, post-v1
+}
+
+KeyHandle {
+    device_id:           HardwareDeviceId,      // e.g., YubiKey serial 12345678
+    sign_slot:           PivSlot,               // PIV slot 9C (Ed25519 sign)
+    decrypt_slot:        Option<PivSlot>,       // PIV slot 9D (X25519 ECDH) if needed
 }
 ```
 
-The vault encrypts every Principal's private key material at rest. The vault key is itself derived from the user's biometric + device entropy + (post-Phase 3) social attestation — see [The Biological Identity Model](#the-biological-identity-model) below. Unlock material is transient: derived per session, used to decrypt the entries the user actually invokes, wiped at session end.
+Operations against a Principal — sign data, decrypt envelope — route through the vault, which translates `AID → KeyHandle`, then issues the PIV APDU to the hardware token via `user/ccid`'s IPC. The vault is bookkeeping plus a transport coordinator; the private key bytes never enter its address space (or any userspace process's address space).
+
+Because private keys never exist in software, the vault has **no "vault key" to derive and no "decrypt at session start" step**. Unlocking the vault means proving you hold the corresponding hardware token — typically a touch on the relevant key as the first operation that needs it. There is no biometric-derived KDF for daily use; biometric and social attestation come back in [Recovery, Biology, and Community](#recovery-biology-and-community) below for the cold-path recovery / witnessing roles, not for daily authentication.
+
+### Plurality: primary and backup
+
+v1 plurality is **one Principal per hardware key**, with at minimum a **primary + backup** key pair per user (typical: two YubiKeys, one carried, one in secure offline storage). The primary signs and decrypts during daily use; the backup is the recovery path if the primary is lost, stolen, or destroyed. Both hold the same AID's signing authority via a key-rotation chain — see [Key Lifecycle § Rotation](#rotation) for how the backup signs a rotation proof that replaces the lost primary.
+
+Additional Principals come from additional keys. A user who genuinely needs separate identity contexts (e.g., distinct work-vs-personal identities with non-correlatable artifacts) provisions a separate key, or a separate slot on the same key, for each. The "many Principals per human" structural claim is preserved; the v1 friction is "buy another hardware key" rather than "click a UI button to mint an off-the-cuff Principal."
+
+A future option keeps the door open for per-context KDF plurality: one hardware key signing a per-context challenge produces a deterministic per-context Principal key. This delivers many Principals from a single key without the "buy another device" friction, at the cost of more design surface. The slot is named here so the wire formats accommodate it; the implementation lands when it's load-bearing (a second key proves too friction-heavy for users wanting more than primary-and-backup).
 
 ### How processes get a Principal
 
@@ -283,57 +319,46 @@ The append-only social log is not a separate concept. Each post is a CambiObject
 
 ---
 
-## The Biological Identity Model
+## Recovery, Biology, and Community
 
-### The Problem With Keys Alone
+Daily authentication is the hardware key (see [Identity, Concretely](#identity-concretely-the-hardware-key) and [The Vault](#the-vault) above). This section is about what happens at the edges of that model: when keys are lost, when AIDs need to migrate, when a new identity must be witnessed into existence. Biological identity and social attestation participate here, not in daily use.
 
-A key pair solves the cryptographic problem of identity. It does not solve the human problem of identity: what happens when you lose the keys?
+### When Keys Are Lost
 
-In a pure key-pair model, losing the private keys means losing the identities. Every file you signed becomes unextendable (you can no longer produce new signatures). Recovery requires either a trusted third party (central authority, violates CambiOS principles) or a pre-established recovery mechanism (another secret to lose).
+A hardware-key model solves the cryptographic problem of identity and eliminates the "stolen private key file" attack surface. It does not solve the human problem of identity: what happens when you lose the keys themselves — physically misplaced, destroyed in a fire, lost in a flood, stolen, or rendered unusable by hardware failure?
 
-The vault is the per-device home for keys; biological identity is what makes the vault recoverable when the device is lost.
+The system answers this in tiers:
 
-### Biometrics as Entropy, Not as Key
+1. **Primary key lost; backup still held.** The default v1 model (see [The Vault § Plurality](#plurality-primary-and-backup)). The backup hardware key signs a rotation proof; the AID stays fixed; the old key is marked dead in the rotation log. The user replaces the primary with a new physical key; the new key is added to the vault as the new primary, the backup re-takes its role.
 
-The biological insight is this: **biometric data is not a private key, but it is a powerful entropy source for key derivation.**
+2. **Both primary and backup lost.** The AID has no live private key. Without external help, the AID is functionally dead — its public key still verifies old signatures (so signed artifacts remain valid), but no new signatures can be produced. The user can generate a new AID with new hardware, with no automatic continuity to the old AID.
 
-You do not sign with your retina. You derive the **vault key** *from* your biometric profile (or a committed representation of it) such that possession of a matching biological sample is required to regenerate the vault key. The vault key in turn protects every Principal's private material at rest. The vault key is never stored; it is derived from things inherent to being alive.
+3. **Both lost AND continuity required.** This is where biology and community step in — the recovery floor below the hardware-key chain. Re-establishing continuity requires *external evidence that you are the same human who controlled the old AID*: biometric proof, plus a quorum of social attesters who can vouch for the link between the lost-AID person and the present-day person standing in front of them. This is post-v1 research; the design slot is named here for future filling.
 
-The primary biometric modalities, in order of preference:
+### Biometric Proof as Recovery Evidence (Future)
 
-1. **Retinal scan**
-2. **Facial geometry**
-3. **DNA/epigenetic profiling** (future fallback)
+Biometric data is not the daily-use identity primitive (the hardware key is). It can, however, serve as evidence in the recovery tier above: "the human re-establishing this AID is the same human whose biometric was committed at the AID's inception."
 
-```
-vault_key = KDF(biometric_commitment, device_context, social_attestation)
-```
+**Biometric as proof, not as entropy.** Earlier framings of this document modeled biometric data as the entropy source for a derived vault key. In the hardware-key model that role evaporates — the vault has no software-held key to derive. What biometric still does is *attest continuity*: a fresh biometric measurement, proven via ZKP against a commitment made at the AID's inception, lets the recovery quorum verify "yes, this is the human we previously knew."
 
-If you lose your device, you regenerate the vault key from the same inputs. The derived vault key is the same; once unlocked, every Principal in the vault is recoverable. Your identities are continuous.
+The proposed primary modalities, in order of preference:
 
-### Uniqueness and Context Vectors
+1. **Retinal scan** — vascular patterns are distinct even between identical twins (shaped by stochastic developmental processes, not genetics alone). Stable over a lifetime.
+2. **Facial geometry** — 3D facial structure diverges with age and life experience. Widely accessible via commodity hardware.
+3. **DNA/epigenetic profiling** — held back until social and ethical consensus exists. **Revisit when:** a published civil-society standard or major identity-protocol acceptance for DNA-as-identity surfaces, or explicit user-base demand makes the question concrete.
 
-No single biometric is perfectly unique in isolation. Identical twins have nearly indistinguishable facial geometry at birth. Retinal patterns are unique but could theoretically be spoofed with sufficient technology. The resolution is a **context vector**: identity is derived not from a single measurement but from multiple independent signals that converge on a unique individual.
+No single biometric is perfectly unique in isolation. The resolution is a **context vector**: recovery evidence draws from multiple independent signals — biometric + temporal continuity + device-binding history + social attestation — that converge on a unique individual.
 
 ```
-IdentityContext {
-    biometric_commitment:  Option<BiometricHash>,    // committed biometric profile (ZKP)
-                                                     // retinal scan, facial geometry, or DNA (future)
-    device_entropy:        [u8; 32],                 // hardware-bound randomness
+RecoveryContext {
+    biometric_commitment:  Option<BiometricHash>,    // committed at AID inception (ZKP)
+    device_entropy:        Option<[u8; 32]>,         // historic hardware-bound entropy
     social_attestation:    Option<Vec<Attestation>>, // quorum of trusted contacts
     temporal_proof:        Option<Timestamp>,        // continuity across time
 }
 ```
 
-The biometric modalities, in order of current preference:
-
-1. **Retinal scan** — vascular patterns are distinct even between identical twins (shaped by stochastic developmental processes, not genetics alone). Stable over a lifetime.
-2. **Facial geometry** — 3D facial structure diverges with age and life experience. Widely accessible via commodity hardware.
-3. **DNA/epigenetic profiling** — held back until social and ethical consensus exists. Slots into the context vector as an additional field once that emerges. **Revisit when:** a published civil-society standard or major identity-protocol acceptance for DNA-as-identity surfaces, or explicit user-base demand makes the question concrete.
-
-Combined with device entropy (hardware-bound) and social attestation (community-bound), the context vector produces a unique vault recoverability story even in adversarial edge cases.
-
-The context vector makes recovery a function of who you are biologically *and* what devices you control *and* what your social context attests.
+This is post-v1 research. The design slot exists; the implementation lands when biometric ZKP infrastructure and the social-attestation substrate mature. **Revisit when:** a real user loses both hardware keys with continuity required, OR the broader ZKP / biometric tooling ecosystem produces a usable production stack.
 
 ### Privacy: Zero-Knowledge Proofs
 
@@ -348,29 +373,32 @@ ZKP: "I possess a biometric sample consistent with the committed profile,
      without revealing anything about my biology beyond the proof."
 ```
 
-The commitment (a hash of the biometric profile) is public and stored with the identity context. The raw biometric data never leaves the device. Verification is proof of biological consistency, not disclosure of biological data.
+The commitment (a hash of the biometric profile) is public and stored with the AID's inception record. The raw biometric data never leaves the device. Verification is proof of biological consistency, not disclosure of biological data.
 
-This is an active research area (biometric ZKPs). CambiOS does not implement it now. But the interface is designed to accommodate it when it matures.
+This is an active research area. CambiOS does not implement biometric ZKPs in v1. The interface is designed to accommodate them at the recovery layer when they mature.
 
-### Vault Recovery via Biometric Context
+### Recovery Protocol (Future)
 
-Lost vault recovery without a central authority:
+When v2+ infrastructure exists, the full recovery flow looks like:
 
 ```
-Recovery protocol:
-1. Present fresh biometric sample (retinal scan, facial geometry, or future modality)
-2. ZKP proves sample matches committed profile
-3. Quorum of trusted social graph contacts attest continuity
-   ("this biometric matches the entity we have communicated with")
-4. New device derives the vault key from the same IdentityContext inputs
-5. Vault entries (all Principals, encrypted) are pulled from the user's
-   per-Principal CRDT replicas (other devices, sovereign cloud peers) and
-   decrypted with the recovered vault key
-6. Compromised individual Principals can be rotated within the recovered
-   vault per the per-Principal rotation protocol below
+Recovery protocol (v2+):
+1. User has lost all hardware keys for AID_old; wants to establish AID_new
+   with continuity attestation to AID_old.
+2. User provisions fresh hardware keys (new primary + new backup).
+3. User presents fresh biometric sample on a new device.
+4. ZKP proves sample matches AID_old's inception biometric commitment.
+5. Recovery quorum (peers attest from their SSB feeds): "we previously
+    interacted with the human now presenting this biometric; the link to
+    AID_old is one we observed over time."
+6. Quorum signs a continuity attestation tying AID_old → AID_new, published
+    to peer SSB feeds.
+7. Verifiers walking the social graph see the continuity attestation
+    alongside AID_old's old signatures; new signatures by AID_new inherit
+    the historical trust weight at whatever discount the verifier chooses.
 ```
 
-The vault key is never stored. It is derived. The derivation inputs are things you are (biology) and people who know you (social graph). Losing them all would be tricky at best.
+The recovery anchor is what you are biologically *and* who knows you. Losing both — destroyed biometric (rare) and isolated from your entire social graph (rare) — would be tricky at best, by design.
 
 ---
 
@@ -496,13 +524,30 @@ The AI never invokes kernel intervention primitives directly. It holds two capab
 
 Critically, **containment is per-Principal**. When the AI flags `social_Principal`, the human's other Principals are untouched. The blast radius of a sandbox event is a context, not a person. This composition with multi-Principal-by-default is what makes "AI watches and contains" usable in practice — narrowing one identity does not disrupt the human's broader work.
 
-### The Bootstrap Principal: A Special Case
+### The Bootstrap Principal: Platform Identity, Not Human Identity
 
-The bootstrap Principal is not a person. It is a hardware-backed key (YubiKey root of trust per Phase 0/1B) used to sign kernel processes and boot modules. It cannot be socially revoked because it has no social graph — no SSB feed, no peers, no quorum.
+The bootstrap Principal is **the platform itself** — kernel, boot modules, signed code that makes up "CambiOS on this disk." It is not a person, does not represent a person, and lives entirely outside the vault model. There is one bootstrap Principal per build, not per human; it cannot be socially revoked because it has no social graph.
 
-Bootstrap Principal revocation is a **system-level event**: firmware update, new YubiKey provisioning, re-signing of boot modules. It is analogous to rotating a root CA certificate — rare, deliberate, and requires physical or administrative access to the machine. The social revocation model does not apply here, and should not be expected to.
+The bootstrap Principal's role is narrow: sign the boot modules at build time, verify those signatures at boot time. The kernel's baked-in `bootstrap_pubkey.bin` is the trust anchor for "this code came from the entity that built this CambiOS image."
 
-The bootstrap Principal is also outside the vault model — there is one bootstrap Principal per device, not per human, and it does not represent a human at all.
+**Distribution model (target):**
+
+For distributed releases, the bootstrap Principal is the **distributor's identity** — Coherent Forge (or whoever else releases binaries) holds the bootstrap private key on hardware and signs each release. The release ships with `bootstrap_pubkey.bin` matching that hardware. Users running distributed binaries are trusting the distributor to have signed the right things.
+
+For **users who compile from source**, the bootstrap Principal is *theirs*. The existing `make gen-dev-piv-keys` machinery (post-rename: `make gen-bootstrap-key`) writes a fresh keypair to `bootstrap_pubkey.bin`, the kernel rebuilds with that key baked in, the user's `sign-elf` signs the boot modules with the corresponding private key. The structural exit from "trust the distributor" is "compile your own and become the distributor for your own machine."
+
+This is the Linux Secure Boot + MOK shape: factory keys for distributors, user-replaceable trust anchors for self-builders. The crucial property is that the bootstrap is **per-distribution**, not **per-user**. Your daily-use YubiKey-backed Principal lives in the vault and is unrelated to the bootstrap. Two different hardware-key-rooted identities at two different layers — never confused.
+
+**Current implementation status (v1):**
+
+The bootstrap key today is a **software keypair** generated by `gen-dev-piv-keys` from a per-developer seed, baked into the kernel and used by `sign-elf` for boot module signatures. This is sufficient for zero-user development and self-hosted use; the hardware-rooted bootstrap lands when distribution becomes concrete. Two gating factors:
+
+1. **No distribution yet, no user-facing trust-chain question.** Premature to commit hardware to a role that doesn't yet have a real-world claim.
+2. **Hardware-vendor algorithm support is still maturing.** The full CambiOS stack is Ed25519 (signing) + X25519 (envelope decrypt); the SwissBit iShield Key 2 Pro's PIV applet currently supports only NIST curves + RSA (see [Open Questions](#open-questions)). YubiKey 5.7+ supports Ed25519/X25519 on PIV; the cleanest hardware bootstrap awaits either SwissBit roadmap progress or a deliberate algorithm-split design choice across the bootstrap and user-identity roles.
+
+When distribution becomes real, the hardware bootstrap question gets a dedicated ADR.
+
+**Bootstrap key revocation** is a **system-level event** rather than a social/quorum one: firmware update, new hardware key provisioning, re-signing of boot modules, release of a new image with the new `bootstrap_pubkey.bin`. Pre-installed users on the old image stay there until they choose to upgrade; no global revocation, no forced upgrade. The social revocation model does not apply at this layer.
 
 ### Properties
 
@@ -533,25 +578,23 @@ This model trades **instant global revocation** for **layered local revocation w
 
 ## Implementation Roadmap
 
-### Phase 0: Bootstrap Identity — Hardware-Backed (YubiKey)
+### Phase 0: Bootstrap Identity
 
-The bootstrap identity is the root of trust for the entire system. It uses a **hardware-backed Ed25519 key on a YubiKey** (OpenPGP smart card interface). The private key never leaves the YubiKey hardware — it cannot be extracted via software, memory dumps, or cold boot attacks.
+The bootstrap identity is the platform's root of trust — used to sign kernel and boot modules at build time, verified at boot time against a kernel-baked public key. The bootstrap Principal is platform identity, not human identity; see [The Bootstrap Principal](#the-bootstrap-principal-platform-identity-not-human-identity) above for the full discussion.
 
-**Build-time signing:** The `sign-elf` tool communicates with the YubiKey to sign boot modules. The YubiKey performs Ed25519 signing internally; the host never sees the private key.
-
-**Compiled-in public key:** The YubiKey's Ed25519 public key is extracted once (`sign-elf --export-pubkey bootstrap_pubkey.bin`) and compiled into the kernel via `include_bytes!`. The kernel uses this key to verify boot module signatures and to restrict identity-binding operations.
-
-**No runtime secret key:** The kernel never holds the bootstrap secret key. The `BOOTSTRAP_SECRET_KEY` static remains zeroed. Runtime object signing is handled by user-space services with their own operational keys (currently degraded until USB HID enables runtime YubiKey communication).
-
-**Recovery model:** Two YubiKeys — one primary (daily use), one backup (physically separate secure storage). If the primary is lost, the backup can sign a key rotation proof. Vault recovery via biometric + social attestation (Phase 2/3) extends this further.
+**Current implementation (v1):** A software keypair generated by `make gen-dev-piv-keys` from a per-developer seed. The public key is baked into the kernel via `include_bytes!`; the private key is held by the developer for `sign-elf` to sign boot modules. Sufficient for zero-user development and self-hosted use.
 
 ```rust
-// bootstrap_pubkey.bin: 32-byte Ed25519 public key from YubiKey
-// Generated by: sign-elf --yubikey --export-pubkey bootstrap_pubkey.bin
+// bootstrap_pubkey.bin: 32-byte Ed25519 public key from gen-dev-piv-keys
 const BOOTSTRAP_PUBKEY: &[u8; 32] = include_bytes!("bootstrap_pubkey.bin");
 ```
 
-The interface it exposes is the permanent interface — algorithm-agnostic, dynamic-sized. The implementation behind it changes. The interface does not.
+**Hardware-rooted bootstrap (v1+ target):** The bootstrap keypair lives in a tamper-resistant hardware token (YubiKey PIV slot 9C or equivalent). `sign-elf` communicates with the token; the private key never leaves silicon. This lands when:
+
+1. Distribution becomes real (an organization releases CambiOS binaries to users that aren't the developer), creating a meaningful trust-chain claim worth anchoring.
+2. Hardware-vendor algorithm support catches up to the stack's Ed25519/X25519 family. YubiKey 5.7+ supports Ed25519 on PIV; SwissBit's iShield Key 2 Pro PIV applet is currently NIST-curves only (request filed with vendor for Ed25519 support).
+
+The current interface is algorithm-agnostic via dynamic-sized fields; switching from software to hardware bootstrap, or from one algorithm family to another, is a build-time change without structural impact. See [Open Questions § Bootstrap hardware](#open-questions) for the gating decision.
 
 ### Phase 1: Cryptographic Hardening
 
@@ -561,32 +604,35 @@ Real entropy for runtime randomness, signed ELF verification with the bootstrap 
 
 ML-DSA-65 implementation integrated alongside Ed25519. New Principals default to Hybrid mode (Ed25519 + ML-DSA-65). Existing Ed25519 Principals can upgrade via key rotation — the rotation proof is dual-signed (old Ed25519 key signs the new Hybrid key, establishing continuity). File verification dispatches on the `SignatureAlgorithm` tag and validates accordingly.
 
-### Phase 1C: Vault Service
+### Phase 1C: Vault Service (Hardware-Key Directory)
 
-The `key-store-service` slot at endpoint 17 (currently degraded — endpoint reserved, no real backend) becomes the **multi-Principal vault**. The architectural slot is the same; what changes is the model.
+The `key-store-service` slot at endpoint 17 (currently degraded — endpoint reserved, no real backend) becomes the **multi-Principal vault**. Per the hardware-key model in [The Vault](#the-vault) above, the vault is a directory of `AID → hardware-key-slot` bindings; private keys live in the YubiKey hardware, never in software.
 
 **Scope:**
-- Vault holds N Principals per human, encrypted at rest under the vault key (biometric-derived + device entropy).
-- Userspace API exposes `bind_for_spawn(context_label) → Principal` for parent processes consulting the vault before spawn.
-- Userspace API exposes `sign_with(principal, data) → Signature` for authored content and IPC handshakes.
-- Vault unlock material is transient: derived from biometric/hardware-key input each session, used to decrypt active entries, wiped at session end.
-- Cross-device sync uses per-Principal CRDT replication (foundation for Phase 7 SSB bridge); no server holds vault state.
-- The `ObjPutSigned` syscall stays the cap-gated "store this pre-signed object" primitive; signing happens in the vault before the syscall is invoked.
+- Vault holds N entries per human, one per provisioned hardware-key slot. v1 minimum: a primary + backup pair (typical: two YubiKeys with matching slot 9C signing keys).
+- Userspace API exposes `bind_for_spawn(context_label) → AID` for parent processes consulting the vault before spawn.
+- Userspace API exposes `sign_with(aid, data) → Signature` for authored content and IPC handshakes; the vault routes through `user/ccid`'s IPC to drive the corresponding hardware token (touch required per slot policy).
+- No vault key derivation, no biometric KDF — daily-use unlock is hardware-key touch on the first operation that needs a signature.
+- Cross-device sync uses per-Principal CRDT replication of the directory (AIDs + hardware-key-handle metadata); private keys cannot sync because they live in silicon. A second device gets a second pair of hardware keys, with a rotation chain linking them to the same AID.
+- The `ObjPutSigned` syscall stays the cap-gated "store this pre-signed object" primitive; signing happens in the vault (via the hardware token) before the syscall is invoked.
 
 **Out of scope (this phase):**
-- Runtime YubiKey access from the running kernel (requires USB HID; deferred to post-v1).
+- Runtime hardware-key access on bare metal (requires Stream B B-viii/B-ix CCID + PIV applet completion).
 - Hardware-backed sealed storage of derived keys (TPM/Secure Enclave integration; long-term).
 - Witness-bearing capabilities for cold-path revocation (deferred to ADR-007 amendment).
+- Per-context KDF plurality (one hardware key → many context-specific Principals via on-device signing of context labels). Slot reserved; lands when multi-key plurality friction becomes load-bearing.
 
-### Phase 2: Biometric Commitment
+### Phase 2: Biometric Recovery Infrastructure (Future)
 
-ZKP-based biometric commitment. The `IdentityContext.biometric_commitment` field becomes populated with retinal scan (primary) or facial geometry (secondary). Vault key derivation incorporates biological context. Recovery via biometric proof becomes possible.
+Per [Recovery, Biology, and Community § Biometric Proof as Recovery Evidence](#biometric-proof-as-recovery-evidence-future), biometric ZKP becomes available at the **recovery tier**, not in daily authentication. The `RecoveryContext.biometric_commitment` field gets populated at AID inception; recovery flows can present a fresh biometric sample and prove continuity to the inception commitment via ZKP.
 
-This requires ZKP infrastructure and biometric scanning integration — future work, but the interface slot exists from Phase 0. DNA/epigenetic profiling may be added as a future modality if social and ethical consensus emerges.
+Requires ZKP infrastructure and biometric scanning integration — post-v1 research. The hardware-key daily-use path doesn't depend on this; biometric is purely recovery floor.
 
-### Phase 3: Social Attestation and Recovery
+### Phase 3: Social Attestation Quorum (Future)
 
-Social graph quorum recovery. The `social_attestation` field in `IdentityContext` becomes populated from the SSB-inspired social layer. Vault recovery via quorum attestation is implemented. The cold-start enrollment protocol is defined.
+Social graph quorum recovery and witnessed enrollment. The `RecoveryContext.social_attestation` field becomes populated from the SSB-inspired social layer. Lost-key recovery via quorum attestation is implemented. The cold-start enrollment protocol — witnessed AID inception with peer-signed attestations — is defined and tooling lands.
+
+This is the recovery floor that participates with biometric ZKP (Phase 2) to handle "both hardware keys lost AND continuity required" cases.
 
 ### Phase 4: Full DID Integration
 
@@ -598,7 +644,7 @@ Social graph quorum recovery. The `social_attestation` field in `IdentityContext
 
 These must hold after every change to identity-related code:
 
-1. **Private keys never leave the vault.** No userspace process other than the vault receives raw private keys. Signing is always a request to the vault.
+1. **Private keys never exist in software.** Per the hardware-key model, private keys live in tamper-resistant silicon (YubiKey PIV slots or equivalent) and are exercised in-place via the CCID transport. The vault holds the AID → hardware-key-slot directory, never the key bytes. No userspace process — including the vault — sees raw private key material at any point. (Pre-hardware-bootstrap-rollout: the software bootstrap key for platform signing is the one exception, explicitly named in [The Bootstrap Principal](#the-bootstrap-principal-platform-identity-not-human-identity); it does not represent a human and is scoped to build-time code signing.)
 
 2. **Every file has a creator and an owner.** The native CambiOS filesystem format has no concept of a creatorless or ownerless file. The creator field is immutable — no API path may modify it after creation. The owner field is transferable only via signed `OwnershipTransfer` objects. Files created by system processes during bootstrap have the bootstrap identity as both creator and owner.
 
@@ -622,6 +668,10 @@ These must hold after every change to identity-related code:
 
 These are known unknowns.
 
+Bootstrap hardware:
+
+- **Hardware-vendor algorithm support for the bootstrap role.** The stack is Ed25519 (signing) + X25519 (envelope decrypt). YubiKey 5.7+ PIV supports both. SwissBit's iShield Key 2 Pro PIV applet is currently NIST curves + RSA only. Three live design options, none chosen pending distribution + vendor roadmap clarity: (1) algorithm split (P-256 bootstrap + Ed25519 user identity; kernel verifies both schemes), (2) FIDO2-mode `sign-elf` adapter (SwissBit's FIDO2 supports Ed25519; stack stays algorithm-uniform), (3) different bootstrap device (additional YubiKey 5.7+ in the bootstrap role; SwissBit repurposed). **Revisit when:** SwissBit responds re: Ed25519/X25519 PIV roadmap, OR distribution becomes concrete and the decision becomes load-bearing.
+
 Phase 1.5 blockers:
 
 - **ML-DSA-65 `no_std` implementation** — Which Rust crate for ML-DSA-65 works in `no_std` bare-metal? `pqcrypto-dilithium` wraps C; `ml-dsa` (RustCrypto) is pure Rust but may need maturity review. Stack usage for lattice operations on a 256KB boot stack needs measurement.
@@ -629,9 +679,9 @@ Phase 1.5 blockers:
 
 Vault design questions:
 
-- **Cross-device vault sync substrate.** Per-Principal CRDT replication is the natural model (each Principal owns its log; vault entries replicate per-Principal). Concrete CRDT choice (RGA, Causal Tree, OR-Set with custom merge) deferred until vault implementation begins. **Revisit when:** Phase 1C lands and a second device joins the user's vault.
+- **Cross-device vault directory sync.** Per-AID CRDT replication is the natural model (each AID owns its directory entry; the entry replicates across the user's devices). Concrete CRDT choice (RGA, Causal Tree, OR-Set with custom merge) deferred until vault implementation begins. Private keys cannot sync — they live in silicon. A second device gets a second hardware-key pair, with a rotation chain linking it to the same AID. **Revisit when:** Phase 1C lands and a second device joins the user's vault.
 - **Witness-bearing cap envelope format.** The external cap form sketched in [Capability shape duality](#capability-shape-duality) — sub-Principal + scope + lineage + non-revocation witness — does not yet have a wire/disk format. Deferred to the ADR-007 amendment that lands non-revocation accumulators. **Revisit when:** the first non-FS persistent cap (e.g., a delegated network grant that survives process exit) needs to be serialized.
-- **Vault unlock UX under coercion.** Biometric unlock can be compelled. A duress mode (a separate biometric pattern that unlocks a decoy vault while alerting peers) is a real research direction but explicitly deferred. **Revisit when:** a credible threat model surfaces that requires it (e.g., journalist-protection deployment).
+- **Hardware-key presentation under coercion.** A physical touch on a hardware key can be compelled — the silicon doesn't distinguish "willing" from "coerced." A duress mode (a separate slot that signs decoy artifacts and alerts peers, or a PIN entry that activates a containment mode) is a real research direction but explicitly deferred. **Revisit when:** a credible threat model surfaces that requires it (e.g., journalist-protection deployment).
 
 Further future unresolved:
 
