@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-05-27 (ADR-033 multi-Principal vault proposed: user/key-store-service as AID → hardware-key-slot directory; bind_for_spawn / sign_with / decrypt_with IPC; primary+backup hardware-key plurality; CLAUDE.md Identity Required Reading row + INDEX regenerated)
+last_synced_to_code: 2026-05-27 (usb-host + ccid IPC gating: recv_verified replaces try_recv_msg on both services' service loops; anonymous senders silently dropped; closes the bypass path that would let a process drive the hardware token directly without going through the vault per ADR-033)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so

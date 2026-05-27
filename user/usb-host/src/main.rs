@@ -621,22 +621,19 @@ const RECV_BUF_SIZE: usize = 256;
 fn serve_loop(ctl: &mut xhci::XhciController) -> ! {
     let mut recv_buf = [0u8; RECV_BUF_SIZE];
     loop {
-        let n = sys::try_recv_msg(USB_HOST_ENDPOINT, &mut recv_buf);
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-        // recv_msg layout: [sender_principal:32][from_endpoint:4][payload:N]
-        let n = n as usize;
-        if n < 36 {
-            // Malformed envelope; drop.
-            continue;
-        }
-        let from_ep = u32::from_le_bytes([
-            recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-        ]);
-        let payload = &recv_buf[36..n];
-        handle_request(ctl, from_ep, payload);
+        // `recv_verified` blocks until a non-anonymous sender's
+        // message arrives. Anonymous callers (None return path)
+        // get silently dropped — no auth, no reply. This is the
+        // "no identity, no participation" floor: the bulk transport
+        // is downstream of the vault's authority check (ADR-033),
+        // and refusing anonymous senders here closes the bypass
+        // path that would otherwise let a process skip the vault
+        // and drive the hardware token directly.
+        let msg = match sys::recv_verified(USB_HOST_ENDPOINT, &mut recv_buf) {
+            Some(m) => m,
+            None => continue,
+        };
+        handle_request(ctl, msg.from_endpoint(), msg.payload());
     }
 }
 
@@ -765,17 +762,14 @@ fn reply_status(reply_ep: u32, status: u8) {
 fn idle_loop() -> ! {
     let mut recv_buf = [0u8; RECV_BUF_SIZE];
     loop {
-        let n = sys::try_recv_msg(USB_HOST_ENDPOINT, &mut recv_buf);
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-        let n = n as usize;
-        if n >= 36 {
-            let from_ep = u32::from_le_bytes([
-                recv_buf[32], recv_buf[33], recv_buf[34], recv_buf[35],
-            ]);
-            reply_status(from_ep, STATUS_DEVICE_NOT_READY);
-        }
+        // Same recv_verified posture as serve_loop — anonymous
+        // callers get dropped before any reply. Verified callers
+        // get a typed `STATUS_DEVICE_NOT_READY` so they know the
+        // service is up but no controller is attached.
+        let msg = match sys::recv_verified(USB_HOST_ENDPOINT, &mut recv_buf) {
+            Some(m) => m,
+            None => continue,
+        };
+        reply_status(msg.from_endpoint(), STATUS_DEVICE_NOT_READY);
     }
 }

@@ -205,13 +205,19 @@ fn log_slot_status(s: &ccid::SlotStatus) {
 
 fn idle_loop() -> ! {
     // No client commands yet (PIV APDU dispatch lands in a future
-    // substage). Drain any incoming messages and sleep.
+    // substage). `recv_verified` blocks waiting for a verified
+    // sender; anonymous callers get dropped before any reply.
+    // This closes the bypass path that would let a process talk
+    // to ccid directly without going through the vault's
+    // authority check (ADR-033).
     let mut recv_buf = [0u8; 256];
     loop {
-        let n = sys::try_recv_msg(CCID_ENDPOINT, &mut recv_buf);
-        if n <= 0 {
-            sys::yield_now();
-        }
+        let _ = sys::recv_verified(CCID_ENDPOINT, &mut recv_buf);
+        // The PIV dispatch lands when stream B B-viii arrives —
+        // command-match + reply against `cambios_ccid_proto`'s
+        // higher-level commands. Until then this drops verified
+        // messages on the floor.
+        // Revisit when: B-viii lands.
     }
 }
 
