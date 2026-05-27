@@ -92,11 +92,11 @@ const DEFAULT_PROFILE: Profile = profile(&[
 #[allow(dead_code)]
 const HELLO_PROFILE: Profile = DEFAULT_PROFILE;
 
-/// Key-store service — claims bootstrap key, signs object puts over IPC.
+/// Key-store service — PIV-backed identity service over IPC.
 const KEY_STORE_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
         SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg,
-        SyscallNumber::ClaimBootstrapKey, SyscallNumber::BindPrincipal,
+        SyscallNumber::BindPrincipal,
     ]);
 
 /// FS service — ObjectStore gateway.

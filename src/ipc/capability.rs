@@ -709,7 +709,7 @@ impl CapabilityManager {
     /// by the caller from [`crate::BOOTSTRAP_PRINCIPAL`]. Passing it in (rather
     /// than having this method read the global) keeps the method testable in
     /// unit tests without depending on shared mutable global state, and
-    /// matches the pattern of the existing `handle_claim_bootstrap_key`
+    /// matches the pattern of the existing `handle_bind_principal`
     /// dispatcher which also loads the bootstrap once at the syscall boundary.
     ///
     /// After a successful return:
@@ -722,8 +722,7 @@ impl CapabilityManager {
     /// # Authority — v0
     ///
     /// Only the bootstrap Principal can revoke. This matches the existing
-    /// pattern for `SyscallNumber::BindPrincipal` and
-    /// `SyscallNumber::ClaimBootstrapKey`. ADR-007 §"Who can revoke" specifies
+    /// pattern for `SyscallNumber::BindPrincipal`. ADR-007 §"Who can revoke" specifies
     /// three authority paths (original grantor, holder of `revoke` right,
     /// bootstrap/policy service); the other two land when the policy service
     /// exists as the mediator.

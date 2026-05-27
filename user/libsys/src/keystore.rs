@@ -33,9 +33,11 @@
 /// IPC endpoint registered by `user/key-store-service`.
 pub const KEY_STORE_ENDPOINT: u32 = 17;
 
-// Legacy commands (kept working for degraded seed-mode bootstrap).
-pub const CMD_SIGN: u8 = 1;
-pub const CMD_GET_PUBKEY: u8 = 2;
+// Command IDs 1 and 2 (CMD_SIGN, CMD_GET_PUBKEY) were the legacy
+// seed-mode signing path that fed off `claim_bootstrap_key`. Removed
+// when the Frame-A vestige was cleaned up — the kernel never held the
+// secret key, so the path was always-denied in practice. Signing now
+// routes through the PIV commands below; do not reuse opcodes 1/2.
 
 // PIV commands (this contract).
 pub const CMD_PIV_HEALTH: u8 = 3;

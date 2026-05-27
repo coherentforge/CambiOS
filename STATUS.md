@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-05-25 (docs/identity.md rewrite: hardware-key-as-personhood-and-identity-in-one-motion framing; vault simplified to AID → hardware-key-slot directory; biometric/social demoted to recovery-tier; bootstrap Principal reframed as platform identity)
+last_synced_to_code: 2026-05-27 (Frame-A vestige cleanup: BOOTSTRAP_SECRET_KEY static + ClaimBootstrapKey syscall + CMD_SIGN/CMD_GET_PUBKEY userspace path removed; slot 18 marked deliberately vacated; fs-service signed-writes stubbed pending CMD_PIV_SIGN migration)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so

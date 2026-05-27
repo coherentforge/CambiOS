@@ -208,7 +208,6 @@ impl SyscallDispatcher {
             SyscallNumber::ObjGet => Self::handle_obj_get(args, &ctx),
             SyscallNumber::ObjDelete => Self::handle_obj_delete(args, &ctx),
             SyscallNumber::ObjList => Self::handle_obj_list(args, &ctx),
-            SyscallNumber::ClaimBootstrapKey => Self::handle_claim_bootstrap_key(args, &ctx),
             SyscallNumber::ObjPutSigned => Self::handle_obj_put_signed(args, &ctx),
             SyscallNumber::MapMmio => Self::handle_map_mmio(args, &ctx),
             SyscallNumber::AllocDma => Self::handle_alloc_dma(args, &ctx),
@@ -1649,55 +1648,6 @@ impl SyscallDispatcher {
     // Key Store syscalls
     // ========================================================================
 
-    /// SYS_CLAIM_BOOTSTRAP_KEY: One-shot delivery of the bootstrap secret key.
-    ///
-    /// Args: arg1 = out_sk_ptr (user vaddr, must hold 64 bytes)
-    ///
-    /// Writes the 64-byte Ed25519 secret key to the caller's buffer, then
-    /// permanently zeroes the kernel's copy. Restricted to the bootstrap
-    /// Principal. Fails if the key has already been claimed.
-    ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) only (BOOTSTRAP_SECRET_KEY is
-    /// independent of the lock hierarchy — single atomic claim operation).
-    ///
-    /// Deferred: Frame-A vestige. `BOOTSTRAP_SECRET_KEY.store()` is
-    /// unreferenced in the current tree, so `claim()` always returns
-    /// `None` and this syscall always returns `PermissionDenied`. Handler
-    /// and ABI preserved intentionally so Frame-B (kernel as arbiter, user
-    /// holds keys) can reuse the syscall number for the user-held-key
-    /// handoff. Do not delete without coordinating the Frame-B rewrite.
-    /// Why: docs/threat-model.md F2 + T-3; project memory
-    /// `frame_b_identity`.
-    /// Revisit when: Frame-B identity rewrite lands.
-    fn handle_claim_bootstrap_key(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        let out_sk_ptr = args.arg1;
-
-        if ctx.cr3 == 0 {
-            return Err(SyscallError::InvalidArg);
-        }
-
-        // Verify caller holds the bootstrap Principal (resolved by dispatch())
-        let principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        if *principal != bootstrap {
-            return Err(SyscallError::PermissionDenied);
-        }
-
-        // Claim the key (one-shot: None if already claimed; under Frame-A
-        // today, always None because BOOTSTRAP_SECRET_KEY.store() is dead).
-        let sk = crate::BOOTSTRAP_SECRET_KEY
-            .claim()
-            .ok_or(SyscallError::PermissionDenied)?;
-
-        // ADR-020 Phase B: write 64-byte secret key via typed slice.
-        let sk_slice = UserWriteSlice::validate(ctx, out_sk_ptr, 64)?;
-        sk_slice.write_from(&sk)?;
-
-        crate::println!("  [ClaimBootstrapKey] pid={} — key claimed, kernel copy zeroed", ctx.process_id.slot());
-
-        Ok(64)
-    }
-
     /// SYS_OBJ_PUT_SIGNED: Store a pre-signed CambiObject.
     ///
     /// Args: arg1 = content_ptr, arg2 = content_len, arg3 = sig_ptr (64 bytes),
@@ -2569,7 +2519,7 @@ impl SyscallDispatcher {
     ///
     /// Authority — v0 (per ADR-007 §"Who can revoke"):
     ///   Only the bootstrap Principal can call this. Matches the restriction
-    ///   pattern of `handle_bind_principal` and `handle_claim_bootstrap_key`.
+    ///   pattern of `handle_bind_principal`.
     ///
     /// Future work will relax this to also accept: the original grantor of the
     /// capability, and any process holding the `revoke` right on the endpoint
@@ -3831,7 +3781,7 @@ impl SyscallDispatcher {
     /// Authority: bootstrap-Principal-only. Reads raw disk bytes
     /// before any volume layer has authenticated them, so it must
     /// be tightly scoped to the signed `fde-mount` boot module.
-    /// Same gating shape as `ClaimBootstrapKey` and `BindPrincipal`.
+    /// Same gating shape as `BindPrincipal`.
     ///
     /// Lock ordering: none directly. `VirtioBlkDevice::call`
     /// yields the calling task via `yield_save_and_switch` while
@@ -3870,8 +3820,7 @@ impl SyscallDispatcher {
         // BindPrincipal had stamped ctx.cr3 onto the syscall entry path;
         // surfaced at A-v.d.3 end-to-end as `read_volume_header: -1`.
 
-        // Bootstrap-Principal-only — same gating shape as
-        // ClaimBootstrapKey / BindPrincipal.
+        // Bootstrap-Principal-only — same gating shape as BindPrincipal.
         let caller = ctx
             .caller_principal
             .as_ref()
@@ -3939,7 +3888,7 @@ impl SyscallDispatcher {
     ///
     /// Authority: bootstrap-Principal-only. The master key
     /// unlocks every block of persistent state; gating must be
-    /// as tight as `ClaimBootstrapKey` / `BindPrincipal`.
+    /// as tight as `BindPrincipal`.
     ///
     /// Idempotency: one-shot. If `OBJECT_STORE` already holds a
     /// `LazyDisk` variant, the call fails `PermissionDenied`. The
@@ -3978,7 +3927,7 @@ impl SyscallDispatcher {
         const FDE_SUBSTRATE_LBA_OFFSET: u64 = 4;
 
         // Bootstrap-Principal-only — same gating shape as
-        // ClaimBootstrapKey / BindPrincipal / ReadVolumeHeader.
+        // BindPrincipal / ReadVolumeHeader.
         let caller = ctx
             .caller_principal
             .as_ref()

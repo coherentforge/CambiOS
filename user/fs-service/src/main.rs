@@ -36,49 +36,22 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 // ============================================================================
-// Key Store interaction (endpoint 17)
+// Endpoint constants
 // ============================================================================
 
-const KS_ENDPOINT: u32 = 17;
-const KS_CMD_SIGN: u8 = 1;
 const FS_ENDPOINT: u32 = proto::FS_ENDPOINT;
 
-/// Request a signature from the key-store service.
-/// Returns Some(signature) on success, None if key-store is unavailable.
-fn request_sign(content: &[u8]) -> Option<[u8; 64]> {
-    if content.is_empty() || content.len() > 254 {
-        return None;
-    }
-
-    let mut req = [0u8; 256];
-    req[0] = KS_CMD_SIGN;
-    req[1..1 + content.len()].copy_from_slice(content);
-    let req_len = 1 + content.len();
-
-    let ret = sys::write(KS_ENDPOINT, &req[..req_len]);
-    if ret < 0 {
-        return None;
-    }
-
-    let mut resp_buf = [0u8; 256];
-    for _ in 0..20 {
-        let n = sys::recv_msg(FS_ENDPOINT, &mut resp_buf);
-        if n > 0 {
-            let total = n as usize;
-            if total >= 36 + 65 {
-                let status = resp_buf[36];
-                if status == 0 {
-                    let mut sig = [0u8; 64];
-                    sig.copy_from_slice(&resp_buf[37..101]);
-                    return Some(sig);
-                }
-            }
-            return None;
-        }
-        sys::yield_now();
-    }
-    None
-}
+// `request_sign` (previously here) routed signing requests to the
+// key-store-service's `CMD_SIGN` handler, which depended on the
+// kernel-held bootstrap secret key — a Frame-A vestige that was never
+// populated in practice. Removed alongside the kernel-side cleanup.
+// Signed-object writes via fs-service are now an explicit follow-up:
+// when re-enabled, they'll route through `CMD_PIV_SIGN` (the PIV
+// backend) instead, which works under `--features dev-piv` today and
+// against a real YubiKey when stream B B-ix lands. The three former
+// call sites (obj_put_signed paths) now return STATUS_DENIED with a
+// "signing not wired up" rationale at the site.
+// Revisit when: fs-service migrates obj_put_signed to CMD_PIV_SIGN.
 
 // ============================================================================
 // Name table (Phase 3 in-memory stub)
@@ -159,52 +132,11 @@ fn find_by_name(name: &[u8]) -> Option<usize> {
     None
 }
 
-fn find_free() -> Option<usize> {
-    let entries = table::entries();
-    let mut i = 0;
-    while i < MAX_NAMES {
-        if !entries[i].used {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Bind `name` to `hash`, overwriting any existing entry with the same name.
-fn bind_name(
-    name: &[u8],
-    hash: &[u8; 32],
-    size: u32,
-    author: &[u8; 32],
-    owner: &[u8; 32],
-    content_type: u8,
-    parent: Option<&[u8; 32]>,
-) -> bool {
-    let slot = find_by_name(name).or_else(find_free);
-    let slot = match slot {
-        Some(i) => i,
-        None => return false,
-    };
-    let entries = table::entries();
-    let e = &mut entries[slot];
-    e.used = true;
-    e.name_len = name.len() as u8;
-    e.name[..name.len()].copy_from_slice(name);
-    e.hash = *hash;
-    e.size = size;
-    e.author = *author;
-    e.owner = *owner;
-    e.content_type = content_type;
-    if let Some(p) = parent {
-        e.has_lineage = true;
-        e.lineage_parent = *p;
-    } else {
-        e.has_lineage = false;
-        e.lineage_parent = [0; 32];
-    }
-    true
-}
+// `find_free` and `bind_name` were the name-table writers used by the
+// signed-write paths (handle_put_named, seed_demo_objects). They became
+// dead when those paths were stubbed pending the CMD_PIV_SIGN
+// migration; resurrect them at that point.
+// Revisit when: signed writes are wired to CMD_PIV_SIGN.
 
 // ============================================================================
 // Handlers — hash-addressed (existing, unchanged)
@@ -213,33 +145,21 @@ fn bind_name(
 use proto::{
     CMD_DELETE, CMD_GET, CMD_GET_BY_NAME, CMD_GRANT, CMD_LIST, CMD_LIST_NAMED, CMD_PUT,
     CMD_PUT_BY_NAME, CMD_REMOVE, CMD_RENAME, CMD_STAT, CMD_TRANSFER, MAX_CONTENT_LEN, MAX_NAME_LEN,
-    STATUS_ALREADY_EXISTS, STATUS_DENIED, STATUS_FULL, STATUS_INVALID, STATUS_NOT_FOUND,
+    STATUS_ALREADY_EXISTS, STATUS_DENIED, STATUS_INVALID, STATUS_NOT_FOUND,
     STATUS_NOT_IMPLEMENTED, STATUS_OK, STAT_FIXED_LEN, STAT_OFF_ACL_IS_PUBLIC, STAT_OFF_AUTHOR,
     STAT_OFF_CONTENT_TYPE, STAT_OFF_HAS_LINEAGE, STAT_OFF_HASH, STAT_OFF_LINEAGE_PARENT,
     STAT_OFF_NAME, STAT_OFF_NAME_LEN, STAT_OFF_OWNER, STAT_OFF_SIZE,
 };
 
-fn handle_put(payload: &[u8], response: &mut [u8]) -> usize {
-    if payload.is_empty() {
-        response[0] = STATUS_INVALID;
-        return 1;
-    }
-    let sig = match request_sign(payload) {
-        Some(sig) => sig,
-        None => {
-            response[0] = STATUS_DENIED;
-            return 1;
-        }
-    };
-    let mut hash = [0u8; 32];
-    let ret = sys::obj_put_signed(payload, &sig, &mut hash);
-    if ret < 0 {
-        response[0] = STATUS_FULL;
-        return 1;
-    }
-    response[0] = STATUS_OK;
-    response[1..33].copy_from_slice(&hash);
-    33
+fn handle_put(_payload: &[u8], response: &mut [u8]) -> usize {
+    // Signed writes via fs-service are pending re-wiring to CMD_PIV_SIGN
+    // after the Frame-A vestige cleanup (see the request_sign comment
+    // up top). Functional behavior is unchanged from before the
+    // cleanup — request_sign always returned None, so this always
+    // landed at STATUS_DENIED — just now explicit at the site rather
+    // than implicit via a dead helper.
+    response[0] = STATUS_DENIED;
+    1
 }
 
 fn handle_get(payload: &[u8], response: &mut [u8]) -> usize {
@@ -384,38 +304,12 @@ fn handle_put_by_name(
     let name = &payload[name_off..name_off + name_len];
     let content = &payload[name_off + name_len..name_off + name_len + content_len];
 
-    // Sign + put into the underlying ObjectStore (matches existing PUT path).
-    let sig = match request_sign(content) {
-        Some(sig) => sig,
-        None => {
-            response[0] = STATUS_DENIED;
-            return 1;
-        }
-    };
-    let mut hash = [0u8; 32];
-    if sys::obj_put_signed(content, &sig, &mut hash) < 0 {
-        response[0] = STATUS_FULL;
-        return 1;
-    }
-
-    // Bind the name. v1 stub: author = owner = sender_principal.
-    let parent_opt = if has_parent { Some(&parent_hash) } else { None };
-    if !bind_name(
-        name,
-        &hash,
-        content_len as u32,
-        sender,
-        sender,
-        content_type,
-        parent_opt,
-    ) {
-        response[0] = STATUS_FULL;
-        return 1;
-    }
-
-    response[0] = STATUS_OK;
-    response[1..33].copy_from_slice(&hash);
-    33
+    // Signed writes pending CMD_PIV_SIGN migration (see request_sign
+    // comment up top). Functional behavior unchanged from pre-cleanup
+    // (the signing call always returned None → STATUS_DENIED).
+    let _ = (name, content, has_parent, parent_hash, sender, content_type);
+    response[0] = STATUS_DENIED;
+    1
 }
 
 fn handle_stat(payload: &[u8], response: &mut [u8]) -> usize {
@@ -577,48 +471,17 @@ fn handle_transfer(_payload: &[u8], response: &mut [u8]) -> usize {
 
 /// Seed the name table with a handful of demo objects so the shell's
 /// `ls` / `cat` / `stat` commands have something to render even before a
-/// client has saved anything. v1 stub — will be replaced when real
-/// persistence arrives.
+/// client has saved anything. Currently a no-op: seeding requires
+/// signed object writes, which are pending CMD_PIV_SIGN migration
+/// (see request_sign comment up top). The shell still works against
+/// objects written by a logged-in user with hardware-key-backed
+/// signing when that path lands; the demo seeds were never load-
+/// bearing for any test, just convenience.
+/// Revisit when: signed writes are wired to CMD_PIV_SIGN and demo
+/// seeds become useful again (or a different non-signed seed
+/// mechanism replaces them).
 fn seed_demo_objects() {
-    // Use the FS-service's own Principal as author. Reading it back via
-    // get_principal keeps the data self-consistent (stat will show
-    // "authored by fs-service" which is honest for a boot-seeded object).
-    let mut author = [0u8; 32];
-    let _ = sys::get_principal(&mut author);
-
-    let demo = [
-        ("readme.txt", proto::CT_PLAIN_TEXT, &b"Welcome to CambiOS. Run `help` for a list of commands.\n"[..]),
-        ("motd",       proto::CT_PLAIN_TEXT, &b"Today is a good day to build a microkernel.\n"[..]),
-        ("version",    proto::CT_PLAIN_TEXT, &b"CambiOS v1 UX layer (Phase 3).\n"[..]),
-    ];
-
-    for (name, ct, content) in demo {
-        if content.len() > proto::MAX_CONTENT_LEN {
-            continue;
-        }
-        let sig = match request_sign(content) {
-            Some(s) => s,
-            None => {
-                sys::print(b"[FS] seed: key-store unavailable, skipping\n");
-                return;
-            }
-        };
-        let mut hash = [0u8; 32];
-        if sys::obj_put_signed(content, &sig, &mut hash) < 0 {
-            sys::print(b"[FS] seed: obj_put failed\n");
-            return;
-        }
-        bind_name(
-            name.as_bytes(),
-            &hash,
-            content.len() as u32,
-            &author,
-            &author,
-            ct,
-            None,
-        );
-    }
-    sys::print(b"[FS] seeded demo objects\n");
+    sys::print(b"[FS] seed: signed writes pending CMD_PIV_SIGN migration, skipping\n");
 }
 
 // ============================================================================

@@ -504,23 +504,6 @@ pub fn try_load_balance() {
 /// bind identities to processes. Written once during boot, read-only after.
 pub static BOOTSTRAP_PRINCIPAL: BootstrapPrincipal = BootstrapPrincipal::new();
 
-/// Bootstrap Secret Key — the Ed25519 secret key for the bootstrap identity.
-///
-/// Used by the kernel to sign CambiObjects on behalf of processes bound to the
-/// bootstrap Principal. Written once during boot, read-only after.
-/// 64 bytes: seed (32) || public_key (32), per Ed25519 convention.
-///
-/// Deferred: Frame-A vestige. `store()` is unreferenced in the current tree,
-/// so the key remains all-zero and `SYS_CLAIM_BOOTSTRAP_KEY` always takes the
-/// `None` branch. Slot preserved intentionally — Frame-B identity (kernel as
-/// arbiter, not Principal-holder) will reuse it for the user-held-key handoff
-/// during bootstrap bind, so deleting the type and syscall number would cost
-/// more than it saves.
-/// Why: see docs/threat-model.md F2 and the `frame_b_identity` project memory.
-/// Revisit when: the Frame-B identity rewrite lands and decides whether to
-/// keep this shape or replace it with a different handoff primitive.
-pub static BOOTSTRAP_SECRET_KEY: BootstrapSecretKey = BootstrapSecretKey::new();
-
 /// Atomic-like wrapper for the bootstrap Principal.
 ///
 /// Written once at boot via `store()`, read via `load()`. Uses a Spinlock
@@ -550,60 +533,6 @@ impl BootstrapPrincipal {
     /// Read the bootstrap Principal.
     pub fn load(&self) -> ipc::Principal {
         *self.inner.lock()
-    }
-}
-
-/// Atomic-like wrapper for the bootstrap Ed25519 secret key (64 bytes).
-///
-/// Written once at boot via `store()`, read via `load()`.
-pub struct BootstrapSecretKey {
-    inner: Spinlock<[u8; 64]>,
-}
-
-impl Default for BootstrapSecretKey {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BootstrapSecretKey {
-    pub const fn new() -> Self {
-        BootstrapSecretKey {
-            inner: Spinlock::new([0u8; 64]),
-        }
-    }
-
-    /// Set the bootstrap secret key (called once during boot).
-    pub fn store(&self, sk: [u8; 64]) {
-        *self.inner.lock() = sk;
-    }
-
-    /// Read the bootstrap secret key.
-    pub fn load(&self) -> [u8; 64] {
-        *self.inner.lock()
-    }
-
-    /// Returns true if the key has been initialized (not all zeros).
-    pub fn is_initialized(&self) -> bool {
-        self.inner.lock().iter().any(|&b| b != 0)
-    }
-
-    /// One-shot claim: returns the secret key and zeroes the stored copy.
-    ///
-    /// After this call, `is_initialized()` returns false and `load()` returns
-    /// all zeros. The key has permanently left kernel memory.
-    /// Returns `None` if already claimed (all zeros).
-    pub fn claim(&self) -> Option<[u8; 64]> {
-        let mut guard = self.inner.lock();
-        if guard.iter().all(|&b| b == 0) {
-            return None;
-        }
-        let key = *guard;
-        // SAFETY: Zero the kernel's copy — key leaves kernel memory permanently.
-        for byte in guard.iter_mut() {
-            *byte = 0;
-        }
-        Some(key)
     }
 }
 

@@ -83,10 +83,9 @@ src/boot/riscv.rs:731:deferred
 src/fs/block.rs:174:eventually
 src/fs/virtio_blk_device.rs:80:deferred
 src/ipc/capability.rs:720:deferred
-src/ipc/capability.rs:774:TODO
-src/ipc/capability.rs:782:for-now
+src/ipc/capability.rs:773:TODO
+src/ipc/capability.rs:781:for-now
 src/lib.rs:100:TBD
-src/lib.rs:513:deferred
 src/memory/mod.rs:633:placeholder
 src/memory/mod.rs:642:placeholder
 src/microkernel/main.rs:930:for-now
@@ -100,8 +99,7 @@ src/process.rs:965:deferred
 src/process.rs:966:deferred
 src/scheduler/mod.rs:281:placeholder
 src/scheduler/mod.rs:282:placeholder
-src/syscalls/dispatcher.rs:1663:deferred
-src/syscalls/dispatcher.rs:4339:for-now
+src/syscalls/dispatcher.rs:4288:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now

@@ -440,12 +440,6 @@ pub fn install_master_key(master_key: &[u8; 64]) -> i64 {
     )
 }
 
-/// Claim the bootstrap secret key from the kernel (one-shot).
-/// Returns 64 on success, negative error on failure.
-pub fn claim_bootstrap_key(out_sk: &mut [u8; 64]) -> i64 {
-    syscall_raw3(SyscallNumber::ClaimBootstrapKey as u64, out_sk.as_mut_ptr() as u64, 0, 0)
-}
-
 // ============================================================================
 // Identity types — the userspace half of "no ID, no participation"
 // ============================================================================

@@ -126,11 +126,13 @@ pub enum SyscallNumber {
     /// List object hashes. Writes packed 32-byte hashes. Returns count of objects.
     ObjList = 17,
 
-    /// claim_bootstrap_key(out_sk_ptr: *mut u8) -> isize
-    /// One-shot: writes the 64-byte bootstrap Ed25519 secret key to the caller's
-    /// buffer and zeroes the kernel's copy. Restricted to bootstrap Principal.
-    /// Returns 64 on success, negative error if already claimed or unauthorized.
-    ClaimBootstrapKey = 18,
+    // Slot 18 deliberately vacated: was `ClaimBootstrapKey`, removed when the
+    // Frame-A "kernel holds the bootstrap secret key" vestige was cleaned up
+    // (see docs/identity.md — kernel never had a secret key in practice;
+    // BOOTSTRAP_SECRET_KEY.store() was never called). Do NOT reuse this slot
+    // — old binaries / audit logs / verification harnesses reference 18 as
+    // ClaimBootstrapKey, and reassignment would silently shift their
+    // semantics. New syscalls take new numbers.
 
     /// obj_put_signed(content_ptr: *const u8, content_len: usize, sig_ptr: *const u8, out_hash: *mut u8) -> isize
     /// Store a pre-signed CambiObject. Kernel verifies the Ed25519 signature
@@ -778,7 +780,7 @@ pub enum SyscallNumber {
     /// — the syscall reads raw disk bytes before any volume layer
     /// has authenticated them, so it must be tightly scoped to the
     /// signed `fde-mount` boot module. Same gating shape as
-    /// `ClaimBootstrapKey` and `BindPrincipal`.
+    /// `BindPrincipal`.
     ReadVolumeHeader = 74,
 
     /// SYS_INSTALL_MASTER_KEY (75): hand the kernel the unwrapped
@@ -811,8 +813,7 @@ pub enum SyscallNumber {
     /// only — the master key is the load-bearing secret guarding
     /// every block of persistent state; it must be tightly scoped
     /// to the signed `fde-mount` boot module. Same gating shape as
-    /// `ClaimBootstrapKey`, `BindPrincipal`, `VerifyVolumeHeader`,
-    /// and `ReadVolumeHeader`.
+    /// `BindPrincipal`, `VerifyVolumeHeader`, and `ReadVolumeHeader`.
     ///
     /// Idempotency: one-shot. After the first successful call, all
     /// subsequent calls fail `PermissionDenied`. The kernel does not
@@ -842,7 +843,7 @@ impl SyscallNumber {
             Self::DeviceInfo | Self::PortIo |
             Self::ObjPut | Self::ObjGet | Self::ObjDelete |
             Self::ObjList | Self::ObjPutSigned |
-            Self::BindPrincipal | Self::ClaimBootstrapKey |
+            Self::BindPrincipal |
             Self::Spawn | Self::WaitTask |
             Self::ConsoleRead |
             Self::RevokeCapability |
@@ -895,7 +896,7 @@ impl SyscallNumber {
             15 => Some(Self::ObjGet),
             16 => Some(Self::ObjDelete),
             17 => Some(Self::ObjList),
-            18 => Some(Self::ClaimBootstrapKey),
+            // 18 = removed (was ClaimBootstrapKey; see slot comment above).
             19 => Some(Self::ObjPutSigned),
             20 => Some(Self::MapMmio),
             21 => Some(Self::AllocDma),
@@ -1633,7 +1634,7 @@ mod tests {
             SyscallNumber::BindPrincipal, SyscallNumber::GetPrincipal,
             SyscallNumber::RecvMsg, SyscallNumber::ObjPut, SyscallNumber::ObjGet,
             SyscallNumber::ObjDelete, SyscallNumber::ObjList,
-            SyscallNumber::ClaimBootstrapKey, SyscallNumber::ObjPutSigned,
+            SyscallNumber::ObjPutSigned,
             SyscallNumber::MapMmio, SyscallNumber::AllocDma,
             SyscallNumber::DeviceInfo, SyscallNumber::PortIo,
             SyscallNumber::ConsoleRead, SyscallNumber::Spawn,
@@ -1706,7 +1707,17 @@ mod tests {
         // FDE-related syscalls (73 VerifyVolumeHeader, 74
         // ReadVolumeHeader, 75 InstallMasterKey) round out the
         // current high-water mark.
+        //
+        // Slot 18 is a deliberate gap: was `ClaimBootstrapKey` until the
+        // Frame-A vestige cleanup; reuse is prohibited (see the slot-18
+        // comment up by the variant definitions). `from_u64(18)` must
+        // return None and is excluded from the sweep.
         for i in 0..=75u64 {
+            if i == 18 {
+                assert!(SyscallNumber::from_u64(i).is_none(),
+                    "slot 18 must remain vacated; reuse is prohibited");
+                continue;
+            }
             let num = SyscallNumber::from_u64(i);
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
