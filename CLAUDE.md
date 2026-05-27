@@ -514,7 +514,7 @@ Handlers live in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs). All I
 
 - **Exit**: calls `CapabilityManager::revoke_all_for_process()` ([ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial.
 - **Allocate**: rolls back on OOM.
-- **BindPrincipal**, **ClaimBootstrapKey**, **AuditAttach**, **ChannelRevoke**, early **RevokeCapability**: **bootstrap-Principal-only**. `ClaimBootstrapKey` is one-shot and zeroes the kernel copy.
+- **BindPrincipal**, **AuditAttach**, **ChannelRevoke**, early **RevokeCapability**: **bootstrap-Principal-only**.
 - **RecvMsg**: wire format is `[sender_principal:32][from_endpoint:4][payload:N]`. Blocks on `MessageWait(endpoint)`.
 - **TryRecvMsg** (Phase 4b): non-blocking RecvMsg. Required for services polling multiple endpoints (virtio-blk ep24+ep26). `from_endpoint` is the sender's **reply endpoint** (first registered endpoint, tracked in `REPLY_ENDPOINT`) — before Phase 4b, `from = pid_slot` sent replies into a queue nobody read.
 - **ObjPutSigned**: caller supplies an Ed25519 signature; kernel verifies against caller's Principal before storing.
