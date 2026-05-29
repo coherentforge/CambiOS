@@ -22,11 +22,16 @@
 use cambios_key_store_service::piv::{
     dispatch::dispatch_piv_command, ActiveBackend,
 };
-use cambios_key_store_service::vault::init::init_vault;
+use cambios_key_store_service::vault::{init::init_vault, BindSource};
 use cambios_libsys as sys;
 use cambios_libsys::keystore::{
     CMD_PIV_ATTEST, CMD_PIV_DECRYPT, CMD_PIV_GET_PUBKEY, CMD_PIV_HEALTH,
     CMD_PIV_LIST_SLOTS, CMD_PIV_SIGN, CMD_PIV_VERIFY_PIN,
+};
+use cambios_libsys::vault::{
+    decode_bind_for_spawn_request, encode_bind_for_spawn_response,
+    encode_error_response as encode_vault_error_response, VaultError,
+    CMD_VAULT_BIND_FOR_SPAWN,
 };
 
 #[panic_handler]
@@ -68,7 +73,7 @@ pub extern "C" fn _start() -> ! {
     // ready when bind_for_spawn / sign_with / decrypt_with arrive.
     let mut bootstrap_aid = [0u8; 32];
     let rc = sys::get_principal(&mut bootstrap_aid);
-    let _vault = if rc == 32 {
+    let vault = if rc == 32 {
         sys::print(b"[KS] vault initialized (1 entry, bootstrap)\n");
         Some(init_vault(bootstrap_aid))
     } else {
@@ -115,6 +120,37 @@ pub extern "C" fn _start() -> ! {
                     1
                 }
             },
+
+            // Vault primitive per ADR-033 § 2.
+            CMD_VAULT_BIND_FOR_SPAWN => match vault.as_ref() {
+                Some(v) => match decode_bind_for_spawn_request(msg.payload()) {
+                    Ok(context) => {
+                        let caller_aid = msg.sender().as_bytes();
+                        match v.bind_for_spawn(caller_aid, context) {
+                            Ok(result) => {
+                                if result.source == BindSource::BootstrapFallback {
+                                    log_vault_fallback(context);
+                                }
+                                encode_bind_for_spawn_response(&result.aid, &mut resp_buf)
+                                    .unwrap_or(0)
+                            }
+                            Err(e) => encode_vault_error_response(e, &mut resp_buf)
+                                .unwrap_or(0),
+                        }
+                    }
+                    Err(_) => encode_vault_error_response(
+                        VaultError::InvalidPayload,
+                        &mut resp_buf,
+                    )
+                    .unwrap_or(0),
+                },
+                None => encode_vault_error_response(
+                    VaultError::BackendError,
+                    &mut resp_buf,
+                )
+                .unwrap_or(0),
+            },
+
             _ => {
                 resp_buf[0] = STATUS_ERROR;
                 1
@@ -123,6 +159,23 @@ pub extern "C" fn _start() -> ! {
 
         sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
     }
+}
+
+/// Emit a structured `[VAULT][FALLBACK]` line on every context-miss
+/// bind_for_spawn. Surfaces silent fallback-to-bootstrap so callers
+/// leaning on the v1 single-Principal practice become greppable in
+/// boot logs — see D4 in `notes/phase-1c-vault-overview.md`.
+/// Revisit when: a userspace audit-emit primitive lands and a second
+/// consumer with line-of-sight to the AI-watcher ring justifies
+/// promoting this from `sys::print` to kernel audit-ring emission.
+fn log_vault_fallback(context: &[u8]) {
+    sys::print(b"[VAULT][FALLBACK] context=");
+    if context.is_empty() {
+        sys::print(b"<empty>");
+    } else {
+        sys::print(context);
+    }
+    sys::print(b" -> bootstrap\n");
 }
 
 /// Initialize the active PIV backend at startup. Returns `None` if

@@ -36,6 +36,12 @@ pub mod time;
 /// is the consumer that justifies this contract.
 pub mod keystore;
 
+/// Multi-Principal vault IPC wire codec. Shares endpoint 17 with the
+/// PIV protocol but defines a distinct command family — opcodes
+/// 10..=15 are reserved for vault primitives per ADR-033. See
+/// [`vault`] for the command catalog and wire format.
+pub mod vault;
+
 
 // ============================================================================
 // Raw syscall primitives — the ONLY unsafe code in user-space

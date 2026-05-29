@@ -15,6 +15,7 @@
 //! address space; the `KeyHandle` is the pointer-into-hardware.
 
 use cambios_libsys::keystore::PivSlot;
+pub use cambios_libsys::vault::VaultError;
 
 pub mod init;
 
@@ -96,27 +97,29 @@ pub struct ContextMapEntry {
     pub aid: AID,
 }
 
-/// Errors returned across the vault's IPC boundary. The full surface is
-/// defined up-front (per D5) so wire format stays stable as 1C-B / 1C-C
-/// dispatch arms land.
+// `VaultError` is shared with clients via `cambios_libsys::vault::VaultError`
+// (re-exported above). Server-side code only ever returns the wire-mappable
+// variants (`NotAuthorized` through `InvalidPayload`); the local-only
+// `WireFormat` / `Ipc` variants exist on the type for client codec/IPC
+// failures and are never produced here.
+
+/// How `bind_for_spawn` resolved the requested context. Internal to the
+/// vault module: the wire response only carries the AID. The dispatch
+/// arm in `main.rs` inspects this to decide whether to emit the
+/// `[VAULT][FALLBACK]` log line per D4 of the 1C overview plan.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum VaultError {
-    /// Caller's bound AID is neither the bootstrap Principal nor in the
-    /// vault's directory.
-    NotAuthorized,
-    /// Requested AID is not in the vault's directory.
-    AidNotFound,
-    /// Vault entry exists, but the underlying hardware token is absent or
-    /// the slot is `None` (Sentinel backend).
-    TokenAbsent,
-    /// `bind_for_spawn(context)` did not find `context` in the context_map.
-    /// In v1 the dispatch arm catches this and falls back to the bootstrap
-    /// AID; future contexts may surface this to the caller.
-    ContextNotFound,
-    /// Underlying PIV backend returned an error.
-    BackendError,
-    /// Wire-format error in the request payload.
-    InvalidPayload,
+pub enum BindSource {
+    /// `context` was found in the vault's `context_map`.
+    ContextMatch,
+    /// `context` was not bound; the v1 vault returned the bootstrap AID.
+    BootstrapFallback,
+}
+
+/// What `bind_for_spawn` returns: the chosen AID plus how it was chosen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BindResult {
+    pub aid: AID,
+    pub source: BindSource,
 }
 
 // ============================================================================
@@ -180,7 +183,7 @@ impl Vault {
     }
 
     /// Look up an AID by context label. Returns `None` on miss; the
-    /// dispatch arm in 1C-B falls back to the bootstrap AID per D4.
+    /// `bind_for_spawn` caller falls back to the bootstrap AID per D4.
     pub fn aid_for_context(&self, label: &[u8]) -> Option<AID> {
         if label.is_empty() || label.len() > MAX_CONTEXT_LABEL_LEN {
             return None;
@@ -192,6 +195,35 @@ impl Vault {
             }
         }
         None
+    }
+
+    /// Vault primitive per ADR-033 § 2: parent processes call this
+    /// before invoking `SYS_SPAWN` to learn which AID the child should
+    /// be bound to.
+    ///
+    /// Flow:
+    ///   1. `authorize(caller_aid)?` — only recognized callers proceed.
+    ///   2. `aid_for_context(context)` — if matched, return it with
+    ///      `BindSource::ContextMatch`.
+    ///   3. Otherwise (v1: always, since the context_map is empty),
+    ///      return the bootstrap AID with `BindSource::BootstrapFallback`.
+    ///      The dispatch arm uses the `BootstrapFallback` source to emit
+    ///      a `[VAULT][FALLBACK]` log line; the wire response carries
+    ///      only the AID.
+    pub fn bind_for_spawn(
+        &self,
+        caller_aid: &AID,
+        context: &[u8],
+    ) -> Result<BindResult, VaultError> {
+        self.authorize(caller_aid)?;
+        if let Some(aid) = self.aid_for_context(context) {
+            Ok(BindResult { aid, source: BindSource::ContextMatch })
+        } else {
+            Ok(BindResult {
+                aid: self.bootstrap_aid,
+                source: BindSource::BootstrapFallback,
+            })
+        }
     }
 }
 
@@ -282,5 +314,71 @@ mod tests {
         assert!(vault.aid_for_context(b"").is_none());
         let too_long = [b'x'; MAX_CONTEXT_LABEL_LEN + 1];
         assert!(vault.aid_for_context(&too_long).is_none());
+    }
+
+    /// Test helper: populate one `context_map` slot. The runtime
+    /// context-binding API lives in a later stage when a UX flow
+    /// surfaces; for now tests need a way to exercise the
+    /// `ContextMatch` branch of `bind_for_spawn`.
+    fn insert_context(vault: &mut Vault, label: &[u8], aid_value: AID) {
+        for slot in vault.context_map.iter_mut() {
+            if slot.is_none() {
+                let mut buf = [0u8; MAX_CONTEXT_LABEL_LEN];
+                buf[..label.len()].copy_from_slice(label);
+                *slot = Some(ContextMapEntry {
+                    label: buf,
+                    label_len: label.len() as u8,
+                    aid: aid_value,
+                });
+                return;
+            }
+        }
+        panic!("context_map full");
+    }
+
+    #[test]
+    fn bind_for_spawn_falls_back_to_bootstrap_on_empty_context_map() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, sentinel_handle());
+        let result = vault.bind_for_spawn(&bootstrap, b"social").unwrap();
+        assert_eq!(result.aid, bootstrap);
+        assert_eq!(result.source, BindSource::BootstrapFallback);
+    }
+
+    #[test]
+    fn bind_for_spawn_falls_back_on_empty_label() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, sentinel_handle());
+        let result = vault.bind_for_spawn(&bootstrap, b"").unwrap();
+        assert_eq!(result.aid, bootstrap);
+        assert_eq!(result.source, BindSource::BootstrapFallback);
+    }
+
+    #[test]
+    fn bind_for_spawn_rejects_unauthorized_caller() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, sentinel_handle());
+        let stranger = aid(0xBB);
+        assert_eq!(
+            vault.bind_for_spawn(&stranger, b"social"),
+            Err(VaultError::NotAuthorized),
+        );
+    }
+
+    #[test]
+    fn bind_for_spawn_returns_context_match_when_label_is_bound() {
+        let bootstrap = aid(0xAA);
+        let work_aid = aid(0xCC);
+        let mut vault = Vault::new(bootstrap, sentinel_handle());
+        insert_context(&mut vault, b"work", work_aid);
+
+        let result = vault.bind_for_spawn(&bootstrap, b"work").unwrap();
+        assert_eq!(result.aid, work_aid);
+        assert_eq!(result.source, BindSource::ContextMatch);
+
+        // Untouched context still falls back.
+        let other = vault.bind_for_spawn(&bootstrap, b"social").unwrap();
+        assert_eq!(other.aid, bootstrap);
+        assert_eq!(other.source, BindSource::BootstrapFallback);
     }
 }
