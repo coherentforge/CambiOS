@@ -43,6 +43,17 @@ pub struct SyscallContext {
 /// device IRQs, 224-255 are reserved for APIC/IPI. SYS_WAIT_IRQ accepts < 224.
 const MAX_DEVICE_IRQ: u32 = 224;
 
+/// SCAFFOLDING: max inline content for SYS_OBJ_PUT / SYS_OBJ_PUT_SIGNED.
+/// The length guard and the on-stack `kbuf` staging buffer both reference this
+/// one const, so "guard length ≤ buffer length" holds by construction — that
+/// closes the kbuf-overrun panic where the guard had drifted to
+/// `MAX_USER_BUFFER` (16384) while `kbuf` stayed 4096.
+/// Why: an inline syscall buffer tracks the kernel-stack budget
+/// (`KERNEL_STACK_SIZE` = 32 KiB), NOT `MAX_CONTENT_BYTES_ON_DISK`, which grows
+/// to multi-block for v2 records. Full rationale in docs/ASSUMPTIONS.md.
+/// Replace when: a channel-based bulk obj_put path (ADR-005) lands.
+const OBJ_PUT_MAX_CONTENT: usize = 4096;
+
 // ============================================================================
 // Tombstone page (ADR-007 Divergence entry 7)
 // ============================================================================
@@ -1443,7 +1454,7 @@ impl SyscallDispatcher {
         let content_len = args.arg_usize(2);
         let out_hash = args.arg3;
 
-        if content_len == 0 || content_len > MAX_USER_BUFFER {
+        if content_len == 0 || content_len > OBJ_PUT_MAX_CONTENT {
             return Err(SyscallError::InvalidArg);
         }
         if ctx.cr3 == 0 {
@@ -1452,7 +1463,7 @@ impl SyscallDispatcher {
 
         // ADR-020 Phase B: read content via typed slice.
         let content_slice = UserReadSlice::validate(ctx, content_ptr, content_len)?;
-        let mut kbuf = [0u8; 4096];
+        let mut kbuf = [0u8; OBJ_PUT_MAX_CONTENT];
         content_slice.read_into(&mut kbuf[..content_len])?;
 
         // caller_principal already resolved by dispatch(); identity gate
@@ -1667,7 +1678,7 @@ impl SyscallDispatcher {
         let sig_ptr = args.arg3;
         let out_hash = args.arg4;
 
-        if content_len == 0 || content_len > MAX_USER_BUFFER {
+        if content_len == 0 || content_len > OBJ_PUT_MAX_CONTENT {
             return Err(SyscallError::InvalidArg);
         }
         if ctx.cr3 == 0 {
@@ -1677,7 +1688,7 @@ impl SyscallDispatcher {
         // ADR-020 Phase B: three independent typed slices — content in,
         // signature in, hash out.
         let content_slice = UserReadSlice::validate(ctx, content_ptr, content_len)?;
-        let mut kbuf = [0u8; 4096];
+        let mut kbuf = [0u8; OBJ_PUT_MAX_CONTENT];
         content_slice.read_into(&mut kbuf[..content_len])?;
 
         let sig_slice = UserReadSlice::validate(ctx, sig_ptr, 64)?;
