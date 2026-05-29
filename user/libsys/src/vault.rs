@@ -27,9 +27,18 @@
 /// be bound to. Per ADR-033 § 2; phase 1C stage B.
 pub const CMD_VAULT_BIND_FOR_SPAWN: u8 = 10;
 
-// Reserved for additive vault growth: 11..=15.
-//   11 = CMD_VAULT_SIGN_WITH    (1C-C)
-//   12 = CMD_VAULT_DECRYPT_WITH (1C-C)
+/// `sign_with(aid: AID, data: &[u8]) → Signature`. The vault routes the
+/// signing operation through `user/ccid`'s PIV transport (today: through
+/// whichever `PivBackend` the service compiles against). Per ADR-033 § 2;
+/// phase 1C stage C.
+pub const CMD_VAULT_SIGN_WITH: u8 = 11;
+
+/// `decrypt_with(aid: AID, ciphertext: &[u8]) → Plaintext`. X25519 ECDH
+/// decryption via the AID's PIV `KeyManagement` slot. Per ADR-033 § 2;
+/// phase 1C stage C.
+pub const CMD_VAULT_DECRYPT_WITH: u8 = 12;
+
+// Reserved for additive vault growth: 13..=15.
 
 // ============================================================================
 // Bounds
@@ -40,6 +49,21 @@ pub const CMD_VAULT_BIND_FOR_SPAWN: u8 = 10;
 /// vault module — both sides hard-code 32, which the 256-byte IPC
 /// payload comfortably accommodates.
 pub const MAX_CONTEXT_LABEL_LEN: usize = 32;
+
+/// Maximum data byte length on the wire for `sign_with`. Matches the
+/// 256-byte IPC payload minus the request header (cmd=1, aid=32,
+/// msg_len=2) and a small safety margin so a `[u8; 256]` response
+/// buffer is enough to encode the response in one shot.
+pub const MAX_VAULT_SIGN_MSG_LEN: usize = 220;
+
+/// Maximum ciphertext byte length on the wire for `decrypt_with`.
+/// Matches `keystore::MAX_WRAPPED_KEY_LEN` so the same `[u8; 256]`
+/// IPC envelope fits both PIV-direct and vault-mediated callers.
+pub const MAX_VAULT_WRAPPED_LEN: usize = 220;
+
+/// Maximum plaintext byte length on the wire for `decrypt_with`
+/// responses. Matches `keystore::MAX_PLAINTEXT_LEN`.
+pub const MAX_VAULT_PLAINTEXT_LEN: usize = 252;
 
 // ============================================================================
 // Wire status byte
@@ -148,6 +172,50 @@ pub fn encode_bind_for_spawn_request(
     Ok(total)
 }
 
+/// Encode a `sign_with` request: `[cmd:1][aid:32][msg_len:2 LE][msg:N]`.
+pub fn encode_sign_with_request(
+    aid: &[u8; 32],
+    msg: &[u8],
+    out: &mut [u8],
+) -> Result<usize, VaultError> {
+    if msg.len() > MAX_VAULT_SIGN_MSG_LEN {
+        return Err(VaultError::WireFormat);
+    }
+    let total = 35 + msg.len();
+    if out.len() < total {
+        return Err(VaultError::WireFormat);
+    }
+    out[0] = CMD_VAULT_SIGN_WITH;
+    out[1..33].copy_from_slice(aid);
+    let len_bytes = (msg.len() as u16).to_le_bytes();
+    out[33] = len_bytes[0];
+    out[34] = len_bytes[1];
+    out[35..total].copy_from_slice(msg);
+    Ok(total)
+}
+
+/// Encode a `decrypt_with` request: `[cmd:1][aid:32][ct_len:2 LE][ct:N]`.
+pub fn encode_decrypt_with_request(
+    aid: &[u8; 32],
+    ciphertext: &[u8],
+    out: &mut [u8],
+) -> Result<usize, VaultError> {
+    if ciphertext.len() > MAX_VAULT_WRAPPED_LEN {
+        return Err(VaultError::WireFormat);
+    }
+    let total = 35 + ciphertext.len();
+    if out.len() < total {
+        return Err(VaultError::WireFormat);
+    }
+    out[0] = CMD_VAULT_DECRYPT_WITH;
+    out[1..33].copy_from_slice(aid);
+    let len_bytes = (ciphertext.len() as u16).to_le_bytes();
+    out[33] = len_bytes[0];
+    out[34] = len_bytes[1];
+    out[35..total].copy_from_slice(ciphertext);
+    Ok(total)
+}
+
 // ============================================================================
 // Decoders — REQUESTS (server-side parse)
 // ============================================================================
@@ -163,6 +231,34 @@ pub fn decode_bind_for_spawn_request(buf: &[u8]) -> Result<&[u8], VaultError> {
         return Err(VaultError::WireFormat);
     }
     Ok(&buf[2..2 + ctx_len])
+}
+
+/// Decode a `sign_with` request. Returns `(aid, msg_slice)` borrowing
+/// `buf`.
+pub fn decode_sign_with_request(buf: &[u8]) -> Result<(&[u8; 32], &[u8]), VaultError> {
+    if buf.len() < 35 || buf[0] != CMD_VAULT_SIGN_WITH {
+        return Err(VaultError::WireFormat);
+    }
+    let aid: &[u8; 32] = buf[1..33].try_into().map_err(|_| VaultError::WireFormat)?;
+    let msg_len = u16::from_le_bytes([buf[33], buf[34]]) as usize;
+    if msg_len > MAX_VAULT_SIGN_MSG_LEN || buf.len() != 35 + msg_len {
+        return Err(VaultError::WireFormat);
+    }
+    Ok((aid, &buf[35..35 + msg_len]))
+}
+
+/// Decode a `decrypt_with` request. Returns `(aid, ciphertext_slice)`
+/// borrowing `buf`.
+pub fn decode_decrypt_with_request(buf: &[u8]) -> Result<(&[u8; 32], &[u8]), VaultError> {
+    if buf.len() < 35 || buf[0] != CMD_VAULT_DECRYPT_WITH {
+        return Err(VaultError::WireFormat);
+    }
+    let aid: &[u8; 32] = buf[1..33].try_into().map_err(|_| VaultError::WireFormat)?;
+    let ct_len = u16::from_le_bytes([buf[33], buf[34]]) as usize;
+    if ct_len > MAX_VAULT_WRAPPED_LEN || buf.len() != 35 + ct_len {
+        return Err(VaultError::WireFormat);
+    }
+    Ok((aid, &buf[35..35 + ct_len]))
 }
 
 // ============================================================================
@@ -196,6 +292,40 @@ pub fn encode_bind_for_spawn_response(
     Ok(33)
 }
 
+/// Encode a `sign_with` OK response: `[status:1][sig:64]`.
+pub fn encode_sign_with_response(
+    sig: &crate::keystore::Ed25519Signature,
+    out: &mut [u8],
+) -> Result<usize, VaultError> {
+    if out.len() < 65 {
+        return Err(VaultError::WireFormat);
+    }
+    out[0] = VaultStatus::Ok as u8;
+    out[1..65].copy_from_slice(&sig.0);
+    Ok(65)
+}
+
+/// Encode a `decrypt_with` OK response:
+/// `[status:1][len:2 LE][plaintext:N]`.
+pub fn encode_decrypt_with_response(
+    plaintext: &[u8],
+    out: &mut [u8],
+) -> Result<usize, VaultError> {
+    if plaintext.len() > MAX_VAULT_PLAINTEXT_LEN {
+        return Err(VaultError::WireFormat);
+    }
+    let total = 3 + plaintext.len();
+    if out.len() < total {
+        return Err(VaultError::WireFormat);
+    }
+    out[0] = VaultStatus::Ok as u8;
+    let len_bytes = (plaintext.len() as u16).to_le_bytes();
+    out[1] = len_bytes[0];
+    out[2] = len_bytes[1];
+    out[3..total].copy_from_slice(plaintext);
+    Ok(total)
+}
+
 // ============================================================================
 // Decoders — RESPONSES (client-side parse)
 // ============================================================================
@@ -216,6 +346,53 @@ pub fn decode_bind_for_spawn_response(buf: &[u8]) -> Result<[u8; 32], VaultError
     let mut aid = [0u8; 32];
     aid.copy_from_slice(&buf[1..33]);
     Ok(aid)
+}
+
+/// Decode a `sign_with` response. Returns the 64-byte Ed25519 signature
+/// on success.
+pub fn decode_sign_with_response(
+    buf: &[u8],
+) -> Result<crate::keystore::Ed25519Signature, VaultError> {
+    if buf.is_empty() {
+        return Err(VaultError::WireFormat);
+    }
+    let status = VaultStatus::from_byte(buf[0]).ok_or(VaultError::WireFormat)?;
+    if let Some(err) = VaultError::from_status(status) {
+        return Err(err);
+    }
+    if buf.len() != 65 {
+        return Err(VaultError::WireFormat);
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&buf[1..65]);
+    Ok(crate::keystore::Ed25519Signature(sig))
+}
+
+/// Decode a `decrypt_with` response into `out`. Returns the plaintext
+/// byte count on success.
+pub fn decode_decrypt_with_response(
+    buf: &[u8],
+    out: &mut [u8],
+) -> Result<usize, VaultError> {
+    if buf.is_empty() {
+        return Err(VaultError::WireFormat);
+    }
+    let status = VaultStatus::from_byte(buf[0]).ok_or(VaultError::WireFormat)?;
+    if let Some(err) = VaultError::from_status(status) {
+        return Err(err);
+    }
+    if buf.len() < 3 {
+        return Err(VaultError::WireFormat);
+    }
+    let pt_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+    if pt_len > MAX_VAULT_PLAINTEXT_LEN || buf.len() != 3 + pt_len {
+        return Err(VaultError::WireFormat);
+    }
+    if out.len() < pt_len {
+        return Err(VaultError::WireFormat);
+    }
+    out[..pt_len].copy_from_slice(&buf[3..3 + pt_len]);
+    Ok(pt_len)
 }
 
 // ============================================================================
@@ -255,6 +432,59 @@ pub fn vault_bind_for_spawn(
     }
     let n = n as usize;
     decode_bind_for_spawn_response(&buf[36..n])
+}
+
+/// Ask the vault to sign `msg` with the AID's signing key. The vault
+/// translates AID → KeyHandle.sign_slot, routes through the active
+/// PIV backend (today: dev-piv `SwPivBackend` under
+/// `--features dev-piv`, `InertPivBackend` otherwise; CcidPivBackend
+/// at Stream B B-ix). `reply_endpoint` must be pre-registered.
+pub fn vault_sign_with(
+    reply_endpoint: u32,
+    aid: &[u8; 32],
+    msg: &[u8],
+) -> Result<crate::keystore::Ed25519Signature, VaultError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_sign_with_request(aid, msg, &mut req)?;
+
+    let rc = crate::write(KEY_STORE_ENDPOINT, &req[..req_len]);
+    if rc < 0 {
+        return Err(VaultError::Ipc);
+    }
+
+    let mut buf = [0u8; 256];
+    let n = crate::recv_msg(reply_endpoint, &mut buf);
+    if n < 36 {
+        return Err(VaultError::Ipc);
+    }
+    let n = n as usize;
+    decode_sign_with_response(&buf[36..n])
+}
+
+/// Ask the vault to X25519 ECDH-decrypt `ciphertext` with the AID's
+/// `KeyManagement` slot, writing plaintext into `out`. Returns the
+/// plaintext byte count.
+pub fn vault_decrypt_with(
+    reply_endpoint: u32,
+    aid: &[u8; 32],
+    ciphertext: &[u8],
+    out: &mut [u8],
+) -> Result<usize, VaultError> {
+    let mut req = [0u8; 256];
+    let req_len = encode_decrypt_with_request(aid, ciphertext, &mut req)?;
+
+    let rc = crate::write(KEY_STORE_ENDPOINT, &req[..req_len]);
+    if rc < 0 {
+        return Err(VaultError::Ipc);
+    }
+
+    let mut buf = [0u8; 256];
+    let n = crate::recv_msg(reply_endpoint, &mut buf);
+    if n < 36 {
+        return Err(VaultError::Ipc);
+    }
+    let n = n as usize;
+    decode_decrypt_with_response(&buf[36..n], out)
 }
 
 // ============================================================================
@@ -418,5 +648,171 @@ mod tests {
         ] {
             assert_eq!(VaultStatus::from_byte(s as u8), Some(s));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // sign_with codec
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sign_with_request_round_trip() {
+        let aid = [0x42u8; 32];
+        let msg = b"hello, world";
+        let mut req = [0u8; 256];
+        let n = encode_sign_with_request(&aid, msg, &mut req).unwrap();
+        assert_eq!(n, 35 + msg.len());
+        let (decoded_aid, decoded_msg) =
+            decode_sign_with_request(&req[..n]).unwrap();
+        assert_eq!(decoded_aid, &aid);
+        assert_eq!(decoded_msg, msg);
+    }
+
+    #[test]
+    fn sign_with_request_rejects_overlong_msg() {
+        let aid = [0u8; 32];
+        let msg = [0u8; MAX_VAULT_SIGN_MSG_LEN + 1];
+        let mut req = [0u8; 256];
+        assert_eq!(
+            encode_sign_with_request(&aid, &msg, &mut req),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn sign_with_request_rejects_short_buffer() {
+        let aid = [0u8; 32];
+        let mut tiny = [0u8; 10];
+        assert_eq!(
+            encode_sign_with_request(&aid, b"x", &mut tiny),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn sign_with_request_rejects_wrong_opcode() {
+        let mut buf = [0u8; 35];
+        buf[0] = 0x99;
+        assert_eq!(
+            decode_sign_with_request(&buf),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn sign_with_request_rejects_length_mismatch() {
+        let mut buf = [0u8; 35];
+        buf[0] = CMD_VAULT_SIGN_WITH;
+        buf[33] = 5;
+        // Declared 5 bytes but buffer ends at byte 35 → length mismatch.
+        assert_eq!(
+            decode_sign_with_request(&buf),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn sign_with_response_round_trip() {
+        let sig = crate::keystore::Ed25519Signature([0xCD; 64]);
+        let mut resp = [0u8; 256];
+        let n = encode_sign_with_response(&sig, &mut resp).unwrap();
+        assert_eq!(n, 65);
+        let decoded = decode_sign_with_response(&resp[..n]).unwrap();
+        assert_eq!(decoded.0, sig.0);
+    }
+
+    #[test]
+    fn sign_with_response_decodes_error_status() {
+        let mut resp = [0u8; 64];
+        encode_error_response(VaultError::TokenAbsent, &mut resp).unwrap();
+        assert_eq!(
+            decode_sign_with_response(&resp[..1]),
+            Err(VaultError::TokenAbsent),
+        );
+    }
+
+    #[test]
+    fn sign_with_response_rejects_truncated_ok() {
+        let truncated = [VaultStatus::Ok as u8, 0xAA, 0xAA];
+        assert_eq!(
+            decode_sign_with_response(&truncated),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // decrypt_with codec
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decrypt_with_request_round_trip() {
+        let aid = [0x77u8; 32];
+        let ct = b"ciphertext-bytes";
+        let mut req = [0u8; 256];
+        let n = encode_decrypt_with_request(&aid, ct, &mut req).unwrap();
+        assert_eq!(n, 35 + ct.len());
+        let (decoded_aid, decoded_ct) =
+            decode_decrypt_with_request(&req[..n]).unwrap();
+        assert_eq!(decoded_aid, &aid);
+        assert_eq!(decoded_ct, ct);
+    }
+
+    #[test]
+    fn decrypt_with_request_rejects_overlong_ciphertext() {
+        let aid = [0u8; 32];
+        let ct = [0u8; MAX_VAULT_WRAPPED_LEN + 1];
+        let mut req = [0u8; 256];
+        assert_eq!(
+            encode_decrypt_with_request(&aid, &ct, &mut req),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn decrypt_with_response_round_trip() {
+        let plaintext = b"decrypted-bytes-here";
+        let mut resp = [0u8; 256];
+        let n = encode_decrypt_with_response(plaintext, &mut resp).unwrap();
+        assert_eq!(n, 3 + plaintext.len());
+        let mut out = [0u8; 256];
+        let pt_len = decode_decrypt_with_response(&resp[..n], &mut out).unwrap();
+        assert_eq!(pt_len, plaintext.len());
+        assert_eq!(&out[..pt_len], plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_response_rejects_overlong_declared_length() {
+        let mut buf = [0u8; 3];
+        buf[0] = VaultStatus::Ok as u8;
+        let len_bytes = (MAX_VAULT_PLAINTEXT_LEN as u16 + 1).to_le_bytes();
+        buf[1] = len_bytes[0];
+        buf[2] = len_bytes[1];
+        let mut out = [0u8; 256];
+        assert_eq!(
+            decode_decrypt_with_response(&buf, &mut out),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn decrypt_with_response_rejects_short_output_buffer() {
+        let plaintext = b"a-meaningfully-long-payload-that-wont-fit";
+        let mut resp = [0u8; 256];
+        let n = encode_decrypt_with_response(plaintext, &mut resp).unwrap();
+        let mut tiny = [0u8; 4];
+        assert_eq!(
+            decode_decrypt_with_response(&resp[..n], &mut tiny),
+            Err(VaultError::WireFormat),
+        );
+    }
+
+    #[test]
+    fn decrypt_with_response_decodes_error_status() {
+        let mut resp = [0u8; 64];
+        encode_error_response(VaultError::TokenAbsent, &mut resp).unwrap();
+        let mut out = [0u8; 256];
+        assert_eq!(
+            decode_decrypt_with_response(&resp[..1], &mut out),
+            Err(VaultError::TokenAbsent),
+        );
     }
 }

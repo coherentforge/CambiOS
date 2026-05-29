@@ -225,6 +225,38 @@ impl Vault {
             })
         }
     }
+
+    /// Resolve `target_aid` to its signing slot for `sign_with`.
+    ///
+    /// Flow:
+    ///   1. `authorize(caller_aid)?`.
+    ///   2. `entry_for(target_aid)?` → `AidNotFound` on miss.
+    ///   3. `entry.key_handle.sign_slot` → `TokenAbsent` if `None`.
+    ///
+    /// Returns the PIV slot the dispatch arm should drive via the
+    /// active backend.
+    pub fn resolve_sign(
+        &self,
+        caller_aid: &AID,
+        target_aid: &AID,
+    ) -> Result<PivSlot, VaultError> {
+        self.authorize(caller_aid)?;
+        let entry = self.entry_for(target_aid).ok_or(VaultError::AidNotFound)?;
+        entry.key_handle.sign_slot.ok_or(VaultError::TokenAbsent)
+    }
+
+    /// Resolve `target_aid` to its decryption (KeyManagement) slot for
+    /// `decrypt_with`. Same shape as `resolve_sign` against the
+    /// `decrypt_slot` field.
+    pub fn resolve_decrypt(
+        &self,
+        caller_aid: &AID,
+        target_aid: &AID,
+    ) -> Result<PivSlot, VaultError> {
+        self.authorize(caller_aid)?;
+        let entry = self.entry_for(target_aid).ok_or(VaultError::AidNotFound)?;
+        entry.key_handle.decrypt_slot.ok_or(VaultError::TokenAbsent)
+    }
 }
 
 // ============================================================================
@@ -380,5 +412,93 @@ mod tests {
         let other = vault.bind_for_spawn(&bootstrap, b"social").unwrap();
         assert_eq!(other.aid, bootstrap);
         assert_eq!(other.source, BindSource::BootstrapFallback);
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_sign / resolve_decrypt
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_sign_returns_slot_for_bootstrap_entry_with_dev_piv_handle() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, dev_piv_handle());
+        assert_eq!(
+            vault.resolve_sign(&bootstrap, &bootstrap),
+            Ok(PivSlot::Signature),
+        );
+    }
+
+    #[test]
+    fn resolve_decrypt_returns_slot_for_bootstrap_entry_with_dev_piv_handle() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, dev_piv_handle());
+        assert_eq!(
+            vault.resolve_decrypt(&bootstrap, &bootstrap),
+            Ok(PivSlot::KeyManagement),
+        );
+    }
+
+    #[test]
+    fn resolve_sign_returns_token_absent_for_sentinel_handle() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, sentinel_handle());
+        assert_eq!(
+            vault.resolve_sign(&bootstrap, &bootstrap),
+            Err(VaultError::TokenAbsent),
+        );
+    }
+
+    #[test]
+    fn resolve_decrypt_returns_token_absent_for_sentinel_handle() {
+        let bootstrap = aid(0xAA);
+        let vault = Vault::new(bootstrap, sentinel_handle());
+        assert_eq!(
+            vault.resolve_decrypt(&bootstrap, &bootstrap),
+            Err(VaultError::TokenAbsent),
+        );
+    }
+
+    #[test]
+    fn resolve_sign_returns_aid_not_found_for_unknown_target() {
+        let bootstrap = aid(0xAA);
+        let stranger = aid(0xBB);
+        let vault = Vault::new(bootstrap, dev_piv_handle());
+        assert_eq!(
+            vault.resolve_sign(&bootstrap, &stranger),
+            Err(VaultError::AidNotFound),
+        );
+    }
+
+    #[test]
+    fn resolve_decrypt_returns_aid_not_found_for_unknown_target() {
+        let bootstrap = aid(0xAA);
+        let stranger = aid(0xBB);
+        let vault = Vault::new(bootstrap, dev_piv_handle());
+        assert_eq!(
+            vault.resolve_decrypt(&bootstrap, &stranger),
+            Err(VaultError::AidNotFound),
+        );
+    }
+
+    #[test]
+    fn resolve_sign_rejects_unauthorized_caller() {
+        let bootstrap = aid(0xAA);
+        let stranger = aid(0xBB);
+        let vault = Vault::new(bootstrap, dev_piv_handle());
+        assert_eq!(
+            vault.resolve_sign(&stranger, &bootstrap),
+            Err(VaultError::NotAuthorized),
+        );
+    }
+
+    #[test]
+    fn resolve_decrypt_rejects_unauthorized_caller() {
+        let bootstrap = aid(0xAA);
+        let stranger = aid(0xBB);
+        let vault = Vault::new(bootstrap, dev_piv_handle());
+        assert_eq!(
+            vault.resolve_decrypt(&stranger, &bootstrap),
+            Err(VaultError::NotAuthorized),
+        );
     }
 }

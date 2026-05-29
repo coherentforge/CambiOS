@@ -20,18 +20,21 @@
 #![deny(unsafe_code)]
 
 use cambios_key_store_service::piv::{
-    dispatch::dispatch_piv_command, ActiveBackend,
+    dispatch::dispatch_piv_command, ActiveBackend, PivBackend,
 };
-use cambios_key_store_service::vault::{init::init_vault, BindSource};
+use cambios_key_store_service::vault::{init::init_vault, BindSource, Vault};
 use cambios_libsys as sys;
 use cambios_libsys::keystore::{
-    CMD_PIV_ATTEST, CMD_PIV_DECRYPT, CMD_PIV_GET_PUBKEY, CMD_PIV_HEALTH,
-    CMD_PIV_LIST_SLOTS, CMD_PIV_SIGN, CMD_PIV_VERIFY_PIN,
+    PivError, CMD_PIV_ATTEST, CMD_PIV_DECRYPT, CMD_PIV_GET_PUBKEY,
+    CMD_PIV_HEALTH, CMD_PIV_LIST_SLOTS, CMD_PIV_SIGN, CMD_PIV_VERIFY_PIN,
 };
 use cambios_libsys::vault::{
-    decode_bind_for_spawn_request, encode_bind_for_spawn_response,
-    encode_error_response as encode_vault_error_response, VaultError,
-    CMD_VAULT_BIND_FOR_SPAWN,
+    decode_bind_for_spawn_request, decode_decrypt_with_request,
+    decode_sign_with_request, encode_bind_for_spawn_response,
+    encode_decrypt_with_response,
+    encode_error_response as encode_vault_error_response,
+    encode_sign_with_response, VaultError, CMD_VAULT_BIND_FOR_SPAWN,
+    CMD_VAULT_DECRYPT_WITH, CMD_VAULT_SIGN_WITH, MAX_VAULT_PLAINTEXT_LEN,
 };
 
 #[panic_handler]
@@ -121,7 +124,7 @@ pub extern "C" fn _start() -> ! {
                 }
             },
 
-            // Vault primitive per ADR-033 § 2.
+            // Vault primitives per ADR-033 § 2.
             CMD_VAULT_BIND_FOR_SPAWN => match vault.as_ref() {
                 Some(v) => match decode_bind_for_spawn_request(msg.payload()) {
                     Ok(context) => {
@@ -145,6 +148,36 @@ pub extern "C" fn _start() -> ! {
                     .unwrap_or(0),
                 },
                 None => encode_vault_error_response(
+                    VaultError::BackendError,
+                    &mut resp_buf,
+                )
+                .unwrap_or(0),
+            },
+
+            CMD_VAULT_SIGN_WITH => match (vault.as_ref(), piv_backend.as_ref()) {
+                (Some(v), Some(b)) => handle_vault_sign(
+                    v,
+                    b,
+                    msg.sender().as_bytes(),
+                    msg.payload(),
+                    &mut resp_buf,
+                ),
+                _ => encode_vault_error_response(
+                    VaultError::BackendError,
+                    &mut resp_buf,
+                )
+                .unwrap_or(0),
+            },
+
+            CMD_VAULT_DECRYPT_WITH => match (vault.as_ref(), piv_backend.as_ref()) {
+                (Some(v), Some(b)) => handle_vault_decrypt(
+                    v,
+                    b,
+                    msg.sender().as_bytes(),
+                    msg.payload(),
+                    &mut resp_buf,
+                ),
+                _ => encode_vault_error_response(
                     VaultError::BackendError,
                     &mut resp_buf,
                 )
@@ -176,6 +209,88 @@ fn log_vault_fallback(context: &[u8]) {
         sys::print(context);
     }
     sys::print(b" -> bootstrap\n");
+}
+
+/// Translate a `PivError` raised by the backend into a `VaultError`
+/// surfaced to the vault caller. The vault wire surface is intentionally
+/// narrower than PIV's — auth-/transport-class failures collapse to
+/// `TokenAbsent` because the wire protocol gives the caller no way to
+/// drive PIN entry or re-seat the card; `SlotEmpty` collapses to
+/// `AidNotFound` because the AID has no usable key; everything else is
+/// `BackendError`.
+fn piv_to_vault_error(e: PivError) -> VaultError {
+    match e {
+        PivError::NotPresent
+        | PivError::AuthRequired
+        | PivError::PinLocked
+        | PivError::CardTransport => VaultError::TokenAbsent,
+        PivError::SlotEmpty => VaultError::AidNotFound,
+        PivError::Generic
+        | PivError::WrongAlgorithm
+        | PivError::WireFormat
+        | PivError::Ipc => VaultError::BackendError,
+    }
+}
+
+/// Dispatch handler for `CMD_VAULT_SIGN_WITH`. Pure-ish: drives the
+/// vault directory + active PIV backend, writes wire bytes into
+/// `resp`. No syscalls, no globals. Returns bytes written.
+fn handle_vault_sign(
+    vault: &Vault,
+    backend: &ActiveBackend,
+    caller_aid: &[u8; 32],
+    request: &[u8],
+    resp: &mut [u8],
+) -> usize {
+    let (target_aid, msg_bytes) = match decode_sign_with_request(request) {
+        Ok(parts) => parts,
+        Err(_) => {
+            return encode_vault_error_response(VaultError::InvalidPayload, resp)
+                .unwrap_or(0);
+        }
+    };
+    let slot = match vault.resolve_sign(caller_aid, target_aid) {
+        Ok(s) => s,
+        Err(e) => return encode_vault_error_response(e, resp).unwrap_or(0),
+    };
+    match backend.sign(slot, msg_bytes) {
+        Ok(sig) => encode_sign_with_response(&sig, resp).unwrap_or(0),
+        Err(e) => {
+            encode_vault_error_response(piv_to_vault_error(e), resp).unwrap_or(0)
+        }
+    }
+}
+
+/// Dispatch handler for `CMD_VAULT_DECRYPT_WITH`. Same shape as
+/// `handle_vault_sign`; uses the `decrypt_slot` and an intermediate
+/// plaintext buffer sized to the vault's `MAX_VAULT_PLAINTEXT_LEN`
+/// ceiling.
+fn handle_vault_decrypt(
+    vault: &Vault,
+    backend: &ActiveBackend,
+    caller_aid: &[u8; 32],
+    request: &[u8],
+    resp: &mut [u8],
+) -> usize {
+    let (target_aid, ciphertext) = match decode_decrypt_with_request(request) {
+        Ok(parts) => parts,
+        Err(_) => {
+            return encode_vault_error_response(VaultError::InvalidPayload, resp)
+                .unwrap_or(0);
+        }
+    };
+    let slot = match vault.resolve_decrypt(caller_aid, target_aid) {
+        Ok(s) => s,
+        Err(e) => return encode_vault_error_response(e, resp).unwrap_or(0),
+    };
+    let mut plaintext = [0u8; MAX_VAULT_PLAINTEXT_LEN];
+    match backend.decrypt(slot, ciphertext, &mut plaintext) {
+        Ok(pt_len) => encode_decrypt_with_response(&plaintext[..pt_len], resp)
+            .unwrap_or(0),
+        Err(e) => {
+            encode_vault_error_response(piv_to_vault_error(e), resp).unwrap_or(0)
+        }
+    }
 }
 
 /// Initialize the active PIV backend at startup. Returns `None` if
