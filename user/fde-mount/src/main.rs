@@ -54,7 +54,8 @@ use cambios_fde_proto::{
     WRAP_NONCE, find_first_live_yubikey, parse, parse_slot_table,
 };
 use cambios_libsys as sys;
-use cambios_libsys::keystore::{PivError, PivHealthState, PivSlot};
+use cambios_libsys::keystore::{PivError, PivHealthState};
+use cambios_libsys::vault::{vault_decrypt_with, VaultError};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use zeroize::Zeroize;
@@ -149,7 +150,19 @@ pub extern "C" fn _start() -> ! {
 // ============================================================================
 
 fn unlock_flow() -> UnlockOutcome {
-    // Step 1: PIV health probe.
+    // Step 0: this process's bound Principal. For the dev-piv boot
+    // flow that's the bootstrap AID; the vault recognizes it as the
+    // entry it was initialized with and routes operations to slot
+    // 9C / 9D under the active backend. Required up-front for the
+    // vault_decrypt_with call in Step 7.
+    let mut bootstrap_aid = [0u8; 32];
+    let rc = sys::get_principal(&mut bootstrap_aid);
+    if rc != 32 {
+        return UnlockOutcome::Failure(b"get_principal", rc);
+    }
+
+    // Step 1: PIV health probe. Stays on the PIV layer — health and
+    // PIN are PIV-specific concerns the vault does not speak.
     let health = match sys::keystore::piv_health(FDE_MOUNT_ENDPOINT) {
         Ok(h) => h,
         Err(e) => return UnlockOutcome::Failure(b"piv_health", piv_error_code(e)),
@@ -158,7 +171,10 @@ fn unlock_flow() -> UnlockOutcome {
         return UnlockOutcome::NoPiv;
     }
 
-    // Step 2: PIN verification.
+    // Step 2: PIN verification. Stays on the PIV layer for the same
+    // reason as health — vault sits above the PIN gate, so the
+    // caller authenticates through `piv_verify_pin` before invoking
+    // vault decrypt operations.
     if let Err(e) = sys::keystore::piv_verify_pin(FDE_MOUNT_ENDPOINT, DEV_PIN) {
         return UnlockOutcome::Failure(b"piv_verify_pin", piv_error_code(e));
     }
@@ -205,19 +221,26 @@ fn unlock_flow() -> UnlockOutcome {
     let ciphertext_with_tag = &envelope
         [WRAP_ENV_CIPHERTEXT_OFF..WRAP_ENV_CIPHERTEXT_OFF + WRAP_ENV_CIPHERTEXT_LEN];
 
-    // Step 7: ECDH via piv_decrypt.
+    // Step 7: ECDH via vault_decrypt_with (first real vault consumer
+    // per ADR-033 § Positive Consequences). The vault resolves
+    // bootstrap_aid → KeyHandle.decrypt_slot (0x9D under
+    // --features dev-piv, sentinel otherwise) and drives the active
+    // PIV backend. Authorization happens server-side via
+    // Vault::authorize on the kernel-stamped sender_principal —
+    // fde-mount is bound to the bootstrap AID at spawn, so
+    // authorize accepts.
     let mut shared = [0u8; 32];
-    let n = match sys::keystore::piv_decrypt(
+    let n = match vault_decrypt_with(
         FDE_MOUNT_ENDPOINT,
-        PivSlot::KeyManagement,
+        &bootstrap_aid,
         eph_pk,
         &mut shared,
     ) {
         Ok(n) => n,
-        Err(e) => return UnlockOutcome::Failure(b"piv_decrypt", piv_error_code(e)),
+        Err(e) => return UnlockOutcome::Failure(b"vault_decrypt_with", vault_error_code(e)),
     };
     if n != 32 {
-        return UnlockOutcome::Failure(b"piv_decrypt (size)", n as i64);
+        return UnlockOutcome::Failure(b"vault_decrypt_with (size)", n as i64);
     }
 
     // Step 8: Derive symmetric key via Blake3.
@@ -285,6 +308,19 @@ fn piv_error_code(e: PivError) -> i64 {
         PivError::CardTransport => -7,
         PivError::WireFormat => -8,
         PivError::Ipc => -9,
+    }
+}
+
+fn vault_error_code(e: VaultError) -> i64 {
+    match e {
+        VaultError::NotAuthorized => -11,
+        VaultError::AidNotFound => -12,
+        VaultError::TokenAbsent => -13,
+        VaultError::ContextNotFound => -14,
+        VaultError::BackendError => -15,
+        VaultError::InvalidPayload => -16,
+        VaultError::WireFormat => -18,
+        VaultError::Ipc => -19,
     }
 }
 
