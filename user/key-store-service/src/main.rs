@@ -22,6 +22,7 @@
 use cambios_key_store_service::piv::{
     dispatch::dispatch_piv_command, ActiveBackend,
 };
+use cambios_key_store_service::vault::init::init_vault;
 use cambios_libsys as sys;
 use cambios_libsys::keystore::{
     CMD_PIV_ATTEST, CMD_PIV_DECRYPT, CMD_PIV_GET_PUBKEY, CMD_PIV_HEALTH,
@@ -59,6 +60,20 @@ pub extern "C" fn _start() -> ! {
             sys::print(b"[KS] WARNING: PIV backend init failed; CMD_PIV_* will return Generic\n");
             None
         }
+    };
+
+    // Vault directory (ADR-033). v1 single-entry: bootstrap AID → active
+    // backend's KeyHandle. The IPC primitives that consume it land in
+    // later 1C stages; today the binding exists so the directory is
+    // ready when bind_for_spawn / sign_with / decrypt_with arrive.
+    let mut bootstrap_aid = [0u8; 32];
+    let rc = sys::get_principal(&mut bootstrap_aid);
+    let _vault = if rc == 32 {
+        sys::print(b"[KS] vault initialized (1 entry, bootstrap)\n");
+        Some(init_vault(bootstrap_aid))
+    } else {
+        sys::print(b"[KS] WARNING: get_principal failed; vault not initialized\n");
+        None
     };
 
     sys::print(b"[KS] ready on endpoint 17\n");

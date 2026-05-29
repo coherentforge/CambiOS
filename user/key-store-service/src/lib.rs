@@ -15,3 +15,4 @@
 extern crate std;
 
 pub mod piv;
+pub mod vault;
