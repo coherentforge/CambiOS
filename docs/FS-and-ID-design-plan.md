@@ -117,13 +117,13 @@ For *implementation details* of each phase (which structs, which files, which sy
 
 **Scope:**
 
-- `user/vault-service/` at endpoint 17 (renamed from `key-store-service`, same slot — the shell command and the boot manifest entry change name; nothing else moves). IPC interface for the operations below.
+- `user/key-store-service/` at endpoint 17 (per [ADR-033](adr/033-multi-principal-vault.md) the directory name stays — the keystore-viewed-through-AID-indirection *is* the vault, so renaming would reintroduce the conceptual split the ADR resolves). IPC interface for the operations below.
 - `bind_for_spawn(context_label) → Principal`: parent processes consult the vault before invoking `SYS_SPAWN`; the kernel binds the new process to whatever Principal the vault returns. The kernel does not know the vault exists; from the kernel's view, spawn just receives a Principal byte string ([ADR-025](adr/025-principal-as-aid.md) AID) to transcribe forward onto the new process's `ProcessCapabilities.principal` slot.
 - `sign_with(principal, data) → Signature`: authored content and IPC handshakes that need a signature ask the vault; private keys never leave the vault process. fs-service requests signing from the vault before calling `ObjPut`/`ObjPutSigned`.
 - N Principals per vault, encrypted at rest under a vault key derived from device entropy. Biometric input lands in Phase 6; for v1 the key derives from device entropy alone, and the vault is *interface-multi-Principal but practice-single-Principal* — N is bounded only by storage and there is no UX for generating new Principals until the vault gains a control surface.
 - `ObjPutSigned` stays cap-gated. The kernel-side syscall is unchanged: "store this pre-signed object." Signature is produced by the vault before the syscall is invoked; the kernel verifies the signature against the bound Principal as it does today. No kernel-side signing change.
 - Per-Principal AI containment is now a real architectural property. When the policy service calls `SYS_REVOKE_CAPABILITY` on capabilities held by Principal `P`, only processes bound to `P` lose the cap; other Principals in the same vault are untouched. This is what makes "AI watches and contains" usable when the AI lands; see [ADR-007 § Divergence](adr/007-capability-revocation-and-telemetry.md#divergence) for the mechanism statement and [ADR-026 § 3](adr/026-identity-transcription-at-the-kernel-ring.md) for the framing.
-- Boot path: vault-service is a signed boot module like fs-service. It starts before fs-service so that fs-service's `ObjPutSigned` calls can already route to a vault. Order in `BOOT_MODULE_ORDER` ratchets accordingly.
+- Boot path: key-store-service is a signed boot module like fs-service. It starts before fs-service so that fs-service's `ObjPutSigned` calls can already route to the vault. Order in `BOOT_MODULE_ORDER` ratchets accordingly.
 
 **Out of scope (this phase):**
 

@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide implementation status
 auto_refresh: required
-last_synced_to_code: 2026-05-29 (Phase 1C stage C: sign_with + decrypt_with IPC primitives land. `CMD_VAULT_SIGN_WITH = 11` / `CMD_VAULT_DECRYPT_WITH = 12` opcodes in libsys::vault; `Vault::resolve_sign(caller, target)` / `Vault::resolve_decrypt(caller, target)` methods authorize then translate AID → KeyHandle.{sign,decrypt}_slot; dispatch helpers route through the active PIV backend; `piv_to_vault_error` collapses PIV's wider error surface onto the vault's narrower wire shape. Phase 1C complete: all three vault primitives shipped, no caller invokes them yet)
+last_synced_to_code: 2026-05-29 (ADR-033 Proposed → Accepted; FS-and-ID Phase 1C name-rename language downgraded to an ADR-033 anchoring sentence; STATUS.md subsystem table row for Multi-Principal vault now reads "Done at implementation layer." Phase 1C ratified — all three vault primitives shipped 2026-05-29 via 71c85a5 / e31f9e3 / 127073e; no caller invokes them yet — fde-mount FDE-unlock migration is the leading next-consumer candidate)
 authoritative_for: what is built vs designed vs planned, current test counts, current phase status
 convention: Keep `last_synced_to_code` a single date. Chronological narrative
 goes in the "Recent landings" section below — rotate out after ~3 weeks so
