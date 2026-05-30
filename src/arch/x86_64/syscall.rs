@@ -132,7 +132,7 @@ pub unsafe fn init() {
 //   RBX, RBP, R12-R15 (callee-saved)
 //   SyscallFrame      ← RSP points here when handler is called
 
-#[cfg(not(fuzzing))]
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
