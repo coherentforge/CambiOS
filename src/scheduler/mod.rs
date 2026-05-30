@@ -767,49 +767,39 @@ impl Scheduler {
     /// Tasks blocked on different channels are left untouched.
     ///
     /// Mirror of [`wake_message_waiters`] — same scan, different match
-    /// arm. Bounded enqueue buffer so we don't allocate from the wake
-    /// path; the cap matches `wake_irq_waiters` / `wake_message_waiters`.
+    /// arm. Index-based and uncapped (see `wake_irq_waiters`); the prior
+    /// 8-slot staging array would have silently dropped a 9th waiter once
+    /// process↔task became 1:N.
     ///
     /// Returns the number of tasks woken.
     pub fn wake_quiesce(&mut self, channel_id_raw: u64) -> usize {
-        /// SCAFFOLDING: stack-resident enqueue-buffer cap. v1 has 1
-        /// peer task per channel (1:1 process↔task), so realistic
-        /// `woken` is 1; 8 leaves slack for a future N:1 task model.
-        /// Why: bounded so we don't allocate from the wake path.
-        /// Replace when: process↔task becomes 1:N AND a real workload
-        /// parks multiple tasks on the same `ChannelQuiesceWait`.
-        const MAX_QUIESCE_WAKE: usize = 8;
-        let mut to_enqueue: [(TaskId, usize); MAX_QUIESCE_WAKE] =
-            [(TaskId(0), 0); MAX_QUIESCE_WAKE];
         let mut woken = 0;
 
-        for task in self.tasks.iter_mut().flatten() {
-            if task.state != TaskState::Blocked {
-                continue;
-            }
-            let matches = matches!(
-                task.block_reason,
-                Some(BlockReason::ChannelQuiesceWait(c)) if c == channel_id_raw
-            );
-            if !matches {
-                continue;
-            }
-            task.state = TaskState::Ready;
-            task.block_reason = None;
-            task.pending_quiesce_channel = None;
-            task.reset_time_slice();
-            if !task.in_ready_queue {
-                task.in_ready_queue = true;
-                if woken < to_enqueue.len() {
-                    to_enqueue[woken] = (task.id, priority_to_band(task.priority));
+        for i in 0..self.tasks.len() {
+            let mut to_enqueue: Option<(TaskId, usize)> = None;
+            if let Some(task) = self.tasks[i].as_mut() {
+                let matches = task.state == TaskState::Blocked
+                    && matches!(
+                        task.block_reason,
+                        Some(BlockReason::ChannelQuiesceWait(c)) if c == channel_id_raw
+                    );
+                if matches {
+                    task.state = TaskState::Ready;
+                    task.block_reason = None;
+                    task.pending_quiesce_channel = None;
+                    task.reset_time_slice();
+                    if !task.in_ready_queue {
+                        task.in_ready_queue = true;
+                        to_enqueue = Some((task.id, priority_to_band(task.priority)));
+                    }
+                    woken += 1;
                 }
             }
-            woken += 1;
+            if let Some((tid, band)) = to_enqueue {
+                self.ready_queues[band].push_back(tid);
+            }
         }
 
-        for &(tid, band) in &to_enqueue[..woken.min(to_enqueue.len())] {
-            self.ready_queues[band].push_back(tid);
-        }
         self.runnable_count += woken;
         woken
     }
@@ -906,34 +896,39 @@ impl Scheduler {
     ///
     /// Returns the number of tasks woken.
     pub fn wake_irq_waiters(&mut self, irq: u32) -> usize {
-        // Collect task IDs + bands to enqueue (avoids borrow overlap with self.ready_queues)
-        let mut to_enqueue: [(TaskId, usize); 32] = [(TaskId(0), 0); 32];
+        // Index-based scan: mutate `self.tasks[i]` then push into
+        // `self.ready_queues[band]` in disjoint, sequential field borrows.
+        // This replaces a fixed 32-slot staging array whose overflow path
+        // marked the 33rd+ matching task `Ready` + `in_ready_queue = true`
+        // but never enqueued it — a permanent lost wakeup (and a broken
+        // `in_ready_queue ⇔ present-in-a-ready-queue` invariant) once more
+        // than 32 tasks blocked on one IRQ. There is no cap now.
         let mut woken = 0;
 
-        for task in self.tasks.iter_mut().flatten() {
-            if task.state == TaskState::Blocked {
-                if let Some(BlockReason::IoWait(waiting_irq)) = task.block_reason {
-                    if waiting_irq == irq {
-                        task.state = TaskState::Ready;
-                        task.block_reason = None;
-                        task.pending_quiesce_channel = None; // ADR-027 hint cleanup
-                        task.reset_time_slice();
-                        if !task.in_ready_queue {
-                            task.in_ready_queue = true;
-                            if woken < to_enqueue.len() {
-                                to_enqueue[woken] = (task.id, priority_to_band(task.priority));
+        for i in 0..self.tasks.len() {
+            let mut to_enqueue: Option<(TaskId, usize)> = None;
+            if let Some(task) = self.tasks[i].as_mut() {
+                if task.state == TaskState::Blocked {
+                    if let Some(BlockReason::IoWait(waiting_irq)) = task.block_reason {
+                        if waiting_irq == irq {
+                            task.state = TaskState::Ready;
+                            task.block_reason = None;
+                            task.pending_quiesce_channel = None; // ADR-027 hint cleanup
+                            task.reset_time_slice();
+                            if !task.in_ready_queue {
+                                task.in_ready_queue = true;
+                                to_enqueue = Some((task.id, priority_to_band(task.priority)));
                             }
+                            woken += 1;
                         }
-                        woken += 1;
                     }
                 }
             }
+            if let Some((tid, band)) = to_enqueue {
+                self.ready_queues[band].push_back(tid);
+            }
         }
 
-        // Enqueue woken tasks into ready queues
-        for &(tid, band) in &to_enqueue[..woken.min(to_enqueue.len())] {
-            self.ready_queues[band].push_back(tid);
-        }
         self.runnable_count += woken;
         woken
     }
@@ -946,32 +941,35 @@ impl Scheduler {
     ///
     /// Returns the number of tasks woken.
     pub fn wake_message_waiters(&mut self, endpoint: u32) -> usize {
-        let mut to_enqueue: [(TaskId, usize); 32] = [(TaskId(0), 0); 32];
+        // Index-based, uncapped: see `wake_irq_waiters` for why the prior
+        // fixed 32-slot staging array dropped the 33rd+ waiter. A popular
+        // service endpoint can have well over 32 receivers blocked on it.
         let mut woken = 0;
 
-        for task in self.tasks.iter_mut().flatten() {
-            if task.state == TaskState::Blocked {
-                if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
-                    if ep == endpoint {
-                        task.state = TaskState::Ready;
-                        task.block_reason = None;
-                        task.pending_quiesce_channel = None; // ADR-027 hint cleanup
-                        task.reset_time_slice();
-                        if !task.in_ready_queue {
-                            task.in_ready_queue = true;
-                            if woken < to_enqueue.len() {
-                                to_enqueue[woken] = (task.id, priority_to_band(task.priority));
+        for i in 0..self.tasks.len() {
+            let mut to_enqueue: Option<(TaskId, usize)> = None;
+            if let Some(task) = self.tasks[i].as_mut() {
+                if task.state == TaskState::Blocked {
+                    if let Some(BlockReason::MessageWait(ep)) = task.block_reason {
+                        if ep == endpoint {
+                            task.state = TaskState::Ready;
+                            task.block_reason = None;
+                            task.pending_quiesce_channel = None; // ADR-027 hint cleanup
+                            task.reset_time_slice();
+                            if !task.in_ready_queue {
+                                task.in_ready_queue = true;
+                                to_enqueue = Some((task.id, priority_to_band(task.priority)));
                             }
+                            woken += 1;
                         }
-                        woken += 1;
                     }
                 }
             }
+            if let Some((tid, band)) = to_enqueue {
+                self.ready_queues[band].push_back(tid);
+            }
         }
 
-        for &(tid, band) in &to_enqueue[..woken.min(to_enqueue.len())] {
-            self.ready_queues[band].push_back(tid);
-        }
         self.runnable_count += woken;
         woken
     }
@@ -1373,6 +1371,59 @@ mod tests {
         assert_eq!(woken, 1);
         assert_eq!(sched.get_task(tid).unwrap().state, TaskState::Ready);
         assert!(sched.get_task(tid).unwrap().block_reason.is_none());
+    }
+
+    /// Regression for the lost-wakeup bug (F3): the wake path used a fixed
+    /// 32-slot staging array, so the 33rd+ task blocked on one IRQ was
+    /// marked `Ready` + `in_ready_queue = true` but never pushed onto a
+    /// ready queue — a permanent lost wakeup, since `find_next_ready_task`
+    /// only pops from the queues and `in_ready_queue = true` blocks any
+    /// later re-enqueue. Reproduced with N > 32 tasks in the realistic
+    /// "blocked while off the ready queue" state (the state a task reaches
+    /// by running — hence being dequeued — then blocking).
+    #[test]
+    fn wake_irq_waiters_enqueues_every_waiter_past_old_staging_cap() {
+        const N: usize = 40;
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+
+        let mut tids = alloc::vec::Vec::new();
+        for _ in 0..N {
+            tids.push(
+                sched
+                    .create_task(0x100000, 0x200000, Priority::NORMAL)
+                    .unwrap(),
+            );
+        }
+
+        // Model each task as Blocked-on-IRQ-5 and *off* every ready queue
+        // (`in_ready_queue == false`), as if it had been scheduled (and so
+        // dequeued) and then blocked.
+        for q in sched.ready_queues.iter_mut() {
+            q.clear();
+        }
+        for &tid in &tids {
+            let t = sched.get_task_mut(tid).unwrap();
+            t.state = TaskState::Blocked;
+            t.block_reason = Some(BlockReason::IoWait(5));
+            t.in_ready_queue = false;
+        }
+
+        let woken = sched.wake_irq_waiters(5);
+        assert_eq!(woken, N, "every blocked waiter reported woken");
+
+        // Load-bearing assertion: every woken task is actually enqueued.
+        // Pre-fix this is 32 (the staging cap); the remaining 8 stay
+        // Ready-but-unschedulable, absent from all queues.
+        let queued: usize = sched.ready_queues.iter().map(|q| q.len()).sum();
+        assert_eq!(queued, N, "every woken task is on a ready queue (no lost wakeup)");
+
+        // `in_ready_queue` ⇔ present-in-a-ready-queue holds for all N.
+        for &tid in &tids {
+            let t = sched.get_task(tid).unwrap();
+            assert_eq!(t.state, TaskState::Ready);
+            assert!(t.in_ready_queue, "woken task marked present-in-queue");
+        }
     }
 
     #[test]
