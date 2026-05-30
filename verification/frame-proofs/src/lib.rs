@@ -23,6 +23,18 @@
 #[path = "../../../src/memory/frame_allocator.rs"]
 pub mod frame_allocator;
 
+/// Stub for the kernel crate-root `hhdm_offset()` that the allocator's
+/// `#[cfg(not(test))] fn zero_frame_range` references via `crate::`. In the
+/// kernel this returns the Limine HHDM offset; the proofs never exercise the
+/// zero-write path (a `0` return makes `zero_frame_range` early-return), so a
+/// constant keeps the harnesses on the real allocator bookkeeping. Without
+/// this stub the `#[path]`-included allocator fails to compile under Kani
+/// (`cfg(not(test))` is true), which silently broke this whole proof crate
+/// once `zero_frame_range` landed — the suite is not in a commit gate.
+pub fn hhdm_offset() -> u64 {
+    0
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::frame_allocator::*;
@@ -75,11 +87,44 @@ mod proofs {
         let length: u64 = kani::any();
         // Keep length small so the inner loop is bounded by unwind;
         // base is fully symbolic — the overflow concern is `base + length`.
+        // Tractable because `MAX_FRAMES` is shrunk under `cfg(kani)`, so the
+        // symbolic-index bitmap access in the unwound loop body is over a
+        // handful of words rather than the 64K-word production array.
         kani::assume(length <= 4 * PAGE_SIZE);
 
         fa.add_region(base, length);
         // No assertion needed: Kani's built-in overflow and OOB checks fire
         // on every arithmetic op and array access inside add_region.
+    }
+
+    /// P2.10b — `add_region` is idempotent in its free-frame accounting.
+    /// The kernel calls it once per USABLE memory-map entry; if two entries
+    /// overlap, re-clearing an already-free frame must NOT increment
+    /// `free_frames` again, or the count diverges from the bitmap's 0-bit
+    /// population and breaks the `free_frames <= total_frames` invariant
+    /// that every capacity check (e.g. `allocate_contiguous`'s `count >
+    /// free_frames` early-out) is built on. Mirrors `reserve_region`'s
+    /// `if !is_set` guard. Two regions are added whose frame ranges overlap
+    /// — [1,5) then [2,6), union [1,6) = 5 frames. Before the fix
+    /// `add_region` incremented unconditionally and reported 8.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn proof_add_region_idempotent_accounting() {
+        let mut fa = FrameAllocator::new();
+
+        // Region A: frames 1..5 (4 frames).
+        fa.add_region(PAGE_SIZE, 4 * PAGE_SIZE);
+        assert_eq!(fa.free_count(), 4);
+
+        // Region B: frames 2..6 (4 frames), overlapping A on frames 2,3,4.
+        // The union is frames 1..6 = 5 distinct free frames; the three
+        // already-free frames must not be counted twice.
+        fa.add_region(2 * PAGE_SIZE, 4 * PAGE_SIZE);
+        assert_eq!(
+            fa.free_count(),
+            5,
+            "overlapping add_region double-counted free frames"
+        );
     }
 
     // Note on `reserve_region`: its overflow fix (saturating_add at line

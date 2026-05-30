@@ -9,9 +9,11 @@ exclude = ["cambios-abi", "cambios-fde-proto", "cambios-ccid-proto", "user/fs-se
 [lints.rust]
 # `cfg(fuzzing)` is set by cargo-fuzz when building under libfuzzer-sys; the
 # kernel uses it (parallel to `cfg(test)`) to gate host-runnable shims for
-# bare-metal-only paths (asm stubs, audit emit, etc.). Register here so
-# rustc's `unexpected_cfgs` lint doesn't warn at every site.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+# bare-metal-only paths (asm stubs, audit emit, etc.). `cfg(kani)` is set by
+# cargo-kani when building a proof crate that `#[path]`-includes kernel source
+# (e.g. frame_allocator.rs shrinks MAX_FRAMES under it so symbolic proofs stay
+# tractable). Register both so rustc's `unexpected_cfgs` lint doesn't warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [lints.clippy]
 # CLAUDE.md Development Convention 1 (path a, prancy-manatee Tier 1 E2):

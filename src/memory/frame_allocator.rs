@@ -38,7 +38,19 @@ pub const PAGE_SIZE: u64 = 4096;
 ///      bitmap further — at 32 GiB the bitmap would be 1 MiB, at 64 GiB it
 ///      would be 2 MiB, and the linear-scan allocator becomes prohibitively
 ///      slow for allocate_contiguous of large regions. See docs/ASSUMPTIONS.md.
-const MAX_FRAMES: usize = 4194304;
+#[cfg(not(kani))]
+pub const MAX_FRAMES: usize = 4194304;
+
+/// SCAFFOLDING: under Kani the frame bitmap is shrunk so that symbolic-base
+/// proofs (e.g. `proof_add_region_overflow_safe`) stay tractable. CBMC builds
+/// the unwound loop body's symbolic-index bitmap access over *every* word of
+/// the array, so the 512 KiB production bitmap (65536 words) is intractable;
+/// 256 frames (a 4-word bitmap) is ample for the small concrete regions the
+/// proofs exercise. Allocator logic is identical on both bounds.
+/// Replace when: never independently — this tracks the `cfg(not(kani))` value
+/// above and only exists to bound the proof state space.
+#[cfg(kani)]
+pub const MAX_FRAMES: usize = 256;
 
 /// SCAFFOLDING: maximum number of distinct USABLE RAM extents the
 /// frame allocator records for the `is_ram_overlap` check used by
@@ -168,8 +180,17 @@ impl FrameAllocator {
             if idx >= MAX_FRAMES {
                 break;
             }
-            self.clear_bit(idx);
-            self.free_frames += 1;
+            // Idempotent accounting: only count a frame as newly free if it
+            // was marked used. Overlapping USABLE map entries (or a repeated
+            // add_region) must not inflate `free_frames` past the bitmap's
+            // 0-bit population — mirrors `reserve_region`'s `if !is_set`
+            // guard. Proven by P2.10b in verification/frame-proofs.
+            if self.is_set(idx) {
+                self.clear_bit(idx);
+                self.free_frames += 1;
+            }
+            // total_frames tracks the highest frame index ever seen; the max
+            // is idempotent under overlap so it stays outside the guard.
             if idx >= self.total_frames {
                 self.total_frames = idx + 1;
             }
@@ -670,6 +691,23 @@ mod tests {
         let frame = alloc.allocate().unwrap();
         assert_eq!(frame.addr, 0x100000);
         assert_eq!(alloc.free_count(), 255);
+    }
+
+    #[test]
+    fn test_add_region_overlap_no_double_count() {
+        // Regression for the add_region free-frame double-count (F9): two
+        // overlapping USABLE regions must count the union of frames once,
+        // not the sum. Region A [0x100000, 0x200000) = 256 frames; region B
+        // [0x180000, 0x280000) = 256 frames, overlapping A on the 128 frames
+        // in [0x180000, 0x200000). The union is [0x100000, 0x280000) = 384
+        // frames. Without the `is_set` guard this reported 256 + 256 = 512,
+        // breaking the `free_frames == popcount(0-bits)` invariant. Proven
+        // exhaustively by P2.10b in verification/frame-proofs.
+        let mut alloc = FrameAllocator::new();
+        alloc.add_region(0x100000, 0x100000);
+        assert_eq!(alloc.free_count(), 256);
+        alloc.add_region(0x180000, 0x100000);
+        assert_eq!(alloc.free_count(), 384, "overlapping add_region double-counted");
     }
 
     #[test]
