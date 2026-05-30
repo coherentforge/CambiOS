@@ -88,9 +88,9 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 
 | Layer        | 2 |
 | Status       | Proven |
-| Backing      | `verification/frame-proofs::{proof_add_region_overflow_safe, proof_allocate_returns_in_bounds, proof_allocate_free_roundtrip}` |
-| Bound        | symbolic region (base, length) pairs at u64::MAX boundary; bitmap state up to a small N |
-| Gap          | Allocator-state-explosion limits prove-able loop depth; mechanical wrap-boundary cases verified, but multi-region interactions beyond the symbolic budget rely on host unit tests as a regression gate. Two real overflow sites in `add_region`/`reserve_region` were found by these proofs and fixed (`saturating_add`) — see CLAUDE.md changelog 2026-04-21. |
+| Backing      | `verification/frame-proofs::{proof_add_region_overflow_safe, proof_add_region_idempotent_accounting, proof_allocate_returns_in_bounds, proof_allocate_free_roundtrip}` (11 harnesses total) |
+| Bound        | symbolic region (base, length) pairs at u64::MAX boundary; bitmap state up to a small N (`MAX_FRAMES` is shrunk to 256 under `cfg(kani)` so symbolic-base proofs stay tractable) |
+| Gap          | Allocator-state-explosion limits prove-able loop depth; mechanical wrap-boundary cases verified, but multi-region interactions beyond the symbolic budget rely on host unit tests as a regression gate. Two real overflow sites in `add_region`/`reserve_region` were found by these proofs and fixed (`saturating_add`) — see CLAUDE.md changelog 2026-04-21. **Honesty note (2026-05-30):** this crate silently stopped compiling once `zero_frame_range` added a `crate::hhdm_offset()` call the proof crate didn't stub, so for an unknown window this "Proven" status was *vacuous* — the suite is in no commit gate, so `make verify` erroring at `verify-frame` went unnoticed. Repaired with a crate-root stub; same pass added `proof_add_region_idempotent_accounting` (the free-frame double-count, P2.10b) and the `cfg(kani)` `MAX_FRAMES` shrink. The deeper fix is gating the suite, not the per-bug repairs. |
 | Cited where  | CLAUDE.md changelog 2026-04-21, `src/memory/frame_allocator.rs` |
 
 ## C-5: Capability delegation cannot escalate rights
@@ -187,19 +187,29 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Cited where  | [PHILOSOPHY.md](../docs/PHILOSOPHY.md), [ADR-026](../docs/adr/026-identity-transcription-at-the-kernel-ring.md), `~/.claude/projects/.../memory/feedback_ai_watches_flags_sandboxes.md` |
 | Revisit when | Never (Layer-3). Tracked here so the project's verification strategy stays honest: this is the AI-trust commitment the *rest* of the architecture is being built to make believable, and it cannot be discharged by proof alone. |
 
+## C-15: ProcessTable lookups reject a stale ProcessId whose slot has been reused
+
+| Layer        | 2 |
+| Status       | Tested |
+| Backing      | `src/process.rs::tests::{process_table_rejects_stale_generation_on_reads, process_table_stale_id_cannot_destroy_current_occupant}` |
+| Bound        | N/A — tests pick representative (slot, generation) pairs, not symbolic ones |
+| Gap          | Found and fixed a *live* confused-deputy. Every `ProcessTable` read/mutate path (`get_cr3`, `get_heap_base`, `get_heap_size`, `vma`, `vma_mut`, `slot_occupied`, `allocate_for`, `free_for`, `destroy_process`) indexed by `slot()` without checking the generation counter that `destroy_process` bumps on reuse. A stale `creator_pid`/`peer_pid` held in a long-lived channel record therefore resolved to the slot's *new* occupant — `teardown_channel_mappings` freed the wrong process's VMA region and unmapped/tombstoned pages out of an unrelated process's page table. All paths now route through `ProcessTable::resolve` (range + generation + occupancy). Not yet a Kani harness: the `&'static mut` slot array plus a frame-allocating, HHDM-writing `ProcessDescriptor::new` need a `verification/process-proofs` stub crate (mirroring `capability-proofs`) before the property is symbolic. The generation predicate itself is a trivial `!=`; the value of a proof here is cross-path coverage, which the host tests already give. |
+| Cited where  | [ADR-019](../docs/adr/019-process-fault-reaping-and-peer-generation.md), `src/process.rs::resolve`, `src/syscalls/dispatcher.rs::teardown_channel_mappings` |
+| Revisit when | A `verification/process-proofs/` crate lands (stubs for memory/paging/config, mirroring capability-proofs) — then this row's Backing gains a Kani harness driving create→destroy→reuse→stale-lookup over a symbolic generation, and Status moves Tested → Proven. |
+
 ---
 
 # Status summary
 
-As of this draft (2026-05-04):
+As of this draft (2026-05-30):
 
 | Status | Layer 1 | Layer 2 | Layer 3 | Total |
 | --- | --- | --- | --- | --- |
 | Proven | 0 | 7 | 0 | 7 |
-| Tested | 1 | 1 | 0 | 2 |
+| Tested | 1 | 2 | 0 | 3 |
 | Asserted | 1 | 0 | 0 | 1 |
 | Aspirational | 0 | 2 | 2 | 4 |
-| **Total** | **2** | **10** | **2** | **14** |
+| **Total** | **2** | **11** | **2** | **15** |
 
 The shape is what it should be at this stage: most of the load-bearing safety properties (parsers, allocator, capability manager, user-slice validators) have proof backing; the cross-module identity / authorization properties are honestly Aspirational with a concrete pivot plan; the meaning-claims are Aspirational by their nature and the doc explicitly says so.
 
