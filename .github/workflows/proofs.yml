@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# CambiOS CI — Tier B: Kani formal-verification proofs.
+#
+# Runs `make verify-all`'s six proof crates (verification/*-proofs), one job
+# each, in parallel. Each crate is workspace-excluded and includes kernel
+# source verbatim via #[path], so the proofs cover the live code; the job is
+# just `cd verification/<crate> && cargo kani`, exactly as the Makefile does.
+#
+# Kani ships its own bundled toolchain + CBMC, independent of
+# rust-toolchain.toml. The pinned version below MUST match the version the
+# proofs are developed against locally (cargo kani --version) -- bump both
+# together. The toolchain bundle from `cargo kani setup` is heavy (~hundreds
+# of MB), so a `setup` job primes a shared cache before the matrix fans out,
+# and the matrix jobs restore it instead of each downloading the world.
+#
+# Cadence note: proofs are slower than the Tier A build/test gate. This runs
+# on push to main + PRs to keep "verified in CI" literally true; if proof
+# runtime makes that noisy, narrow to pull_request only or a nightly schedule.
+
+name: Proofs (Kani)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proofs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in lockstep with the local `cargo kani --version`. New info as of
+  # this workflow: nothing in the repo pinned a Kani version before.
+  KANI_VERSION: "0.67.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Prime the Kani install (verifier binaries + bundled toolchain/CBMC) into a
+  # version-keyed cache so the six matrix jobs restore it rather than each
+  # doing the full download. No checkout needed -- this job only installs Kani.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: setup kani
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache Kani toolchain + verifier binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+          key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+      - name: Install Kani ${{ env.KANI_VERSION }}
+        run: |
+          if ! command -v cargo-kani >/dev/null; then
+            cargo install --locked kani-verifier@${KANI_VERSION}
+          fi
+          cargo kani setup
+
+  # ---------------------------------------------------------------------------
+  # One job per proof crate. Restores the primed cache (a hit, since `setup`
+  # wrote it), then runs the crate's harnesses. fail-fast off so a regression
+  # in one proof crate still reports the status of the other five.
+  # ---------------------------------------------------------------------------
+  kani:
+    name: kani (${{ matrix.crate }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - buddy-proofs
+          - elf-proofs
+          - frame-proofs
+          - capability-proofs
+          - userslice-proofs
+          - dtb-proofs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Kani toolchain + verifier binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+          key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+      - name: Ensure Kani present (no-op on cache hit)
+        run: |
+          if ! command -v cargo-kani >/dev/null; then
+            ( cd "$HOME" && cargo install --locked kani-verifier@${KANI_VERSION} )
+          fi
+          cargo kani setup
+      - name: cargo kani
+        working-directory: verification/${{ matrix.crate }}
+        run: cargo kani
