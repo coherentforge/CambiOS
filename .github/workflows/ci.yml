@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# CambiOS CI — Tier A: the core regression gate.
+#
+# Mirrors the local pre-commit discipline (CLAUDE.md § Tri-Architecture
+# Regression Discipline, ADR-013) on GitHub-hosted Linux runners:
+#
+#   * tri-arch release build        — `make check-all` (x86_64 + aarch64 + riscv64)
+#   * host unit tests               — `make test`, retargeted to the Linux host
+#   * missing_safety_doc = "deny"   — `cargo clippy --lib` (Dev Convention 1)
+#   * don't-grow-the-baseline lints — the pure-Python check-* gates
+#
+# The pinned nightly and the three bare-metal targets come from
+# rust-toolchain.toml; rustup installs them automatically on first use. The
+# *-unknown-none targets are tier-2 with prebuilt core/alloc, so every build
+# here is a pure Rust cross-compile — no C toolchain, no build-std.
+#
+# NOT in scope (deliberately):
+#   * Tier B — Kani proofs (`make verify-all`). Heavier setup (CBMC + a
+#     bundled toolchain, worth caching); lands as a separate workflow.
+#   * Tier C — QEMU boot smoke (`make run-quiet`). Needs qemu-system-* plus
+#     ISO/FAT-image tooling and seed signing; deferred.
+#   * The commit-msg / pre-commit / pre-push provenance hooks. They enforce
+#     Claude-authored-commit provenance (CLAUDE_PREFLIGHT_SESSION, edit logs)
+#     and are inherently local — meaningless in CI. This workflow is additive;
+#     that discipline stays where it is.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref instead of stacking them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Tri-arch release build — the `make check-all` payload, one job per target
+  # so the three cross-compiles run in parallel. fail-fast: false so a break on
+  # one arch still reports the status of the other two.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-none
+          - aarch64-unknown-none
+          - riscv64gc-unknown-none-elf
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain + target (rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: cargo build --release
+        run: cargo build --target ${{ matrix.target }} --release
+
+  # ---------------------------------------------------------------------------
+  # Host unit tests — `make test`, retargeted from x86_64-apple-darwin to the
+  # runner's native triple. The darwin target in the Makefile exists only to
+  # override .cargo/config.toml's bare-metal default; the --lib tests are pure
+  # logic. RUST_MIN_STACK matches the Makefile (buddy-allocator deep recursion).
+  # ---------------------------------------------------------------------------
+  test:
+    name: unit tests (--lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: host-test
+      - name: cargo test --lib
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test --lib --target x86_64-unknown-linux-gnu
+
+  # ---------------------------------------------------------------------------
+  # clippy — enforces missing_safety_doc = "deny" (Cargo.toml [lints.clippy],
+  # Dev Convention 1) on the x86_64 kernel lib. Mirrors CLAUDE.md's Quick
+  # Reference invocation; no `-D warnings` so the gate is exactly the manifest
+  # deny, not a flood of unrelated style lints.
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (missing_safety_doc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain + clippy
+        run: |
+          rustup show
+          rustup component add clippy
+          rustup target add x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy --lib
+        run: cargo clippy --target x86_64-unknown-none --release --lib
+
+  # ---------------------------------------------------------------------------
+  # Don't-grow-the-baseline content lints — pure Python (CLAUDE.md Dev
+  # Conventions 1/8/9, ADR-021). No Rust toolchain needed; ubuntu-latest ships
+  # python3 + make. One step per gate so a reviewer sees exactly which is green.
+  #
+  # Commit-boundary / provenance gates are excluded on purpose: they read the
+  # staged diff or session state and are no-ops or meaningless in CI —
+  # check-index-isolation, check-lockfile (advisory), check-status-freshness
+  # (advisory), claude-preflight.
+  #
+  # Note: check-adrs regenerates docs/adr/INDEX.md as a side effect (exit 0 when
+  # cross-refs are valid). CI does not commit, so a stale committed INDEX.md is
+  # not caught here — it fails only on broken/duplicate ADR references.
+  # ---------------------------------------------------------------------------
+  lints:
+    name: baseline lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check-adrs (ADR cross-references)
+        run: make check-adrs
+      - name: check-assumptions (Convention 8 numeric bounds)
+        run: make check-assumptions
+      - name: check-deferrals (Convention 9 Revisit-when triggers)
+        run: make check-deferrals
+      - name: check-boot-panics (ADR-021 boot-init panics)
+        run: make check-boot-panics
+      - name: check-banned-paths (deleted-stays-deleted)
+        run: make check-banned-paths
+      - name: check-unsafe-coverage (Convention 1 SAFETY comments)
+        run: make check-unsafe-coverage
