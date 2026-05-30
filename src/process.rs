@@ -898,27 +898,58 @@ impl ProcessTable {
         Ok(process_id)
     }
 
-    /// Allocate memory for a process, returning kernel-accessible virtual address.
-    /// Returns 0 on failure.
-    pub fn allocate_for(&mut self, process_id: ProcessId, size: usize) -> usize {
+    /// Resolve a `ProcessId` to its slot index, but only when the slot is
+    /// currently occupied **and** the stored generation matches the id's
+    /// generation. Returns `None` for an out-of-range slot, an empty slot,
+    /// or a *stale* id whose slot has since been freed and reused by a
+    /// later generation.
+    ///
+    /// Every read/mutate path routes through this. Indexing by `slot()`
+    /// alone is a confused-deputy / use-after-free hazard: a stale
+    /// `ProcessId` (e.g. a `creator_pid`/`peer_pid` stored in a long-lived
+    /// channel record — see `teardown_channel_mappings`) would otherwise
+    /// resolve to the slot's *new* occupant, letting channel teardown free
+    /// the wrong process's VMA region and unmap pages out of an unrelated
+    /// process's page table. `destroy_process` bumps the generation for
+    /// exactly this reason; that bump is only load-bearing if readers
+    /// check it. Proven by the `process_table_*` generation tests below.
+    #[inline]
+    fn resolve(&self, process_id: ProcessId) -> Option<usize> {
         let idx = process_id.slot() as usize;
         if idx >= self.processes.len() {
-            return 0;
+            return None;
         }
-        match self.processes[idx].as_mut() {
-            Some(desc) => desc.allocate(size),
+        if self.generations[idx] != process_id.generation() {
+            return None;
+        }
+        // Generation match implies the same incarnation; confirm occupancy
+        // (a freed-but-not-yet-reused slot carries no descriptor).
+        if self.processes[idx].is_none() {
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// Allocate memory for a process, returning kernel-accessible virtual address.
+    /// Returns 0 on failure (including a stale / unknown `process_id`).
+    pub fn allocate_for(&mut self, process_id: ProcessId, size: usize) -> usize {
+        match self.resolve(process_id) {
+            Some(idx) => self.processes[idx]
+                .as_mut()
+                .map(|desc| desc.allocate(size))
+                .unwrap_or(0),
             None => 0,
         }
     }
 
     /// Free memory for a process by kernel-accessible virtual address.
+    /// Returns `false` for a stale / unknown `process_id`.
     pub fn free_for(&mut self, process_id: ProcessId, virt_addr: usize) -> bool {
-        let idx = process_id.slot() as usize;
-        if idx >= self.processes.len() {
-            return false;
-        }
-        match self.processes[idx].as_mut() {
-            Some(desc) => desc.free(virt_addr),
+        match self.resolve(process_id) {
+            Some(idx) => self.processes[idx]
+                .as_mut()
+                .map(|desc| desc.free(virt_addr))
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -930,21 +961,17 @@ impl ProcessTable {
     /// whatever the frame allocator handed us at creation time. This
     /// getter reads the stored `phys_base` field.
     pub fn get_heap_base(&self, process_id: ProcessId) -> u64 {
-        let idx = process_id.slot() as usize;
-        if idx < self.processes.len() {
-            self.processes[idx].as_ref().map(|p| p.phys_base).unwrap_or(0)
-        } else {
-            0
+        match self.resolve(process_id) {
+            Some(idx) => self.processes[idx].as_ref().map(|p| p.phys_base).unwrap_or(0),
+            None => 0,
         }
     }
 
-    /// Get process heap size
+    /// Get process heap size. Returns 0 for a stale / unknown `process_id`.
     pub fn get_heap_size(&self, process_id: ProcessId) -> u64 {
-        let idx = process_id.slot() as usize;
-        if idx < self.processes.len() {
-            self.processes[idx].as_ref().map(|p| p.heap_size).unwrap_or(0)
-        } else {
-            0
+        match self.resolve(process_id) {
+            Some(idx) => self.processes[idx].as_ref().map(|p| p.heap_size).unwrap_or(0),
+            None => 0,
         }
     }
 
@@ -974,6 +1001,12 @@ impl ProcessTable {
         if idx >= self.processes.len() {
             return;
         }
+        // Reject a stale `process_id`: destroying by slot alone would let a
+        // stale id reap the slot's *current* occupant (and bump its
+        // generation), a confused-deputy that revokes a live process.
+        if self.generations[idx] != process_id.generation() {
+            return;
+        }
         if let Some(mut desc) = self.processes[idx].take() {
             // Step 1: Reclaim VMA-tracked user-space regions.
             // Unmaps pages from the process page table and frees
@@ -997,40 +1030,34 @@ impl ProcessTable {
         }
     }
 
-    /// Get a process's CR3 (PML4 physical address). Returns 0 if no per-process page table.
+    /// Get a process's CR3 (PML4 physical address). Returns 0 if no
+    /// per-process page table, or for a stale / unknown `process_id`.
     pub fn get_cr3(&self, process_id: ProcessId) -> u64 {
-        let idx = process_id.slot() as usize;
-        if idx < self.processes.len() {
-            self.processes[idx].as_ref().map(|p| p.cr3).unwrap_or(0)
-        } else {
-            0
+        match self.resolve(process_id) {
+            Some(idx) => self.processes[idx].as_ref().map(|p| p.cr3).unwrap_or(0),
+            None => 0,
         }
     }
 
-    /// Check whether a process slot is occupied.
+    /// Check whether the slot named by `process_id` is occupied by *that
+    /// same incarnation* (occupied and generation-matching). A stale id
+    /// whose slot has been reused reports `false`.
     pub fn slot_occupied(&self, process_id: ProcessId) -> bool {
-        let idx = process_id.slot() as usize;
-        idx < self.processes.len() && self.processes[idx].is_some()
+        self.resolve(process_id).is_some()
     }
 
-    /// Get mutable access to a process's VMA tracker.
+    /// Get mutable access to a process's VMA tracker. `None` for a stale /
+    /// unknown `process_id`.
     pub fn vma_mut(&mut self, process_id: ProcessId) -> Option<&mut VmaTracker> {
-        let idx = process_id.slot() as usize;
-        if idx < self.processes.len() {
-            self.processes[idx].as_mut().map(|p| &mut p.vma)
-        } else {
-            None
-        }
+        let idx = self.resolve(process_id)?;
+        self.processes[idx].as_mut().map(|p| &mut p.vma)
     }
 
-    /// Get read-only access to a process's VMA tracker.
+    /// Get read-only access to a process's VMA tracker. `None` for a stale
+    /// / unknown `process_id`.
     pub fn vma(&self, process_id: ProcessId) -> Option<&VmaTracker> {
-        let idx = process_id.slot() as usize;
-        if idx < self.processes.len() {
-            self.processes[idx].as_ref().map(|p| &p.vma)
-        } else {
-            None
-        }
+        let idx = self.resolve(process_id)?;
+        self.processes[idx].as_ref().map(|p| &p.vma)
     }
 }
 
@@ -1421,5 +1448,93 @@ mod tests {
     fn process_descriptor_initializes_empty_fd_table() {
         let desc = test_descriptor();
         assert_eq!(desc.fds.count(), 0);
+    }
+
+    // ========================================================================
+    // ProcessTable generation-validity tests (F2). A stale `ProcessId` whose
+    // slot has been freed and reused by a later generation must NOT resolve
+    // to the slot's new occupant — otherwise channel teardown driven by a
+    // stale `creator_pid`/`peer_pid` (see `teardown_channel_mappings`) frees
+    // the wrong VMA region and unmaps pages out of an unrelated process's
+    // page table. These tests fail against slot-only indexing and pass once
+    // every read path routes through `ProcessTable::resolve`.
+    // ========================================================================
+
+    /// Build a `ProcessTable` over a leaked, all-`None` slot array — no boot
+    /// object-table region or frame allocation required.
+    fn empty_table(num_slots: usize) -> Box<ProcessTable> {
+        let mut v: alloc::vec::Vec<Option<ProcessDescriptor>> = alloc::vec::Vec::new();
+        for _ in 0..num_slots {
+            v.push(None);
+        }
+        let leaked: &'static mut [Option<ProcessDescriptor>] = Box::leak(v.into_boxed_slice());
+        ProcessTable::from_object_slice(leaked, 0).expect("table construction")
+    }
+
+    #[test]
+    fn process_table_rejects_stale_generation_on_reads() {
+        let mut table = empty_table(2);
+
+        // Slot 0 occupied at generation 0 with recognizable resources.
+        let mut occupant = test_descriptor();
+        occupant.cr3 = 0xAAAA_0000;
+        occupant.phys_base = 0xBBBB_0000;
+        table.processes[0] = Some(occupant);
+        let current = ProcessId::new(0, 0);
+
+        // The current id resolves to its own resources.
+        assert!(table.slot_occupied(current));
+        assert_eq!(table.get_cr3(current), 0xAAAA_0000);
+        assert_eq!(table.get_heap_base(current), 0xBBBB_0000);
+        assert!(table.vma(current).is_some());
+
+        // Model destroy + slot reuse: a later generation now owns slot 0
+        // with *different* resources. (`destroy_process` reclaim touches
+        // fabricated frame state, so we install the post-reuse state
+        // directly: generation bumped, new occupant.)
+        let mut new_occupant = test_descriptor();
+        new_occupant.cr3 = 0xCCCC_0000;
+        new_occupant.phys_base = 0xDDDD_0000;
+        table.processes[0] = Some(new_occupant);
+        table.generations[0] = 1;
+
+        let stale = ProcessId::new(0, 0); // old generation
+        let reused = ProcessId::new(0, 1); // current occupant
+
+        // The stale id must NOT leak the new occupant's resources.
+        assert!(!table.slot_occupied(stale));
+        assert_eq!(table.get_cr3(stale), 0, "stale id leaked new occupant cr3");
+        assert_eq!(table.get_heap_base(stale), 0);
+        assert_eq!(table.get_heap_size(stale), 0);
+        assert!(table.vma(stale).is_none());
+        assert!(table.vma_mut(stale).is_none());
+
+        // The current occupant still resolves correctly.
+        assert!(table.slot_occupied(reused));
+        assert_eq!(table.get_cr3(reused), 0xCCCC_0000);
+        assert!(table.vma_mut(reused).is_some());
+    }
+
+    #[test]
+    fn process_table_stale_id_cannot_destroy_current_occupant() {
+        let mut table = empty_table(1);
+        table.processes[0] = Some(test_descriptor());
+        table.generations[0] = 5;
+        let mut fa = FrameAllocator::new();
+
+        // A stale id (generation 4) must not reap the live occupant (gen 5).
+        let stale = ProcessId::new(0, 4);
+        table.destroy_process(stale, &mut fa);
+        assert!(
+            table.processes[0].is_some(),
+            "stale id reaped the live occupant"
+        );
+        assert_eq!(table.generations[0], 5, "stale destroy must not bump gen");
+
+        // The current id destroys it and bumps the generation.
+        let current = ProcessId::new(0, 5);
+        table.destroy_process(current, &mut fa);
+        assert!(table.processes[0].is_none());
+        assert_eq!(table.generations[0], 6);
     }
 }
