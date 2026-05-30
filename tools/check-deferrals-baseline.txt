@@ -59,6 +59,7 @@ docs/adr/029-posix-file-storage-model.md:355:deferred
 docs/adr/029-posix-file-storage-model.md:359:deferred
 docs/adr/029-posix-file-storage-model.md:414:deferred
 docs/adr/031-unified-storage-substrate.md:24:deferred
+docs/adr/033-multi-principal-vault.md:149:deferred
 docs/identity-synthesis.md:124:deferred
 docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:77:deferred
@@ -82,9 +83,9 @@ src/boot/riscv.rs:24:deferred
 src/boot/riscv.rs:731:deferred
 src/fs/block.rs:174:eventually
 src/fs/virtio_blk_device.rs:80:deferred
-src/ipc/capability.rs:720:deferred
-src/ipc/capability.rs:773:TODO
-src/ipc/capability.rs:781:for-now
+src/ipc/capability.rs:717:deferred
+src/ipc/capability.rs:770:TODO
+src/ipc/capability.rs:778:for-now
 src/lib.rs:100:TBD
 src/memory/mod.rs:633:placeholder
 src/memory/mod.rs:642:placeholder
@@ -95,11 +96,11 @@ src/microkernel/main.rs:2029:deferred
 src/microkernel/main.rs:2058:deferred
 src/microkernel/main.rs:2361:for-now
 src/platform/mod.rs:353:for-now
-src/process.rs:965:deferred
-src/process.rs:966:deferred
+src/process.rs:992:deferred
+src/process.rs:993:deferred
 src/scheduler/mod.rs:281:placeholder
 src/scheduler/mod.rs:282:placeholder
-src/syscalls/dispatcher.rs:4288:for-now
+src/syscalls/dispatcher.rs:4299:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now
@@ -460,6 +461,7 @@ tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/middleware/me
 tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/middleware/message_logger.py:32:placeholder
 tools/mcp-rust-analyzer/.venv/lib/python3.14/site-packages/uvicorn/protocols/websockets/wsproto_impl.py:115:TODO
 user/compositor/src/main.rs:511:for-now
+user/key-store-service/src/vault/mod.rs:353:for-now
 user/libgui-proto/src/lib.rs:27:deferred
 user/libgui/src/font.rs:13:placeholder
 user/libgui/src/font.rs:248:placeholder
