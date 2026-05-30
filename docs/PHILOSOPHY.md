@@ -1,5 +1,13 @@
 # CambiOS: Philosophical Foundations
 
+> The systems people depend on most have been built to take from them, and
+> infrastructure that matters should be provably trustworthy instead of asking
+> people to take that on faith.
+
+CambiOS is built on one test - does this create something for the person, or take
+something from them - and the architecture is designed to make the answer checkable
+rather than promised.
+
 ## Sovereign & Generative for Digital Wellbeing
 
 Every technical choice in CambiOS answers to one question before any other:
