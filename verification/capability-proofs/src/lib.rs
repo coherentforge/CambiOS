@@ -274,10 +274,12 @@ mod proofs {
         assert!(caps.verify_access(endpoint, CapabilityRights::FULL).is_ok());
     }
 
-    /// P3.6 — `capability_count()` never exceeds the table capacity (32)
-    /// across a single grant/revoke. The table bounds are enforced by
-    /// the `self.count >= 32` check in `grant`; this proof witnesses
-    /// that the `count` field actually respects the cap.
+    /// P3.6 — `capability_count()` never exceeds the table capacity
+    /// (`MAX_CAPS_PER_PROCESS`) across a single grant/revoke. The table
+    /// bounds are enforced by the `count >= MAX_CAPS_PER_PROCESS` check in
+    /// `grant`; this proof witnesses that the `count` field actually
+    /// respects the cap. The bound is read from the source const, so the
+    /// proof tracks the capacity automatically.
     #[kani::proof]
     #[kani::unwind(2)]
     fn proof_count_bounded_after_ops() {
@@ -286,39 +288,50 @@ mod proofs {
 
         // A single grant either succeeds (count == 1) or is irrelevant.
         let _ = caps.grant(endpoint, CapabilityRights::SEND_ONLY);
-        assert!(caps.capability_count() <= 32);
+        assert!(caps.capability_count() as usize <= MAX_CAPS_PER_PROCESS);
 
         // A revoke never takes count past the cap either.
         let _ = caps.revoke(endpoint);
-        assert!(caps.capability_count() <= 32);
+        assert!(caps.capability_count() as usize <= MAX_CAPS_PER_PROCESS);
     }
 
-    /// P3.7 — When the table is full (`count == 32`) and the endpoint is
-    /// not already present, `grant` returns `Err(CapabilityFull)` without
-    /// mutating state.
+    /// P3.7 — When the table is full (`count == MAX_CAPS_PER_PROCESS`) and
+    /// the endpoint is not already present, `grant` returns
+    /// `Err(CapabilityFull)` without mutating state.
     ///
-    /// We construct a full table by granting 32 distinct endpoints, then
-    /// attempt a 33rd grant with a fresh endpoint. The scan-for-existing
-    /// loop inside `grant` terminates before the capacity check only
-    /// when the endpoint matches an existing entry; the fresh-endpoint
-    /// case exercises the capacity-reject branch directly.
+    /// We construct a full table by granting `MAX_CAPS_PER_PROCESS` distinct
+    /// endpoints, then attempt one more grant with a fresh endpoint. The
+    /// scan-for-existing loop inside `grant` terminates before the capacity
+    /// check only when the endpoint matches an existing entry; the
+    /// fresh-endpoint case exercises the capacity-reject branch directly.
+    /// Unwind covers the fill loop (`MAX_CAPS_PER_PROCESS` iterations) plus
+    /// the full-table scan inside the final rejected grant. The fill count
+    /// and fresh-endpoint index are read from the source const, so this
+    /// proof can no longer drift out of sync with the table capacity (the
+    /// 32→64 bump previously left this harness asserting against 32 and it
+    /// failed silently because the suite is not in any commit gate).
     #[kani::proof]
-    #[kani::unwind(34)]
+    #[kani::unwind(66)]
     fn proof_grant_at_capacity_rejects_new_endpoint() {
         let mut caps = ProcessCapabilities::new(ProcessId::new(1, 0));
 
-        // Fill the table with 32 distinct endpoints (indices 0..32).
-        for i in 0..32u32 {
+        // Fill the table with MAX_CAPS_PER_PROCESS distinct endpoints
+        // (indices 0..MAX_CAPS_PER_PROCESS).
+        for i in 0..MAX_CAPS_PER_PROCESS as u32 {
             caps.grant(EndpointId(i), CapabilityRights::SEND_ONLY).unwrap();
         }
-        assert_eq!(caps.capability_count(), 32);
+        assert_eq!(caps.capability_count() as usize, MAX_CAPS_PER_PROCESS);
 
-        // A fresh endpoint (index 100) is rejected.
+        // A fresh endpoint (index == MAX_CAPS_PER_PROCESS, just past the
+        // filled range) is rejected without mutating count.
         assert!(matches!(
-            caps.grant(EndpointId(100), CapabilityRights::SEND_ONLY),
+            caps.grant(
+                EndpointId(MAX_CAPS_PER_PROCESS as u32),
+                CapabilityRights::SEND_ONLY
+            ),
             Err(CapabilityError::CapabilityFull)
         ));
-        assert_eq!(caps.capability_count(), 32);
+        assert_eq!(caps.capability_count() as usize, MAX_CAPS_PER_PROCESS);
     }
 
     // ========================================================================
@@ -449,8 +462,13 @@ mod proofs {
     /// and every system capability flag in one shot. After the call,
     /// any `verify_access` on any endpoint returns `Err(AccessDenied)`,
     /// and every system-cap query returns `Ok(false)`.
+    // Unwind covers the per-process capability-array scan inside
+    // `revoke_all_for_process` / `verify_access`, which is
+    // `MAX_CAPS_PER_PROCESS` (64) slots wide. Sized as table + headroom,
+    // matching P3.7; the prior value (34) was correct for the 32-slot table
+    // and silently became insufficient after the 32→64 bump.
     #[kani::proof]
-    #[kani::unwind(34)]
+    #[kani::unwind(66)]
     fn proof_revoke_all_clears_endpoints_and_system_caps() {
         let mut mgr = make_manager(3);
         let pid = ProcessId::new(1, 0);

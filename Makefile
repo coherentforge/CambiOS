@@ -1181,20 +1181,16 @@ test:
 # `#[path]` includes (no copy, no fork). Kani uses its own bundled
 # nightly toolchain, so this works regardless of `rust-toolchain.toml`.
 #
-# Run after any change to a proven module (currently: BuddyAllocator).
-# A proof failure means the property no longer holds — investigate before
-# committing.
+# Run after any change to a proven module. A proof failure means the property
+# no longer holds — investigate before committing.
+#
+# `verify` is an alias for `verify-all`, which is the single canonical list of
+# proof crates (defined below alongside the per-crate `verify-<crate>` targets).
+# Keeping one list prevents the drift that previously left `dtb-proofs` out of
+# the aggregate and a stale 4-crate enumeration here.
 # =============================================================================
 .PHONY: verify
-verify:
-	@echo "=== Kani proofs: BuddyAllocator ==="
-	cd verification/buddy-proofs && cargo kani
-	@echo "=== Kani proofs: ELF parser ==="
-	cd verification/elf-proofs && cargo kani
-	@echo "=== Kani proofs: FrameAllocator ==="
-	cd verification/frame-proofs && cargo kani
-	@echo "=== Kani proofs: CapabilityManager ==="
-	cd verification/capability-proofs && cargo kani
+verify: verify-all
 
 # =============================================================================
 # make stats — derive canonical counts from source code.
@@ -1643,7 +1639,7 @@ fuzz-syscall-dispatcher:
 # proof crates. Each proof crate is workspace-excluded; cargo-kani uses its
 # own pinned nightly toolchain. Run individual proof crates from this
 # wrapper rather than `cd`-ing into each one.
-.PHONY: verify-userslice verify-capability verify-elf verify-frame verify-buddy verify-all
+.PHONY: verify-userslice verify-capability verify-elf verify-frame verify-buddy verify-dtb verify-all
 verify-userslice:
 	cd verification/userslice-proofs && cargo kani
 
@@ -1659,7 +1655,10 @@ verify-frame:
 verify-buddy:
 	cd verification/buddy-proofs && cargo kani
 
-verify-all: verify-buddy verify-elf verify-frame verify-capability verify-userslice
+verify-dtb:
+	cd verification/dtb-proofs && cargo kani
+
+verify-all: verify-buddy verify-elf verify-frame verify-capability verify-userslice verify-dtb
 	@echo "=== All proof crates verified ==="
 
 clean:
