@@ -119,27 +119,20 @@ pub mod user_slice;
 #[cfg(kani)]
 mod proofs {
     use super::dispatcher::SyscallContext;
-    use super::user_slice::{UserReadSlice, UserWriteSlice};
+    use super::user_slice::{MAX_USER_BUFFER, USER_SPACE_END, UserReadSlice, UserWriteSlice};
     use super::SyscallError;
 
-    // user_slice.rs makes `MAX_USER_BUFFER` and `USER_SPACE_END`
-    // `pub(super)`, which from this crate means the values are visible
-    // only within `crate::user_slice`. We re-state them here at the
-    // values the kernel uses; if either drifts in the kernel, the
-    // proofs catch the inconsistency at the next run.
-    //
-    // `USER_SPACE_END` is arch-conditional in the kernel
-    // (`src/syscalls/user_slice.rs:64-68`). The proof crate is
-    // built under whatever toolchain Kani picked (typically
-    // aarch64-apple-darwin on Apple Silicon hosts), so the proof
-    // constant must follow the same `cfg` to match the kernel's
-    // active value at proof-build time.
-    const MAX_USER_BUFFER: usize = 4096;
-
-    #[cfg(target_arch = "x86_64")]
-    const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
-    #[cfg(not(target_arch = "x86_64"))]
-    const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
+    // MAX_USER_BUFFER and USER_SPACE_END are imported (above) directly
+    // from the included kernel module rather than re-stated. They are
+    // `pub(super)` in user_slice.rs, which once mounted at this crate's
+    // root resolves to `pub(in crate)`, so the proof module can reach
+    // them. Importing instead of hand-copying makes drift impossible: the
+    // harnesses always constrain against the exact values `validate()`
+    // enforces. A stale hand-copy (4096 vs the kernel's real 16384) is
+    // what made the `*_len_over_max_buffer_rejects` harnesses unsound —
+    // surfaced only by x86_64 CI, because aarch64 Kani false-greened them.
+    // USER_SPACE_END remains arch-conditional in the kernel; importing it
+    // picks up whichever value the active target compiled.
 
     fn any_ctx() -> SyscallContext {
         SyscallContext { cr3: kani::any() }
