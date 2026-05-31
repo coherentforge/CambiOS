@@ -126,12 +126,22 @@ pub struct Capability {
 /// cache-line-friendly linear scan. Bumped 32 → 64 in lockstep with
 /// `MAX_ENDPOINTS` at A-v.d.3 (the boot manifest grants one cap per
 /// endpoint, so the two must match or trailing endpoints silently fail
-/// their grant — the original fde-mount=32 IPC bug).
-/// `verification/capability-proofs` references this const directly, so the
-/// harness capacity tracks the source and cannot silently drift (the 32→64
-/// bump previously broke P3.7 unnoticed). Full rationale in docs/ASSUMPTIONS.md.
+/// their grant — the original fde-mount=32 IPC bug). Full rationale in
+/// docs/ASSUMPTIONS.md.
 /// Replace when: the policy service / audit consumer exhausts 64.
+#[cfg(not(kani))]
 pub const MAX_CAPS_PER_PROCESS: usize = 64;
+
+/// SCAFFOLDING: 16-slot capability table under Kani, for proof tractability.
+/// `verification/capability-proofs` P3.7 symbolically fills a full table, and
+/// `grant`'s per-call scan makes that ~O(N²); at the production 64 the CBMC
+/// formula exhausts CI-runner memory (the first Tier B run OOM'd). The proven
+/// property — a full table rejects further grants — is size-independent, so 16
+/// proves the same guarantee. Mirrors `frame_allocator::MAX_FRAMES`'s
+/// `cfg(kani)` shrink; full rationale in docs/ASSUMPTIONS.md.
+/// Replace when: never independently — tracks the `cfg(not(kani))` value above.
+#[cfg(kani)]
+pub const MAX_CAPS_PER_PROCESS: usize = 16;
 
 /// Capability table for a single process. Holds up to
 /// [`MAX_CAPS_PER_PROCESS`] capabilities in a fixed inline array.

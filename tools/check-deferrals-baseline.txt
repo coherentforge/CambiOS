@@ -83,9 +83,9 @@ src/boot/riscv.rs:24:deferred
 src/boot/riscv.rs:731:deferred
 src/fs/block.rs:174:eventually
 src/fs/virtio_blk_device.rs:80:deferred
-src/ipc/capability.rs:717:deferred
-src/ipc/capability.rs:770:TODO
-src/ipc/capability.rs:778:for-now
+src/ipc/capability.rs:727:deferred
+src/ipc/capability.rs:780:TODO
+src/ipc/capability.rs:788:for-now
 src/lib.rs:100:TBD
 src/memory/mod.rs:633:placeholder
 src/memory/mod.rs:642:placeholder
