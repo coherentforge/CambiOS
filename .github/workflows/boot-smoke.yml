@@ -55,10 +55,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU + boot-media tooling
+        # libpcsclite-dev: sign-elf depends on card-backend-pcsc (its YubiKey
+        # backend) unconditionally, which links the system libpcsclite. macOS
+        # ships PC/SC in-OS; Linux needs the dev package. CI signs with --seed
+        # and never touches PC/SC at runtime, but the tool must still build.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 xorriso qemu-utils build-essential
+            qemu-system-x86 xorriso qemu-utils build-essential libpcsclite-dev
       - name: Install pinned toolchain + bare-metal target (rust-toolchain.toml)
         run: |
           rustup show
