@@ -83,10 +83,20 @@ UDP_STACK_ELF_RISCV64 := $(UDP_STACK_DIR)/target/riscv64gc-unknown-none-elf/rele
 SHELL_ELF_RISCV64 := $(SHELL_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-shell
 POLICY_SERVICE_ELF_RISCV64 := $(POLICY_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-policy-service
 
+# Host-tool build target + headless QEMU display (CI overrides). HOST_TARGET:
+# the host-side tools (sign-elf, mkinitrd, ...) are native binaries, not
+# bare-metal; each overrides the parent .cargo/config.toml bare-metal default.
+# Defaults to the macOS dev host; CI on Linux overrides with
+# `HOST_TARGET=x86_64-unknown-linux-gnu`. Consumed by the host-tool output-path
+# vars and their build rules below. QEMU_DISPLAY: empty by default (interactive
+# `run-quiet` keeps its window); headless CI sets `QEMU_DISPLAY=-display none`.
+HOST_TARGET ?= aarch64-apple-darwin
+QEMU_DISPLAY ?=
+
 # RISC-V initrd artifacts
 INITRD_RISCV64 := initrd-riscv64.img
 MKINITRD_DIR := tools/mkinitrd
-MKINITRD := $(MKINITRD_DIR)/target/aarch64-apple-darwin/release/mkinitrd
+MKINITRD := $(MKINITRD_DIR)/target/$(HOST_TARGET)/release/mkinitrd
 
 # User-space ELF binaries (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
@@ -137,7 +147,7 @@ FDE_MOUNT_ELF_RISCV64 := $(FDE_MOUNT_DIR)/target/riscv64gc-unknown-none-elf/rele
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
-SIGN_ELF := $(SIGN_ELF_DIR)/target/aarch64-apple-darwin/release/sign-elf
+SIGN_ELF := $(SIGN_ELF_DIR)/target/$(HOST_TARGET)/release/sign-elf
 
 # Dev-PIV keypair generator (host-side). Derives Ed25519+X25519 keys from a
 # persistent per-developer seed; writes dev_bootstrap_pubkey.bin (consumed by
@@ -684,12 +694,12 @@ terminal-window-riscv64:
 
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
-	cd $(SIGN_ELF_DIR) && cargo build --release
+	cd $(SIGN_ELF_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== sign-elf ready ==="
 
 mkinitrd:
 	@echo "=== Building mkinitrd host tool ==="
-	cd $(MKINITRD_DIR) && cargo build --release
+	cd $(MKINITRD_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== mkinitrd ready ==="
 
 # Builds the gen-dev-piv-keys tool (idempotent; rebuilds only on source
@@ -902,6 +912,7 @@ run-quiet: iso disk-img
 			-device qemu-xhci,id=xhci0 \
 			-device usb-ccid,bus=xhci0.0 \
 			-vga virtio \
+			$(QEMU_DISPLAY) \
 			-no-reboot
 
 # Quiet run under `--features dev-piv` — the stream A FDE end-to-end
