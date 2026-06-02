@@ -15,6 +15,16 @@
 #   make run SIGN_MODE=seed         # Seed-based signing (CI/testing)
 #   CAMBIO_SIGN_PIN=123456 make run # YubiKey with PIN via env var
 
+# Force bash for all recipes. GNU make defaults SHELL to /bin/sh, which on Linux
+# is dash — and dash's printf does NOT support `\xHH` hex escapes. Every
+# user-crate rule builds CARGO_ENCODED_RUSTFLAGS via `printf '%s\x1f%s' ...` to
+# join rustflags with the 0x1F separator byte; under dash that emits the literal
+# text "\x1f", cargo then passes the whole rustflags blob as one unsplit linker
+# arg, and the linker-script path mangles ("cannot find linker script
+# link.ld\x1f..."). macOS /bin/sh is bash, so this was invisible until the Linux
+# boot-smoke CI runner hit it.
+SHELL := /bin/bash
+
 KERNEL := target/x86_64-unknown-none/release/cambios_microkernel
 ISO := cambios.iso
 LIMINE_DIR := $(HOME)/.cache/cambios/limine
