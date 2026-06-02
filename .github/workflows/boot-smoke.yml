@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# CambiOS CI — Tier C: QEMU boot smoke.
+#
+# Boots the kernel headless under QEMU and asserts it reaches the shell. This
+# catches the one regression class the Tier A build gate and Tier B proofs
+# cannot: a kernel that compiles + proves clean but triple-faults or hangs at
+# boot. `make run-quiet` builds the ISO (kernel + signed user modules), creates
+# the virtio-blk backing image, boots qemu-system-x86_64, and streams serial
+# through tools/qemu-run-quiet.py, which exits 0 (shell sentinel seen) / 1
+# (panic/exception) / 2 (hang or timeout).
+#
+# Nightly cadence (not per-push): a full ISO build + TCG boot is the slowest
+# job in CI, and A+B already gate every push. workflow_dispatch is enabled so a
+# run can be triggered on demand (e.g. to validate a change to the boot path).
+#
+# Linux-port notes (vs the macOS dev host):
+#   * HOST_TARGET=x86_64-unknown-linux-gnu builds the sign-elf host tool for the
+#     runner instead of aarch64-apple-darwin (see the Makefile HOST_TARGET var).
+#   * QEMU_DISPLAY=-display none runs QEMU headless (no Cocoa/gtk window).
+#   * SIGN_MODE=seed signs modules with the dev seed, not a YubiKey.
+#   * x86_64 run-quiet boots via SeaBIOS + the BIOS-CD ISO, so no UEFI firmware
+#     is needed (the /opt/homebrew edk2 lookup is only in the run-uefi path).
+#
+# riscv64 and aarch64 boot-smoke jobs are the planned follow-ups (the keystone
+# HOST_TARGET fix already covers their mkinitrd/sign-elf builds; riscv adds an
+# initrd + the qemu-run-quiet wrapper, aarch64 adds an OS-conditional firmware
+# path + mtools). x86_64 lands first to validate the pipeline before aarch64's
+# TCG-vs-hvf boot-speed unknown.
+
+name: Boot smoke (QEMU)
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # ~nightly, 07:00 UTC (adjustable)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  x86_64:
+    name: boot-smoke (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HOST_TARGET: x86_64-unknown-linux-gnu
+      QEMU_DISPLAY: -display none
+      SIGN_MODE: seed
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU + boot-media tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso qemu-utils build-essential
+      - name: Install pinned toolchain + bare-metal target (rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: boot-smoke-x86_64
+      - name: Boot to shell under QEMU (headless, seed-signed)
+        run: make run-quiet TIMEOUT=180
