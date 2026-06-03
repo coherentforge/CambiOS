@@ -48,6 +48,12 @@ github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
 "025-principal-as-aid" = "025-principal-as-aid"
 "026-identity-transcription-at-the-kernel-ring" = "026-identity-transcription"
 "027-service-clusters" = "027-service-clusters"
+"028-three-storage-models" = "028-three-storage-models"
+"029-posix-file-storage-model" = "029-posix-file-storage-model"
+"030-stream-cap-variant" = "030-stream-cap-variant"
+"031-unified-storage-substrate" = "031-unified-storage-substrate"
+"032-full-disk-encryption-below-substrate" = "032-full-disk-encryption-below-substrate"
+"033-multi-principal-vault" = "033-multi-principal-vault"
 
 # Kernel docs/<FOO>.md references in ADR bodies (`](../FOO.md)`) -> site URL.
 # Anything not listed falls through to a GitHub blob link.
@@ -62,6 +68,7 @@ github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
 "INTERRUPT_ROUTING.md" = "/docs/interrupt-routing/"
 "SYSCALLS.md" = "/docs/syscalls/"
 "identity.md" = "/docs/identity/"
+"identity-synthesis.md" = "/docs/identity-synthesis/"
 "FS-and-ID-design-plan.md" = "/docs/fs-and-id-design/"
 "developer-experience.md" = "/docs/developer-experience/"
 "win-compat.md" = "/docs/win-compat/"
@@ -71,3 +78,10 @@ github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
 [root_doc_map]
 "STATUS.md" = "/docs/status/"
 "README.md" = "/"
+
+# Phase 2: design docs (beyond ADRs) that mirror to the site. Maps a kernel
+# docs/<stem>.md to a site content/docs/<slug>.md (slug = URL). The page title
+# comes from the doc's first `# ` heading; internal links (adr/NNN-*.md and
+# sibling FOO.md) are rewritten to site URLs the same way ADR links are.
+[docs_sync]
+"identity-synthesis" = "identity-synthesis"

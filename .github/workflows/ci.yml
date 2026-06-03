@@ -90,6 +90,15 @@ jobs:
         env:
           RUST_MIN_STACK: "8388608"
         run: cargo test --lib --target x86_64-unknown-linux-gnu
+      # STATUS.md number-drift gate. The test binary is now built, so
+      # `make stats` enumerates --lib tests cheaply (retargeted to the Linux
+      # host via STATS_TEST_TARGET). --strict makes objective count drift
+      # (prose vs build, Kani harnesses vs source) FAIL CI; the date heuristic
+      # stays advisory and is not checked here.
+      - name: check-status-freshness (counts vs build, --full --strict)
+        env:
+          STATS_TEST_TARGET: x86_64-unknown-linux-gnu
+        run: python3 tools/check-status-freshness.py --full --strict
 
   # ---------------------------------------------------------------------------
   # clippy — enforces missing_safety_doc = "deny" (Cargo.toml [lints.clippy],
@@ -120,8 +129,10 @@ jobs:
   #
   # Commit-boundary / provenance gates are excluded on purpose: they read the
   # staged diff or session state and are no-ops or meaningless in CI —
-  # check-index-isolation, check-lockfile (advisory), check-status-freshness
-  # (advisory), claude-preflight.
+  # check-index-isolation, check-lockfile (advisory), claude-preflight.
+  # (check-status-freshness's number-drift check runs in the `test` job with
+  # --full --strict, where a built test binary makes the counts verifiable; its
+  # date heuristic stays local/advisory and is not run in CI.)
   #
   # Note: check-adrs regenerates docs/adr/INDEX.md as a side effect (exit 0 when
   # cross-refs are valid). CI does not commit, so a stale committed INDEX.md is

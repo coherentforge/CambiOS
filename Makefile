@@ -1223,6 +1223,13 @@ verify: verify-all
 # test binaries).
 # =============================================================================
 .PHONY: stats
+# Host triple used to enumerate --lib tests in `make stats`. Defaults to the
+# maintainer's macOS host; override in CI / on Linux
+# (STATS_TEST_TARGET=x86_64-unknown-linux-gnu). The --lib tests are pure logic,
+# so the count is host-independent — the target only overrides the .cargo
+# bare-metal default so a host binary can be built.
+STATS_TEST_TARGET ?= x86_64-apple-darwin
+
 stats:
 	@echo "=== CambiOS stats (derived from source) ==="
 	@printf "Syscalls:        "
@@ -1231,8 +1238,10 @@ stats:
 	@find src -name '*.rs' | wc -l | tr -d ' '
 	@printf "Userspace .rs:   "
 	@find user -name '*.rs' -not -path '*/target/*' | wc -l | tr -d ' '
+	@printf "Kani harnesses:  "
+	@grep -rh --include='*.rs' --exclude-dir=target '#\[kani::proof\]' verification 2>/dev/null | grep -vc '^[[:space:]]*//' || true
 	@printf "Tests (lib):     "
-	@RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin -- --list 2>/dev/null | awk '/^[0-9]+ tests?,/ {print $$1; found=1; exit} END {if (!found) print "(build first: make test)"}'
+	@RUST_MIN_STACK=8388608 cargo test --lib --target $(STATS_TEST_TARGET) -- --list 2>/dev/null | awk '/^[0-9]+ tests?,/ {print $$1; found=1; exit} END {if (!found) print "(build first: make test)"}'
 
 # Generate machine-readable symbol index for AI-assisted development.
 # Output: .symbols (gitignored). Read by Claude Code at session start
@@ -1300,6 +1309,13 @@ check-lockfile:
 # see tools/check-status-freshness.py for the trigger and rationale.
 check-status-freshness:
 	@python3 tools/check-status-freshness.py
+
+# Full variant: also re-derives the unit-test count via `make stats`
+# (compiles). For CI / manual runs — NOT the pre-commit hook, which must
+# stay compile-free. The cheap Kani-harness + prose-consistency checks
+# run in both; only the live test-count compare is gated behind --full.
+check-status-freshness-full:
+	@python3 tools/check-status-freshness.py --full
 
 # Pre-edit audit for a file. Run before the first Edit on any file per
 # session — especially under parallel-thread development. Surfaces

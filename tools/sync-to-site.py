@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Sync mirrored docs from the kernel repo to the cambios-site repo.
 
-Phase 1 scope: ADRs only. Reads tools/sync-to-site.toml for the slug map and
-the cross-doc reference maps, walks docs/adr/ in the kernel, transforms each
-(adds Hugo frontmatter, rewrites internal links to site URLs, falls back to
-GitHub blob URLs for kernel docs the site doesn't host), writes the site
-copy. Idempotent: re-running on a synced state is a no-op.
+Scope: ADRs (docs/adr/) plus the design docs listed in the [docs_sync] config
+section. Reads tools/sync-to-site.toml for the slug map and the cross-doc
+reference maps, walks docs/adr/ (and docs/<stem>.md for [docs_sync] entries) in
+the kernel, transforms each (adds Hugo frontmatter, rewrites internal links to
+site URLs, falls back to GitHub blob URLs for kernel docs the site doesn't
+host), writes the site copy. Idempotent: re-running on a synced state is a no-op.
 
 Usage:
     python3 tools/sync-to-site.py [--site-dir PATH] [--check] [--only adr]
@@ -114,6 +115,34 @@ def rewrite_links(text: str, slug_map: dict, doc_map: dict, root_map: dict, gith
     return text
 
 
+def rewrite_doc_links(text: str, slug_map: dict, doc_map: dict, github_url: str) -> str:
+    """Rewrite links in a kernel docs/<name>.md (not docs/adr/) to site URLs.
+
+    Two forms appear in design docs: ADR references as ](adr/NNN-slug.md) and
+    sibling-doc references as ](FOO.md). Both resolve to site URLs via the same
+    maps the ADR sync uses, with a GitHub-blob fallback for unmapped targets.
+    """
+    # 1) ADR links from a doc: ](adr/NNN-kernel-slug.md) [#anchor]
+    def adr_link(m):
+        slug, anchor = m.group(1), m.group(2) or ""
+        site_slug = slug_map.get(slug)
+        if site_slug:
+            return f"](/adr/{site_slug}/{anchor})"
+        return f"]({github_url}/docs/adr/{slug}.md{anchor})"
+    text = re.sub(r"\]\(adr/(\d{3}-[a-z0-9-]+)\.md(#[^\)]+)?\)", adr_link, text)
+
+    # 2) Sibling docs (same dir): ](FOO.md) -> /docs/foo/ if mapped, else GitHub.
+    #    The slash-free character class means ](adr/NNN.md) (already rewritten
+    #    above) and full URLs are not matched here.
+    def doc_link(m):
+        fname, anchor = m.group(1), m.group(2) or ""
+        if fname in doc_map:
+            return f"]({doc_map[fname]}{anchor})"
+        return f"]({github_url}/docs/{fname}{anchor})"
+    text = re.sub(r"\]\(([A-Za-z][A-Za-z0-9_.-]*\.md)(#[^\)]+)?\)", doc_link, text)
+    return text
+
+
 def convert_adr(kernel_path: Path, slug_map, doc_map, root_map, github_url) -> str:
     src = kernel_path.read_text()
     header = parse_adr_header(src, kernel_path.stem)
@@ -168,11 +197,67 @@ def sync_adrs(kernel_root: Path, site_dir: Path, config: dict, check: bool) -> i
     return changes
 
 
+def sync_docs(kernel_root: Path, site_dir: Path, config: dict, check: bool) -> int:
+    """Sync kernel docs/<stem>.md design docs to site content/docs/<slug>.md.
+
+    Driven by the [docs_sync] config section. Mirrors convert_adr's shape: drop
+    the H1 (the site renders the frontmatter title), add Hugo frontmatter,
+    rewrite internal links. Idempotent. Returns the change count."""
+    docs_sync = config.get("docs_sync", {})
+    if not docs_sync:
+        return 0
+    slug_map = config["slug_map"]
+    doc_map = config["doc_map"]
+    github_url = config["paths"]["github_blob_url"]
+
+    kernel_docs_dir = kernel_root / "docs"
+    site_docs_dir = site_dir / "content" / "docs"
+    if not site_docs_dir.is_dir():
+        sys.exit(f"ERROR: site docs dir not found: {site_docs_dir}")
+
+    changes = 0
+    for stem, slug in sorted(docs_sync.items()):
+        kernel_path = kernel_docs_dir / f"{stem}.md"
+        if not kernel_path.is_file():
+            print(f"WARN: docs_sync entry {stem!r} has no kernel file at "
+                  f"{kernel_path}; skipping. Fix sync-to-site.toml.")
+            continue
+        src = kernel_path.read_text()
+        lines = src.split("\n")
+        m = re.match(r"^#\s+(.+)$", lines[0])
+        if m:
+            title, body = m.group(1).strip(), "\n".join(lines[1:])
+        else:
+            title, body = stem, src
+        body = rewrite_doc_links(body, slug_map, doc_map, github_url)
+        safe_title = title.replace('"', '\\"')
+        fm = (
+            "---\n"
+            f'title: "{safe_title}"\n'
+            f"url: /docs/{slug}/\n"
+            "---\n"
+        )
+        new_content = fm + body
+        site_path = site_docs_dir / f"{slug}.md"
+        old_content = site_path.read_text() if site_path.exists() else ""
+        if old_content == new_content:
+            continue
+        changes += 1
+        rel = site_path.relative_to(site_dir)
+        if check:
+            action = "would update" if site_path.exists() else "would create"
+        else:
+            action = "updated" if site_path.exists() else "created"
+            site_path.write_text(new_content)
+        print(f"{action}: {rel}")
+    return changes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site-dir", help="Site repo path (overrides CAMBIOS_SITE_DIR)")
     parser.add_argument("--check", action="store_true", help="Dry-run; print plan, write nothing")
-    parser.add_argument("--only", choices=["adr"], help="Restrict to one kind (default: all)")
+    parser.add_argument("--only", choices=["adr", "docs"], help="Restrict to one kind (default: all)")
     args = parser.parse_args()
 
     config = load_config()
@@ -182,6 +267,8 @@ def main() -> int:
     total = 0
     if args.only in (None, "adr"):
         total += sync_adrs(KERNEL_ROOT, site_dir, config, args.check)
+    if args.only in (None, "docs"):
+        total += sync_docs(KERNEL_ROOT, site_dir, config, args.check)
 
     verb = "would be applied" if args.check else "applied"
     print(f"\n{total} change(s) {verb}.")

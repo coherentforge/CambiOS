@@ -19,12 +19,12 @@ belongs in the linked ADR, not here.
 ## At a glance
 
 - **Tri-arch first-class**: clean release build on `x86_64`, `aarch64`, `riscv64gc`; all three boot in QEMU to an `cambios>` shell prompt. `make check-all` is the permanent regression gate.
-- **561 host unit tests passing** on `x86_64-apple-darwin`. Run `make stats` for current counts — numbers live in code, not prose.
+- **892 host unit tests passing** on `x86_64-apple-darwin`. Run `make stats` for current counts — numbers live in code, not prose.
 - **Security model live end-to-end**: cryptographic identity, signed-ELF verification, capability-gated IPC, content-addressed ObjectStore, audit ring, kernel identity gate, userspace `recv_verified`.
 - **GUI stack live on x86_64 + aarch64**: scanout-virtio-gpu drives QEMU virtio-gpu-pci; compositor composites; virtio-input forwards HID keyboard/pointer events into the focused window; first-party app `pong` (continuous-motion 1-player vs AI) runs as the default GUI boot module on x86_64, and `worm` renders on aarch64 via `make run-aarch64-gui` now that the kernel has an ECAM-based PCI enumerator. `tree` (Minesweeper) stays buildable for regression.
 - **Persistent storage live**: virtio-blk + disk-backed ObjectStore + `arcobj` shell CLI; objects survive reboot.
 - **Bare metal**: USB boot tooling complete, untested on hardware.
-- **Formal verification**: Kani proofs live on BuddyAllocator + ELF parser + FrameAllocator + CapabilityManager + UserSlice + DTB parser (1 + 7 + 10 + 12 + 12 + 5 = 47 harnesses across 6 proof crates; proof authoring fixed 6 overflow sites in `src/loader/elf.rs`, 2 in `src/memory/frame_allocator.rs`, and 2 in `src/boot/riscv.rs`). [verification/CLAIMS.md](verification/CLAIMS.md) tracks the gap between proven and aspirational claims.
+- **Formal verification**: Kani proofs live on BuddyAllocator + ELF parser + FrameAllocator + CapabilityManager + UserSlice + DTB parser (1 + 7 + 11 + 12 + 12 + 5 = 48 harnesses across 6 proof crates; proof authoring fixed 6 overflow sites in `src/loader/elf.rs`, 2 in `src/memory/frame_allocator.rs`, and 2 in `src/boot/riscv.rs`). [verification/CLAIMS.md](verification/CLAIMS.md) tracks the gap between proven and aspirational claims.
 
 ## Recent landings
 
@@ -145,7 +145,7 @@ Chronological, newest first. ~3 week window — older items rotate out; git log 
 | TLB shootdown | Done (x86 vector-IPI / ARM TLBI broadcast / RISC-V SBI IPI) | x/a/r | `src/arch/*/tlb.rs` | — |
 | Process lifecycle cleanup | Done (Phase 3.2d.ii; kernel stack free deferred) | x/a/r | `src/syscalls/dispatcher.rs`, `src/process.rs` | — |
 | USB boot tooling | Done (`make img-usb` + `make usb DEVICE=...`) | x | `Makefile` | — |
-| Formal verification (Kani) | Started 2026-04-16. Live across 6 proof crates, 47 passing harnesses: `BuddyAllocator::free` reserved-prefix (1); ELF header parser (7; fixed 6 integer-overflow sites); FrameAllocator (10; fixed 2 overflow sites with `saturating_add`; `reserve_region` overflow covered by unit tests where CBMC's budget blew); CapabilityManager (12; Tier A `ProcessCapabilities` invariants + Tier B cross-process on a 3-slot manager); UserSlice validators (12; ADR-020 `UserReadSlice`/`UserWriteSlice` exhaustive over `(addr, len)` × CR3 state); DTB parser (5; fixed 2 `attempt to add with overflow` sites in `be_u32_at`/`be_u64_at` with `checked_add`). Walker proof (P-DTB-6) and ELF `verify_binary` cross-cutting proof both deferred — CBMC budget intractable; targeted by the planned Kani→Verus pivot. Compositor protocol parser deferred until scanout settles past Scanout-4.c. The gap-map between proven and aspirational claims is [verification/CLAIMS.md](verification/CLAIMS.md). | — | `verification/{buddy,elf,frame,capability,userslice,dtb}-proofs/` | [ADR-000 § Divergence](docs/adr/000-zta-and-cap.md), [verification/CLAIMS.md](verification/CLAIMS.md) |
+| Formal verification (Kani) | Started 2026-04-16. Live across 6 proof crates, 48 passing harnesses: `BuddyAllocator::free` reserved-prefix (1); ELF header parser (7; fixed 6 integer-overflow sites); FrameAllocator (11; fixed 2 overflow sites with `saturating_add`; `reserve_region` overflow covered by unit tests where CBMC's budget blew); CapabilityManager (12; Tier A `ProcessCapabilities` invariants + Tier B cross-process on a 3-slot manager); UserSlice validators (12; ADR-020 `UserReadSlice`/`UserWriteSlice` exhaustive over `(addr, len)` × CR3 state); DTB parser (5; fixed 2 `attempt to add with overflow` sites in `be_u32_at`/`be_u64_at` with `checked_add`). Walker proof (P-DTB-6) and ELF `verify_binary` cross-cutting proof both deferred — CBMC budget intractable; targeted by the planned Kani→Verus pivot. Compositor protocol parser deferred until scanout settles past Scanout-4.c. The gap-map between proven and aspirational claims is [verification/CLAIMS.md](verification/CLAIMS.md). | — | `verification/{buddy,elf,frame,capability,userslice,dtb}-proofs/` | [ADR-000 § Divergence](docs/adr/000-zta-and-cap.md), [verification/CLAIMS.md](verification/CLAIMS.md) |
 | AArch64 SMP timer on AP | **Gap**: PPI 30 not firing on second CPU under QEMU `virt`. Single-CPU works. | a | — | — |
 | DHCP client | Paused (pre-work in `udp-stack`; waiting on channel architecture consumer) | — | partial in `user/udp-stack/` | — |
 | DNS / TCP / Yggdrasil mesh / TLS / VFS / USB HID / DID resolution / identity revocation | Planned | — | — | [identity.md](docs/identity.md), various ADRs |
@@ -204,7 +204,7 @@ Parity-target with x86_64 / AArch64. All phases landed as of 2026-04-19. Source:
 
 ## Test coverage
 
-Total: **561** on `x86_64-apple-darwin`. Run `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`, or `make stats` for the current number.
+Total: **892** on `x86_64-apple-darwin`. Run `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`, or `make stats` for the current number.
 
 Major categories (approximate; breakdown drifts faster than the total):
 

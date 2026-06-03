@@ -2,133 +2,235 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2024-2026 Jason Ricca
 """
-Pre-commit advisory: warn when STATUS.md's `last_synced_to_code:` is
-stale by more than THRESHOLD_DAYS.
+Pre-commit advisory: surface STATUS.md drift before it compounds.
 
-Context: STATUS.md is the load-bearing answer to "is X done yet?"
-The Post-Change Review §8 checklist asks every commit to update
-the relevant subsystem row + bump `last_synced_to_code:` when it
-moves. In practice that did not fire on most of the 110 commits
-between 2026-04-22 and 2026-05-04, producing a 12-day drift window
-where major architectural decisions (ADR-025/026/027, multi-Principal
-vault Phase 1C, ADR-022 wall-clock implementation, two new proof
-crates) were unrepresented in the index. The catch-up sync had to
-recover that drift in one large doc commit instead of incremental
-updates per landing.
+Two independent advisory checks, both exit-0 (warn-but-pass), in the
+same don't-grow-the-baseline family as the other tools/check-*.py gates.
 
-This lint surfaces drift before it compounds. Same shape as the
-existing don't-grow-the-baseline gates: noisy enough to read, not
-bossy enough to block.
+1. DATE drift — `last_synced_to_code:` more than THRESHOLD_DAYS old.
+   (Original behavior, unchanged. Rationale: the 2026-04-22 -> 2026-05-04
+   12-day drift window that had to be recovered in one large catch-up sync.)
 
-# Behavior
+2. NUMBER drift — STATUS.md's prose counts no longer match the source.
+   This is the gap that let the file sit at "561 host unit tests /
+   47 harnesses" while the code was already at 892 / 48: a sync bumped
+   the *date* but never re-derived the *numbers*, and a date-only check
+   passed silently. The date moving is not evidence the counts moved.
 
-- Locate `last_synced_to_code: YYYY-MM-DD` in STATUS.md's frontmatter
-  (the HTML comment block at the top).
-- Compute drift = today - that_date in days.
-- If drift > THRESHOLD_DAYS, print one stderr line naming the
-  drift and the trailing parenthetical (the human-readable
-  description from the date marker). Exit 0 — advisory.
-- Otherwise exit 0 silently.
+   - Kani harness count is derived CHEAPLY (count active `#[kani::proof]`
+     under verification/, no compile) and compared to every *total*
+     stated in STATUS.md prose. Safe to run on every commit.
+   - The unit-test count cannot be derived without compiling, so by
+     default this only checks that the stated test numbers agree with
+     EACH OTHER (catches a partial update — one mention fixed, another
+     missed). With `--full` it runs `make stats` and compares against the
+     live count; that path compiles, so it is for CI / manual runs, NOT
+     the pre-commit hook.
 
-Pre-CI / pre-HN posture: this is informational, not blocking.
-Tightening to a hard block becomes worth it when the warn cycle
-proves it does not change behavior — at that point swap exit 0
-for exit 1 here. Convention 9 cadence: prose first (the warning
-message), then mechanism on first failure-to-respond.
-
-# Threshold
-
-7 days. Calibrated against the cause: a working week of accumulated
-landings without sync is the point where catch-up cost (reading 7
-days of git log to reconstruct what's missing) starts to exceed the
-incremental cost (1-3 lines per commit). N=14 would tolerate one
-slow week silently; N=7 catches that case while still permitting
-weekend-only quiet stretches without noise.
-
-# Edge cases
-
-- STATUS.md missing or `last_synced_to_code:` line not found:
-  exit 1 (config-level error, not advisory).
-- Date unparseable (typo, wrong format): exit 1.
-- Date in the future: drift = 0, silent pass. The human knows
-  what they're doing; reverse drift is not what this lint catches.
+Posture unchanged: advisory, exit 0. Only config-level errors (STATUS.md
+missing, unparseable date) exit 1. Tighten to a hard block by flipping
+the relevant return once the warn cycle proves it changes behavior.
 
 Usage:
-  python3 tools/check-status-freshness.py
-  make check-status-freshness     # same, via Makefile
-
-Bypass:
-  None needed — advisory only. If desired, pipe stderr to /dev/null
-  in CI noise contexts.
+  python3 tools/check-status-freshness.py          # date + cheap number checks (pre-commit)
+  python3 tools/check-status-freshness.py --full    # also re-derive the test count via `make stats`
+  make check-status-freshness                       # no-arg form
+  make check-status-freshness-full                  # --full form
 """
+import argparse
 import datetime
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 THRESHOLD_DAYS = 7
 STATUS_FILE = Path("STATUS.md")
+VERIFICATION_DIR = Path("verification")
+
 DATE_RE = re.compile(
     r"last_synced_to_code:\s*(\d{4}-\d{2}-\d{2})(?:\s*\(([^)]*)\))?"
 )
+# Total-harness mentions only. Per-crate notes in the Recent-landings
+# narrative ("(5 harnesses)", "12 harnesses on src/ipc/...") are
+# deliberately NOT matched — only the "N harnesses across M proof crates"
+# and "N passing harnesses" totals are checked against the derived count.
+HARNESS_TOTAL_RES = (
+    re.compile(r"(\d+)\s+harnesses across \d+ proof crates"),
+    re.compile(r"(\d+)\s+passing harnesses"),
+)
+TEST_COUNT_RES = (
+    re.compile(r"(\d+)\s+host unit tests"),
+    re.compile(r"Total:\s*\*\*(\d+)\*\*"),
+)
+MAKE_STATS_TESTS_RE = re.compile(r"Tests \(lib\):\s*(\d+)")
+
+_WARNINGS = 0
 
 
-def main() -> int:
-    if not STATUS_FILE.exists():
-        print(
-            f"check-status-freshness: ERROR: {STATUS_FILE} not found "
-            f"(run from repository root)",
-            file=sys.stderr,
-        )
-        return 1
+def warn(msg: str) -> None:
+    global _WARNINGS
+    _WARNINGS += 1
+    print(f"check-status-freshness: WARN: {msg}", file=sys.stderr)
 
-    text = STATUS_FILE.read_text()
+
+def check_date(text: str) -> int:
+    """Date-drift check. Returns 1 only on config error; else 0 (advisory)."""
     match = DATE_RE.search(text)
     if not match:
         print(
-            f"check-status-freshness: ERROR: `last_synced_to_code: "
+            "check-status-freshness: ERROR: `last_synced_to_code: "
             f"YYYY-MM-DD` line not found in {STATUS_FILE} frontmatter",
             file=sys.stderr,
         )
         return 1
-
     raw_date, annotation = match.group(1), match.group(2)
     try:
         synced = datetime.date.fromisoformat(raw_date)
     except ValueError:
         print(
-            f"check-status-freshness: ERROR: cannot parse "
+            "check-status-freshness: ERROR: cannot parse "
             f"`last_synced_to_code: {raw_date}` as a date",
             file=sys.stderr,
         )
         return 1
+    drift = (datetime.date.today() - synced).days
+    if drift > THRESHOLD_DAYS:
+        annot = f" ({annotation})" if annotation else ""
+        warn(
+            f"STATUS.md last_synced_to_code is {synced.isoformat()}{annot} "
+            f"— {drift} days behind today (threshold {THRESHOLD_DAYS}). "
+            "Consider a Recent-landings entry, a subsystem-row update, or a "
+            "date bump before this commit lands."
+        )
+    return 0
 
-    today = datetime.date.today()
-    drift = (today - synced).days
 
-    if drift <= THRESHOLD_DAYS:
-        return 0  # Fresh enough; silent pass.
+def count_kani_harnesses():
+    """Active `#[kani::proof]` count under verification/. Cheap; no compile.
+    Returns None if the directory is absent (wrong cwd)."""
+    if not VERIFICATION_DIR.is_dir():
+        return None
+    count = 0
+    for path in VERIFICATION_DIR.rglob("*.rs"):
+        if "target" in path.parts:
+            continue
+        for line in path.read_text(errors="ignore").splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("//"):
+                continue
+            if "#[kani::proof]" in stripped:
+                count += 1
+    return count
 
-    annot = f" ({annotation})" if annotation else ""
-    print(
-        f"check-status-freshness: WARN: STATUS.md last_synced_to_code "
-        f"is {synced.isoformat()}{annot} — {drift} days behind today "
-        f"({today.isoformat()}, threshold {THRESHOLD_DAYS}).",
-        file=sys.stderr,
+
+def stated_counts(text: str, patterns) -> list:
+    found = []
+    for rx in patterns:
+        found.extend(int(m) for m in rx.findall(text))
+    return found
+
+
+def check_numbers(text: str, full: bool) -> int:
+    """Advisory number-drift checks. Returns the count of genuine drift
+    mismatches (operational warnings — missing dir, unparseable `make stats`
+    — do not count, so they never trip --strict / CI)."""
+    drift = 0
+
+    # --- Kani harnesses: cheap, every run ---
+    derived = count_kani_harnesses()
+    stated_h = stated_counts(text, HARNESS_TOTAL_RES)
+    if derived is None:
+        warn("verification/ not found — skipping Kani harness check "
+             "(run from repo root).")
+    elif stated_h:
+        bad = sorted({n for n in stated_h if n != derived})
+        if bad:
+            drift += 1
+            warn(
+                f"Kani harness drift: source has {derived} active "
+                f"`#[kani::proof]` harnesses, STATUS.md prose states "
+                f"{', '.join(map(str, bad))}. Update the harness totals."
+            )
+
+    # --- Unit tests: intra-prose consistency always; live compare on --full ---
+    stated_t = stated_counts(text, TEST_COUNT_RES)
+    if stated_t and len(set(stated_t)) > 1:
+        drift += 1
+        warn(
+            "STATUS.md states inconsistent unit-test counts "
+            f"({', '.join(map(str, sorted(set(stated_t))))}) — the prose "
+            "disagrees with itself, a partial update."
+        )
+    if full and stated_t:
+        try:
+            out = subprocess.run(
+                ["make", "stats"], capture_output=True, text=True,
+                timeout=900, check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            warn(f"--full: could not run `make stats` ({exc}).")
+            return drift
+        match = MAKE_STATS_TESTS_RE.search(out)
+        if not match:
+            warn("--full: could not parse Tests(lib) from `make stats`.")
+            return drift
+        live = int(match.group(1))
+        bad = sorted({n for n in stated_t if n != live})
+        if bad:
+            drift += 1
+            warn(
+                f"Unit-test drift: `make stats` reports {live} lib tests, "
+                f"STATUS.md states {', '.join(map(str, bad))}. Update the "
+                "test totals."
+            )
+    return drift
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="STATUS.md freshness advisory (date + number drift)."
     )
-    print(
-        "Consider whether recent commits warrant a Recent-landings "
-        "entry, a subsystem-table row update, or a date bump before "
-        "this commit lands. Per-landing increments are cheaper than "
-        "the catch-up sync that recovers from prolonged drift.",
-        file=sys.stderr,
+    parser.add_argument(
+        "--full", action="store_true",
+        help="also re-derive the unit-test count via `make stats` "
+             "(compiles; for CI / manual use, not the pre-commit hook)",
     )
-    print(
-        "Advisory only — this commit is not blocked. The lint hardens "
-        "to exit 1 once the warn cycle proves it does not change "
-        "behavior; see tools/check-status-freshness.py for the trigger.",
-        file=sys.stderr,
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="exit 1 on objective number drift (Kani/test count mismatch). "
+             "The date heuristic stays advisory. For CI enforcement.",
     )
+    args = parser.parse_args()
+
+    if not STATUS_FILE.exists():
+        print(
+            f"check-status-freshness: ERROR: {STATUS_FILE} not found "
+            "(run from repository root)",
+            file=sys.stderr,
+        )
+        return 1
+
+    text = STATUS_FILE.read_text()
+    rc = check_date(text)
+    if rc != 0:
+        return rc
+    drift = check_numbers(text, full=args.full)
+
+    if args.strict and drift:
+        print(
+            f"check-status-freshness: FAIL (--strict): {drift} number-drift "
+            "issue(s) above must be fixed before this lands.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if _WARNINGS:
+        print(
+            "Advisory only — not blocking. Per-landing increments are cheaper "
+            "than the catch-up sync that recovers from prolonged drift.",
+            file=sys.stderr,
+        )
     return 0
 
 
