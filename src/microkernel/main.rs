@@ -907,6 +907,9 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // another task, the trap vector's `mv sp, a0 ; sret` swaps out
     // this stack; we resume here when the scheduler picks idle again.
     loop {
+        // ADR-034 §3: reclaim exited tasks' page-table roots + kernel stacks
+        // from this hart's deferred-reclaim queue, in normal context.
+        cambios_core::reaper::drain_local();
         // SAFETY: wfi is always legal in S-mode. On a hart with SIE
         // set, it blocks until the next interrupt (timer or external)
         // fires, at which point control re-enters the trap vector.
@@ -1037,6 +1040,8 @@ unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
     // SAFETY: trap vector installed; PerCpu/timer/scheduler all live.
     unsafe { cambios_core::arch::riscv64::trap::enable_interrupts(); }
     loop {
+        // ADR-034 §3: drain this hart's deferred-reclaim queue.
+        cambios_core::reaper::drain_local();
         // SAFETY: wfi is always legal in S-mode with SIE set.
         unsafe { core::arch::asm!("wfi", options(nostack, nomem, preserves_flags)); }
     }
@@ -2186,6 +2191,8 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     x86_64::instructions::interrupts::enable();
 
     loop {
+        // ADR-034 §3: drain this CPU's deferred-reclaim queue.
+        cambios_core::reaper::drain_local();
         hlt();
     }
 }
@@ -2275,6 +2282,8 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     }
 
     loop {
+        // ADR-034 §3: drain this CPU's deferred-reclaim queue.
+        cambios_core::reaper::drain_local();
         cambios_core::wfi();
     }
 }
@@ -2636,6 +2645,12 @@ fn microkernel_loop() -> ! {
         // Load balancing: migrate tasks from overloaded to underloaded CPUs
         // (internally throttled to once per BALANCE_INTERVAL_TICKS)
         cambios_core::try_load_balance();
+
+        // ADR-034 §3: drain this CPU's deferred-reclaim queue — free the
+        // page-table roots + kernel stacks of tasks that exited on this CPU,
+        // now that they have yielded off them. Normal context, no hierarchy
+        // lock held: the safe place to take FRAME_ALLOCATOR + free.
+        cambios_core::reaper::drain_local();
 
         // Halt/wait CPU until next interrupt (timer, keyboard, etc.)
         #[cfg(target_arch = "x86_64")]

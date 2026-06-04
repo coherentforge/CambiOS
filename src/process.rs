@@ -992,33 +992,48 @@ impl ProcessTable {
     /// Kernel stack deallocation is deferred to a separate cleanup
     /// pass (bounded leak, requires scheduler-level deferred-free
     /// mechanism). See STATUS.md.
+    /// Reclaim a terminating process's inline-freeable resources and return
+    /// the page-table root to be freed **later** by the per-CPU reaper.
+    ///
+    /// VMA-tracked frames and the heap are freed inline here. The page-table
+    /// root (PML4 / satp L0 / TTBR0 L0) is **not** — it is the dying task's
+    /// *active* root, and freeing it inline unmaps the running address space
+    /// (the confirmed triple-fault, ADR-034 Context). Instead the root is
+    /// returned so the caller can hand it to `reaper::drain_local`, which
+    /// frees it from a clean context after the task has yielded off it.
+    ///
+    /// Returns `Some(root_phys)` for a process with a per-process page table,
+    /// `None` for a kernel task (`cr3 == 0`) or a stale / unknown / unoccupied
+    /// `process_id` (nothing to defer).
+    #[must_use = "the returned page-table root must be enqueued for the reaper, \
+                  or it leaks"]
     pub fn destroy_process(
         &mut self,
         process_id: ProcessId,
         frame_alloc: &mut FrameAllocator,
-    ) {
+    ) -> Option<u64> {
         let idx = process_id.slot() as usize;
         if idx >= self.processes.len() {
-            return;
+            return None;
         }
         // Reject a stale `process_id`: destroying by slot alone would let a
         // stale id reap the slot's *current* occupant (and bump its
         // generation), a confused-deputy that revokes a live process.
         if self.generations[idx] != process_id.generation() {
-            return;
+            return None;
         }
         if let Some(mut desc) = self.processes[idx].take() {
             // Step 1: Reclaim VMA-tracked user-space regions.
             // Unmaps pages from the process page table and frees
-            // physical frames. Must precede page table reclaim.
+            // physical frames. Must precede page table reclaim, and runs
+            // while the page table is still intact (and still the dying
+            // task's active root).
             let _vma_count = desc.reclaim_user_vmas(frame_alloc);
 
-            // Step 2: Reclaim page table frames (PML4 + intermediates).
-            // Only for processes with a per-process page table (cr3 != 0).
-            #[cfg(not(test))]
-            if desc.cr3 != 0 {
-                paging::reclaim_process_page_tables(desc.cr3, frame_alloc);
-            }
+            // Step 2: Page-table frames (root + intermediates) are NOT freed
+            // here — see the doc comment. Capture the root for the reaper.
+            // `None` when cr3 == 0 (kernel task, no per-process table).
+            let deferred_root = if desc.cr3 != 0 { Some(desc.cr3) } else { None };
 
             // Step 3: Reclaim the heap region.
             let _ = desc.reclaim_heap(frame_alloc);
@@ -1027,6 +1042,10 @@ impl ProcessTable {
             // slot gets a distinct ProcessId. Wrapping is intentional —
             // u32 gives ~4 billion reuses per slot before wrap.
             self.generations[idx] = self.generations[idx].wrapping_add(1);
+
+            deferred_root
+        } else {
+            None
         }
     }
 
@@ -1522,18 +1541,28 @@ mod tests {
         table.generations[0] = 5;
         let mut fa = FrameAllocator::new();
 
-        // A stale id (generation 4) must not reap the live occupant (gen 5).
+        // A stale id (generation 4) must not reap the live occupant (gen 5),
+        // and must defer no page-table root.
         let stale = ProcessId::new(0, 4);
-        table.destroy_process(stale, &mut fa);
+        assert_eq!(
+            table.destroy_process(stale, &mut fa),
+            None,
+            "stale id must defer nothing"
+        );
         assert!(
             table.processes[0].is_some(),
             "stale id reaped the live occupant"
         );
         assert_eq!(table.generations[0], 5, "stale destroy must not bump gen");
 
-        // The current id destroys it and bumps the generation.
+        // The current id destroys it, bumps the generation, and returns the
+        // page-table root for the reaper to free (ADR-034 Phase A).
         let current = ProcessId::new(0, 5);
-        table.destroy_process(current, &mut fa);
+        assert_eq!(
+            table.destroy_process(current, &mut fa),
+            Some(0x2000_0000),
+            "destroy must defer the descriptor's cr3 root"
+        );
         assert!(table.processes[0].is_none());
         assert_eq!(table.generations[0], 6);
     }

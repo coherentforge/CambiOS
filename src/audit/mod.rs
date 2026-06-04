@@ -100,6 +100,16 @@ pub enum AuditEventKind {
     /// - `arg0`: kind discriminant (0 = Close, 1 = Revoke)
     /// - `arg1`: number of pages freed
     ChannelTeardownCompleted = 20,
+    /// Defense-in-depth witness (ADR-034 §3): `reclaim_process_page_tables`
+    /// was asked to free a page-table root that is *still this CPU's active
+    /// CR3/satp/TTBR0*. Post-Phase-A the reaper only frees roots the owning
+    /// task has yielded off, so this never fires in correct operation —
+    /// emitting it means a regression reintroduced the active-root self-free.
+    /// The reclaim refuses (frees nothing) in both build profiles; a
+    /// `debug_assert!` additionally fast-fails dev builds.
+    /// - `subject_pid`: 0 (kernel-context event)
+    /// - `arg0`: the active root physical address the free was refused for
+    ReapWouldFreeActiveRoot = 21,
 }
 
 /// ARCHITECTURAL: `cluster_revoked` event's `arg2` discriminant for
@@ -638,6 +648,30 @@ impl RawAuditEvent {
             0,
             exit_code as u64,
             runtime_ticks,
+            0,
+            0,
+        )
+    }
+
+    /// `REAP_WOULD_FREE_ACTIVE_ROOT`: defense-in-depth witness that a
+    /// page-table reclaim was refused because the root is the active
+    /// CR3/satp/TTBR0 (ADR-034 §3). Kernel-context event (no subject pid).
+    ///
+    /// - `arg0`: the active root physical address the free was refused for
+    pub fn reap_would_free_active_root(
+        active_root_phys: u64,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ReapWouldFreeActiveRoot,
+            0,
+            sequence,
+            timestamp,
+            0,
+            0,
+            active_root_phys,
+            0,
             0,
             0,
         )

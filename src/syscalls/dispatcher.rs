@@ -355,20 +355,32 @@ impl SyscallDispatcher {
         //      pop — a window during which concurrent teardown (below)
         //      could page-fault the next `Scheduler::schedule` call.
         //   3. Capture the parent TaskId for wake-up outside the lock.
-        let parent_to_wake = {
+        // ADR-034 §3: also capture the kernel stack to defer, and record
+        // whether THIS call won the Running->Terminated transition. Only the
+        // winner enqueues the self-referential set (enqueue-once) — a
+        // double-exit or a fault racing a clean exit must not enqueue the
+        // root/stack twice (a double-free).
+        let (parent_to_wake, kstack_to_reclaim, won_transition) = {
             let mut sched_guard = crate::local_scheduler().lock();
             if let Some(sched) = sched_guard.as_mut() {
-                let parent = if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
+                let (parent, kstack, won) = if let Some(task) =
+                    sched.get_task_mut_pub(ctx.task_id)
+                {
+                    let already_terminated =
+                        task.state == crate::scheduler::TaskState::Terminated;
                     task.state = crate::scheduler::TaskState::Terminated;
                     task.exit_code = exit_code;
-                    task.parent_task
+                    // kernel_stack_top is 0 for the idle task (boot stack);
+                    // user tasks carry a heap-allocated stack to free.
+                    let kstack = if already_terminated { 0 } else { task.kernel_stack_top };
+                    (task.parent_task, kstack, !already_terminated)
                 } else {
-                    None
+                    (None, 0, false)
                 };
                 sched.purge_task(ctx.task_id);
-                parent
+                (parent, kstack, won)
             } else {
-                None
+                (None, 0, false)
             }
         };
 
@@ -511,7 +523,11 @@ impl SyscallDispatcher {
         // contiguous heap region).
         //
         // Lock ordering: PROCESS_TABLE(6) → FRAME_ALLOCATOR(7), valid.
-        let heap_reclaimed = {
+        // `deferred_root` is the page-table root `destroy_process` chose NOT
+        // to free inline (it is the dying task's active CR3/satp/TTBR0). It is
+        // handed to the reaper below. `None` for a kernel task or an
+        // already-reaped slot.
+        let (heap_reclaimed, deferred_root) = {
             let mut pt_guard = crate::PROCESS_TABLE.lock();
             if let Some(pt) = pt_guard.as_mut() {
                 if pt.slot_occupied(ctx.process_id) {
@@ -526,13 +542,13 @@ impl SyscallDispatcher {
                         pt.record_exit(ctx.process_id, p);
                     }
                     let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
-                    pt.destroy_process(ctx.process_id, &mut fa_guard);
-                    true
+                    let root = pt.destroy_process(ctx.process_id, &mut fa_guard);
+                    (true, root)
                 } else {
-                    false
+                    (false, None)
                 }
             } else {
-                false
+                (false, None)
             }
         };
 
@@ -551,6 +567,39 @@ impl SyscallDispatcher {
             clusters_to_revoke.len(),
             if heap_reclaimed { ", heap+vma+pt" } else { "" }
         );
+
+        // ADR-034 §3: defer the self-referential set — the page-table root
+        // this CPU still runs through (CR3/satp/TTBR0) and the kernel stack it
+        // still stands on — to this CPU's reaper. Both are in use *right now*;
+        // freeing the root inline is the confirmed triple-fault, and the stack
+        // can't free itself. `reaper::drain_local()` frees them from the idle
+        // loop after the terminal yield below switches the CPU off them.
+        //
+        // Pushed under the per-CPU queue lock alone — every hierarchy lock was
+        // released above, so this is not a lower-while-holding-higher
+        // inversion. Safe to enqueue here because `purge_task` cleared
+        // `current_task`, so the timer ISR takes its no-switch path
+        // (`time_slice_expired()` is false with no current task): the dying
+        // task is never involuntarily switched away between this push and the
+        // terminal yield, so the item is durable before any context switch.
+        // Enqueue-once: gated on winning the Running->Terminated transition.
+        if won_transition && (deferred_root.is_some() || kstack_to_reclaim != 0) {
+            let item = crate::reaper::ReclaimItem {
+                root_phys: deferred_root.unwrap_or(0),
+                kstack_top: kstack_to_reclaim,
+            };
+            if crate::local_reclaim_queue().lock().push(item).is_err() {
+                // Structurally impossible (queue sized to MAX_TASKS, ADR-034
+                // §5). If it ever happens, degrade to a bounded leak — the
+                // resources stay allocated (as before ADR-034) but the kernel
+                // stays live. Never panic or block in the death path.
+                crate::println!(
+                    "  [Exit] WARN: reclaim queue full; leaking root={:#x} kstack={:#x}",
+                    item.root_phys,
+                    item.kstack_top
+                );
+            }
+        }
 
         // Yield to next task. Terminated tasks are never re-scheduled,
         // so this loop effectively does not return.

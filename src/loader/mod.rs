@@ -42,7 +42,11 @@ use core::mem::size_of;
 /// observed usage and costs MAX_TASKS × 32 KiB ≈ 8 MiB of kernel memory.
 /// Replace when: per-kstack guard-page mapping lands (then this becomes a
 /// HARDWARE-bounded value driven by the page-fault report, not a guess).
-const KERNEL_STACK_SIZE: usize = 32 * 1024;
+///
+/// `pub` so `reaper::free_kernel_stack` can reconstruct the exact `Layout`
+/// when freeing a terminated task's stack (ADR-034 Phase A) — the deferred
+/// free must use the same size this allocation used.
+pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
 
 /// SCAFFOLDING: default user stack 16 pages (64 KiB).
 /// Why: conservative default that fits all current services.
@@ -690,7 +694,7 @@ pub fn load_elf_process(
     let kstack_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 16)
         .map_err(|_| LoaderError::KernelStackAllocationFailed)?;
 
-    // SAFETY: Layout is valid (KERNEL_STACK_SIZE=8192, align=16).
+    // SAFETY: Layout is valid (KERNEL_STACK_SIZE=32768, align=16).
     let kstack_base = unsafe { alloc(kstack_layout) };
     if kstack_base.is_null() {
         return Err(LoaderError::KernelStackAllocationFailed);

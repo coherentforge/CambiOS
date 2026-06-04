@@ -33,6 +33,7 @@ pub mod arch;
 pub mod loader;
 pub mod syscalls;
 pub mod process;
+pub mod reaper;
 pub mod acpi;
 pub mod fs;
 pub mod crypto;
@@ -722,6 +723,44 @@ pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
     // SAFETY: `tp` initialized at boot; cpu_id is a pure read.
     let cpu_id = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
     &PER_CPU_FRAME_CACHE[cpu_id]
+}
+
+/// Per-CPU deferred-reclaim queues (ADR-034 §3). Each CPU owns
+/// `PER_CPU_RECLAIM_QUEUE[cpu_id]`. A dying task's death path pushes its
+/// `{ page-table root, kernel stack }` here (under this lock alone — never
+/// nested with a hierarchy lock); the per-CPU idle-loop reaper
+/// (`reaper::drain_local`) pops and frees them from a clean context.
+///
+/// `IrqSpinlock`, not a plain `Spinlock`, because the pusher is a task in the
+/// `Terminated`-but-still-running state: disabling interrupts across the brief
+/// push removes any question of a timer-ISR or idle-drain reentrancy on this
+/// CPU's queue while the push is in flight. Isolated "Additional lock domain"
+/// (like `PER_CPU_FRAME_CACHE`) — see CLAUDE.md § Lock Ordering.
+pub static PER_CPU_RECLAIM_QUEUE: [IrqSpinlock<reaper::ReclaimQueue>; MAX_CPUS] =
+    [const { IrqSpinlock::new(reaper::ReclaimQueue::new()) }; MAX_CPUS];
+
+/// Get the current CPU's deferred-reclaim queue lock.
+#[cfg(target_arch = "x86_64")]
+pub fn local_reclaim_queue() -> &'static IrqSpinlock<reaper::ReclaimQueue> {
+    // SAFETY: GS base initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::x86_64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_RECLAIM_QUEUE[cpu_id]
+}
+
+/// Get the current CPU's deferred-reclaim queue lock (AArch64).
+#[cfg(target_arch = "aarch64")]
+pub fn local_reclaim_queue() -> &'static IrqSpinlock<reaper::ReclaimQueue> {
+    // SAFETY: TPIDR_EL1 initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_RECLAIM_QUEUE[cpu_id]
+}
+
+/// Get the current hart's deferred-reclaim queue lock (RISC-V).
+#[cfg(target_arch = "riscv64")]
+pub fn local_reclaim_queue() -> &'static IrqSpinlock<reaper::ReclaimQueue> {
+    // SAFETY: `tp` initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_RECLAIM_QUEUE[cpu_id]
 }
 
 /// Allocate a physical frame, preferring the local CPU's cache.

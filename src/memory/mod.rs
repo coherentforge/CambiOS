@@ -443,6 +443,35 @@ pub mod paging {
             return 0;
         }
 
+        // ADR-034 §3 release-build active-root guard. Freeing the L0 root that
+        // is still this hart's active satp / this CPU's active TTBR0 unmaps the
+        // running address space (the confirmed triple-fault on RISC-V; on
+        // AArch64 it would brick the TTBR0 regime). Post-Phase-A the reaper
+        // only frees roots the owning task has yielded off, so a hit here means
+        // a regression reintroduced the active-root self-free. Refuse (free
+        // nothing) in BOTH build profiles. See x86_64 `paging.rs` for the full
+        // rationale.
+        #[cfg(not(test))]
+        {
+            // SAFETY: HHDM is set and a valid root exists by the time any
+            // process page table is reclaimed; reading the root register
+            // (satp / TTBR0_EL1) is a pure read.
+            let active = unsafe { ap::active_root() };
+            if active == l0_phys {
+                crate::audit::emit(crate::audit::RawAuditEvent::reap_would_free_active_root(
+                    l0_phys,
+                    crate::audit::now(),
+                    0,
+                ));
+                debug_assert!(
+                    false,
+                    "reclaim_process_page_tables called on the active root {:#x}",
+                    l0_phys
+                );
+                return 0;
+            }
+        }
+
         let mut freed = 0usize;
 
         // SAFETY: l0_phys is a valid L0 page table from

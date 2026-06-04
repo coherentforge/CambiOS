@@ -292,6 +292,35 @@ pub fn reclaim_process_page_tables(
         return 0;
     }
 
+    // ADR-034 §3 release-build active-root guard. Freeing the PML4 that is
+    // still this CPU's active CR3 unmaps the running address space — the
+    // next TLB miss faults on an unmapped #PF handler → #DF → triple fault
+    // (the confirmed bug this whole mechanism exists to prevent). Post-Phase-A
+    // the reaper only frees roots the owning task has yielded off, so a hit
+    // here means a regression reintroduced the active-root self-free. Refuse
+    // (free nothing) in BOTH build profiles; the read is invisible cost on a
+    // path that only runs at teardown. `debug_assert!` adds dev fast-fail.
+    #[cfg(not(test))]
+    {
+        let cr3: u64;
+        // SAFETY: reading CR3 is a pure, ring-0-legal read; no memory touched.
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)); }
+        // CR3 bits[51:12] hold the PML4 base; mask off PCD/PWT/PCID low bits.
+        if (cr3 & 0x000F_FFFF_FFFF_F000) == pml4_phys {
+            crate::audit::emit(crate::audit::RawAuditEvent::reap_would_free_active_root(
+                pml4_phys,
+                crate::audit::now(),
+                0,
+            ));
+            debug_assert!(
+                false,
+                "reclaim_process_page_tables called on the active CR3 root {:#x}",
+                pml4_phys
+            );
+            return 0;
+        }
+    }
+
     let hhdm = crate::hhdm_offset();
     let mut freed = 0usize;
 
