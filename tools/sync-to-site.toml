@@ -54,6 +54,7 @@ github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
 "031-unified-storage-substrate" = "031-unified-storage-substrate"
 "032-full-disk-encryption-below-substrate" = "032-full-disk-encryption-below-substrate"
 "033-multi-principal-vault" = "033-multi-principal-vault"
+"034-deferred-task-resource-reclamation" = "034-deferred-task-resource-reclamation"
 "035-translation-layer-compatibility" = "035-translation-layer-compatibility"
 
 # Kernel docs/<FOO>.md references in ADR bodies (`](../FOO.md)`) -> site URL.
