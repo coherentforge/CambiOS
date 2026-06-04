@@ -17,3 +17,9 @@
 # and sat untracked until the 2026-04-21 rebase surfaced them.
 user/hello-riscv64.S
 user/user-riscv64.ld
+
+# (2026-06-04): stale pre-rename backup of main.rs, tracked since the
+# first commit (6a6d512) and never compiled (cargo ignores .bak). Flagged
+# by the 2026-06-03 correctness review; deleted here. Banned so a stray
+# copy can't resurface untracked and get swept into a future commit.
+src/microkernel/main.rs.bak
