@@ -60,6 +60,8 @@ docs/adr/029-posix-file-storage-model.md:359:deferred
 docs/adr/029-posix-file-storage-model.md:414:deferred
 docs/adr/031-unified-storage-substrate.md:24:deferred
 docs/adr/033-multi-principal-vault.md:149:deferred
+docs/adr/034-deferred-task-resource-reclamation.md:11:deferred
+docs/adr/034-deferred-task-resource-reclamation.md:16:deferred
 docs/identity-synthesis.md:124:deferred
 docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:77:deferred

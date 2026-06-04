@@ -416,6 +416,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 - [ADR-021](docs/adr/021-typed-boot-error-propagation.md) — typed boot error propagation; enforced by `make check-boot-panics`. Read when working on `src/microkernel/main.rs` or any boot-init path.
 - [ADR-022](docs/adr/022-wall-clock-time.md) — wall-clock time syscalls (44/45) and the SetWallclock cap (reservation only; impl deferred behind audit refactor). Read when impl resumes.
 - [ADR-024](docs/adr/024-syscall-abi-crate.md) — `cambios-abi` crate as the syscall ABI definition surface. Read when modifying the syscall ABI or generating bindings.
+- [ADR-034](docs/adr/034-deferred-task-resource-reclamation.md) — deferred reclamation of a terminating task's self-referential resources (page-table root, kernel stack, task slot) via per-CPU reapers; the N-CPU address-space occupancy invariant. Read when working on process exit/teardown, the reaper, or the scheduler slot lifecycle; pairs with [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md).
 
 ## Design Documents
 
