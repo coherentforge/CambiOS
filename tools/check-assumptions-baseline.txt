@@ -318,9 +318,9 @@ src/memory/frame_allocator.rs:67:BITMAP_WORDS
 src/memory/heap.rs:17:MIN_BLOCK_SIZE
 src/memory/heap.rs:20:HEAP_ALIGN
 src/memory/mod.rs:77:ENTRIES_PER_TABLE
-src/memory/mod.rs:611:BOOTLOADER_BASE
-src/memory/mod.rs:614:KERNEL_LOAD_ADDR
-src/memory/mod.rs:617:EXTENDED_MEMORY_BASE
+src/memory/mod.rs:629:BOOTLOADER_BASE
+src/memory/mod.rs:632:KERNEL_LOAD_ADDR
+src/memory/mod.rs:635:EXTENDED_MEMORY_BASE
 src/pci/mod.rs:36:MAX_PCI_DEVICES
 src/policy/mod.rs:75:DECISION_NONE
 src/policy/mod.rs:76:DECISION_ALLOW

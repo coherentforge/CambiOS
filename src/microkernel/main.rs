@@ -681,6 +681,19 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     init_kernel_heap();
     init_frame_allocator();
 
+    // Capture the boot satp root as the canonical kernel page table, so
+    // the (portable) scheduler substitutes it for kernel/idle tasks
+    // (cr3 == 0) and the satp reload gate in arch::riscv64 actually fires
+    // on a switch onto one. Without this, kernel_cr3() == 0, the gate's
+    // `if page_table_root != 0` skips the reload, and a kernel/idle task
+    // keeps the previous user satp loaded after that user process exits —
+    // a use-after-free of a freed page-table root. Mirrors the x86_64
+    // (CR3) / aarch64 (TTBR1) set_kernel_cr3 wiring in kmain. BOOT_SATP
+    // holds `(MODE << 60) | PPN`; set_kernel_cr3 wants the root phys.
+    let boot_satp = cambios_core::arch::riscv64::entry::BOOT_SATP
+        .load(core::sync::atomic::Ordering::Acquire);
+    cambios_core::set_kernel_cr3((boot_satp & ((1u64 << 44) - 1)) << 12);
+
     // Smoke-test: allocate a Box and verify the pointer + stored value.
     // Confirms the heap + allocator + paging are all wired correctly.
     {

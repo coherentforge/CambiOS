@@ -419,6 +419,21 @@ pub mod paging {
     /// by `ProcessDescriptor::reclaim_user_vmas()`. This function frees
     /// only the intermediate page-table structures.
     ///
+    /// **Walks only the user half (L0[0..256]).** User mappings live in
+    /// the low half on every arch (matching x86_64's
+    /// `paging::reclaim_process_page_tables`, which walks 0..256). The
+    /// upper half (256..512) is NOT process-owned: on RISC-V there is no
+    /// TTBR split, so `create_process_page_table` copies the kernel-half
+    /// descriptors from the boot root — and those point at the *shared
+    /// static* `BOOT_L2_IDENTITY` / `BOOT_L2_KERNEL` tables in
+    /// `arch::riscv64::entry`. Descending there and freeing them would
+    /// zero the HHDM and kernel map that every CPU and every address
+    /// space depend on (global corruption, strictly worse than a single
+    /// process brick). On AArch64 the upper half is always zero (kernel
+    /// lives in TTBR1), so 0..256 is a no-op narrowing there — and a
+    /// standing regression guard should a future change ever copy the
+    /// kernel half into an AArch64 user L0.
+    ///
     /// Returns the total number of frames freed (including the L0).
     pub fn reclaim_process_page_tables(
         l0_phys: u64,
@@ -435,7 +450,10 @@ pub mod paging {
         // terminated so no CPU has this table loaded.
         let l0_virt = phys_to_virt(l0_phys) as *const u64;
 
-        for l0_idx in 0..512usize {
+        // User half only (see the doc comment). The upper half (256..512)
+        // is shared kernel state on RISC-V (copied static tables) or empty
+        // on AArch64 — freeing it would corrupt the global kernel map.
+        for l0_idx in 0..256usize {
             // SAFETY: l0_virt points to a 4 KiB page table with 512
             // 8-byte entries. l0_idx < 512.
             let l0_entry = unsafe { core::ptr::read(l0_virt.add(l0_idx)) };
