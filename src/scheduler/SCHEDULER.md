@@ -32,7 +32,7 @@ The scheduler subsystem is three files:
 
 ### Key types (`task.rs`)
 
-- **`TaskId(pub u32)`** — slot index in the scheduler's task array
+- **`TaskId`** — a global slot index packed with a reuse generation (`slot` in the low 32 bits, `generation` in the high 32, mirroring `ProcessId`). Lookups are generation-validated, so a stale id whose slot was reclaimed resolves to `None` rather than the new occupant (ADR-034 Phase B). The slot is the array index into the per-CPU task array
 - **`TaskState`** — five-state enum: `Ready`, `Running`, `Blocked`, `Terminated`, `Suspended`
 - **`Priority(pub u8)`** — 0–255, with named constants `IDLE=0`, `LOW=64`, `NORMAL=128`, `HIGH=192`, `CRITICAL=255`
 - **`BlockReason`** — why a task is `Blocked`: `MessageWait(EndpointId)`, `IoWait(irq)`, `TimerWait(ms)`, `SyncSendWait(ep)`, etc.

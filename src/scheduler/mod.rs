@@ -277,7 +277,7 @@ impl Scheduler {
         // Create idle task (always runnable, lowest priority)
         // Idle task MUST be always ready to service: blocking requires a ready task to exist.
         let mut idle_task = Task::new(
-            TaskId(0),
+            TaskId::IDLE,
             0x100000,  // Placeholder entry point (idle task runs kmain's loop)
             0x200000,  // Placeholder stack (idle uses boot stack)
             Priority::IDLE,
@@ -287,7 +287,7 @@ impl Scheduler {
 
         self.tasks[0] = Some(idle_task);
         self.task_count = 1;
-        self.current_task = Some(TaskId(0));
+        self.current_task = Some(TaskId::IDLE);
         self.state = SchedulerState::Running;
 
         Ok(())
@@ -305,7 +305,7 @@ impl Scheduler {
             .find(|&i| self.tasks[i].is_none())
             .ok_or(ScheduleError::NoReadyTasks)?;
 
-        let task_id = TaskId(slot as u32);
+        let task_id = TaskId::new(slot as u32, crate::task_generation(slot as u32));
         let mut task = Task::new(task_id, entry_point, stack_pointer, priority);
         task.in_ready_queue = true;
 
@@ -335,7 +335,7 @@ impl Scheduler {
             .find(|&i| self.tasks[i].is_none())
             .ok_or(ScheduleError::NoReadyTasks)?;
 
-        let task_id = TaskId(slot as u32);
+        let task_id = TaskId::new(slot as u32, crate::task_generation(slot as u32));
         let mut task = Task::new_with_stack(task_id, entry_point, saved_rsp, stack_top, priority);
         task.in_ready_queue = true;
 
@@ -361,7 +361,7 @@ impl Scheduler {
 
         // Check if time slice expired
         if self.time_slice_expired() {
-            Some(self.current_task.unwrap_or(TaskId(0)))
+            Some(self.current_task.unwrap_or(TaskId::IDLE))
         } else {
             None
         }
@@ -390,7 +390,7 @@ impl Scheduler {
         if let Some(task_id) = self.current_task {
             // Extract priority before mutating, to avoid overlapping borrows
             let enqueue_band = {
-                if let Some(task) = self.tasks.get_mut(task_id.0 as usize).and_then(|t| t.as_mut()) {
+                if let Some(task) = self.tasks.get_mut(task_id.slot() as usize).and_then(|t| t.as_mut()) {
                     if task.state == TaskState::Running {
                         task.state = TaskState::Ready;
                         task.reset_time_slice();
@@ -441,7 +441,7 @@ impl Scheduler {
         // Check bands from highest (3) to lowest (0)
         for band in (0..NUM_PRIORITY_BANDS).rev() {
             while let Some(tid) = self.ready_queues[band].pop_front() {
-                let idx = tid.0 as usize;
+                let idx = tid.slot() as usize;
                 if let Some(Some(task)) = self.tasks.get_mut(idx) {
                     if task.state == TaskState::Ready {
                         task.in_ready_queue = false;
@@ -456,7 +456,7 @@ impl Scheduler {
         // Fallback: idle task (always ready as last resort)
         if let Some(Some(task)) = self.tasks.first() {
             if task.state == TaskState::Ready {
-                return Ok(TaskId(0));
+                return Ok(TaskId::IDLE);
             }
         }
 
@@ -526,7 +526,7 @@ impl Scheduler {
                     if rsp == 0 {
                         crate::println!(
                             "\n!!! ZERO RSP: schedule picked task {} (state={:?}, kstack_top={:#x}, saved_rsp=0) !!!",
-                            next_task.0, task.state, task.kernel_stack_top
+                            next_task.slot(), task.state, task.kernel_stack_top
                         );
                     }
                     rsp
@@ -571,7 +571,7 @@ impl Scheduler {
                     if rsp == 0 {
                         crate::println!(
                             "\n!!! ZERO RSP in voluntary_yield: task {} (state={:?}) !!!",
-                            next_task.0, task.state
+                            next_task.slot(), task.state
                         );
                     }
                     rsp
@@ -583,16 +583,24 @@ impl Scheduler {
         }
     }
 
-    /// Get task by ID - O(1) direct indexing
-    /// 
-    /// TaskId is an index into the tasks array. Direct indexing is O(1).
+    /// Get task by ID — O(1) slot indexing, then generation-validated.
+    ///
+    /// A `TaskId` whose slot was reclaimed and reused (the reaper bumped the
+    /// generation, ADR-034 Phase B) mismatches the live task's generation and
+    /// resolves to `None` rather than the new occupant — this is what closes
+    /// the `SYS_WAIT_TASK` use-after-free as a structural class, at every
+    /// lookup, not just one call site. (Today all generations are 0, so this
+    /// is a no-op until the reaper starts bumping.)
     fn get_task(&self, id: TaskId) -> Option<&Task> {
-        self.tasks.get(id.0 as usize)?.as_ref()
+        let task = self.tasks.get(id.slot() as usize)?.as_ref()?;
+        if task.id.generation() == id.generation() { Some(task) } else { None }
     }
 
-    /// Get mutable task by ID - O(1) direct indexing
+    /// Get mutable task by ID — O(1) slot indexing, then generation-validated
+    /// (see [`Scheduler::get_task`]).
     fn get_task_mut(&mut self, id: TaskId) -> Option<&mut Task> {
-        self.tasks.get_mut(id.0 as usize)?.as_mut()
+        let task = self.tasks.get_mut(id.slot() as usize)?.as_mut()?;
+        if task.id.generation() == id.generation() { Some(task) } else { None }
     }
 
     /// Public mutable task accessor (for setting process_id/CR3 after creation)
@@ -634,7 +642,7 @@ impl Scheduler {
             "block_task called with interrupts enabled — see CLAUDE.md blocking pattern",
         );
         // Safety check: never block idle task
-        if task_id == TaskId(0) {
+        if task_id.is_idle() {
             return Err(ScheduleError::InvalidTaskState);
         }
 
@@ -693,7 +701,7 @@ impl Scheduler {
         task_id: TaskId,
         channel_id_raw: u64,
     ) -> Result<QuiesceArmResult, ScheduleError> {
-        if task_id == TaskId(0) {
+        if task_id.is_idle() {
             return Err(ScheduleError::InvalidTaskState);
         }
         let task = self.get_task_mut(task_id).ok_or(ScheduleError::TaskNotFound)?;
@@ -730,10 +738,10 @@ impl Scheduler {
         &self,
         process_id: crate::ipc::ProcessId,
     ) -> Option<TaskId> {
-        self.tasks.iter().enumerate().find_map(|(idx, slot)| {
+        self.tasks.iter().find_map(|slot| {
             let task = slot.as_ref()?;
             if task.process_id == Some(process_id) {
-                Some(TaskId(idx as u32))
+                Some(task.id)
             } else {
                 None
             }
@@ -820,7 +828,7 @@ impl Scheduler {
         };
         // Idle task is never quiesced; defensive guard mirroring
         // block_task's TaskId(0) gate.
-        if task_id == TaskId(0) {
+        if task_id.is_idle() {
             return false;
         }
         let task = match self.get_task_mut(task_id) {
@@ -880,7 +888,7 @@ impl Scheduler {
         if let Some(b) = band {
             self.ready_queues[b].push_back(task_id);
         }
-        if task_id != TaskId(0) {
+        if !task_id.is_idle() {
             self.runnable_count += 1;
         }
 
@@ -1093,7 +1101,7 @@ impl Scheduler {
         for band in 0..NUM_PRIORITY_BANDS {
             self.ready_queues[band].retain(|&tid| tid != task_id);
         }
-        let idx = task_id.0 as usize;
+        let idx = task_id.slot() as usize;
         if let Some(Some(task)) = self.tasks.get_mut(idx) {
             if task.in_ready_queue {
                 task.in_ready_queue = false;
@@ -1114,7 +1122,7 @@ impl Scheduler {
     /// (slot 0) or the currently running task.
     pub fn remove_task(&mut self, task_id: TaskId) -> Result<Task, ScheduleError> {
         // Never remove idle task
-        if task_id == TaskId(0) {
+        if task_id.is_idle() {
             return Err(ScheduleError::InvalidTaskState);
         }
         // Cannot remove the currently running task
@@ -1122,7 +1130,7 @@ impl Scheduler {
             return Err(ScheduleError::InvalidTaskState);
         }
 
-        let idx = task_id.0 as usize;
+        let idx = task_id.slot() as usize;
         if idx >= self.tasks.len() {
             return Err(ScheduleError::TaskNotFound);
         }
@@ -1147,14 +1155,15 @@ impl Scheduler {
 
     /// Accept a task from another scheduler (migration target).
     ///
-    /// Places the task at its existing slot index (`task.id.0`). The slot
-    /// must be free on this scheduler.
+    /// Places the task at its existing slot index (`task.id.slot()`). The
+    /// slot must be free on this scheduler. Migration preserves the full
+    /// `TaskId` (slot + generation) — identity is stable across CPUs.
     pub fn accept_task(&mut self, task: Task) -> Result<TaskId, ScheduleError> {
         if task.state == TaskState::Running {
             return Err(ScheduleError::InvalidTaskState);
         }
 
-        let idx = task.id.0 as usize;
+        let idx = task.id.slot() as usize;
         if idx >= self.tasks.len() {
             return Err(ScheduleError::TaskNotFound);
         }
@@ -1201,7 +1210,7 @@ impl Scheduler {
                 crate::println!(
                     "    slot {}: id={} state={:?} in_q={} band={} saved_rsp={:#x}",
                     idx,
-                    task.id.0,
+                    task.id.slot(),
                     task.state,
                     task.in_ready_queue,
                     priority_to_band(task.priority),
@@ -1214,7 +1223,7 @@ impl Scheduler {
         for band in (0..NUM_PRIORITY_BANDS).rev() {
             crate::print!("    ready_queue[band {}] len={}:", band, self.ready_queues[band].len());
             for tid in self.ready_queues[band].iter() {
-                crate::print!(" {}", tid.0);
+                crate::print!(" {}", tid.slot());
             }
             crate::println!();
         }
@@ -1234,7 +1243,7 @@ impl Scheduler {
     pub fn pick_migratable_task(&self) -> Option<TaskId> {
         for band in (0..NUM_PRIORITY_BANDS).rev() {
             for tid in self.ready_queues[band].iter() {
-                let idx = tid.0 as usize;
+                let idx = tid.slot() as usize;
                 if idx == 0 { continue; } // skip idle
                 if let Some(Some(task)) = self.tasks.get(idx) {
                     if task.state == TaskState::Ready && !task.pinned {
@@ -1262,7 +1271,7 @@ pub fn migrate_task_between(
     dst.accept_task(task)?;
     // Update global task→CPU map (lock-free)
     #[cfg(not(test))]
-    crate::set_task_cpu(task_id.0, dst_cpu);
+    crate::set_task_cpu(task_id.slot(), dst_cpu);
     Ok(())
 }
 
@@ -1510,7 +1519,7 @@ mod tests {
     fn test_remove_idle_task_fails() {
         let mut sched = Scheduler::new();
         sched.init().unwrap();
-        assert!(sched.remove_task(TaskId(0)).is_err());
+        assert!(sched.remove_task(TaskId::new(0, 0)).is_err());
     }
 
     #[test]
@@ -1518,14 +1527,14 @@ mod tests {
         let mut sched = Scheduler::new();
         sched.init().unwrap();
         // Idle task (0) is Running — current_task
-        assert!(sched.remove_task(TaskId(0)).is_err());
+        assert!(sched.remove_task(TaskId::new(0, 0)).is_err());
     }
 
     #[test]
     fn test_remove_nonexistent_task_fails() {
         let mut sched = Scheduler::new();
         sched.init().unwrap();
-        assert!(sched.remove_task(TaskId(5)).is_err());
+        assert!(sched.remove_task(TaskId::new(5, 0)).is_err());
     }
 
     // ====================================================================
@@ -1635,11 +1644,11 @@ mod tests {
         sched.init().unwrap();
         assert_eq!(sched.task_count(), 1);
 
-        let task = Task::new(TaskId(3), 0x100000, 0x200000, Priority::NORMAL);
+        let task = Task::new(TaskId::new(3, 0), 0x100000, 0x200000, Priority::NORMAL);
         let tid = sched.accept_task(task).unwrap();
-        assert_eq!(tid, TaskId(3));
+        assert_eq!(tid, TaskId::new(3, 0));
         assert_eq!(sched.task_count(), 2);
-        assert!(sched.get_task_pub(TaskId(3)).is_some());
+        assert!(sched.get_task_pub(TaskId::new(3, 0)).is_some());
     }
 
     #[test]
@@ -1658,7 +1667,7 @@ mod tests {
         let mut sched = Scheduler::new();
         sched.init().unwrap();
 
-        let mut task = Task::new(TaskId(5), 0x100000, 0x200000, Priority::NORMAL);
+        let mut task = Task::new(TaskId::new(5, 0), 0x100000, 0x200000, Priority::NORMAL);
         task.state = TaskState::Running;
         assert!(sched.accept_task(task).is_err());
     }
@@ -1737,7 +1746,7 @@ mod tests {
 
         // Next create should reuse slot 1
         let t3 = sched.create_task(0x300000, 0x400000, Priority::NORMAL).unwrap();
-        assert_eq!(t3, TaskId(1)); // Reused slot 1
+        assert_eq!(t3, TaskId::new(1, 0)); // Reused slot 1
         assert_eq!(sched.task_count(), 3);
     }
 
@@ -1748,7 +1757,7 @@ mod tests {
         let mut dst = Scheduler::new();
         dst.init().unwrap();
 
-        assert!(migrate_task_between(&mut src, &mut dst, TaskId(0), 1).is_err());
+        assert!(migrate_task_between(&mut src, &mut dst, TaskId::new(0, 0), 1).is_err());
     }
 
     #[test]
@@ -1865,7 +1874,7 @@ mod tests {
         sched.init().unwrap();
 
         assert_eq!(
-            sched.arm_quiesce(TaskId(0), QUIESCE_TEST_CHANNEL_ID),
+            sched.arm_quiesce(TaskId::new(0, 0), QUIESCE_TEST_CHANNEL_ID),
             Err(ScheduleError::InvalidTaskState)
         );
     }
@@ -1876,7 +1885,7 @@ mod tests {
         sched.init().unwrap();
 
         assert_eq!(
-            sched.arm_quiesce(TaskId(99), QUIESCE_TEST_CHANNEL_ID),
+            sched.arm_quiesce(TaskId::new(99, 0), QUIESCE_TEST_CHANNEL_ID),
             Err(ScheduleError::TaskNotFound)
         );
     }

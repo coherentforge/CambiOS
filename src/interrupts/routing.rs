@@ -239,7 +239,7 @@ mod tests {
     fn test_routing_table_register() {
         let mut table = InterruptRoutingTable::new();
         let irq = IrqNumber::TIMER;
-        let task_id = TaskId(1);
+        let task_id = TaskId::new(1, 0);
 
         assert!(table.register(irq, task_id, 128).is_ok());
         assert!(table.lookup(irq).is_some());
@@ -250,7 +250,7 @@ mod tests {
     fn test_routing_table_duplicate() {
         let mut table = InterruptRoutingTable::new();
         let irq = IrqNumber::TIMER;
-        let task_id = TaskId(1);
+        let task_id = TaskId::new(1, 0);
 
         assert!(table.register(irq, task_id, 128).is_ok());
         assert_eq!(table.register(irq, task_id, 128), Err(InterruptRoutingError::IrqAlreadyRegistered));
@@ -260,7 +260,7 @@ mod tests {
     fn test_routing_table_unregister() {
         let mut table = InterruptRoutingTable::new();
         let irq = IrqNumber::TIMER;
-        let task_id = TaskId(1);
+        let task_id = TaskId::new(1, 0);
 
         table.register(irq, task_id, 128).unwrap();
         assert_eq!(table.entry_count(), 1);

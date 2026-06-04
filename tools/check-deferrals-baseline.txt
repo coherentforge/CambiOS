@@ -62,6 +62,7 @@ docs/adr/031-unified-storage-substrate.md:24:deferred
 docs/adr/033-multi-principal-vault.md:149:deferred
 docs/adr/034-deferred-task-resource-reclamation.md:11:deferred
 docs/adr/034-deferred-task-resource-reclamation.md:16:deferred
+docs/adr/035-translation-layer-compatibility.md:54:deferred
 docs/identity-synthesis.md:124:deferred
 docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:77:deferred
@@ -89,9 +90,9 @@ src/ipc/capability.rs:727:deferred
 src/ipc/capability.rs:780:TODO
 src/ipc/capability.rs:788:for-now
 src/lib.rs:101:TBD
-src/lib.rs:742:deferred
-src/lib.rs:750:deferred
-src/lib.rs:758:deferred
+src/lib.rs:778:deferred
+src/lib.rs:786:deferred
+src/lib.rs:794:deferred
 src/memory/mod.rs:680:placeholder
 src/memory/mod.rs:689:placeholder
 src/microkernel/main.rs:946:for-now
@@ -109,7 +110,7 @@ src/reaper.rs:41:deferred
 src/reaper.rs:58:deferred
 src/scheduler/mod.rs:281:placeholder
 src/scheduler/mod.rs:282:placeholder
-src/syscalls/dispatcher.rs:4348:for-now
+src/syscalls/dispatcher.rs:4354:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now

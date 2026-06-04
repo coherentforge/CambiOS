@@ -560,7 +560,7 @@ impl SyscallDispatcher {
         crate::println!(
             "  [Exit] pid={} task={} code={} (reclaimed {} cap(s), {} chan(s), {} cluster(s){})",
             ctx.process_id.slot(),
-            ctx.task_id.0,
+            ctx.task_id.slot(),
             exit_code,
             revoked_count,
             channels_revoked,
@@ -714,7 +714,7 @@ impl SyscallDispatcher {
                     } else {
                         crate::policy::DECISION_DENY
                     };
-                    crate::policy::POLICY_DECISIONS[tid.0 as usize]
+                    crate::policy::POLICY_DECISIONS[tid.slot() as usize]
                         .store(val, core::sync::atomic::Ordering::Release);
                     crate::wake_task_on_cpu(tid);
                 }
@@ -2443,7 +2443,7 @@ impl SyscallDispatcher {
             // SAFETY: tp is valid after percpu_init; pure read from per-CPU data.
             { unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() } }
         };
-        crate::set_task_cpu(new_task_id.0, cpu_id as u16);
+        crate::set_task_cpu(new_task_id.slot(), cpu_id as u16);
 
         // Drop all locks before acquiring CAPABILITY_MANAGER(4)
         // Note: CAPABILITY_MANAGER is level 4, lower than SCHEDULER(1), but
@@ -2515,10 +2515,10 @@ impl SyscallDispatcher {
         crate::println!(
             "  [Spawn] '{}' → task {} process {} (parent=task {})",
             core::str::from_utf8(name).unwrap_or("?"),
-            new_task_id.0, process_id.slot(), ctx.task_id.0
+            new_task_id.slot(), process_id.slot(), ctx.task_id.slot()
         );
 
-        Ok(new_task_id.0 as u64)
+        Ok(new_task_id.slot() as u64)
     }
 
     /// SYS_WAIT_TASK: Block until a child task exits.
@@ -2528,7 +2528,13 @@ impl SyscallDispatcher {
     fn handle_wait_task(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         use crate::scheduler::{TaskState, BlockReason};
 
-        let child_id = crate::scheduler::TaskId(args.arg1_u32());
+        // B.1: ABI still carries a bare slot (u32); stamp the slot's current
+        // generation so the generation-validated lookup matches the live task.
+        // B.4 widens this to `TaskId::from_raw(args.arg1())` (the full handle
+        // the parent received from spawn) so a reused slot is detected.
+        let child_slot = args.arg1_u32();
+        let child_id =
+            crate::scheduler::TaskId::new(child_slot, crate::task_generation(child_slot));
 
         // Check the child task's state
         {
@@ -4617,7 +4623,7 @@ mod tests {
     fn fake_ctx() -> SyscallContext {
         SyscallContext {
             process_id: ProcessId::new(7, 1),
-            task_id: TaskId(3),
+            task_id: TaskId::new(3, 0),
             cr3: 0,
             caller_principal: Some(Principal::from_public_key([1u8; 32])),
         }

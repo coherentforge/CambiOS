@@ -144,8 +144,6 @@ src/audit/mod.rs:836:FLAG_SAMPLED
 src/boot/initrd.rs:55:ARCHIVE_VERSION
 src/boot/initrd.rs:58:ARCHIVE_HEADER_SIZE
 src/boot/initrd.rs:61:ENTRY_HEADER_SIZE
-src/boot_modules.rs:12:MAX_MODULES
-src/boot_modules.rs:15:MAX_NAME_LEN
 src/config/tier.rs:117:SLOT_OVERHEAD
 src/fs/disk.rs:109:SB_OFF_MAGIC
 src/fs/disk.rs:110:SB_OFF_VERSION
@@ -278,7 +276,7 @@ src/io/mod.rs:161:NS16550_PHYS_BASE
 src/io/mod.rs:291:UARTFR_RXFE
 src/ipc/channel.rs:45:MAX_CHANNELS
 src/ipc/channel.rs:61:MAX_CHANNEL_PAGES
-src/lib.rs:407:BALANCE_INTERVAL_TICKS
+src/lib.rs:443:BALANCE_INTERVAL_TICKS
 src/loader/elf.rs:15:ELF_CLASS_64BIT
 src/loader/elf.rs:16:ELF_DATA_LITTLE_ENDIAN
 src/loader/elf.rs:17:ELF_TYPE_EXECUTABLE

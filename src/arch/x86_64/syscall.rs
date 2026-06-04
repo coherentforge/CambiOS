@@ -251,7 +251,7 @@ extern "C" fn syscall_handler_inner(frame: *const SyscallFrame) -> i64 {
         match sched.as_ref().and_then(|s| {
             let tid = s.current_task()?;
             let task = s.current_task_ref()?;
-            let pid = task.process_id.unwrap_or(ProcessId::new(tid.0, 0));
+            let pid = task.process_id.unwrap_or(ProcessId::new(tid.slot(), 0));
             Some((tid, pid, task.cr3))
         }) {
             Some(info) => info,

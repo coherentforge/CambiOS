@@ -439,7 +439,7 @@ mod tests {
     fn test_ctx(cr3: u64) -> SyscallContext {
         SyscallContext {
             process_id: ProcessId::new(1, 0),
-            task_id: TaskId(1),
+            task_id: TaskId::new(1, 0),
             cr3,
             caller_principal: Some(Principal::from_public_key([0u8; 32])),
         }

@@ -282,9 +282,9 @@ mod tests {
     #[test]
     fn test_boot_order_push_grows_len() {
         let mut order = BootModuleOrder::new();
-        assert!(order.push(TaskId(1)));
-        assert!(order.push(TaskId(2)));
-        assert!(order.push(TaskId(3)));
+        assert!(order.push(TaskId::new(1, 0)));
+        assert!(order.push(TaskId::new(2, 0)));
+        assert!(order.push(TaskId::new(3, 0)));
         assert_eq!(order.len(), 3);
     }
 
@@ -292,26 +292,26 @@ mod tests {
     fn test_boot_order_push_fills_to_capacity() {
         let mut order = BootModuleOrder::new();
         for i in 0..MAX_MODULES as u32 {
-            assert!(order.push(TaskId(i)));
+            assert!(order.push(TaskId::new(i, 0)));
         }
         assert_eq!(order.len(), MAX_MODULES);
         // Overflow pushed entries must be refused.
-        assert!(!order.push(TaskId(999)));
+        assert!(!order.push(TaskId::new(999, 0)));
         assert_eq!(order.len(), MAX_MODULES);
     }
 
     #[test]
     fn test_boot_order_advance_walks_chain() {
         let mut order = BootModuleOrder::new();
-        order.push(TaskId(10));  // module 0
-        order.push(TaskId(20));  // module 1
-        order.push(TaskId(30));  // module 2
+        order.push(TaskId::new(10, 0));  // module 0
+        order.push(TaskId::new(20, 0));  // module 1
+        order.push(TaskId::new(30, 0));  // module 2
 
         // Initial cursor is 1: module 0 runs first without any advance().
         // First advance returns module 1 (TaskId(20)).
-        assert_eq!(order.advance(), Some(TaskId(20)));
+        assert_eq!(order.advance(), Some(TaskId::new(20, 0)));
         // Second advance returns module 2 (TaskId(30)).
-        assert_eq!(order.advance(), Some(TaskId(30)));
+        assert_eq!(order.advance(), Some(TaskId::new(30, 0)));
         // Third advance: chain complete.
         assert_eq!(order.advance(), None);
         // Repeated advances past the end stay None — idempotent.
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn test_boot_order_single_module_has_no_chain_work() {
         let mut order = BootModuleOrder::new();
-        order.push(TaskId(5));
+        order.push(TaskId::new(5, 0));
         // len == 1, cursor starts at 1, so advance() returns None
         // immediately — there's nothing after module 0 to release.
         assert_eq!(order.advance(), None);

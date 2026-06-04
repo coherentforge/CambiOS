@@ -575,7 +575,7 @@ unsafe extern "C" fn kmain() -> ! {
         if let Some(sched) = guard.as_ref() {
             // Find the first Ready task with a non-zero kernel_stack_top
             for slot in 1..cambios_core::MAX_TASKS as u32 {
-                if let Some(task) = sched.get_task_pub(TaskId(slot)) {
+                if let Some(task) = sched.get_task_pub(TaskId::new(slot, cambios_core::task_generation(slot))) {
                     if task.kernel_stack_top != 0 {
                         // SAFETY: BSP percpu is initialized, interrupts may be
                         // enabled but we're the only code path accessing kernel_rsp0
@@ -945,7 +945,7 @@ fn scheduler_init_riscv64() {
     // Register every freshly-loaded task in the global task→CPU map
     // (everything on hart 0 for now; later passes migrate).
     for slot in 0..cambios_core::MAX_TASKS as u32 {
-        if scheduler.get_task_pub(TaskId(slot)).is_some() {
+        if scheduler.get_task_pub(TaskId::new(slot, cambios_core::task_generation(slot))).is_some() {
             cambios_core::set_task_cpu(slot, 0);
         }
     }
@@ -1499,7 +1499,7 @@ fn scheduler_init() {
 
     // Register all initial tasks in the global task→CPU map (all on CPU 0)
     for slot in 0..cambios_core::MAX_TASKS as u32 {
-        if scheduler.get_task_pub(TaskId(slot)).is_some() {
+        if scheduler.get_task_pub(TaskId::new(slot, cambios_core::task_generation(slot))).is_some() {
             cambios_core::set_task_cpu(slot, 0);
         }
     }
@@ -1787,7 +1787,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
-                    result.task_id.0, result.process_id.slot(), result.entry_point
+                    result.task_id.slot(), result.process_id.slot(), result.entry_point
                 );
 
                 // Sequential boot-release chain: append this task to the
@@ -2312,7 +2312,7 @@ fn distribute_tasks_to_aps() {
         if let Some(sched) = guard.as_ref() {
             // Tasks 1..N that are Ready (not Running or Blocked on hardware)
             for slot in 1..cambios_core::MAX_TASKS as u32 {
-                let tid = TaskId(slot);
+                let tid = TaskId::new(slot, cambios_core::task_generation(slot));
                 if let Some(task) = sched.get_task_pub(tid) {
                     if task.state == cambios_core::scheduler::TaskState::Ready {
                         migratable[count] = Some(tid);

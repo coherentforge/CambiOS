@@ -8,13 +8,68 @@
 use core::fmt;
 use crate::ipc::ProcessId;
 
-/// Task/Process ID
+/// Task identity: a global slot index packed with a reuse generation.
+///
+/// Layout mirrors [`crate::ipc::ProcessId`]: slot in the low 32 bits,
+/// generation in the high 32 bits of a `u64`. The slot is a *global*
+/// namespace (the same index on any CPU refers to the same logical task —
+/// migration preserves it, see `Scheduler::accept_task`), tracked by the
+/// global `TASK_CPU_MAP` / `TASK_GENERATION` arrays in `lib.rs`. The
+/// generation is bumped only when a dead task's slot is reclaimed (ADR-034
+/// Phase B), so a stale `TaskId` whose slot was reused is detectable by a
+/// generation mismatch rather than silently resolving to the new occupant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TaskId(pub u32);
+pub struct TaskId(u64);
+
+impl TaskId {
+    /// The idle task — slot 0, generation 0. Slot 0 is never reclaimed
+    /// (the idle task is immutable per the scheduler invariants), so its
+    /// generation is always 0.
+    pub const IDLE: TaskId = TaskId::new(0, 0);
+
+    /// Construct from a slot index and reuse generation.
+    #[inline]
+    pub const fn new(slot: u32, generation: u32) -> Self {
+        TaskId((slot as u64) | ((generation as u64) << 32))
+    }
+
+    /// Slot index — the array index into per-CPU `tasks[]`, `TASK_CPU_MAP`,
+    /// and `TASK_GENERATION`.
+    #[inline]
+    pub const fn slot(&self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Reuse generation (incremented on slot reclaim).
+    #[inline]
+    pub const fn generation(&self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Raw packed `u64` — the wire form crossing the syscall boundary
+    /// (spawn returns it, wait_task takes it).
+    #[inline]
+    pub const fn as_raw(&self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct from the raw packed `u64` (syscall boundary).
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        TaskId(raw)
+    }
+
+    /// Whether this is the idle task (slot 0). Idle-task guards are
+    /// slot-based: slot 0 is the idle task on every CPU.
+    #[inline]
+    pub const fn is_idle(&self) -> bool {
+        self.slot() == 0
+    }
+}
 
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Task({})", self.0)
+        write!(f, "Task({}:{})", self.slot(), self.generation())
     }
 }
 

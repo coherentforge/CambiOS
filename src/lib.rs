@@ -235,6 +235,42 @@ pub fn get_task_cpu(task_id: u32) -> Option<u16> {
     }
 }
 
+/// Global per-slot reuse generation (ADR-034 Phase B), indexed by task
+/// *slot* — the same global namespace as `TASK_CPU_MAP`. Bumped only when a
+/// dead task's slot is reclaimed by the reaper, never on migration (which
+/// preserves the slot and the full `TaskId`). A `TaskId` carries the
+/// generation it was stamped with at creation; a stale id whose slot was
+/// reused mismatches the live task's generation and resolves to `None`
+/// instead of the new occupant (the `SYS_WAIT_TASK` use-after-free fix).
+/// Mirrors `ProcessTable.generations` for processes.
+pub static TASK_GENERATION: [AtomicU32; MAX_TASKS] =
+    [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// Read the current reuse generation for a task slot. Out-of-range slots
+/// report generation 0 (they can never match a live task).
+pub fn task_generation(slot: u32) -> u32 {
+    if (slot as usize) < MAX_TASKS {
+        TASK_GENERATION[slot as usize].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Bump a slot's generation on reclaim; returns the new generation. Called
+/// by the reaper when it frees a dead task's slot, so the next occupant of
+/// the slot gets a distinct `TaskId`. Wrapping is intentional — `u32` gives
+/// ~4 billion reuses per slot before wrap (far beyond any boot lifetime).
+pub fn bump_task_generation(slot: u32) -> u32 {
+    if (slot as usize) < MAX_TASKS {
+        // fetch_add returns the previous value; the new generation is +1.
+        TASK_GENERATION[slot as usize]
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    } else {
+        0
+    }
+}
+
 /// Wake a task by ID, looking up its owning CPU automatically.
 ///
 /// This is the correct cross-CPU wake primitive. It reads TASK_CPU_MAP
@@ -243,7 +279,7 @@ pub fn get_task_cpu(task_id: u32) -> Option<u16> {
 /// Returns `true` if the task was successfully woken.
 #[cfg(not(test))]
 pub fn wake_task_on_cpu(task_id: scheduler::TaskId) -> bool {
-    let cpu = match get_task_cpu(task_id.0) {
+    let cpu = match get_task_cpu(task_id.slot()) {
         Some(c) => c as usize,
         None => return false,
     };

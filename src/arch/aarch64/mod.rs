@@ -714,7 +714,7 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
     if let Some(task_id) = crate::terminate_current_task() {
         crate::println!(
             "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
-            task_id.0, ec_name, fault_type, access, far, elr, dfsc
+            task_id.slot(), ec_name, fault_type, access, far, elr, dfsc
         );
         // Yield away immediately. The task is Terminated and will never be
         // re-scheduled, so this loop does not return. Without this, the
@@ -982,7 +982,7 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
         match sched.as_ref().and_then(|s| {
             let tid = s.current_task()?;
             let task = s.current_task_ref()?;
-            let pid = task.process_id.unwrap_or(ProcessId::new(tid.0 as u32, 0));
+            let pid = task.process_id.unwrap_or(ProcessId::new(tid.slot(), 0));
             Some((tid, pid, task.cr3))
         }) {
             Some(info) => info,

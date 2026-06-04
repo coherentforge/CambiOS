@@ -96,7 +96,7 @@ pub mod exceptions {
             if let Some(task_id) = crate::terminate_current_task() {
                 crate::println!(
                     "  [DivZero] Task {} killed: RIP={:#x}",
-                    task_id.0, stack_frame.instruction_pointer.as_u64()
+                    task_id.slot(), stack_frame.instruction_pointer.as_u64()
                 );
                 // Yield away immediately — without this, iretq returns to
                 // the faulting instruction and re-faults at hardware speed.
@@ -131,7 +131,7 @@ pub mod exceptions {
             if let Some(task_id) = crate::terminate_current_task() {
                 crate::println!(
                     "  [GPF] Task {} killed: code={:#x} RIP={:#x}",
-                    task_id.0, error_code, stack_frame.instruction_pointer.as_u64()
+                    task_id.slot(), error_code, stack_frame.instruction_pointer.as_u64()
                 );
                 // Yield away immediately — without this, iretq returns to
                 // the faulting instruction and re-faults at hardware speed.
@@ -180,7 +180,7 @@ pub mod exceptions {
             if let Some(task_id) = crate::terminate_current_task() {
                 crate::println!(
                     "  [PageFault] Task {} killed: {} {} at {:#x} (RIP={:#x})",
-                    task_id.0, fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
+                    task_id.slot(), fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
                 );
                 // Yield away immediately — without this, iretq returns to
                 // the faulting instruction and re-faults at hardware speed.
@@ -203,7 +203,7 @@ pub mod exceptions {
             // SAFETY: GS base is initialized during boot (BSP and AP).
             let cpu_id = unsafe { crate::arch::percpu::current_cpu_id() };
             let task_id = crate::local_scheduler().try_lock().and_then(|guard| {
-                guard.as_ref().and_then(|s| s.current_task().map(|t| t.0))
+                guard.as_ref().and_then(|s| s.current_task().map(|t| t.slot()))
             });
 
             crate::println!(
@@ -263,7 +263,7 @@ pub mod device_irqs {
             if let Some(route) = router_guard.lookup(irq) {
                 let task_id = route.handler_task;
                 drop(router_guard);
-                if let Some(cpu) = crate::get_task_cpu(task_id.0) {
+                if let Some(cpu) = crate::get_task_cpu(task_id.slot()) {
                     let cpu = cpu as usize;
                     if let Some(mut sched_guard) = crate::PER_CPU_SCHEDULER[cpu].try_lock() {
                         if let Some(sched) = sched_guard.as_mut() {

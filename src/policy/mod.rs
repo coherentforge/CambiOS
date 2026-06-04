@@ -539,7 +539,7 @@ pub fn policy_check(
 
     // --- Woken: read decision from POLICY_DECISIONS ---
 
-    let decision_val = POLICY_DECISIONS[task_id.0 as usize].swap(DECISION_NONE, Ordering::Acquire);
+    let decision_val = POLICY_DECISIONS[task_id.slot() as usize].swap(DECISION_NONE, Ordering::Acquire);
     let allowed = decision_val != DECISION_DENY; // 0 (timeout) and 1 (Allow) → Allow
 
     // Cache the result
@@ -604,7 +604,7 @@ pub fn expire_pending_queries() {
     for entry in expired.iter().take(count) {
         if let Some(tid) = *entry {
             // No decision stored → DECISION_NONE (0) → fail-open Allow
-            POLICY_DECISIONS[tid.0 as usize].store(DECISION_NONE, Ordering::Release);
+            POLICY_DECISIONS[tid.slot() as usize].store(DECISION_NONE, Ordering::Release);
             crate::wake_task_on_cpu(tid);
         }
     }
@@ -623,12 +623,12 @@ mod tests {
     #[test]
     fn test_router_submit_and_complete() {
         let mut router = PolicyRouter::new();
-        let qid = router.submit_query(TaskId(5), 100).unwrap();
+        let qid = router.submit_query(TaskId::new(5, 0), 100).unwrap();
         assert_eq!(qid, 1);
         assert_eq!(router.pending_count(), 1);
 
         let tid = router.complete_query(qid);
-        assert_eq!(tid, Some(TaskId(5)));
+        assert_eq!(tid, Some(TaskId::new(5, 0)));
         assert_eq!(router.pending_count(), 0);
     }
 
@@ -641,9 +641,9 @@ mod tests {
     #[test]
     fn test_router_monotonic_query_ids() {
         let mut router = PolicyRouter::new();
-        let q1 = router.submit_query(TaskId(1), 0).unwrap();
-        let q2 = router.submit_query(TaskId(2), 0).unwrap();
-        let q3 = router.submit_query(TaskId(3), 0).unwrap();
+        let q1 = router.submit_query(TaskId::new(1, 0), 0).unwrap();
+        let q2 = router.submit_query(TaskId::new(2, 0), 0).unwrap();
+        let q3 = router.submit_query(TaskId::new(3, 0), 0).unwrap();
         assert!(q1 < q2);
         assert!(q2 < q3);
     }
@@ -652,10 +652,10 @@ mod tests {
     fn test_router_capacity_full() {
         let mut router = PolicyRouter::new();
         for i in 0..MAX_PENDING_QUERIES as u32 {
-            assert!(router.submit_query(TaskId(i), 0).is_some());
+            assert!(router.submit_query(TaskId::new(i, 0), 0).is_some());
         }
         // Table is full — next submit fails
-        assert!(router.submit_query(TaskId(99), 0).is_none());
+        assert!(router.submit_query(TaskId::new(99, 0), 0).is_none());
     }
 
     #[test]
@@ -664,41 +664,41 @@ mod tests {
         // Fill the table
         let mut qids = [0u64; MAX_PENDING_QUERIES];
         for i in 0..MAX_PENDING_QUERIES {
-            qids[i] = router.submit_query(TaskId(i as u32), 0).unwrap();
+            qids[i] = router.submit_query(TaskId::new(i as u32, 0), 0).unwrap();
         }
         // Full
-        assert!(router.submit_query(TaskId(99), 0).is_none());
+        assert!(router.submit_query(TaskId::new(99, 0), 0).is_none());
 
         // Complete one — frees a slot
         router.complete_query(qids[0]);
-        assert!(router.submit_query(TaskId(99), 0).is_some());
+        assert!(router.submit_query(TaskId::new(99, 0), 0).is_some());
     }
 
     #[test]
     fn test_router_expire_stale() {
         let mut router = PolicyRouter::new();
-        let _q1 = router.submit_query(TaskId(1), 10).unwrap();
-        let _q2 = router.submit_query(TaskId(2), 90).unwrap();
-        let _q3 = router.submit_query(TaskId(3), 250).unwrap();
+        let _q1 = router.submit_query(TaskId::new(1, 0), 10).unwrap();
+        let _q2 = router.submit_query(TaskId::new(2, 0), 90).unwrap();
+        let _q3 = router.submit_query(TaskId::new(3, 0), 250).unwrap();
 
         // Expire at tick 150 with timeout 100 — q1 (submitted at 10, age 140) is stale;
         // q2 (submitted at 90, age 60) and q3 (submitted at 250, future) are not.
         let (expired, count) = router.expire_stale(150, 100);
         assert_eq!(count, 1);
-        assert_eq!(expired[0], Some(TaskId(1)));
+        assert_eq!(expired[0], Some(TaskId::new(1, 0)));
         assert_eq!(router.pending_count(), 2);
 
         // Expire at tick 300 — q2 (submitted at 90, age 210) is now stale
         let (expired, count) = router.expire_stale(300, 100);
         assert_eq!(count, 1);
-        assert_eq!(expired[0], Some(TaskId(2)));
+        assert_eq!(expired[0], Some(TaskId::new(2, 0)));
         assert_eq!(router.pending_count(), 1);
     }
 
     #[test]
     fn test_router_expire_none_stale() {
         let mut router = PolicyRouter::new();
-        let _q1 = router.submit_query(TaskId(1), 100).unwrap();
+        let _q1 = router.submit_query(TaskId::new(1, 0), 100).unwrap();
 
         // Check at tick 150 with timeout 100 — not yet expired
         let (_, count) = router.expire_stale(150, 100);
