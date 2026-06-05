@@ -735,6 +735,12 @@ pub struct RecentExitsRing {
     write_idx: usize,
 }
 
+impl Default for RecentExitsRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecentExitsRing {
     pub const fn new() -> Self {
         Self {
@@ -753,11 +759,9 @@ impl RecentExitsRing {
     /// was bound at exit time, or `None` if the (slot, generation) pair
     /// is not in the ring (either never recorded or already overwritten).
     pub fn lookup(&self, slot: u32, generation: u32) -> Option<crate::ipc::Principal> {
-        for entry in self.entries.iter() {
-            if let Some(rx) = entry {
-                if rx.slot == slot && rx.generation == generation {
-                    return Some(rx.principal);
-                }
+        for rx in self.entries.iter().flatten() {
+            if rx.slot == slot && rx.generation == generation {
+                return Some(rx.principal);
             }
         }
         None
@@ -924,9 +928,7 @@ impl ProcessTable {
         }
         // Generation match implies the same incarnation; confirm occupancy
         // (a freed-but-not-yet-reused slot carries no descriptor).
-        if self.processes[idx].is_none() {
-            return None;
-        }
+        self.processes[idx].as_ref()?;
         Some(idx)
     }
 

@@ -1472,8 +1472,8 @@ fn encode_acl_change(c: &AclChange, is_grant: bool, out: &mut Vec<u8>) {
 }
 
 /// Decode one journal record from the start of `buf`. Returns the
-/// decoded record and the number of bytes consumed (header + payload
-/// + checksum). The caller advances its cursor by the returned byte
+/// decoded record and the number of bytes consumed (header + payload +
+/// checksum). The caller advances its cursor by the returned byte
 /// count to read the next record.
 ///
 /// Errors:

@@ -588,7 +588,7 @@ fn pick_format_geometry(
     if dev_blocks < 1 + 2 + 1 + JOURNAL_BLOCKS + 1 {
         return Err(StoreError::InvalidObject);
     }
-    let capacity_slots = desired_capacity_slots.min(MAX_OBJECTS_ON_DISK).max(1);
+    let capacity_slots = desired_capacity_slots.clamp(1, MAX_OBJECTS_ON_DISK);
     let used_by_slots = 1 + 2 * capacity_slots + JOURNAL_BLOCKS;
     if used_by_slots + 2 > dev_blocks {
         // Need at least 1 bitmap block + 1 data block remaining.
@@ -1015,8 +1015,8 @@ impl<B: BlockDevice> DiskObjectStore<B> {
     /// "I know this device is supposed to have valid substrate
     /// state; if it doesn't, fail loud" variant.
     ///
-    /// The FDE first-mount path uses this: after [`OffsetBlockDevice`]
-    /// + [`crate::fs::crypto::encrypted_device::EncryptedBlockDevice`]
+    /// The FDE first-mount path uses this: after [`OffsetBlockDevice`] +
+    /// [`crate::fs::crypto::encrypted_device::EncryptedBlockDevice`]
     /// wrapping, the kernel checks the underlying disk's raw bytes
     /// at the substrate's data offset *before* wrapping. If those
     /// bytes are all zero, the volume is fresh-wrapped (never
@@ -1085,12 +1085,9 @@ impl<B: BlockDevice> DiskObjectStore<B> {
         if dev_blocks < min_required {
             return Err(StoreError::InvalidObject);
         }
-        let capacity_slots = desired_capacity_slots
-            .min(MAX_OBJECTS_ON_DISK)
-            .max(1);
-        let capacity_data_blocks = desired_capacity_data_blocks
-            .min(MAX_DATA_BLOCKS_ON_DISK)
-            .max(1);
+        let capacity_slots = desired_capacity_slots.clamp(1, MAX_OBJECTS_ON_DISK);
+        let capacity_data_blocks =
+            desired_capacity_data_blocks.clamp(1, MAX_DATA_BLOCKS_ON_DISK);
         if total_blocks_for_capacity(capacity_slots, capacity_data_blocks) > dev_blocks {
             return Err(StoreError::InvalidObject);
         }
@@ -1688,13 +1685,11 @@ impl<B: BlockDevice> ObjectStore for DiskObjectStore<B> {
             let data_region_lba = self.superblock.data_region_lba;
             let mut freed_blocks: Vec<u64> = Vec::new();
             let mut mutations: Vec<crate::fs::journal::BitmapMutation> = Vec::new();
-            for slot_opt in header.extents.iter() {
-                if let Some(extent) = slot_opt {
-                    for j in 0..extent.block_count as u64 {
-                        let block = extent.start_lba + j - data_region_lba;
-                        freed_blocks.push(block);
-                        mutations.push(crate::fs::journal::BitmapMutation::Clear(block));
-                    }
+            for extent in header.extents.iter().flatten() {
+                for j in 0..extent.block_count as u64 {
+                    let block = extent.start_lba + j - data_region_lba;
+                    freed_blocks.push(block);
+                    mutations.push(crate::fs::journal::BitmapMutation::Clear(block));
                 }
             }
             if !mutations.is_empty() {

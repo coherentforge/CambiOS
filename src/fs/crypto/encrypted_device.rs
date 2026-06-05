@@ -87,7 +87,7 @@ const XTS_INNER_BLOCK_LEN: usize = AES_BLOCK_LEN;
 const XTS_BLOCKS_PER_SECTOR: usize = BLOCK_SIZE / XTS_INNER_BLOCK_LEN;
 
 // Static check: confirm BLOCK_SIZE divides evenly.
-const _: () = assert!(BLOCK_SIZE % XTS_INNER_BLOCK_LEN == 0);
+const _: () = assert!(BLOCK_SIZE.is_multiple_of(XTS_INNER_BLOCK_LEN));
 const _: () = assert!(XTS_BLOCKS_PER_SECTOR == 256);
 
 /// XTS-AES-256 cipher state — the two AES-256 instances K1 (data)
@@ -152,7 +152,7 @@ impl XtsAes256 {
     /// runtime check on attacker-controlled input.
     pub fn encrypt_data_unit(&self, buf: &mut [u8], tweak: [u8; XTS_INNER_BLOCK_LEN]) {
         assert!(
-            !buf.is_empty() && buf.len() % XTS_INNER_BLOCK_LEN == 0,
+            !buf.is_empty() && buf.len().is_multiple_of(XTS_INNER_BLOCK_LEN),
             "XTS data-unit length must be a non-zero multiple of AES block size"
         );
 
@@ -180,7 +180,7 @@ impl XtsAes256 {
     /// applied in place of K1 forward.
     pub fn decrypt_data_unit(&self, buf: &mut [u8], tweak: [u8; XTS_INNER_BLOCK_LEN]) {
         assert!(
-            !buf.is_empty() && buf.len() % XTS_INNER_BLOCK_LEN == 0,
+            !buf.is_empty() && buf.len().is_multiple_of(XTS_INNER_BLOCK_LEN),
             "XTS data-unit length must be a non-zero multiple of AES block size"
         );
 

@@ -499,8 +499,7 @@ impl SyscallDispatcher {
                             if let Some(member) = member_slot.as_ref() {
                                 if member.state == MemberState::Departed
                                     && member.joined_pid == Some(ctx.process_id)
-                                {
-                                    if matches!(
+                                    && matches!(
                                         crate::ipc::cluster_policy::on_member_depart(
                                             record.policy,
                                             member.role,
@@ -510,7 +509,6 @@ impl SyscallDispatcher {
                                         to_revoke.push(id);
                                         break; // one revoke per cluster
                                     }
-                                }
                             }
                         }
                     }
@@ -3159,8 +3157,8 @@ impl SyscallDispatcher {
     /// Args: arg1 = channel_id (u64), arg2 = TeardownKind low byte
     /// (0 = Close, 1 = Revoke).
     ///
-    /// Lock ordering: CHANNEL_MANAGER(6) → (drop) → PROCESS_TABLE(7)
-    /// + FRAME_ALLOCATOR(8) inside `teardown_channel_mappings`, then
+    /// Lock ordering: CHANNEL_MANAGER(6) → (drop) → PROCESS_TABLE(7) +
+    /// FRAME_ALLOCATOR(8) inside `teardown_channel_mappings`, then
     /// `wake_quiesce_for_channel` walks PER_CPU_SCHEDULER(1) (helper
     /// never holds it with anything else). Identical lock sequence
     /// to `handle_channel_close` plus the wake walk at the end.
@@ -3885,7 +3883,7 @@ impl SyscallDispatcher {
         let header_ptr = args.arg1;
         let header_len = args.arg_usize(2);
 
-        if header_len < HEADER_MIN_LEN || header_len > HEADER_MAX_LEN {
+        if !(HEADER_MIN_LEN..=HEADER_MAX_LEN).contains(&header_len) {
             return Err(SyscallError::InvalidArg);
         }
         if ctx.cr3 == 0 {
@@ -4060,8 +4058,8 @@ impl SyscallDispatcher {
     /// Master key hygiene: copied once from userspace into a
     /// kernel stack buffer; consumed by `EncryptedBlockDevice::new`
     /// (which materializes the AES round-key schedules);
-    /// explicitly zeroed via `core::sync::atomic::compiler_fence`
-    /// + volatile write before the function returns. The plaintext
+    /// explicitly zeroed via `core::sync::atomic::compiler_fence` +
+    /// volatile write before the function returns. The plaintext
     /// master never lives in any persistent kernel slot.
     #[cfg(not(test))]
     fn handle_install_master_key(
@@ -4272,18 +4270,16 @@ impl SyscallDispatcher {
         };
 
         // Step 2: per-channel teardown.
-        for ch_slot in snapshot.channels.iter() {
-            if let Some(channel_id) = ch_slot {
-                let record = {
-                    let mut chan_guard = crate::CHANNEL_MANAGER.lock();
-                    match chan_guard.as_mut() {
-                        Some(chan_mgr) => chan_mgr.revoke(*channel_id).ok(),
-                        None => None,
-                    }
-                };
-                if let Some(record) = record {
-                    Self::teardown_channel_mappings(&record);
+        for channel_id in snapshot.channels.iter().flatten() {
+            let record = {
+                let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+                match chan_guard.as_mut() {
+                    Some(chan_mgr) => chan_mgr.revoke(*channel_id).ok(),
+                    None => None,
                 }
+            };
+            if let Some(record) = record {
+                Self::teardown_channel_mappings(&record);
             }
         }
 

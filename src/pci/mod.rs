@@ -747,7 +747,7 @@ pub fn parse_virtio_modern_caps(cfg: &[u8]) -> VirtioModernCaps {
         // Standard config space is 256 bytes; reject pointers into the
         // device-header region (<0x40) or past the end.
         let p = cap_ptr as usize;
-        if p < 0x40 || p >= PCI_CONFIG_SPACE_SIZE {
+        if !(0x40..PCI_CONFIG_SPACE_SIZE).contains(&p) {
             break;
         }
 

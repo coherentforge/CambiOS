@@ -454,11 +454,9 @@ impl ClusterManager {
     /// (returns `RoleNotInPolicy` on the first mismatch). Finds a free
     /// table slot, writes the record, returns the `ClusterId`.
     pub fn create(&mut self, params: ClusterCreateParams) -> Result<ClusterId, ClusterError> {
-        for slot in params.expected_members.iter() {
-            if let Some((_, role)) = slot {
-                if !params.policy.role_is_valid(*role) {
-                    return Err(ClusterError::RoleNotInPolicy);
-                }
+        for (_, role) in params.expected_members.iter().flatten() {
+            if !params.policy.role_is_valid(*role) {
+                return Err(ClusterError::RoleNotInPolicy);
             }
         }
 

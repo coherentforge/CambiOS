@@ -174,9 +174,9 @@ pub trait BinaryVerifier {
 /// 2. All segments are in user space (below canonical hole)
 /// 3. W^X: no segment is both writable and executable
 /// 4. No overlapping segments (byte-level intersection)
-/// 4a. No page-level permission conflict between segments (two segments
-///     sharing a 4 KiB page with different perms — T-5 in
-///     docs/threat-model.md)
+///    - No page-level permission conflict between two segments
+///      sharing a 4 KiB page with different perms (4a; T-5 in
+///      docs/threat-model.md)
 /// 5. Total memory footprint within limit
 pub struct DefaultVerifier {
     /// Maximum allowed total memory (bytes)
