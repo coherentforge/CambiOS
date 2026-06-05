@@ -43,5 +43,5 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 031 | [Unified Storage Substrate](031-unified-storage-substrate.md) | Proposed | 2026-05-17 |
 | 032 | [Full-Disk Encryption Below the Substrate](032-full-disk-encryption-below-substrate.md) | Proposed | 2026-05-17 |
 | 033 | [Multi-Principal Vault](033-multi-principal-vault.md) | Accepted | 2026-05-27 |
-| 034 | [Deferred Reclamation of a Terminating Task's Self-Referential Resources](034-deferred-task-resource-reclamation.md) | Proposed | 2026-06-03 |
+| 034 | [Deferred Reclamation of a Terminating Task's Self-Referential Resources](034-deferred-task-resource-reclamation.md) | Accepted | 2026-06-03 |
 | 035 | [Translation-Layer Compatibility — Interop with ToIP / FPP / KERI via the Vault](035-translation-layer-compatibility.md) | Proposed | 2026-06-04 |
