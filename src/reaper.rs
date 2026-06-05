@@ -36,6 +36,8 @@
 
 extern crate alloc;
 
+// Only `free_kernel_stack` (kernel-only, `cfg(not(test))`) uses Layout.
+#[cfg(not(test))]
 use core::alloc::Layout;
 
 /// One deferred-reclamation work item: the self-referential resources of a
@@ -53,6 +55,11 @@ pub struct ReclaimItem {
     /// stored in `Task::kernel_stack_top`. `0` means the task ran on the boot
     /// stack (the idle task) and there is nothing to free.
     pub kstack_top: u64,
+    /// The terminated task whose scheduler slot is to be reclaimed (ADR-034
+    /// Phase B). Carries the full `(slot, generation)` so the reaper frees the
+    /// slot only if it still holds that exact dead task, then bumps the slot's
+    /// generation so the next occupant gets a distinct `TaskId`.
+    pub task_id: crate::scheduler::TaskId,
 }
 
 /// SCAFFOLDING: depth of each per-CPU deferred-reclaim queue. Tracks
@@ -81,7 +88,11 @@ impl ReclaimQueue {
     /// `static` initialized with `[const { IrqSpinlock::new(...) }; MAX_CPUS]`.
     pub const fn new() -> Self {
         Self {
-            items: [ReclaimItem { root_phys: 0, kstack_top: 0 }; RECLAIM_QUEUE_CAPACITY],
+            items: [ReclaimItem {
+                root_phys: 0,
+                kstack_top: 0,
+                task_id: crate::scheduler::TaskId::IDLE,
+            }; RECLAIM_QUEUE_CAPACITY],
             len: 0,
         }
     }
@@ -134,7 +145,12 @@ impl Default for ReclaimQueue {
 /// Lock discipline (ADR-034 §3): pop under the queue lock **alone**, release
 /// it, then take `FRAME_ALLOCATOR(8)` for the frame frees — never nested. The
 /// kernel-stack free goes through the global allocator (a distinct lock),
-/// taken only after `FRAME_ALLOCATOR` is released.
+/// taken only after `FRAME_ALLOCATOR` is released. The slot free takes the
+/// local `SCHEDULER(1)` last, also un-nested with the others.
+///
+/// The slot lives in *this* CPU's scheduler: the dying task enqueued to its
+/// own CPU's queue, and a Terminated+purged task cannot migrate, so the slot
+/// is local to the reaper. No foreign-`SCHEDULER` acquisition (ADR-034 §3).
 ///
 /// Bounded: the loop runs at most `RECLAIM_QUEUE_CAPACITY` times per call
 /// (the queue cannot grow while we drain it on this CPU — the only pusher is a
@@ -165,6 +181,21 @@ pub fn drain_local() {
         // Free the kernel stack the task stood on (FRAME_ALLOCATOR released).
         if item.kstack_top != 0 {
             free_kernel_stack(item.kstack_top);
+        }
+
+        // Reclaim the scheduler slot (ADR-034 Phase B) and bump the slot's
+        // generation so the next occupant gets a distinct TaskId. Both happen
+        // under the local SCHEDULER lock so no create on this CPU can grab the
+        // freed slot with the stale generation in between. `reap_slot`
+        // validates the slot still holds that exact Terminated task, so a
+        // double-drain or a racing reuse is a no-op rather than a corruption.
+        if !item.task_id.is_idle() {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_mut() {
+                if sched.reap_slot(item.task_id) {
+                    crate::bump_task_generation(item.task_id.slot());
+                }
+            }
         }
     }
 }

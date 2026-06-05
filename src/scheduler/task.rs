@@ -73,6 +73,81 @@ impl fmt::Display for TaskId {
     }
 }
 
+/// SCAFFOLDING: retained recently-exited tasks for `SYS_WAIT_TASK` (ADR-034
+/// Phase B). Mirrors `RECENT_EXITS_RING_SIZE = 64`.
+/// Why: a parent reads a child's exit code by `(slot, generation)` *after* the
+///      reaper freed the slot, so the code must outlive it. 64 covers a parent
+///      waking within 64 subsequent exits (shell-waits-on-a-game resolves in
+///      one); a slower waiter ages out to a typed not-found (ADR-034 Residual
+///      Risks), never a wrong code (generation-keyed). Cost ≈ 1.5 KiB `.bss`.
+/// Replace when: a workload routinely has >64 exits between a child's exit and
+///      its parent's wait (a supervisor reaping a burst); size to its fan-out.
+pub const TASK_EXIT_RING_SIZE: usize = 64;
+
+/// One latched task exit: enough for `SYS_WAIT_TASK` to return the code and
+/// authorize the caller after the task's slot is gone.
+#[derive(Clone, Copy)]
+struct TaskExit {
+    slot: u32,
+    generation: u32,
+    exit_code: i32,
+    /// Parent at exit time — only this task may collect the code.
+    parent: Option<TaskId>,
+}
+
+/// Bounded ring of recently-exited tasks' statuses (ADR-034 Phase B).
+///
+/// Mirrors `RecentExitsRing` (which retains a dead *process*'s Principal):
+/// `record` latches a task's `(slot, generation, exit_code, parent)` during
+/// its exit — before the reaper frees the slot or bumps the generation — and
+/// `lookup` returns the code keyed by the exact `(slot, generation)`. A stale
+/// `TaskId` whose slot was reused mismatches the generation and gets `None`
+/// (not the new occupant's code); a waiter slower than the ring's wrap also
+/// gets `None` (typed not-found, the documented age-out contract).
+pub struct TaskExitRing {
+    entries: [Option<TaskExit>; TASK_EXIT_RING_SIZE],
+    write_idx: usize,
+}
+
+impl Default for TaskExitRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskExitRing {
+    /// Empty ring. `const` so the global static can be initialized directly.
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; TASK_EXIT_RING_SIZE],
+            write_idx: 0,
+        }
+    }
+
+    /// Latch a task's exit. Overwrites the oldest entry on wrap.
+    pub fn record(&mut self, task_id: TaskId, exit_code: i32, parent: Option<TaskId>) {
+        self.entries[self.write_idx] = Some(TaskExit {
+            slot: task_id.slot(),
+            generation: task_id.generation(),
+            exit_code,
+            parent,
+        });
+        self.write_idx = (self.write_idx + 1) % TASK_EXIT_RING_SIZE;
+    }
+
+    /// Look up an exit by exact `(slot, generation)`. Returns
+    /// `(exit_code, parent)`, or `None` if not recorded / aged out / a
+    /// generation mismatch (slot reused by a different task).
+    pub fn lookup(&self, task_id: TaskId) -> Option<(i32, Option<TaskId>)> {
+        for entry in self.entries.iter().flatten() {
+            if entry.slot == task_id.slot() && entry.generation == task_id.generation() {
+                return Some((entry.exit_code, entry.parent));
+            }
+        }
+        None
+    }
+}
+
 /// Task state machine
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -433,8 +508,11 @@ pub enum BlockReason {
     TimerWait(u64),
     /// Blocked by debugger
     DebuggerWait,
-    /// Waiting for child process
-    ChildWait,
+    /// Waiting for a specific child task to exit (ADR-034 Phase B). Carries
+    /// the awaited child's slot so a child's exit wakes only the parent
+    /// actually waiting on *it*, not a parent waiting on a different child
+    /// (the spurious-sibling-wake the unpayloaded variant allowed).
+    ChildWait(u32),
     /// Waiting for policy service to respond to a syscall query
     PolicyWait(u64),
     /// Boot-time gate: module loaded but not yet released. `load_boot_modules`
@@ -464,7 +542,7 @@ impl fmt::Display for BlockReason {
             BlockReason::SyncWait(id) => write!(f, "SyncWait({})", id),
             BlockReason::TimerWait(ms) => write!(f, "TimerWait({}ms)", ms),
             BlockReason::DebuggerWait => write!(f, "DebuggerWait"),
-            BlockReason::ChildWait => write!(f, "ChildWait"),
+            BlockReason::ChildWait(slot) => write!(f, "ChildWait(slot {})", slot),
             BlockReason::PolicyWait(qid) => write!(f, "PolicyWait({})", qid),
             BlockReason::BootGate => write!(f, "BootGate"),
             BlockReason::ChannelQuiesceWait(id) => write!(f, "ChannelQuiesceWait({})", id),

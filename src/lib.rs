@@ -271,6 +271,75 @@ pub fn bump_task_generation(slot: u32) -> u32 {
     }
 }
 
+/// Global ring of recently-exited tasks' statuses (ADR-034 Phase B). The
+/// death path latches a task's `(slot, generation, exit_code, parent)` here
+/// before the reaper frees the slot, so `SYS_WAIT_TASK` can return the exit
+/// code keyed by `(slot, generation)` after the slot is gone. Global (not
+/// per-CPU) so a parent on any CPU can read a child that exited on any CPU.
+///
+/// Its own `Spinlock` — an isolated "Additional lock domain" (like
+/// `AUDIT_RING`): never held while acquiring a hierarchy lock. The reverse
+/// (taking this ring while holding `SCHEDULER(1)`) happens once, in
+/// `SYS_WAIT_TASK`'s lost-wakeup guard, and is safe because the death path
+/// records the ring with no scheduler lock held — so there is no inverse
+/// order anywhere and no deadlock cycle.
+pub static TASK_EXIT_RING: Spinlock<scheduler::TaskExitRing> =
+    Spinlock::new(scheduler::TaskExitRing::new());
+
+/// Latch a task's exit status into [`TASK_EXIT_RING`].
+pub fn record_task_exit(
+    task_id: scheduler::TaskId,
+    exit_code: i32,
+    parent: Option<scheduler::TaskId>,
+) {
+    TASK_EXIT_RING.lock().record(task_id, exit_code, parent);
+}
+
+/// Look up a recently-exited task's `(exit_code, parent)` by exact
+/// `(slot, generation)`. `None` if not recorded, aged out, or a generation
+/// mismatch (slot reused by a different task — the UAF guard).
+pub fn lookup_task_exit(task_id: scheduler::TaskId) -> Option<(i32, Option<scheduler::TaskId>)> {
+    TASK_EXIT_RING.lock().lookup(task_id)
+}
+
+/// Resolve a possibly-cross-CPU task to `(parent, state, exit_code)`,
+/// generation-validated (ADR-034 Phase B). Locates the owning CPU via
+/// `TASK_CPU_MAP` and reads under that CPU's scheduler lock. `None` if the
+/// task is not live (slot empty or generation mismatch). Used by
+/// `SYS_WAIT_TASK` to authorize and check a child without assuming it is
+/// local — the child may have been migrated by the load balancer.
+///
+/// A live child can be in flight between two CPUs: the load balancer's
+/// `migrate_task` removes it from the source scheduler and inserts it into
+/// the destination, updating `TASK_CPU_MAP` between the two. If we sample the
+/// stale CPU and lock it after the remove, `get_task_pub` misses. We retry
+/// once on a freshly-read CPU to absorb a single in-flight migration (a task
+/// migrates at most once per balance pass, ~1/sec), so a live child is not
+/// reported as not-found.
+#[cfg(not(test))]
+pub fn task_parent_and_state(
+    task_id: scheduler::TaskId,
+) -> Option<(Option<scheduler::TaskId>, scheduler::TaskState, i32)> {
+    // Bounded: at most 2 attempts (one in-flight migration), never a loop.
+    for _ in 0..2 {
+        let cpu = get_task_cpu(task_id.slot())? as usize;
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let guard = PER_CPU_SCHEDULER[cpu].lock();
+        if let Some(sched) = guard.as_ref() {
+            if let Some(task) = sched.get_task_pub(task_id) {
+                return Some((task.parent_task, task.state, task.exit_code as i32));
+            }
+        }
+        // Missed: either genuinely gone, or migrated since we read the map.
+        // Re-read the map; if it still points at the same CPU the task is
+        // genuinely gone and the next iteration returns the same None.
+        drop(guard);
+    }
+    None
+}
+
 /// Wake a task by ID, looking up its owning CPU automatically.
 ///
 /// This is the correct cross-CPU wake primitive. It reads TASK_CPU_MAP
@@ -286,6 +355,26 @@ pub fn wake_task_on_cpu(task_id: scheduler::TaskId) -> bool {
     let mut guard = PER_CPU_SCHEDULER[cpu].lock();
     if let Some(sched) = guard.as_mut() {
         sched.wake_task(task_id).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Wake `parent_id` iff it is Blocked waiting on the child in `child_slot`
+/// (ADR-034 Phase B). Cross-CPU: resolves the parent's owning CPU via
+/// `TASK_CPU_MAP` and applies the selective wake under that CPU's scheduler
+/// lock — the same lock `SYS_WAIT_TASK`'s lost-wakeup guard holds while it
+/// re-checks the exit ring, so the child's record-then-wake never slips past
+/// a parent mid-block. Returns `true` if woken.
+#[cfg(not(test))]
+pub fn wake_child_waiter(parent_id: scheduler::TaskId, child_slot: u32) -> bool {
+    let cpu = match get_task_cpu(parent_id.slot()) {
+        Some(c) if (c as usize) < MAX_CPUS => c as usize,
+        _ => return false,
+    };
+    let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+    if let Some(sched) = guard.as_mut() {
+        sched.wake_child_waiter(parent_id, child_slot)
     } else {
         false
     }
@@ -341,6 +430,24 @@ pub fn terminate_current_task() -> Option<scheduler::TaskId> {
 #[cfg(test)]
 pub fn wake_task_on_cpu(_task_id: scheduler::TaskId) -> bool {
     false
+}
+
+/// Test stub for wake_child_waiter — per-CPU scheduler array unavailable
+/// under host tests. `Scheduler::wake_child_waiter` is exercised directly in
+/// `src/scheduler/mod.rs::tests`.
+#[cfg(test)]
+pub fn wake_child_waiter(_parent_id: scheduler::TaskId, _child_slot: u32) -> bool {
+    false
+}
+
+/// Test stub for task_parent_and_state — per-CPU scheduler array unavailable
+/// under host tests. `Scheduler::get_task_pub` is exercised directly in
+/// `src/scheduler/mod.rs::tests`.
+#[cfg(test)]
+pub fn task_parent_and_state(
+    _task_id: scheduler::TaskId,
+) -> Option<(Option<scheduler::TaskId>, scheduler::TaskState, i32)> {
+    None
 }
 
 /// Arm the per-channel quiesce protocol on a peer task, locating the

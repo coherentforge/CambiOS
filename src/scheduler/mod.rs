@@ -10,6 +10,7 @@ pub mod task;
 pub mod timer;
 
 pub use task::{Task, TaskId, TaskState, Priority, CpuContext, ScheduleError, BlockReason};
+pub use task::{TaskExitRing, TASK_EXIT_RING_SIZE};
 pub use timer::{Timer, TimerConfig, AdaptiveTickMode};
 use core::fmt;
 use alloc::vec::Vec;
@@ -330,6 +331,24 @@ impl Scheduler {
         stack_top: u64,
         priority: Priority,
     ) -> Result<TaskId, ScheduleError> {
+        // Deferred: this free-slot search scans only THIS CPU's `tasks[]`, so
+        // two CPUs spawning concurrently can claim the same slot index.
+        // Revisit when: a second concurrent cross-CPU `SYS_SPAWN` call site
+        //   exists (e.g. shell + terminal-window on different CPUs both
+        //   spawning), or an SMP stress test surfaces a duplicate
+        //   `(slot, generation)`.
+        // Why: `TASK_CPU_MAP`, `TASK_GENERATION`, migration (`accept_task`), and
+        //   ADR-034's `(slot, generation)` identity all treat the slot as a
+        //   GLOBAL namespace. A duplicate slot yields two live tasks with an
+        //   identical `TaskId` (both read the same global generation):
+        //   mis-routed cross-CPU wakes, exit-ring collisions, a defeated
+        //   generation guard, and a drop-on-floor in `migrate_task_between`.
+        //   Pre-existing — predates ADR-034 (the bare-`u32` slot already
+        //   collided); Phase B inherits the assumption without worsening it.
+        //   Today's single-shell spawner never triggers it. The fix is a global
+        //   task-slot allocator (an atomic free-list claimed before the per-CPU
+        //   insert) — a focused scheduler change with its own verification, not
+        //   a tack-on to the leak/UAF fix.
         // Find first free slot (skip slot 0 = idle task)
         let slot = (1..MAX_TASKS)
             .find(|&i| self.tasks[i].is_none())
@@ -895,6 +914,24 @@ impl Scheduler {
         Ok(task_id)
     }
 
+    /// Wake `parent_id` **iff** it is Blocked waiting on the child in
+    /// `child_slot` (ADR-034 Phase B). Returns `true` if it was woken.
+    ///
+    /// Lets a child's exit wake only the parent actually waiting on *it*: a
+    /// parent blocked on a different child (`ChildWait(other)`), or not
+    /// blocked at all, is left untouched — that child's exit is latched in the
+    /// `TASK_EXIT_RING` for the parent to collect later. `parent_id` is
+    /// generation-validated by `get_task`, so a stale parent handle is a
+    /// no-op.
+    pub fn wake_child_waiter(&mut self, parent_id: TaskId, child_slot: u32) -> bool {
+        let is_waiting = matches!(
+            self.get_task(parent_id),
+            Some(t) if t.state == TaskState::Blocked
+                && matches!(t.block_reason, Some(BlockReason::ChildWait(s)) if s == child_slot)
+        );
+        is_waiting && self.wake_task(parent_id).is_ok()
+    }
+
     /// Wake all tasks blocked on a specific hardware IRQ.
     ///
     /// Scans for tasks with `BlockReason::IoWait(irq)` and moves them from
@@ -1109,6 +1146,36 @@ impl Scheduler {
             if task.state == TaskState::Ready {
                 self.runnable_count = self.runnable_count.saturating_sub(1);
             }
+        }
+    }
+
+    /// Reclaim a terminated task's slot (ADR-034 Phase B). Called by the
+    /// reaper, off the dying task's own context, to clear the leaked slot
+    /// `purge_task` deliberately leaves occupied.
+    ///
+    /// Frees the slot **only** if it still holds that exact dead task — same
+    /// `(slot, generation)` and `Terminated` — so a double-drain, or a slot
+    /// already reused by a new task, is a safe no-op rather than evicting a
+    /// live occupant. Returns `true` if the slot was freed. The caller bumps
+    /// the slot's generation (under this same lock) on a `true` return so the
+    /// next occupant gets a distinct `TaskId`; freeing and bumping under one
+    /// lock means no `create_*_task` on this CPU can grab the slot with the
+    /// stale generation in between.
+    ///
+    /// Does **not** touch `runnable_count` — a Terminated task is not runnable
+    /// (`purge_task` already reconciled the count when the task left Ready).
+    pub fn reap_slot(&mut self, task_id: TaskId) -> bool {
+        let idx = task_id.slot() as usize;
+        let is_dead_match = matches!(
+            self.tasks.get(idx).and_then(|s| s.as_ref()),
+            Some(task) if task.id == task_id && task.state == TaskState::Terminated
+        );
+        if is_dead_match {
+            self.tasks[idx] = None;
+            self.task_count = self.task_count.saturating_sub(1);
+            true
+        } else {
+            false
         }
     }
 
@@ -1528,6 +1595,106 @@ mod tests {
         sched.init().unwrap();
         // Idle task (0) is Running — current_task
         assert!(sched.remove_task(TaskId::new(0, 0)).is_err());
+    }
+
+    // ADR-034 Phase B: slot reclaim, selective child-wake, exit ring.
+
+    #[test]
+    fn test_reap_slot_frees_terminated() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.get_task_mut_pub(tid).unwrap().state = TaskState::Terminated;
+        assert_eq!(sched.task_count(), 2); // idle + 1
+
+        assert!(sched.reap_slot(tid));
+        assert!(sched.get_task_pub(tid).is_none());
+        assert_eq!(sched.task_count(), 1); // idle only
+        // Idempotent: a second reap of the now-empty slot is a no-op.
+        assert!(!sched.reap_slot(tid));
+    }
+
+    #[test]
+    fn test_reap_slot_rejects_non_terminated() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Ready (not Terminated) → must not be reaped.
+        assert!(!sched.reap_slot(tid));
+        assert!(sched.get_task_pub(tid).is_some());
+    }
+
+    #[test]
+    fn test_reap_slot_rejects_stale_generation() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.get_task_mut_pub(tid).unwrap().state = TaskState::Terminated;
+        // Same slot, wrong generation → reap must refuse (a reused-slot guard).
+        let stale = TaskId::new(tid.slot(), tid.generation().wrapping_add(7));
+        assert!(!sched.reap_slot(stale));
+        assert!(sched.get_task_pub(tid).is_some());
+    }
+
+    #[test]
+    fn test_wake_child_waiter_matching() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let parent = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(parent, BlockReason::ChildWait(42)).unwrap();
+
+        assert!(sched.wake_child_waiter(parent, 42));
+        assert_eq!(sched.get_task_pub(parent).unwrap().state, TaskState::Ready);
+    }
+
+    #[test]
+    fn test_wake_child_waiter_ignores_other_child() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let parent = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.block_task(parent, BlockReason::ChildWait(42)).unwrap();
+
+        // A sibling (slot 7) exiting must not wake a parent waiting on slot 42.
+        assert!(!sched.wake_child_waiter(parent, 7));
+        assert_eq!(sched.get_task_pub(parent).unwrap().state, TaskState::Blocked);
+    }
+
+    #[test]
+    fn test_wake_child_waiter_ignores_unblocked() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let parent = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Ready, not waiting on any child.
+        assert!(!sched.wake_child_waiter(parent, 42));
+    }
+
+    #[test]
+    fn test_task_exit_ring_record_and_lookup() {
+        let mut ring = TaskExitRing::new();
+        let child = TaskId::new(5, 2);
+        let parent = TaskId::new(1, 0);
+        ring.record(child, 42, Some(parent));
+
+        assert_eq!(ring.lookup(child), Some((42, Some(parent))));
+        // Wrong generation (slot reused) → not found.
+        assert_eq!(ring.lookup(TaskId::new(5, 3)), None);
+        // Wrong slot → not found.
+        assert_eq!(ring.lookup(TaskId::new(6, 2)), None);
+    }
+
+    #[test]
+    fn test_task_exit_ring_ages_out() {
+        let mut ring = TaskExitRing::new();
+        let victim = TaskId::new(1, 0);
+        ring.record(victim, 7, None);
+        // Fill the ring past capacity; the oldest entry (victim) is overwritten.
+        for slot in 2..(TASK_EXIT_RING_SIZE as u32 + 2) {
+            ring.record(TaskId::new(slot, 0), slot as i32, None);
+        }
+        assert_eq!(ring.lookup(victim), None);
+        // A recent entry is still present.
+        let recent = TaskId::new(TASK_EXIT_RING_SIZE as u32 + 1, 0);
+        assert_eq!(ring.lookup(recent), Some((TASK_EXIT_RING_SIZE as i32 + 1, None)));
     }
 
     #[test]

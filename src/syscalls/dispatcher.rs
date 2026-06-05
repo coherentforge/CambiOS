@@ -385,9 +385,23 @@ impl SyscallDispatcher {
         };
 
 
-        // Wake parent if it's blocked in WaitTask
+        // ADR-034 Phase B: latch this task's exit status into the global ring
+        // BEFORE waking the parent. The parent's SYS_WAIT_TASK reads the code
+        // from here keyed by (slot, generation) once the reaper has freed the
+        // slot, and the record-then-wake order is what closes the lost-wakeup
+        // window: a parent that re-checks the ring under its scheduler lock
+        // (the lock the wake below must take) either sees this record or has
+        // not yet blocked. Recorded once, by the transition winner.
+        if won_transition {
+            crate::record_task_exit(ctx.task_id, exit_code as i32, parent_to_wake);
+        }
+
+        // Wake the parent iff it is blocked waiting on THIS child (ADR-034
+        // Phase B selective wake). A parent waiting on a different child, or
+        // not waiting, is left alone — this child's exit is already latched in
+        // the ring above for later collection. Must follow the ring record.
         if let Some(parent_id) = parent_to_wake {
-            crate::wake_task_on_cpu(parent_id);
+            crate::wake_child_waiter(parent_id, ctx.task_id.slot());
         }
 
         // Reclaim capability table entries for the exiting process.
@@ -583,10 +597,15 @@ impl SyscallDispatcher {
         // task is never involuntarily switched away between this push and the
         // terminal yield, so the item is durable before any context switch.
         // Enqueue-once: gated on winning the Running->Terminated transition.
-        if won_transition && (deferred_root.is_some() || kstack_to_reclaim != 0) {
+        // Enqueue whenever we won the transition and this is a real task: even
+        // a kernel task with no per-process root and no heap stack still owns a
+        // scheduler slot the reaper must reclaim (ADR-034 Phase B). The idle
+        // task never exits, so it never reaches here, but guard anyway.
+        if won_transition && !ctx.task_id.is_idle() {
             let item = crate::reaper::ReclaimItem {
                 root_phys: deferred_root.unwrap_or(0),
                 kstack_top: kstack_to_reclaim,
+                task_id: ctx.task_id,
             };
             if crate::local_reclaim_queue().lock().push(item).is_err() {
                 // Structurally impossible (queue sized to MAX_TASKS, ADR-034
@@ -2518,7 +2537,10 @@ impl SyscallDispatcher {
             new_task_id.slot(), process_id.slot(), ctx.task_id.slot()
         );
 
-        Ok(new_task_id.slot() as u64)
+        // ADR-034 Phase B.4: return the full (slot, generation) handle. The
+        // parent passes it back verbatim to SYS_WAIT_TASK, which keys the exit
+        // ring by it — so a reaped+reused slot is detected by generation.
+        Ok(new_task_id.as_raw())
     }
 
     /// SYS_WAIT_TASK: Block until a child task exits.
@@ -2526,55 +2548,123 @@ impl SyscallDispatcher {
     /// Args: arg1 = child task ID
     /// Returns: child's exit code
     fn handle_wait_task(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        use crate::scheduler::{TaskState, BlockReason};
+        use crate::scheduler::BlockReason;
 
-        // B.1: ABI still carries a bare slot (u32); stamp the slot's current
-        // generation so the generation-validated lookup matches the live task.
-        // B.4 widens this to `TaskId::from_raw(args.arg1())` (the full handle
-        // the parent received from spawn) so a reused slot is detected.
-        let child_slot = args.arg1_u32();
-        let child_id =
-            crate::scheduler::TaskId::new(child_slot, crate::task_generation(child_slot));
+        // ADR-034 Phase B.4: the ABI carries the full (slot, generation) handle
+        // the parent received from spawn. A child whose slot was reaped and
+        // reused mismatches the generation and is detected, not silently
+        // resolved to the new occupant.
+        let child_id = crate::scheduler::TaskId::from_raw(args.arg1);
+        let child_slot = child_id.slot();
 
-        // Check the child task's state
-        {
-            let mut sched_guard = crate::local_scheduler().lock();
-            let sched = sched_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
-
-            let child = sched.get_task_mut_pub(child_id)
-                .ok_or(SyscallError::InvalidArg)?;
-
-            // Only the parent can wait on a child
-            if child.parent_task != Some(ctx.task_id) {
+        // Fast path: the child already exited. The global exit ring outlives
+        // the reaper freeing the slot and is CPU-agnostic, so this covers a
+        // child that exited on any CPU, before or after reaping.
+        if let Some((code, parent)) = crate::lookup_task_exit(child_id) {
+            if parent != Some(ctx.task_id) {
                 return Err(SyscallError::PermissionDenied);
             }
+            return Ok(code as u64);
+        }
 
-            // If already terminated, return exit code immediately
-            if child.state == TaskState::Terminated {
-                return Ok(child.exit_code as u64);
+        // Not recorded as exited → the child should still be live. Resolve it
+        // (possibly cross-CPU — the load balancer may have migrated it) to
+        // authorize the caller and read its state.
+        match crate::task_parent_and_state(child_id) {
+            Some((parent, state, exit_code)) => {
+                if parent != Some(ctx.task_id) {
+                    return Err(SyscallError::PermissionDenied);
+                }
+                if state == crate::scheduler::TaskState::Terminated {
+                    // Exited; the ring write just hasn't landed in our view.
+                    // The live latched exit_code is authoritative.
+                    return Ok(exit_code as u64);
+                }
+                // Alive → block below.
             }
-
-            // Block the caller until the child exits
-            if let Some(task) = sched.get_task_mut_pub(ctx.task_id) {
-                task.state = TaskState::Blocked;
-                task.block_reason = Some(BlockReason::ChildWait);
+            None => {
+                // Not live. But the child may have exited AND been reaped in
+                // the gap between the fast-path ring lookup above and this
+                // resolve (interrupts are enabled here, so we can be preempted
+                // for a full quantum, and the child's CPU reaps promptly from
+                // its idle loop). The exit code is now only in the ring — the
+                // slot is gone and its generation bumped — so re-check the ring
+                // before declaring not-found, or a clean exit is reported as a
+                // spurious error (the shell-waits-on-a-game common case).
+                if let Some((code, parent)) = crate::lookup_task_exit(child_id) {
+                    if parent != Some(ctx.task_id) {
+                        return Err(SyscallError::PermissionDenied);
+                    }
+                    return Ok(code as u64);
+                }
+                // Genuinely unknown handle, or the exit aged out of the ring.
+                return Err(SyscallError::InvalidArg);
             }
         }
 
-        // Yield — when the child exits, handle_exit wakes us via wake_task_on_cpu
-        // SAFETY: Scheduler lock is released, we are on the kernel stack.
+        // Block until the child exits. H5: disable interrupts BEFORE marking
+        // Blocked so neither the timer ISR nor the cross-CPU waker acts on a
+        // half-set state; then re-check the ring UNDER our scheduler lock — the
+        // lock `wake_child_waiter` must take — to close the lost-wakeup window.
+        // handle_exit records the ring before waking us, so we either see the
+        // record here (and skip blocking) or block and get woken; the wake
+        // cannot run until we release this lock after blocking.
+        // SAFETY: disabling interrupts is sound at kernel privilege; it is
+        // re-enabled on the next task's restored context after the yield below
+        // (or explicitly on the no-block return path).
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        // SAFETY: as above; `daifset, #2` masks IRQ at EL1.
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+
+        let raced_exit = {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(found) = crate::lookup_task_exit(child_id) {
+                Some(found) // child exited between our resolve and now — don't block
+            } else {
+                if let Some(sched) = sched_guard.as_mut() {
+                    let _ = sched.block_task(ctx.task_id, BlockReason::ChildWait(child_slot));
+                }
+                None
+            }
+            // IrqSpinlock drop: IF stays disabled (our cli is still in effect).
+        };
+
+        if let Some((code, parent)) = raced_exit {
+            // We never blocked — restore interrupts and return.
+            // SAFETY: re-enabling interrupts is sound at kernel privilege; it
+            // pairs with the `cli` above on the path where we did not block,
+            // restoring the interrupts-enabled state syscall handlers run in.
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+            // SAFETY: as above; `daifclr, #2` unmasks IRQ at EL1.
+            #[cfg(target_arch = "aarch64")]
+            unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+            if parent != Some(ctx.task_id) {
+                return Err(SyscallError::PermissionDenied);
+            }
+            return Ok(code as u64);
+        }
+
+        // Blocked. Yield; the child's exit (selective wake) sets us Ready.
+        // yield re-enables interrupts via the next task's restored context.
+        // SAFETY: scheduler lock released, on the kernel stack.
         unsafe { crate::arch::yield_save_and_switch(); }
 
-        // We've been woken — child should be terminated now. Read exit code.
-        {
-            let sched_guard = crate::local_scheduler().lock();
-            if let Some(sched) = sched_guard.as_ref() {
-                if let Some(child) = sched.get_task_pub(child_id) {
-                    return Ok(child.exit_code as u64);
-                }
+        // Woken: the child has exited and recorded the ring. The selective
+        // wake guarantees we are only woken for OUR child, so a single check
+        // suffices — no spurious-sibling re-block loop.
+        if let Some((code, parent)) = crate::lookup_task_exit(child_id) {
+            if parent != Some(ctx.task_id) {
+                return Err(SyscallError::PermissionDenied);
             }
+            return Ok(code as u64);
         }
 
+        // The exit aged out of the ring before we read it (a waiter slower than
+        // TASK_EXIT_RING_SIZE subsequent exits — ADR-034 Residual Risks).
+        // Typed not-found; preserves the pre-Phase-B "0 on missing" shape.
         Ok(0)
     }
 

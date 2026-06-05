@@ -581,8 +581,10 @@ fn cmd_spawn(name: &[u8]) {
         return;
     }
 
-    let task_id = result as u32;
-    let exit_code = sys::wait_task(task_id);
+    // Keep the full (slot, generation) handle — do not truncate to the slot,
+    // or wait_task can't tell a reaped+reused slot from our child (ADR-034).
+    let task_handle = result as u64;
+    let exit_code = sys::wait_task(task_handle);
 
     // Print exit info
     sys::print(b"[");

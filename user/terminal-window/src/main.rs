@@ -301,7 +301,8 @@ fn cmd_play(t: &mut Terminal<GuiBackend>, args: &[u8]) {
         return;
     }
 
-    let _exit = sys::wait_task(tid as u32);
+    // Full (slot, generation) handle — must not truncate to the slot (ADR-034).
+    let _exit = sys::wait_task(tid as u64);
 
     // Game's done — re-attach our window. If reopen fails the GUI is
     // dead and the terminal can't draw; clean exit beats a zombie.

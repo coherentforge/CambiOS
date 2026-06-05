@@ -1112,14 +1112,22 @@ pub fn console_read(buf: &mut [u8]) -> i64 {
     syscall_raw3(SyscallNumber::ConsoleRead as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
 }
 
-/// Spawn a boot module by name. Returns the new task ID, or negative error.
+/// Spawn a boot module by name. Returns the new task **handle** (a packed
+/// `(slot, generation)` value, ADR-034 Phase B), or a negative error. Pass
+/// the handle verbatim to [`wait_task`] — do not truncate it to the slot, or
+/// the generation is lost and a reaped+reused slot can't be distinguished.
+/// (For v1 the generation high bit is never set, so a valid handle is
+/// non-negative; the negative-means-error convention holds.)
 pub fn spawn(name: &[u8]) -> i64 {
     syscall_raw3(SyscallNumber::Spawn as u64, name.as_ptr() as u64, name.len() as u64, 0)
 }
 
-/// Block until the specified child task exits. Returns the child's exit code.
-pub fn wait_task(task_id: u32) -> i64 {
-    syscall_raw3(SyscallNumber::WaitTask as u64, task_id as u64, 0, 0)
+/// Block until the child named by `task_handle` (the value [`spawn`] returned)
+/// exits. Returns the child's exit code. The handle carries the child's
+/// generation so a stale handle whose slot was reused is rejected rather than
+/// collecting a different task's code (ADR-034 Phase B).
+pub fn wait_task(task_handle: u64) -> i64 {
+    syscall_raw3(SyscallNumber::WaitTask as u64, task_handle, 0, 0)
 }
 
 /// Get system time in ticks.

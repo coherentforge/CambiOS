@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: src/scheduler/
 auto_refresh: required
-last_synced_to_code: 2026-04-10
+last_synced_to_code: 2026-06-04
 authoritative_for: scheduler internals, task lifecycle, time slicing, priority bands, blocking primitives, IPC integration with the scheduler
 -->
 
@@ -35,7 +35,7 @@ The scheduler subsystem is three files:
 - **`TaskId`** — a global slot index packed with a reuse generation (`slot` in the low 32 bits, `generation` in the high 32, mirroring `ProcessId`). Lookups are generation-validated, so a stale id whose slot was reclaimed resolves to `None` rather than the new occupant (ADR-034 Phase B). The slot is the array index into the per-CPU task array
 - **`TaskState`** — five-state enum: `Ready`, `Running`, `Blocked`, `Terminated`, `Suspended`
 - **`Priority(pub u8)`** — 0–255, with named constants `IDLE=0`, `LOW=64`, `NORMAL=128`, `HIGH=192`, `CRITICAL=255`
-- **`BlockReason`** — why a task is `Blocked`: `MessageWait(EndpointId)`, `IoWait(irq)`, `TimerWait(ms)`, `SyncSendWait(ep)`, etc.
+- **`BlockReason`** — why a task is `Blocked`: `MessageWait(EndpointId)`, `IoWait(irq)`, `TimerWait(ms)`, `SyncSendWait(ep)`, `ChildWait(child_slot)` (a parent in `SYS_WAIT_TASK`, carrying the awaited child's slot for selective wake — ADR-034 Phase B), etc.
 - **`CpuContext`** — `#[cfg(target_arch = "x86_64")]` and `#[cfg(target_arch = "aarch64")]` variants. x86_64 stores all 16 GPRs + RIP/RSP/RFLAGS. AArch64 stores callee-saved only (x19–x30, sp, pc, pstate); caller-saved go through `SavedContext` instead.
 - **`Task`** — full metadata: state, context, priority, time slice, kernel stack top, `cr3` (page table root), `home_cpu`, `pinned`, `parent_task` (for `WaitTask`), `exit_code`, `saved_rsp` (pointer to `SavedContext` on this task's kernel stack)
 
@@ -187,6 +187,8 @@ unsafe { yield_save_and_switch(); }
 | `wake_task(task_id)` | Move a task from Blocked back to Ready, re-enqueuing it in its priority band. |
 | `wake_irq_waiters(irq_number)` | Scan for tasks blocked with `BlockReason::IoWait(irq)` and wake them. Used by device ISRs. |
 | `wake_message_waiters(endpoint)` | Scan for tasks blocked with `BlockReason::MessageWait(endpoint)` and wake them. Used by IPC send. |
+| `wake_child_waiter(parent, child_slot)` | Wake `parent` **iff** it is Blocked on `ChildWait(child_slot)` (ADR-034 Phase B). Selective: a child's exit wakes only the parent waiting on *it*, never a parent waiting on a sibling. |
+| `reap_slot(task_id)` | Free a Terminated task's slot (clears `tasks[slot]`, decrements `task_count`) iff it still holds that exact `(slot, generation)` Terminated task. Called by the per-CPU reaper (ADR-034 Phase B), off the dying task's own context, to reclaim the slot `purge_task` leaves occupied. |
 
 Cross-CPU wake is mediated through `lib.rs` helpers:
 
@@ -225,9 +227,9 @@ These are the verification targets the scheduler is designed for. Several are ch
 
 ## Tests
 
-35 unit tests cover the scheduler:
+43 unit tests cover the scheduler:
 
-- 29 tests in `mod.rs`: scheduler creation, init, task lifecycle, schedule selection, time slice expiration, block/wake, IRQ wake, message wake, idle task immutability, remove/accept/migrate primitives, `active_runnable_count`, `pick_migratable_task`, invariants, IPC integration
+- 37 tests in `mod.rs`: scheduler creation, init, task lifecycle, schedule selection, time slice expiration, block/wake, IRQ wake, message wake, idle task immutability, remove/accept/migrate primitives, `active_runnable_count`, `pick_migratable_task`, invariants, IPC integration, and the ADR-034 Phase B slot reclaim / selective child-wake / exit-ring (`reap_slot`, `wake_child_waiter`, `TaskExitRing`)
 - 6 tests in `timer.rs`: timer creation, init, configuration verification, frequency presets, tick counting, `ticks_to_ms` conversion
 
 Test layer sits on the host (`x86_64-apple-darwin`) — no QEMU dependency, no x86 hardware features. Run with:
