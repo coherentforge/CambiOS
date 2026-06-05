@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:366:eventually
-CLAUDE.md:381:deferred
+CLAUDE.md:367:eventually
+CLAUDE.md:382:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -91,9 +91,9 @@ src/ipc/capability.rs:727:deferred
 src/ipc/capability.rs:780:TODO
 src/ipc/capability.rs:788:for-now
 src/lib.rs:101:TBD
-src/lib.rs:885:deferred
-src/lib.rs:893:deferred
-src/lib.rs:901:deferred
+src/lib.rs:966:deferred
+src/lib.rs:974:deferred
+src/lib.rs:982:deferred
 src/memory/mod.rs:680:placeholder
 src/memory/mod.rs:689:placeholder
 src/microkernel/main.rs:946:for-now

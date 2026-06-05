@@ -767,14 +767,36 @@ pub fn load_elf_process(
     }
 
     // --- Step 8: Register task in scheduler ---
-    let task_id = scheduler
-        .create_isr_task(
-            metadata.entry_point,
-            saved_ctx_addr,
-            kstack_top,
-            priority,
-        )
-        .map_err(|_| LoaderError::SchedulerFull)?;
+    // Claim a globally-arbitrated slot first. The slot namespace is shared
+    // across all CPUs (TASK_CPU_MAP / TASK_GENERATION / ADR-034 (slot, gen)
+    // identity), so only a global claim guarantees two concurrent spawns on
+    // different CPUs never get the same slot. Release it on any insert failure
+    // so a failed spawn doesn't leak the slot.
+    let slot = crate::claim_task_slot().ok_or(LoaderError::SchedulerFull)?;
+    let task_id = match scheduler.create_isr_task(
+        slot,
+        metadata.entry_point,
+        saved_ctx_addr,
+        kstack_top,
+        priority,
+    ) {
+        Ok(id) => id,
+        Err(crate::scheduler::ScheduleError::SlotOccupied) => {
+            // The slot is held by a live task — a "should never happen" state
+            // (the reaper releases a bit only after clearing the local entry,
+            // so a claimed-free bit implies an empty local slot). The bit must
+            // stay SET to match the occupant; releasing it would hand an in-use
+            // slot to another CPU. Do NOT release.
+            return Err(LoaderError::SchedulerFull);
+        }
+        Err(_) => {
+            // Invalid-slot defensive failure (unreachable for a slot from
+            // claim_task_slot, which only returns [1, MAX_TASKS)). The slot was
+            // left empty, so return the bit to the global pool.
+            crate::release_task_slot(slot);
+            return Err(LoaderError::SchedulerFull);
+        }
+    };
 
     // Set process_id and CR3 on the task
     if let Some(task) = scheduler.get_task_mut_pub(task_id) {

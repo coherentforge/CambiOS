@@ -190,11 +190,29 @@ pub fn drain_local() {
         // validates the slot still holds that exact Terminated task, so a
         // double-drain or a racing reuse is a no-op rather than a corruption.
         if !item.task_id.is_idle() {
-            let mut sched_guard = crate::local_scheduler().lock();
-            if let Some(sched) = sched_guard.as_mut() {
-                if sched.reap_slot(item.task_id) {
-                    crate::bump_task_generation(item.task_id.slot());
+            let reaped = {
+                let mut sched_guard = crate::local_scheduler().lock();
+                if let Some(sched) = sched_guard.as_mut() {
+                    if sched.reap_slot(item.task_id) {
+                        crate::bump_task_generation(item.task_id.slot());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
                 }
+            };
+            // Release the GLOBAL slot bit only after a successful reap+bump, and
+            // only then — a false `reaped` means the slot already holds a
+            // different live task (racing reuse / double-drain) and its bit must
+            // NOT be cleared. Releasing after the bump is what lets the next
+            // claimer of this slot observe the new generation (this release is
+            // the synchronizes-with edge for the claimer's acquire load). Done
+            // with the SCHEDULER lock dropped: the bitmap is an independent
+            // lock-free domain (ADR-034 Residual Risk closure).
+            if reaped {
+                crate::release_task_slot(item.task_id.slot() as usize);
             }
         }
     }

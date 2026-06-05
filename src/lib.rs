@@ -271,6 +271,87 @@ pub fn bump_task_generation(slot: u32) -> u32 {
     }
 }
 
+/// Global task-slot allocation bitmap (ADR-034 Residual Risk closure). Bit `s`
+/// set ⇒ slot `s` is owned by some CPU's scheduler. The slot namespace is
+/// GLOBAL — `TASK_CPU_MAP`, `TASK_GENERATION`, and ADR-034's `(slot, generation)`
+/// `TaskId` all index by this slot — so the same slot must never be live on two
+/// CPUs at once. This bitmap is the single arbiter: a CPU must win the CAS on a
+/// bit before it may use the slot, so concurrent cross-CPU `SYS_SPAWN` can never
+/// hand the same slot to two tasks. Lock-free; an "Additional lock domain" (it
+/// acquires no lock, so `claim` is safe to call while SCHEDULER is held).
+///
+/// ARCHITECTURAL: one bit per global task slot; width tracks `MAX_TASKS`.
+static TASK_SLOT_BITMAP: [AtomicU64; MAX_TASKS / 64] =
+    [const { AtomicU64::new(0) }; MAX_TASKS / 64];
+
+/// Pure core of the allocator: index of the lowest bit in `word` that is both
+/// clear (free) and not in `reserved`, or `None` if the word has none. Split
+/// out from the atomic effect so the bit logic is verifiable independently of
+/// hardware state (Formal-Verification: pure logic separated from effects).
+const fn lowest_free_bit(word: u64, reserved: u64) -> Option<u32> {
+    let free = !word & !reserved;
+    if free == 0 {
+        None
+    } else {
+        Some(free.trailing_zeros())
+    }
+}
+
+/// Claim a free global task slot in `[1, MAX_TASKS)`, or `None` if all are in
+/// use. Lock-free: the CPU whose CAS flips a bit 0→1 owns that slot. Slot 0 is
+/// permanently reserved for the per-CPU idle task (every CPU's local index 0 is
+/// its idle; `TaskId::IDLE` is never globally looked up).
+///
+/// Pairs with [`release_task_slot`]; the reaper releases after it frees the
+/// local slot and bumps the generation, so a later claimer of the same slot
+/// observes the new generation (the claimer's acquire synchronizes-with the
+/// release).
+pub fn claim_task_slot() -> Option<usize> {
+    // ARCHITECTURAL: bit 0 of word 0 reserves slot 0 (idle).
+    const SLOT0_RESERVED: u64 = 1;
+    let mut word_idx = 0;
+    while word_idx < TASK_SLOT_BITMAP.len() {
+        let reserved = if word_idx == 0 { SLOT0_RESERVED } else { 0 };
+        // Retry this word until we either claim a bit or find it full. Bounded:
+        // each lost CAS means another CPU set a bit, so the word's free count
+        // strictly decreases — at most 64 iterations before it reads full.
+        loop {
+            let cur = TASK_SLOT_BITMAP[word_idx].load(Ordering::Acquire);
+            match lowest_free_bit(cur, reserved) {
+                None => break, // word full; advance to the next
+                Some(bit) => {
+                    let next = cur | (1u64 << bit);
+                    if TASK_SLOT_BITMAP[word_idx]
+                        .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Some(word_idx * 64 + bit as usize);
+                    }
+                    // CAS lost: another CPU mutated the word; reload and retry.
+                }
+            }
+        }
+        word_idx += 1;
+    }
+    None
+}
+
+/// Release a global task slot previously handed out by [`claim_task_slot`].
+/// Called by the reaper AFTER `reap_slot` frees the local entry and the slot's
+/// generation is bumped — never before, so a new claimer of this slot is
+/// guaranteed to read the bumped generation (this release is the
+/// synchronizes-with edge for the claimer's acquire). Slot 0 is never released
+/// (the idle slot is never claimed).
+pub fn release_task_slot(slot: usize) {
+    debug_assert!(slot != 0 && slot < MAX_TASKS, "release of reserved/oob slot");
+    if slot == 0 || slot >= MAX_TASKS {
+        return;
+    }
+    let word_idx = slot / 64;
+    let mask = !(1u64 << (slot % 64));
+    TASK_SLOT_BITMAP[word_idx].fetch_and(mask, Ordering::AcqRel);
+}
+
 /// Global ring of recently-exited tasks' statuses (ADR-034 Phase B). The
 /// death path latches a task's `(slot, generation, exit_code, parent)` here
 /// before the reaper frees the slot, so `SYS_WAIT_TASK` can return the exit
@@ -1264,5 +1345,82 @@ mod aarch64_logic_tests {
         assert_eq!(core::mem::size_of::<*const u8>(), 8); // 64-bit pointer
         // Total with alignment padding: 8 + 4 + (4 pad) + 8 + 4 + 4 = 32
         assert_eq!(8 + 4 + 4 + 8 + 4 + 4, 32);
+    }
+}
+
+#[cfg(test)]
+mod slot_allocator_tests {
+    use super::{
+        claim_task_slot, lowest_free_bit, release_task_slot, MAX_TASKS, TASK_SLOT_BITMAP,
+    };
+    use core::sync::atomic::Ordering;
+
+    // Pure bit logic — no global state, safe to run in parallel with anything.
+    #[test]
+    fn test_lowest_free_bit() {
+        // Empty word, nothing reserved: bit 0.
+        assert_eq!(lowest_free_bit(0, 0), Some(0));
+        // Empty word, bit 0 reserved: bit 1.
+        assert_eq!(lowest_free_bit(0, 1), Some(1));
+        // Low bits taken, next free is 3.
+        assert_eq!(lowest_free_bit(0b0000_0111, 0), Some(3));
+        // Full word: none.
+        assert_eq!(lowest_free_bit(u64::MAX, 0), None);
+        // Only reserved bits free ⇒ none.
+        assert_eq!(lowest_free_bit(!0b1, 1), None);
+        // Reserved bit already set in the word is harmless.
+        assert_eq!(lowest_free_bit(0b1, 1), Some(1));
+    }
+
+    // The stateful allocator touches the single global TASK_SLOT_BITMAP, which
+    // no other test mutates. Keep ALL allocator state assertions in this one
+    // test fn so they run on a single thread (no cross-test race), and restore
+    // the bitmap to all-zero on exit so the static is left pristine.
+    #[test]
+    fn test_task_slot_allocator() {
+        // Precondition: a clean bitmap (no prior test claimed without release).
+        for w in TASK_SLOT_BITMAP.iter() {
+            assert_eq!(w.load(Ordering::Acquire), 0, "bitmap not pristine at start");
+        }
+
+        // Slot 0 is reserved: claims start at 1 and are strictly distinct.
+        let a = claim_task_slot().unwrap();
+        let b = claim_task_slot().unwrap();
+        let c = claim_task_slot().unwrap();
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+        assert_eq!(c, 3);
+        assert!(a != b && b != c && a != c);
+        assert!(a >= 1, "slot 0 must never be handed out");
+
+        // Release the middle one; the next claim reuses exactly that slot
+        // (lowest free bit), not a fresh one.
+        release_task_slot(b);
+        let reused = claim_task_slot().unwrap();
+        assert_eq!(reused, b, "released slot should be reused (lowest free)");
+
+        // Drain everything we hold, then exhaust the namespace.
+        release_task_slot(a);
+        release_task_slot(c);
+        release_task_slot(reused);
+
+        // Exhaustion: claim every usable slot [1, MAX_TASKS); the next is None.
+        let mut held = [0usize; MAX_TASKS];
+        let mut n = 0;
+        while let Some(s) = claim_task_slot() {
+            held[n] = s;
+            n += 1;
+            assert!(n <= MAX_TASKS, "claimed more slots than exist");
+        }
+        assert_eq!(n, MAX_TASKS - 1, "exactly MAX_TASKS-1 usable slots (0 reserved)");
+        assert!(claim_task_slot().is_none(), "full bitmap must return None");
+
+        // Restore: release all and confirm the static is pristine again.
+        for &s in held.iter().take(n) {
+            release_task_slot(s);
+        }
+        for w in TASK_SLOT_BITMAP.iter() {
+            assert_eq!(w.load(Ordering::Acquire), 0, "bitmap not restored on exit");
+        }
     }
 }

@@ -708,6 +708,16 @@ pub enum ScheduleError {
     InvalidTaskState,
     TaskNotFound,
     InvalidTransition,
+    /// A caller-claimed task slot was already occupied by a live task.
+    ///
+    /// A "should never happen" state under the global slot allocator: the
+    /// reaper releases a slot's global bit only AFTER clearing the local
+    /// `tasks[slot]` entry, so a claimed-free bit implies an empty local slot.
+    /// Kept distinct from `NoReadyTasks` (exhaustion) so the spawn path can fail
+    /// SAFE — the caller must NOT release the global bit, because the slot is in
+    /// use and its bit must stay set to match the occupant. Releasing it would
+    /// hand a live slot to another CPU (duplicate `(slot, generation)`).
+    SlotOccupied,
 }
 
 impl fmt::Display for ScheduleError {
@@ -717,6 +727,7 @@ impl fmt::Display for ScheduleError {
             ScheduleError::InvalidTaskState => write!(f, "Task in invalid state"),
             ScheduleError::TaskNotFound => write!(f, "Task not found"),
             ScheduleError::InvalidTransition => write!(f, "Invalid state transition"),
+            ScheduleError::SlotOccupied => write!(f, "Task slot already occupied"),
         }
     }
 }

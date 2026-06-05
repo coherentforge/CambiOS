@@ -351,6 +351,7 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 - `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter. Not part of the lock hierarchy.
 - `AUDIT_RING` — acquired by `drain_tick()` (try_lock from BSP ISR, holds no other lock) and by `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO` handlers (two-phase protocol: never held while PROCESS_TABLE or FRAME_ALLOCATOR is held). `audit::emit()` never touches it.
 - `PER_CPU_AUDIT_BUFFER[cpu]` — lock-free SPSC; no lock at all. Written by local CPU, drained by BSP.
+- `TASK_SLOT_BITMAP` — lock-free global task-slot allocator (`claim_task_slot`/`release_task_slot`, ADR-034 Residual Risk closure); CAS only, no lock. `claim` may be called while SCHEDULER is held (it acquires no lock); `release` runs in the reaper with SCHEDULER dropped. Arbitrates the global slot namespace so concurrent cross-CPU spawns can't collide.
 
 ## Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 

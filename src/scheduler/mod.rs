@@ -294,7 +294,15 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Create and add a new task
+    /// Create and add a new task. **Test-only fixture.**
+    ///
+    /// This picks a slot by a per-CPU-local `tasks[]` scan, which is NOT a
+    /// globally-arbitrated slot (two CPUs would collide). The production spawn
+    /// path goes through `crate::claim_task_slot` + [`create_isr_task`]; this
+    /// helper exists only so unit tests can add a task without an ISR context.
+    /// `#[cfg(test)]` enforces that no production caller bypasses the global
+    /// allocator.
+    #[cfg(test)]
     pub fn create_task(
         &mut self,
         entry_point: u64,
@@ -326,33 +334,34 @@ impl Scheduler {
     /// the task starts at entry_point with RSP = stack_top.
     pub fn create_isr_task(
         &mut self,
+        slot: usize,
         entry_point: u64,
         saved_rsp: u64,
         stack_top: u64,
         priority: Priority,
     ) -> Result<TaskId, ScheduleError> {
-        // Deferred: this free-slot search scans only THIS CPU's `tasks[]`, so
-        // two CPUs spawning concurrently can claim the same slot index.
-        // Revisit when: a second concurrent cross-CPU `SYS_SPAWN` call site
-        //   exists (e.g. shell + terminal-window on different CPUs both
-        //   spawning), or an SMP stress test surfaces a duplicate
-        //   `(slot, generation)`.
-        // Why: `TASK_CPU_MAP`, `TASK_GENERATION`, migration (`accept_task`), and
-        //   ADR-034's `(slot, generation)` identity all treat the slot as a
-        //   GLOBAL namespace. A duplicate slot yields two live tasks with an
-        //   identical `TaskId` (both read the same global generation):
-        //   mis-routed cross-CPU wakes, exit-ring collisions, a defeated
-        //   generation guard, and a drop-on-floor in `migrate_task_between`.
-        //   Pre-existing — predates ADR-034 (the bare-`u32` slot already
-        //   collided); Phase B inherits the assumption without worsening it.
-        //   Today's single-shell spawner never triggers it. The fix is a global
-        //   task-slot allocator (an atomic free-list claimed before the per-CPU
-        //   insert) — a focused scheduler change with its own verification, not
-        //   a tack-on to the leak/UAF fix.
-        // Find first free slot (skip slot 0 = idle task)
-        let slot = (1..MAX_TASKS)
-            .find(|&i| self.tasks[i].is_none())
-            .ok_or(ScheduleError::NoReadyTasks)?;
+        // The slot is arbitrated by the GLOBAL allocator (`crate::claim_task_slot`)
+        // before this call, not by a per-CPU `tasks[]` scan. The slot namespace
+        // is shared across all CPUs — `TASK_CPU_MAP`, `TASK_GENERATION`, and
+        // ADR-034's `(slot, generation)` identity all index by global slot — so
+        // only a global claim guarantees two CPUs spawning concurrently never
+        // get the same slot. This method just places the task at the already
+        // claimed slot.
+        //
+        // Defensive: slot 0 is the idle task and an out-of-range slot is a
+        // caller bug (claim_task_slot only ever returns [1, MAX_TASKS)).
+        if slot == 0 || slot >= MAX_TASKS {
+            return Err(ScheduleError::NoReadyTasks);
+        }
+        // An occupied slot would mean the caller's global claim raced a
+        // still-live task — unreachable, since the reaper releases the global
+        // bit only AFTER clearing the local entry, so a claimed-free bit implies
+        // an empty local slot. Return the SlotOccupied variant (not
+        // NoReadyTasks) so the caller fails SAFE: the slot is in use, so its
+        // global bit must stay SET and must NOT be released.
+        if self.tasks[slot].is_some() {
+            return Err(ScheduleError::SlotOccupied);
+        }
 
         let task_id = TaskId::new(slot as u32, crate::task_generation(slot as u32));
         let mut task = Task::new_with_stack(task_id, entry_point, saved_rsp, stack_top, priority);
@@ -1885,7 +1894,7 @@ mod tests {
     fn test_migrate_preserves_task_properties() {
         let mut src = Scheduler::new();
         src.init().unwrap();
-        let tid = src.create_isr_task(0xDEAD, 0xBEEF, 0xCAFE, Priority::HIGH).unwrap();
+        let tid = src.create_isr_task(1, 0xDEAD, 0xBEEF, 0xCAFE, Priority::HIGH).unwrap();
 
         let mut dst = Scheduler::new();
         dst.init().unwrap();
@@ -1896,6 +1905,43 @@ mod tests {
         assert_eq!(task.priority, Priority::HIGH);
         assert_eq!(task.saved_rsp, 0xBEEF);
         assert_eq!(task.kernel_stack_top, 0xCAFE);
+    }
+
+    #[test]
+    fn test_create_isr_task_rejects_occupied_slot() {
+        // Defense-in-depth for the global slot allocator (ADR-034 Residual Risk):
+        // a slot is arbitrated globally before this call, so the occupied case is
+        // unreachable in production — but if it ever fires it must fail SAFE.
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+
+        let tid = sched
+            .create_isr_task(5, 0x1000, 0x2000, 0x3000, Priority::NORMAL)
+            .unwrap();
+        assert_eq!(tid.slot(), 5);
+
+        // A second create at the same occupied slot must return SlotOccupied
+        // (NOT NoReadyTasks), so the loader keeps the global bit SET rather than
+        // releasing an in-use slot to another CPU.
+        let err = sched
+            .create_isr_task(5, 0x4000, 0x5000, 0x6000, Priority::NORMAL)
+            .unwrap_err();
+        assert_eq!(err, ScheduleError::SlotOccupied);
+
+        // Slot 0 (idle) and out-of-range are caller bugs, not occupancy → the
+        // slot is left empty, so the loader is free to release: NoReadyTasks.
+        assert_eq!(
+            sched
+                .create_isr_task(0, 0x1000, 0x2000, 0x3000, Priority::NORMAL)
+                .unwrap_err(),
+            ScheduleError::NoReadyTasks
+        );
+        assert_eq!(
+            sched
+                .create_isr_task(MAX_TASKS, 0x1000, 0x2000, 0x3000, Priority::NORMAL)
+                .unwrap_err(),
+            ScheduleError::NoReadyTasks
+        );
     }
 
     #[test]

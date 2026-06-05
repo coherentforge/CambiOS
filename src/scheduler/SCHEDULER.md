@@ -32,7 +32,7 @@ The scheduler subsystem is three files:
 
 ### Key types (`task.rs`)
 
-- **`TaskId`** — a global slot index packed with a reuse generation (`slot` in the low 32 bits, `generation` in the high 32, mirroring `ProcessId`). Lookups are generation-validated, so a stale id whose slot was reclaimed resolves to `None` rather than the new occupant (ADR-034 Phase B). The slot is the array index into the per-CPU task array
+- **`TaskId`** — a global slot index packed with a reuse generation (`slot` in the low 32 bits, `generation` in the high 32, mirroring `ProcessId`). Lookups are generation-validated, so a stale id whose slot was reclaimed resolves to `None` rather than the new occupant (ADR-034 Phase B). The slot is the array index into the per-CPU task array, but the slot *namespace* is global and arbitrated by the lock-free `TASK_SLOT_BITMAP` allocator in `lib.rs` (`claim_task_slot` / `release_task_slot`, ADR-034 Residual Risk closure) — a slot is claimed before any per-CPU insert, so two CPUs spawning concurrently can never get the same slot
 - **`TaskState`** — five-state enum: `Ready`, `Running`, `Blocked`, `Terminated`, `Suspended`
 - **`Priority(pub u8)`** — 0–255, with named constants `IDLE=0`, `LOW=64`, `NORMAL=128`, `HIGH=192`, `CRITICAL=255`
 - **`BlockReason`** — why a task is `Blocked`: `MessageWait(EndpointId)`, `IoWait(irq)`, `TimerWait(ms)`, `SyncSendWait(ep)`, `ChildWait(child_slot)` (a parent in `SYS_WAIT_TASK`, carrying the awaited child's slot for selective wake — ADR-034 Phase B), etc.
@@ -197,6 +197,15 @@ Cross-CPU wake is mediated through `lib.rs` helpers:
 
 The IPC layer uses these helpers exclusively — there is no hardcoded `PER_CPU_SCHEDULER[0]` access for cross-CPU wake. See [ADR-001](../../docs/adr/001-smp-scheduling-and-lock-hierarchy.md) § "Wake and block primitives."
 
+### Global slot allocation
+
+The task-slot namespace is shared across every CPU's scheduler (`TASK_CPU_MAP`, `TASK_GENERATION`, and the `(slot, generation)` `TaskId` all index by global slot), so slot *selection* is global, not per-CPU. `lib.rs` holds a lock-free bitmap `TASK_SLOT_BITMAP` and two helpers (ADR-034 Residual Risk closure):
+
+- `claim_task_slot() -> Option<usize>` — CAS-claims the lowest free slot in `[1, MAX_TASKS)` (slot 0 reserved for the per-CPU idle task). The single production spawn path (`loader::load_elf_process`) claims before calling `create_isr_task(slot, …)`, so a per-CPU `tasks[]` scan can never hand two concurrently-spawning CPUs the same slot.
+- `release_task_slot(slot)` — clears the bit. Called by the per-CPU reaper **after** `reap_slot` frees the local entry and `bump_task_generation` runs, so a later claimer of the same slot observes the new generation (the release is the synchronizes-with edge). A slot stays globally claimed from spawn until reaped + bumped + released, so there is no window to reuse it with a stale generation.
+
+`create_isr_task` therefore takes an explicit, already-claimed `slot`; it no longer scans. Its defensive `Err` for an occupied slot is `ScheduleError::SlotOccupied` (distinct from exhaustion), so the loader fails safe and keeps the bit set rather than releasing an in-use slot.
+
 ## Task Migration and Load Balancing
 
 `mod.rs` exposes migration primitives (`remove_task`, `accept_task`, `migrate_task_between`, `migrate_task`) and a push-based load balancer in `lib.rs::try_load_balance()`:
@@ -227,9 +236,9 @@ These are the verification targets the scheduler is designed for. Several are ch
 
 ## Tests
 
-43 unit tests cover the scheduler:
+44 unit tests cover the scheduler:
 
-- 37 tests in `mod.rs`: scheduler creation, init, task lifecycle, schedule selection, time slice expiration, block/wake, IRQ wake, message wake, idle task immutability, remove/accept/migrate primitives, `active_runnable_count`, `pick_migratable_task`, invariants, IPC integration, and the ADR-034 Phase B slot reclaim / selective child-wake / exit-ring (`reap_slot`, `wake_child_waiter`, `TaskExitRing`)
+- 38 tests in `mod.rs`: scheduler creation, init, task lifecycle, schedule selection, time slice expiration, block/wake, IRQ wake, message wake, idle task immutability, remove/accept/migrate primitives, `active_runnable_count`, `pick_migratable_task`, invariants, IPC integration, the ADR-034 Phase B slot reclaim / selective child-wake / exit-ring (`reap_slot`, `wake_child_waiter`, `TaskExitRing`), and the ADR-034 global-allocator defensive refusal (`create_isr_task` → `SlotOccupied` on an occupied slot)
 - 6 tests in `timer.rs`: timer creation, init, configuration verification, frequency presets, tick counting, `ticks_to_ms` conversion
 
 Test layer sits on the host (`x86_64-apple-darwin`) — no QEMU dependency, no x86 hardware features. Run with:
