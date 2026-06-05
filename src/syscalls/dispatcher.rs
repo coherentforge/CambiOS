@@ -3578,6 +3578,9 @@ impl SyscallDispatcher {
         // kernel-no-trust discipline.
         let mut expected_members: [Option<(crate::ipc::Principal, ClusterRole)>;
             MAX_CLUSTER_MEMBERS] = [None; MAX_CLUSTER_MEMBERS];
+        // `i` indexes the packed wire buffer by stride (off = i * MEMBER_BYTES) and the
+        // parallel `expected_members` array; an iterator would obscure the wire layout.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..count {
             let off = i * MEMBER_BYTES;
             let mut principal_bytes = [0u8; 32];

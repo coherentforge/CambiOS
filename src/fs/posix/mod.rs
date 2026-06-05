@@ -599,6 +599,10 @@ pub fn encode_inode_header(buf: &mut Block, inode: &PosixInode) -> Result<(), In
 /// "slot is free" signal. `Occupied(...)` carries the fully-validated
 /// inode contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Copy` decode result, matched immediately; boxing `Occupied(PosixInode)` would add a
+// heap allocation to the inode-read path and break `Copy`. The `Free` variant's size is
+// a stack temporary, never stored in bulk.
+#[allow(clippy::large_enum_variant)]
 pub enum InodeHeaderState {
     Free,
     Occupied(PosixInode),
@@ -674,6 +678,9 @@ pub fn decode_inode_header(buf: &Block) -> Result<InodeHeaderState, InodeError> 
     let cow_refcount = read_u32_le(buf, INODE_OFF_COW_REFCOUNT);
 
     let mut extents = [None; MAX_EXTENTS_PER_INODE];
+    // `i` indexes a packed inode record by stride (base = OFF + i * EXTENT_PACKED_SIZE)
+    // and the parallel `extents` array; an iterator would obscure the fixed wire layout.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..extent_count {
         let base = INODE_OFF_EXTENTS + i * EXTENT_PACKED_SIZE;
         let start_lba = read_u64_le(buf, base + EXTENT_OFF_START_LBA);
@@ -682,6 +689,9 @@ pub fn decode_inode_header(buf: &Block) -> Result<InodeHeaderState, InodeError> 
     }
 
     let mut acl = [None; MAX_INODE_ACL_ENTRIES];
+    // `i` indexes a packed ACL record by stride (base = OFF + i * ACL_ENTRY_PACKED_SIZE)
+    // and the parallel `acl` array; an iterator would obscure the fixed wire layout.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..acl_count {
         let base = INODE_OFF_ACL + i * ACL_ENTRY_PACKED_SIZE;
         let mut principal = [0u8; 32];

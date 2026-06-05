@@ -919,6 +919,10 @@ pub unsafe fn scan() {
             // SAFETY: Device confirmed present; offset 0x04 is the
             // standard PCI command/status register; this is a
             // read-modify-write of architecturally-defined bits.
+            // One SAFETY comment covers the read+write pair: this is a single
+            // logical RMW of one register, and the project's policy is per-block
+            // SAFETY (Convention 1), not one unsafe op per block.
+            #[allow(clippy::multiple_unsafe_ops_per_block)]
             unsafe {
                 let cmd_status = config::read32(0, dev, func, 0x04);
                 let want = cmd_status | 0x7; // I/O + Memory + Bus Master

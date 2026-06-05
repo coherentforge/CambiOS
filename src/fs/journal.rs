@@ -212,6 +212,10 @@ pub struct LinkCountSet {
 /// The journal-replay idempotency invariant (ADR-029 § Verification
 /// Stance row 3) is a structural property of the enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Records are encoded to disk immediately, never held in a bulk array in production
+// (only test helpers collect them); boxing a variant would add allocations to the
+// journal path for no real memory saving.
+#[allow(clippy::large_enum_variant)]
 pub enum JournalRecord {
     /// Allocate a fresh inode at the given slot.
     InodeAllocate { inode: InodeId },
@@ -1578,6 +1582,9 @@ fn decode_extent_update(payload: &[u8]) -> Result<JournalRecord, JournalError> {
     }
 
     let mut new_extents = [None; MAX_EXTENTS_PER_INODE];
+    // `i` indexes a packed payload by stride (base = 16 + i * 12) and the parallel
+    // `new_extents` array; an iterator would obscure the fixed record layout.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..extent_count {
         let base = 16 + i * 12;
         let start_lba = u64::from_le_bytes(payload[base..base + 8].try_into().unwrap());

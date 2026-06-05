@@ -275,25 +275,33 @@ pub unsafe fn write_eoi() {
 // APIC timer calibration and configuration
 // ============================================================================
 
+/// PIT calibration reported a zero bus frequency, so the APIC timer reload
+/// count cannot be derived. A typed error (not `()`), per the kernel's
+/// every-failure-is-a-typed-error convention; the boot path maps it to
+/// [`crate::boot::BootError::ApicCalibrationFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApicCalibrationFailed;
+
 /// Calibrate the APIC timer against the PIT and configure periodic mode.
 ///
 /// Uses PIT Channel 0 in one-shot mode for a ~10ms calibration window.
 /// After calibration, programs the APIC timer to fire at the requested
 /// frequency on `TIMER_VECTOR`.
 ///
-/// Returns `Err(())` if PIT calibration reports a bus frequency of
-/// zero — the caller maps that to [`crate::boot::BootError::ApicCalibrationFailed`].
+/// Returns [`ApicCalibrationFailed`] if PIT calibration reports a bus
+/// frequency of zero — the caller maps that to
+/// [`crate::boot::BootError::ApicCalibrationFailed`].
 ///
 /// # Safety
 /// Must be called during single-threaded boot with interrupts disabled.
 /// PIC must be disabled first (PIT Channel 0 won't generate an IRQ).
-pub unsafe fn configure_timer(frequency_hz: u32) -> Result<(), ()> {
+pub unsafe fn configure_timer(frequency_hz: u32) -> Result<(), ApicCalibrationFailed> {
     // SAFETY: Called during single-threaded boot with interrupts disabled.
     // PIT calibration is valid at this point.
     let bus_freq = unsafe { calibrate_against_pit() };
 
     if bus_freq == 0 {
-        return Err(());
+        return Err(ApicCalibrationFailed);
     }
 
     // SAFETY: APIC_TIMER_DCR is a valid APIC register offset.

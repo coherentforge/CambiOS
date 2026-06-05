@@ -852,6 +852,9 @@ fn decode_record_header_v2(buf: &Block) -> Result<Option<HeaderDecodedV2>, Store
     let mut extents: [Option<Extent>; MAX_EXTENTS_PER_CAMBIOBJECT] =
         [None; MAX_EXTENTS_PER_CAMBIOBJECT];
     let mut saw_none = false;
+    // `i` indexes a packed on-disk record by stride (base = OFF + i * EXTENT_PACKED_SIZE)
+    // and the parallel `extents` array; an iterator would obscure the fixed wire layout.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..MAX_EXTENTS_PER_CAMBIOBJECT {
         let base = HDR_V2_OFF_EXTENTS + i * EXTENT_PACKED_SIZE;
         let start_lba = read_u64_le(buf, base + EXTENT_OFF_START_LBA);
@@ -906,6 +909,9 @@ fn decode_record_header_v2(buf: &Block) -> Result<Option<HeaderDecodedV2>, Store
 /// load-bearing structural commitment to backward compatibility:
 /// any future record version adds an arm here, and existing
 /// versions keep their decode paths.
+// Short-lived decode result, matched immediately and never held in bulk; boxing the
+// larger V2 variant would add a heap allocation to the disk-read path for no gain.
+#[allow(clippy::large_enum_variant)]
 enum DecodedHeader {
     V1(HeaderDecoded),
     V2(HeaderDecodedV2),

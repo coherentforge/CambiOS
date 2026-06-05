@@ -556,6 +556,9 @@ pub fn arm_quiesce_for_process(
     peer_pid: ipc::ProcessId,
     channel_id_raw: u64,
 ) -> Option<(scheduler::TaskId, scheduler::QuiesceArmResult)> {
+    // `cpu` is the index into PER_CPU_SCHEDULER; the explicit `0..MAX_CPUS` is the
+    // kernel's uniform per-CPU-walk idiom and makes the iteration bound visible.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..MAX_CPUS {
         let mut guard = PER_CPU_SCHEDULER[cpu].lock();
         if let Some(sched) = guard.as_mut() {
@@ -594,6 +597,9 @@ pub fn arm_quiesce_for_process(
 #[cfg(not(test))]
 pub fn wake_quiesce_for_channel(channel_id_raw: u64) -> usize {
     let mut total = 0;
+    // `cpu` is the index into PER_CPU_SCHEDULER; the explicit `0..MAX_CPUS` is the
+    // kernel's uniform per-CPU-walk idiom and makes the iteration bound visible.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..MAX_CPUS {
         let mut guard = PER_CPU_SCHEDULER[cpu].lock();
         if let Some(sched) = guard.as_mut() {
