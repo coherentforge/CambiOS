@@ -58,17 +58,16 @@ impl Pl011 {
 
     /// Write a single byte, blocking until the TX FIFO has space.
     pub fn send(&mut self, byte: u8) {
-        // SAFETY: base points to the PL011 MMIO region.
-        // We read the flag register to check TX FIFO full, then write
-        // the data register. Both are volatile MMIO accesses.
-        unsafe {
-            let fr = self.base + Self::UARTFR;
-            // Spin until TX FIFO not full
-            while core::ptr::read_volatile(fr as *const u32) & Self::UARTFR_TXFF != 0 {
-                core::hint::spin_loop();
-            }
-            core::ptr::write_volatile((self.base + Self::UARTDR) as *mut u32, byte as u32);
+        let fr = self.base + Self::UARTFR;
+        // Spin until TX FIFO not full.
+        // SAFETY: fr is the PL011 flag register (UARTFR) in the mapped MMIO
+        // region; a volatile MMIO read of a hardware status register.
+        while unsafe { core::ptr::read_volatile(fr as *const u32) } & Self::UARTFR_TXFF != 0 {
+            core::hint::spin_loop();
         }
+        // SAFETY: UARTDR is the PL011 data register in the mapped MMIO region;
+        // a volatile MMIO write.
+        unsafe { core::ptr::write_volatile((self.base + Self::UARTDR) as *mut u32, byte as u32) };
     }
 }
 
@@ -131,16 +130,16 @@ impl Ns16550 {
 
     /// Write a single byte, blocking until THR is empty.
     pub fn send(&mut self, byte: u8) {
-        // SAFETY: base points to the NS16550 MMIO region. LSR and THR
-        // are 8-bit volatile MMIO accesses.
-        unsafe {
-            let lsr = (self.base + Self::LSR) as *const u8;
-            // Spin until TX holding register empty
-            while core::ptr::read_volatile(lsr) & Self::LSR_THRE == 0 {
-                core::hint::spin_loop();
-            }
-            core::ptr::write_volatile((self.base + Self::THR) as *mut u8, byte);
+        let lsr = (self.base + Self::LSR) as *const u8;
+        // Spin until TX holding register empty.
+        // SAFETY: lsr is the NS16550 line-status register in the mapped MMIO
+        // region; an 8-bit volatile MMIO read.
+        while unsafe { core::ptr::read_volatile(lsr) } & Self::LSR_THRE == 0 {
+            core::hint::spin_loop();
         }
+        // SAFETY: THR is the NS16550 transmit holding register in the mapped
+        // MMIO region; an 8-bit volatile MMIO write.
+        unsafe { core::ptr::write_volatile((self.base + Self::THR) as *mut u8, byte) };
     }
 }
 
@@ -285,16 +284,17 @@ pub fn read_byte() -> Option<u8> {
         let serial = guard.as_mut()?;
 
         // PL011: check UARTFR.RXFE (bit 4). If clear, data is available.
-        // SAFETY: base points to the PL011 MMIO region, initialized at boot.
-        unsafe {
-            let fr = core::ptr::read_volatile((serial.base + Pl011::UARTFR) as *const u32);
-            const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
-            if fr & UARTFR_RXFE == 0 {
-                let data = core::ptr::read_volatile((serial.base + Pl011::UARTDR) as *const u32);
-                Some(data as u8)
-            } else {
-                None
-            }
+        const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
+        // SAFETY: UARTFR is the PL011 flag register in the mapped MMIO region
+        // (initialized at boot); a volatile MMIO read.
+        let fr = unsafe { core::ptr::read_volatile((serial.base + Pl011::UARTFR) as *const u32) };
+        if fr & UARTFR_RXFE == 0 {
+            // SAFETY: UARTDR is the PL011 data register in the mapped MMIO
+            // region; a volatile MMIO read.
+            let data = unsafe { core::ptr::read_volatile((serial.base + Pl011::UARTDR) as *const u32) };
+            Some(data as u8)
+        } else {
+            None
         }
     }
 
@@ -304,15 +304,16 @@ pub fn read_byte() -> Option<u8> {
         let serial = guard.as_mut()?;
 
         // NS16550: check LSR.DR (bit 0). If set, a byte is waiting in RHR.
-        // SAFETY: base points to the NS16550 MMIO region, initialized at boot.
-        unsafe {
-            let lsr = core::ptr::read_volatile((serial.base + Ns16550::LSR) as *const u8);
-            if lsr & Ns16550::LSR_DR != 0 {
-                let data = core::ptr::read_volatile((serial.base + Ns16550::THR) as *const u8);
-                Some(data)
-            } else {
-                None
-            }
+        // SAFETY: LSR is the NS16550 line-status register in the mapped MMIO
+        // region (initialized at boot); an 8-bit volatile MMIO read.
+        let lsr = unsafe { core::ptr::read_volatile((serial.base + Ns16550::LSR) as *const u8) };
+        if lsr & Ns16550::LSR_DR != 0 {
+            // SAFETY: THR/RHR is the NS16550 receive register in the mapped MMIO
+            // region; an 8-bit volatile MMIO read.
+            let data = unsafe { core::ptr::read_volatile((serial.base + Ns16550::THR) as *const u8) };
+            Some(data)
+        } else {
+            None
         }
     }
 }

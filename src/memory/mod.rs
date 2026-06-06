@@ -125,10 +125,12 @@ pub mod paging {
     #[inline]
     unsafe fn read_entry(table_phys: u64, index: usize) -> u64 {
         debug_assert!(index < ENTRIES_PER_TABLE);
-        let ptr = phys_to_virt(table_phys);
-        // SAFETY: table_phys is a valid page table frame, index is in bounds.
-        // HHDM maps the frame to a valid VA. Volatile read for hardware coherency.
-        unsafe { core::ptr::read_volatile(ptr.add(index)) }
+        // wrapping_add keeps the offset a *safe* op (index < ENTRIES_PER_TABLE per
+        // the debug_assert), leaving only the volatile read unsafe.
+        let entry_ptr = phys_to_virt(table_phys).wrapping_add(index);
+        // SAFETY: entry_ptr is the HHDM VA of PTE `index` in a valid page table
+        // frame; volatile read for hardware coherency.
+        unsafe { core::ptr::read_volatile(entry_ptr) }
     }
 
     /// Write a page table entry at a given level and index.
@@ -138,9 +140,12 @@ pub mod paging {
     #[inline]
     unsafe fn write_entry(table_phys: u64, index: usize, value: u64) {
         debug_assert!(index < ENTRIES_PER_TABLE);
-        let ptr = phys_to_virt(table_phys);
-        // SAFETY: Same as read_entry. Volatile write ensures hardware sees update.
-        unsafe { core::ptr::write_volatile(ptr.add(index), value) };
+        // wrapping_add keeps the offset a *safe* op (index < ENTRIES_PER_TABLE per
+        // the debug_assert), leaving only the volatile write unsafe.
+        let entry_ptr = phys_to_virt(table_phys).wrapping_add(index);
+        // SAFETY: entry_ptr is the HHDM VA of PTE `index` in a valid page table
+        // frame; volatile write so hardware observes the update.
+        unsafe { core::ptr::write_volatile(entry_ptr, value) };
     }
 
     /// Walk L0→L1→L2, allocating intermediate tables from `frame_alloc`
@@ -153,27 +158,31 @@ pub mod paging {
         let indices = [l0_index(va), l1_index(va), l2_index(va)];
         let mut table_phys = root_phys;
 
-        // SAFETY: Caller guarantees root_phys is a valid page table. Each
-        // iteration either descends into an existing valid table or allocates
-        // a fresh zeroed frame and installs a table descriptor.
-        unsafe {
-            for &idx in &indices {
-                let entry = read_entry(table_phys, idx);
-                if ap::pte_is_valid(entry) {
-                    table_phys = ap::pte_addr(entry);
-                } else {
-                    let frame = frame_alloc
-                        .allocate()
-                        .map_err(|_| PagingError::FrameAllocationFailed)?;
-                    // SAFETY: frame.addr is a freshly allocated frame, HHDM maps it.
+        // Caller guarantees root_phys is a valid page table; each iteration
+        // descends into an existing valid table or installs a fresh one, so
+        // table_phys is a valid page table at every step.
+        for &idx in &indices {
+            // SAFETY: table_phys is a valid page table (loop invariant above).
+            let entry = unsafe { read_entry(table_phys, idx) };
+            if ap::pte_is_valid(entry) {
+                table_phys = ap::pte_addr(entry);
+            } else {
+                let frame = frame_alloc
+                    .allocate()
+                    .map_err(|_| PagingError::FrameAllocationFailed)?;
+                // SAFETY: frame.addr is freshly allocated and HHDM-mapped, so its
+                // VA is valid for PAGE_SIZE bytes; zero it before use as a table.
+                unsafe {
                     core::ptr::write_bytes(
                         phys_to_virt(frame.addr) as *mut u8,
                         0,
                         PAGE_SIZE as usize,
                     );
-                    write_entry(table_phys, idx, ap::make_table_pte(frame.addr));
-                    table_phys = frame.addr;
                 }
+                // SAFETY: table_phys is a valid page table (loop invariant);
+                // installs a table descriptor pointing at the new frame.
+                unsafe { write_entry(table_phys, idx, ap::make_table_pte(frame.addr)) };
+                table_phys = frame.addr;
             }
         }
 
@@ -381,22 +390,26 @@ pub mod paging {
         // the next trap faults on instruction-fetch.
         #[cfg(target_arch = "riscv64")]
         {
-            // SAFETY: csrr satp is always legal from S-mode; walker
-            // reads use HHDM-mapped tables; single-writer-at-boot.
+            let satp: u64;
+            // SAFETY: `csrr satp` is always legal from S-mode; reads the
+            // active address-space root register into `satp`.
             unsafe {
-                let satp: u64;
                 core::arch::asm!(
                     "csrr {0}, satp",
                     out(reg) satp,
                     options(nostack, nomem, preserves_flags),
                 );
-                let current_root_phys = (satp & ((1u64 << 44) - 1)) << 12;
-                let src = phys_to_virt(current_root_phys) as *const u64;
-                let dst = phys_to_virt(frame.addr);
-                for i in 256..512 {
-                    let entry = core::ptr::read(src.add(i));
-                    core::ptr::write(dst.add(i), entry);
-                }
+            }
+            let current_root_phys = (satp & ((1u64 << 44) - 1)) << 12;
+            let src = phys_to_virt(current_root_phys) as *const u64;
+            let dst = phys_to_virt(frame.addr);
+            // wrapping_add keeps the offsets safe (i < 512); only the reads/
+            // writes of HHDM-mapped tables are unsafe. Single-writer-at-boot.
+            for i in 256..512 {
+                // SAFETY: src is the HHDM VA of the active page-table root.
+                let entry = unsafe { core::ptr::read(src.wrapping_add(i)) };
+                // SAFETY: dst is the HHDM VA of the freshly allocated root frame.
+                unsafe { core::ptr::write(dst.wrapping_add(i), entry) };
             }
         }
 
@@ -483,9 +496,9 @@ pub mod paging {
         // is shared kernel state on RISC-V (copied static tables) or empty
         // on AArch64 — freeing it would corrupt the global kernel map.
         for l0_idx in 0..256usize {
-            // SAFETY: l0_virt points to a 4 KiB page table with 512
-            // 8-byte entries. l0_idx < 512.
-            let l0_entry = unsafe { core::ptr::read(l0_virt.add(l0_idx)) };
+            // SAFETY: l0_virt points to a 4 KiB page table with 512 8-byte
+            // entries; l0_idx < 256 (user half) is in bounds.
+            let l0_entry = unsafe { core::ptr::read(l0_virt.wrapping_add(l0_idx)) };
             if !ap::pte_is_valid(l0_entry) || !ap::pte_is_table(l0_entry) {
                 // Either unused or a block/leaf descriptor (AArch64 1 GiB
                 // block or RISC-V gigapage) — we don't create those for
@@ -497,7 +510,7 @@ pub mod paging {
 
             for l1_idx in 0..512usize {
                 // SAFETY: same reasoning.
-                let l1_entry = unsafe { core::ptr::read(l1_virt.add(l1_idx)) };
+                let l1_entry = unsafe { core::ptr::read(l1_virt.wrapping_add(l1_idx)) };
                 if !ap::pte_is_valid(l1_entry) || !ap::pte_is_table(l1_entry) {
                     continue;
                 }
@@ -506,7 +519,7 @@ pub mod paging {
 
                 for l2_idx in 0..512usize {
                     // SAFETY: same reasoning.
-                    let l2_entry = unsafe { core::ptr::read(l2_virt.add(l2_idx)) };
+                    let l2_entry = unsafe { core::ptr::read(l2_virt.wrapping_add(l2_idx)) };
                     if !ap::pte_is_valid(l2_entry) || !ap::pte_is_table(l2_entry) {
                         continue;
                     }
@@ -561,18 +574,16 @@ pub mod paging {
     /// (TTBR1 on AArch64, upper half of `satp` on RISC-V). We have to
     /// walk the root to find their physical address.
     unsafe fn kernel_virt_to_phys(root_phys: u64, va: u64) -> Option<u64> {
-        // SAFETY: Caller guarantees root_phys is the kernel page-table
-        // root. walk_to_l3_readonly and read_entry access valid
-        // HHDM-mapped tables.
-        unsafe {
-            let l3_phys = walk_to_l3_readonly(root_phys, va)?;
-            let idx = l3_index(va);
-            let entry = read_entry(l3_phys, idx);
-            if !ap::pte_is_valid(entry) {
-                return None;
-            }
-            Some(ap::pte_addr(entry) + (va & 0xFFF))
+        // SAFETY: Caller guarantees root_phys is the kernel page-table root;
+        // walk_to_l3_readonly walks valid HHDM-mapped tables.
+        let l3_phys = unsafe { walk_to_l3_readonly(root_phys, va) }?;
+        let idx = l3_index(va);
+        // SAFETY: l3_phys is a valid page table returned by the walk above.
+        let entry = unsafe { read_entry(l3_phys, idx) };
+        if !ap::pte_is_valid(entry) {
+            return None;
         }
+        Some(ap::pte_addr(entry) + (va & 0xFFF))
     }
 
     /// Allocate one bootstrap frame (physical address). Returns None if
@@ -585,13 +596,11 @@ pub mod paging {
         if idx >= 3 {
             return None;
         }
-        // SAFETY: idx < 3 by the bounds check above. BOOTSTRAP_FRAMES is
-        // a static array; single-core boot guarantees no aliasing.
-        // kernel_virt_to_phys walks valid kernel page tables.
-        unsafe {
-            let virt = &BOOTSTRAP_FRAMES[idx] as *const _ as u64;
-            kernel_virt_to_phys(root_phys, virt)
-        }
+        // SAFETY: idx < 3 (bounds check above); single-core boot, no aliasing.
+        // `&raw const` avoids forming a reference to the `static mut`.
+        let virt = unsafe { &raw const BOOTSTRAP_FRAMES[idx] } as u64;
+        // SAFETY: kernel_virt_to_phys walks valid kernel page tables.
+        unsafe { kernel_virt_to_phys(root_phys, virt) }
     }
 
     /// Shared driver for early MMIO bring-up. Each arch's
@@ -614,39 +623,47 @@ pub mod paging {
         let hhdm_off = hhdm();
         let va = pa + hhdm_off;
 
-        // SAFETY: Caller preconditions satisfied. All accesses go
-        // through HHDM-mapped tables during single-core boot.
-        unsafe {
-            let indices = [l0_index(va), l1_index(va), l2_index(va)];
-            let mut table_phys = root_phys;
+        // Caller preconditions satisfied (see # Safety); all accesses go through
+        // HHDM-mapped tables during single-core boot.
+        let indices = [l0_index(va), l1_index(va), l2_index(va)];
+        let mut table_phys = root_phys;
 
-            for &idx in &indices {
-                let entry = read_entry(table_phys, idx);
-                if ap::pte_is_valid(entry) && ap::pte_is_table(entry) {
-                    table_phys = ap::pte_addr(entry);
-                } else {
-                    let frame_phys = bootstrap_alloc(root_phys)
-                        .ok_or("early_map_mmio: bootstrap frames exhausted")?;
+        for &idx in &indices {
+            // SAFETY: table_phys is a valid kernel page table (root_phys per the
+            // caller; each iteration descends into or installs a valid table).
+            let entry = unsafe { read_entry(table_phys, idx) };
+            if ap::pte_is_valid(entry) && ap::pte_is_table(entry) {
+                table_phys = ap::pte_addr(entry);
+            } else {
+                // SAFETY: bootstrap_alloc walks valid kernel page tables.
+                let frame_phys = unsafe { bootstrap_alloc(root_phys) }
+                    .ok_or("early_map_mmio: bootstrap frames exhausted")?;
+                // SAFETY: frame_phys is freshly allocated and HHDM-mapped; zero
+                // PAGE_SIZE bytes before use as a table.
+                unsafe {
                     core::ptr::write_bytes(
                         phys_to_virt(frame_phys) as *mut u8,
                         0,
                         PAGE_SIZE as usize,
                     );
-                    write_entry(table_phys, idx, ap::make_table_pte(frame_phys));
-                    table_phys = frame_phys;
                 }
+                // SAFETY: table_phys is a valid page table; installs a table descriptor.
+                unsafe { write_entry(table_phys, idx, ap::make_table_pte(frame_phys)) };
+                table_phys = frame_phys;
             }
-
-            let idx = l3_index(va);
-            let existing = read_entry(table_phys, idx);
-            if ap::pte_is_valid(existing) {
-                // Already mapped — tolerate (idempotent MMIO bring-up).
-                return Ok(());
-            }
-
-            write_entry(table_phys, idx, make_leaf(pa));
-            flush(va);
         }
+
+        let idx = l3_index(va);
+        // SAFETY: table_phys is the valid L2 table reached by the walk above.
+        let existing = unsafe { read_entry(table_phys, idx) };
+        if ap::pte_is_valid(existing) {
+            // Already mapped — tolerate (idempotent MMIO bring-up).
+            return Ok(());
+        }
+
+        // SAFETY: table_phys is a valid L2 table; installs the leaf PTE for `pa`.
+        unsafe { write_entry(table_phys, idx, make_leaf(pa)) };
+        flush(va);
 
         Ok(())
     }

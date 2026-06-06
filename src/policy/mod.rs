@@ -543,12 +543,14 @@ pub fn policy_check(
     let allowed = decision_val != DECISION_DENY; // 0 (timeout) and 1 (Allow) → Allow
 
     // Cache the result
-    // SAFETY: per-CPU cache access — we're running on this CPU after wake
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: per-CPU read — we're running on this CPU after wake.
     let wake_cpu = unsafe { crate::arch::x86_64::percpu::current_cpu_id() } as usize;
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: per-CPU read — we're running on this CPU after wake.
     let wake_cpu = unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
     #[cfg(target_arch = "riscv64")]
+    // SAFETY: per-CPU read — we're running on this CPU after wake.
     let wake_cpu = unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
 
     // SAFETY: per-CPU access — we are running on this CPU after wake.

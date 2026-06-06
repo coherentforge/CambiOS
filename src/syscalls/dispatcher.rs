@@ -1159,10 +1159,11 @@ impl SyscallDispatcher {
         // CRITICAL: Disable interrupts before block_task to prevent the timer
         // ISR from seeing Blocked state before yield_save_and_switch saves context.
         // See handle_recv_msg for detailed race explanation.
-        // SAFETY: Disabling interrupts is safe at kernel privilege level.
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: `cli` is safe at kernel privilege (ring 0); local to this CPU.
         unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: masking DAIF.I is safe at EL1; local to this CPU.
         unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
         {
             let mut sched_guard = crate::local_scheduler().lock();
@@ -1400,10 +1401,11 @@ impl SyscallDispatcher {
             // IrqSpinlock preserves the disabled state on drop.
             // yield_save_and_switch also does cli (redundant) then saves
             // and switches. .Lyield_resume does sti on wake.
-            // SAFETY: Disabling interrupts is safe at kernel privilege level.
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: `cli` is safe at kernel privilege (ring 0); local to this CPU.
             unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: masking DAIF.I is safe at EL1; local to this CPU.
             unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
             {
                 let mut sched_guard = crate::local_scheduler().lock();
@@ -3260,10 +3262,11 @@ impl SyscallDispatcher {
         // pattern as handle_wait_irq / handle_recv_msg — the timer
         // ISR must not see Blocked state before
         // yield_save_and_switch saves the correct context.
-        // SAFETY: kernel privilege; cli is local to this CPU.
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: `cli` is safe at kernel privilege (ring 0); local to this CPU.
         unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: masking DAIF.I is safe at EL1; local to this CPU.
         unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
         {
             let mut sched_guard = crate::local_scheduler().lock();

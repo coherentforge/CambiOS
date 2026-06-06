@@ -450,35 +450,36 @@ pub unsafe fn init_ecam(phys_base: u64, size: u64) -> Result<(), &'static str> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: Reading TTBR1_EL1 in EL1 is unconditionally valid;
-        // `kernel_root_phys` returns the physical base of the kernel
-        // page table. `map_range` walks/installs intermediate tables via
-        // the frame allocator, then writes device-memory leaf descriptors.
-        unsafe {
-            let root_phys = crate::arch::aarch64::paging::kernel_root_phys();
-            let mut pt = crate::memory::paging::page_table_from_cr3(root_phys);
+        // SAFETY: reading TTBR1_EL1 in EL1 is unconditionally valid;
+        // kernel_root_phys returns the physical base of the kernel page table.
+        let root_phys = unsafe { crate::arch::aarch64::paging::kernel_root_phys() };
+        // SAFETY: root_phys is the kernel page-table root read just above.
+        let mut pt = unsafe { crate::memory::paging::page_table_from_cr3(root_phys) };
 
-            let mut fa = crate::FRAME_ALLOCATOR.lock();
-            for page in 0..map_pages {
-                let off = page * 0x1000;
-                // Idempotent: if a prior call already mapped this page,
-                // `map_range` would report AlreadyMapped — tolerate it
-                // and continue. Any other error is a hard failure.
-                match crate::memory::paging::map_page(
+        let mut fa = crate::FRAME_ALLOCATOR.lock();
+        for page in 0..map_pages {
+            let off = page * 0x1000;
+            // Idempotent: if a prior call already mapped this page, map_page
+            // reports AlreadyMapped — tolerate it; any other error is fatal.
+            // SAFETY: pt is the kernel page table; map_page walks/installs
+            // intermediate tables via the frame allocator and writes one
+            // device-memory leaf descriptor.
+            match unsafe {
+                crate::memory::paging::map_page(
                     &mut pt,
                     virt_base + off,
                     phys_base + off,
                     crate::memory::paging::flags::kernel_rw(),
                     &mut fa,
-                ) {
-                    Ok(()) => {}
-                    Err(crate::memory::paging::PagingError::AlreadyMapped) => {}
-                    Err(_) => {
-                        return Err(
-                            "init_ecam: map_page failed — frame allocator \
-                             exhausted or invalid VA",
-                        );
-                    }
+                )
+            } {
+                Ok(()) => {}
+                Err(crate::memory::paging::PagingError::AlreadyMapped) => {}
+                Err(_) => {
+                    return Err(
+                        "init_ecam: map_page failed — frame allocator \
+                         exhausted or invalid VA",
+                    );
                 }
             }
         }
@@ -916,19 +917,15 @@ pub unsafe fn scan() {
             // read). Status is the high 16 bits of the same dword and
             // is RW1C; reading the dword and writing it back unchanged
             // preserves status bits (writes of 0 are no-ops on RW1C).
-            // SAFETY: Device confirmed present; offset 0x04 is the
-            // standard PCI command/status register; this is a
-            // read-modify-write of architecturally-defined bits.
-            // One SAFETY comment covers the read+write pair: this is a single
-            // logical RMW of one register, and the project's policy is per-block
-            // SAFETY (Convention 1), not one unsafe op per block.
-            #[allow(clippy::multiple_unsafe_ops_per_block)]
-            unsafe {
-                let cmd_status = config::read32(0, dev, func, 0x04);
-                let want = cmd_status | 0x7; // I/O + Memory + Bus Master
-                if want != cmd_status {
-                    config::write32(0, dev, func, 0x04, want);
-                }
+            // SAFETY: device confirmed present; offset 0x04 is the standard PCI
+            // command/status register; read the current command/status dword.
+            let cmd_status = unsafe { config::read32(0, dev, func, 0x04) };
+            let want = cmd_status | 0x7; // I/O + Memory + Bus Master
+            if want != cmd_status {
+                // SAFETY: same register; write back with I/O+Memory+BusMaster set.
+                // Status is the high 16 bits and is RW1C, so writing the read-back
+                // value unchanged (0s) preserves it.
+                unsafe { config::write32(0, dev, func, 0x04, want) };
             }
 
             // SAFETY: `count < MAX_PCI_DEVICES` guaranteed by the check above.
@@ -1073,18 +1070,18 @@ pub unsafe fn register_virtio_mmio(phys_base: u64, size: u64) -> bool {
     // SAFETY: caller guarantees this region is HHDM-mapped and maps to
     // real virtio-mmio hardware. Volatile 32-bit reads are the
     // spec-defined access width.
-    let magic = unsafe { core::ptr::read_volatile(vbase.byte_add(MAGIC_OFFSET)) };
+    let magic = unsafe { core::ptr::read_volatile(vbase.wrapping_byte_add(MAGIC_OFFSET)) };
     if magic != EXPECTED_MAGIC {
         return false;
     }
     // SAFETY: same as above.
-    let version = unsafe { core::ptr::read_volatile(vbase.byte_add(VERSION_OFFSET)) };
+    let version = unsafe { core::ptr::read_volatile(vbase.wrapping_byte_add(VERSION_OFFSET)) };
     if version != EXPECTED_VERSION_LEGACY {
         return false;
     }
     // SAFETY: same as above.
     let virtio_id =
-        unsafe { core::ptr::read_volatile(vbase.byte_add(VIRTIO_MMIO_DEVICE_ID_OFFSET)) };
+        unsafe { core::ptr::read_volatile(vbase.wrapping_byte_add(VIRTIO_MMIO_DEVICE_ID_OFFSET)) };
     if virtio_id == 0 {
         // QEMU advertises 8 virtio-mmio slots at fixed addresses and
         // reports `DeviceID == 0` for unpopulated ones. That is not an
