@@ -687,8 +687,10 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
 
     // Read ELR_EL1 (faulting PC) from the saved frame
     let frame = saved_sp as *const u64;
-    // SAFETY: saved_sp points to SavedContext; ELR_EL1 is at offset 248 (index 31).
-    let elr = unsafe { core::ptr::read_volatile(frame.add(31)) };
+    // SAFETY: saved_sp points to SavedContext; ELR_EL1 is at index 31
+    // (offset 248). wrapping_add keeps the offset arithmetic safe, leaving the
+    // volatile read as the sole unsafe op.
+    let elr = unsafe { core::ptr::read_volatile(frame.wrapping_add(31)) };
 
     let ec_name = match ec {
         0x20 => "Instruction Abort (EL0)",
@@ -867,22 +869,22 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
-            // SAFETY: Reading TTBR0_EL1 is always safe at EL1.
-            // Writing TTBR0_EL1 switches the user address space; the
-            // hint.page_table_root was validated by the scheduler.
+            let current_ttbr0: u64;
+            // SAFETY: reading TTBR0_EL1 is always safe at EL1.
             unsafe {
-                let current_ttbr0: u64;
                 core::arch::asm!(
                     "mrs {0}, ttbr0_el1",
                     out(reg) current_ttbr0,
                     options(nostack, nomem),
                 );
-                if current_ttbr0 != hint.page_table_root {
-                    // SAFETY: hint.page_table_root is a valid user page table
-                    // physical address. After writing TTBR0_EL1, we must
-                    // invalidate TLB entries to flush stale translations from
-                    // the previous address space. Without this, the CPU may
-                    // use cached translations and fault on valid pages.
+            }
+            if current_ttbr0 != hint.page_table_root {
+                // SAFETY: hint.page_table_root is a valid user page table
+                // physical address (validated by the scheduler). After writing
+                // TTBR0_EL1, we must invalidate TLB entries to flush stale
+                // translations from the previous address space. Without this,
+                // the CPU may use cached translations and fault on valid pages.
+                unsafe {
                     core::arch::asm!(
                         "msr ttbr0_el1, {0}",
                         "isb",
@@ -963,14 +965,18 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
     let frame = saved_sp as *const u64;
 
     // SAFETY: frame points to the SavedContext with 31 u64 GPRs starting at
-    // offset 0. x8 is at index 8, x0-x5 at indices 0-5.
-    let syscall_num = unsafe { core::ptr::read_volatile(frame.add(8)) };  // x8
-    let arg1 = unsafe { core::ptr::read_volatile(frame.add(0)) };         // x0
-    let arg2 = unsafe { core::ptr::read_volatile(frame.add(1)) };         // x1
-    let arg3 = unsafe { core::ptr::read_volatile(frame.add(2)) };         // x2
-    let arg4 = unsafe { core::ptr::read_volatile(frame.add(3)) };         // x3
-    let arg5 = unsafe { core::ptr::read_volatile(frame.add(4)) };         // x4
-    let arg6 = unsafe { core::ptr::read_volatile(frame.add(5)) };         // x5
+    // offset 0, so the first 9 (x0..x8) are in-bounds and 8-byte aligned. One
+    // volatile read of the block preserves the no-elide/no-reorder guarantee;
+    // the subsequent indexing is safe. Only x0..x5 (args) and x8 (syscall
+    // number) are consumed; x6/x7 are read into the array but left unused.
+    let gprs: [u64; 9] = unsafe { core::ptr::read_volatile(frame as *const [u64; 9]) };
+    let syscall_num = gprs[8]; // x8
+    let arg1 = gprs[0];        // x0
+    let arg2 = gprs[1];        // x1
+    let arg3 = gprs[2];        // x2
+    let arg4 = gprs[3];        // x3
+    let arg5 = gprs[4];        // x4
+    let arg6 = gprs[5];        // x5
 
     use crate::syscalls::{SyscallArgs, SyscallError};
     use crate::syscalls::dispatcher::{SyscallContext, SyscallDispatcher};
@@ -1203,19 +1209,20 @@ extern "C" fn yield_inner(current_sp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
-            // SAFETY: Reading TTBR0_EL1 is always safe at EL1. Writing
-            // TTBR0_EL1 switches user page tables; hint.page_table_root
-            // was validated by the scheduler. Interrupts are disabled.
+            let current_ttbr0: u64;
+            // SAFETY: reading TTBR0_EL1 is always safe at EL1.
             unsafe {
-                let current_ttbr0: u64;
                 core::arch::asm!(
                     "mrs {0}, ttbr0_el1",
                     out(reg) current_ttbr0,
                     options(nostack, nomem),
                 );
-                if current_ttbr0 != hint.page_table_root {
-                    // SAFETY: hint.page_table_root is a valid user page table
-                    // physical address. TLB invalidation required after switch.
+            }
+            if current_ttbr0 != hint.page_table_root {
+                // SAFETY: hint.page_table_root is a valid user page table
+                // physical address (validated by the scheduler). TLB
+                // invalidation required after the switch. Interrupts disabled.
+                unsafe {
                     core::arch::asm!(
                         "msr ttbr0_el1, {0}",
                         "isb",

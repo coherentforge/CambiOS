@@ -50,18 +50,21 @@ pub fn shootdown_range(virt_start: u64, num_pages: usize) {
         shootdown_all();
         return;
     }
-    // SAFETY: Each TLBI is safe from EL1. We batch all invalidations
-    // before a single DSB ISH + ISB.
-    unsafe {
-        for i in 0..num_pages {
-            let addr = virt_start + (i as u64) * (1 << PAGE_SHIFT);
-            let operand = addr >> PAGE_SHIFT;
+    // Batch all per-page invalidations, then a single DSB ISH + ISB.
+    for i in 0..num_pages {
+        let addr = virt_start + (i as u64) * (1 << PAGE_SHIFT);
+        let operand = addr >> PAGE_SHIFT;
+        // SAFETY: TLBI vale1is is safe from EL1; operand is the VA in VPN form.
+        unsafe {
             core::arch::asm!(
                 "tlbi vale1is, {0}",
                 in(reg) operand,
                 options(nostack),
             );
         }
+    }
+    // SAFETY: DSB/ISB are always safe from EL1; completes the TLB invalidation.
+    unsafe {
         core::arch::asm!(
             "dsb ish",
             "isb",

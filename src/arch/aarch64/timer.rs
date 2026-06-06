@@ -116,18 +116,21 @@ pub unsafe fn init(frequency_hz: u32) -> Result<(), crate::boot::BootError> {
     // Record boot timestamp
     BOOT_COUNTER.store(read_counter(), Ordering::Release);
 
-    // SAFETY: Writing CNTP_TVAL_EL0 and CNTP_CTL_EL0 from EL1 during boot
-    // with interrupts masked is safe. This is the standard ARM Generic Timer
-    // init sequence.
+    // Standard ARM Generic Timer init sequence; interrupts masked during boot.
+
+    // Set the countdown value.
+    // SAFETY: writing CNTP_TVAL_EL0 from EL1 is safe.
     unsafe {
-        // Set the countdown value
         core::arch::asm!(
             "msr cntp_tval_el0, {0}",
             in(reg) reload as u64,
             options(nostack, nomem),
         );
+    }
 
-        // Enable the timer: CNTP_CTL_EL0 bit[0]=ENABLE, bit[1]=IMASK(0=unmask)
+    // Enable the timer: CNTP_CTL_EL0 bit[0]=ENABLE, bit[1]=IMASK(0=unmask).
+    // SAFETY: writing CNTP_CTL_EL0 from EL1 is safe.
+    unsafe {
         core::arch::asm!(
             "mov {tmp}, #1",
             "msr cntp_ctl_el0, {tmp}",
@@ -179,17 +182,21 @@ pub unsafe fn init_ap() -> Result<(), crate::boot::BootError> {
         return Err(crate::boot::BootError::TimerInvariantViolation);
     }
 
-    // SAFETY: Writing CNTP_TVAL_EL0 and CNTP_CTL_EL0 from EL1 during AP
-    // startup with interrupts masked is safe.
+    // AP timer init; interrupts masked during AP startup.
+
+    // Set countdown.
+    // SAFETY: writing CNTP_TVAL_EL0 from EL1 is safe.
     unsafe {
-        // Set countdown
         core::arch::asm!(
             "msr cntp_tval_el0, {0}",
             in(reg) reload,
             options(nostack, nomem),
         );
+    }
 
-        // Enable
+    // Enable.
+    // SAFETY: writing CNTP_CTL_EL0 from EL1 is safe.
+    unsafe {
         core::arch::asm!(
             "mov {tmp}, #1",
             "msr cntp_ctl_el0, {tmp}",

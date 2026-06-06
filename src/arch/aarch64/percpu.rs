@@ -65,6 +65,9 @@ pub struct PerCpu {
 // Sync for compilation, but each element is only mutated by its owning CPU
 // during single-threaded init (init_bsp/init_ap).
 unsafe impl Send for PerCpu {}
+// SAFETY: Same as the Send impl above — each PerCpu instance is touched only by
+// its owning CPU (via TPIDR_EL1), so there is no concurrent shared access that
+// would need synchronization.
 unsafe impl Sync for PerCpu {}
 
 impl PerCpu {
@@ -158,16 +161,21 @@ pub fn cpu_count() -> u32 {
 /// # Safety
 /// Must be called once during single-threaded boot on the BSP.
 pub unsafe fn init_bsp(mpidr_aff: u64) {
-    // SAFETY: Single-threaded boot, no concurrent access to PER_CPU_DATA[0].
-    // Writing TPIDR_EL1 from EL1 is always safe. percpu has 'static lifetime.
-    unsafe {
-        let percpu = &raw mut PER_CPU_DATA[0];
-        (*percpu).self_ptr = percpu as *const PerCpu;
-        (*percpu).cpu_id = 0;
-        (*percpu).mpidr_aff = mpidr_aff;
-        (*percpu).current_task_id = 0;
-        (*percpu).interrupt_depth = 0;
+    // SAFETY: single-threaded boot; forms a raw pointer to the BSP's slot in
+    // the static-mut per-CPU array (indexing a static mut is the unsafe op).
+    let percpu = unsafe { &raw mut PER_CPU_DATA[0] };
 
+    // SAFETY: percpu is a valid, uniquely-owned 'static slot (single-threaded
+    // boot, no concurrent access); reborrow it as &mut for the field init.
+    let slot = unsafe { &mut *percpu };
+    slot.self_ptr = percpu as *const PerCpu;
+    slot.cpu_id = 0;
+    slot.mpidr_aff = mpidr_aff;
+    slot.current_task_id = 0;
+    slot.interrupt_depth = 0;
+
+    // SAFETY: writing TPIDR_EL1 from EL1 is always permitted.
+    unsafe {
         core::arch::asm!(
             "msr tpidr_el1, {0}",
             in(reg) percpu as u64,
@@ -186,16 +194,22 @@ pub unsafe fn init_bsp(mpidr_aff: u64) {
 pub unsafe fn init_ap(cpu_index: usize, mpidr_aff: u64) {
     assert!(cpu_index > 0 && cpu_index < MAX_CPUS, "AP cpu_index out of range");
 
-    // SAFETY: Each AP initializes only its own PER_CPU_DATA slot.
-    // Writing TPIDR_EL1 from EL1 on this AP is safe.
-    unsafe {
-        let percpu = &raw mut PER_CPU_DATA[cpu_index];
-        (*percpu).self_ptr = percpu as *const PerCpu;
-        (*percpu).cpu_id = cpu_index as u32;
-        (*percpu).mpidr_aff = mpidr_aff;
-        (*percpu).current_task_id = 0;
-        (*percpu).interrupt_depth = 0;
+    // SAFETY: forms a raw pointer to this AP's own slot in the static-mut
+    // per-CPU array (indexing a static mut is the unsafe op). cpu_index was
+    // bounds-checked above.
+    let percpu = unsafe { &raw mut PER_CPU_DATA[cpu_index] };
 
+    // SAFETY: percpu is a valid, uniquely-owned 'static slot — each AP
+    // initializes only its own slot; reborrow it as &mut for the field init.
+    let slot = unsafe { &mut *percpu };
+    slot.self_ptr = percpu as *const PerCpu;
+    slot.cpu_id = cpu_index as u32;
+    slot.mpidr_aff = mpidr_aff;
+    slot.current_task_id = 0;
+    slot.interrupt_depth = 0;
+
+    // SAFETY: writing TPIDR_EL1 from EL1 on this AP is safe.
+    unsafe {
         core::arch::asm!(
             "msr tpidr_el1, {0}",
             in(reg) percpu as u64,
@@ -217,16 +231,17 @@ pub unsafe fn init_ap(cpu_index: usize, mpidr_aff: u64) {
 #[inline(always)]
 pub unsafe fn current_percpu() -> &'static PerCpu {
     let ptr: u64;
-    // SAFETY: TPIDR_EL1 was set to a valid PerCpu pointer during init.
-    // The pointed-to data has 'static lifetime (lives in PER_CPU_DATA array).
+    // SAFETY: reading TPIDR_EL1 is always safe at EL1.
     unsafe {
         core::arch::asm!(
             "mrs {0}, tpidr_el1",
             out(reg) ptr,
             options(nostack, readonly, preserves_flags),
         );
-        &*(ptr as *const PerCpu)
     }
+    // SAFETY: TPIDR_EL1 was set to a valid PerCpu pointer during init; the
+    // pointed-to data has 'static lifetime (lives in PER_CPU_DATA array).
+    unsafe { &*(ptr as *const PerCpu) }
 }
 
 /// Get the current CPU's PerCpu data (mutable).
@@ -238,16 +253,17 @@ pub unsafe fn current_percpu() -> &'static PerCpu {
 #[inline(always)]
 pub unsafe fn current_percpu_mut() -> &'static mut PerCpu {
     let ptr: u64;
-    // SAFETY: Same as current_percpu; additionally, caller guarantees
-    // exclusive access (e.g., interrupts masked or in ISR context).
+    // SAFETY: reading TPIDR_EL1 is always safe at EL1.
     unsafe {
         core::arch::asm!(
             "mrs {0}, tpidr_el1",
             out(reg) ptr,
             options(nostack, readonly, preserves_flags),
         );
-        &mut *(ptr as *mut PerCpu)
     }
+    // SAFETY: TPIDR_EL1 was set to a valid PerCpu pointer during init (data is
+    // 'static); caller guarantees exclusive access (interrupts masked / ISR).
+    unsafe { &mut *(ptr as *mut PerCpu) }
 }
 
 #[cfg(test)]

@@ -204,41 +204,45 @@ pub unsafe fn early_map_mmio(phys_addr: u64) -> Result<(), &'static str> {
     // we supply the root, the leaf descriptor, and the VA-targeted TLB
     // invalidation.
     let pa = phys_addr & !0xFFF;
-    // SAFETY: Caller guarantees HHDM is set and phys_addr is valid MMIO.
-    // The shared helper reads/writes HHDM-mapped page tables under
-    // single-core boot.
-    unsafe {
-        crate::memory::paging::early_map_mmio_arch(
-            pa,
-            kernel_root_phys(),
-            |pa_frame| {
-                // Kernel RW + Device-nGnRnE + UXN + PXN + AF + ISH + valid + "page"
-                pa_frame
-                    | DESC_VALID
-                    | DESC_TABLE
-                    | DESC_AF
-                    | DESC_ISH
-                    | DESC_ATTR_DEVICE
-                    | DESC_PXN
-                    | DESC_UXN
-            },
-            |va| {
-                // Per-VA TLB invalidate + barrier pair.
-                // SAFETY: vale1is is broadcast-capable and safe from
-                // EL1; the VA argument is shifted to the VPN form TLBI
-                // expects. Closure body inherits the enclosing
-                // `unsafe` in `early_map_mmio` — single-core boot, EL1.
-                core::arch::asm!(
-                    "dsb ishst",
-                    "tlbi vale1is, {va}",
-                    "dsb ish",
-                    "isb",
-                    va = in(reg) va >> 12,
-                    options(nostack),
-                );
-            },
-        )
-    }
+
+    // SAFETY: Caller guarantees HHDM is set; reads this CPU's root page-table
+    // physical address.
+    let root = unsafe { kernel_root_phys() };
+
+    // Leaf descriptor: Kernel RW + Device-nGnRnE + UXN + PXN + AF + ISH +
+    // valid + "page". Pure arithmetic — no unsafe.
+    let make_leaf = |pa_frame: u64| {
+        pa_frame
+            | DESC_VALID
+            | DESC_TABLE
+            | DESC_AF
+            | DESC_ISH
+            | DESC_ATTR_DEVICE
+            | DESC_PXN
+            | DESC_UXN
+    };
+
+    // Per-VA TLB invalidate + barrier pair. Defined outside the early-map
+    // `unsafe` block so its asm carries its own (necessary) unsafe rather than
+    // leaning on the enclosing block.
+    let flush = |va: u64| {
+        // SAFETY: vale1is is broadcast-capable and safe from EL1; the VA
+        // argument is shifted to the VPN form TLBI expects. Single-core boot, EL1.
+        unsafe {
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vale1is, {va}",
+                "dsb ish",
+                "isb",
+                va = in(reg) va >> 12,
+                options(nostack),
+            );
+        }
+    };
+
+    // SAFETY: Caller guarantees HHDM is set and phys_addr is valid MMIO. The
+    // shared helper reads/writes HHDM-mapped page tables under single-core boot.
+    unsafe { crate::memory::paging::early_map_mmio_arch(pa, root, make_leaf, flush) }
 }
 
 // ============================================================================

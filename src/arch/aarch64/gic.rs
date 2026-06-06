@@ -131,10 +131,12 @@ pub fn read_cpu_id() -> u32 {
 /// # Safety
 /// Must be called once per CPU during boot with interrupts masked.
 pub unsafe fn init() {
-    // SAFETY: All system register accesses below are from EL1 during boot with
-    // interrupts masked. This is the standard GICv3 CPU interface init sequence.
+    // Standard GICv3 CPU interface init sequence; from EL1 during boot with
+    // interrupts masked.
+
+    // Enable system register access (ICC_SRE_EL1.SRE = 1).
+    // SAFETY: ICC_SRE_EL1 access is safe from EL1.
     unsafe {
-        // Enable system register access (ICC_SRE_EL1.SRE = 1)
         core::arch::asm!(
             "mrs {tmp}, S3_0_C12_C12_5",  // ICC_SRE_EL1
             "orr {tmp}, {tmp}, #1",        // Set SRE bit
@@ -142,17 +144,23 @@ pub unsafe fn init() {
             "isb",
             tmp = out(reg) _,
         );
+    }
 
-        // Set priority mask to lowest priority (accept all interrupts)
-        // ICC_PMR_EL1 = 0xFF
+    // Set priority mask to lowest priority (accept all interrupts).
+    // ICC_PMR_EL1 = 0xFF.
+    // SAFETY: ICC_PMR_EL1 write is safe from EL1.
+    unsafe {
         core::arch::asm!(
             "mov {tmp}, #0xFF",
             "msr S3_0_C4_C6_0, {tmp}",    // ICC_PMR_EL1
             tmp = out(reg) _,
             options(nostack, nomem),
         );
+    }
 
-        // Enable Group 1 interrupts (ICC_IGRPEN1_EL1 = 1)
+    // Enable Group 1 interrupts (ICC_IGRPEN1_EL1 = 1).
+    // SAFETY: ICC_IGRPEN1_EL1 write is safe from EL1.
+    unsafe {
         core::arch::asm!(
             "mov {tmp}, #1",
             "msr S3_0_C12_C12_7, {tmp}",  // ICC_IGRPEN1_EL1
@@ -283,40 +291,39 @@ unsafe fn gicr_write(cpu_id: u32, offset: usize, value: u32) {
 pub unsafe fn init_distributor(gicd_base: u64) {
     GICD_BASE.store(gicd_base, Ordering::Release);
 
-    // SAFETY: GICD MMIO is mapped and valid. All gicd_read/gicd_write and
-    // write_volatile calls below access valid GICD registers. Called once
-    // during single-threaded boot.
-    unsafe {
-        // Disable distributor while configuring
-        gicd_write(GICD_CTLR, 0);
+    // GICD MMIO is mapped and valid; every call below targets a valid GICD
+    // register. Called once during single-threaded boot.
 
-        // Read number of supported IRQ lines
-        let typer = gicd_read(GICD_TYPER);
-        let num_irqs = ((typer & 0x1F) + 1) * 32;
-        crate::println!("  GIC Distributor: {} IRQ lines", num_irqs);
+    // SAFETY: GICD mapped; disable the distributor while configuring it.
+    unsafe { gicd_write(GICD_CTLR, 0); }
 
-        // Set all SPI priorities to 0xA0 (default, lower than SGI/PPI)
-        // SPIs start at INTID 32, priorities are byte-addressable
-        let mut i = 32u32;
-        while i < num_irqs {
-            let offset = GICD_IPRIORITYR + (i as usize);
-            core::ptr::write_volatile(
-                (gicd_base as usize + offset) as *mut u8,
-                0xA0,
-            );
-            i += 1;
-        }
+    // Read number of supported IRQ lines.
+    // SAFETY: GICD mapped; GICD_TYPER is a read-only ID register.
+    let typer = unsafe { gicd_read(GICD_TYPER) };
+    let num_irqs = ((typer & 0x1F) + 1) * 32;
+    crate::println!("  GIC Distributor: {} IRQ lines", num_irqs);
 
-        // Disable all SPIs initially
-        i = 1; // Register 0 is SGI/PPI (handled by GICR)
-        while i < num_irqs / 32 {
-            gicd_write(GICD_ICENABLER + (i as usize) * 4, 0xFFFF_FFFF);
-            i += 1;
-        }
-
-        // Enable distributor: ARE (bit 4) + EnableGrp1NS (bit 1)
-        gicd_write(GICD_CTLR, (1 << 4) | (1 << 1));
+    // Set all SPI priorities to 0xA0 (default, lower than SGI/PPI).
+    // SPIs start at INTID 32, priorities are byte-addressable.
+    let mut i = 32u32;
+    while i < num_irqs {
+        let offset = GICD_IPRIORITYR + (i as usize);
+        let prio_ptr = (gicd_base as usize + offset) as *mut u8;
+        // SAFETY: GICD mapped; offset is within the SPI priority byte range.
+        unsafe { core::ptr::write_volatile(prio_ptr, 0xA0); }
+        i += 1;
     }
+
+    // Disable all SPIs initially.
+    i = 1; // Register 0 is SGI/PPI (handled by GICR)
+    while i < num_irqs / 32 {
+        // SAFETY: GICD mapped; ICENABLER register index is within range.
+        unsafe { gicd_write(GICD_ICENABLER + (i as usize) * 4, 0xFFFF_FFFF); }
+        i += 1;
+    }
+
+    // SAFETY: GICD mapped; enable ARE (bit 4) + EnableGrp1NS (bit 1).
+    unsafe { gicd_write(GICD_CTLR, (1 << 4) | (1 << 1)); }
 }
 
 /// Initialize the GIC Redistributor for a specific CPU.
@@ -330,48 +337,51 @@ pub unsafe fn init_redistributor(gicr_base: u64, cpu_id: u32) {
         GICR_BASE.store(gicr_base, Ordering::Release);
     }
 
-    // SAFETY: GICR MMIO is mapped and valid. All gicr_read/gicr_write and
-    // write_volatile calls below access valid per-CPU GICR registers.
-    // Called once per CPU during boot.
-    unsafe {
-        // Wake the redistributor (clear ProcessorSleep bit[1])
-        let waker = gicr_read(cpu_id, GICR_WAKER);
-        gicr_write(cpu_id, GICR_WAKER, waker & !(1 << 1));
+    // GICR MMIO is mapped and valid; every call below targets a valid per-CPU
+    // GICR register. Called once per CPU during boot.
 
-        // Wait for ChildrenAsleep (bit[2]) to clear
-        while gicr_read(cpu_id, GICR_WAKER) & (1 << 2) != 0 {
-            core::hint::spin_loop();
-        }
+    // Wake the redistributor (clear ProcessorSleep bit[1]).
+    // SAFETY: GICR mapped; GICR_WAKER is a valid per-CPU register.
+    let waker = unsafe { gicr_read(cpu_id, GICR_WAKER) };
+    // SAFETY: GICR mapped; clear ProcessorSleep on this CPU's redistributor.
+    unsafe { gicr_write(cpu_id, GICR_WAKER, waker & !(1 << 1)); }
 
-        // Put all SGIs/PPIs into Group 1 Non-Secure. GICR_IGROUPR0 is
-        // RES0 on secure-only systems, but on QEMU virt (two-security-
-        // state GICv3) bit N == 0 routes INTID N through Group 0
-        // (secure FIQ), which never reaches ICC_IAR1_EL1 at EL1-NS.
-        // The BSP tends to come up with bits already set by firmware;
-        // APs on QEMU virt do NOT. Explicitly assigning here makes the
-        // AP timer PPI (30) deliverable on every CPU.
-        gicr_write(cpu_id, GICR_IGROUPR0, 0xFFFF_FFFF);
-        // GICR_IGRPMODR0 = 0 keeps the assignment as Group 1 NS (not
-        // Group 1 Secure). 0 is the reset value; written explicitly
-        // for determinism since GICR_IGROUPR0 × GICR_IGRPMODR0 encodes
-        // the final group.
-        gicr_write(cpu_id, GICR_IGRPMODR0, 0x0);
-
-        // Set PPI 30 (timer) priority to 0x80 (higher than SPIs)
-        let timer_prio_offset = GICR_IPRIORITYR + 30;
-        let cpu_base = gicr_base as usize + (cpu_id as usize) * 0x20000;
-        core::ptr::write_volatile(
-            (cpu_base + timer_prio_offset) as *mut u8,
-            0x80,
-        );
-
-        // Enable PPI 30 (ARM Generic Timer) in the redistributor.
-        // GICR_ISENABLER0 is write-1-to-set — writing a single bit is
-        // sufficient and avoids accidentally re-enabling stale PPIs
-        // that another boot stage left in ISENABLER0 (the previous
-        // read-modify-write was harmless but imprecise).
-        gicr_write(cpu_id, GICR_ISENABLER0, 1 << 30);
+    // Wait for ChildrenAsleep (bit[2]) to clear.
+    // SAFETY: GICR mapped; GICR_WAKER is a valid per-CPU register.
+    while unsafe { gicr_read(cpu_id, GICR_WAKER) } & (1 << 2) != 0 {
+        core::hint::spin_loop();
     }
+
+    // Put all SGIs/PPIs into Group 1 Non-Secure. GICR_IGROUPR0 is
+    // RES0 on secure-only systems, but on QEMU virt (two-security-
+    // state GICv3) bit N == 0 routes INTID N through Group 0
+    // (secure FIQ), which never reaches ICC_IAR1_EL1 at EL1-NS.
+    // The BSP tends to come up with bits already set by firmware;
+    // APs on QEMU virt do NOT. Explicitly assigning here makes the
+    // AP timer PPI (30) deliverable on every CPU.
+    // SAFETY: GICR mapped; route SGIs/PPIs to Group 1 NS on this CPU.
+    unsafe { gicr_write(cpu_id, GICR_IGROUPR0, 0xFFFF_FFFF); }
+    // GICR_IGRPMODR0 = 0 keeps the assignment as Group 1 NS (not
+    // Group 1 Secure). 0 is the reset value; written explicitly
+    // for determinism since GICR_IGROUPR0 × GICR_IGRPMODR0 encodes
+    // the final group.
+    // SAFETY: GICR mapped; keep the group assignment as Group 1 NS.
+    unsafe { gicr_write(cpu_id, GICR_IGRPMODR0, 0x0); }
+
+    // Set PPI 30 (timer) priority to 0x80 (higher than SPIs).
+    let timer_prio_offset = GICR_IPRIORITYR + 30;
+    let cpu_base = gicr_base as usize + (cpu_id as usize) * 0x20000;
+    let prio_ptr = (cpu_base + timer_prio_offset) as *mut u8;
+    // SAFETY: GICR mapped; prio_ptr is this CPU's PPI-30 priority byte.
+    unsafe { core::ptr::write_volatile(prio_ptr, 0x80); }
+
+    // Enable PPI 30 (ARM Generic Timer) in the redistributor.
+    // GICR_ISENABLER0 is write-1-to-set — writing a single bit is
+    // sufficient and avoids accidentally re-enabling stale PPIs
+    // that another boot stage left in ISENABLER0 (the previous
+    // read-modify-write was harmless but imprecise).
+    // SAFETY: GICR mapped; ISENABLER0 write-1-to-set enables PPI 30.
+    unsafe { gicr_write(cpu_id, GICR_ISENABLER0, 1 << 30); }
 
     crate::println!("  GIC Redistributor: CPU {} woken, PPI 30 enabled", cpu_id);
 }
@@ -408,16 +418,15 @@ pub unsafe fn set_spi_trigger(intid: u32, edge: bool) {
     debug_assert!((32..1020).contains(&intid));
     let reg_idx = (intid / 16) as usize;
     let bit_offset = (intid % 16) * 2 + 1;
-    // SAFETY: GICD is initialized and intid is a valid SPI range.
-    unsafe {
-        let mut val = gicd_read(GICD_ICFGR + reg_idx * 4);
-        if edge {
-            val |= 1 << bit_offset;
-        } else {
-            val &= !(1 << bit_offset);
-        }
-        gicd_write(GICD_ICFGR + reg_idx * 4, val);
+    // SAFETY: GICD initialized; ICFGR register index in range for this SPI.
+    let mut val = unsafe { gicd_read(GICD_ICFGR + reg_idx * 4) };
+    if edge {
+        val |= 1 << bit_offset;
+    } else {
+        val &= !(1 << bit_offset);
     }
+    // SAFETY: GICD initialized; write back the modified ICFGR word.
+    unsafe { gicd_write(GICD_ICFGR + reg_idx * 4, val); }
 }
 
 #[cfg(test)]

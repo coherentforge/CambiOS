@@ -461,18 +461,15 @@ pub unsafe fn init_ecam(phys_base: u64, size: u64) -> Result<(), &'static str> {
             let off = page * 0x1000;
             // Idempotent: if a prior call already mapped this page, map_page
             // reports AlreadyMapped — tolerate it; any other error is fatal.
-            // SAFETY: pt is the kernel page table; map_page walks/installs
-            // intermediate tables via the frame allocator and writes one
-            // device-memory leaf descriptor.
-            match unsafe {
-                crate::memory::paging::map_page(
-                    &mut pt,
-                    virt_base + off,
-                    phys_base + off,
-                    crate::memory::paging::flags::kernel_rw(),
-                    &mut fa,
-                )
-            } {
+            // map_page (a safe fn) walks/installs intermediate tables via the
+            // frame allocator and writes one device-memory leaf descriptor.
+            match crate::memory::paging::map_page(
+                &mut pt,
+                virt_base + off,
+                phys_base + off,
+                crate::memory::paging::flags::kernel_rw(),
+                &mut fa,
+            ) {
                 Ok(()) => {}
                 Err(crate::memory::paging::PagingError::AlreadyMapped) => {}
                 Err(_) => {

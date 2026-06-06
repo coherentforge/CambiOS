@@ -74,7 +74,7 @@ src/arch/aarch64/mod.rs:78:placeholder
 src/arch/aarch64/mod.rs:80:placeholder
 src/arch/aarch64/mod.rs:82:placeholder
 src/arch/aarch64/mod.rs:434:placeholder
-src/arch/aarch64/mod.rs:1027:eventually
+src/arch/aarch64/mod.rs:1033:eventually
 src/arch/riscv64/mod.rs:70:placeholder
 src/arch/riscv64/mod.rs:72:placeholder
 src/arch/riscv64/mod.rs:74:placeholder
