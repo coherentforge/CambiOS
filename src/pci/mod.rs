@@ -404,7 +404,7 @@ mod config {
 ///      visible, or an MCFG/DTB parser surfaces more than one
 ///      `bus_start..bus_end` range). See docs/ASSUMPTIONS.md.
 #[cfg(not(target_arch = "x86_64"))]
-const ECAM_MAP_BYTES: u64 = 1 * 1024 * 1024;
+const ECAM_MAP_BYTES: u64 = 1024 * 1024;
 
 /// Map the ECAM window for PCIe config space and install the kernel VA
 /// so [`scan`] (and subsequent BAR / capability-list reads) can hit it.
@@ -446,7 +446,7 @@ pub unsafe fn init_ecam(phys_base: u64, size: u64) -> Result<(), &'static str> {
     // advertises up to 256 MiB, but the scanner only touches bus 0
     // today — see ECAM_MAP_BYTES rationale.
     let map_len = core::cmp::min(size, ECAM_MAP_BYTES);
-    let map_pages = (map_len + 0xFFF) / 0x1000;
+    let map_pages = map_len.div_ceil(0x1000);
 
     #[cfg(target_arch = "aarch64")]
     {

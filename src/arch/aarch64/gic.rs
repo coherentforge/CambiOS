@@ -32,11 +32,9 @@ const MAX_CPUS: usize = 256;
 
 /// Per-CPU last acknowledged INTID, saved by `acknowledge_irq()` for `write_eoi()`.
 /// Indexed by logical CPU index. 1023 = spurious / no pending acknowledge.
-static LAST_IAR: [AtomicU32; MAX_CPUS] = {
-    // const-init: array of AtomicU32(1023)
-    const INIT: AtomicU32 = AtomicU32::new(1023);
-    [INIT; MAX_CPUS]
-};
+// Inline-const array init (the kernel's idiom for atomic arrays, e.g.
+// TASK_GENERATION in lib.rs) — avoids a named interior-mutable `const`.
+static LAST_IAR: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(1023) }; MAX_CPUS];
 
 /// Get the current CPU's logical index (for LAST_IAR indexing).
 ///
@@ -383,7 +381,7 @@ pub unsafe fn init_redistributor(gicr_base: u64, cpu_id: u32) {
 /// # Safety
 /// GICD must be initialized. `intid` must be in range 32..1020.
 pub unsafe fn enable_spi(intid: u32) {
-    debug_assert!(intid >= 32 && intid < 1020);
+    debug_assert!((32..1020).contains(&intid));
     let reg_idx = (intid / 32) as usize;
     let bit = 1u32 << (intid % 32);
     // SAFETY: GICD is initialized and intid is a valid SPI range.
@@ -395,7 +393,7 @@ pub unsafe fn enable_spi(intid: u32) {
 /// # Safety
 /// GICD must be initialized. `intid` must be in range 32..1020.
 pub unsafe fn disable_spi(intid: u32) {
-    debug_assert!(intid >= 32 && intid < 1020);
+    debug_assert!((32..1020).contains(&intid));
     let reg_idx = (intid / 32) as usize;
     let bit = 1u32 << (intid % 32);
     // SAFETY: GICD is initialized and intid is a valid SPI range.
@@ -407,9 +405,9 @@ pub unsafe fn disable_spi(intid: u32) {
 /// # Safety
 /// GICD must be initialized. `intid` must be in range 32..1020.
 pub unsafe fn set_spi_trigger(intid: u32, edge: bool) {
-    debug_assert!(intid >= 32 && intid < 1020);
+    debug_assert!((32..1020).contains(&intid));
     let reg_idx = (intid / 16) as usize;
-    let bit_offset = ((intid % 16) * 2 + 1) as u32;
+    let bit_offset = (intid % 16) * 2 + 1;
     // SAFETY: GICD is initialized and intid is a valid SPI range.
     unsafe {
         let mut val = gicd_read(GICD_ICFGR + reg_idx * 4);

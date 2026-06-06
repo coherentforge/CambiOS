@@ -186,7 +186,7 @@ pub(crate) fn be_u64_at(data: &[u8], offset: usize) -> u64 {
 
 /// Find the end of a null-terminated name starting at `offset`.
 /// Returns (name_bytes, next_aligned_offset).
-fn read_name<'a>(data: &'a [u8], offset: usize) -> (&'a [u8], usize) {
+fn read_name(data: &[u8], offset: usize) -> (&[u8], usize) {
     let mut end = offset;
     while end < data.len() && data[end] != 0 {
         end += 1;

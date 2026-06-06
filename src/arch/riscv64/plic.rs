@@ -263,7 +263,7 @@ pub unsafe fn init(phys_base: u64, size_bytes: u64) -> Result<(), &'static str> 
 /// [`init`] must have run. `source_id` must be in 1..MAX_SOURCES.
 pub unsafe fn enable_irq(source_id: u32) {
     debug_assert!(
-        source_id >= 1 && source_id < MAX_SOURCES,
+        (1..MAX_SOURCES).contains(&source_id),
         "plic::enable_irq: source_id out of range",
     );
     if base() == 0 {
@@ -288,7 +288,7 @@ pub unsafe fn enable_irq(source_id: u32) {
 #[allow(dead_code)] // wired when the first driver registers a revocation flow
 pub unsafe fn disable_irq(source_id: u32) {
     debug_assert!(
-        source_id >= 1 && source_id < MAX_SOURCES,
+        (1..MAX_SOURCES).contains(&source_id),
         "plic::disable_irq: source_id out of range",
     );
     if base() == 0 {

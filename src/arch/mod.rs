@@ -59,6 +59,11 @@ pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
 }
 
 /// AArch64 variant: TLBI broadcast instructions (hardware-mediated, no IPI).
+///
+/// # Safety
+///
+/// The page table modifications (unmaps) must already be visible in memory
+/// before calling this. Must be called at EL1.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
@@ -69,6 +74,11 @@ pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
 
 /// RISC-V variant: local `sfence.vma` plus cross-hart broadcast via
 /// SBI IPI when other harts are online.
+///
+/// # Safety
+///
+/// The page table modifications (unmaps) must already be visible in memory
+/// before calling this. Must be called in S-mode.
 #[cfg(target_arch = "riscv64")]
 #[inline]
 pub unsafe fn tlb_shootdown_range(virt_addr: u64, page_count: u32) {
