@@ -19,7 +19,7 @@ belongs in the linked ADR, not here.
 ## At a glance
 
 - **Tri-arch first-class**: clean release build on `x86_64`, `aarch64`, `riscv64gc`; all three boot in QEMU to an `cambios>` shell prompt. `make check-all` is the permanent regression gate.
-- **903 host unit tests passing** on `x86_64-apple-darwin`. Run `make stats` for current counts — numbers live in code, not prose.
+- **Host unit tests passing** on `x86_64-apple-darwin`. Run `make stats` for the current count — numbers live in code, not prose.
 - **Security model live end-to-end**: cryptographic identity, signed-ELF verification, capability-gated IPC, content-addressed ObjectStore, audit ring, kernel identity gate, userspace `recv_verified`.
 - **GUI stack live on x86_64 + aarch64**: scanout-virtio-gpu drives QEMU virtio-gpu-pci; compositor composites; virtio-input forwards HID keyboard/pointer events into the focused window; first-party app `pong` (continuous-motion 1-player vs AI) runs as the default GUI boot module on x86_64, and `worm` renders on aarch64 via `make run-aarch64-gui` now that the kernel has an ECAM-based PCI enumerator. `tree` (Minesweeper) stays buildable for regression.
 - **Persistent storage live**: virtio-blk + disk-backed ObjectStore + `arcobj` shell CLI; objects survive reboot.
@@ -204,7 +204,7 @@ Parity-target with x86_64 / AArch64. All phases landed as of 2026-04-19. Source:
 
 ## Test coverage
 
-Total: **903** on `x86_64-apple-darwin`. Run `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`, or `make stats` for the current number.
+Run `RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin`, or `make stats`, for the current total on `x86_64-apple-darwin`. The number is not pinned in prose — it lives in code, and a hardcoded copy only drifts CI red as the suite grows.
 
 Major categories (approximate; breakdown drifts faster than the total):
 

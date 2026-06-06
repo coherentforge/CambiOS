@@ -4,43 +4,38 @@
 """
 Pre-commit advisory: surface STATUS.md drift before it compounds.
 
-Two independent advisory checks, both exit-0 (warn-but-pass), in the
-same don't-grow-the-baseline family as the other tools/check-*.py gates.
+Two independent advisory checks, both exit-0 (warn-but-pass) by default, in
+the same don't-grow-the-baseline family as the other tools/check-*.py gates.
 
 1. DATE drift — `last_synced_to_code:` more than THRESHOLD_DAYS old.
-   (Original behavior, unchanged. Rationale: the 2026-04-22 -> 2026-05-04
-   12-day drift window that had to be recovered in one large catch-up sync.)
+   Rationale: the 2026-04-22 -> 2026-05-04 12-day drift window that had to
+   be recovered in one large catch-up sync. The date moving is not, on its
+   own, evidence the content moved.
 
-2. NUMBER drift — STATUS.md's prose counts no longer match the source.
-   This is the gap that let the file sit at "561 host unit tests /
-   47 harnesses" while the code was already at 892 / 48: a sync bumped
-   the *date* but never re-derived the *numbers*, and a date-only check
-   passed silently. The date moving is not evidence the counts moved.
+2. KANI-HARNESS number drift — STATUS.md's stated harness totals no longer
+   match the source. Derived CHEAPLY (count active `#[kani::proof]` under
+   verification/, no compile) and compared to every *total* stated in the
+   prose. Safe to run on every commit.
 
-   - Kani harness count is derived CHEAPLY (count active `#[kani::proof]`
-     under verification/, no compile) and compared to every *total*
-     stated in STATUS.md prose. Safe to run on every commit.
-   - The unit-test count cannot be derived without compiling, so by
-     default this only checks that the stated test numbers agree with
-     EACH OTHER (catches a partial update — one mention fixed, another
-     missed). With `--full` it runs `make stats` and compares against the
-     live count; that path compiles, so it is for CI / manual runs, NOT
-     the pre-commit hook.
+   The unit-test COUNT is deliberately NOT checked. STATUS.md no longer pins
+   a test total in prose — it points at `make stats` instead — because that
+   number can only be derived by compiling, and a hardcoded copy drifted CI
+   red every time the suite grew (892 -> 903 was the last instance). With no
+   pinned number there is nothing to compare and nothing to drift, so the
+   `--full`/`make stats` path that used to verify it is gone entirely.
 
-Posture unchanged: advisory, exit 0. Only config-level errors (STATUS.md
-missing, unparseable date) exit 1. Tighten to a hard block by flipping
-the relevant return once the warn cycle proves it changes behavior.
+Posture: advisory, exit 0. `--strict` makes objective Kani-harness drift
+exit 1 (for CI); the date heuristic always stays advisory. Only config-level
+errors (STATUS.md missing, unparseable date) exit 1 unconditionally.
 
 Usage:
-  python3 tools/check-status-freshness.py          # date + cheap number checks (pre-commit)
-  python3 tools/check-status-freshness.py --full    # also re-derive the test count via `make stats`
-  make check-status-freshness                       # no-arg form
-  make check-status-freshness-full                  # --full form
+  python3 tools/check-status-freshness.py            # date + Kani-harness checks
+  python3 tools/check-status-freshness.py --strict   # Kani-harness drift FAILs (CI)
+  make check-status-freshness                         # no-arg form
 """
 import argparse
 import datetime
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -59,11 +54,6 @@ HARNESS_TOTAL_RES = (
     re.compile(r"(\d+)\s+harnesses across \d+ proof crates"),
     re.compile(r"(\d+)\s+passing harnesses"),
 )
-TEST_COUNT_RES = (
-    re.compile(r"(\d+)\s+host unit tests"),
-    re.compile(r"Total:\s*\*\*(\d+)\*\*"),
-)
-MAKE_STATS_TESTS_RE = re.compile(r"Tests \(lib\):\s*(\d+)")
 
 _WARNINGS = 0
 
@@ -131,10 +121,10 @@ def stated_counts(text: str, patterns) -> list:
     return found
 
 
-def check_numbers(text: str, full: bool) -> int:
-    """Advisory number-drift checks. Returns the count of genuine drift
-    mismatches (operational warnings — missing dir, unparseable `make stats`
-    — do not count, so they never trip --strict / CI)."""
+def check_numbers(text: str) -> int:
+    """Advisory number-drift check (Kani harnesses). Returns the count of
+    genuine drift mismatches; operational warnings (missing verification/ dir)
+    do not count, so they never trip --strict / CI."""
     drift = 0
 
     # --- Kani harnesses: cheap, every run ---
@@ -153,52 +143,19 @@ def check_numbers(text: str, full: bool) -> int:
                 f"{', '.join(map(str, bad))}. Update the harness totals."
             )
 
-    # --- Unit tests: intra-prose consistency always; live compare on --full ---
-    stated_t = stated_counts(text, TEST_COUNT_RES)
-    if stated_t and len(set(stated_t)) > 1:
-        drift += 1
-        warn(
-            "STATUS.md states inconsistent unit-test counts "
-            f"({', '.join(map(str, sorted(set(stated_t))))}) — the prose "
-            "disagrees with itself, a partial update."
-        )
-    if full and stated_t:
-        try:
-            out = subprocess.run(
-                ["make", "stats"], capture_output=True, text=True,
-                timeout=900, check=False,
-            ).stdout
-        except (OSError, subprocess.SubprocessError) as exc:
-            warn(f"--full: could not run `make stats` ({exc}).")
-            return drift
-        match = MAKE_STATS_TESTS_RE.search(out)
-        if not match:
-            warn("--full: could not parse Tests(lib) from `make stats`.")
-            return drift
-        live = int(match.group(1))
-        bad = sorted({n for n in stated_t if n != live})
-        if bad:
-            drift += 1
-            warn(
-                f"Unit-test drift: `make stats` reports {live} lib tests, "
-                f"STATUS.md states {', '.join(map(str, bad))}. Update the "
-                "test totals."
-            )
+    # The unit-test count is intentionally NOT checked. STATUS.md no longer
+    # pins a total in prose (it points at `make stats`), so there is nothing
+    # to drift against and nothing that would need a compile to verify.
     return drift
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="STATUS.md freshness advisory (date + number drift)."
-    )
-    parser.add_argument(
-        "--full", action="store_true",
-        help="also re-derive the unit-test count via `make stats` "
-             "(compiles; for CI / manual use, not the pre-commit hook)",
+        description="STATUS.md freshness advisory (date + Kani-harness drift)."
     )
     parser.add_argument(
         "--strict", action="store_true",
-        help="exit 1 on objective number drift (Kani/test count mismatch). "
+        help="exit 1 on objective Kani-harness drift (source vs prose). "
              "The date heuristic stays advisory. For CI enforcement.",
     )
     args = parser.parse_args()
@@ -215,7 +172,7 @@ def main() -> int:
     rc = check_date(text)
     if rc != 0:
         return rc
-    drift = check_numbers(text, full=args.full)
+    drift = check_numbers(text)
 
     if args.strict and drift:
         print(

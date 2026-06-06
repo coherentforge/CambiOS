@@ -1310,13 +1310,6 @@ check-lockfile:
 check-status-freshness:
 	@python3 tools/check-status-freshness.py
 
-# Full variant: also re-derives the unit-test count via `make stats`
-# (compiles). For CI / manual runs — NOT the pre-commit hook, which must
-# stay compile-free. The cheap Kani-harness + prose-consistency checks
-# run in both; only the live test-count compare is gated behind --full.
-check-status-freshness-full:
-	@python3 tools/check-status-freshness.py --full
-
 # Pre-edit audit for a file. Run before the first Edit on any file per
 # session — especially under parallel-thread development. Surfaces
 # uncommitted changes (HEAD commit, status, full diff) so the caller
