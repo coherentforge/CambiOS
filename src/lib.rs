@@ -5,8 +5,12 @@
 #![cfg_attr(not(test), no_main)]
 #![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![warn(clippy::undocumented_unsafe_blocks)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
+// Per-op unsafe discipline (Dev Convention 1): every `unsafe {}` holds at most
+// one unsafe op and carries its own `// SAFETY:`. Hard-denied now that all three
+// arch backends are clean; a genuinely-irreducible block takes a local
+// `#[allow(clippy::multiple_unsafe_ops_per_block)]` with a written rationale.
+#![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::multiple_unsafe_ops_per_block)]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 //! CambiOS Microkernel - Verification-Ready Core
 //!

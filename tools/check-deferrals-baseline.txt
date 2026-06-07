@@ -90,10 +90,10 @@ src/fs/virtio_blk_device.rs:80:deferred
 src/ipc/capability.rs:727:deferred
 src/ipc/capability.rs:780:TODO
 src/ipc/capability.rs:788:for-now
-src/lib.rs:101:TBD
-src/lib.rs:972:deferred
-src/lib.rs:980:deferred
-src/lib.rs:988:deferred
+src/lib.rs:105:TBD
+src/lib.rs:976:deferred
+src/lib.rs:984:deferred
+src/lib.rs:992:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
 src/microkernel/main.rs:946:for-now

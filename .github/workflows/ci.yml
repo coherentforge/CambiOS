@@ -92,13 +92,16 @@ jobs:
         run: cargo test --lib --target x86_64-unknown-linux-gnu
 
   # ---------------------------------------------------------------------------
-  # clippy — enforces missing_safety_doc = "deny" (Cargo.toml [lints.clippy],
-  # Dev Convention 1) on the x86_64 kernel lib. Mirrors CLAUDE.md's Quick
-  # Reference invocation; no `-D warnings` so the gate is exactly the manifest
-  # deny, not a flood of unrelated style lints.
+  # clippy — enforces the unsafe-discipline deny lints on ALL THREE backends
+  # (`make check-clippy`): missing_safety_doc (Cargo.toml [lints.clippy]) +
+  # multiple_unsafe_ops_per_block + undocumented_unsafe_blocks (src/lib.rs
+  # #![deny], Dev Convention 1). Tri-arch because x86_64 clippy never compiles
+  # the cfg-gated aarch64/riscv64 paths, so a per-op violation in an arch
+  # backend only surfaces when clippy runs on that target. No `-D warnings`, so
+  # the gate is exactly the deny lints, not a flood of unrelated style lints.
   # ---------------------------------------------------------------------------
   clippy:
-    name: clippy (missing_safety_doc)
+    name: clippy (unsafe discipline, tri-arch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,12 +109,12 @@ jobs:
         run: |
           rustup show
           rustup component add clippy
-          rustup target add x86_64-unknown-none
+          rustup target add x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf
       - uses: Swatinem/rust-cache@v2
         with:
           key: clippy
-      - name: cargo clippy --lib
-        run: cargo clippy --target x86_64-unknown-none --release --lib
+      - name: make check-clippy (tri-arch)
+        run: make check-clippy
 
   # ---------------------------------------------------------------------------
   # Don't-grow-the-baseline content lints — pure Python (CLAUDE.md Dev

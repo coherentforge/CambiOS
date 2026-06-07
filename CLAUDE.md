@@ -92,7 +92,7 @@ Open mechanism decisions awaiting Revisit-when triggers — see [docs/dev-notes/
 
 ## Development Conventions
 
-1. **Every `unsafe` block MUST have a `// SAFETY:` comment, and every `pub unsafe fn` MUST have a `# Safety` rustdoc section** explaining why the operation is safe / what contract the caller must uphold. Citing alignment, bounds, aliasing, or lifetime invariants is the point — "trust me" is not a SAFETY comment. The `unsafe { ... }` rule is enforced by `make check-unsafe-coverage`; the `pub unsafe fn` rule is enforced by `clippy::missing_safety_doc = "deny"` in `[lints.clippy]`.
+1. **Every `unsafe` block MUST have a `// SAFETY:` comment, and every `pub unsafe fn` MUST have a `# Safety` rustdoc section** explaining why the operation is safe / what contract the caller must uphold. Citing alignment, bounds, aliasing, or lifetime invariants is the point — "trust me" is not a SAFETY comment. The `unsafe { ... }` rule is enforced by `make check-unsafe-coverage`; the `pub unsafe fn` rule is enforced by `clippy::missing_safety_doc = "deny"` in `[lints.clippy]`. One unsafe op per block, each with its own `// SAFETY:`, is hard-enforced by `#![deny(clippy::multiple_unsafe_ops_per_block)]` + `#![deny(clippy::undocumented_unsafe_blocks)]` in `src/lib.rs`, gated tri-arch by `make check-clippy` (a genuinely-irreducible block takes a local `#[allow(...)]` with rationale).
 
 2. **Lock ordering** (see [Lock Ordering](#lock-ordering)) must always be followed. Never acquire a lower-numbered lock while holding a higher-numbered one.
 
@@ -247,7 +247,7 @@ make check-index-isolation   # STATUS.md diff >20 lines + any .rs staged → rej
 make check-lockfile          # T-1: lists added/removed Cargo.lock crates (advisory)
 make check-unsafe-coverage   # Convention 1 (blocks): every `unsafe { }` has `// SAFETY:` (cluster + cfg-attr + assignment-continuation aware)
 make check-status-freshness  # STATUS.md `last_synced_to_code:` within 7 days of today (advisory; warn-but-pass)
-cargo clippy --target x86_64-unknown-none --release --lib  # Convention 1 (signatures): clippy::missing_safety_doc = "deny" — every `pub unsafe fn` has `# Safety` rustdoc
+make check-clippy            # Convention 1 (tri-arch deny gate, CI per-push): missing_safety_doc (every `pub unsafe fn` has `# Safety`) + multiple_unsafe_ops_per_block + undocumented_unsafe_blocks; runs clippy on x86_64+aarch64+riscv64 because arch-cfg'd unsafe only lints on its own target
 # Commit-msg hooks (Claude-authored commits only):
 # 1. H1 (2026-04-23): `Staged files:` block must match `git diff --cached
 #    --name-only`. Script: tools/check-claude-staged-files.py.
