@@ -80,6 +80,9 @@ pub struct PerCpu {
 // `hart_id` are read-only and benign. The array below requires Sync
 // for compilation, but single-writer-per-slot is upheld at init.
 unsafe impl Send for PerCpu {}
+// SAFETY: Same as the Send impl above — each PerCpu is touched only by its
+// owning hart (tp is set once per hart, not shared), so there is no concurrent
+// shared access that would need synchronization.
 unsafe impl Sync for PerCpu {}
 
 impl PerCpu {
@@ -171,23 +174,28 @@ pub fn cpu_count() -> u32 {
 /// paging is active (because we write a pointer into `tp` that the
 /// trap handler will dereference via `sd`/`ld` on any future trap).
 pub unsafe fn init_bsp(hart_id: u64) {
-    // SAFETY: Single-threaded boot; no concurrent access. percpu has
-    // 'static lifetime (lives in PER_CPU_DATA).
-    unsafe {
-        let percpu = &raw mut PER_CPU_DATA[0];
-        (*percpu).self_ptr = percpu as *const PerCpu;
-        (*percpu).cpu_id = 0;
-        (*percpu).hart_id = hart_id;
-        (*percpu).current_task_id = 0;
-        (*percpu).interrupt_depth = 0;
-        (*percpu).user_sp_scratch = 0;
+    // SAFETY: single-hart boot; raw pointer to the BSP's slot in the static-mut
+    // per-CPU array (indexing a static mut is the unsafe op).
+    let percpu = unsafe { &raw mut PER_CPU_DATA[0] };
 
-        // Set tp = kernel PerCpu pointer; clear sscratch = 0. The
-        // trap vector's entry `csrrw tp, sscratch, tp` expects this
-        // invariant during kernel execution: sscratch == 0 (sentinel
-        // for "trap came from kernel"). Before entering U-mode for
-        // the first time, the sret-return path sets sscratch =
-        // kernel_tp so the next U→S trap picks up the swap.
+    // SAFETY: percpu is a valid, uniquely-owned 'static slot (single-hart boot,
+    // no concurrent access); reborrow it as &mut for the field init.
+    let slot = unsafe { &mut *percpu };
+    slot.self_ptr = percpu as *const PerCpu;
+    slot.cpu_id = 0;
+    slot.hart_id = hart_id;
+    slot.current_task_id = 0;
+    slot.interrupt_depth = 0;
+    slot.user_sp_scratch = 0;
+
+    // Set tp = kernel PerCpu pointer; clear sscratch = 0. The
+    // trap vector's entry `csrrw tp, sscratch, tp` expects this
+    // invariant during kernel execution: sscratch == 0 (sentinel
+    // for "trap came from kernel"). Before entering U-mode for
+    // the first time, the sret-return path sets sscratch =
+    // kernel_tp so the next U→S trap picks up the swap.
+    // SAFETY: writing the tp / sscratch CSRs from S-mode is always permitted.
+    unsafe {
         core::arch::asm!(
             "mv tp, {ptr}",
             "csrw sscratch, zero",
@@ -210,16 +218,21 @@ pub unsafe fn init_ap(cpu_index: usize, hart_id: u64) {
         "AP cpu_index out of range"
     );
 
-    // SAFETY: Each AP initializes only its own slot. Writing `tp`
-    // from S-mode on this hart is safe.
-    unsafe {
-        let percpu = &raw mut PER_CPU_DATA[cpu_index];
-        (*percpu).self_ptr = percpu as *const PerCpu;
-        (*percpu).cpu_id = cpu_index as u32;
-        (*percpu).hart_id = hart_id;
-        (*percpu).current_task_id = 0;
-        (*percpu).interrupt_depth = 0;
+    // SAFETY: raw pointer to this AP's own slot in the static-mut per-CPU array
+    // (indexing a static mut is the unsafe op). cpu_index was bounds-checked above.
+    let percpu = unsafe { &raw mut PER_CPU_DATA[cpu_index] };
 
+    // SAFETY: percpu is a valid, uniquely-owned 'static slot — each AP
+    // initializes only its own slot; reborrow it as &mut for the field init.
+    let slot = unsafe { &mut *percpu };
+    slot.self_ptr = percpu as *const PerCpu;
+    slot.cpu_id = cpu_index as u32;
+    slot.hart_id = hart_id;
+    slot.current_task_id = 0;
+    slot.interrupt_depth = 0;
+
+    // SAFETY: writing the tp CSR from S-mode on this hart is safe.
+    unsafe {
         core::arch::asm!(
             "mv tp, {0}",
             in(reg) percpu as u64,
@@ -241,16 +254,17 @@ pub unsafe fn init_ap(cpu_index: usize, hart_id: u64) {
 #[inline(always)]
 pub unsafe fn current_percpu() -> &'static PerCpu {
     let ptr: u64;
-    // SAFETY: `tp` holds a valid *const PerCpu after init. The pointed
-    // memory has 'static lifetime (PER_CPU_DATA).
+    // SAFETY: reading the tp register is always safe at S-mode.
     unsafe {
         core::arch::asm!(
             "mv {0}, tp",
             out(reg) ptr,
             options(nostack, readonly, preserves_flags),
         );
-        &*(ptr as *const PerCpu)
     }
+    // SAFETY: tp holds a valid *const PerCpu after init; the pointed memory has
+    // 'static lifetime (PER_CPU_DATA).
+    unsafe { &*(ptr as *const PerCpu) }
 }
 
 /// Get the current hart's PerCpu data (mutable).
@@ -262,15 +276,17 @@ pub unsafe fn current_percpu() -> &'static PerCpu {
 #[inline(always)]
 pub unsafe fn current_percpu_mut() -> &'static mut PerCpu {
     let ptr: u64;
-    // SAFETY: Same as current_percpu; caller guarantees exclusive access.
+    // SAFETY: reading the tp register is always safe at S-mode.
     unsafe {
         core::arch::asm!(
             "mv {0}, tp",
             out(reg) ptr,
             options(nostack, readonly, preserves_flags),
         );
-        &mut *(ptr as *mut PerCpu)
     }
+    // SAFETY: tp holds a valid PerCpu pointer after init ('static memory);
+    // caller guarantees exclusive access (trap handler / interrupts masked).
+    unsafe { &mut *(ptr as *mut PerCpu) }
 }
 
 #[cfg(test)]

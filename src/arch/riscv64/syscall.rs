@@ -60,19 +60,18 @@ pub unsafe extern "C" fn ecall_handler_inner(saved_sp: u64) -> u64 {
     // u64 pointer.
     let frame = saved_sp as *mut u64;
 
-    // SAFETY: bounds below are < 32 (gpr slots); pointer math stays
-    // within the 256-byte gpr region.
-    let (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) = unsafe {
-        (
-            core::ptr::read_volatile(frame.add(17)), // a7 = syscall num
-            core::ptr::read_volatile(frame.add(10)), // a0
-            core::ptr::read_volatile(frame.add(11)), // a1
-            core::ptr::read_volatile(frame.add(12)), // a2
-            core::ptr::read_volatile(frame.add(13)), // a3
-            core::ptr::read_volatile(frame.add(14)), // a4
-            core::ptr::read_volatile(frame.add(15)), // a5
-        )
-    };
+    // SAFETY: frame points at the SavedContext; gpr[0..32] occupy offsets
+    // 0..256, so [u64;18] (a0..a7 live at indices 10..17) is in-bounds and
+    // 8-byte aligned. One volatile read of the block preserves the
+    // no-elide/no-reorder guarantee; the subsequent indexing is safe.
+    let gprs: [u64; 18] = unsafe { core::ptr::read_volatile(frame as *const [u64; 18]) };
+    let syscall_num = gprs[17]; // a7 = syscall num
+    let arg1 = gprs[10];        // a0
+    let arg2 = gprs[11];        // a1
+    let arg3 = gprs[12];        // a2
+    let arg4 = gprs[13];        // a3
+    let arg5 = gprs[14];        // a4
+    let arg6 = gprs[15];        // a5
 
     // Resolve (task, process, cr3) from the current hart's scheduler.
     // Identical shape to AArch64's `svc_handler_inner`.
@@ -91,16 +90,17 @@ pub unsafe extern "C" fn ecall_handler_inner(saved_sp: u64) -> u64 {
             // Write error to a0, skip past the ecall, keep the same
             // frame — we never had enough context to dispatch.
             let err = SyscallError::InvalidArg.as_i64() as u64;
-            // SAFETY: `frame` points at the SavedContext built by the trap
-            // vector (same invariant as the gpr reads at line 64). Offsets
-            // 10 (a0) and 32 (sepc) lie within the 33-slot context
-            // (gpr[0..32] + sepc at slot 32), so `frame.add(n)` stays in
-            // bounds.
-            unsafe {
-                core::ptr::write_volatile(frame.add(10), err);
-                let sepc = core::ptr::read_volatile(frame.add(32)); // offset 256
-                core::ptr::write_volatile(frame.add(32), sepc.wrapping_add(4));
-            }
+            // frame points at the SavedContext built by the trap vector (same
+            // invariant as the gpr reads above). Offsets 10 (a0) and 32 (sepc)
+            // lie within the 33-slot context (gpr[0..32] + sepc at slot 32);
+            // wrapping_add keeps the offset math safe, leaving only the
+            // volatile accesses unsafe.
+            // SAFETY: frame[10] (a0) is in the gpr region; write the error code.
+            unsafe { core::ptr::write_volatile(frame.wrapping_add(10), err); }
+            // SAFETY: frame[32] is the sepc slot; read it to advance the PC.
+            let sepc = unsafe { core::ptr::read_volatile(frame.wrapping_add(32)) }; // offset 256
+            // SAFETY: frame[32] is the sepc slot; skip past the 4-byte ecall.
+            unsafe { core::ptr::write_volatile(frame.wrapping_add(32), sepc.wrapping_add(4)); }
             return saved_sp;
         }
     };
@@ -123,12 +123,14 @@ pub unsafe extern "C" fn ecall_handler_inner(saved_sp: u64) -> u64 {
     };
 
     // Write a0 = return value; advance sepc past the ecall (4 bytes).
-    // SAFETY: same as above — frame gpr[10] and sepc slot are valid.
-    unsafe {
-        core::ptr::write_volatile(frame.add(10), result as u64);
-        let sepc = core::ptr::read_volatile(frame.add(32)); // offset 256
-        core::ptr::write_volatile(frame.add(32), sepc.wrapping_add(4));
-    }
+    // frame gpr[10] and sepc slot are valid (same invariant as the gpr reads
+    // above); wrapping_add keeps the offset math safe.
+    // SAFETY: frame[10] (a0) is in the gpr region; write the return value.
+    unsafe { core::ptr::write_volatile(frame.wrapping_add(10), result as u64); }
+    // SAFETY: frame[32] is the sepc slot; read it to advance the PC.
+    let sepc = unsafe { core::ptr::read_volatile(frame.wrapping_add(32)) }; // offset 256
+    // SAFETY: frame[32] is the sepc slot; skip past the 4-byte ecall.
+    unsafe { core::ptr::write_volatile(frame.wrapping_add(32), sepc.wrapping_add(4)); }
 
     saved_sp
 }

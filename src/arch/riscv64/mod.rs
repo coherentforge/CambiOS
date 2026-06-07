@@ -520,19 +520,22 @@ extern "C" fn timer_isr_inner(current_sp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
-            // SAFETY: satp read/write is legal from S-mode; the
-            // hint's page-table root came from the scheduler.
+            let current_satp: u64;
+            // SAFETY: reading satp is legal from S-mode.
             unsafe {
-                let current_satp: u64;
                 core::arch::asm!(
                     "csrr {0}, satp",
                     out(reg) current_satp,
                     options(nostack, nomem, preserves_flags),
                 );
-                let current_root = (current_satp & ((1u64 << 44) - 1)) << 12;
-                if current_root != hint.page_table_root {
-                    let ppn = hint.page_table_root >> 12;
-                    let new_satp = (9u64 << 60) | ppn; // Sv48 mode = 9
+            }
+            let current_root = (current_satp & ((1u64 << 44) - 1)) << 12;
+            if current_root != hint.page_table_root {
+                let ppn = hint.page_table_root >> 12;
+                let new_satp = (9u64 << 60) | ppn; // Sv48 mode = 9
+                // SAFETY: new_satp targets the scheduler-validated page-table
+                // root; sfence.vma flushes stale TLB entries after the switch.
+                unsafe {
                     core::arch::asm!(
                         "csrw satp, {0}",
                         "sfence.vma zero, zero",
@@ -579,27 +582,27 @@ extern "C" fn yield_inner(current_sp: u64) -> u64 {
             unsafe { gdt::set_kernel_stack(hint.kernel_stack_top); }
         }
         if hint.page_table_root != 0 {
-            // SAFETY: satp read/write is always legal from S-mode. The
-            // new root phys was validated by the scheduler; we issue
-            // sfence.vma to drop stale TLB entries.
+            let current_satp: u64;
+            // SAFETY: reading satp is always legal from S-mode.
             unsafe {
-                let current_satp: u64;
                 core::arch::asm!(
                     "csrr {0}, satp",
                     out(reg) current_satp,
                     options(nostack, nomem, preserves_flags),
                 );
-                // satp encodes MODE[63:60] | ASID[59:44] | PPN[43:0].
-                // We compare PPN * 4 KiB against hint.page_table_root.
-                let current_root = (current_satp & ((1u64 << 44) - 1)) << 12;
-                if current_root != hint.page_table_root {
-                    // Build new satp: MODE = Sv48 (9), ASID=0 for now,
-                    // PPN = hint.page_table_root >> 12.
-                    let ppn = hint.page_table_root >> 12;
-                    let new_satp = (9u64 << 60) | ppn;
-                    // SAFETY: new_satp targets a valid Sv48 root table
-                    // from the scheduler; sfence.vma is mandatory per
-                    // the priv spec after changing satp.
+            }
+            // satp encodes MODE[63:60] | ASID[59:44] | PPN[43:0].
+            // We compare PPN * 4 KiB against hint.page_table_root.
+            let current_root = (current_satp & ((1u64 << 44) - 1)) << 12;
+            if current_root != hint.page_table_root {
+                // Build new satp: MODE = Sv48 (9), ASID=0 for now,
+                // PPN = hint.page_table_root >> 12.
+                let ppn = hint.page_table_root >> 12;
+                let new_satp = (9u64 << 60) | ppn;
+                // SAFETY: new_satp targets a valid Sv48 root table from the
+                // scheduler; sfence.vma is mandatory per the priv spec after
+                // changing satp.
+                unsafe {
                     core::arch::asm!(
                         "csrw satp, {0}",
                         "sfence.vma zero, zero",

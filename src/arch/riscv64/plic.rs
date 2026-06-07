@@ -221,24 +221,25 @@ pub unsafe fn init(phys_base: u64, size_bytes: u64) -> Result<(), &'static str> 
     // Zero every source priority so no IRQ will fire from a
     // stale-register start. Source 0 is reserved (priority always 0).
     //
-    // SAFETY: MMIO is just mapped; offsets are bounded by MAX_SOURCES.
-    unsafe {
-        for src in 1..MAX_SOURCES {
-            write32(priority_offset(src), 0);
-        }
-
-        // Clear every enable bit in this hart's S-mode context —
-        // MAX_SOURCES / 32 u32 words at the context's enable base.
-        for word in 0..(MAX_SOURCES / 32) {
-            let off = REG_ENABLE_BASE
-                + (HART0_S_CONTEXT as u64) * REG_ENABLE_STRIDE
-                + (word as u64) * 4;
-            write32(off, 0);
-        }
-
-        // Threshold = 0: accept any IRQ with priority ≥ 1.
-        write32(threshold_offset(HART0_S_CONTEXT), 0);
+    // MMIO is just mapped; offsets are bounded by MAX_SOURCES.
+    for src in 1..MAX_SOURCES {
+        // SAFETY: priority_offset(src) is within mapped PLIC MMIO (src < MAX_SOURCES).
+        unsafe { write32(priority_offset(src), 0); }
     }
+
+    // Clear every enable bit in this hart's S-mode context —
+    // MAX_SOURCES / 32 u32 words at the context's enable base.
+    for word in 0..(MAX_SOURCES / 32) {
+        let off = REG_ENABLE_BASE
+            + (HART0_S_CONTEXT as u64) * REG_ENABLE_STRIDE
+            + (word as u64) * 4;
+        // SAFETY: off is within this context's enable-bit region in mapped MMIO.
+        unsafe { write32(off, 0); }
+    }
+
+    // Threshold = 0: accept any IRQ with priority ≥ 1.
+    // SAFETY: threshold_offset(HART0_S_CONTEXT) is within mapped PLIC MMIO.
+    unsafe { write32(threshold_offset(HART0_S_CONTEXT), 0); }
 
     // Enable supervisor external interrupts (sie.SEIE, bit 9). Now
     // the hart will trap on PLIC-asserted IRQs once any source is
@@ -270,15 +271,16 @@ pub unsafe fn enable_irq(source_id: u32) {
         return;
     }
     let ctx = S_CONTEXT.load(Ordering::Acquire);
-    // SAFETY: caller promises init has run; offsets are bounded.
-    unsafe {
-        // Priority = 1 = enabled.
-        write32(priority_offset(source_id), 1);
-        // Enable bit.
-        let eoff = enable_offset(ctx, source_id);
-        let current = read32(eoff);
-        write32(eoff, current | enable_bit(source_id));
-    }
+    // Priority = 1 = enabled.
+    // SAFETY: caller promises init has run; priority_offset(source_id) is in MMIO.
+    unsafe { write32(priority_offset(source_id), 1); }
+
+    // Enable bit: read-modify-write the context's enable word.
+    let eoff = enable_offset(ctx, source_id);
+    // SAFETY: eoff is within this context's enable-bit region in mapped MMIO.
+    let current = unsafe { read32(eoff) };
+    // SAFETY: same eoff; set this source's enable bit.
+    unsafe { write32(eoff, current | enable_bit(source_id)); }
 }
 
 /// Disarm a source. Priority = 0 and enable bit cleared. Idempotent.
@@ -295,13 +297,13 @@ pub unsafe fn disable_irq(source_id: u32) {
         return;
     }
     let ctx = S_CONTEXT.load(Ordering::Acquire);
-    // SAFETY: same.
-    unsafe {
-        write32(priority_offset(source_id), 0);
-        let eoff = enable_offset(ctx, source_id);
-        let current = read32(eoff);
-        write32(eoff, current & !enable_bit(source_id));
-    }
+    // SAFETY: caller promises init has run; priority_offset(source_id) is in MMIO.
+    unsafe { write32(priority_offset(source_id), 0); }
+    let eoff = enable_offset(ctx, source_id);
+    // SAFETY: eoff is within this context's enable-bit region in mapped MMIO.
+    let current = unsafe { read32(eoff) };
+    // SAFETY: same eoff; clear this source's enable bit.
+    unsafe { write32(eoff, current & !enable_bit(source_id)); }
 }
 
 /// Claim the highest-priority pending IRQ on this hart's S-mode

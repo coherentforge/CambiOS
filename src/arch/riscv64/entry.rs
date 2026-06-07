@@ -202,28 +202,32 @@ pub unsafe extern "C" fn riscv64_fill_boot_page_tables() -> u64 {
     // RWX+G+A+D+V flags (leaf, global, pre-accessed to avoid A-bit
     // fault on first access).
     //
-    // SAFETY: static mut array, exclusive access during single-hart boot.
-    unsafe {
-        let l2_id = &mut (*(&raw mut BOOT_L2_IDENTITY)).0;
-        let mut i = 0;
-        while i < 512 {
-            // PPN of 1 GiB-aligned physical address (i * 0x40000000 >> 12 = i << 18)
-            let ppn = (i as u64) << 18;
-            l2_id[i] = (ppn << 10) | pte::V | pte::R | pte::W | pte::X | pte::G | pte::A | pte::D;
-            i += 1;
-        }
+    // Raw pointer to the BOOT_L2_IDENTITY static mut (no reference formed —
+    // avoids static_mut_refs); exclusively owned during single-hart boot.
+    let l2_id_ptr = &raw mut BOOT_L2_IDENTITY;
+    // SAFETY: l2_id_ptr is the sole pointer to this static at single-hart boot;
+    // reborrow its inner array as &mut for the fill below.
+    let l2_id = unsafe { &mut (*l2_id_ptr).0 };
+    let mut i = 0;
+    while i < 512 {
+        // PPN of 1 GiB-aligned physical address (i * 0x40000000 >> 12 = i << 18)
+        let ppn = (i as u64) << 18;
+        l2_id[i] = (ppn << 10) | pte::V | pte::R | pte::W | pte::X | pte::G | pte::A | pte::D;
+        i += 1;
     }
 
     // Build L2_KERNEL: one gigapage at index 510 mapping virtual
     // 0xffffffff80000000 -> physical 0x80000000. PPN = 0x80000.
     //
-    // SAFETY: same as above.
-    unsafe {
-        let l2_k = &mut (*(&raw mut BOOT_L2_KERNEL)).0;
-        let kernel_gigapage_ppn: u64 = 0x80000; // 0x8000_0000 >> 12
-        l2_k[510] = (kernel_gigapage_ppn << 10)
-            | pte::V | pte::R | pte::W | pte::X | pte::G | pte::A | pte::D;
-    }
+    // Raw pointer to the BOOT_L2_KERNEL static mut (no reference formed);
+    // exclusively owned during single-hart boot.
+    let l2_k_ptr = &raw mut BOOT_L2_KERNEL;
+    // SAFETY: l2_k_ptr is the sole pointer to this static at single-hart boot;
+    // reborrow its inner array as &mut to install the kernel gigapage.
+    let l2_k = unsafe { &mut (*l2_k_ptr).0 };
+    let kernel_gigapage_ppn: u64 = 0x80000; // 0x8000_0000 >> 12
+    l2_k[510] = (kernel_gigapage_ppn << 10)
+        | pte::V | pte::R | pte::W | pte::X | pte::G | pte::A | pte::D;
 
     // Build L3 root:
     //   L3[0]   -> L2_IDENTITY (identity map)
@@ -234,15 +238,17 @@ pub unsafe extern "C" fn riscv64_fill_boot_page_tables() -> u64 {
     // next-level table"). G is set so all address spaces see the
     // mapping (no ASID in play yet).
     //
-    // SAFETY: static mut, single-hart boot.
-    unsafe {
-        let l3 = &mut (*(&raw mut BOOT_L3)).0;
-        let l2_id_pte = (l2_id_phys >> 12) << 10 | pte::V;
-        let l2_k_pte = (l2_kern_phys >> 12) << 10 | pte::V;
-        l3[0] = l2_id_pte;
-        l3[256] = l2_id_pte;
-        l3[511] = l2_k_pte;
-    }
+    // Raw pointer to the BOOT_L3 static mut (no reference formed); exclusively
+    // owned during single-hart boot.
+    let l3_ptr = &raw mut BOOT_L3;
+    // SAFETY: l3_ptr is the sole pointer to this static at single-hart boot;
+    // reborrow its inner array as &mut to install the three root entries.
+    let l3 = unsafe { &mut (*l3_ptr).0 };
+    let l2_id_pte = (l2_id_phys >> 12) << 10 | pte::V;
+    let l2_k_pte = (l2_kern_phys >> 12) << 10 | pte::V;
+    l3[0] = l2_id_pte;
+    l3[256] = l2_id_pte;
+    l3[511] = l2_k_pte;
 
     // Compute satp. Mode=9 (Sv48), ASID=0, PPN=l3_phys >> 12.
     let satp = SATP_MODE_SV48 | (l3_phys >> 12);
