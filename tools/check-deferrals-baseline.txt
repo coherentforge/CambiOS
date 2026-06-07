@@ -68,7 +68,7 @@ docs/identity-synthesis.md:124:deferred
 docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:77:deferred
 docs/storage-planning.md:42:deferred
-src/arch/aarch64/gic.rs:128:deferred
+src/arch/aarch64/gic.rs:130:deferred
 src/arch/aarch64/mod.rs:76:placeholder
 src/arch/aarch64/mod.rs:78:placeholder
 src/arch/aarch64/mod.rs:80:placeholder
