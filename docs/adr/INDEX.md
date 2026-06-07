@@ -45,3 +45,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 033 | [Multi-Principal Vault](033-multi-principal-vault.md) | Accepted | 2026-05-27 |
 | 034 | [Deferred Reclamation of a Terminating Task's Self-Referential Resources](034-deferred-task-resource-reclamation.md) | Accepted | 2026-06-03 |
 | 035 | [Translation-Layer Compatibility — Interop with ToIP / FPP / KERI via the Vault](035-translation-layer-compatibility.md) | Proposed | 2026-06-04 |
+| 036 | [Typed MMIO Register Blocks for Device Drivers](036-typed-mmio-register-blocks.md) | Accepted | 2026-06-07 |
