@@ -1165,6 +1165,9 @@ impl SyscallDispatcher {
         #[cfg(target_arch = "aarch64")]
         // SAFETY: masking DAIF.I is safe at EL1; local to this CPU.
         unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: clearing sstatus.SIE is safe at S-mode; local to this hart.
+        unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)); }
         {
             let mut sched_guard = crate::local_scheduler().lock();
             if let Some(sched) = sched_guard.as_mut() {
@@ -1407,6 +1410,9 @@ impl SyscallDispatcher {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: masking DAIF.I is safe at EL1; local to this CPU.
             unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+            #[cfg(target_arch = "riscv64")]
+            // SAFETY: clearing sstatus.SIE is safe at S-mode; local to this hart.
+            unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)); }
             {
                 let mut sched_guard = crate::local_scheduler().lock();
                 if let Some(sched) = sched_guard.as_mut() {
@@ -2617,6 +2623,9 @@ impl SyscallDispatcher {
         // SAFETY: as above; `daifset, #2` masks IRQ at EL1.
         #[cfg(target_arch = "aarch64")]
         unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+        // SAFETY: as above; `csrci sstatus, 2` clears SIE at S-mode.
+        #[cfg(target_arch = "riscv64")]
+        unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)); }
 
         let raced_exit = {
             let mut sched_guard = crate::local_scheduler().lock();
@@ -2641,6 +2650,9 @@ impl SyscallDispatcher {
             // SAFETY: as above; `daifclr, #2` unmasks IRQ at EL1.
             #[cfg(target_arch = "aarch64")]
             unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+            // SAFETY: as above; `csrsi sstatus, 2` sets SIE at S-mode.
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack)); }
             if parent != Some(ctx.task_id) {
                 return Err(SyscallError::PermissionDenied);
             }
@@ -3268,6 +3280,9 @@ impl SyscallDispatcher {
         #[cfg(target_arch = "aarch64")]
         // SAFETY: masking DAIF.I is safe at EL1; local to this CPU.
         unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: clearing sstatus.SIE is safe at S-mode; local to this hart.
+        unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)); }
         {
             let mut sched_guard = crate::local_scheduler().lock();
             if let Some(sched) = sched_guard.as_mut() {

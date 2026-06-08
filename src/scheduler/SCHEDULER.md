@@ -157,7 +157,7 @@ yield_save_and_switch() (assembly)
     └── eret / iretq → resume next task
 ```
 
-Both x86_64 and AArch64 have full implementations. They share the `SavedContext` layout, the `ContextSwitchHint` plumbing, and the `on_voluntary_yield()` portable scheduler entry. The arch-specific differences are limited to the synthetic frame format (iretq vs eret) and the post-switch register writes (TSS.RSP0 vs SP_EL1, CR3 vs TTBR0_EL1).
+x86_64, AArch64, and RISC-V have full implementations. They share the `SavedContext` layout, the `ContextSwitchHint` plumbing, and the `on_voluntary_yield()` portable scheduler entry. The arch-specific differences are limited to the synthetic frame format (iretq vs eret vs sret) and the post-switch register writes (the page-table root: CR3 / TTBR0_EL1 / satp, plus the per-CPU kernel-stack pointer).
 
 The blocking pattern used by syscall handlers:
 
@@ -166,6 +166,7 @@ The blocking pattern used by syscall handlers:
 // before yield_save_and_switch saves the correct context.
 unsafe { core::arch::asm!("cli"); }    // x86_64
 // or: msr daifset, #2                  // AArch64
+// or: csrci sstatus, 2                 // RISC-V (clear SIE)
 
 // Mark the task Blocked
 local_scheduler().lock().as_mut().unwrap()
