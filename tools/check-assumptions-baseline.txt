@@ -61,13 +61,10 @@ src/arch/riscv64/paging.rs:57:ADDR_MASK
 src/arch/riscv64/paging.rs:60:SATP_PPN_MASK
 src/arch/riscv64/paging.rs:180:HHDM_GIGAPAGE_COVERAGE
 src/arch/riscv64/percpu.rs:34:MAX_CPUS
-src/arch/riscv64/plic.rs:58:REG_PRIORITY_STRIDE
-src/arch/riscv64/plic.rs:61:REG_ENABLE_BASE
-src/arch/riscv64/plic.rs:63:REG_ENABLE_STRIDE
-src/arch/riscv64/plic.rs:66:REG_CONTEXT_BASE
-src/arch/riscv64/plic.rs:68:REG_CONTEXT_STRIDE
-src/arch/riscv64/plic.rs:70:REG_CONTEXT_THRESHOLD
-src/arch/riscv64/plic.rs:73:REG_CONTEXT_CLAIM
+src/arch/riscv64/plic.rs:65:REG_ENABLE_BASE
+src/arch/riscv64/plic.rs:67:REG_ENABLE_STRIDE
+src/arch/riscv64/plic.rs:70:REG_CONTEXT_BASE
+src/arch/riscv64/plic.rs:72:REG_CONTEXT_STRIDE
 src/arch/riscv64/sbi.rs:47:SBI_LEGACY_SET_TIMER
 src/arch/riscv64/sbi.rs:113:SBI_EXT_HSM
 src/arch/riscv64/sbi.rs:115:SBI_HSM_HART_START

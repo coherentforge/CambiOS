@@ -48,29 +48,28 @@
 //! matching x86_64/AArch64. Until then the inline UART path provides
 //! a working signal.
 
+use crate::arch::mmio::ReadWrite;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ============================================================================
-// Register offsets
+// Region base offsets
+//
+// The within-region layout (per-source priority stride, threshold/claim
+// offsets) is now encoded as field positions in the typed blocks below, pinned
+// by offset_of!/size_of asserts. Only the three region base offsets and the
+// two per-context strides remain as consts - they drive the accessor address
+// math (the PLIC's per-context regions can't be one flat block; see below).
 // ============================================================================
 
-/// Priority register stride (per source).
-const REG_PRIORITY_STRIDE: u64 = 4;
-
-/// Enable-bitmap base (per-context enables).
+/// Enable-bitmap region base (per-context enables start here).
 const REG_ENABLE_BASE: u64 = 0x2000;
-/// Per-context enable-bitmap stride.
+/// Per-context enable-bitmap stride (== size_of::<PlicEnableCtx>()).
 const REG_ENABLE_STRIDE: u64 = 0x80;
 
-/// Per-context control base (threshold + claim/complete).
+/// Per-context control region base (threshold + claim/complete start here).
 const REG_CONTEXT_BASE: u64 = 0x20_0000;
 /// Per-context control stride.
 const REG_CONTEXT_STRIDE: u64 = 0x1000;
-/// Context control: threshold offset.
-const REG_CONTEXT_THRESHOLD: u64 = 0x00;
-/// Context control: claim/complete offset (one register, read = claim,
-/// write = complete).
-const REG_CONTEXT_CLAIM: u64 = 0x04;
 
 /// SCAFFOLDING: max PLIC source ID we set priority / clear enables for
 /// during init. Real hardware can have up to 1023 sources but QEMU
@@ -108,7 +107,14 @@ static PLIC_MMIO_SIZE: AtomicU64 = AtomicU64::new(0);
 static S_CONTEXT: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
-// MMIO helpers — 32-bit word-aligned accesses
+// Typed register blocks (ADR-036)
+//
+// The PLIC's full spec register file spans ~64 MiB, but only the DTB-reported
+// region (~6 MiB on QEMU virt) is mapped - so a single flat `#[repr(C)]` block
+// covering the whole spec would over-claim the mapping at construction. Instead
+// each of the three regions is a small typed block reached by an asserted-
+// stride accessor (the GIC `gicr(cpu_id)` pattern), claiming only its sub-block
+// of the mapped region. Within-region offsets are pinned by offset_of!/size_of.
 // ============================================================================
 
 #[inline]
@@ -116,52 +122,75 @@ fn base() -> u64 {
     PLIC_MMIO_VBASE.load(Ordering::Acquire)
 }
 
-/// Read a 32-bit register at `base + offset`.
+/// Per-source priority registers (PLIC base + 0x0). Source 0 is reserved
+/// (priority always 0). 1024 = the PLIC spec's maximum source count.
+#[repr(C)]
+struct PlicPriorities {
+    prio: [ReadWrite<u32>; 1024],
+}
+const _: () = assert!(core::mem::size_of::<PlicPriorities>() == 0x1000);
+
+/// One context's interrupt-enable bitmap: 1 bit per source, 32 words cover all
+/// 1024 sources. At PLIC base + REG_ENABLE_BASE + context * REG_ENABLE_STRIDE.
+#[repr(C)]
+struct PlicEnableCtx {
+    words: [ReadWrite<u32>; 32],
+}
+const _: () = assert!(core::mem::size_of::<PlicEnableCtx>() as u64 == REG_ENABLE_STRIDE);
+
+/// One context's control block. At PLIC base + REG_CONTEXT_BASE +
+/// context * REG_CONTEXT_STRIDE.
+#[repr(C)]
+struct PlicContext {
+    /// +0x00 priority threshold: the context masks any source whose priority
+    /// is <= this value.
+    threshold: ReadWrite<u32>,
+    /// +0x04 claim/complete: reading claims the highest-priority pending
+    /// source (and marks it in-service); writing the same id completes it.
+    claim: ReadWrite<u32>,
+}
+const _: () = assert!(core::mem::offset_of!(PlicContext, threshold) == 0x00);
+const _: () = assert!(core::mem::offset_of!(PlicContext, claim) == 0x04);
+
+/// Construct the priority-register block (PLIC base + 0x0).
 ///
 /// # Safety
-/// `offset` must be within the mapped MMIO range published by `init`.
+/// `init` must have published a valid, mapped PLIC base.
 #[inline]
-unsafe fn read32(offset: u64) -> u32 {
-    let ptr = (base() + offset) as *const u32;
-    // SAFETY: caller asserts offset is in range; PLIC MMIO is 4-byte
-    // aligned and word-accessible.
-    unsafe { core::ptr::read_volatile(ptr) }
+unsafe fn plic_priorities() -> &'static PlicPriorities {
+    // SAFETY: the priority region is at the PLIC base, inside the mapped MMIO
+    // (ADR-036 § 3); `init` published the base.
+    unsafe { &*(base() as *const PlicPriorities) }
 }
 
-/// Write a 32-bit register at `base + offset`.
+/// Construct `context`'s enable-bitmap block.
 ///
 /// # Safety
-/// `offset` must be within the mapped MMIO range published by `init`.
+/// `init` must have run and `context` must be a PLIC context whose enable
+/// bitmap lies within the mapped region.
 #[inline]
-unsafe fn write32(offset: u64, value: u32) {
-    let ptr = (base() + offset) as *mut u32;
-    // SAFETY: same as read32.
-    unsafe { core::ptr::write_volatile(ptr, value) };
+unsafe fn plic_enable(context: u32) -> &'static PlicEnableCtx {
+    let addr = base() + REG_ENABLE_BASE + (context as u64) * REG_ENABLE_STRIDE;
+    // SAFETY: `addr` is this context's enable bitmap within mapped PLIC MMIO;
+    // the stride is REG_ENABLE_STRIDE == size_of::<PlicEnableCtx>() (asserted).
+    unsafe { &*(addr as *const PlicEnableCtx) }
 }
 
+/// Construct `context`'s control block (threshold + claim/complete).
+///
+/// # Safety
+/// `init` must have run and `context` must be a PLIC context whose control
+/// block lies within the mapped region.
 #[inline]
-fn priority_offset(source_id: u32) -> u64 {
-    (source_id as u64) * REG_PRIORITY_STRIDE
-}
-
-#[inline]
-fn enable_offset(context: u32, source_id: u32) -> u64 {
-    REG_ENABLE_BASE + (context as u64) * REG_ENABLE_STRIDE + ((source_id as u64) / 32) * 4
+unsafe fn plic_context(context: u32) -> &'static PlicContext {
+    let addr = base() + REG_CONTEXT_BASE + (context as u64) * REG_CONTEXT_STRIDE;
+    // SAFETY: `addr` is this context's control block within mapped PLIC MMIO.
+    unsafe { &*(addr as *const PlicContext) }
 }
 
 #[inline]
 fn enable_bit(source_id: u32) -> u32 {
     1u32 << (source_id % 32)
-}
-
-#[inline]
-fn threshold_offset(context: u32) -> u64 {
-    REG_CONTEXT_BASE + (context as u64) * REG_CONTEXT_STRIDE + REG_CONTEXT_THRESHOLD
-}
-
-#[inline]
-fn claim_offset(context: u32) -> u64 {
-    REG_CONTEXT_BASE + (context as u64) * REG_CONTEXT_STRIDE + REG_CONTEXT_CLAIM
 }
 
 // ============================================================================
@@ -218,28 +247,27 @@ pub unsafe fn init(phys_base: u64, size_bytes: u64) -> Result<(), &'static str> 
     PLIC_MMIO_SIZE.store(size_bytes, Ordering::Release);
     S_CONTEXT.store(HART0_S_CONTEXT, Ordering::Release);
 
-    // Zero every source priority so no IRQ will fire from a
-    // stale-register start. Source 0 is reserved (priority always 0).
-    //
-    // MMIO is just mapped; offsets are bounded by MAX_SOURCES.
+    // Zero every source priority so no IRQ fires from a stale-register start.
+    // Source 0 is reserved (priority always 0). The loop bound is a compile-time
+    // constant < the array length, so every index is provably in range.
+    // SAFETY: the base was just published; the PLIC region is mapped (ADR-036 § 3).
+    let prios = unsafe { plic_priorities() };
     for src in 1..MAX_SOURCES {
-        // SAFETY: priority_offset(src) is within mapped PLIC MMIO (src < MAX_SOURCES).
-        unsafe { write32(priority_offset(src), 0); }
+        prios.prio[src as usize].write(0);
     }
 
-    // Clear every enable bit in this hart's S-mode context —
-    // MAX_SOURCES / 32 u32 words at the context's enable base.
+    // Clear every enable bit in this hart's S-mode context (MAX_SOURCES / 32
+    // u32 words).
+    // SAFETY: as above; HART0_S_CONTEXT's enable bitmap is within the mapping.
+    let en = unsafe { plic_enable(HART0_S_CONTEXT) };
     for word in 0..(MAX_SOURCES / 32) {
-        let off = REG_ENABLE_BASE
-            + (HART0_S_CONTEXT as u64) * REG_ENABLE_STRIDE
-            + (word as u64) * 4;
-        // SAFETY: off is within this context's enable-bit region in mapped MMIO.
-        unsafe { write32(off, 0); }
+        en.words[word as usize].write(0);
     }
 
-    // Threshold = 0: accept any IRQ with priority ≥ 1.
-    // SAFETY: threshold_offset(HART0_S_CONTEXT) is within mapped PLIC MMIO.
-    unsafe { write32(threshold_offset(HART0_S_CONTEXT), 0); }
+    // Threshold = 0: accept any IRQ with priority >= 1.
+    // SAFETY: as above; HART0_S_CONTEXT's control block is within the mapping.
+    let ctx = unsafe { plic_context(HART0_S_CONTEXT) };
+    ctx.threshold.write(0);
 
     // Enable supervisor external interrupts (sie.SEIE, bit 9). Now
     // the hart will trap on PLIC-asserted IRQs once any source is
@@ -270,17 +298,19 @@ pub unsafe fn enable_irq(source_id: u32) {
     if base() == 0 {
         return;
     }
-    let ctx = S_CONTEXT.load(Ordering::Acquire);
-    // Priority = 1 = enabled.
-    // SAFETY: caller promises init has run; priority_offset(source_id) is in MMIO.
-    unsafe { write32(priority_offset(source_id), 1); }
+    let ctx_id = S_CONTEXT.load(Ordering::Acquire);
+    // Priority = 1 = enabled. source_id < MAX_SOURCES (debug_assert) keeps the
+    // array index in range - same bounded-index pattern as the GIC enable_spi.
+    // SAFETY: base != 0 means init published a mapped base (ADR-036 § 3).
+    let prios = unsafe { plic_priorities() };
+    prios.prio[source_id as usize].write(1);
 
-    // Enable bit: read-modify-write the context's enable word.
-    let eoff = enable_offset(ctx, source_id);
-    // SAFETY: eoff is within this context's enable-bit region in mapped MMIO.
-    let current = unsafe { read32(eoff) };
-    // SAFETY: same eoff; set this source's enable bit.
-    unsafe { write32(eoff, current | enable_bit(source_id)); }
+    // Set this source's enable bit (read-modify-write the context's word).
+    // SAFETY: as above; ctx_id is this kernel's S-mode context.
+    let en = unsafe { plic_enable(ctx_id) };
+    let word = (source_id / 32) as usize;
+    let current = en.words[word].read();
+    en.words[word].write(current | enable_bit(source_id));
 }
 
 /// Disarm a source. Priority = 0 and enable bit cleared. Idempotent.
@@ -296,14 +326,15 @@ pub unsafe fn disable_irq(source_id: u32) {
     if base() == 0 {
         return;
     }
-    let ctx = S_CONTEXT.load(Ordering::Acquire);
-    // SAFETY: caller promises init has run; priority_offset(source_id) is in MMIO.
-    unsafe { write32(priority_offset(source_id), 0); }
-    let eoff = enable_offset(ctx, source_id);
-    // SAFETY: eoff is within this context's enable-bit region in mapped MMIO.
-    let current = unsafe { read32(eoff) };
-    // SAFETY: same eoff; clear this source's enable bit.
-    unsafe { write32(eoff, current & !enable_bit(source_id)); }
+    let ctx_id = S_CONTEXT.load(Ordering::Acquire);
+    // SAFETY: base != 0 means init published a mapped base (ADR-036 § 3).
+    let prios = unsafe { plic_priorities() };
+    prios.prio[source_id as usize].write(0);
+    // SAFETY: as above; ctx_id is this kernel's S-mode context.
+    let en = unsafe { plic_enable(ctx_id) };
+    let word = (source_id / 32) as usize;
+    let current = en.words[word].read();
+    en.words[word].write(current & !enable_bit(source_id));
 }
 
 /// Claim the highest-priority pending IRQ on this hart's S-mode
@@ -317,10 +348,12 @@ pub fn claim() -> u32 {
     if base() == 0 {
         return 0;
     }
-    let ctx = S_CONTEXT.load(Ordering::Acquire);
-    // SAFETY: init has run; offset is bounded; claim is a
-    // side-effect-carrying read but it's the documented PLIC protocol.
-    unsafe { read32(claim_offset(ctx)) }
+    let ctx_id = S_CONTEXT.load(Ordering::Acquire);
+    // SAFETY: base != 0 means init published a mapped base (ADR-036 § 3).
+    let ctx = unsafe { plic_context(ctx_id) };
+    // Reading the claim register is a side-effecting read (it marks the source
+    // in-service) - the documented PLIC claim protocol.
+    ctx.claim.read()
 }
 
 /// Signal to the PLIC that the driver has finished handling
@@ -329,9 +362,11 @@ pub fn complete(source_id: u32) {
     if base() == 0 || source_id == 0 {
         return;
     }
-    let ctx = S_CONTEXT.load(Ordering::Acquire);
-    // SAFETY: init has run; offset is bounded.
-    unsafe { write32(claim_offset(ctx), source_id) };
+    let ctx_id = S_CONTEXT.load(Ordering::Acquire);
+    // SAFETY: base != 0 means init published a mapped base (ADR-036 § 3).
+    let ctx = unsafe { plic_context(ctx_id) };
+    // Writing the source id back to the claim register completes it.
+    ctx.claim.write(source_id);
 }
 
 // ============================================================================
