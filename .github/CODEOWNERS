@@ -1,0 +1,34 @@
+# CambiOS code ownership.
+#
+# Paths listed here REQUIRE a code-owner review before a PR can merge (paired with
+# branch protection: require_code_owner_reviews=true). The cambios-agent bot is
+# intentionally NOT an owner, so it cannot self-merge changes to these paths — an
+# owner (a human, or a review agent acting as one) must approve first.
+#
+# Unlisted paths the bot MAY auto-merge on green CI, hands-off:
+#   - docs/ (except docs/adr/) — STATUS.md, ASSUMPTIONS.md, design docs
+#   - verification/ — test/proof additions  (see note below)
+#   - user/ — the hands-off USERSPACE-BUILD lane (looser rules than kernel)
+
+# Verified kernel core
+/src/                 @riccajason
+
+# Syscall ABI surface (the kernel/userspace contract)
+/cambios-abi/         @riccajason
+
+# Architecture decision records (authoritative history)
+/docs/adr/            @riccajason
+
+# Project operating contract
+/CLAUDE.md            @riccajason
+
+# The gates themselves: build, lint, hooks, CI
+/Makefile             @riccajason
+/tools/               @riccajason
+/.github/             @riccajason
+
+# Conscious exceptions (NOT owned, so the bot auto-merges them on green CI):
+#   user/        — Jason's hands-off USERSPACE-BUILD lane. Add here to require review.
+#   verification/— hands-off test/proof drains. NOTE: a bot could in principle make
+#                  a proof vacuous and keep CI green; add `/verification/ @riccajason`
+#                  if that risk outweighs hands-off proof draining.
