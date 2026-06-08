@@ -343,7 +343,7 @@ impl CapabilityRights {
 ///
 /// SCAFFOLDING: 16 messages per endpoint queue.
 /// Why: verification wants a predictable memory layout and bounded queue size.
-///      Pre-allocated 32 endpoints × 16 messages × ~280 B ≈ 140 KiB at boot.
+///      Pre-allocated 64 endpoints × 16 messages × ~280 B ≈ 280 KiB at boot.
 /// Replace when: the audit telemetry channel (ADR-007) starts seeing bursts
 ///      that overflow this — first dropped event is the trigger. Note: bumping
 ///      this also bumps the boot memory cost linearly. See docs/ASSUMPTIONS.md.
@@ -970,7 +970,7 @@ impl EndpointShard {
 
 /// Sharded IPC manager — per-endpoint locking eliminates global serialization.
 ///
-/// Instead of one global lock for all 32 endpoints, each endpoint gets its
+/// Instead of one global lock for all 64 endpoints, each endpoint gets its
 /// own Spinlock. CPUs communicating on different endpoints never contend.
 ///
 /// The interceptor is shared (read-only after boot), so it's stored separately
