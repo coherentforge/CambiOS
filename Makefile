@@ -1401,7 +1401,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 fde-mount-aarch64 usb-host-aarch64 ccid-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1417,6 +1417,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	cp $(KS_SERVICE_ELF_AARCH64) /tmp/key-store-service-signed.elf
 	cp $(FS_SERVICE_ELF_AARCH64) /tmp/fs-service-signed.elf
 	cp $(BLK_DRIVER_ELF_AARCH64) /tmp/virtio-blk-signed.elf
+	cp $(FDE_MOUNT_ELF_AARCH64) /tmp/fde-mount-signed.elf
 	cp $(USB_HOST_ELF_AARCH64) /tmp/usb-host-signed.elf
 	cp $(CCID_ELF_AARCH64) /tmp/ccid-signed.elf
 	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
@@ -1435,6 +1436,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fde-mount-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/usb-host-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/ccid-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
@@ -1453,6 +1455,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
+	mcopy -i $(IMG_AARCH64) /tmp/fde-mount-signed.elf ::/boot/fde-mount.elf
 	mcopy -i $(IMG_AARCH64) /tmp/usb-host-signed.elf ::/boot/usb-host.elf
 	mcopy -i $(IMG_AARCH64) /tmp/ccid-signed.elf ::/boot/ccid.elf
 	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
@@ -1467,7 +1470,7 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/sprouty-signed.elf ::/boot/sprouty.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
 	mcopy -i $(IMG_AARCH64) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/usb-host-signed.elf /tmp/ccid-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/ping-signed.elf /tmp/sprouty-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
+	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/fde-mount-signed.elf /tmp/usb-host-signed.elf /tmp/ccid-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/ping-signed.elf /tmp/sprouty-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
@@ -1549,7 +1552,7 @@ kernel-riscv64:
 # img-riscv64 deps, copy + sign + --module here, and pick the right
 # slot in BOOT_MODULE_ORDER (between compositor's last GUI dep and
 # shell, mirroring x86_64).
-img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
+img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 fde-mount-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64
 	mkdir -p initrd_root_riscv64
@@ -1557,6 +1560,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	cp $(KS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/key-store-service.elf
 	cp $(FS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/fs-service.elf
 	cp $(BLK_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-blk.elf
+	cp $(FDE_MOUNT_ELF_RISCV64)      initrd_root_riscv64/fde-mount.elf
 	cp $(USB_HOST_ELF_RISCV64)       initrd_root_riscv64/usb-host.elf
 	cp $(CCID_ELF_RISCV64)           initrd_root_riscv64/ccid.elf
 	cp $(NET_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-net.elf
@@ -1567,6 +1571,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-blk.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fde-mount.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/usb-host.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/ccid.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-net.elf
@@ -1582,6 +1587,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 		--module key-store-service=initrd_root_riscv64/key-store-service.elf \
 		--module fs-service=initrd_root_riscv64/fs-service.elf \
 		--module virtio-blk=initrd_root_riscv64/virtio-blk.elf \
+		--module fde-mount=initrd_root_riscv64/fde-mount.elf \
 		--module usb-host=initrd_root_riscv64/usb-host.elf \
 		--module ccid=initrd_root_riscv64/ccid.elf \
 		--module virtio-net=initrd_root_riscv64/virtio-net.elf \
