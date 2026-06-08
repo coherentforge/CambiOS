@@ -60,6 +60,55 @@ pub fn interrupts_enabled() -> bool {
     false
 }
 
+/// Save the current interrupt state and clear SIE (mask S-mode interrupts).
+///
+/// Returns an opaque token (the pre-mask sstatus) to pass to
+/// [`irq_restore`]. The single masking primitive behind [`IrqSpinlock`];
+/// pair every call with exactly one `irq_restore`.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn irq_save_disable() -> usize {
+    let sstatus: u64;
+    // SAFETY: csrr is a pure read of sstatus; csrci sstatus, 2 clears SIE.
+    // Local to this hart; no memory operands. preserves_flags holds (RISC-V
+    // has no condition-flags register).
+    unsafe {
+        core::arch::asm!(
+            "csrr {0}, sstatus",
+            "csrci sstatus, 2",
+            out(reg) sstatus,
+            options(nomem, preserves_flags),
+        );
+    }
+    sstatus as usize
+}
+
+/// Restore the interrupt state captured by [`irq_save_disable`].
+///
+/// Sets SIE only if it was set (interrupts enabled) at save time, so
+/// nested holds never prematurely unmask.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn irq_restore(token: usize) {
+    if token & (1 << 1) != 0 {
+        // SAFETY: csrsi sstatus, 2 sets SIE at S-mode; only reached when SIE
+        // was set at save time, so this restores rather than newly enables.
+        unsafe { core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack)); }
+    }
+}
+
+/// Host-test stubs (same rationale as `interrupts_enabled`): no privileged
+/// interrupt-state instructions under `cargo test --lib`.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn irq_save_disable() -> usize {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn irq_restore(_token: usize) {}
+
 /// GDT compatibility shim.
 ///
 /// RISC-V has no segment selectors — privilege is managed via modes

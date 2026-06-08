@@ -62,6 +62,57 @@ pub fn interrupts_enabled() -> bool {
     false
 }
 
+/// Save the current interrupt state and disable maskable interrupts.
+///
+/// Returns an opaque token (the pre-`cli` RFLAGS) to pass to
+/// [`irq_restore`]. The single masking primitive behind [`IrqSpinlock`];
+/// pair every call with exactly one `irq_restore`.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn irq_save_disable() -> usize {
+    let rflags: u64;
+    // SAFETY: pushfq/pop is a balanced read of RFLAGS (net-zero stack); cli
+    // disables maskable interrupts at ring 0. nomem: no memory operands.
+    // preserves_flags is sound — cli touches IF, not the status flags.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {0}",
+            "cli",
+            out(reg) rflags,
+            options(nomem, preserves_flags),
+        );
+    }
+    rflags as usize
+}
+
+/// Restore the interrupt state captured by [`irq_save_disable`].
+///
+/// Re-enables interrupts only if they were enabled when the token was
+/// taken (RFLAGS.IF set), so nested holds never prematurely unmask.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn irq_restore(token: usize) {
+    if token & (1 << 9) != 0 {
+        // SAFETY: sti re-enables maskable interrupts at ring 0; only reached
+        // when IF was set at save time, so this restores rather than newly
+        // enables. Local to this CPU.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    }
+}
+
+/// Host-test stubs (same rationale as `interrupts_enabled`): no privileged
+/// interrupt-state instructions under `cargo test --lib`.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn irq_save_disable() -> usize {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn irq_restore(_token: usize) {}
+
 // ============================================================================
 // Explicit context switch primitives (global_asm — no compiler interference)
 // ============================================================================

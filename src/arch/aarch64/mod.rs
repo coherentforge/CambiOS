@@ -67,6 +67,54 @@ pub fn interrupts_enabled() -> bool {
     false
 }
 
+/// Save the current interrupt state and mask IRQs (DAIF.I set).
+///
+/// Returns an opaque token (the pre-mask DAIF) to pass to [`irq_restore`].
+/// The single masking primitive behind [`IrqSpinlock`]; pair every call
+/// with exactly one `irq_restore`.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn irq_save_disable() -> usize {
+    let daif: u64;
+    // SAFETY: mrs is a pure read of DAIF; daifset #2 masks IRQ at EL1. Local
+    // to this CPU; no memory operands. preserves_flags holds (NZCV untouched).
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, daif",
+            "msr daifset, #2",
+            out(reg) daif,
+            options(nomem, preserves_flags),
+        );
+    }
+    daif as usize
+}
+
+/// Restore the interrupt state captured by [`irq_save_disable`].
+///
+/// Unmasks IRQs only if they were unmasked (DAIF.I clear) at save time,
+/// so nested holds never prematurely unmask.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn irq_restore(token: usize) {
+    if token & (1 << 7) == 0 {
+        // SAFETY: daifclr #2 unmasks IRQ at EL1; only reached when DAIF.I was
+        // clear at save time, so this restores rather than newly enables.
+        unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    }
+}
+
+/// Host-test stubs (same rationale as `interrupts_enabled`): no privileged
+/// interrupt-state instructions under `cargo test --lib`.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn irq_save_disable() -> usize {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn irq_restore(_token: usize) {}
+
 /// GDT compatibility shim.
 ///
 /// AArch64 has no segment selectors — privilege is managed via exception

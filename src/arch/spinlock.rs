@@ -107,52 +107,25 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 
 /// Save current interrupt state and disable interrupts.
 /// Returns an opaque token to restore the previous state.
+///
+/// Delegates to the active backend's `arch::irq_save_disable()` so the
+/// privileged mask instruction is `target_os = "none"`-gated per arch
+/// (x86_64 `cli`, aarch64 `daifset`, riscv64 `csrci`); host-test builds
+/// resolve to a no-op stub. This is why `IrqSpinlock` actually masks
+/// interrupts on all three kernel arches, not just x86_64.
 #[inline(always)]
 fn save_and_disable_interrupts() -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let rflags: u64;
-        // SAFETY: Reading RFLAGS and disabling interrupts is safe at ring 0.
-        // pushfq/popfq is balanced (net stack effect zero). cli prevents
-        // interrupts until sti or popfq restores IF.
-        unsafe {
-            core::arch::asm!(
-                "pushfq",
-                "pop {}",
-                "cli",
-                out(reg) rflags,
-                options(nomem, preserves_flags),
-            );
-        }
-        rflags as usize
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // Test/non-x86 target: no-op (no cli/sti in userspace)
-        0
-    }
+    crate::arch::irq_save_disable()
 }
 
 /// Restore interrupt state from a previously saved token.
+///
+/// Delegates to `arch::irq_restore()`, which re-enables interrupts only if
+/// the token shows they were enabled at save time (so nested holds never
+/// prematurely unmask).
 #[inline(always)]
 fn restore_interrupts(saved: usize) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Only re-enable interrupts if they were enabled before (IF bit = bit 9)
-        if saved & (1 << 9) != 0 {
-            // SAFETY: Re-enabling interrupts is safe. We only do this if IF was
-            // set before save_and_disable_interrupts() was called.
-            unsafe {
-                core::arch::asm!("sti", options(nomem, nostack));
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = saved;
-    }
+    crate::arch::irq_restore(saved);
 }
 
 // ============================================================================
