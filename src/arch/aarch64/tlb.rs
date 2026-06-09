@@ -26,11 +26,16 @@ const PAGE_SHIFT: u64 = 12;
 /// The virtual address is shifted right by 12 to form the TLBI operand.
 pub fn shootdown_page(virt_addr: u64) {
     let operand = virt_addr >> PAGE_SHIFT;
-    // SAFETY: TLBI instructions are safe to execute from EL1. The DSB ISH
-    // ensures the invalidation completes on all CPUs before we proceed.
-    // ISB ensures subsequent instruction fetches see the new mappings.
+    // SAFETY: TLBI instructions are safe to execute from EL1.
+    // The leading DSB ISHST orders prior page-table stores (the caller's
+    // PTE write) before the broadcast TLBI, so every remote table walker
+    // that observes the invalidate also observes the new entry — without it
+    // a walker could re-cache the stale PTE after the TLBI (Arm ARM DDI 0487,
+    // TLB-maintenance ordering). The trailing DSB ISH ensures the
+    // invalidation completes on all CPUs; ISB syncs the local pipeline.
     unsafe {
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vale1is, {0}",
             "dsb ish",
             "isb",
@@ -49,6 +54,12 @@ pub fn shootdown_range(virt_start: u64, num_pages: usize) {
     if num_pages > 16 {
         shootdown_all();
         return;
+    }
+    // Order prior PTE store(s) before the TLBI loop — once, store-only,
+    // inner-shareable (matches barrier_map; see shootdown_page).
+    // SAFETY: DSB ISHST is always safe from EL1; orders prior stores.
+    unsafe {
+        core::arch::asm!("dsb ishst", options(nostack));
     }
     // Batch all per-page invalidations, then a single DSB ISH + ISB.
     for i in 0..num_pages {
@@ -76,9 +87,12 @@ pub fn shootdown_range(virt_start: u64, num_pages: usize) {
 /// Invalidate all TLB entries across all CPUs.
 pub fn shootdown_all() {
     // SAFETY: TLBI VMALLE1IS is safe from EL1, broadcasts to all cores.
-    // DSB ISH + ISB ensure completion.
+    // The leading DSB ISHST orders prior page-table stores before the
+    // invalidate (see shootdown_page); the trailing DSB ISH + ISB ensure
+    // completion and local pipeline sync.
     unsafe {
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vmalle1is",
             "dsb ish",
             "isb",

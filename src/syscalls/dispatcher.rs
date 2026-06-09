@@ -3487,14 +3487,17 @@ impl SyscallDispatcher {
         // whether we tombstoned or unmapped — the PTE changed either
         // way and stale TLB entries must be invalidated.
         if shootdown_creator {
-            // SAFETY: shootdown_range requires ring 0 and that the
-            // page-table mutations above are already visible.
+            // SAFETY: shootdown_range requires ring 0. The page-table
+            // mutations above are ordered before the broadcast TLBI by the
+            // leading barrier inside the primitive (DSB ISHST on aarch64,
+            // sfence/fence on riscv64) — no separate caller barrier needed.
             unsafe {
                 crate::arch::tlb_shootdown_range(record.creator_vaddr, record.num_pages);
             }
         }
         if shootdown_peer {
-            // SAFETY: same preconditions.
+            // SAFETY: same preconditions (ring 0; store-before-TLBI ordering
+            // enforced inside the primitive).
             unsafe {
                 crate::arch::tlb_shootdown_range(record.peer_vaddr, record.num_pages);
             }
