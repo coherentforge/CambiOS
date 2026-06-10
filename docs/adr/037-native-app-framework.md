@@ -52,9 +52,9 @@ sharp (see "Relationship to ADR-018").
   wrapper (parses the 36-byte header once: `sender_principal` + `from_endpoint` + payload), a shared
   `ServiceError` + `Result` alias (replacing the 11 reinvented status sets), and a generic,
   **monomorphized** `ServiceLoop<H: Handler>` owning recv→dispatch→reply→yield. No `Box<dyn>` (honors
-  the no-trait-objects-in-hot-paths rule). A `no_std`/no-serde `Encode`/`Decode` derive is **deferred**
-  to the second real request/response struct (second-consumer discriminator).
-- **L2 — `libui` (GUI toolkit).** The widget/layout/event tier `libgui` v0 deferred: an event loop
+  the no-trait-objects-in-hot-paths rule). A `no_std`/no-serde `Encode`/`Decode` derive is held back.
+  **Revisit when:** a second real request/response struct needs it (the second-consumer discriminator).
+- **L2 — `libui` (GUI toolkit).** The widget/layout/event tier that `libgui` v0 left out: an event loop
   wired to compositor input (`MsgTag::InputEvent`), a minimal widget set (Label, Button, container)
   over a Box/Flex layout pass, focus/z-order, decoration drawing — all rendering through the existing
   `Surface` API (CPU writes into the attached surface channel).
