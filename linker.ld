@@ -33,6 +33,18 @@ SECTIONS
     .data : {
         *(.data .data.*)
 
+        /* GOT and relocation-read-only sections. relocation-model=static means
+         * no runtime dynamic linker, so the GOT is filled at link time; but a
+         * dependency object can still emit a GOTPCREL relocation, which makes
+         * LLD materialize a small .got. LLD marks .got writable, so it lives in
+         * the already-writable :data segment — placing it in :rodata would
+         * taint that segment's read-only flag (W^X downgrade). Naming the
+         * sections here stops LLD from orphaning .got to the kernel base, where
+         * it overlaps .text. */
+        *(.got .got.*)
+        *(.got.plt .got.plt.*)
+        *(.data.rel.ro .data.rel.ro.*)
+
         /* Limine request sections — bootloader scans these */
         KEEP(*(.requests_start_marker))
         KEEP(*(.requests))
