@@ -37,27 +37,23 @@ use cambios_sprouty::{
     level,
 };
 
-/// IPC endpoint. `MAX_ENDPOINTS` is a SCAFFOLDING bound of 32 in
-/// [src/ipc/mod.rs], so valid IDs are 0..=31. 22 is free under the
-/// current allocation (16=FS, 17=KS, 18=shell, 19=ping, 20=virtio-net,
-/// 21=udp-stack, 24/25/26=virtio-blk, 27=scanout-driver, 28=compositor,
-/// 29=worm/hello-window, 30=input, 31=tree).
-///
-/// Revisit when: MAX_ENDPOINTS is raised — sprouty moves to
-/// its class-grouped slot (34) alongside Tree=31 / Worm=32 / Ping=33.
-// Was 22 (POLICY_QUERY_ENDPOINT collision). Then 23, which silently
-// collides with `POLICY_RESP_ENDPOINT` -- the kernel hardcodes a
-// "only the policy service may write to ep 23" check in
-// handle_write (src/syscalls/dispatcher.rs:417), so the compositor's
-// Welcome reply to sprouty got -EPERM at the kernel level and
-// sprouty blocked forever on recv_verified.
-// 15 is in the kernel-task grant range (0..16 per
-// capability_manager_init) but no service registers there, and
-// the kernel has no hardcoded intercept on it. After Phase 3.4
-// MAX_ENDPOINTS bump + name-server lands, games will stop hand-
-// picking and this comment can be retired.
-// Revisit when: name-server lands or MAX_ENDPOINTS > 32.
-const SPROUTY_ENDPOINT: u32 = 15;
+/// Sprouty's window input endpoint. Games sit at the top of the now-64-wide
+/// endpoint space (Tree=61, Worm=62, Sprouty=63), deliberately above the
+/// boot-service band (14..=33). Sprouty's endpoint has collided repeatedly
+/// as the low band filled in — a worked example of why ad-hoc `const u32`
+/// endpoints need the structural fix in ADR-018:
+///   - 22 aliased POLICY_QUERY_ENDPOINT.
+///   - 23 aliased POLICY_RESP_ENDPOINT; the kernel hardcodes a "only the
+///     policy service may write to ep 23" check in handle_write, so the
+///     compositor's Welcome reply got -EPERM and sprouty blocked forever
+///     on recv_verified.
+///   - 15 looked free, but terminal-window (auto-started) opens its front
+///     layer on 15 and drains the shared per-endpoint queue, stealing
+///     sprouty's routed input.
+/// 63 is at the top of the space, clear of every auto-started service.
+/// Revisit when: ADR-018's endpoint reservation table lands — hand-picked
+/// game endpoints move under manifest-declared reservations.
+const SPROUTY_ENDPOINT: u32 = 63;
 
 /// TUNING: physics tick interval in kernel ticks (1 tick = 10 ms at
 /// 100 Hz). 3 → 30 ms → 33 FPS — first game past ping's 20 FPS, first

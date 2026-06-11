@@ -56,19 +56,19 @@ use cambios_worm::game::{Direction, State, StepOutcome, Worm};
 
 mod render;
 
-/// Worm's IPC endpoint. The launch-plan direction is "one endpoint
-/// per app, grouped by class" (Tree=31, Worm=32, Pong=33, Mario=34),
-/// but the kernel's `MAX_ENDPOINTS` is currently a SCAFFOLDING bound
-/// of 32 — endpoint IDs are 0..=31, so 32 is out of range and
-/// `register_endpoint(32)` fails. Worm sits at 29 (free between
-/// compositor=28 and compositor-input=30) until the bound is bumped
-/// per docs/ASSUMPTIONS.md's replacement trigger ("first service that
-/// needs >32 endpoints"). When MAX_ENDPOINTS grows, move Worm to the
-/// planned slot and group by app class.
-///
-/// Revisit when: MAX_ENDPOINTS is raised kernel-side — Worm + Pong +
-/// Mario all move to their class-grouped IDs at that point.
-const WORM_ENDPOINT: u32 = 29;
+/// Worm's window input endpoint. Games sit at the top of the now-64-wide
+/// endpoint space (Tree=61, Worm=62, Sprouty=63), deliberately above the
+/// boot-service band (14..=33). The old launch-plan slots (Tree=31,
+/// Worm=32, Pong=33, Mario=34) were eaten by services that grew into that
+/// range (usb-host=31, fde-mount=32, ccid=33), so class-grouping moved to
+/// the high end. Worm previously sat at 29, which aliases hello-window's
+/// endpoint — it only worked because hello-window is disabled in
+/// limine.conf. Endpoint IDs are ad-hoc `const u32`s with no
+/// kernel-enforced ownership; ADR-018's reservation table is the
+/// structural fix.
+/// Revisit when: ADR-018's endpoint reservation table lands — hand-picked
+/// game endpoints move under manifest-declared reservations.
+const WORM_ENDPOINT: u32 = 62;
 
 /// USB HID usage codes we bind. Full evdev→HID table lives in
 /// `user/virtio-input/src/evdev.rs`; we re-declare only the ones the

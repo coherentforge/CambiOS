@@ -46,7 +46,18 @@ mod sprites;
 
 use game::{Board, RevealOutcome, State};
 
-const TREE_ENDPOINT: u32 = 31;
+/// Tree's window input endpoint. Games sit at the top of the now-64-wide
+/// endpoint space (Tree=61, Worm=62, Sprouty=63), deliberately above the
+/// boot-service band (14..=33). That band is densely allocated and
+/// auto-started services keep growing into it: Tree originally used 31 and
+/// silently lost all input to `usb-host`, which also claims 31 and drains
+/// the shared per-endpoint queue, so the compositor's routed events never
+/// reached this game. Endpoint IDs are ad-hoc `const u32`s with no
+/// kernel-enforced one-owner-per-endpoint check; ADR-018's endpoint
+/// reservation table is the structural fix.
+/// Revisit when: ADR-018's endpoint reservation table lands — hand-picked
+/// game endpoints move under manifest-declared reservations.
+const TREE_ENDPOINT: u32 = 61;
 
 /// HID usage codes we care about. Full evdev→HID table lives in
 /// `user/virtio-input/src/evdev.rs`; we re-declare only the two we
