@@ -1151,6 +1151,16 @@ impl SyscallDispatcher {
                         unsafe { crate::arch::aarch64::gic::enable_spi(irq_num); }
                     }
                 }
+                #[cfg(target_arch = "riscv64")]
+                {
+                    // SAFETY: the PLIC is initialized before user tasks run.
+                    // Enabling this hart's S-mode context for the source lets
+                    // SYS_WAIT_IRQ wake when the IRQ fires - mirrors the aarch64
+                    // enable_spi arm (and the x86 set_irq_destination above).
+                    // Currently latent: no riscv64 driver registers an on-demand
+                    // device IRQ yet, but without this arm one never would fire.
+                    unsafe { crate::arch::riscv64::plic::enable_irq(irq_num); }
+                }
             }
             // Drop locks before yield
         }
