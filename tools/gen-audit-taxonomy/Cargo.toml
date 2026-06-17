@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "gen-audit-taxonomy"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Render the canonical audit event taxonomy (cambios-abi) to markdown"
+
+# Renders from cambios-abi's `TAXONOMY` const slice directly — no parsing,
+# so the generated doc cannot drift from the source of truth. The whole
+# point of the taxonomy restructure is to remove second representations;
+# a parser would be one.
+[dependencies]
+cambios-abi = { path = "../../cambios-abi" }

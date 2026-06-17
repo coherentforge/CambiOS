@@ -23,94 +23,16 @@ pub mod drain;
 
 use crate::ipc::{EndpointId, ProcessId};
 
-/// Audit event kind discriminant.
-///
-/// Each variant maps 1:1 to an event type from ADR-007 § "What gets logged".
-/// The `repr(u8)` is the wire format written into `RawAuditEvent.data[0]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum AuditEventKind {
-    /// After a successful `RegisterEndpoint` or capability delegation.
-    CapabilityGranted = 0,
-    /// After a successful `revoke()` or `revoke_all_for_process()`.
-    CapabilityRevoked = 1,
-    /// When a capability check returns `PermissionDenied`.
-    CapabilityDenied = 2,
-    /// After successful IPC send (sampled, not every send).
-    IpcSend = 3,
-    /// After successful IPC recv (sampled).
-    IpcRecv = 4,
-    /// After `SYS_CHANNEL_CREATE` succeeds.
-    ChannelCreated = 5,
-    /// After `SYS_CHANNEL_ATTACH` succeeds.
-    ChannelAttached = 6,
-    /// After channel close (any path).
-    ChannelClosed = 7,
-    /// When the interceptor / policy service denies a syscall.
-    SyscallDenied = 8,
-    /// After `BinaryVerifier::verify()` succeeds.
-    BinaryLoaded = 9,
-    /// After `BinaryVerifier::verify()` fails.
-    BinaryRejected = 10,
-    /// After process creation.
-    ProcessCreated = 11,
-    /// After process exit.
-    ProcessTerminated = 12,
-    /// When the policy service is consulted (sampled).
-    PolicyQuery = 13,
-    /// Reserved for future AI watcher anomaly flagging.
-    AnomalyHook = 14,
-    /// Synthetic: reports accumulated drops from a staging buffer.
-    AuditDropped = 15,
-    /// Compositor reports a window-focus transition (T-7 Phase A,
-    /// docs/threat-model.md). Emitted by the compositor via
-    /// `SYS_AUDIT_EMIT_INPUT_FOCUS` whenever the focused window
-    /// changes — including initial focus and focus loss when the
-    /// last live window exits.
-    InputFocusChange = 16,
-    /// After `SYS_CLUSTER_CREATE` succeeds (ADR-027). Emitted by
-    /// `handle_cluster_create` once the cluster record is in
-    /// `Forming` state.
-    ClusterCreated = 17,
-    /// After cluster revoke completes (ADR-027 Decision 3).
-    /// Emitted by `do_cluster_revoke` from both the explicit
-    /// `SYS_CLUSTER_REVOKE` path and the exit-path auto-revoke
-    /// when a joined member's process exits and the cluster's
-    /// policy returns `RevokeCluster` for the departed role. The
-    /// `arg2` slot carries a `CLUSTER_REVOKE_REASON_*` discriminant
-    /// distinguishing the two paths.
-    ClusterRevoked = 18,
-    /// After `SYS_CHANNEL_BEGIN_TEARDOWN` succeeds on an `Active`
-    /// channel (ADR-027 Phase 1 quiesce protocol). Marks the start
-    /// of the two-phase teardown window — the channel is in
-    /// `Revoking`, the peer is being arm-quiesced. The matching
-    /// completion event lands as `ChannelTeardownCompleted`. Not
-    /// emitted on the `AwaitingAttach` short-circuit path: that
-    /// transition is a single-step terminal close and is reported
-    /// as the existing `ChannelClosed` event instead.
-    /// - `subject_pid`: the endpoint that initiated teardown
-    /// - `object_id`: channel id
-    /// - `arg0`: kind discriminant (0 = Close, 1 = Revoke)
-    ChannelTeardownStarted = 19,
-    /// After `SYS_CHANNEL_COMPLETE_TEARDOWN` succeeds. The channel
-    /// slot is freed, both sides unmapped, any quiesced peer task
-    /// woken. Pairs with the matching `ChannelTeardownStarted`.
-    /// - `subject_pid`: the endpoint that completed teardown
-    /// - `object_id`: channel id
-    /// - `arg0`: kind discriminant (0 = Close, 1 = Revoke)
-    /// - `arg1`: number of pages freed
-    ChannelTeardownCompleted = 20,
-    /// Defense-in-depth witness (ADR-034 §3): `reclaim_process_page_tables`
-    /// was asked to free a page-table root that is *still this CPU's active
-    /// CR3/satp/TTBR0*. Post-Phase-A the reaper only frees roots the owning
-    /// task has yielded off, so this never fires in correct operation —
-    /// emitting it means a regression reintroduced the active-root self-free.
-    /// The reclaim refuses (frees nothing) in both build profiles; a
-    /// `debug_assert!` additionally fast-fails dev builds.
-    /// - `subject_pid`: 0 (kernel-context event)
-    /// - `arg0`: the active root physical address the free was refused for
-    ReapWouldFreeActiveRoot = 21,
-}
+/// The audit event taxonomy — [`AuditEventKind`], the coarse
+/// [`AuditClass`], and the flags-byte sampled bit — is defined once in
+/// `cambios-abi` (`cambios_abi::audit`), shared by the kernel (producer
+/// of [`RawAuditEvent`]) and the `audit-tail` consumer. ADR-007 carries
+/// the categories and rationale; the variant list lives in the ABI crate
+/// and the generated doc at `docs/generated/audit-taxonomy.md`. See
+/// `cambios_abi::audit` for the wire-stability contract and the
+/// `domain.action` naming vocabulary.
+pub use cambios_abi::audit::{AuditClass, AuditEventKind, FLAG_SAMPLED};
+use cambios_abi::audit::flags_with_class;
 
 /// ARCHITECTURAL: `cluster_revoked` event's `arg2` discriminant for
 /// "caller of SYS_CLUSTER_REVOKE initiated the teardown" (cluster
@@ -143,7 +65,7 @@ pub const RAW_AUDIT_EVENT_SIZE: usize = 64;
 ///
 /// ```text
 /// [0]      event_kind: u8          (AuditEventKind discriminant)
-/// [1]      flags: u8               (bit 0: sampled; bits 1-7: reserved)
+/// [1]      flags: u8               (bit 0: sampled; bits 1-3: AuditClass; bits 4-7: reserved)
 /// [2..4]   reserved: [u8; 2]
 /// [4..8]   sequence: u32           (per-CPU monotonic, wraps)
 /// [8..16]  timestamp: u64          (Timer::get_ticks())
@@ -254,7 +176,10 @@ impl RawAuditEvent {
     ) -> Self {
         let mut data = [0u8; RAW_AUDIT_EVENT_SIZE];
         data[0] = kind as u8;
-        data[1] = flags;
+        // The class (flags bits 1..=3) is a property of the kind, stamped
+        // here from `kind.class()` so the emit call site can never mislabel
+        // it. `flags` carries only the sampled bit (bit 0) from the builders.
+        data[1] = flags_with_class(flags & FLAG_SAMPLED != 0, kind.class());
         // data[2..4] reserved
         data[4..8].copy_from_slice(&sequence.to_le_bytes());
         data[8..16].copy_from_slice(&timestamp.to_le_bytes());
@@ -832,9 +757,6 @@ impl RawAuditEvent {
     }
 }
 
-/// Flag: this event was generated via sampling (not every occurrence).
-pub const FLAG_SAMPLED: u8 = 0x01;
-
 /// TUNING: IPC send/recv audit sampling rate. Emit 1 event per N operations.
 ///
 /// At typical IPC rates (~1000 msg/sec), 1-in-100 sampling produces ~10
@@ -1102,7 +1024,9 @@ mod tests {
         let e = RawAuditEvent::input_focus_change(compositor, 42, 17, owner, 1234, 5);
 
         assert_eq!(e.kind(), AuditEventKind::InputFocusChange as u8);
-        assert_eq!(e.flags(), 0);
+        // flags now carries the class in bits 1..=3; InputFocusChange is Context.
+        assert_eq!(e.flags() & FLAG_SAMPLED, 0);
+        assert_eq!(AuditClass::from_flags(e.flags()), Some(AuditClass::Context));
         assert_eq!(e.sequence(), 5);
         assert_eq!(e.timestamp(), 1234);
         assert_eq!(e.subject_pid(), compositor.as_raw());

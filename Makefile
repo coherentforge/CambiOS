@@ -199,7 +199,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -1272,6 +1272,29 @@ check-doc-refs:
 
 update-doc-refs-baseline:
 	python3 tools/check-doc-refs.py --update-baseline
+
+# Regenerate docs/generated/audit-taxonomy.md from the canonical audit event
+# taxonomy in cambios-abi (the `audit_taxonomy!` macro). The doc is rendered
+# from the `TAXONOMY` const slice — never hand-edited. ADR-007 carries the
+# categories and rationale; this generated file carries the enumeration.
+audit-taxonomy:
+	@mkdir -p docs/generated
+	( cd tools/gen-audit-taxonomy && cargo run --release -q ) > $(CURDIR)/docs/generated/audit-taxonomy.md
+	@echo "=== regenerated docs/generated/audit-taxonomy.md ==="
+
+# Verify docs/generated/audit-taxonomy.md is in sync with cambios-abi.
+# Regenerates to a temp file and diffs against the committed copy; fails if
+# stale. Same generate-and-verify shape as check-adrs -> INDEX.md. Run after
+# any audit-taxonomy change (and in the commit gate).
+check-audit-taxonomy:
+	@tmp=$$(mktemp); \
+	( cd tools/gen-audit-taxonomy && cargo run --release -q ) > $$tmp 2>/dev/null; \
+	if diff -u docs/generated/audit-taxonomy.md $$tmp >/dev/null; then \
+		rm -f $$tmp; echo "=== audit-taxonomy.md in sync ==="; \
+	else \
+		echo "ERROR: docs/generated/audit-taxonomy.md is stale — run 'make audit-taxonomy'"; \
+		diff -u docs/generated/audit-taxonomy.md $$tmp || true; rm -f $$tmp; exit 1; \
+	fi
 
 # Mirror kernel ADRs to the cambios-site repo. Reads tools/sync-to-site.toml
 # for the slug map (kernel ADR stem -> site URL slug) and cross-doc reference

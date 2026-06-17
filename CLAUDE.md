@@ -239,6 +239,8 @@ make stats
 
 # Lints (all don't-grow-the-baseline gates; baselines in tools/check-*-baseline.txt)
 make check-adrs              # ADR cross-refs + regenerate docs/adr/INDEX.md
+make audit-taxonomy          # regenerate docs/generated/audit-taxonomy.md from cambios-abi (audit_taxonomy! macro)
+make check-audit-taxonomy    # verify the generated taxonomy doc is in sync (local make-target lint, like check-adrs; not ubuntu-CI-gated)
 make check-assumptions       # Convention 8 numeric-const tags
 make check-deferrals         # Convention 9 Revisit-when triggers
 make check-boot-panics       # ADR-021 Phase C — no panic!/expect/etc in boot init; exempt via `// BOOT_PANIC_OK: <reason>`

@@ -40,6 +40,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod audit;
+
 /// Syscall numbers — must match userspace convention.
 ///
 /// `repr(u64)` is the wire ABI: the value the architecture-specific
