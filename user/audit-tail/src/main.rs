@@ -17,6 +17,7 @@
 #![no_std]
 #![no_main]
 
+use cambios_abi::audit::AuditEventKind;
 use cambios_libsys as sys;
 use cambios_style::{format as fmt_style, style};
 use core::fmt::Write;
@@ -83,8 +84,8 @@ pub extern "C" fn _start() -> ! {
 /// Format and print one event from the ring.
 ///
 /// Layout (per `RawAuditEvent` in `src/audit/mod.rs`):
-///   [0]      kind: u8
-///   [1]      flags: u8
+///   [0]      kind: u8 (AuditEventKind discriminant; names via cambios-abi)
+///   [1]      flags: u8 (bit 0 sampled, bits 1-3 AuditClass)
 ///   [16..24] subject_pid: u64 (raw ProcessId)
 fn print_event(event_base: usize) {
     let p = event_base as *const u8;
@@ -103,11 +104,17 @@ fn print_event(event_base: usize) {
     let mut buf = [0u8; 192];
     let mut w = StackWriter::new(&mut buf);
 
+    // Canonical `domain.action` name from the shared taxonomy (cambios-abi).
+    // Unknown discriminants (a newer kernel than this consumer) render as
+    // "unknown" rather than guessing.
+    let kind_name = AuditEventKind::from_u8(kind)
+        .map(|k| k.name())
+        .unwrap_or("unknown");
     let _ = write!(
         w,
         "{} {} {}",
         style::dim("[AUDIT-TAIL]"),
-        style::emphasis(core::str::from_utf8(kind_name(kind)).unwrap_or("?")),
+        style::emphasis(kind_name),
         style::dim("pid="),
     );
     let mut pid_buf = [0u8; 20];
@@ -189,31 +196,6 @@ impl<'a> core::fmt::Write for StackWriter<'a> {
         } else {
             Ok(())
         }
-    }
-}
-
-fn kind_name(kind: u8) -> &'static [u8] {
-    match kind {
-        0 => b"CapabilityGranted",
-        1 => b"CapabilityRevoked",
-        2 => b"CapabilityDenied",
-        3 => b"IpcSend",
-        4 => b"IpcRecv",
-        5 => b"ChannelCreated",
-        6 => b"ChannelAttached",
-        7 => b"ChannelClosed",
-        8 => b"SyscallDenied",
-        9 => b"BinaryLoaded",
-        10 => b"BinaryRejected",
-        11 => b"ProcessCreated",
-        12 => b"ProcessTerminated",
-        13 => b"PolicyQuery",
-        14 => b"AnomalyHook",
-        15 => b"AuditDropped",
-        16 => b"InputFocusChange",
-        17 => b"ClusterCreated",
-        18 => b"ClusterRevoked",
-        _ => b"Unknown",
     }
 }
 
