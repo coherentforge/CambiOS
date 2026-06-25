@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:367:eventually
-CLAUDE.md:382:deferred
+CLAUDE.md:369:eventually
+CLAUDE.md:384:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -12,10 +12,10 @@ docs/adr/001-smp-scheduling-and-lock-hierarchy.md:119:deferred
 docs/adr/003-content-addressed-storage-and-identity.md:240:deferred
 docs/adr/005-ipc-primitives-control-and-bulk.md:116:eventually
 docs/adr/006-policy-service.md:216:eventually
-docs/adr/007-capability-revocation-and-telemetry.md:205:eventually
-docs/adr/007-capability-revocation-and-telemetry.md:209:eventually
-docs/adr/007-capability-revocation-and-telemetry.md:254:eventually
-docs/adr/007-capability-revocation-and-telemetry.md:404:eventually
+docs/adr/007-capability-revocation-and-telemetry.md:202:eventually
+docs/adr/007-capability-revocation-and-telemetry.md:206:eventually
+docs/adr/007-capability-revocation-and-telemetry.md:251:eventually
+docs/adr/007-capability-revocation-and-telemetry.md:401:eventually
 docs/adr/008-boot-time-sized-object-tables.md:460:deferred
 docs/adr/008-boot-time-sized-object-tables.md:496:eventually
 docs/adr/010-persistent-object-store-on-disk-format.md:148:eventually
