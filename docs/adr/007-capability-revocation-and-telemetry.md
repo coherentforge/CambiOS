@@ -158,27 +158,24 @@ This closes [SECURITY.md gap #5](../SECURITY.md#gap-analysis) and provides the s
 
 ### What gets logged
 
-The kernel emits events to a dedicated **audit telemetry channel** (using the channel mechanism from [ADR-005](005-ipc-primitives-control-and-bulk.md)). The event types are:
+The kernel emits fixed-size 64-byte events (`RawAuditEvent`, one cache line) into per-CPU staging buffers, drained to a global audit ring that user-space consumers read. Each event carries a discriminant, a coarse class, a subject, and event-specific arguments.
 
-| Event | When emitted | Payload |
-|---|---|---|
-| `CAPABILITY_GRANTED` | After a successful `RegisterEndpoint` or delegation | `{ grantor, grantee, endpoint, rights, timestamp }` |
-| `CAPABILITY_REVOKED` | After a successful `revoke()` | `{ revoker, holder, capability, reason, timestamp }` |
-| `CAPABILITY_DENIED` | When a capability check returns `PermissionDenied` | `{ caller, attempted_endpoint, attempted_rights, timestamp }` |
-| `IPC_SEND` | After successful IPC send (sampled, not every send) | `{ sender, recipient_endpoint, payload_len, timestamp }` |
-| `IPC_RECV` | After successful IPC recv (sampled) | `{ receiver, sender_principal, payload_len, timestamp }` |
-| `CHANNEL_CREATED` | After `SYS_CHANNEL_CREATE` | `{ creator, peer, size, purpose, channel_id, timestamp }` |
-| `CHANNEL_ATTACHED` | After `SYS_CHANNEL_ATTACH` | `{ attacher, channel_id, timestamp }` |
-| `CHANNEL_CLOSED` | After channel close (any path) | `{ closer, channel_id, bytes_transferred_estimate, lifetime_ticks, timestamp }` |
-| `SYSCALL_DENIED` | When the policy service denies a syscall | `{ caller, syscall_number, reason, timestamp }` |
-| `BINARY_LOADED` | After `BinaryVerifier::verify()` succeeds | `{ binary_hash, signer_principal, size, timestamp }` |
-| `BINARY_REJECTED` | After `BinaryVerifier::verify()` fails | `{ binary_hash, rejection_reason, timestamp }` |
-| `PROCESS_CREATED` | After process creation | `{ process_id, principal, parent, timestamp }` |
-| `PROCESS_TERMINATED` | After process exit | `{ process_id, exit_code, runtime_ticks, timestamp }` |
-| `POLICY_QUERY` | When the policy service is consulted (high volume — sampled) | `{ caller, query_kind, decision, cached, timestamp }` |
-| `ANOMALY_HOOK` | Reserved for future use; emitted when the AI watcher (when it exists) flags a pattern | `{ subject, anomaly_kind, severity, evidence_summary, timestamp }` |
+Events are organized into **categories** (this is the durable decision; the specific variant list is not):
 
-Each event is a small structured record (32-128 bytes). They're emitted to the audit channel as fast as possible, with some events sampled (IPC sends/recvs in the steady state are too high-volume to log every one — 1-in-N sampling is configurable).
+- **Capability** (`cap.*`) — grant, revoke, deny. The authority-mutation trail the policy service and AI watcher key on.
+- **Enforcement** (`enforce.*`) — syscall denial and policy consultation. Distinct from `cap.*` denial so the log records *which layer* refused (cap-table vs interceptor/policy); `enforce.policy_query` is a consultation record, not a denial.
+- **IPC dataflow** (`ipc.*`) — send/recv, sampled (steady-state volume is too high to log every one).
+- **Channel** (`chan.*`) and **cluster** (`cluster.*`) lifecycle — create/attach/close/teardown; cluster create/revoke.
+- **Process** (`proc.*`) and **loader** (`loader.*`) lifecycle — process create/terminate; signed-binary load/reject.
+- **UI context** (`ui.*`) — window-focus transitions; an observable trail, explicitly *not* a security-decision input.
+- **AI** (`ai.*`) — reserved for the AI watcher's anomaly flags.
+- **Meta** (`meta.*`) — audit-internal events (dropped-event reports, kernel-invariant witnesses); never an authorization signal.
+
+The coarse class (security / dataflow / lifecycle / context / anomaly / meta) rides in the event's flags byte so a consumer can filter without a decode table; it is fixed at the event's definition site, never chosen at the emit call site.
+
+**The canonical, current list of event variants is generated, not frozen here.** It lives in `cambios-abi` (the `audit_taxonomy!` macro in `cambios-abi/src/audit.rs`) and is rendered to [`docs/generated/audit-taxonomy.md`](../generated/audit-taxonomy.md) by `make audit-taxonomy`. This ADR carries the categories and rationale (the decision); the enumeration lives where it cannot drift from the wire format. Adding or renaming an event is a macro-table change + regenerate, not an edit to this ADR. Discriminants are append-only and never reused; `AUDIT_TAXONOMY_VERSION` tracks the vocabulary.
+
+Events are emitted as fast as possible, with `ipc.*` sampled (1-in-N, configurable).
 
 ### How the channel works
 
@@ -466,3 +463,27 @@ Phase 3.3 implementation (2026-04-12) diverges from this ADR in three ways:
 9. **Verification-stance update — no-leak invariant under tombstone.** This ADR's § "What revocation means" originally guaranteed "any subsequent access from either side faults," and § Verification Stance lists "no leak after revoke" as a target. The tombstone refines the access-failure mode for RO peer mappings — subsequent reads return zeros from a kernel-owned shared page rather than faulting — without weakening the leak invariant: original channel frames are freed to the allocator; the peer's RO mapping points to the tombstone, not to original or recycled data; a future re-allocation of the freed frames is unrelated to the peer's mapping. The "no further data flow after revoke" invariant holds — every read returns the same zeros; the kernel-stamped channel record stays in `Revoked`, observable via `SYS_CHANNEL_INFO`, and the peer's userspace cooperates by detecting the terminal state and dropping the dead reference.
 
    The atomicity and immediacy properties are preserved: the PTE swap (RO mapping → tombstone PTE) and the TLB shootdown both happen under the existing `PROCESS_TABLE` + `FRAME_ALLOCATOR` lock pair before `revoke()` returns. The kernel's verification surface widens by three local facts — the tombstone page exists and is RO; `teardown_channel_mappings` branches on peer-mapping permission (RO → remap, RW → unmap); the freed channel frames never alias the tombstone — all three locally encoded and amenable to the same Kani-harness pattern as the existing capability-revoke proofs.
+
+The audit taxonomy restructure (2026-06-17, commit 336b395) relocates this ADR's event enumeration without changing what is logged.
+
+10. **The event list moved from this ADR's prose to a generated artifact.** The § "What gets logged" table originally enumerated 15 event types inline; by 2026-06 the kernel emitted 22 (the table had frozen while `AuditEventKind` grew — the stale-ADR shape this restructure addresses). The canonical list now lives in `cambios-abi`'s `audit_taxonomy!` macro (`cambios-abi/src/audit.rs`), rendered to [`docs/generated/audit-taxonomy.md`](../generated/audit-taxonomy.md) by `make audit-taxonomy`; the body above now carries categories + rationale only. A `domain.action` naming vocabulary and a coarse on-wire `AuditClass` (security / dataflow / lifecycle / context / anomaly / meta, in flags-byte bits 1..=3) were added at the same time, and event names shifted from `SCREAMING_CASE` to `domain.action` (`CAPABILITY_GRANTED` → `cap.granted`). The original frozen table is preserved here verbatim:
+
+    | Event | When emitted | Payload |
+    |---|---|---|
+    | `CAPABILITY_GRANTED` | After a successful `RegisterEndpoint` or delegation | `{ grantor, grantee, endpoint, rights, timestamp }` |
+    | `CAPABILITY_REVOKED` | After a successful `revoke()` | `{ revoker, holder, capability, reason, timestamp }` |
+    | `CAPABILITY_DENIED` | When a capability check returns `PermissionDenied` | `{ caller, attempted_endpoint, attempted_rights, timestamp }` |
+    | `IPC_SEND` | After successful IPC send (sampled, not every send) | `{ sender, recipient_endpoint, payload_len, timestamp }` |
+    | `IPC_RECV` | After successful IPC recv (sampled) | `{ receiver, sender_principal, payload_len, timestamp }` |
+    | `CHANNEL_CREATED` | After `SYS_CHANNEL_CREATE` | `{ creator, peer, size, purpose, channel_id, timestamp }` |
+    | `CHANNEL_ATTACHED` | After `SYS_CHANNEL_ATTACH` | `{ attacher, channel_id, timestamp }` |
+    | `CHANNEL_CLOSED` | After channel close (any path) | `{ closer, channel_id, bytes_transferred_estimate, lifetime_ticks, timestamp }` |
+    | `SYSCALL_DENIED` | When the policy service denies a syscall | `{ caller, syscall_number, reason, timestamp }` |
+    | `BINARY_LOADED` | After `BinaryVerifier::verify()` succeeds | `{ binary_hash, signer_principal, size, timestamp }` |
+    | `BINARY_REJECTED` | After `BinaryVerifier::verify()` fails | `{ binary_hash, rejection_reason, timestamp }` |
+    | `PROCESS_CREATED` | After process creation | `{ process_id, principal, parent, timestamp }` |
+    | `PROCESS_TERMINATED` | After process exit | `{ process_id, exit_code, runtime_ticks, timestamp }` |
+    | `POLICY_QUERY` | When the policy service is consulted (high volume — sampled) | `{ caller, query_kind, decision, cached, timestamp }` |
+    | `ANOMALY_HOOK` | Reserved for future use; emitted when the AI watcher (when it exists) flags a pattern | `{ subject, anomaly_kind, severity, evidence_summary, timestamp }` |
+
+    The payload columns describe the *intended* fields at ADR-drafting time; the actual wire encoding (64-byte flat `RawAuditEvent` with `arg0..arg3` slots) is documented at the source and in the generated doc.
