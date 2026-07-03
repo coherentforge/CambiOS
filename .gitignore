@@ -37,3 +37,10 @@ dev_bootstrap_pubkey.bin
 dev_slot_9c_seed.bin
 user/key-store-service/dev_piv_secret.bin
 tools/gen-dev-piv-keys/.dev-seed.bin
+
+# Claude Code state. settings.json (shared allowlist for the project's
+# own lint/check commands) is committed; settings.local.json
+# (per-developer permission grants + the PostToolUse edit-log hook)
+# and worktrees/ (session-scoped side checkouts) stay local.
+.claude/*
+!.claude/settings.json

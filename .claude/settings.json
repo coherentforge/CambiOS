@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make check-all *)",
+      "Bash(make check-assumptions *)",
+      "Bash(make check-deferrals *)",
+      "Bash(make check-adrs *)",
+      "Bash(make claude-preflight *)",
+      "Bash(make check-stable *)",
+      "Bash(make check-unsafe-coverage *)",
+      "Bash(make check-banned-paths *)",
+      "Bash(make check-status-freshness *)"
+    ]
+  }
+}
