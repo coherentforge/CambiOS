@@ -1,6 +1,6 @@
 # ADR-037: Native App Framework: runtime, IPC stdlib, toolkit, service scaffolding
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-10
 - **Depends on:** [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC primitives the stdlib wraps), [ADR-024](024-syscall-abi-crate.md) (`cambios-abi`)
 - **Related:** [ADR-018](018-init-process-and-boot-manifest.md) (init + boot manifest — owns the manifest, signing, kernel reservation table; this ADR's authoring layer feeds its build tool), [ADR-004](004-cryptographic-integrity.md) (ARCSIG signing), [ADR-011](011-graphics-architecture-and-scaling.md) + [ADR-014](014-compositor-scanout-driver-protocol.md) (compositor/GUI the toolkit renders through), [ADR-012](012-input-architecture-and-device-classes.md) (input the event loop pumps), [ADR-006](006-policy-service.md) (policy-service — the first consumer), [ADR-008](008-boot-time-sized-object-tables.md) (tier sizing)
