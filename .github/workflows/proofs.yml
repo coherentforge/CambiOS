@@ -8,16 +8,32 @@
 # source verbatim via #[path], so the proofs cover the live code; the job is
 # just `cd verification/<crate> && cargo kani`, exactly as the Makefile does.
 #
+# Path-gated. A proof's only inputs are the single kernel file it #[path]-
+# includes plus the proof crate's own harnesses/stubs under verification/, so
+# nothing else needs to re-verify. The `changes` job detects whether any
+# proof-relevant path changed; the `kani` matrix jobs ALWAYS run (they are
+# required status checks, so they must always report a conclusion) but skip the
+# expensive `setup` + `cargo kani` steps when nothing relevant changed,
+# reporting success as a no-op. A workflow-level `paths:` filter would skip the
+# jobs ENTIRELY, leaving the six required checks pending forever and blocking
+# every unrelated PR — hence the in-job gate instead.
+#
+# Per-crate input map (kept in lockstep with each crate's #[path] include):
+#   buddy-proofs       src/memory/buddy_allocator.rs
+#   frame-proofs       src/memory/frame_allocator.rs
+#   elf-proofs         src/loader/elf.rs
+#   capability-proofs  src/ipc/capability.rs
+#   userslice-proofs   src/syscalls/user_slice.rs
+#   dtb-proofs         src/boot/riscv.rs
+# A change to any of these (or to verification/ or this file) re-runs all six;
+# adding a proof crate means adding its #[path] file to the filter below.
+#
 # Kani ships its own bundled toolchain + CBMC, independent of
 # rust-toolchain.toml. The pinned version below MUST match the version the
 # proofs are developed against locally (cargo kani --version) -- bump both
 # together. The toolchain bundle from `cargo kani setup` is heavy (~hundreds
 # of MB), so a `setup` job primes a shared cache before the matrix fans out,
 # and the matrix jobs restore it instead of each downloading the world.
-#
-# Cadence note: proofs are slower than the Tier A build/test gate. This runs
-# on push to main + PRs to keep "verified in CI" literally true; if proof
-# runtime makes that noisy, narrow to pull_request only or a nightly schedule.
 
 name: Proofs (Kani)
 
@@ -35,18 +51,46 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Keep in lockstep with the local `cargo kani --version`. New info as of
-  # this workflow: nothing in the repo pinned a Kani version before.
+  # Keep in lockstep with the local `cargo kani --version`.
   KANI_VERSION: "0.67.0"
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Detect whether any proof-relevant path changed. Output drives the in-job
+  # gate on `setup` and `kani` below. Not a required status check, so it is
+  # safe for this job to be the single point that decides "run vs no-op".
+  # ---------------------------------------------------------------------------
+  changes:
+    name: detect proof-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      proofs: ${{ steps.filter.outputs.proofs }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            proofs:
+              - 'verification/**'
+              - 'src/memory/buddy_allocator.rs'
+              - 'src/memory/frame_allocator.rs'
+              - 'src/loader/elf.rs'
+              - 'src/ipc/capability.rs'
+              - 'src/syscalls/user_slice.rs'
+              - 'src/boot/riscv.rs'
+              - '.github/workflows/proofs.yml'
+
+  # ---------------------------------------------------------------------------
   # Prime the Kani install (verifier binaries + bundled toolchain/CBMC) into a
   # version-keyed cache so the six matrix jobs restore it rather than each
   # doing the full download. No checkout needed -- this job only installs Kani.
+  # Skipped entirely when no proof-relevant path changed (not a required check).
   # ---------------------------------------------------------------------------
   setup:
     name: setup kani
+    needs: changes
+    if: needs.changes.outputs.proofs == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Cache Kani toolchain + verifier binaries
@@ -65,13 +109,17 @@ jobs:
           cargo kani setup
 
   # ---------------------------------------------------------------------------
-  # One job per proof crate. Restores the primed cache (a hit, since `setup`
-  # wrote it), then runs the crate's harnesses. fail-fast off so a regression
-  # in one proof crate still reports the status of the other five.
+  # One job per proof crate. ALWAYS runs (these are required status checks, so
+  # each must report a conclusion on every PR) via `!cancelled()` — this also
+  # lets it run when `setup` was skipped. When proof-relevant paths changed it
+  # restores the primed cache and runs the harnesses; otherwise it reports
+  # success as a no-op. fail-fast off so one regression still reports the other
+  # five.
   # ---------------------------------------------------------------------------
   kani:
     name: kani (${{ matrix.crate }})
-    needs: setup
+    needs: [changes, setup]
+    if: ${{ !cancelled() && needs.changes.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -85,8 +133,13 @@ jobs:
           - userslice-proofs
           - dtb-proofs
     steps:
+      - name: No proof-relevant changes — skip (report success)
+        if: needs.changes.outputs.proofs != 'true'
+        run: echo "No proof-relevant paths changed; skipping Kani for ${{ matrix.crate }}."
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.proofs == 'true'
       - name: Restore Kani toolchain + verifier binaries
+        if: needs.changes.outputs.proofs == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -95,11 +148,13 @@ jobs:
             ~/.cargo/bin/cargo-kani
           key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
       - name: Ensure Kani present (no-op on cache hit)
+        if: needs.changes.outputs.proofs == 'true'
         run: |
           if ! command -v cargo-kani >/dev/null; then
             ( cd "$HOME" && cargo install --locked kani-verifier@${KANI_VERSION} )
           fi
           cargo kani setup
       - name: cargo kani
+        if: needs.changes.outputs.proofs == 'true'
         working-directory: verification/${{ matrix.crate }}
         run: cargo kani
