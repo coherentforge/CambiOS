@@ -286,20 +286,27 @@ pub unsafe fn init(phys_base: u64, size_bytes: u64) -> Result<(), &'static str> 
 }
 
 /// Arm a source: priority = 1 and enable bit set for this hart's
-/// S-mode context. Idempotent.
+/// S-mode context. Idempotent. A `source_id` outside the kernel-managed
+/// range (1..MAX_SOURCES) is a no-op, so the function is total over its
+/// argument and safe to call with an untrusted value.
 ///
 /// # Safety
-/// [`init`] must have run. `source_id` must be in 1..MAX_SOURCES.
+/// [`init`] must have run. Any `source_id` is accepted; out-of-range values
+/// are ignored, so the SYS_WAIT_IRQ path may pass a caller-supplied irq_num.
 pub unsafe fn enable_irq(source_id: u32) {
-    debug_assert!(
-        (1..MAX_SOURCES).contains(&source_id),
-        "plic::enable_irq: source_id out of range",
-    );
+    // SYS_WAIT_IRQ (dispatcher::handle_wait_irq) admits irq_num up to
+    // MAX_DEVICE_IRQ (224) > MAX_SOURCES (128), so filter out-of-managed-range
+    // here as a no-op (same posture as the base() == 0 guard below): a release
+    // build must not enable a source the init/teardown loops (1..MAX_SOURCES)
+    // never clear, and source 0 is the PLIC "no source" sentinel.
+    if !(1..MAX_SOURCES).contains(&source_id) {
+        return;
+    }
     if base() == 0 {
         return;
     }
     let ctx_id = S_CONTEXT.load(Ordering::Acquire);
-    // Priority = 1 = enabled. source_id < MAX_SOURCES (debug_assert) keeps the
+    // Priority = 1 = enabled. source_id < MAX_SOURCES (checked above) keeps the
     // array index in range - same bounded-index pattern as the GIC enable_spi.
     // SAFETY: base != 0 means init published a mapped base (ADR-036 § 3).
     let prios = unsafe { plic_priorities() };
@@ -314,15 +321,15 @@ pub unsafe fn enable_irq(source_id: u32) {
 }
 
 /// Disarm a source. Priority = 0 and enable bit cleared. Idempotent.
+/// An out-of-range `source_id` is a no-op (see [`enable_irq`]).
 ///
 /// # Safety
 /// Same as [`enable_irq`].
 #[allow(dead_code)] // wired when the first driver registers a revocation flow
 pub unsafe fn disable_irq(source_id: u32) {
-    debug_assert!(
-        (1..MAX_SOURCES).contains(&source_id),
-        "plic::disable_irq: source_id out of range",
-    );
+    if !(1..MAX_SOURCES).contains(&source_id) {
+        return;
+    }
     if base() == 0 {
         return;
     }

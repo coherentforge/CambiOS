@@ -1151,6 +1151,16 @@ impl SyscallDispatcher {
                         unsafe { crate::arch::aarch64::gic::enable_spi(irq_num); }
                     }
                 }
+                #[cfg(target_arch = "riscv64")]
+                {
+                    // SAFETY: the PLIC is initialized before user tasks run.
+                    // Enabling this hart's S-mode context for the source lets
+                    // SYS_WAIT_IRQ wake when the IRQ fires - mirrors the aarch64
+                    // enable_spi arm (and the x86 set_irq_destination above).
+                    // Currently latent: no riscv64 driver registers an on-demand
+                    // device IRQ yet, but without this arm one never would fire.
+                    unsafe { crate::arch::riscv64::plic::enable_irq(irq_num); }
+                }
             }
             // Drop locks before yield
         }
@@ -3487,14 +3497,17 @@ impl SyscallDispatcher {
         // whether we tombstoned or unmapped — the PTE changed either
         // way and stale TLB entries must be invalidated.
         if shootdown_creator {
-            // SAFETY: shootdown_range requires ring 0 and that the
-            // page-table mutations above are already visible.
+            // SAFETY: shootdown_range requires ring 0. The page-table
+            // mutations above are ordered before the broadcast TLBI by the
+            // leading barrier inside the primitive (DSB ISHST on aarch64,
+            // sfence/fence on riscv64) — no separate caller barrier needed.
             unsafe {
                 crate::arch::tlb_shootdown_range(record.creator_vaddr, record.num_pages);
             }
         }
         if shootdown_peer {
-            // SAFETY: same preconditions.
+            // SAFETY: same preconditions (ring 0; store-before-TLBI ordering
+            // enforced inside the primitive).
             unsafe {
                 crate::arch::tlb_shootdown_range(record.peer_vaddr, record.num_pages);
             }

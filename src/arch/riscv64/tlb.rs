@@ -186,9 +186,17 @@ fn broadcast_shootdown(virt_start: u64, num_pages: usize) {
     let expected_acks = targets.count_ones();
     let _guard = SHOOTDOWN_LOCK.lock();
 
-    // Publish payload. Release ordering on the ACK store so target
-    // harts observe SHOOTDOWN_VA / SHOOTDOWN_PAGES before the IPI
-    // latches on their side.
+    // Publish the request payload, then a Release fence before the IPI.
+    // The fence is load-bearing: the payload stores are Relaxed, and neither
+    // the SBI IPI nor RISC-V trap entry carries any cross-hart memory
+    // ordering, so without an explicit release-to-acquire chain a responding
+    // hart could observe stale SHOOTDOWN_VA / SHOOTDOWN_PAGES (a prior
+    // request, or the initial zero) and flush the wrong page. The Release
+    // fence here pairs with the Acquire fence at the top of `handle_ipi` to
+    // give every responder a happens-before edge over these stores. (The
+    // SHOOTDOWN_ACK Release store below does NOT provide this — release and
+    // acquire must pair on the same location, and responders never
+    // Acquire-load ACK before reading the payload.)
     SHOOTDOWN_VA.store(virt_start, Ordering::Relaxed);
     let pages_u32 = if num_pages >= PAGES_SENTINEL_ALL as usize {
         PAGES_SENTINEL_ALL
@@ -197,6 +205,10 @@ fn broadcast_shootdown(virt_start: u64, num_pages: usize) {
     };
     SHOOTDOWN_PAGES.store(pages_u32, Ordering::Relaxed);
     SHOOTDOWN_ACK.store(0, Ordering::Release);
+    // RVWMO: a Release fence orders all prior memory accesses (the payload
+    // stores) before any later store a remote Acquire observes — i.e. before
+    // the IPI-causing event below.
+    core::sync::atomic::fence(Ordering::Release);
 
     // Fire the IPI.
     // SAFETY: SBI IPI is legal from S-mode; target harts have SSIE
@@ -251,6 +263,12 @@ pub unsafe fn handle_ipi() {
             options(nostack, nomem, preserves_flags),
         );
     }
+
+    // Acquire fence pairs with the Release fence in `broadcast_shootdown`:
+    // it orders the payload loads below AFTER the initiator's payload stores,
+    // so this hart reads the current request, never a stale one. Required
+    // because the IPI / trap delivery is not itself a cross-hart fence.
+    core::sync::atomic::fence(Ordering::Acquire);
 
     let va = SHOOTDOWN_VA.load(Ordering::Acquire);
     let pages = SHOOTDOWN_PAGES.load(Ordering::Acquire);

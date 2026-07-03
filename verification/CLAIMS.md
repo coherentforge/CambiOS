@@ -197,20 +197,40 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Cited where  | [ADR-019](../docs/adr/019-process-fault-reaping-and-peer-generation.md), `src/process.rs::resolve`, `src/syscalls/dispatcher.rs::teardown_channel_mappings` |
 | Revisit when | A `verification/process-proofs/` crate lands (stubs for memory/paging/config, mirroring capability-proofs) — then this row's Backing gains a Kani harness driving create→destroy→reuse→stale-lookup over a symbolic generation, and Status moves Tested → Proven. |
 
+## C-16: An aarch64 TLB shootdown orders the unmapped PTE write before the broadcast invalidation, so no remote core retains a live mapping after the shootdown returns
+
+| Layer        | 2 |
+| Status       | Aspirational |
+| Backing      | Barrier emitted, disassembly-confirmed (WI-1, `4f29675`): `dsb ishst` precedes every broadcast `tlbi ...is` in `shootdown_page` / `shootdown_range` / `shootdown_all`, with the trailing `dsb ish; isb` retained. Arm ARM DDI 0487 requires the store-ordering `DSB ISHST` before a broadcast TLBI so the PTE write is observable to the invalidate. Not a test, not a proof - the witness is the emitted instruction plus the spec rule. |
+| Bound        | The three shootdown primitives in `src/arch/aarch64/tlb.rs`; every unmap path that reaches them. |
+| Gap          | QEMU TCG is too strongly ordered to witness the race, so a green boot proves only no-regression and no test can exercise it; no herd7/litmus or Kani weak-memory model exists. The claim rests on (a) the `dsb ishst` being present in the emitted code and (b) the Arm ARM ordering rule being applied correctly - neither is machine-checked. The TLBI *completion* ordering (trailing `dsb ish`) was already correct before WI-1; only the *pre-TLBI store* ordering was missing. |
+| Cited where  | `src/arch/aarch64/tlb.rs`, WI-1 (`4f29675`), `notes/audit-concurrency-cfg-parity.md` finding A |
+| Revisit when | Real weakly-ordered aarch64 SMP hardware is in the test loop, OR a herd7/litmus or Kani weak-memory model of the shootdown handshake is added to CI - then Status can move toward Tested/Proven. |
+
+## C-17: A riscv64 TLB-shootdown responder always observes the current request payload, never a stale VA/page-count from a prior shootdown
+
+| Layer        | 2 |
+| Status       | Aspirational |
+| Backing      | Fences emitted, disassembly-confirmed (WI-2, `3cb182b`): `fence rw, w` (Release) before the SBI IPI send in `broadcast_shootdown`, and `fence r, rw` (Acquire) in the inlined `handle_ipi` after clearing `sip.SSIP` and before the payload loads. RISC-V RVWMO: release/acquire synchronize only on the *same* location, so the `SHOOTDOWN_ACK` counter does not order the *payload* (a different location), and neither the SBI IPI nor trap entry is a cross-hart fence - the explicit fence pair is the message-passing happens-before edge. Not a test, not a proof. |
+| Bound        | `broadcast_shootdown` + `handle_ipi` in `src/arch/riscv64/tlb.rs`; the `SHOOTDOWN_VA` / `SHOOTDOWN_PAGES` payload. |
+| Gap          | QEMU TCG cannot reproduce the stale-read race (it serializes the IPI under a strong model), so no test witnesses it; no litmus/Kani RVWMO model exists. The claim rests on (a) both fences being present in the emitted code and (b) the RVWMO message-passing argument being correct - neither is machine-checked. The `SHOOTDOWN_ACK` release/acquire counter (a separate location) was already correct and is unchanged; only the payload publication lacked an edge. |
+| Cited where  | `src/arch/riscv64/tlb.rs`, WI-2 (`3cb182b`), `notes/audit-concurrency-cfg-parity.md` finding B |
+| Revisit when | Real riscv64 SMP hardware is in the test loop, OR a herd7/litmus or Kani RVWMO model of the shootdown handshake is added to CI - then Status can move toward Tested/Proven. |
+
 ---
 
 # Status summary
 
-As of this draft (2026-05-30):
+As of this draft (2026-06-11):
 
 | Status | Layer 1 | Layer 2 | Layer 3 | Total |
 | --- | --- | --- | --- | --- |
 | Proven | 0 | 7 | 0 | 7 |
 | Tested | 1 | 2 | 0 | 3 |
 | Asserted | 1 | 0 | 0 | 1 |
-| Aspirational | 0 | 2 | 2 | 4 |
-| **Total** | **2** | **11** | **2** | **15** |
+| Aspirational | 0 | 4 | 2 | 6 |
+| **Total** | **2** | **13** | **2** | **17** |
 
-The shape is what it should be at this stage: most of the load-bearing safety properties (parsers, allocator, capability manager, user-slice validators) have proof backing; the cross-module identity / authorization properties are honestly Aspirational with a concrete pivot plan; the meaning-claims are Aspirational by their nature and the doc explicitly says so.
+The shape is what it should be at this stage: most of the load-bearing safety properties (parsers, allocator, capability manager, user-slice validators) have proof backing; the cross-module identity / authorization properties are honestly Aspirational with a concrete pivot plan; the meaning-claims are Aspirational by their nature and the doc explicitly says so. The two weak-memory TLB-shootdown ordering invariants (C-16, C-17) are a third honest-Aspirational kind: the barrier/fence is provably emitted (disassembly) but the only witness QEMU can give is no-regression, so real weakly-ordered SMP hardware or a litmus/Kani model is the path to a stronger status.
 
 Counts are not the goal; the goal is that the gap is named everywhere it exists.
