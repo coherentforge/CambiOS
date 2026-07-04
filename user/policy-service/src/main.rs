@@ -28,16 +28,6 @@ use cambios_libsys as sys;
 use cambios_libsys::SyscallNumber;
 
 // ============================================================================
-// Panic handler (required for no_std)
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[POLICY] PANIC!\n");
-    sys::exit(1);
-}
-
-// ============================================================================
 // Constants
 // ============================================================================
 
@@ -211,17 +201,20 @@ fn is_allowed(profile: Profile, syscall_num: u32) -> bool {
 }
 
 // ============================================================================
-// Entry point
+// Entry point — the ritual (_start, endpoint registration, boot-gate
+// release, panic handler) is emitted by `service_main!` (ADR-037 L0).
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    // Register our query endpoint
-    sys::register_endpoint(POLICY_QUERY_ENDPOINT);
+cambios_libsys_rt::service_main! {
+    name: "POLICY",
+    endpoint: POLICY_QUERY_ENDPOINT,
+    main: service_loop,
+}
 
+/// Steady-state query loop. `service_main!` has already registered the
+/// query endpoint and released the boot gate.
+fn service_loop() -> ! {
     sys::print(b"[POLICY] ready on endpoint 22\n");
-    sys::module_ready();
 
     // Service loop: recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
