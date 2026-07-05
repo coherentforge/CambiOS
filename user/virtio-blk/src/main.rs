@@ -65,19 +65,10 @@ mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
+use cambios_libipc as ipc;
 use cambios_libsys as sys;
 use transport::{LegacyMmioTransport, LegacyPciTransport, Transport};
 use virtqueue::{BounceBuffer, ChainSegment, VirtQueue};
-
-// ============================================================================
-// Panic handler
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[BLK] PANIC!\n");
-    sys::exit(1);
-}
 
 // ============================================================================
 // IPC protocol
@@ -624,12 +615,18 @@ fn handle_kernel_cmd(driver: &mut BlkDriver, payload: &[u8], response: &mut [u8]
 }
 
 // ============================================================================
-// Entry point
+// Entry point — _start and the panic handler are emitted by
+// `service_main!` (ADR-037 L0, no-endpoint form: registration order and
+// the module_ready point depend on device probing below, so `run` owns
+// both).
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "BLK",
+    main: run,
+}
+
+fn run() -> ! {
     // Step 1: find the virtio-blk device. Absence is non-fatal — the driver
     // still registers its endpoint and replies NO_DEVICE so upstream can
     // discover the situation cleanly.
@@ -706,63 +703,46 @@ pub extern "C" fn _start() -> ! {
     sys::print(b"[BLK] ready on endpoint 26 (virtio-blk / kernel)\n");
     sys::module_ready();
 
-    let mut recv_buf = [0u8; 292];
+    let mut recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let mut resp_buf = [0u8; 256];
-    let mut kern_recv_buf = [0u8; 292];
+    let mut kern_recv_buf = [0u8; ipc::RECV_BUF_SIZE];
 
-    // Dual-endpoint service loop. We MUST use try_recv_msg (non-blocking)
-    // on both endpoints: a blocking recv on one would park the task on
-    // MessageWait(that endpoint), and a wake targeting the other endpoint
-    // would miss us. That's what caused the Phase 4b arcobj handshake
-    // stall before SYS_TRY_RECV_MSG (37) landed.
+    // Dual-endpoint poll loop (ADR-037 Phase 1 driver shape). Both
+    // endpoints MUST be polled non-blocking: a blocking recv on one would
+    // park the task on MessageWait(that endpoint), and a wake targeting
+    // the other endpoint would miss us. That's what caused the Phase 4b
+    // arcobj handshake stall before SYS_TRY_RECV_MSG (37) landed.
     loop {
         let mut did_work = false;
 
-        // Poll the user-facing endpoint (identity-required).
-        let n = sys::try_recv_msg(BLK_ENDPOINT, &mut recv_buf);
-        if n > 0 {
-            let total = n as usize;
-            if total >= 37 {
-                // Reject anonymous senders on the user endpoint (mirrors
-                // what recv_verified's check did previously).
-                let mut principal_zero = true;
-                for &b in &recv_buf[0..32] {
-                    if b != 0 { principal_zero = false; break; }
+        // User-facing endpoint: identity-required. poll_verified applies
+        // recv_verified's structural anonymous-sender rejection — the
+        // hand-rolled principal-zero scan this loop used to carry.
+        did_work |= ipc::poll_verified(BLK_ENDPOINT, &mut recv_buf, |msg| {
+            // payload[0] = cmd, payload[1..] = args (>= 1 payload byte is
+            // guaranteed by the verified parse).
+            let resp_len = match msg.payload()[0] {
+                CMD_READ_BLOCK | CMD_WRITE_BLOCK => handle_unimplemented(&mut resp_buf),
+                CMD_FLUSH => handle_flush(&mut driver, &mut resp_buf),
+                CMD_GET_CAPACITY => handle_get_capacity(&driver, &mut resp_buf),
+                CMD_GET_STATUS => handle_get_status(&driver, &mut resp_buf),
+                _ => {
+                    resp_buf[0] = STATUS_ERROR;
+                    1
                 }
-                if !principal_zero {
-                    // payload[0] = cmd, payload[1..] = args
-                    let cmd = recv_buf[36];
-                    let from_ep = u32::from_le_bytes(recv_buf[32..36].try_into().unwrap());
-                    let resp_len = match cmd {
-                        CMD_READ_BLOCK | CMD_WRITE_BLOCK => handle_unimplemented(&mut resp_buf),
-                        CMD_FLUSH => handle_flush(&mut driver, &mut resp_buf),
-                        CMD_GET_CAPACITY => handle_get_capacity(&driver, &mut resp_buf),
-                        CMD_GET_STATUS => handle_get_status(&driver, &mut resp_buf),
-                        _ => {
-                            resp_buf[0] = STATUS_ERROR;
-                            1
-                        }
-                    };
-                    sys::write(from_ep, &resp_buf[..resp_len]);
-                }
-            }
-            did_work = true;
-        }
+            };
+            sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
+        });
 
-        // Poll the kernel-facing endpoint (kernel is anonymous sender —
-        // trust is by endpoint choice; nobody else registers ep26).
-        let n = sys::try_recv_msg(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf);
-        if n > 0 {
-            let total = n as usize;
-            if total >= 37 {
-                let payload = &kern_recv_buf[36..total];
-                let resp_len = handle_kernel_cmd(&mut driver, payload, &mut resp_buf);
-                if resp_len > 0 {
-                    sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf[..resp_len]);
-                }
+        // Kernel-facing endpoint: the kernel is the anonymous sender —
+        // trust is by endpoint choice; nobody else registers ep26. See
+        // the RawMessage docs for why poll_raw is legitimate here.
+        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+            let resp_len = handle_kernel_cmd(&mut driver, msg.payload(), &mut resp_buf);
+            if resp_len > 0 {
+                sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf[..resp_len]);
             }
-            did_work = true;
-        }
+        });
 
         if !did_work {
             sys::yield_now();
@@ -777,25 +757,23 @@ fn no_device_loop() -> ! {
     sys::register_endpoint(BLK_KERNEL_CMD_ENDPOINT);
     sys::module_ready();
 
-    let mut recv_buf = [0u8; 256];
-    let mut kern_recv_buf = [0u8; 292];
+    let mut recv_buf = [0u8; ipc::RECV_BUF_SIZE];
+    let mut kern_recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let resp_buf = [STATUS_NO_DEVICE; 1];
 
     loop {
         let mut did_work = false;
 
-        let n = sys::try_recv_msg(BLK_ENDPOINT, &mut recv_buf);
-        if n > 0 && (n as usize) >= 37 {
-            let from_ep = u32::from_le_bytes(recv_buf[32..36].try_into().unwrap());
-            sys::write(from_ep, &resp_buf);
-            did_work = true;
-        }
+        // NO_DEVICE responder: deliberately raw — any well-formed request
+        // (verified or not) gets the one-byte error so callers fail fast
+        // instead of timing out. No data path exists in this loop.
+        did_work |= ipc::poll_raw(BLK_ENDPOINT, &mut recv_buf, |msg| {
+            sys::write(msg.from_endpoint(), &resp_buf);
+        });
 
-        let n = sys::try_recv_msg(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf);
-        if n > 0 {
+        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |_msg| {
             sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf);
-            did_work = true;
-        }
+        });
 
         if !did_work {
             sys::yield_now();

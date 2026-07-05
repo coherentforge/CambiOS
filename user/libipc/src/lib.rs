@@ -294,6 +294,96 @@ impl<H: Handler> ServiceLoop<H> {
 }
 
 // ============================================================================
+// Multi-endpoint polling (the driver shape: ADR-037 Phase 1)
+// ============================================================================
+
+/// A message whose trust anchor is **endpoint choice, not sender
+/// identity** — the kernel-command pattern. Kernel-origin messages carry
+/// no Principal (`recv_verified` structurally rejects them); a service
+/// accepts them only on an endpoint nothing else speaks on (virtio-blk's
+/// ep 26 is the precedent).
+///
+/// **Never use this for a user-facing endpoint.** User requests go
+/// through [`ServiceLoop`] / [`poll_verified`] and the identity gate.
+/// Reaching for [`poll_raw`] on an endpoint users can send to is the
+/// exact bypass the project's identity rules exist to prevent.
+pub struct RawMessage<'a> {
+    from_endpoint: u32,
+    payload: &'a [u8],
+}
+
+impl<'a> RawMessage<'a> {
+    /// Parse a received wire message (`wire` = the first `n` bytes the
+    /// kernel wrote: 36-byte header + payload). Returns `None` below the
+    /// 37-byte minimum (header + 1 payload byte). No identity check —
+    /// see the type docs for when that is legitimate.
+    pub fn parse(wire: &'a [u8]) -> Option<Self> {
+        if wire.len() < 37 {
+            return None;
+        }
+        let from_endpoint = u32::from_le_bytes([wire[32], wire[33], wire[34], wire[35]]);
+        Some(Self {
+            from_endpoint,
+            payload: &wire[36..],
+        })
+    }
+
+    /// The endpoint the sender named for replies.
+    pub const fn from_endpoint(&self) -> u32 {
+        self.from_endpoint
+    }
+
+    /// The payload bytes (after the 36-byte header).
+    pub const fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// A [`Reader`] positioned at the start of the payload.
+    pub fn reader(&self) -> Reader<'a> {
+        Reader::new(self.payload)
+    }
+}
+
+/// Poll a **verified** endpoint without blocking; run `f` if an
+/// identity-verified message is queued. Returns `true` if a message was
+/// consumed — the did-work aggregate for multi-endpoint poll loops
+/// (yield only when every endpoint came up empty).
+///
+/// A queued-but-rejected message (anonymous sender) returns `false`:
+/// hostile anonymous traffic earns a yield per drop, not a hot spin.
+pub fn poll_verified(endpoint: u32, buf: &mut [u8], f: impl FnOnce(&VerifiedMessage<'_>)) -> bool {
+    match sys::try_recv_verified(endpoint, buf) {
+        Some(msg) => {
+            f(&msg);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Poll a **kernel-trusted raw** endpoint without blocking; run `f` if a
+/// message is queued. Trust is by endpoint choice — read the
+/// [`RawMessage`] docs before using this anywhere new. Returns `true`
+/// if a message was consumed.
+pub fn poll_raw(endpoint: u32, buf: &mut [u8], f: impl FnOnce(&RawMessage<'_>)) -> bool {
+    let n = sys::try_recv_msg(endpoint, buf);
+    if n <= 0 {
+        return false;
+    }
+    let total = n as usize;
+    if total > buf.len() {
+        return false;
+    }
+    match RawMessage::parse(&buf[..total]) {
+        Some(msg) => {
+            f(&msg);
+            true
+        }
+        None => false,
+    }
+}
+
+// ============================================================================
 // Host tests (ADR-037 verification posture: thorough host tests for the
 // pure logic — parsing, status round-trips. The loop itself is proven by
 // its consumers under QEMU; it is syscall-bound and non-terminating.)
@@ -372,6 +462,30 @@ mod tests {
         let mut w8 = Writer::new(&mut buf8);
         w8.put_u64(u64::MAX).unwrap();
         assert_eq!(w8.put_bytes(&[]), Ok(())); // zero-length always fits
+    }
+
+    #[test]
+    fn raw_message_parses_header_and_payload() {
+        let mut wire = [0u8; 40];
+        // 32 zero principal bytes (anonymous — RawMessage doesn't care),
+        // then from_endpoint = 25 LE, then 4 payload bytes.
+        wire[32..36].copy_from_slice(&25u32.to_le_bytes());
+        wire[36..40].copy_from_slice(&[9, 8, 7, 6]);
+        let msg = RawMessage::parse(&wire).unwrap();
+        assert_eq!(msg.from_endpoint(), 25);
+        assert_eq!(msg.payload(), &[9, 8, 7, 6]);
+        let mut r = msg.reader();
+        assert_eq!(r.u8().unwrap(), 9);
+    }
+
+    #[test]
+    fn raw_message_rejects_below_minimum() {
+        // 36 bytes = header with zero payload bytes -> below the 37 minimum.
+        assert!(RawMessage::parse(&[0u8; 36]).is_none());
+        assert!(RawMessage::parse(&[]).is_none());
+        // Exactly 37 = header + 1 payload byte -> parses.
+        let msg = RawMessage::parse(&[0u8; 37]).unwrap();
+        assert_eq!(msg.payload().len(), 1);
     }
 
     #[test]

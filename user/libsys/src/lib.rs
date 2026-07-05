@@ -927,6 +927,28 @@ impl<'a> VerifiedMessage<'a> {
 /// stamp sender identity on IPC messages.
 pub fn recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMessage<'a>> {
     let n = recv_msg(endpoint, buf);
+    parse_verified(buf, n)
+}
+
+/// Non-blocking [`recv_verified`]: polls `endpoint` via [`try_recv_msg`]
+/// and applies the **identical** verification (same parser, not a
+/// parallel implementation). For services that poll multiple endpoints
+/// and cannot afford to block on any single one — a blocking recv would
+/// park the task on `MessageWait(that endpoint)` and a wake targeting a
+/// different endpoint would miss it (the Phase 4b arcobj handshake
+/// stall that motivated `SYS_TRY_RECV_MSG`).
+///
+/// Returns `None` for all of: queue empty, message too short, sender
+/// anonymous.
+pub fn try_recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMessage<'a>> {
+    let n = try_recv_msg(endpoint, buf);
+    parse_verified(buf, n)
+}
+
+/// The one verification parser behind [`recv_verified`] and
+/// [`try_recv_verified`]: length check, Principal extraction, the
+/// structural anonymous-sender rejection, header split.
+fn parse_verified(buf: &mut [u8], n: i64) -> Option<VerifiedMessage<'_>> {
     if n <= 0 {
         return None;
     }
