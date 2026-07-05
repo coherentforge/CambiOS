@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-libipc"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+cambios-libsys = { path = "../libsys" }

@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 cambios-libsys = { path = "../libsys" }
 cambios-libsys-rt = { path = "../libsys-rt" }
+cambios-libipc = { path = "../libipc" }
 
 [profile.release]
 opt-level = "s"        # Size-optimized (small ELF)

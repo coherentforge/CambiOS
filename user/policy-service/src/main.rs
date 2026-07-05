@@ -24,6 +24,8 @@
 #![no_main]
 #![deny(unsafe_code)]
 
+use cambios_libipc as ipc;
+use cambios_libipc::MessageExt;
 use cambios_libsys as sys;
 use cambios_libsys::SyscallNumber;
 
@@ -36,10 +38,6 @@ const POLICY_QUERY_ENDPOINT: u32 = 22;
 
 /// IPC endpoint where the kernel intercepts our responses.
 const POLICY_RESP_ENDPOINT: u32 = 23;
-
-/// Minimum payload size for a valid query.
-/// IPC header (36 bytes) + query payload (48 bytes) = 84 bytes total.
-const MIN_QUERY_SIZE: usize = 36 + 48;
 
 // Syscall numbers come from `cambios-libsys::SyscallNumber` (re-exported from
 // the standalone `cambios-abi` crate so kernel + userspace share one source
@@ -212,58 +210,39 @@ cambios_libsys_rt::service_main! {
 }
 
 /// Steady-state query loop. `service_main!` has already registered the
-/// query endpoint and released the boot gate.
+/// query endpoint and released the boot gate; `ServiceLoop` owns
+/// recv → dispatch → yield (ADR-037 L1).
 fn service_loop() -> ! {
     sys::print(b"[POLICY] ready on endpoint 22\n");
-
-    // Service loop: recv_verified rejects anonymous senders.
-    let mut recv_buf = [0u8; 256];
-
-    loop {
-        let msg = match sys::recv_verified(POLICY_QUERY_ENDPOINT, &mut recv_buf) {
-            Some(msg) => msg,
-            None => {
-                sys::yield_now();
-                continue;
-            }
-        };
-
-        // Query payload must be at least 48 bytes (query_id + pid + syscall + principal)
-        let payload = msg.payload();
-        if payload.len() < 48 {
-            continue;
-        }
-
-        // Extract query fields
-        let query_id_bytes: [u8; 8] = match payload[0..8].try_into() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let caller_pid_bytes: [u8; 4] = match payload[8..12].try_into() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let syscall_bytes: [u8; 4] = match payload[12..16].try_into() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let caller_pid = u32::from_le_bytes(caller_pid_bytes);
-        let syscall_num = u32::from_le_bytes(syscall_bytes);
-
-        // Profile lookup + check
-        let profile = profile_for(caller_pid);
-        let allowed = is_allowed(profile, syscall_num);
-
-        // Build response: [query_id:8][decision:1]
-        let mut resp = [0u8; 9];
-        resp[0..8].copy_from_slice(&query_id_bytes);
-        resp[8] = if allowed { 0 } else { 1 };
-
-        // Send response to the policy response endpoint (kernel intercepts this)
-        sys::write(POLICY_RESP_ENDPOINT, &resp);
-    }
+    ipc::ServiceLoop::new(POLICY_QUERY_ENDPOINT, PolicyHandler).run()
 }
 
-// Suppress unused warning for MIN_QUERY_SIZE (kept as documentation of the protocol).
-#[allow(dead_code)]
-const _MIN_QUERY_SIZE: usize = MIN_QUERY_SIZE;
+/// Per-query dispatch: parse the fixed query, decide, reply.
+struct PolicyHandler;
+
+impl ipc::Handler for PolicyHandler {
+    fn handle(&mut self, msg: &ipc::VerifiedMessage<'_>) -> ipc::Result<()> {
+        // Query payload: [query_id:8][caller_pid:4][syscall_num:4][caller_principal:32]
+        let mut r = msg.reader();
+        let query_id = r.u64()?;
+        let caller_pid = r.u32()?;
+        let syscall_num = r.u32()?;
+        // caller_principal is unused today, but consuming it preserves the
+        // 48-byte minimum the wire format defines — shorter queries are
+        // Malformed and dropped, exactly as the hand-rolled check did.
+        let _caller_principal = r.take(32)?;
+
+        // Profile lookup + check
+        let allowed = is_allowed(profile_for(caller_pid), syscall_num);
+
+        // Response: [query_id:8][decision:1] (0 = Allow, 1 = Deny)
+        let mut resp = [0u8; 9];
+        let mut w = ipc::Writer::new(&mut resp);
+        w.put_u64(query_id)?;
+        w.put_u8(if allowed { 0 } else { 1 })?;
+
+        // The kernel intercepts writes to the policy response endpoint.
+        sys::write(POLICY_RESP_ENDPOINT, &resp);
+        Ok(())
+    }
+}
