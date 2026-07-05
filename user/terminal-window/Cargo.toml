@@ -14,7 +14,7 @@ cambios-libgui = { path = "../libgui" }
 cambios-libgui-proto = { path = "../libgui-proto" }
 cambios-libinput-proto = { path = "../libinput-proto" }
 cambios-style = { path = "../cambios-style" }
-linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
+cambios-libsys-rt = { path = "../libsys-rt", features = ["heap"] }
 
 [profile.release]
 opt-level = "s"

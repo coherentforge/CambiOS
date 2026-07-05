@@ -58,11 +58,8 @@
 //! 64 KiB SCAFFOLDING tag is the reference).
 //!
 //! The `heap:` arms expand only in consumers (macro bodies are not
-//! type-checked until expansion), so their first compile-proof is the
-//! first `alloc`-consuming service port.
-//! Revisit when: ADR-037 Phase 1 ports an `alloc`-consuming service
-//! (terminal-window is the natural candidate) — that port validates the
-//! `heap:` arm end-to-end.
+//! type-checked until expansion); terminal-window's port is the
+//! expansion-proof consumer (ADR-037 Phase 1).
 
 #![no_std]
 
@@ -83,8 +80,15 @@ pub use linked_list_allocator as __alloc;
 /// - `name: "SVC", endpoint: E, main: f` — single endpoint.
 /// - `name: "SVC", endpoints: [E1, E2], main: f` — multi-endpoint
 ///   services (e.g. virtio-blk's client + kernel-command pair).
-/// - Add `heap: SIZE` (requires the `heap` feature) for `alloc`
-///   consumers; SIZE is the static arena in bytes.
+/// - `name: "SVC", main: f` — **no-endpoint form** for services whose
+///   registration and readiness the macro cannot order for them (GUI
+///   apps register reply endpoints inside `libgui::Client::open`, and
+///   gate readiness on window setup). The macro emits only `_start`
+///   (+ heap) and the panic handler; **`main` MUST call
+///   `sys::module_ready()` itself once ready**, or the boot gate holds
+///   every later module forever.
+/// - Add `heap: SIZE` (requires the `heap` feature) to any form for
+///   `alloc` consumers; SIZE is the static arena in bytes.
 ///
 /// `name` is a string literal used as the panic-message prefix
 /// (`[NAME] PANIC!`). `main` must be `fn() -> !`.
@@ -111,6 +115,51 @@ macro_rules! service_main {
         pub extern "C" fn _start() -> ! {
             $( let _ = $crate::__sys::register_endpoint($ep); )+
             $crate::__sys::module_ready();
+            $main()
+        }
+    };
+
+    // --- no-endpoint arms: registration + module_ready stay in `main`
+    //     (GUI apps — see the macro docs; `main` must call module_ready) ---
+    (name: $name:literal, main: $main:path $(,)?) => {
+        #[panic_handler]
+        fn __cambios_rt_panic(_info: &::core::panic::PanicInfo) -> ! {
+            $crate::__sys::print(::core::concat!("[", $name, "] PANIC!\n").as_bytes());
+            $crate::__sys::exit(1)
+        }
+
+        #[allow(unsafe_code)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() -> ! {
+            $main()
+        }
+    };
+    (name: $name:literal, heap: $size:expr, main: $main:path $(,)?) => {
+        #[panic_handler]
+        fn __cambios_rt_panic(_info: &::core::panic::PanicInfo) -> ! {
+            $crate::__sys::print(::core::concat!("[", $name, "] PANIC!\n").as_bytes());
+            $crate::__sys::exit(1)
+        }
+
+        #[global_allocator]
+        static __CAMBIOS_RT_ALLOC: $crate::__alloc::LockedHeap =
+            $crate::__alloc::LockedHeap::empty();
+
+        static mut __CAMBIOS_RT_HEAP: [u8; $size] = [0u8; $size];
+
+        #[allow(unsafe_code)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start() -> ! {
+            // SAFETY: __CAMBIOS_RT_HEAP is a 'static BSS arena; _start
+            // runs exactly once, before any allocation, so this is the
+            // sole direct access and the allocator takes ownership of
+            // the region for the process lifetime.
+            unsafe {
+                __CAMBIOS_RT_ALLOC.lock().init(
+                    ::core::ptr::addr_of_mut!(__CAMBIOS_RT_HEAP) as *mut u8,
+                    $size,
+                );
+            }
             $main()
         }
     };

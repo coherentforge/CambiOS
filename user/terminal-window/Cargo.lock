@@ -34,6 +34,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cambios-libsys-rt"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
+ "linked_list_allocator",
+]
+
+[[package]]
 name = "cambios-libterm"
 version = "0.1.0"
 dependencies = [
@@ -55,9 +63,9 @@ dependencies = [
  "cambios-libgui-proto",
  "cambios-libinput-proto",
  "cambios-libsys",
+ "cambios-libsys-rt",
  "cambios-libterm",
  "cambios-style",
- "linked_list_allocator",
 ]
 
 [[package]]

@@ -20,10 +20,9 @@ use cambios_libterm::Terminal;
 use cambios_style::format;
 use cambios_terminal_window::gui_backend::GuiBackend;
 use core::fmt::Write;
-use linked_list_allocator::LockedHeap;
 
 // ============================================================================
-// Userspace heap
+// Userspace heap (arena emitted by `service_main!`'s `heap:` arm)
 // ============================================================================
 //
 // SCAFFOLDING: 64 KiB static heap. The LineEditor needs alloc for its
@@ -35,10 +34,6 @@ use linked_list_allocator::LockedHeap;
 // Replace when: the kernel exposes a syscall-mapped per-process heap,
 // or libterm gains a no-alloc feature.
 const HEAP_SIZE: usize = 64 * 1024;
-static mut HEAP_AREA: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 // ============================================================================
 // Configuration
@@ -75,31 +70,20 @@ const BANNER: &[u8] =
     b"CambiOS terminal v0\r\ntype `help` for commands.\r\n\r\n";
 
 // ============================================================================
-// Panic handler
+// Entry point — _start, heap arena + init, and the panic handler are
+// emitted by `service_main!` (ADR-037 L0, no-endpoint + heap form).
+// libgui's Client::open registers the reply endpoints, and readiness is
+// gated on window setup, so `run` calls `sys::module_ready()` itself.
 // ============================================================================
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[terminal-window] PANIC!\n");
-    sys::exit(1);
+cambios_libsys_rt::service_main! {
+    name: "terminal-window",
+    heap: HEAP_SIZE,
+    main: run,
 }
 
-// ============================================================================
-// Entry point
-// ============================================================================
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+fn run() -> ! {
     sys::print(b"[terminal-window] starting\n");
-
-    // Initialize the userspace heap before any alloc-using code runs.
-    // SAFETY: HEAP_AREA is a static byte buffer with `'static` lifetime.
-    // We hand its full extent to the allocator exactly once at startup;
-    // no other code reads or writes HEAP_AREA directly.
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(HEAP_AREA) as *mut u8;
-        ALLOCATOR.lock().init(ptr, HEAP_SIZE);
-    }
 
     // Open the back layer first and run the splash on it. After the
     // splash returns, the back surface holds the steady-state
