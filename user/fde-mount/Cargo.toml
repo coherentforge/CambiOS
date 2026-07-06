@@ -10,6 +10,7 @@ description = "CambiOS FDE-mount orchestrator boot module (stream A A-v.a). Read
 
 [dependencies]
 cambios-libsys = { path = "../libsys" }
+cambios-libsys-rt = { path = "../libsys-rt" }
 cambios-fde-proto = { path = "../../cambios-fde-proto" }
 blake3 = { version = "1.8", default-features = false, features = ["pure"] }
 chacha20poly1305 = { version = "0.10", default-features = false }

@@ -66,9 +66,12 @@ struct ScanoutChannel {
     size_bytes: usize,
 }
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "SCANOUT-LIMINE",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[SCANOUT-LIMINE] starting\r\n");
 
     // Map the Limine framebuffer. The kernel grants the
@@ -336,8 +339,3 @@ fn print_fb(fb: &FramebufferDescriptor) {
     sys::print(b"\r\n");
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"SCANOUT-LIMINE", b"panic");
-    sys::exit(255);
-}

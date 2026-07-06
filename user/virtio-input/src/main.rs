@@ -134,9 +134,12 @@ struct InputDevice {
 // Entry
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "VIRTIO-INPUT",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[VIRTIO-INPUT] starting (ADR-012 Input-1)\r\n");
 
     // Scan PCI up to a small limit — no known platform exposes more
@@ -605,8 +608,3 @@ fn print_u64_dec(n: u64) {
     sys::print(&out[..len]);
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"VIRTIO-INPUT", b"panic");
-    sys::exit(255);
-}

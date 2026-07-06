@@ -52,11 +52,6 @@ use ring::{DmaBuf, Ring, BUF_SIZE, RING_SIZE};
 // Panic handler
 // ============================================================================
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[I219] PANIC!\n");
-    sys::exit(1);
-}
 
 // ============================================================================
 // IPC protocol (matches virtio-net for UDP stack compatibility)
@@ -383,9 +378,12 @@ fn handle_recv_packet(driver: &mut I219Driver, response: &mut [u8]) -> usize {
 // Entry point
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "I219",
+    main: run,
+}
+
+fn run() -> ! {
     // Step 1: Find the I219 PCI device (silent if not present — expected on QEMU).
     let dev = match pci::PciDeviceInfo::find_i219() {
         Some(d) => d,

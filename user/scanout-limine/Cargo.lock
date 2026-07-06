@@ -3,12 +3,26 @@
 version = 4
 
 [[package]]
+name = "cambios-abi"
+version = "0.1.0"
+
+[[package]]
 name = "cambios-libscanout"
 version = "0.1.0"
 
 [[package]]
 name = "cambios-libsys"
 version = "0.1.0"
+dependencies = [
+ "cambios-abi",
+]
+
+[[package]]
+name = "cambios-libsys-rt"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
+]
 
 [[package]]
 name = "cambios-scanout-limine"
@@ -16,4 +30,5 @@ version = "0.1.0"
 dependencies = [
  "cambios-libscanout",
  "cambios-libsys",
+ "cambios-libsys-rt",
 ]

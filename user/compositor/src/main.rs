@@ -74,9 +74,12 @@ const DISPATCH_BUFFER_BYTES: usize = 320;
 /// 32-byte sender_principal + 4-byte from_endpoint.
 const RECV_HEADER_BYTES: usize = 36;
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "COMPOSITOR",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[COMPOSITOR] Phase Scanout-2 (ADR-014)\r\n");
 
     if sys::register_endpoint(COMPOSITOR_ENDPOINT) < 0 {
@@ -1411,8 +1414,3 @@ fn run_first_pixels_test(backend: &mut LimineFbBackend) {
     sys::print(b"[COMPOSITOR] FrameDisplayed timeout -- test INCONCLUSIVE\r\n");
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"COMPOSITOR", b"panic");
-    sys::exit(255);
-}

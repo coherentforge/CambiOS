@@ -18,9 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cambios-libsys-rt"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
+]
+
+[[package]]
 name = "cambios-virtio-input"
 version = "0.1.0"
 dependencies = [
  "cambios-libinput-proto",
  "cambios-libsys",
+ "cambios-libsys-rt",
 ]

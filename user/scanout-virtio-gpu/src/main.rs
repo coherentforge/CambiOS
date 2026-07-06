@@ -137,9 +137,12 @@ struct CompositorBinding {
 // Entry point
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "SCANOUT-VGPU",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[SCANOUT-VGPU] starting (Phase Scanout-4.b)\r\n");
 
     let mut setup = match initialize_device() {
@@ -698,8 +701,3 @@ fn print_u64_dec(n: u64) {
     sys::print(&out[..len]);
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"SCANOUT-VGPU", b"panic");
-    sys::exit(255);
-}

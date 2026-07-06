@@ -86,11 +86,6 @@ const DEV_PIN: &[u8] = b"123456";
 // Panic handler
 // ============================================================================
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[FDE-MOUNT] PANIC!\n");
-    sys::exit(1);
-}
 
 // ============================================================================
 // Outcome
@@ -115,12 +110,14 @@ enum UnlockOutcome {
 // Entry point
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    sys::register_endpoint(FDE_MOUNT_ENDPOINT);
+cambios_libsys_rt::service_main! {
+    name: "FDE-MOUNT",
+    endpoint: FDE_MOUNT_ENDPOINT,
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[FDE-MOUNT] starting on endpoint 32\n");
-    sys::module_ready();
 
     match unlock_flow() {
         UnlockOutcome::Success => {

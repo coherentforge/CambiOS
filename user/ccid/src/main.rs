@@ -47,18 +47,15 @@ const OP_BULK_IN: u8 = 0x02;
 
 const STATUS_OK: u8 = 0;
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[CCID] PANIC!\n");
-    sys::exit(1);
+
+cambios_libsys_rt::service_main! {
+    name: "CCID",
+    endpoint: CCID_ENDPOINT,
+    main: run,
 }
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    sys::register_endpoint(CCID_ENDPOINT);
+fn run() -> ! {
     sys::print(b"[CCID] ready on endpoint 33\n");
-    sys::module_ready();
 
     // Boot-time path: issue a single GetSlotStatus to slot 1 and
     // log the result. After that we idle on the endpoint awaiting

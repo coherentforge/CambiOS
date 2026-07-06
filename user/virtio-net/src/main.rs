@@ -47,11 +47,6 @@ use virtqueue::{BounceBuffer, VirtQueue};
 // Panic handler
 // ============================================================================
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[NET] PANIC!\n");
-    sys::exit(1);
-}
 
 // ============================================================================
 // IPC protocol
@@ -432,9 +427,12 @@ fn handle_recv_packet(driver: &mut NetDriver, response: &mut [u8]) -> usize {
 // Entry point
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "NET",
+    main: run,
+}
+
+fn run() -> ! {
     // Step 1: Find the virtio-net PCI device (silent on success)
     let dev = match pci::PciDeviceInfo::find_virtio_net() {
         Some(d) => d,

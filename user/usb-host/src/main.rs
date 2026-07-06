@@ -49,11 +49,6 @@ use cambios_libsys as sys;
 
 const USB_HOST_ENDPOINT: u32 = 31;
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[USB-HOST] PANIC!\n");
-    sys::exit(1);
-}
 
 // ---------------------------------------------------------------------------
 // Diagnostic logging
@@ -99,9 +94,12 @@ fn log_dec(label: &[u8], v: u32) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "USB-HOST",
+    main: run,
+}
+
+fn run() -> ! {
     // Step 1: locate the xHCI controller via PCI class/subclass/prog_if.
     let dev = match pci::PciDeviceInfo::find_xhci() {
         Some(d) => d,
