@@ -484,6 +484,6 @@ user/sprouty/src/render.rs:10:for-now
 user/sprouty/src/render.rs:21:placeholder
 user/sprouty/src/render.rs:63:placeholder
 user/sprouty/src/render.rs:66:placeholder
-user/udp-stack/src/main.rs:833:for-now
+user/udp-stack/src/main.rs:823:for-now
 user/virtio-input/src/transport.rs:7:for-now
 user/worm/src/main.rs:104:deferred

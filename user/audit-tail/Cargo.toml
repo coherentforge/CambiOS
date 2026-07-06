@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 cambios-abi = { path = "../../cambios-abi" }
 cambios-libsys = { path = "../libsys" }
+cambios-libsys-rt = { path = "../libsys-rt" }
 cambios-style = { path = "../cambios-style" }
 
 [profile.release]

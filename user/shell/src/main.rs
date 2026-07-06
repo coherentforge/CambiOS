@@ -30,13 +30,14 @@ const SHELL_ENDPOINT: u32 = 18;
 /// future segment without revisiting the type.
 const PROMPT_BUF_SIZE: usize = 128;
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    sys::register_endpoint(SHELL_ENDPOINT);
+cambios_libsys_rt::service_main! {
+    name: "Shell",
+    endpoint: SHELL_ENDPOINT,
+    main: run,
+}
 
+fn run() -> ! {
     sys::print(b"[Shell] ready on endpoint 18\n");
-    sys::module_ready();
 
     sys::print(b"\r\n");
     sys::print(b"CambiOS Shell v0.1\r\n");
@@ -1231,12 +1232,3 @@ fn print_u64(mut val: u64) {
     sys::print(&buf[pos..]);
 }
 
-// ============================================================================
-// Panic handler
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"\r\n!!! SHELL PANIC !!!\r\n");
-    sys::exit(1);
-}

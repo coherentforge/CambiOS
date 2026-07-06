@@ -18,11 +18,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cambios-libsys-rt"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
+]
+
+[[package]]
 name = "cambios-shell"
 version = "0.1.0"
 dependencies = [
  "cambios-fde-proto",
  "cambios-libsys",
+ "cambios-libsys-rt",
  "cambios-style",
 ]
 

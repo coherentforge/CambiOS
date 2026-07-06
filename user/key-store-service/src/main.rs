@@ -37,22 +37,21 @@ use cambios_libsys::vault::{
     CMD_VAULT_DECRYPT_WITH, CMD_VAULT_SIGN_WITH, MAX_VAULT_PLAINTEXT_LEN,
 };
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[KS] PANIC!\n");
-    sys::exit(1);
-}
-
 const KS_ENDPOINT: u32 = 17;
 const STATUS_ERROR: u8 = 1;
 
 // ============================================================================
-// Entry point
+// Entry point — _start + panic handler emitted by `service_main!`
+// (ADR-037 L0, no-endpoint form: the PIV backend must be live before
+// module_ready releases fde-mount, so `run` owns the ordering).
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "KS",
+    main: run,
+}
+
+fn run() -> ! {
     // Register our IPC endpoint.
     sys::register_endpoint(KS_ENDPOINT);
 

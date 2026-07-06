@@ -57,16 +57,6 @@ fn blocking_recv(endpoint: u32, buf: &mut [u8]) -> usize {
 }
 
 // ============================================================================
-// Panic handler
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[UDP] PANIC!\n");
-    sys::exit(1);
-}
-
-// ============================================================================
 // Constants
 // ============================================================================
 
@@ -965,12 +955,17 @@ fn print_mac(mac: &[u8; 6]) {
 }
 
 // ============================================================================
-// Entry point
+// Entry point — _start + panic handler emitted by `service_main!`
+// (ADR-037 L0, no-endpoint form: DHCP/ARP bring-up sits between
+// registration and module_ready, so `run` owns the ordering).
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "UDP",
+    main: run,
+}
+
+fn run() -> ! {
     // Step 1: register UDP_ENDPOINT FIRST. Per Phase 4b, this is the
     // endpoint the kernel stamps as `from` on every outgoing write —
     // virtio-net's responses then queue here, and `net_reply_endpoint`

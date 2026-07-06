@@ -35,8 +35,12 @@ const EVENT_SIZE: usize = 64;
 /// audit-tail task cooperative with other userspace work.
 const READ_BATCH: usize = 32;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "AUDIT-TAIL",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[AUDIT-TAIL] starting\r\n");
 
     // Release the boot gate immediately — audit-tail is a leaf consumer.
@@ -257,8 +261,3 @@ fn print_u64_dec(mut n: u64) {
     sys::print(&out[..len]);
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[AUDIT-TAIL] panic\r\n");
-    sys::exit(255);
-}

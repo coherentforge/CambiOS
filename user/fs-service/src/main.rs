@@ -26,16 +26,6 @@ use cambios_libfs_proto as proto;
 use cambios_libsys as sys;
 
 // ============================================================================
-// Panic handler (required for no_std)
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[FS] PANIC!\n");
-    sys::exit(1);
-}
-
-// ============================================================================
 // Endpoint constants
 // ============================================================================
 
@@ -611,12 +601,17 @@ fn seed_demo_objects(bootstrap_aid: &[u8; 32]) {
 }
 
 // ============================================================================
-// Entry point
+// Entry point — _start + panic handler emitted by `service_main!`
+// (ADR-037 L0, no-endpoint form: principal query + demo seeding sit
+// between registration and module_ready, so `run` owns the ordering).
 // ============================================================================
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "FS",
+    main: run,
+}
+
+fn run() -> ! {
     let _pid = sys::get_pid();
 
     sys::register_endpoint(FS_ENDPOINT);
