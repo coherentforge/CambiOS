@@ -11,6 +11,7 @@ name = "cambios-fb-demo"
 version = "0.1.0"
 dependencies = [
  "cambios-libsys",
+ "cambios-libsys-rt",
 ]
 
 [[package]]
@@ -18,4 +19,11 @@ name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
  "cambios-abi",
+]
+
+[[package]]
+name = "cambios-libsys-rt"
+version = "0.1.0"
+dependencies = [
+ "cambios-libsys",
 ]

@@ -27,9 +27,12 @@ const HELLO_WINDOW_ENDPOINT: u32 = 29;
 const WINDOW_WIDTH: u32 = 640;
 const WINDOW_HEIGHT: u32 = 480;
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "HELLO-WINDOW",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[HELLO-WINDOW] libgui v0 client\r\n");
 
     // hello-window is a leaf boot module — release the boot gate
@@ -224,8 +227,3 @@ fn print_u64_dec(n: u64) {
     sys::print(&out[..len]);
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"HELLO-WINDOW", b"panic");
-    sys::exit(255);
-}

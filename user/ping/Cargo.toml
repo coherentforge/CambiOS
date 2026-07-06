@@ -10,6 +10,7 @@ description = "CambiOS Ping — third first-party app. Single-player vs AI on th
 
 [dependencies]
 cambios-libsys = { path = "../libsys" }
+cambios-libsys-rt = { path = "../libsys-rt" }
 cambios-libgui = { path = "../libgui" }
 
 [profile.release]

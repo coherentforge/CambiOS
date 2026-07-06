@@ -69,9 +69,12 @@ mod keys {
     pub const Q: u32 = 0x14;
 }
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "TREE",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[TREE] booting\r\n");
 
     // Leaf boot module — release the boot gate immediately, before
@@ -250,8 +253,3 @@ fn redraw(
 #[allow(dead_code)]
 const _: State = State::Playing;
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"TREE", b"panic");
-    sys::exit(255);
-}

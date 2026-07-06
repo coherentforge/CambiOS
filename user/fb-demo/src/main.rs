@@ -25,8 +25,12 @@
 use cambios_libsys as sys;
 use cambios_libsys::FramebufferDescriptor;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "FB-DEMO",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[FB-DEMO] starting\r\n");
 
     // Release the boot gate up-front. fb-demo is a leaf — nothing
@@ -232,9 +236,3 @@ fn print_hex64(mut n: u64) {
     sys::print(&buf);
 }
 
-// Panic handler (Rust requires one for no_std binaries).
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::print(b"[FB-DEMO] panic\r\n");
-    sys::exit(255);
-}

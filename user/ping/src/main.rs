@@ -115,9 +115,12 @@ impl Input {
     }
 }
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "PING",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[PING] booting\r\n");
 
     // Leaf boot module — release the boot gate immediately so
@@ -258,8 +261,3 @@ fn redraw(client: &mut Client, ping: &Ping) {
     }
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"PING", b"panic");
-    sys::exit(255);
-}

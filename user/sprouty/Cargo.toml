@@ -10,6 +10,7 @@ description = "CambiOS Super Sprouty-O — fourth first-party HN-launch mini-gam
 
 [dependencies]
 cambios-libsys = { path = "../libsys" }
+cambios-libsys-rt = { path = "../libsys-rt" }
 cambios-libgui = { path = "../libgui" }
 
 [profile.release]

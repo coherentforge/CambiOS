@@ -106,9 +106,12 @@ mod keys {
 /// the player wants to reach.
 const STEP_TICKS: u64 = 20;
 
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+cambios_libsys_rt::service_main! {
+    name: "WORM",
+    main: run,
+}
+
+fn run() -> ! {
     sys::print(b"[WORM] booting\r\n");
 
     // Leaf boot module — release the boot gate immediately, before
@@ -250,8 +253,3 @@ fn redraw(client: &mut Client, worm: &Worm) {
     }
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    sys::log_error(b"WORM", b"panic");
-    sys::exit(255);
-}

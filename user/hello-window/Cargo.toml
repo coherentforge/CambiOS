@@ -10,6 +10,7 @@ description = "CambiOS first GUI client — Phase Scanout-3 (ADR-011). Opens one
 
 [dependencies]
 cambios-libsys = { path = "../libsys" }
+cambios-libsys-rt = { path = "../libsys-rt" }
 cambios-libgui = { path = "../libgui" }
 
 [profile.release]
