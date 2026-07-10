@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Host-side tool: override the parent project's bare-metal kernel
+# target. Same precedent as tools/sign-elf and tools/format-volume.
+[build]
+target = "aarch64-apple-darwin"

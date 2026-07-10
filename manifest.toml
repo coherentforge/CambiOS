@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+#
+# CambiOS boot-service registry — the endpoint-registry source artifact
+# (ADR-037 Phase 2) and the single source tools/build-manifest generates
+# the signed ADR-018 boot manifest from. This file is the build-time
+# authority on (service -> reserved endpoints, capabilities, lifecycle,
+# dependencies); the kernel's reservation + spawn-grant tables are its
+# runtime transcription. Never a parallel authority: change endpoints
+# HERE, and client const tables (libsys / libfs-proto / libgui-proto /
+# libscanout) must agree until they are generated from this file.
+#
+# Endpoint map (kernel MAX_ENDPOINTS = 64; 0 = REPLY_ENDPOINT sentinel,
+# unusable; 1 = init):
+#   14/15 terminal-window back/front   24/25/26 virtio-blk client/
+#   16 fs-service                               kernel-reply/kernel-cmd
+#   17 key-store-service               27 scanout driver
+#   18 shell                           28 compositor
+#   20 virtio-net                      30 compositor input
+#   21 udp-stack                       31 usb-host
+#   22/23 policy query/response        32 fde-mount
+#                                      33 ccid
+# User-spawned apps (games 61-63, ping 19, hello-window 29) are NOT
+# manifest entries — they take the legacy spawn path and register from
+# the unreserved range, first-come (ADR-018 § 3).
+#
+# Grant posture per entry (assembled by build-manifest, ADR-018 § 2):
+# receive on each reserved endpoint + send on all endpoints (replies
+# target clients' self-chosen reply endpoints) + the System caps named
+# here. `system` entries below mirror today's name-based grants in
+# load_boot_modules and the code-verified channel_create / spawn call
+# sites (grep 2026-07-08: create-channel = compositor + scanout drivers;
+# create-process = shell + terminal-window).
+#
+# depends_on = hard startup dependencies only (init spawns in DAG
+# order and gates on readiness pings). Soft orderings the old
+# BOOT_MODULE_ORDER chain encoded (e.g. "policy first so enforcement
+# is warm") are NOT dependencies; the kernel's fail-open policy window
+# covers them.
+
+[init]
+endpoint = 1
+
+# --- storage + identity chain ------------------------------------------------
+
+[[service]]
+name = "policy-service"
+endpoints = [22, 23]
+
+[[service]]
+name = "key-store-service"
+endpoints = [17]
+
+[[service]]
+name = "fs-service"
+endpoints = [16]
+depends_on = ["key-store-service"]
+
+[[service]]
+name = "virtio-blk"
+endpoints = [24, 25, 26]
+
+[[service]]
+name = "fde-mount"
+endpoints = [32]
+lifetime = "one-shot"
+depends_on = ["virtio-blk", "key-store-service"]
+
+# --- network -------------------------------------------------------------------
+
+[[service]]
+name = "virtio-net"
+endpoints = [20]
+
+[[service]]
+name = "udp-stack"
+endpoints = [21]
+system = ["set-wallclock"]
+depends_on = ["virtio-net"]
+
+# --- GUI stack -----------------------------------------------------------------
+
+[[service]]
+name = "scanout-virtio-gpu"
+endpoints = [27]
+system = ["create-channel"]
+
+[[service]]
+name = "compositor"
+endpoints = [28, 30]
+system = ["create-channel", "emit-input-audit"]
+depends_on = ["scanout-virtio-gpu"]
+
+[[service]]
+name = "virtio-input"
+depends_on = ["compositor"]
+
+[[service]]
+name = "terminal-window"
+endpoints = [14, 15]
+system = ["create-process", "set-wallclock"]
+depends_on = ["compositor"]
+
+# --- USB / PIV chain -------------------------------------------------------------
+
+[[service]]
+name = "usb-host"
+endpoints = [31]
+
+[[service]]
+name = "ccid"
+endpoints = [33]
+depends_on = ["usb-host"]
+
+# --- observability + shell -------------------------------------------------------
+
+[[service]]
+name = "audit-tail"
+system = ["audit-consumer"]
+
+[[service]]
+name = "shell"
+endpoints = [18]
+system = ["create-process"]
+depends_on = ["fs-service"]

@@ -159,6 +159,11 @@ FDE_MOUNT_ELF_RISCV64 := $(FDE_MOUNT_DIR)/target/riscv64gc-unknown-none-elf/rele
 SIGN_ELF_DIR := tools/sign-elf
 SIGN_ELF := $(SIGN_ELF_DIR)/target/$(HOST_TARGET)/release/sign-elf
 
+# Boot-manifest builder (ADR-018 step 2; input = manifest.toml, the
+# ADR-037 Phase-2 endpoint-registry artifact)
+BUILD_MANIFEST_DIR := tools/build-manifest
+BUILD_MANIFEST := $(BUILD_MANIFEST_DIR)/target/$(HOST_TARGET)/release/build-manifest
+
 # Dev-PIV keypair generator (host-side). Derives Ed25519+X25519 keys from a
 # persistent per-developer seed; writes dev_bootstrap_pubkey.bin (consumed by
 # the kernel under --features dev-piv) and user/key-store-service/
@@ -199,7 +204,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -706,6 +711,19 @@ sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== sign-elf ready ==="
+
+# Boot manifest (ADR-018 migration step 2). Emits manifest.bin from
+# manifest.toml (the ADR-037 Phase-2 endpoint-registry artifact) via
+# tools/build-manifest, then signs it with the same ARCSIG path +
+# SIGN_MODE resolution as the boot-module ELFs. Not yet consumed by
+# the ISO — boot wiring lands at ADR-018 migration step 7.
+manifest: sign-tool
+	@echo "=== Building build-manifest tool ==="
+	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
+	@echo "=== Emitting + signing manifest.bin ==="
+	$(BUILD_MANIFEST) manifest.toml -o manifest.bin
+	$(SIGN_ELF) $(SIGN_FLAGS) manifest.bin
+	@echo "=== manifest.bin ready (signed) ==="
 
 mkinitrd:
 	@echo "=== Building mkinitrd host tool ==="

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "build-manifest"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS boot-manifest builder — reads the endpoint-registry TOML (ADR-037 Phase 2), derives v1 service AIDs, validates, and emits the manifest blob (ADR-018 migration step 2). Signing is sign-elf's job."
+
+[dependencies]
+cambios-manifest = { path = "../../cambios-manifest" }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

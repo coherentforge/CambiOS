@@ -396,8 +396,17 @@ fn read_binary_for_signing(path: &str) -> Vec<u8> {
         binary.truncate(binary.len() - 72);
     }
 
-    if binary.len() < 4 || &binary[..4] != b"\x7fELF" {
-        eprintln!("'{}' does not appear to be an ELF binary", path);
+    // Signable payload allowlist: ELF boot modules and CBOSMANI boot
+    // manifests (ADR-018). The trailer scheme is content-agnostic
+    // (signs blake3(payload)), but an explicit magic check keeps
+    // "sign whatever file I typo'd" impossible.
+    let is_elf = binary.len() >= 4 && &binary[..4] == b"\x7fELF";
+    let is_manifest = binary.len() >= 8 && &binary[..8] == b"CBOSMANI";
+    if !is_elf && !is_manifest {
+        eprintln!(
+            "'{}' is neither an ELF binary nor a CBOSMANI manifest blob",
+            path
+        );
         process::exit(1);
     }
 

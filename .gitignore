@@ -44,3 +44,8 @@ tools/gen-dev-piv-keys/.dev-seed.bin
 # and worktrees/ (session-scoped side checkouts) stay local.
 .claude/*
 !.claude/settings.json
+
+# Boot manifest blob — build artifact of `make manifest` (ADR-018).
+# The source of truth is manifest.toml (committed); the signed blob is
+# regenerated per build like the ISOs.
+manifest.bin
