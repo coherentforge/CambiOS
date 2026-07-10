@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-manifest"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "CambiOS boot-manifest wire format — shared by kernel (transcription), init (policy parse), and tools/build-manifest (emission). ADR-018."
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies beyond `core`. Same contract-crate posture as
+# cambios-abi (ADR-024): consumable by every bare-metal target, the
+# host test target, and host tooling; a future verification target.
+# AID *derivation* (blake3) deliberately lives in tools/build-manifest,
+# not here, to keep this crate dependency-free.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"
