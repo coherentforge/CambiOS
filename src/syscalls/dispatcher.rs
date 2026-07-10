@@ -909,9 +909,35 @@ impl SyscallDispatcher {
 
         let endpoint = crate::ipc::EndpointId(endpoint_id);
 
+        // ADR-018: endpoint reservation gate. A manifest-reserved
+        // endpoint may only be registered by the AID the manifest
+        // assigned to it. The reservation read is a self-contained
+        // lock-copy-unlock on a table outside the lock hierarchy
+        // (BOOTSTRAP_PRINCIPAL pattern) and deliberately happens
+        // BEFORE CAPABILITY_MANAGER is acquired so the two are never
+        // held together. Empty table (no manifest loaded) ⇒ every
+        // endpoint is Unreserved and this is a no-op.
+        let reserved_owner =
+            crate::ipc::endpoint_reservation::ENDPOINT_RESERVATIONS.owner(endpoint_id);
+
         // Lock ordering: CAPABILITY_MANAGER(4)
         let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
         let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+        if let Some(owner_aid) = reserved_owner {
+            let caller_matches = cap_mgr
+                .get_principal(ctx.process_id)
+                .map(|p| p.aid() == &owner_aid)
+                .unwrap_or(false);
+            if !caller_matches {
+                // Squat attempt on a reserved endpoint — a security
+                // event, recorded like any other capability denial.
+                crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+                    ctx.process_id, endpoint, crate::audit::now(), 0,
+                ));
+                return Err(SyscallError::PermissionDenied);
+            }
+        }
 
         cap_mgr
             .grant_capability(ctx.process_id, endpoint, crate::ipc::CapabilityRights::FULL)

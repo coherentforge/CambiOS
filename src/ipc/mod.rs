@@ -11,6 +11,7 @@ pub mod capability;
 pub mod channel;
 pub mod cluster;
 pub mod cluster_policy;
+pub mod endpoint_reservation;
 pub mod interceptor;
 
 extern crate alloc;
