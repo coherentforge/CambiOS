@@ -27,7 +27,7 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 015 | [Storage Tiers and the Commitment Ladder](015-storage-tiers-and-commitment-ladder.md) | Stale — superseded by [ADR-028](028-three-storage-models.md) (2026-05-11) | 2026-04-16 (frozen as historical record) |
 | 016 | [Windows Compatibility via Bounded Static Shims](016-win-compat-api-ai-boundary.md) | Proposed | 2026-04-21 |
 | 017 | [User-Directed Cloud Inference](017-user-directed-cloud-inference.md) | Proposed | 2026-04-21 |
-| 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Proposed | 2026-04-19 |
+| 018 | [Init Process and Boot Manifest](018-init-process-and-boot-manifest.md) | Accepted | 2026-04-19 |
 | 019 | [Process Fault Reaping and Peer-Generation Signaling](019-process-fault-reaping-and-peer-generation.md) | Proposed | 2026-04-19 |
 | 020 | [Typed User-Buffer Slices at the Syscall Boundary](020-typed-user-buffer-slices-at-syscall-boundary.md) | Accepted | 2026-04-19 |
 | 021 | [Typed BootError Propagation Through the Init Path](021-typed-boot-error-propagation.md) | Accepted | 2026-04-19 |

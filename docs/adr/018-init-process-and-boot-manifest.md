@@ -1,10 +1,17 @@
 # ADR-018: Init Process and Boot Manifest
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-19
-- **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-003](003-content-addressed-storage-and-identity.md) (Identity/Principal model), [ADR-004](004-cryptographic-integrity.md) (Signed boot modules), [ADR-008](008-boot-time-sized-object-tables.md) (Boot-time-sized object tables)
-- **Related:** [ADR-006](006-policy-service.md) (Policy service — explicitly defers init/manifest design to this ADR), [ADR-002](002-three-layer-enforcement-pipeline.md), [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC primitives), [ADR-007](007-capability-revocation-and-telemetry.md) (Revocation + telemetry), [ADR-012](012-input-architecture-and-device-classes.md), [ADR-014](014-compositor-scanout-driver-protocol.md)
+- **Depends on:** [ADR-000](000-zta-and-cap.md) (Zero-Trust + Capabilities), [ADR-003](003-content-addressed-storage-and-identity.md) (Identity/Principal model), [ADR-004](004-cryptographic-integrity.md) (Signed boot modules — ARCSIG trailer), [ADR-008](008-boot-time-sized-object-tables.md) (Boot-time-sized object tables), [ADR-025](025-principal-as-aid.md) (Principal as 32-byte AID), [ADR-026](026-identity-transcription-at-the-kernel-ring.md) (transcribe-don't-interpret — the kernel-side manifest handling follows this pattern)
+- **Related:** [ADR-006](006-policy-service.md) (Policy service — explicitly defers init/manifest design to this ADR), [ADR-002](002-three-layer-enforcement-pipeline.md), [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC primitives), [ADR-007](007-capability-revocation-and-telemetry.md) (Revocation + telemetry), [ADR-012](012-input-architecture-and-device-classes.md), [ADR-014](014-compositor-scanout-driver-protocol.md), [ADR-019](019-process-fault-reaping-and-peer-generation.md) (kernel substrate for restart observation — prerequisite for migration step 10), [ADR-024](024-syscall-abi-crate.md) (shared-crate consumption pattern `cambios-manifest` follows), [ADR-034](034-deferred-task-resource-reclamation.md) (generation-carrying task handles init's supervision keys on), [ADR-037](037-native-app-framework.md) (service runtime that emits the readiness ping; its Phase-2 endpoint registry is `build-manifest`'s input)
 - **Supersedes:** N/A (introduces the init/manifest slot that ADR-006 and ADR-008 both explicitly deferred)
+
+> Body revised at acceptance (2026-07-06) against the tree as of ADR-037's
+> landing: kernel-side transcription replaces the install syscall, Principals
+> are AIDs per ADR-025, grants gained the narrow-receive/wildcard-send
+> default, and the migration path was resequenced. The drafting-time text it
+> replaces is in git history (this ADR was never previously Accepted, so no
+> Divergence appendix applies).
 
 ## Context
 
@@ -16,7 +23,7 @@ This works for bring-up. It is not what a general-purpose OS does in production,
 - **[ADR-006](006-policy-service.md) § Failure Modes** — "The init process (when it exists — see roadmap item 21) restarts the policy service."
 - **[ADR-008](008-boot-time-sized-object-tables.md) § Decision (point 7)** — "When CambiOS grows a boot-manifest mechanism (anticipated post-v1, alongside the init process and service configuration work), the table sizing policy moves from compile-time configuration to the manifest."
 
-The "second boot module needs user-declared endpoints" threshold ADR-006 named has been crossed: policy-service, key-store, fs-service, virtio-blk, compositor, and shell all have hard-coded endpoint numbers spread across the kernel and user crates, and the input-hub ([ADR-012](012-input-architecture-and-device-classes.md)) and scanout-driver ([ADR-014](014-compositor-scanout-driver-protocol.md)) add two more on the near horizon. Every new core service today requires editing at least three crates to teach them each other's endpoint numbers.
+The "second boot module needs user-declared endpoints" threshold ADR-006 named has been crossed many times over: the endpoint census at acceptance time spans 16 through 33 plus app slots, across the kernel, `user/libsys`, `user/libfs-proto`, `user/libgui-proto`, `user/libscanout`, and every service crate. Every new core service today requires editing at least three crates to teach them each other's endpoint numbers.
 
 This ADR designs the slot the two reference ADRs are waiting for.
 
@@ -24,7 +31,7 @@ This ADR designs the slot the two reference ADRs are waiting for.
 
 Four problems have accumulated that the compile-time / kernel-sequenced approach cannot cleanly address.
 
-**Problem 1 — endpoint numbers are ambient.** Core service endpoints are `const u32` values scattered across the kernel (`src/ipc/`, `src/syscalls/dispatcher.rs`) and every user crate (`user/libsys/`, `user/fs-service/`, etc.). Nothing structural prevents a different process from calling `SYS_REGISTER_ENDPOINT(16)` and squatting on the fs-service slot. The restriction "only fs-service gets endpoint 16" is enforced by convention — by the fact that fs-service is the only thing coded to register 16 — not by structure. This conflicts with [ADR-000](000-zta-and-cap.md)'s zero-trust stance: authority for a stable identity-bearing endpoint should be a capability check, not a convention.
+**Problem 1 — endpoint numbers are ambient.** Core service endpoints are `const u32` values scattered across the kernel (`src/ipc/`, `src/syscalls/dispatcher.rs`) and every user crate (`user/libsys/`, `user/fs-service/`, etc.). Nothing structural prevents a different process from calling `SYS_REGISTER_ENDPOINT(16)` and squatting on the fs-service slot — `handle_register_endpoint` performs no ownership check at all. The restriction "only fs-service gets endpoint 16" is enforced by convention — by the fact that fs-service is the only thing coded to register 16 — not by structure. This conflicts with [ADR-000](000-zta-and-cap.md)'s zero-trust stance: authority for a stable identity-bearing endpoint should be a capability check, not a convention.
 
 **Problem 2 — the kernel owns the service lifecycle.** `BOOT_MODULE_ORDER`, `BlockReason::BootGate`, and `SYS_MODULE_READY` exist to sequence boot module startup. This is scaffolding. It does not compose with post-boot lifecycle needs (crash restart, dependency reordering after a service upgrade, shutdown sequencing) because the kernel isn't the right component to own any of those. Every production OS (systemd, launchd, sysvinit, runit, s6) has a user-space supervisor for exactly this reason. Keeping the logic in the kernel means either growing the kernel into a supervisor — violating the microkernel principle and the verification-first commitment — or rewriting it later.
 
@@ -32,40 +39,50 @@ Four problems have accumulated that the compile-time / kernel-sequenced approach
 
 **Problem 4 — no crash recovery for core services.** When the policy service, fs-service, or virtio-blk driver crashes, nothing brings it back. [ADR-006 § Failure Modes](006-policy-service.md#failure-modes) describes graceful degradation on policy-service crash (fall back to permissive default), but the "restart" half of the recovery is explicitly delegated to the future init process. That future is now.
 
-**Why these problems must be solved together.** Each piece in isolation produces a half-measure: a manifest without init is just a config file nobody reads; init without a manifest is a hard-coded service list; endpoint reservations without a manifest is a new capability with no declarative source of authority; crash recovery without init is kernel-resident supervision. The four pieces compose into one mechanism — a signed manifest describing the core service set, an init process that reads it and owns the lifecycle, and a kernel that enforces the reservations but does not interpret the manifest.
+**A fifth problem surfaced at acceptance review — identity is ambient too.** Every boot module and every spawned process today binds the *bootstrap* Principal (`register_process_capabilities`, `handle_spawn`). An endpoint reservation keyed on Principal is vacuous while everything shares one Principal: `Reserved(bootstrap)` blocks nobody. Per-service identity is load-bearing for Problem 1's fix, so this ADR must also assign each core service its own Principal.
+
+**Why these problems must be solved together.** Each piece in isolation produces a half-measure: a manifest without init is just a config file nobody reads; init without a manifest is a hard-coded service list; endpoint reservations without per-service identity are vacuous; crash recovery without init is kernel-resident supervision. The pieces compose into one mechanism — a signed manifest describing the core service set, a kernel that transcribes the manifest's security claims into enforcement tables, and an init process that owns the lifecycle the manifest describes.
 
 ## The Reframe
 
 The architectural insight:
 
-> **The kernel spawns init and hands init the manifest. Init runs the rest of the system. The kernel enforces manifest-derived invariants (endpoint ownership, initial capabilities) but never parses the manifest itself.**
+> **The kernel spawns init and hands init the manifest. Init runs the rest of the system. The kernel transcribes the manifest's security sections — endpoint ownership, per-service identity, initial capabilities — into write-once enforcement tables at boot, but never interprets its policy: ordering, dependencies, and lifecycle are init's alone.**
 
-This matches the pattern already established for policy ([ADR-006](006-policy-service.md)): the kernel makes mechanical checks ("does this Principal own this endpoint?"), and a user-space service makes decisions ("should this service be spawned, restarted, granted X?"). Init is the decision-maker for service lifecycle, the way the policy service is the decision-maker for authorization.
+This is [ADR-026](026-identity-transcription-at-the-kernel-ring.md)'s transcribe-don't-interpret pattern applied to boot configuration, and it matches the split already established for policy ([ADR-006](006-policy-service.md)): the kernel makes mechanical checks ("does this Principal own this endpoint?"), and a user-space service makes decisions ("should this service be restarted?"). Init is the decision-maker for service lifecycle, the way the policy service is the decision-maker for authorization.
 
-The reframe does not invent new kernel primitives. `SYS_SPAWN`, the capability system, the signed-ELF loader, and the Principal binding (`SYS_BIND_PRINCIPAL`) are all already in place. What this ADR adds is:
+The reframe does not invent new kernel primitives — `SYS_SPAWN`, the capability system, and the signed-ELF loader are all in place, and no new syscall is added. What this ADR adds is:
 
-1. A signed manifest blob, loaded as a boot module, consumed by init.
-2. An init process that parses the manifest and drives `SYS_SPAWN` + capability installation in dependency order.
-3. A kernel endpoint-reservation table, populated at init start, that rejects `SYS_REGISTER_ENDPOINT(N)` from any Principal other than the one the manifest assigned to `N`.
+1. A signed manifest blob, loaded as a boot module: transcribed by the kernel (security sections), interpreted by init (policy sections).
+2. Kernel enforcement tables — an endpoint-reservation table and a per-module spawn-grant table — populated once at boot from the verified blob, before any user instruction runs, immutable for the life of the boot.
+3. An init process (PID 1) that parses the manifest's policy fields and drives `SYS_SPAWN` in dependency order, then owns restart policy.
 4. The removal of `BOOT_MODULE_ORDER`, `BlockReason::BootGate`, and `SYS_MODULE_READY` — the scaffolding init replaces.
 
-The kernel's boot surface shrinks. The user-space supervision surface grows in a place where it belongs.
+The kernel's boot surface shrinks (the sequencing machinery is deleted; a bounded pure parse is added). The user-space supervision surface grows in a place where it belongs.
 
 ## Decision
 
-CambiOS adopts a **user-space init process (PID 1) driven by a signed boot manifest** as the mechanism for core-service lifecycle, endpoint reservation, and capability assignment.
+CambiOS adopts a **user-space init process (PID 1) driven by a signed boot manifest** as the mechanism for core-service lifecycle, endpoint reservation, per-service identity, and capability assignment.
 
-### 1. The manifest is a signed boot-loaded blob
+### 1. The manifest is a signed boot-loaded blob, transcribed by the kernel
 
-The manifest is a fixed-layout binary blob plus an `ARCSIG` trailer (the existing signing mechanism from [ADR-004](004-cryptographic-integrity.md), reused rather than reinvented). It is loaded as a Limine boot module alongside init and the services it describes. The kernel verifies the signature against the bootstrap Principal before handing init a mapped read-only pointer to the blob.
+The manifest is a fixed-layout binary blob plus an `ARCSIG` trailer (the existing signing mechanism from [ADR-004](004-cryptographic-integrity.md) § Divergence 1 — the trailer signs `blake3(blob)`, so it is content-agnostic and the loader's existing `inspect_signature_trailer` path is reused unchanged). It is loaded as a Limine boot module alongside init and the services it describes.
 
-The blob is **not** an ELF. It is a flat record structure parsed by init. Rationale:
+During boot-module load — before any user task exists — the kernel:
 
-- Fixed-layout parsing has a bounded-loop, no-allocation shape that is cheap to verify.
-- No dependency on a general-purpose deserialization library in the init process's TCB.
-- The blob is authored by the bootstrap holder at build time; self-describing wire formats (CBOR, JSON) add no value when there is one producer and one consumer.
+1. verifies the blob's ARCSIG trailer against the bootstrap Principal (exactly as for signed ELFs);
+2. **transcribes** the blob's security sections into two write-once kernel tables: the endpoint-reservation table (endpoint → owning AID) and the spawn-grant table (module name → AID + capability grants);
+3. maps the blob read-only into init's address space at a fixed address for init's policy-side parse.
 
-The wire format is specified in the Architecture section below.
+The tables follow the `BOOTSTRAP_PRINCIPAL` lifecycle pattern: written once at boot while single-threaded, read-only thereafter, **not** part of the lock hierarchy. There is nothing to race and no runtime mutation path — per-boot immutability is a security property, not a limitation.
+
+The blob is **not** an ELF. It is a flat record structure. Rationale:
+
+- Fixed-layout parsing has a bounded-loop, no-allocation shape that is cheap to verify — the parser is a pure function over a byte slice, host-testable and a Kani target (the BuddyAllocator template applied to parsing).
+- No general-purpose deserialization library in either TCB.
+- The blob is authored by the bootstrap holder at build time; self-describing wire formats (CBOR, JSON) add no value when there is one producer and two same-repo consumers.
+
+The parser is written once, in a shared crate (`cambios-manifest`, root-level, `no_std`, zero-dep, MPL-2.0 — the [ADR-024](024-syscall-abi-crate.md) consumption pattern), and consumed by the kernel (security sections), init (policy sections), and `tools/build-manifest` (serializer + validation).
 
 ### 2. Per-entry shape
 
@@ -73,34 +90,41 @@ Each manifest entry describes one boot-time service:
 
 ```rust
 pub struct ManifestEntry {
-    /// 32-byte Ed25519 public key — the Principal this service claims at
-    /// SYS_BIND_PRINCIPAL. The kernel checks that the signed ELF's
-    /// embedded public key matches this value before allowing the bind.
+    /// The 32-byte AID (ADR-025) this service runs as. The kernel binds
+    /// it at spawn time from the transcribed table; the manifest's
+    /// bootstrap signature IS the authorization for the name → AID
+    /// binding. v1 derivation: build-manifest generates a domain-tagged
+    /// Blake3 hash of the module name — deterministic, distinct per
+    /// service, and deliberately not a valid signing key (services that
+    /// sign use the key-store, ADR-033). Module *authenticity* is
+    /// unchanged: the ELF's own ARCSIG trailer is still verified against
+    /// the bootstrap key at load/spawn.
     pub principal: [u8; 32],
 
     /// Name of the boot module to load, matches strip_module_name()
     /// output (e.g. "policy-service", "fs-service").
     pub module_name: BoundedStr<MODULE_NAME_MAX>,
 
-    /// Endpoints this Principal owns exclusively for the lifetime of
-    /// the boot. RegisterEndpoint(N) from any other Principal is
-    /// rejected with PermissionDenied. The entry may reserve zero
-    /// endpoints (services that only talk to others).
+    /// Endpoints this AID owns exclusively for the lifetime of the
+    /// boot. RegisterEndpoint(N) from any other Principal is rejected
+    /// with PermissionDenied. The entry may reserve zero endpoints
+    /// (services that only talk to others).
     pub reserved_endpoints: BoundedVec<u32, RESERVED_ENDPOINTS_MAX>,
 
     /// Capabilities the kernel installs on this process at spawn,
-    /// before any user instruction runs. Replaces the ad-hoc "bootstrap
-    /// Principal grants full rights at boot" convention.
+    /// before any user instruction runs. Replaces both the blanket
+    /// "grant everything to trusted boot modules" path and the
+    /// name-based narrow grants in load_boot_modules.
     pub granted_capabilities: BoundedVec<CapabilityGrant, GRANTS_MAX>,
 
-    /// Lifecycle policy. OneShot services exit and are not restarted
-    /// (e.g. a future identity-bootstrap tool). Persistent services
-    /// are restarted by init on exit according to the restart policy.
+    /// Lifecycle policy — init-interpreted; the kernel ignores it.
     pub lifetime: ServiceLifetime,
 
     /// Names of services that must reach steady state before this one
-    /// is spawned. Init resolves this into a startup DAG and spawns in
-    /// topological order. Cycles are a manifest-validation error.
+    /// is spawned — init-interpreted; the kernel ignores it. Init
+    /// resolves this into a startup DAG and spawns in topological
+    /// order. Cycles are a manifest-validation error (caught at build
+    /// time by build-manifest and again by init).
     pub depends_on: BoundedVec<BoundedStr<MODULE_NAME_MAX>, DEPS_MAX>,
 }
 
@@ -110,7 +134,7 @@ pub enum ServiceLifetime {
         /// Exponential backoff: first restart after `initial_delay_ms`,
         /// doubling to a cap of `max_delay_ms`. After `max_restarts`
         /// consecutive failures within `failure_window_ms`, init gives
-        /// up on the service and emits an AuditEventKind::ServiceDead.
+        /// up on the service and emits a ServiceDead audit event.
         initial_delay_ms: u32,
         max_delay_ms: u32,
         max_restarts: u16,
@@ -118,65 +142,76 @@ pub enum ServiceLifetime {
     },
 }
 
-pub struct CapabilityGrant {
-    pub kind: CapabilityKind,
-    pub target: CapabilityTarget,  // endpoint id, channel id, etc.
-    pub rights: CapabilityRights,
+pub enum CapabilityGrant {
+    /// Rights on one named endpoint.
+    Endpoint { endpoint: u32, rights: CapabilityRights },
+    /// Rights on every endpoint. v1 services carry
+    /// `AllEndpoints { send }` because replies target clients'
+    /// self-chosen reply endpoints, which cannot be pre-declared.
+    AllEndpoints { rights: CapabilityRights },
+    /// A system capability (CreateProcess, CreateChannel,
+    /// MapFramebuffer, AuditConsumer, SetWallclock, ...).
+    System { kind: CapabilityKind },
 }
 ```
 
-All bounds (`MODULE_NAME_MAX`, `RESERVED_ENDPOINTS_MAX`, `GRANTS_MAX`, `DEPS_MAX`, `MAX_MANIFEST_ENTRIES`) are SCAFFOLDING bounds per Development Convention 8 and get rows in [ASSUMPTIONS.md](../ASSUMPTIONS.md) when implementation lands.
+**Default grant posture (v1): narrow receive, wildcard send.** Each service's default grants are `Endpoint { receive }` on exactly its reserved endpoints plus `AllEndpoints { send }` — a service can never drain another service's queue, even if a reservation check were buggy, while replies to dynamic client endpoints keep working. Narrowing *send* is deferred — **Revisit when:** a reply-capability mechanism (seL4-style reply caps, or ADR-030 stream caps) is in scope. What v1 *does* narrow: the name-based grants in `load_boot_modules` (MapFramebuffer, AuditConsumer, SetWallclock) become per-entry manifest data, and CreateProcess/CreateChannel/CreateCluster stop being universal — each service declares what it holds.
+
+All bounds (`MODULE_NAME_MAX`, `RESERVED_ENDPOINTS_MAX`, `GRANTS_MAX`, `DEPS_MAX`, `MAX_MANIFEST_ENTRIES`) are SCAFFOLDING bounds per Development Convention 8 and get rows in [ASSUMPTIONS.md](../ASSUMPTIONS.md) when implementation lands. `MAX_MANIFEST_ENTRIES` moves in lockstep with `MAX_BOOT_MODULES` (sized together for the v1-endgame service count at ≤25% utilization). The reservation table itself is sized by `MAX_ENDPOINTS` — ARCHITECTURAL lockstep, not a separate bound.
 
 ### 3. What the manifest does **not** declare
 
 Explicitly out of scope, to avoid the "describe the whole process tree" trap:
 
-- **Dynamic endpoints** — processes spawned post-boot (shells, apps, PE-compat sandboxes, transient workers) register endpoints via `SYS_REGISTER_ENDPOINT` and receive dynamic numbers, exactly as today. No manifest entry.
-- **User-spawned processes** — the shell spawning `hello.elf`, a build system spawning `cargo`, an app spawning a worker. These are not init's concern; the spawner is the parent and owns lifecycle.
+- **Unreserved endpoints** — processes spawned post-boot (shells, apps, PE-compat sandboxes, transient workers) register self-chosen endpoint numbers from the unreserved range via `SYS_REGISTER_ENDPOINT`, exactly as today (first-come). There is no dynamic endpoint allocator yet; when one is needed it allocates from the unreserved range and the reservation table needs no change.
+- **User-spawned processes** — the shell spawning a game, a build system spawning `cargo`, an app spawning a worker. These are not init's concern; the spawner is the parent and owns lifecycle. They take the legacy spawn path (today's blanket-grant posture, bootstrap-bound) until a policy-mediated grant flow narrows it — that is [ADR-006](006-policy-service.md)'s territory, not this ADR's.
 - **Policy** — who can call which syscall, who can create channels, who can delegate capabilities. That's the policy service's job ([ADR-006](006-policy-service.md)). The manifest declares *initial* capabilities at spawn; policy decides *subsequent* grants and revocations.
 - **Table sizing until post-v1** — ADR-008 § 7 commits that `TableSizingPolicy` moves into the manifest eventually. This ADR defines the manifest shape that migration targets, but does not land the migration itself. See the Migration Path section.
 
 ### 4. The init process
 
-Init is a user-space ELF (`user/init/`), signed by the bootstrap key, loaded as a boot module. It is the first and only process the kernel creates directly. Its responsibilities:
+Init is a user-space ELF (`user/init/`), signed by the bootstrap key, loaded as a boot module. It is the first and only process the kernel creates directly. It is bound at creation to **its own AID**, carried in the manifest header — audit shows init's actions as init, not as the operator. Its responsibilities:
 
-1. **Read and validate the manifest.** Parse the blob the kernel mapped into its address space. Reject on any structural error (unknown version, oversize bounds, cyclic `depends_on`, missing module, duplicate endpoint reservation).
-2. **Install the endpoint reservation table.** One kernel call (`SYS_INSTALL_ENDPOINT_RESERVATIONS`, new) passes the (Principal, endpoint) pairs derived from the manifest. The kernel atomically populates its reservation table. This call is one-shot: the kernel rejects subsequent calls, period. There is no "re-read manifest at runtime" path in v1.
-3. **Spawn services in DAG order.** For each service in topological order of `depends_on`: call `SYS_SPAWN(module_name, initial_capabilities)` — a spawn variant that atomically creates the process and installs the grants. Block on the service's readiness signal (a minimal "I'm up" IPC to a well-known init endpoint) before spawning dependents.
-4. **Own post-boot service lifecycle.** When `SYS_WAIT_TASK` returns for a Persistent service, apply the service's restart policy. OneShot services are logged and not restarted.
-5. **Emit audit events.** Every spawn, restart, and give-up emits an `AuditEventKind::ServiceLifecycle` event through the existing audit infrastructure ([ADR-007](007-capability-revocation-and-telemetry.md)).
+1. **Parse the manifest's policy fields.** The same blob the kernel verified and transcribed, via the same `cambios-manifest` parser. Reject on any structural error (unknown version, oversize bounds, cyclic `depends_on`, missing module). Init's parse cannot affect security state — grants, reservations, and identity were transcribed by the kernel before init's first instruction. A buggy init parse can mis-order or refuse to spawn; it cannot mis-grant.
+2. **Spawn services in DAG order.** For each service in topological order of `depends_on`: call `SYS_SPAWN(module_name)` — the existing syscall, unchanged ABI. The kernel recognizes manifest-listed names when the caller is init and atomically binds the entry's AID + installs exactly the entry's grants (see § 5). Block on the service's readiness signal — a minimal "I'm up" IPC to init's endpoint (endpoint 1, reserved to init's AID), emitted by the service runtime entry macro ([ADR-037](037-native-app-framework.md) `service_main!`) where `SYS_MODULE_READY` is emitted today — before spawning dependents.
+3. **Own post-boot service lifecycle.** When a Persistent service exits, apply the service's restart policy. OneShot services are logged and not restarted. Prerequisite: [ADR-019](019-process-fault-reaping-and-peer-generation.md) phases A/B make faults reap and wake the parent at all (today they do neither), and phase D distinguishes fault from clean exit.
+   > **Deferred decision.** Init's steady-state wake model — it must observe N children's exits *and* readiness pings on its endpoint with one blocking primitive. Candidates: a kernel-authored exit-notification message to init's endpoint (single RecvMsg loop; precedent: the kernel already writes IPC on the virtio-blk kernel-cmd path), or a wait-any variant of `SYS_WAIT_TASK`. **Revisit when:** migration step 10 starts.
+4. **Audit.** Spawns and exits are already kernel-audited (`ProcessCreated`, `ProcessTerminated`; ADR-019 adds `ProcessFaulted`). The genuinely new event is init's *decision* audit — restart-gave-up (`ServiceDead`) — which lands with migration step 10 through the `cambios-abi` audit taxonomy; the emission mechanism (narrow emit syscall vs kernel-emitted on wait outcome) is decided there.
 
-Init holds exactly two privileged capabilities at boot: `CreateProcess` (to call `SYS_SPAWN`) and `InstallEndpointReservations` (a new kind, one-shot, consumed by the single install call). It does **not** hold `GrantCapability` as a general authority — the capability-install-list passed to `SYS_SPAWN` is bounded by what the signed manifest says, and the kernel validates the install against the manifest hash init presented when registering. Init is a mechanism for executing the manifest, not an authority beyond it.
+Init holds exactly **one** privileged capability at boot: `CreateProcess`. It holds no grant authority at all — grants flow from the kernel's transcribed table at spawn time, so init cannot widen, forge, or reassign them. Init is a mechanism for executing the manifest's policy, not an authority beyond it.
 
-### 5. The kernel's shrunken boot surface
+### 5. The kernel's boot surface: what is removed, what is added
 
 The kernel removes:
 
-- `BOOT_MODULE_ORDER` in [src/lib.rs](../../src/lib.rs)
-- `BootModuleOrder` in [src/boot_modules.rs](../../src/boot_modules.rs)
+- `BOOT_MODULE_ORDER` in [src/lib.rs](../../src/lib.rs) and `BootModuleOrder` in [src/boot_modules.rs](../../src/boot_modules.rs)
 - `BlockReason::BootGate` in [src/scheduler/task.rs](../../src/scheduler/task.rs)
-- `SyscallNumber::ModuleReady` and `handle_module_ready` in the syscall layer
-- The per-module "register endpoint on behalf of bootstrap Principal at load" ad-hoc grants in `load_boot_modules`
+- `SyscallNumber::ModuleReady` (= 36) and `handle_module_ready` — the slot is retired permanently, never reused (same discipline as slot 18)
+- `SPAWN_ONLY_MODULES` in `load_boot_modules` — under init, "loaded but not spawned" is simply "not in the manifest"
+- The blanket-grant path for boot modules (`register_process_capabilities`: send/receive on all endpoints + CreateProcess + CreateChannel + CreateCluster to everyone) and the name-based narrow grants (MapFramebuffer, AuditConsumer, SetWallclock) — all subsumed by manifest `granted_capabilities`. (The `POLICY_SERVICE_PID` name-hook at spawn stays — it is kernel-internal interceptor plumbing, not a capability.)
 
 The kernel adds:
 
-- The endpoint reservation table: an array keyed by endpoint id, each slot either `Unreserved` (any Principal may `RegisterEndpoint` it) or `Reserved(Principal)` (only that Principal may register it). Checked inside `SYS_REGISTER_ENDPOINT`.
-- `SyscallNumber::InstallEndpointReservations` (one-shot, init-only).
-- `SYS_SPAWN` extended to accept a capability-install-list validated against the manifest.
-- A `ServiceDead` audit event variant consumed by the eventual AI watcher.
+- The **endpoint-reservation table**: dense `[EndpointReservation; MAX_ENDPOINTS]`, each slot `Unreserved` (first-come, as today) or `Reserved(aid)`. Checked inside `SYS_REGISTER_ENDPOINT` before the existing self-grant logic. Write-once at boot.
+- The **spawn-grant table**: module name → (AID, grants). Write-once at boot.
+- The **manifest transcription path** in boot-module load: identify the manifest module by name, verify ARCSIG, parse via `cambios-manifest`, populate both tables. Invalid manifest → typed boot error ([ADR-021](021-typed-boot-error-propagation.md); `make check-boot-panics` applies). Absent manifest → empty tables, behavior identical to today.
+- A **manifest branch in `handle_spawn`**: if the requested name is in the spawn-grant table *and* the caller is init (PID 1 — structural, kernel-created), bind the table's AID and install exactly the table's grants instead of the legacy blanket. All other callers take today's path unchanged.
 
-Net: the kernel's boot path loads init + manifest + signed service modules, verifies all signatures, spawns init, hands it the manifest pointer, and goes to the idle loop. The boot sequencing logic that exists today is deleted, not refactored.
+No new syscall. `SYS_SPAWN`'s ABI is untouched; the libsys wrapper is untouched.
+
+Net: the kernel's boot path loads init + manifest + signed service modules, verifies all signatures, transcribes the manifest, spawns init, and goes to the idle loop. The boot sequencing logic that exists today is deleted, not refactored.
 
 ### 6. Bootstrap chicken-and-egg
 
-Init needs a manifest to know what to spawn. The manifest needs to be signed. Signing needs the bootstrap key. The bootstrap key is held by the operator (the YubiKey root of trust per `project_yubikey_root_of_trust`) and used at build time to sign the manifest blob as part of the image. At runtime:
+Init needs a manifest to know what to spawn. The manifest needs to be signed. Signing needs the bootstrap key. The bootstrap key is held by the operator (the YubiKey root of trust) and used at build time to sign the manifest blob as part of the image (`tools/build-manifest`, with the same YubiKey / `--seed` / dev-piv paths as `tools/sign-elf`). At runtime:
 
 1. Limine loads the kernel, init, the manifest blob, and every service ELF referenced by the manifest as boot modules.
-2. The kernel, during early boot, enumerates the boot modules and verifies each signed ELF + the manifest blob against the bootstrap public key (already embedded in the kernel per [ADR-004](004-cryptographic-integrity.md)).
-3. The kernel creates init as PID 1, maps the manifest blob read-only into init's address space at a known address, and installs `CreateProcess` + `InstallEndpointReservations` capabilities on init.
-4. Init runs.
+2. The kernel, during early boot, verifies each signed ELF and the manifest blob against the bootstrap public key (compile-time embedded per [ADR-004](004-cryptographic-integrity.md) § Divergence 3).
+3. The kernel transcribes the manifest into the reservation + spawn-grant tables.
+4. The kernel creates init as PID 1, binds init's manifest-declared AID, maps the manifest blob read-only into init's address space at a fixed address, and installs `CreateProcess`.
+5. Init runs.
 
-Fs-service, key-store, and the ObjectStore do not exist yet at step 3. The manifest cannot live in the ObjectStore at v1 for exactly this reason — the ObjectStore depends on fs-service, which depends on the manifest to be loaded. This is why v1 pins the manifest to a boot module. Post-v1, when a second-stage loader can materialize the manifest from the persistent ObjectStore, the same parser handles both sources.
+Fs-service, key-store, and the ObjectStore do not exist yet at step 4. The manifest cannot live in the ObjectStore at v1 for exactly this reason — the ObjectStore depends on fs-service, which depends on the manifest to be loaded. This is why v1 pins the manifest to a boot module. Post-v1, when a second-stage loader can materialize the manifest from the persistent ObjectStore, the same parser handles both sources.
 
 ## Architecture
 
@@ -190,7 +225,8 @@ Fs-service, key-store, and the ObjectStore do not exist yet at step 3. The manif
 │ entries_offset: u32   (offset from start of blob)          │
 │ strings_offset: u32   (interned module names + dep names)  │
 │ strings_len: u32                                           │
-│ reserved: [u8; 36]    (zeroed in v1)                       │
+│ init_aid: [u8; 32]    (AID the kernel binds to PID 1)      │
+│ init_endpoint: u32    (readiness-ping endpoint; v1 = 1)    │
 ├────────────────────────────────────────────────────────────┤
 │ Entry 0: fixed-size ManifestEntryRaw                       │
 │   principal: [u8; 32]                                      │
@@ -209,11 +245,12 @@ Fs-service, key-store, and the ObjectStore do not exist yet at step 3. The manif
 │ String table (UTF-8, no NUL terminators; length-prefixed   │
 │ by StringRef; validated to be inside strings_len)          │
 ├────────────────────────────────────────────────────────────┤
-│ ARCSIG trailer (existing Ed25519 signing format)           │
+│ ARCSIG trailer (existing Ed25519 signing format, over      │
+│ blake3 of everything above)                                │
 └────────────────────────────────────────────────────────────┘
 ```
 
-Every `[u32; N]` / `[T; N]` array is a fixed-size inline field with a separate length byte. No variable-length inline fields, no pointers, no dynamic dispatch. Parsing is a bounded loop over `entry_count` records, each a `core::mem::transmute` into the raw struct after range-checks on the two offsets. A reference parser lands in `user/init/src/manifest.rs`; the bounds-check logic is small enough to be an explicit verification target.
+Every `[u32; N]` / `[T; N]` array is a fixed-size inline field with a separate length byte. No variable-length inline fields, no pointers, no dynamic dispatch. Parsing is a bounded loop over `entry_count` records with range-checks on every offset before access. The parser lives in the shared `cambios-manifest` crate; its bounds-check logic is small enough to be an explicit verification target. Reservation rows may exist without a matching spawn entry (init's own endpoint; virtio-blk's kernel-reply endpoint 25).
 
 ### Startup sequence (post-kernel-init)
 
@@ -224,44 +261,43 @@ Kernel init (frame alloc, heap, object tables per ADR-008)
 Kernel verifies signatures on all boot modules + manifest blob
     │
     ▼
-Kernel creates PID 1 (init), maps manifest read-only into init's AS,
-installs CreateProcess + InstallEndpointReservations caps, starts init
+Kernel transcribes manifest security sections into write-once tables:
+endpoint reservations + per-module (AID, grants) spawn table
     │
     ▼
-Init parses manifest, validates DAG, no cycles
+Kernel creates PID 1 (init), binds init's manifest-declared AID,
+maps manifest read-only into init's AS, installs CreateProcess
     │
     ▼
-Init calls SYS_INSTALL_ENDPOINT_RESERVATIONS(manifest_hash, reservations[])
-    │
-    ▼
-Kernel validates manifest hash matches the blob it loaded, populates
-the reservation table, marks the install one-shot-consumed
+Init parses manifest policy fields, validates DAG, no cycles
     │
     ▼
 Init spawns services in topological order:
     for svc in topo_order(manifest):
-        block on all svc.depends_on to be ready
-        SYS_SPAWN(svc.module_name, svc.granted_capabilities, manifest_hash)
+        block until all svc.depends_on are ready
+        SYS_SPAWN(svc.module_name)        ← kernel applies AID + grants
         block on svc's readiness ping to init's endpoint
     │
     ▼
-Steady state: init blocks in SYS_WAIT_TASK, dispatches restarts per
-policy when services exit
+Steady state: init supervises exits, dispatches restarts per policy
+(wake model decided at step 10; requires ADR-019)
 ```
 
 ### Endpoint reservation check
 
-`SYS_REGISTER_ENDPOINT(n)` gains one check before its current capability-install logic:
+`SYS_REGISTER_ENDPOINT(n)` gains one check before its current self-grant logic:
 
 ```rust
 match endpoint_reservation_table[n] {
     Unreserved => { /* proceed as today */ }
-    Reserved(principal) if caller.principal() == principal => { /* proceed */ }
+    Reserved(aid) if caller.principal().aid() == &aid => { /* proceed */ }
     Reserved(_) => return Err(SyscallError::PermissionDenied),
 }
 ```
 
-The table is a flat `[EndpointReservation; ENDPOINT_RESERVATION_TABLE_SIZE]` where `ENDPOINT_RESERVATION_TABLE_SIZE` is a SCAFFOLDING bound sized for v1 core-service count × 4 headroom (per Development Convention 8's "≤25% utilization" rule). Endpoints beyond the reservation table size cannot be reserved and are always `Unreserved` — dynamic endpoints live in that upper range.
+The table is a flat `[EndpointReservation; MAX_ENDPOINTS]` — ARCHITECTURAL lockstep with `MAX_ENDPOINTS` (an endpoint that exists is reservable; at 64 endpoints the table is ~2 KB). Endpoints the manifest does not list stay `Unreserved` and behave exactly as today. Endpoint 0 is structurally unreservable (it is the `REPLY_ENDPOINT` "unset" sentinel); endpoint 1 is init's.
+
+Restarts need no table change by design: reservations are keyed by AID, not by process, so a restarted service binds the same manifest AID and legitimately re-registers the same endpoint. [ADR-019](019-process-fault-reaping-and-peer-generation.md)'s endpoint *generation* counter — not this table — is what signals "new incarnation" to clients.
 
 ### Restart and backoff
 
@@ -270,20 +306,22 @@ Init tracks per-service restart state:
 ```rust
 struct ServiceRuntime {
     entry: &'static ManifestEntry,
-    task_id: TaskId,
+    task_id: TaskId,               // generation-carrying (ADR-034)
     last_restart_at_ticks: u64,
     consecutive_failures_in_window: u16,
     next_delay_ms: u32,
 }
 ```
 
-On `SYS_WAIT_TASK` return for a Persistent service, init:
+On observing a Persistent service's exit, init:
 
 1. If `consecutive_failures_in_window >= max_restarts` within `failure_window_ms` of the first failure in the window: emit `ServiceDead`, stop restarting.
 2. Else sleep for `next_delay_ms`, then re-spawn via the same DAG path.
 3. Double `next_delay_ms` up to `max_delay_ms`. Reset to `initial_delay_ms` after a healthy window elapses without another failure.
 
 The backoff is deliberately simple. More sophisticated supervision strategies (watchdog pings, health-check endpoints, jittered restart) are explicit non-goals for v1; they can be added without changing the kernel surface.
+
+**Prerequisite:** this section is inert until [ADR-019](019-process-fault-reaping-and-peer-generation.md) lands its phases A/B (fault path reaps and wakes the parent — today a faulting service leaks and no one is notified) and D (`ExitInfo` distinguishes fault from clean exit). ADR-019 is reviewed for acceptance as its own gate before migration step 10.
 
 ### Interaction with ADR-008 table sizing
 
@@ -293,31 +331,31 @@ The `TableSizingPolicy` defined in ADR-008 § 2 stays compile-time for the initi
 
 | Threat | Without init/manifest | With init/manifest |
 |---|---|---|
-| Rogue process squats core service endpoint | Succeeds if timing works — `SYS_REGISTER_ENDPOINT(16)` is unconditional | Kernel rejects: reservation table enforces per-endpoint Principal ownership |
-| Attacker replaces a service ELF at build time | Caught by existing signed-ELF verification | Same — manifest entries reference module names, signature check still applies |
-| Attacker replaces the manifest blob itself | N/A (no manifest today) | Blob is ARCSIG-signed by bootstrap key; kernel rejects unsigned/wrong-key blob before init runs |
+| Rogue process squats core service endpoint | Succeeds if timing works — `SYS_REGISTER_ENDPOINT(16)` is unconditional | Kernel rejects: reservation table enforces per-endpoint AID ownership, and per-service AIDs make the check discriminating (bootstrap-bound user spawns cannot claim fs-service's slot) |
+| Attacker replaces a service ELF at build time | Caught by existing signed-ELF verification | Same — manifest entries reference module names; the ELF's ARCSIG check still applies independently |
+| Attacker replaces the manifest blob itself | N/A (no manifest today) | Blob is ARCSIG-signed by the bootstrap key; kernel rejects unsigned/wrong-key blob before transcription |
 | Attacker adds an entry to the manifest | N/A | Blob is signed as one unit; any edit invalidates the signature |
-| Compromised init grants itself extra capabilities | N/A | Init's `SYS_SPAWN` install-list is validated against the manifest hash init registered; kernel rejects grants not in the manifest. Init cannot grant authority it cannot prove the bootstrap signer authorized. |
-| Compromised init refuses to start a service | N/A | Same threat as any compromised user-space supervisor — service does not run. Detected by absence of readiness ping; does not affect other services. Not a kernel-TCB compromise. |
+| Compromised init grants itself or a service extra capabilities | N/A | Structurally impossible: grants flow only from the kernel's boot-transcribed table. Init passes no grant data at spawn and has no install authority — there is nothing to forge |
+| Compromised init lies about manifest content | N/A | Impossible for security sections: the kernel transcribed them itself from the verified blob before init's first instruction. Init's parse affects only ordering and lifecycle |
+| Compromised init refuses to start / mis-orders services | N/A | Same threat as any compromised user-space supervisor — a service doesn't run. Detected by absent readiness pings; does not affect other services' identity, reservations, or grants. Not a kernel-TCB compromise |
 | Crashed policy service never restarts | Matches ADR-006 § Failure Modes: permissive fallback, no recovery | Init restarts per manifest policy; permissive window is bounded by restart delay |
-| Manifest hash substitution at install time | N/A | `SYS_INSTALL_ENDPOINT_RESERVATIONS` validates the hash against the blob the kernel loaded, not a hash init claims — init cannot present a forged hash |
 
-Key property: **the kernel TCB does not grow.** Init is in the boot-lifecycle TCB but not the kernel TCB. A compromised init cannot escalate into kernel privileges; its authority is bounded by what the signed manifest authorizes and by the two capabilities (`CreateProcess`, `InstallEndpointReservations`) the kernel granted it.
+Key property: **the kernel gains no runtime-attacker-reachable surface.** The one kernel-side addition that touches manifest bytes — the transcription parse — runs once at boot, single-threaded, on input that is operator-signed *before* parsing begins; it is a bounded pure function and a verification target, not an attack surface. Init is in the boot-lifecycle TCB but not the kernel TCB: its worst failure mode is refusing to supervise, never widening authority.
 
 ## Verification Stance
 
 Kernel-side additions are small and fit the verification posture:
 
-- The endpoint reservation table is a dense array with an O(1) indexed lookup. Reservation install is one-shot and idempotent-after-success.
-- The `SYS_INSTALL_ENDPOINT_RESERVATIONS` path is a single bounded loop over the reservation list with a hash-equality check.
-- `SYS_SPAWN`'s install-list validation is a bounded iteration over the requested grants cross-checked against the manifest-derived allowed set.
+- The endpoint-reservation and spawn-grant tables are dense arrays with O(1) indexed / name-keyed lookup, written once at boot (the `BOOTSTRAP_PRINCIPAL` lifecycle — outside the lock hierarchy entirely).
+- The transcription parse is a bounded loop over `entry_count` fixed-size records — a pure function over a byte slice, shared with userspace via `cambios-manifest`, host-tested against every structural error case, and a natural Kani target ("parsed tables ≡ well-formed blob content").
+- `handle_spawn`'s manifest branch is a name-keyed table lookup plus a bounded grant-application loop.
 - Deleting `BootGate`, `BOOT_MODULE_ORDER`, and `SYS_MODULE_READY` removes more verification surface than the additions introduce.
 
 Init itself is user-space and is **not** in the kernel verification target. Its correctness is enforced through:
 
-- Signed ELF + build-time testing of the manifest parser on malformed inputs.
-- Capability isolation: init only holds what the kernel granted it; its worst failure mode is refusing to supervise, not bypassing authorization.
-- The ObjectStore audit trail (via ADR-007) records every spawn and restart decision.
+- Signed ELF + build-time testing of the manifest parser on malformed inputs (the same parser crate the kernel uses — written and tested once).
+- Structural containment: init's parse cannot affect grants, reservations, or identity (kernel-transcribed before init runs); its failure domain is ordering and lifecycle only.
+- The audit trail ([ADR-007](007-capability-revocation-and-telemetry.md)) records every spawn and exit; step 10 adds init's give-up decisions.
 
 This matches CLAUDE.md's verification posture: kernel code is verification-targeted, user-space code is reviewed and tested but not formally verified.
 
@@ -333,13 +371,15 @@ This matches CLAUDE.md's verification posture: kernel code is verification-targe
 
 **Why considered.** Standard, tool-friendly, flexible. Easy to extend.
 
-**Why rejected.** Adds a no_std CBOR parser to the init TCB — extra dependency, extra verification surface, extra attack surface. The manifest has one producer (build time) and one consumer (init) — self-description buys nothing. A fixed-layout binary with a version field can evolve with explicit version bumps, which is what we want anyway.
+**Why rejected.** Adds a `no_std` CBOR parser to two TCBs — now including the kernel's, since the kernel transcribes. The manifest has one producer (build time) and two same-repo consumers — self-description buys nothing. A fixed-layout binary with a version field can evolve with explicit version bumps, which is what we want anyway.
 
-### Option C: Kernel parses the manifest
+### Option C: Kernel parses the manifest — *adopted in part at acceptance review (2026-07-06)*
 
-**Why considered.** Removes the init "install reservations" syscall. Kernel has the blob already; could populate reservation table itself.
+**Why considered.** The kernel has the blob and has already verified its signature; it can populate the enforcement tables itself, and no install syscall is needed.
 
-**Why rejected.** Puts parser logic in the kernel TCB. Every parser bug becomes a kernel CVE. The init process already exists as the right architectural place for this — putting the parser there costs one syscall and keeps the kernel's responsibility to "verify the signature, enforce the result of the parse."
+**What the original rejection got right, and kept.** The drafting-time rejection ("every parser bug becomes a kernel CVE; init is the right architectural place") conflated two concerns. The one it was right about stays rejected: the kernel must not *interpret* the manifest — sequencing, dependency resolution, restart policy, lifecycle are user-space decisions, exactly as ADR-006 splits policy from mechanism.
+
+**What changed.** The acceptance review re-derived the parsing question and reversed it. The drafted alternative — init parses, then hands the kernel the derived tables via a one-shot `SYS_INSTALL_ENDPOINT_RESERVATIONS` syscall — turned out to be strictly worse: it added a syscall, a capability kind, a one-shot protocol, and a hash-check handshake, and its enforcement tables were only as faithful as *unverified-at-runtime userspace parsing*, all to buy a "smaller kernel TCB" argument that does not survive scrutiny. The transcription parse is ~150 lines of bounded, allocation-free offset-walking over input that is **operator-signed before parsing begins**, run once at boot, single-threaded, pre-userspace — smaller and purer than the ELF header walk the loader already performs, and a better verification target than a trust link. Kernel-side transcription strengthens the end-to-end property to "enforcement tables ≡ signed blob content" with no userspace in the chain, and deletes an entire syscall from the design. Transcribe, don't interpret ([ADR-026](026-identity-transcription-at-the-kernel-ring.md)) is the governing pattern.
 
 ### Option D: Multiple init processes (launchd-style agents)
 
@@ -347,30 +387,30 @@ This matches CLAUDE.md's verification posture: kernel code is verification-targe
 
 **Why rejected.** Out of scope for v1. CambiOS is a single-operator system today; multi-user / per-user supervision is a post-v1 concern and this ADR does not preclude adding user-level supervisors later as children of the system init.
 
-### Option E: Embed the manifest in init's ELF as a `.rodata` section (chosen: no)
+### Option E: Embed the manifest in init's ELF as a `.rodata` section
 
 **Why considered.** One fewer boot module. Manifest signature is part of init's signature — one fewer verify call.
 
-**Why rejected.** Conflates init with its configuration. An operator who wants to adjust the manifest (change reservations, add a service) would have to rebuild init. Separating the manifest keeps init minimal and keeps the manifest the only thing the operator touches for fleet configuration.
+**Why rejected.** Conflates init with its configuration, and (post-review) would force the kernel to parse init's ELF sections to reach the security data it must transcribe. An operator who wants to adjust the manifest (change reservations, add a service) would have to rebuild init. Separating the manifest keeps init minimal and keeps the manifest the only thing the operator touches for fleet configuration.
 
-### Option F (chosen): Separate signed manifest blob, user-space init, shrunken kernel
+### Option F (chosen): Separate signed manifest blob, kernel transcription, user-space init
 
-**Why chosen.** Aligns with the layering [ADR-006](006-policy-service.md) established for policy. Shrinks the kernel. Composes with the existing signing infrastructure. Makes the core service set declarative. Gives ADR-006's and ADR-008's explicit "future init" references a concrete home. Does not close off the post-v1 migration to ObjectStore-hosted manifests.
+**Why chosen.** Aligns with the layering [ADR-006](006-policy-service.md) established for policy and the transcription stance [ADR-026](026-identity-transcription-at-the-kernel-ring.md) established for identity. Shrinks the kernel's boot machinery while adding only a bounded pure parse. Composes with the existing signing infrastructure. Makes the core service set declarative and per-service identity real. Gives ADR-006's and ADR-008's explicit "future init" references a concrete home. Does not close off the post-v1 migration to ObjectStore-hosted manifests.
 
 ## Migration Path
 
-Sequenced to be landable in bounded commits with no regressions between them. The tri-arch regression gate applies at every step.
+Sequenced to be landable in bounded commits with no regressions between them. The tri-arch regression gate applies at every step. The manifest is per-build data: each step ships a manifest matching that step's reality (tables are per-*boot* immutable, not per-project).
 
-1. **Define the manifest wire format** as a Rust module (`cambios_core::manifest`) shared between kernel, init, and the build tooling. Pure data structures + parsing logic, no side effects. Unit tests on host for every structural error case.
-2. **Add the bootstrap-side build tool** (`tools/build-manifest/`) that takes a TOML or Rust-defined source and emits a signed manifest blob. Sign with the same YubiKey path as `tools/sign-elf/`.
-3. **Add the endpoint reservation table** to the kernel (`src/ipc/endpoint_reservation.rs`). Initially empty, initially no caller — just the data structure and its check in `SYS_REGISTER_ENDPOINT`. Behavior is unchanged (empty table ⇒ all endpoints unreserved).
-4. **Add `SyscallNumber::InstallEndpointReservations`** (new variant, new handler). Gated by a new `InstallEndpointReservations` capability kind, no one holds it yet. No caller.
-5. **Extend `SYS_SPAWN`** to accept a capability-install-list and a manifest-hash argument. Backward-compatible: current callers pass an empty list + the sentinel hash `[0; 32]`, which the kernel treats as "legacy spawn, no manifest cross-check." Behavior unchanged for existing code paths.
-6. **Write the init process** (`user/init/`). Parser, DAG resolver, restart loop, audit emission. Standalone tests on host for the parser and DAG logic. Hard-coded manifest in this step for bring-up.
-7. **Land the init-as-first-module change.** `limine.conf` gains `init.elf` and `manifest.bin`. Kernel verifies both, spawns init with the manifest pointer, grants init its two capabilities. Other boot modules still load through the existing path. Init starts, parses, but does nothing yet — coexistence with the old `BOOT_MODULE_ORDER` chain.
-8. **Cut over service startup to init.** Remove service entries from the old boot chain. Init spawns them via `SYS_SPAWN`. Verify all existing integration tests pass. At this step, `BOOT_MODULE_ORDER` / `BootGate` / `SYS_MODULE_READY` are unused for new services but the machinery is still compiled in.
-9. **Delete the scaffolding.** Remove `BOOT_MODULE_ORDER`, `BootModuleOrder`, `BlockReason::BootGate`, `SyscallNumber::ModuleReady`, `handle_module_ready`. Update CLAUDE.md, STATUS.md, and dependent tests. This is the irreversible commit.
-10. **Wire restart policy.** Implement `ServiceLifetime::Persistent` backoff in init. Add integration test that kills a boot service and asserts init restarts it.
+1. **`cambios-manifest` crate** — wire format, parser, validation, grant/AID types. Root-level, `no_std`, zero-dep, MPL-2.0, workspace-excluded (the `cambios-abi` pattern). Host tests for every structural error case. No kernel change.
+2. **`tools/build-manifest`** — consumes the endpoint-registry source artifact ([ADR-037](037-native-app-framework.md) Phase 2 — the registry TOML and the manifest source are one artifact, build-manifest is its single consumer), derives v1 service AIDs, validates endpoint uniqueness + DAG acyclicity + bounds, emits the signed blob (same YubiKey / `--seed` / dev-piv signing paths as `tools/sign-elf`). `make manifest` target.
+3. **Endpoint-reservation table** in the kernel (`src/ipc/endpoint_reservation.rs`), checked in `SYS_REGISTER_ENDPOINT`. Write-once lifecycle documented at the static. Empty table ⇒ behavior unchanged.
+4. **Kernel manifest transcription** — identify the manifest module by name during boot-module load, verify ARCSIG, parse via `cambios-manifest`, populate reservation + spawn-grant tables. Invalid ⇒ typed boot error (ADR-021). Absent ⇒ empty tables, behavior unchanged.
+5. **`handle_spawn` manifest branch** (init-only, name-keyed). Dormant — no manifest module is loaded yet, so the table is empty.
+6. **`user/init/`** — policy-field parse, DAG resolver, spawn + readiness loop. Host tests for parser and DAG logic. No allocator.
+7. **Boot integration, coexistence.** `limine.conf` gains `init.elf` and `manifest.bin`. The kernel transcribes (step 4 goes live), maps the blob into init, spawns init as PID 1 with its manifest AID + `CreateProcess`. **The step-7 manifest reserves only endpoint 1 (init's)** — old-chain services are still bootstrap-bound, so reserving their endpoints to per-service AIDs would make their own registrations fail. Init parses, validates, and idles; the `BOOT_MODULE_ORDER` chain still starts every service. Zero behavior change, full machinery exercised.
+8. **Cutover.** Manifest-listed services leave the boot chain (the kernel loads them registry-only); init spawns them in DAG order; the full reservation set and per-service AIDs ship in this step's manifest; `service_main!`'s `module_ready()` becomes the readiness ping to endpoint 1 (one macro edit + the explicit call in no-endpoint-form services). **Required sweep:** per-service AIDs change `sender_principal` values peers observe — audit every bootstrap-equality assumption (channel `peer_principal` flows, any service checking sender == bootstrap). Cutover lands as one step with heavy boot proof (`make run-quiet` + interactive), with dependency-closed waves as the fallback plan if it fights back.
+9. **Delete the scaffolding.** Remove `BOOT_MODULE_ORDER`, `BootModuleOrder`, `BlockReason::BootGate`, `SyscallNumber::ModuleReady` (slot 36 retired with a tombstone comment, never reused — the slot-18 discipline), `handle_module_ready`, the libsys wrapper, `SPAWN_ONLY_MODULES`, and the blanket boot-grant path. Update CLAUDE.md, STATUS.md, the ABI tests (36 is in the identity-exempt set today), and dependent tests. This is the irreversible commit.
+10. **Wire restart policy.** Backoff loop in init, the wake-model decision (see § 4 deferred decision), `ServiceDead` audit via the `cambios-abi` taxonomy, integration test that kills a boot service and asserts init restarts it. **Prerequisite:** ADR-019 acceptance + phases A/B/D — reviewed as its own gate before this step starts.
 11. **Move `TableSizingPolicy` into the manifest.** Add a top-level manifest field, have the kernel pass it to ADR-008's sizing path, and demote the compile-time const to a fallback default. Fulfills ADR-008 § 7.
 12. **Post-v1: migrate the manifest source.** When the persistent ObjectStore ([ADR-010](010-persistent-object-store-on-disk-format.md)) is the trusted source for system configuration, the manifest moves there. The parser stays. The loader path (boot module → ObjectStore lookup) is the only change.
 
@@ -379,20 +419,28 @@ Steps 1–7 establish the slot without behavior change. Step 8 is the first beha
 ## Cross-References
 
 - **[ADR-000](000-zta-and-cap.md)** — Capabilities; the endpoint reservation check is a new capability-style structural authority check
-- **[ADR-003](003-content-addressed-storage-and-identity.md)** — Principals; manifest entries bind module → Principal identity
-- **[ADR-004](004-cryptographic-integrity.md)** — ARCSIG signing format; manifest reuses it
-- **[ADR-006](006-policy-service.md)** — Policy service; explicitly defers endpoint-registry and restart-authority to this ADR; init holds the bootstrap restart authority until policy-service is up, thereafter cooperates with policy for grant decisions
-- **[ADR-008](008-boot-time-sized-object-tables.md)** — `TableSizingPolicy`; this ADR's manifest is the vehicle for ADR-008 § 7's promised migration
-- **[ADR-007](007-capability-revocation-and-telemetry.md)** — Audit channel; init emits `ServiceLifecycle` and `ServiceDead` events
+- **[ADR-004](004-cryptographic-integrity.md)** — ARCSIG signing format; the manifest blob reuses the trailer + `blake3(payload)` scheme unchanged
+- **[ADR-006](006-policy-service.md)** — Policy service; explicitly defers endpoint-registry and restart-authority to this ADR (its § Architecture deferral triggers at steps 7-8); init holds restart authority, policy mediates subsequent grant decisions
+- **[ADR-007](007-capability-revocation-and-telemetry.md)** — Audit channel; spawns/exits kernel-audited today, init's `ServiceDead` lands at step 10
+- **[ADR-008](008-boot-time-sized-object-tables.md)** — `TableSizingPolicy`; this ADR's manifest is the vehicle for ADR-008 § 7's promised migration (step 11)
+- **[ADR-019](019-process-fault-reaping-and-peer-generation.md)** — kernel substrate for restart observation (fault reap, parent wake, `ExitInfo`, endpoint generations); prerequisite for step 10; its endpoint-generation counter is the "new incarnation" signal that composes with stable reservations
+- **[ADR-024](024-syscall-abi-crate.md)** — the shared-contract-crate pattern `cambios-manifest` follows (workspace-excluded, `no_std`, MPL-2.0, consumed by kernel + userspace + tools)
+- **[ADR-025](025-principal-as-aid.md)** — Principal as opaque 32-byte AID; manifest `principal` fields are AIDs, and v1's derived service AIDs are deliberately not signing keys
+- **[ADR-026](026-identity-transcription-at-the-kernel-ring.md)** — transcribe-don't-interpret; the kernel-side manifest handling is this pattern applied to boot configuration
+- **[ADR-033](033-multi-principal-vault.md)** — services that need real signing keys use the key-store; manifest AIDs carry identity, not key material
+- **[ADR-034](034-deferred-task-resource-reclamation.md)** — generation-carrying task handles; init's supervision keys restarts on them
+- **[ADR-037](037-native-app-framework.md)** — `service_main!` is where the readiness ping is emitted (one macro site + explicit no-endpoint services); its Phase-2 endpoint registry is `build-manifest`'s input artifact
 - **[ADR-002](002-three-layer-enforcement-pipeline.md)** — Enforcement pipeline; `SYS_REGISTER_ENDPOINT` gains one check, same pattern as other kernel-side mechanical checks
 - **[ADR-012](012-input-architecture-and-device-classes.md)** / **[ADR-014](014-compositor-scanout-driver-protocol.md)** — Input-hub and compositor/scanout-driver both need reserved endpoints; this ADR is the mechanism they plug into
 
 ## See Also in CLAUDE.md
 
-Updates required when the implementation lands:
+Updates required as the implementation lands:
 
-- **§ "Quick Reference"** — add `make manifest` / `tools/build-manifest` build command
-- **§ "Syscall Numbers"** — note `InstallEndpointReservations` addition and `ModuleReady` removal
-- **§ "Required Reading by Subsystem"** — add a row for "init / service lifecycle / manifest"
-- **§ "Platform Gotchas"** — note that the manifest blob is a required boot module; missing manifest = kernel refuses to spawn init
-- **§ "Deep Reference" / directory layout** — add `user/init/` and `tools/build-manifest/`
+- **§ "Quick Reference"** — add `make manifest` / `tools/build-manifest` build command (step 2)
+- **§ "Syscall Numbers"** — note `ModuleReady` (36) retirement at step 9; no syscall additions
+- **§ "Lock Ordering" (additional lock domains)** — add the reservation + spawn-grant tables to the `BOOTSTRAP_PRINCIPAL`-pattern list (written once at boot, read-only thereafter, not in the hierarchy) at step 3-4
+- **§ "Required Reading by Subsystem"** — add a row for "init / service lifecycle / manifest" (steps 6-7)
+- **§ "Platform Gotchas"** — note that the manifest blob is a required boot module post-cutover; missing manifest ⇒ kernel refuses to spawn init (step 8)
+- **§ "Deep Reference" / directory layout** — add `cambios-manifest/`, `user/init/`, `tools/build-manifest/`
+- **Worked example "Adding a new syscall"** — unaffected (this ADR adds none); the boot-module walkthroughs that mention `module_ready` update at step 9
