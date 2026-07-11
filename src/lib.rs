@@ -43,6 +43,7 @@ pub mod fs;
 pub mod crypto;
 pub mod boot;
 pub mod boot_modules;
+pub mod manifest;
 pub mod audit;
 pub mod policy;
 pub mod pci;

@@ -94,6 +94,34 @@ pub enum BootError {
     /// the BSP had not finished its boot-time timer init.
     /// Site: `src/arch/aarch64/timer.rs` AP-side invariant panic.
     TimerInvariantViolation,
+
+    // ── Boot manifest (ADR-018 — a present-but-invalid manifest is
+    //    fatal: booting permissively on corrupt security configuration
+    //    would be the vulnerability. An absent manifest module is NOT
+    //    an error — the enforcement tables stay empty.) ──
+
+    /// The manifest module's ARCSIG trailer is missing, unsupported,
+    /// or its signature does not verify against the bootstrap pubkey.
+    /// Site: `src/manifest.rs` `transcribe_manifest_module`.
+    ManifestSignatureInvalid,
+
+    /// The manifest blob failed the structural parse (bad magic /
+    /// version / offsets / entry fields). The parse-error detail is
+    /// printed at the site before this is returned.
+    /// Site: `src/manifest.rs` `validate_payload`.
+    ManifestMalformed,
+
+    /// The manifest failed cross-record validation (duplicate module
+    /// name or duplicate endpoint reservation).
+    /// Site: `src/manifest.rs` `validate_payload`.
+    ManifestInconsistent,
+
+    /// Populating the enforcement tables failed (reservation or
+    /// spawn-table install rejected a row). Unreachable after a clean
+    /// `validate_unique` pass; kept so the tables' own invariants do
+    /// not depend on their caller.
+    /// Site: `src/manifest.rs` populate helpers.
+    ManifestTranscriptionFailed,
 }
 
 /// Halt the system on a typed boot-path failure.
@@ -126,6 +154,14 @@ pub fn boot_failed(err: BootError) -> ! {
             "platform timer base frequency too low for target HZ",
         BootError::TimerInvariantViolation =>
             "AP came up before BSP finished timer init",
+        BootError::ManifestSignatureInvalid =>
+            "boot manifest ARCSIG trailer missing, unsupported, or signature invalid",
+        BootError::ManifestMalformed =>
+            "boot manifest blob failed structural parse",
+        BootError::ManifestInconsistent =>
+            "boot manifest failed cross-record validation (duplicate name/endpoint)",
+        BootError::ManifestTranscriptionFailed =>
+            "boot manifest transcription failed (table install rejected a row)",
     };
     crate::println!("[BOOT FAIL] {}", msg);
     crate::halt()

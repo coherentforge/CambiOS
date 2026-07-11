@@ -4,6 +4,7 @@ tools/*/target/
 verification/*/target/
 fuzz/target/
 cambios-abi/target/
+cambios-manifest/target/
 cambios-fde-proto/target/
 cambios-ccid-proto/target/
 fuzz/artifacts/

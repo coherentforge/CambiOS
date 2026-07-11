@@ -43,6 +43,7 @@ dev-piv = []
 
 [dependencies]
 cambios-abi = { path = "cambios-abi" }
+cambios-manifest = { path = "cambios-manifest" }
 cambios-fde-proto = { path = "cambios-fde-proto" }
 bitflags = "2.3"
 limine = "0.5"

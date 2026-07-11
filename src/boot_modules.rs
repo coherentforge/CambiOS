@@ -9,11 +9,13 @@
 //! kernel's lifetime.
 
 /// SCAFFOLDING: maximum number of boot modules the registry can track.
-/// Mirrors `MAX_BOOT_MODULES` in [src/boot/mod.rs] — same accounting,
-/// the registry is the spawnable view of what the boot adapter populated.
-/// Replace when: bumping this requires bumping `MAX_BOOT_MODULES` in
-/// lockstep (and vice versa); the two constants must stay equal.
-pub(crate) const MAX_MODULES: usize = 32;
+/// Mirrors `MAX_BOOT_MODULES` in [src/boot/mod.rs] and
+/// `MAX_MANIFEST_ENTRIES` in cambios-manifest — same accounting: the
+/// registry is the spawnable view, BootInfo the boot-protocol view,
+/// the manifest the described view. 128 = v1-endgame estimate (~30)
+/// at ≤25% utilization; registry cost 128 × ~88 B ≈ 11 KiB.
+/// Replace when: `MAX_MANIFEST_ENTRIES` moves (keep the trio equal).
+pub(crate) const MAX_MODULES: usize = 128;
 
 /// Maximum length of a module name (bytes).
 const MAX_NAME_LEN: usize = 64;

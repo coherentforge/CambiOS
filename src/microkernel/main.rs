@@ -939,8 +939,12 @@ fn scheduler_init_riscv64() {
 
     // Load signed boot modules from the initrd (BootInfo.modules).
     // `load_boot_modules` is arch-independent: same SignedBinaryVerifier,
-    // same capability / BOOT_MODULE_ORDER wiring as x86_64 / aarch64.
-    load_boot_modules(&mut scheduler);
+    // same capability / BOOT_MODULE_ORDER wiring as x86_64 / aarch64 —
+    // including the ADR-018 manifest transcription and its fatal
+    // invalid-manifest path.
+    if let Err(e) = load_boot_modules(&mut scheduler) {
+        cambios_core::boot::error::boot_failed(e);
+    }
 
     // Register every freshly-loaded task in the global task→CPU map
     // (everything on hart 0 for now; later passes migrate).
@@ -1494,8 +1498,12 @@ fn scheduler_init() {
     // Idle task (Task 0) uses the Limine boot stack (256KB). Its saved_rsp
     // starts at 0 and will be filled on the first timer interrupt.
 
-    // Load ELF binaries from Limine boot modules (filesystem-free loading)
-    load_boot_modules(&mut scheduler);
+    // Load ELF binaries from Limine boot modules (filesystem-free loading).
+    // A present-but-invalid boot manifest is the only fatal outcome
+    // (ADR-018); per-module ELF failures stay print-and-continue.
+    if let Err(e) = load_boot_modules(&mut scheduler) {
+        cambios_core::boot::error::boot_failed(e);
+    }
 
     // Register all initial tasks in the global task→CPU map (all on CPU 0)
     for slot in 0..cambios_core::MAX_TASKS as u32 {
@@ -1583,14 +1591,14 @@ fn register_process_capabilities(process_id: ProcessId) {
 ///
 /// Process IDs are assigned starting at 5 (0-4 are used by kernel tasks
 /// and the existing hand-built user tasks).
-fn load_boot_modules(scheduler: &mut Scheduler) {
+fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot::error::BootError> {
     use cambios_core::loader::{self, SignedBinaryVerifier};
     use cambios_core::FRAME_ALLOCATOR;
 
     let info = cambios_core::boot::info();
     if info.module_count() == 0 {
         println!("  No boot modules found");
-        return;
+        return Ok(());
     }
 
     println!("Loading {} boot module(s)...", info.module_count());
@@ -1620,6 +1628,26 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         // for the duration of ELF loading.
         let binary = unsafe { core::slice::from_raw_parts(addr, size as usize) };
 
+        // ADR-018: the boot-manifest module is data, not an ELF. Verify
+        // its ARCSIG trailer against the same bootstrap key and
+        // transcribe its security sections into the write-once
+        // enforcement tables (endpoint reservations + spawn grants).
+        // A present-but-invalid manifest aborts boot via the typed
+        // error path — booting permissively on corrupt security
+        // configuration would be the vulnerability. Absent module ⇒
+        // this arm never runs ⇒ tables stay empty ⇒ behavior today.
+        if short_name == cambios_manifest::MANIFEST_MODULE_NAME.as_bytes() {
+            let (spawn_rows, reservations) = cambios_core::manifest::transcribe_manifest_module(
+                binary,
+                bootstrap.current_key_bytes(),
+            )?;
+            println!(
+                "    ✓ Boot manifest transcribed: {} spawn row(s), {} reserved endpoint(s)",
+                spawn_rows, reservations
+            );
+            continue;
+        }
+
         // Check for ELF magic before attempting to load
         if binary.len() < 4 || &binary[0..4] != b"\x7fELF" {
             println!("    ✗ Skipped (not an ELF binary)");
@@ -1640,7 +1668,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
         const SPAWN_ONLY_MODULES: &[&[u8]] =
             &[b"tree", b"worm", b"ping", b"sprouty"];
 
-        if SPAWN_ONLY_MODULES.iter().any(|name| *name == short_name) {
+        if SPAWN_ONLY_MODULES.contains(&short_name) {
             BOOT_MODULE_REGISTRY
                 .lock()
                 .register(short_name, addr, size as usize);
@@ -1829,6 +1857,7 @@ fn load_boot_modules(scheduler: &mut Scheduler) {
 
     // NEXT_PROCESS_ID removed — process table allocates slots
     // internally via linear scan with generation stamping.
+    Ok(())
 }
 
 /// Initialize IPC subsystem

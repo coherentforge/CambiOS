@@ -54,6 +54,7 @@ dependencies = [
  "blake3",
  "cambios-abi",
  "cambios-fde-proto",
+ "cambios-manifest",
  "ed25519-compact",
  "limine",
  "uart_16550",
@@ -66,6 +67,10 @@ version = "0.1.0"
 
 [[package]]
 name = "cambios-fde-proto"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-manifest"
 version = "0.1.0"
 
 [[package]]

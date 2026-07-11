@@ -72,13 +72,16 @@ pub const MAX_FRAMEBUFFERS: usize = 8;
 
 /// SCAFFOLDING: max boot modules tracked in BootInfo. Mirrors
 /// `MAX_MODULES` in [src/boot_modules.rs] (the runtime registry that
-/// the spawn syscall queries).
+/// the spawn syscall queries) and `MAX_MANIFEST_ENTRIES` in
+/// cambios-manifest (a manifest can never describe more modules than
+/// the boot protocol delivers) — the three move in lockstep.
 /// Why: same accounting; BootInfo holds the boot-protocol view, the
-///      registry holds the spawnable view.
-/// Replace when: v1 module count crosses 24 (75% utilization), e.g.,
-///      a USB HID stack for bare-metal keyboards/mice lands alongside
-///      the current CCID stream.
-pub const MAX_BOOT_MODULES: usize = 32;
+///      registry holds the spawnable view, the manifest the described
+///      view. 128 = v1-endgame service estimate (~30) at ≤25%
+///      utilization per ASSUMPTIONS.md. Memory cost: 128 × ~88 B ≈
+///      11 KiB in .bss.
+/// Replace when: `MAX_MANIFEST_ENTRIES` moves (keep the trio equal).
+pub const MAX_BOOT_MODULES: usize = 128;
 
 /// SCAFFOLDING: max virtio-mmio device regions discovered from the boot
 /// protocol. RISC-V QEMU virt populates from DTB `/soc/virtio_mmio@*`

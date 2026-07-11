@@ -149,6 +149,14 @@ impl EndpointReservations {
     pub fn count_reserved(&self) -> usize {
         self.inner.lock().count_reserved()
     }
+
+    /// Scoped access to the inner table for the boot-time manifest
+    /// transcription (`crate::manifest`), which populates via the
+    /// pure, host-tested table helpers. Single-threaded boot only;
+    /// the closure must not acquire any other lock.
+    pub(crate) fn with_table<R>(&self, f: impl FnOnce(&mut EndpointReservationTable) -> R) -> R {
+        f(&mut self.inner.lock())
+    }
 }
 
 /// The kernel-wide endpoint reservation table. Empty (all
