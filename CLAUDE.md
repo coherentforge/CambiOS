@@ -351,6 +351,7 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 - `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR. Cache lock released before acquiring global allocator on refill/drain.
 - `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint. Released before acquiring scheduler for task wake.
 - `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter. Not part of the lock hierarchy.
+- `ENDPOINT_RESERVATIONS`, `SPAWN_GRANTS`, `INIT_PROCESS` (ADR-018) — BOOTSTRAP_PRINCIPAL lifecycle: written once during single-threaded boot (manifest transcription; init creation for `INIT_PROCESS`), read-only thereafter. Not in the hierarchy; every accessor is a self-contained lock-copy-unlock, never called with another lock held.
 - `AUDIT_RING` — acquired by `drain_tick()` (try_lock from BSP ISR, holds no other lock) and by `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO` handlers (two-phase protocol: never held while PROCESS_TABLE or FRAME_ALLOCATOR is held). `audit::emit()` never touches it.
 - `PER_CPU_AUDIT_BUFFER[cpu]` — lock-free SPSC; no lock at all. Written by local CPU, drained by BSP.
 - `TASK_SLOT_BITMAP` — lock-free global task-slot allocator (`claim_task_slot`/`release_task_slot`, ADR-034 Residual Risk closure); CAS only, no lock. `claim` may be called while SCHEDULER is held (it acquires no lock); `release` runs in the reaper with SCHEDULER dropped. Arbitrates the global slot namespace so concurrent cross-CPU spawns can't collide.

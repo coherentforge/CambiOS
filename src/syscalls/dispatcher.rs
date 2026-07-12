@@ -2456,6 +2456,21 @@ impl SyscallDispatcher {
             .find_by_name(name)
             .ok_or(SyscallError::InvalidArg)?;
 
+        // ADR-018 step 5: when the caller is init and the boot manifest
+        // declared this module, the spawn binds the entry's derived AID
+        // and installs exactly the entry's transcribed grants — no
+        // blanket endpoint loop, no inherited system caps. Dormant
+        // until migration step 7 creates init and records its identity:
+        // with INIT_PROCESS never set, is_init_process is false for
+        // every caller and every spawn takes the legacy arm below. Both
+        // lookups touch only outside-the-hierarchy locks and run before
+        // any hierarchy lock is held.
+        let manifest_row = if crate::manifest::is_init_process(ctx.process_id) {
+            crate::manifest::SPAWN_GRANTS.lookup(name)
+        } else {
+            None
+        };
+
         // SAFETY: module_addr points to Limine EXECUTABLE_AND_MODULES memory,
         // which is valid for the kernel's lifetime via HHDM.
         let binary = unsafe { core::slice::from_raw_parts(module_addr, module_size) };
@@ -2519,52 +2534,74 @@ impl SyscallDispatcher {
             let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
             if let Some(cap_mgr) = cap_guard.as_mut() {
                 let _ = cap_mgr.register_process(process_id);
-                // Grant send/receive on all endpoints (spawned processes are trusted boot modules)
-                for ep in 0..crate::ipc::MAX_ENDPOINTS as u32 {
-                    let _ = cap_mgr.grant_capability(
-                        process_id,
-                        crate::ipc::EndpointId(ep),
-                        crate::ipc::CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
-                    );
-                }
-                // ADR-008: spawned processes inherit CreateProcess
-                // (trusted boot modules only for now).
-                let _ = cap_mgr.grant_system_capability(
-                    process_id,
-                    CapabilityKind::CreateProcess,
-                );
-                // ADR-005: spawned processes may create channels.
-                let _ = cap_mgr.grant_system_capability(
-                    process_id,
-                    CapabilityKind::CreateChannel,
-                );
-                // ADR-027: spawned processes may register service clusters
-                // (same trust posture as CreateChannel — clusters are
-                // bookkeeping over channels per ADR-027 § Decision 1).
-                let _ = cap_mgr.grant_system_capability(
-                    process_id,
-                    CapabilityKind::CreateCluster,
-                );
-                // T-7 Phase A (docs/threat-model.md): only the compositor
-                // gets EmitInputAudit. The cap was over-granted to every
-                // spawned module in the original landing (mirroring
-                // CreateProcess / CreateChannel) — security-review
-                // 2026-04-25 caught the forgery surface that creates: any
-                // shell-spawned app (games, terminal-window) holding the
-                // cap could call SYS_AUDIT_EMIT_INPUT_FOCUS with an
-                // arbitrary owner_principal, fabricating focus-transition
-                // audit entries that look like legitimate compositor
-                // emissions. Narrowing to name == "compositor" closes the
-                // forgery vector now without waiting for Frame-B.
-                if name == b"compositor" {
+                if let Some(row) = &manifest_row {
+                    // Manifest arm (ADR-018 step 5): exactly the entry's
+                    // grants + the entry's AID. Failure here means a
+                    // kernel invariant broke (the row was validated at
+                    // boot; the process is fresh) — report it loudly;
+                    // the under-granted process is fail-safe (it can
+                    // compute and exit, nothing else) and teardown
+                    // policy is init's, via the restart machinery.
+                    // Revisit when: ADR-019 restart policy lands
+                    // (migration step 10).
+                    if let Err(e) =
+                        crate::manifest::install_manifest_row(cap_mgr, process_id, row)
+                    {
+                        crate::println!(
+                            "  [Spawn] manifest grant install FAILED for '{}': {}",
+                            core::str::from_utf8(name).unwrap_or("?"), e
+                        );
+                    }
+                } else {
+                    // Legacy arm: blanket grants for old-chain boot modules.
+                    // Deleted at migration step 9 with BOOT_MODULE_ORDER.
+                    // Grant send/receive on all endpoints (spawned processes are trusted boot modules)
+                    for ep in 0..crate::ipc::MAX_ENDPOINTS as u32 {
+                        let _ = cap_mgr.grant_capability(
+                            process_id,
+                            crate::ipc::EndpointId(ep),
+                            crate::ipc::CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
+                        );
+                    }
+                    // ADR-008: spawned processes inherit CreateProcess
+                    // (trusted boot modules only for now).
                     let _ = cap_mgr.grant_system_capability(
                         process_id,
-                        CapabilityKind::EmitInputAudit,
+                        CapabilityKind::CreateProcess,
                     );
-                }
-                // Bind bootstrap Principal
-                if !bootstrap.is_zero() {
-                    let _ = cap_mgr.bind_principal(process_id, bootstrap);
+                    // ADR-005: spawned processes may create channels.
+                    let _ = cap_mgr.grant_system_capability(
+                        process_id,
+                        CapabilityKind::CreateChannel,
+                    );
+                    // ADR-027: spawned processes may register service clusters
+                    // (same trust posture as CreateChannel — clusters are
+                    // bookkeeping over channels per ADR-027 § Decision 1).
+                    let _ = cap_mgr.grant_system_capability(
+                        process_id,
+                        CapabilityKind::CreateCluster,
+                    );
+                    // T-7 Phase A (docs/threat-model.md): only the compositor
+                    // gets EmitInputAudit. The cap was over-granted to every
+                    // spawned module in the original landing (mirroring
+                    // CreateProcess / CreateChannel) — security-review
+                    // 2026-04-25 caught the forgery surface that creates: any
+                    // shell-spawned app (games, terminal-window) holding the
+                    // cap could call SYS_AUDIT_EMIT_INPUT_FOCUS with an
+                    // arbitrary owner_principal, fabricating focus-transition
+                    // audit entries that look like legitimate compositor
+                    // emissions. Narrowing to name == "compositor" closes the
+                    // forgery vector now without waiting for Frame-B.
+                    if name == b"compositor" {
+                        let _ = cap_mgr.grant_system_capability(
+                            process_id,
+                            CapabilityKind::EmitInputAudit,
+                        );
+                    }
+                    // Bind bootstrap Principal
+                    if !bootstrap.is_zero() {
+                        let _ = cap_mgr.bind_principal(process_id, bootstrap);
+                    }
                 }
             }
         }

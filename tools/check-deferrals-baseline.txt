@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:369:eventually
-CLAUDE.md:384:deferred
+CLAUDE.md:370:eventually
+CLAUDE.md:385:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -111,7 +111,7 @@ src/reaper.rs:43:deferred
 src/reaper.rs:65:deferred
 src/scheduler/mod.rs:282:placeholder
 src/scheduler/mod.rs:283:placeholder
-src/syscalls/dispatcher.rs:4500:for-now
+src/syscalls/dispatcher.rs:4537:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now
