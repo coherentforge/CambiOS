@@ -60,6 +60,15 @@ pub const MANIFEST_USER_VADDR: u64 = 0x0100_0000;
 /// it is the kernel's `REPLY_ENDPOINT` "unset" sentinel.
 pub const INIT_ENDPOINT: u32 = 1;
 
+/// First payload byte of the readiness ping a spawned service sends
+/// to init's endpoint once its endpoints are registered (ADR-018 § 4
+/// — emitted where `SYS_MODULE_READY` is emitted today, swapped at
+/// migration step 8). *Which service* is ready comes from the
+/// kernel-stamped `sender_principal`, never from the payload; the tag
+/// only distinguishes ready pings from future message kinds on the
+/// same endpoint.
+pub const READY_PING_TAG: u8 = 0x01;
+
 /// Domain-separation tag for v1 service-AID derivation:
 /// `aid = blake3(SERVICE_AID_DOMAIN_TAG || module_name)`.
 /// Derivation itself lives in tools/build-manifest (this crate is
@@ -77,9 +86,9 @@ pub const INIT_AID_DOMAIN_TAG: &str = "cambios:v1:init-aid";
 ///      plus input-hub, net diversification, AI watcher, win-compat
 ///      services) at ≤25% utilization per ASSUMPTIONS.md.
 /// Replace when: MAX_BOOT_MODULES (src/boot/mod.rs + src/boot_modules.rs,
-///      currently 32) is bumped to match — the two must move in lockstep;
+///      128 since migration step 4) moves — the two stay in lockstep;
 ///      a manifest can never describe more modules than the registry
-///      can load. The kernel-side bump lands with migration step 3-4.
+///      can load.
 pub const MAX_MANIFEST_ENTRIES: usize = 128;
 
 /// SCAFFOLDING: maximum reserved endpoints per manifest entry.
@@ -156,6 +165,20 @@ const OFF_INIT_AID: usize = 32;
 /// | 380    | 128  | depends_on `[StringRef 8B; 16]`            |
 /// | 508    | 20   | reserved (must be 0 in v1)                 |
 pub const ENTRY_LEN: usize = 528;
+
+/// ARCHITECTURAL: upper bound on a well-formed manifest payload,
+/// fully derived from the wire bounds above — header, a full entry
+/// region, and a strings region where every entry carries a
+/// maximum-length name plus `DEPS_MAX` maximum-length dependency
+/// references with zero interning. Both sides of the boot contract
+/// consume it: the kernel bounds its read-only mapping of the blob
+/// into init (ADR-018 § 6, migration step 7), and init clamps the
+/// header-declared extent before forming its parse slice — a slice
+/// must never extend past the mapped region, however trustworthy the
+/// header. Changes only when the constituent bounds do.
+pub const MANIFEST_MAX_BYTES: usize = HEADER_LEN
+    + MAX_MANIFEST_ENTRIES * ENTRY_LEN
+    + MAX_MANIFEST_ENTRIES * MODULE_NAME_MAX * (1 + DEPS_MAX);
 
 const E_OFF_PRINCIPAL: usize = 0;
 const E_OFF_NAME_REF: usize = 32;
@@ -801,6 +824,51 @@ pub fn validate_unique(m: &Manifest<'_>) -> Result<(), ValidateError> {
     Ok(())
 }
 
+/// Payload extent declared by a manifest header: the end of the
+/// strings region, which parse guarantees is the last region. For
+/// consumers that receive the blob through a page-granular mapping
+/// (init at `MANIFEST_USER_VADDR`) and must size their parse slice
+/// before [`Manifest::parse`] can run — a Rust slice must never
+/// extend past the mapped object, however little of it the parser
+/// reads, so "parse with a max-size window" is not an option.
+///
+/// `header` needs only the first [`HEADER_LEN`] bytes (always mapped:
+/// any blob shorter than its own header was rejected by the kernel's
+/// boot-time verification). Validates magic, version, and the header
+/// fields' internal consistency (mirroring `parse`'s region-ordering
+/// checks, minus the blob-length checks that need the full slice) and
+/// caps the result at [`MANIFEST_MAX_BYTES`] — a header declaring
+/// more than the wire format allows is malformed, and the cap is what
+/// lets the caller trust the extent enough to build a slice from it.
+/// `None` on any inconsistency.
+pub fn payload_extent(header: &[u8]) -> Option<usize> {
+    if header.len() < HEADER_LEN {
+        return None;
+    }
+    if header[0..8] != MAGIC {
+        return None;
+    }
+    if read_u32(header, OFF_VERSION) != VERSION {
+        return None;
+    }
+    let entry_count = read_u32(header, OFF_ENTRY_COUNT);
+    if entry_count as usize > MAX_MANIFEST_ENTRIES {
+        return None;
+    }
+    let entries_offset = read_u32(header, OFF_ENTRIES_OFFSET);
+    let strings_offset = read_u32(header, OFF_STRINGS_OFFSET);
+    let strings_len = read_u32(header, OFF_STRINGS_LEN);
+    let entries_end = entries_offset as u64 + (entry_count as u64) * (ENTRY_LEN as u64);
+    if (entries_offset as usize) < HEADER_LEN || (strings_offset as u64) < entries_end {
+        return None;
+    }
+    let extent = strings_offset as u64 + strings_len as u64;
+    if extent > MANIFEST_MAX_BYTES as u64 {
+        return None;
+    }
+    Some(extent as usize)
+}
+
 /// Topologically sort the entries by `depends_on` (dependencies first).
 /// Writes entry indices into `out` (which must hold at least
 /// `m.entry_count()` slots) and returns the count. Iterative DFS with
@@ -1191,6 +1259,81 @@ mod tests {
         let m = Manifest::parse(&blob).unwrap();
         assert_eq!(m.entry_count(), 3);
         assert_eq!(m.entry(1).unwrap().module_name(), "fs-service");
+    }
+
+    #[test]
+    fn payload_extent_matches_emitted_size_from_header_alone() {
+        let blob = build_sample();
+        // Full blob and header-only slice agree — init reads only the
+        // first HEADER_LEN mapped bytes before sizing its parse slice.
+        assert_eq!(payload_extent(&blob), Some(blob.len()));
+        assert_eq!(payload_extent(&blob[..HEADER_LEN]), Some(blob.len()));
+        // The extent-sized slice parses.
+        let extent = payload_extent(&blob[..HEADER_LEN]).unwrap();
+        assert!(Manifest::parse(&blob[..extent]).is_ok());
+
+        // Empty manifest: extent is exactly the header.
+        let mut buf = vec![0u8; emitted_size(&[]).unwrap()];
+        let n = emit_manifest(aid(9), 1, &[], &mut buf).unwrap();
+        assert_eq!(payload_extent(&buf), Some(n));
+    }
+
+    #[test]
+    fn payload_extent_rejects_malformed_headers() {
+        let blob = build_sample();
+        assert_eq!(payload_extent(&blob[..HEADER_LEN - 1]), None); // short
+        let mut b = blob.clone();
+        b[0] = b'X';
+        assert_eq!(payload_extent(&b), None); // magic
+        let mut b = blob.clone();
+        b[OFF_VERSION] = 0xFF;
+        assert_eq!(payload_extent(&b), None); // version
+        let mut b = blob.clone();
+        b[OFF_ENTRY_COUNT..OFF_ENTRY_COUNT + 4]
+            .copy_from_slice(&(MAX_MANIFEST_ENTRIES as u32 + 1).to_le_bytes());
+        assert_eq!(payload_extent(&b), None); // entry_count over max
+        let mut b = blob.clone();
+        b[OFF_STRINGS_OFFSET..OFF_STRINGS_OFFSET + 4].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(payload_extent(&b), None); // strings before entries end
+        let mut b = blob.clone();
+        b[OFF_STRINGS_LEN..OFF_STRINGS_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(payload_extent(&b), None); // extent past MANIFEST_MAX_BYTES
+    }
+
+    #[test]
+    fn manifest_max_bytes_bounds_a_maximal_manifest() {
+        // 128 entries, every name at MODULE_NAME_MAX, every entry
+        // carrying DEPS_MAX dependency references — the worst case the
+        // wire bounds permit must fit under MANIFEST_MAX_BYTES.
+        let names: Vec<String> = (0..MAX_MANIFEST_ENTRIES)
+            .map(|i| format!("{:0>width$}", i, width = MODULE_NAME_MAX))
+            .collect();
+        let mut defs: Vec<EntryDef> = Vec::new();
+        let mut dep_lists: Vec<Vec<&str>> = Vec::new();
+        for i in 0..MAX_MANIFEST_ENTRIES {
+            let start = i.saturating_sub(DEPS_MAX);
+            dep_lists.push(names[start..i].iter().map(|s| s.as_str()).collect());
+        }
+        for i in 0..MAX_MANIFEST_ENTRIES {
+            defs.push(EntryDef {
+                module_name: &names[i],
+                principal: aid((i + 1) as u8),
+                reserved_endpoints: &[],
+                grants: &[],
+                lifetime: ServiceLifetime::OneShot,
+                depends_on: &dep_lists[i],
+            });
+        }
+        let size = emitted_size(&defs).unwrap();
+        assert!(
+            size <= MANIFEST_MAX_BYTES,
+            "maximal manifest {} exceeds MANIFEST_MAX_BYTES {}",
+            size,
+            MANIFEST_MAX_BYTES
+        );
+        let mut buf = vec![0u8; size];
+        let n = emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        assert_eq!(payload_extent(&buf[..HEADER_LEN]), Some(n));
     }
 
     #[test]

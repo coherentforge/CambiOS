@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-init"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+cambios-manifest = { path = "../../cambios-manifest" }
+
+# Syscall layer — bare-metal only. The host build (engine unit tests;
+# the bin collapses to a stub) must not pull syscall asm the host
+# can't assemble (aarch64-apple-darwin reserves x18).
+[target.'cfg(target_os = "none")'.dependencies]
+cambios-libsys = { path = "../libsys" }
+
+[profile.release]
+opt-level = "s"        # Size-optimized (small ELF)
+lto = true
+codegen-units = 1
+strip = false          # Keep symbols for kernel loader debug
+panic = "abort"

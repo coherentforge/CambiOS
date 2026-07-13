@@ -55,6 +55,8 @@ SHELL_DIR := user/shell
 SHELL_ELF := $(SHELL_DIR)/target/x86_64-unknown-none/release/cambios-shell
 POLICY_SERVICE_DIR := user/policy-service
 POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-policy-service
+INIT_DIR := user/init
+INIT_ELF := $(INIT_DIR)/target/x86_64-unknown-none/release/cambios-init
 FB_DEMO_DIR := user/fb-demo
 FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/cambios-fb-demo
 COMPOSITOR_DIR := user/compositor
@@ -204,7 +206,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -304,6 +306,15 @@ policy-service:
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Policy service ready ==="
+
+# ADR-018 init (PID 1). Built like any service; enters the ISO/boot
+# chain at migration step 7.
+init:
+	@echo "=== Building init ==="
+	cd $(INIT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+	@echo "=== init ready ==="
 
 fb-demo:
 	@echo "=== Building fb-demo (Phase GUI-1) ==="
@@ -473,6 +484,13 @@ policy-service-aarch64:
 		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
 	@echo "=== Policy service (AArch64) ready ==="
 
+init-aarch64:
+	@echo "=== Building init (AArch64) ==="
+	cd $(INIT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
+	@echo "=== init (AArch64) ready ==="
+
 fb-demo-aarch64:
 	@echo "=== Building fb-demo (AArch64) ==="
 	cd $(FB_DEMO_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
@@ -629,6 +647,13 @@ policy-service-riscv64:
 		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
 	@echo "=== Policy service (RISC-V) ready ==="
+
+init-riscv64:
+	@echo "=== Building init (RISC-V) ==="
+	cd $(INIT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
+	@echo "=== init (RISC-V) ready ==="
 
 audit-tail-riscv64:
 	@echo "=== Building audit-tail (RISC-V) ==="
