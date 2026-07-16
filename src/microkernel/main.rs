@@ -1609,6 +1609,17 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
     let verifier = SignedBinaryVerifier::with_key(*bootstrap.current_key_bytes());
     let mut loaded_count = 0u32;
 
+    // ADR-018 step 7: the manifest arm below stashes the transcribed
+    // blob's module bytes (init needs them mapped at
+    // MANIFEST_USER_VADDR — a DIFFERENT buffer from init's own ELF);
+    // the init arm stashes init's ELF bytes. After the loop the pair
+    // decides whether the kernel creates init as PID 1 — manifest
+    // without init module is a broken boot image (typed boot error),
+    // init module without manifest is registered-but-never-created
+    // (harmless; legacy boot proceeds).
+    let mut manifest_module: Option<(*const u8, usize)> = None;
+    let mut init_module: Option<(*const u8, usize)> = None;
+
     for (i, module) in info.modules().enumerate() {
         let size = module.size;
         let addr = module.phys_addr as *const u8;
@@ -1645,6 +1656,19 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
                 "    ✓ Boot manifest transcribed: {} spawn row(s), {} reserved endpoint(s)",
                 spawn_rows, reservations
             );
+            manifest_module = Some((addr, size as usize));
+            continue;
+        }
+
+        // ADR-018 step 7: init never rides the legacy auto-start chain
+        // — register spawn-only here, create it as PID 1 after the
+        // loop (only if a manifest was transcribed).
+        if short_name == cambios_manifest::INIT_MODULE_NAME.as_bytes() {
+            BOOT_MODULE_REGISTRY
+                .lock()
+                .register(short_name, addr, size as usize);
+            init_module = Some((addr, size as usize));
+            println!("    ✓ Registered init (created after manifest transcription)");
             continue;
         }
 
@@ -1855,8 +1879,215 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
         }
     }
 
+    // ADR-018 step 7: create init as PID 1 iff a manifest described
+    // this boot. Runs while the caller still exclusively borrows the
+    // BSP scheduler, so init cannot be scheduled before its blob
+    // mapping, grants, and identity are installed — the same ordering
+    // guarantee the module loop above relies on for its own
+    // post-load capability grants.
+    match (manifest_module, init_module) {
+        (Some(manifest), Some(init)) => {
+            create_init_process(init, manifest, &verifier, scheduler)?;
+        }
+        (Some(_), None) => {
+            println!("✗ Boot manifest transcribed but no '{}' boot module",
+                cambios_manifest::INIT_MODULE_NAME);
+            return Err(cambios_core::boot::error::BootError::InitModuleMissing);
+        }
+        (None, Some(_)) => {
+            // Registered spawn-only above; without a manifest there is
+            // no identity to bind or table to execute — legacy boot.
+            println!("  init module present but no manifest — init not created");
+        }
+        (None, None) => {}
+    }
+
     // NEXT_PROCESS_ID removed — process table allocates slots
     // internally via linear scan with generation stamping.
+    Ok(())
+}
+
+/// Create init as PID 1 (ADR-018 § 6 step 4): verify + load its
+/// signed ELF, map the manifest blob read-only into its address space
+/// at `MANIFEST_USER_VADDR`, install its narrow capability set
+/// (receive on its manifest-declared endpoint + `CreateProcess` —
+/// nothing else), bind its manifest-declared AID, and record its
+/// identity for `handle_spawn`'s manifest branch.
+///
+/// Called from `load_boot_modules` while the BSP scheduler is still
+/// exclusively borrowed — init becomes schedulable here but cannot
+/// run until boot releases the scheduler, so every step below lands
+/// before init's first instruction.
+///
+/// `init_elf` is init's own signed ELF (loaded as the process image);
+/// `manifest_blob` is the transcribed manifest module (mapped into
+/// init at `MANIFEST_USER_VADDR`). Two different module buffers —
+/// conflating them is exactly the first-boot bug this signature
+/// prevents recurring.
+fn create_init_process(
+    init_elf: (*const u8, usize),
+    manifest_blob: (*const u8, usize),
+    verifier: &cambios_core::loader::SignedBinaryVerifier,
+    scheduler: &mut Scheduler,
+) -> Result<(), cambios_core::boot::error::BootError> {
+    let (init_addr, init_size) = init_elf;
+    let (blob_addr, blob_size) = manifest_blob;
+    use cambios_core::boot::error::BootError;
+    use cambios_core::ipc::capability::CapabilityKind;
+    use cambios_core::ipc::{CapabilityRights, EndpointId, Principal};
+    use cambios_core::{loader, FRAME_ALLOCATOR};
+
+    // Transcription captured the header's AID + endpoint; absent here
+    // means the caller's manifest_transcribed bookkeeping broke.
+    let identity = match cambios_core::manifest::init_identity() {
+        Some(id) => id,
+        None => {
+            println!("✗ init identity not captured at transcription");
+            return Err(BootError::InitCreationFailed);
+        }
+    };
+
+    // The signed blob (payload + ARCSIG trailer) must fit the mapping
+    // budget both sides of the boot contract agree on. The trailer
+    // rides along — init's parser sizes itself from the header and
+    // ignores trailing bytes.
+    //
+    // ARCHITECTURAL: one page of slack over `MANIFEST_MAX_BYTES`
+    // covers the ARCSIG trailer (72 B today) without coupling this
+    // bound to the trailer's exact layout. Derived, not tuned.
+    const MANIFEST_MAPPING_BUDGET: usize = cambios_manifest::MANIFEST_MAX_BYTES + 4096;
+    if blob_size == 0 || blob_size > MANIFEST_MAPPING_BUDGET {
+        println!("✗ manifest module size {} outside mapping budget", blob_size);
+        return Err(BootError::InitCreationFailed);
+    }
+
+    // SAFETY: init_addr/init_size come from the boot-module loop,
+    // which received them from the boot protocol; the module memory is
+    // EXECUTABLE_AND_MODULES, valid for the kernel's lifetime via the
+    // HHDM, and read-only for the duration of ELF loading.
+    let binary = unsafe { core::slice::from_raw_parts(init_addr, init_size) };
+
+    // Load + schedule init. Same lock discipline as the module loop:
+    // PROCESS_TABLE(7) → FRAME_ALLOCATOR(8) while the caller holds the
+    // scheduler exclusively.
+    let result = {
+        let mut pt_guard = PROCESS_TABLE.lock();
+        let mut fa_guard = FRAME_ALLOCATOR.lock();
+        let pt = match pt_guard.as_mut() {
+            Some(pt) => pt,
+            None => {
+                println!("✗ ProcessTable not initialized for init creation");
+                return Err(BootError::InitCreationFailed);
+            }
+        };
+        match loader::load_elf_process(
+            binary,
+            Priority::NORMAL,
+            verifier,
+            pt,
+            &mut fa_guard,
+            scheduler,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("✗ init ELF load failed: {}", e);
+                return Err(BootError::InitCreationFailed);
+            }
+        }
+    };
+
+    // Map the manifest blob read-only at the fixed contract address.
+    // The pages are boot-module physical memory (outside the frame
+    // allocator's usable range) shared with the registry entry — the
+    // mapping is deliberately NOT VMA-tracked: `destroy_process`
+    // reclaims VMA-tracked regions, and these pages are not init's to
+    // free. The fixed address sits below `VMA_ALLOC_BASE`, so dynamic
+    // regions can never collide with it (same convention as the ELF
+    // segments at 0x400000 and the stack at 0x800000).
+    {
+        let mut fa_guard = FRAME_ALLOCATOR.lock();
+        // Limine module addresses are HHDM virtual pointers (that is
+        // what lets the module loop read them directly); the page
+        // tables need the physical address back out.
+        let blob_phys_base = (blob_addr as u64) - cambios_core::hhdm_offset();
+        let num_pages = blob_size.div_ceil(4096);
+        for i in 0..num_pages as u64 {
+            // SAFETY: result.cr3 is the fresh page-table root
+            // load_elf_process just created, and no other reference to
+            // it exists (init cannot run while the boot path holds the
+            // scheduler). blob_phys_base derives from a boot-protocol
+            // module address, page-aligned by the bootloader; the
+            // frames are module memory, never handed to the frame
+            // allocator, so mapping them read-only aliases nothing.
+            let mut pt = unsafe { cambios_core::memory::paging::page_table_from_cr3(result.cr3) };
+            if let Err(e) = cambios_core::memory::paging::map_page(
+                &mut pt,
+                cambios_manifest::MANIFEST_USER_VADDR + i * 4096,
+                blob_phys_base + i * 4096,
+                cambios_core::memory::paging::flags::user_ro(),
+                &mut fa_guard,
+            ) {
+                println!("✗ manifest blob mapping failed at page {}: {:?}", i, e);
+                return Err(BootError::InitCreationFailed);
+            }
+        }
+    }
+
+    // Narrow capability set (ADR-018 § 4): receive on init's endpoint
+    // + CreateProcess. No blanket endpoint loop, no channel/cluster
+    // caps, no grant authority of any kind — grants flow from the
+    // kernel's transcribed table at spawn time, so init cannot widen,
+    // forge, or reassign them.
+    {
+        let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
+        let cap_mgr = match cap_guard.as_mut() {
+            Some(m) => m,
+            None => {
+                println!("✗ CapabilityManager not initialized for init creation");
+                return Err(BootError::InitCreationFailed);
+            }
+        };
+        let ok = cap_mgr.register_process(result.process_id).is_ok()
+            && cap_mgr
+                .grant_capability(
+                    result.process_id,
+                    EndpointId(identity.endpoint),
+                    CapabilityRights { send: false, receive: true, delegate: false, revoke: false },
+                )
+                .is_ok()
+            && cap_mgr
+                .grant_system_capability(result.process_id, CapabilityKind::CreateProcess)
+                .is_ok()
+            && cap_mgr
+                .bind_principal(result.process_id, Principal::from_aid(identity.aid))
+                .is_ok();
+        if !ok {
+            println!("✗ init capability setup failed");
+            return Err(BootError::InitCreationFailed);
+        }
+    }
+
+    // Record init's identity — this is what arms handle_spawn's
+    // manifest branch (dormant since step 5).
+    if cambios_core::manifest::set_init_process(result.process_id).is_err() {
+        println!("✗ init identity already set (double init creation)");
+        return Err(BootError::InitCreationFailed);
+    }
+
+    cambios_core::audit::emit(cambios_core::audit::RawAuditEvent::process_created(
+        result.process_id,
+        result.process_id, // self-parented: init is kernel-created
+        cambios_core::audit::now(),
+        0,
+    ));
+
+    println!(
+        "✓ init created as PID 1: task {} process {} (endpoint {}, manifest at {:#x})",
+        result.task_id.slot(),
+        result.process_id.slot(),
+        identity.endpoint,
+        cambios_manifest::MANIFEST_USER_VADDR,
+    );
     Ok(())
 }
 

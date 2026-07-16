@@ -206,7 +206,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf manifest-step7 fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -750,6 +750,21 @@ manifest: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) manifest.bin
 	@echo "=== manifest.bin ready (signed) ==="
 
+# ADR-018 step-7 coexistence variant: entry endpoint reservations are
+# suppressed so the kernel's reservation table holds only init's
+# endpoint — old-chain services are still bootstrap-bound and must be
+# able to register their own endpoints. This is what the ISO stages
+# during coexistence; the plain `manifest` target above emits the full
+# reservation set that ships at the step-8 cutover (this target
+# retires there).
+manifest-step7: sign-tool
+	@echo "=== Building build-manifest tool ==="
+	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
+	@echo "=== Emitting + signing manifest.bin (step-7: init-only reservations) ==="
+	$(BUILD_MANIFEST) manifest.toml -o manifest.bin --init-only-reservations
+	$(SIGN_ELF) $(SIGN_FLAGS) manifest.bin
+	@echo "=== manifest.bin ready (signed, init-only reservations) ==="
+
 mkinitrd:
 	@echo "=== Building mkinitrd host tool ==="
 	cd $(MKINITRD_DIR) && cargo build --release --target $(HOST_TARGET)
@@ -830,7 +845,7 @@ iso-dev-piv: kernel-dev-piv key-store-service-dev-piv gen-dev-piv-keys format-vo
 	@echo "=== Re-assembling ISO with --features dev-piv binaries ==="
 	$(MAKE) --assume-old=kernel --assume-old=key-store-service SIGN_MODE=dev-piv iso
 
-iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input usb-host ccid shell policy-service fb-demo compositor scanout-virtio-gpu tree worm ping sprouty terminal-window audit-tail fde-mount sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input usb-host ccid shell policy-service init manifest-step7 fb-demo compositor scanout-virtio-gpu tree worm ping sprouty terminal-window audit-tail fde-mount sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -863,6 +878,13 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	cp $(WORM_ELF) iso_root/boot/worm.elf
 	cp $(AUDIT_TAIL_ELF) iso_root/boot/audit-tail.elf
 	cp $(FDE_MOUNT_ELF) iso_root/boot/fde-mount.elf
+	# ADR-018 step 7: init + the signed manifest blob. manifest.bin
+	# arrives already signed by the manifest-step7 prerequisite — do
+	# NOT re-sign it here (sign-elf appends a trailer; a second pass
+	# would stack trailers and break verification).
+	cp $(INIT_ELF) iso_root/boot/init.elf
+	cp manifest.bin iso_root/boot/manifest.bin
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/init.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf

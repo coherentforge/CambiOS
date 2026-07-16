@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:370:eventually
-CLAUDE.md:385:deferred
+CLAUDE.md:373:eventually
+CLAUDE.md:388:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -98,10 +98,10 @@ src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
 src/microkernel/main.rs:950:for-now
 src/microkernel/main.rs:1042:for-now
-src/microkernel/main.rs:1657:deferred
-src/microkernel/main.rs:2076:deferred
-src/microkernel/main.rs:2105:deferred
-src/microkernel/main.rs:2412:for-now
+src/microkernel/main.rs:1681:deferred
+src/microkernel/main.rs:2307:deferred
+src/microkernel/main.rs:2336:deferred
+src/microkernel/main.rs:2643:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:994:deferred
 src/process.rs:995:deferred

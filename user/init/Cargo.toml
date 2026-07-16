@@ -16,6 +16,15 @@ cambios-manifest = { path = "../../cambios-manifest" }
 [target.'cfg(target_os = "none")'.dependencies]
 cambios-libsys = { path = "../libsys" }
 
+[features]
+# ADR-018 step-7 coexistence gate: with the feature OFF (default),
+# init parses + validates the manifest and idles — the legacy
+# BOOT_MODULE_ORDER chain still starts every service, so running the
+# spawn wave would double-spawn them all. The step-8 cutover builds
+# with --features supervise and removes the old chain; the flag
+# retires when the default flips there.
+supervise = []
+
 [profile.release]
 opt-level = "s"        # Size-optimized (small ELF)
 lto = true

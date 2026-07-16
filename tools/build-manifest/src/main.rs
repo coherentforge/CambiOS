@@ -144,10 +144,22 @@ fn init_aid() -> [u8; 32] {
 // ============================================================================
 
 fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {} <registry.toml> [-o <manifest.bin>]", prog);
+    eprintln!(
+        "Usage: {} <registry.toml> [-o <manifest.bin>] [--init-only-reservations]",
+        prog
+    );
     eprintln!();
     eprintln!("Emits an UNSIGNED CBOSMANI manifest blob. Sign it with:");
     eprintln!("  sign-elf [--seed <hex>] <manifest.bin>");
+    eprintln!();
+    eprintln!("--init-only-reservations (ADR-018 migration step 7, coexistence):");
+    eprintln!("  emit every entry with an empty reserved_endpoints set, so the");
+    eprintln!("  kernel's reservation table holds only init's endpoint. Old-chain");
+    eprintln!("  services are still bootstrap-bound — reserving their endpoints");
+    eprintln!("  to per-service AIDs would deny their own registrations. Grants,");
+    eprintln!("  dependencies, and lifetimes emit at full fidelity (the spawn");
+    eprintln!("  table is dormant until init spawns). The flag retires at the");
+    eprintln!("  step-8 cutover, when the full reservation set ships.");
     exit(2);
 }
 
@@ -157,6 +169,7 @@ fn main() {
 
     let mut input: Option<&str> = None;
     let mut output = "manifest.bin".to_string();
+    let mut init_only_reservations = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -167,6 +180,7 @@ fn main() {
                     None => usage(prog),
                 }
             }
+            "--init-only-reservations" => init_only_reservations = true,
             "-h" | "--help" => usage(prog),
             arg if input.is_none() => input = Some(arg),
             _ => usage(prog),
@@ -254,11 +268,16 @@ fn main() {
         defs.push(EntryDef {
             module_name: &svc.name,
             principal: service_aid(&svc.name),
-            reserved_endpoints: &svc.endpoints,
+            // Step-7 coexistence mode: reservations suppressed (see
+            // usage text); everything else emits at full fidelity.
+            reserved_endpoints: if init_only_reservations { &[] } else { &svc.endpoints },
             grants: &grants_store[i],
             lifetime,
             depends_on: &deps_store[i],
         });
+    }
+    if init_only_reservations {
+        eprintln!("init-only-reservations: entry endpoint reservations suppressed (step-7 coexistence)");
     }
 
     // Emit, then self-check through the same parser the kernel + init

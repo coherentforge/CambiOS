@@ -32,11 +32,11 @@ fn main() {
 
 #[cfg(target_os = "none")]
 mod svc {
-    use cambios_init::engine::{Action, EngineError, Event, SupervisorEngine};
+    use cambios_init::engine::SupervisorEngine;
     use cambios_libsys as sys;
     use cambios_manifest::{
         payload_extent, topo_order, Manifest, HEADER_LEN, MANIFEST_USER_VADDR,
-        MAX_MANIFEST_ENTRIES, READY_PING_TAG,
+        MAX_MANIFEST_ENTRIES,
     };
 
     #[panic_handler]
@@ -114,6 +114,10 @@ mod svc {
                 sys::exit(1)
             }
         };
+        // Construction validates the DAG order + dependency edges even
+        // when the wave below is compiled out — step 7 exercises the
+        // full parse/validate machinery with zero behavior change.
+        #[cfg_attr(not(feature = "supervise"), allow(unused_mut, unused_variables))]
         let mut eng = match SupervisorEngine::new(&m, &order[..n]) {
             Ok(e) => e,
             Err(_) => {
@@ -122,17 +126,32 @@ mod svc {
             }
         };
 
-        sys::print(b"[init] manifest parsed; supervising boot wave\n");
-        supervise(&m, &mut eng, init_ep);
+        // ADR-018 step-7 coexistence: the spawn wave is compiled out
+        // (see the `supervise` feature in Cargo.toml) — the legacy
+        // boot chain still starts every service, and running the wave
+        // here would double-spawn them all. Step 8 flips the feature
+        // and removes the chain.
+        #[cfg(not(feature = "supervise"))]
+        {
+            sys::print(b"[init] manifest valid: ");
+            print_num(n as u32);
+            sys::print(b" service(s) described; supervision starts at the step-8 cutover\n");
+        }
 
-        let s = eng.summary();
-        sys::print(b"[init] boot wave settled: ");
-        print_num(s.ready as u32);
-        sys::print(b" ready, ");
-        print_num(s.spawn_failed as u32);
-        sys::print(b" spawn-failed, ");
-        print_num(s.dep_failed as u32);
-        sys::print(b" dep-failed\n");
+        #[cfg(feature = "supervise")]
+        {
+            sys::print(b"[init] manifest parsed; supervising boot wave\n");
+            supervise(&m, &mut eng, init_ep);
+
+            let s = eng.summary();
+            sys::print(b"[init] boot wave settled: ");
+            print_num(s.ready as u32);
+            sys::print(b" ready, ");
+            print_num(s.spawn_failed as u32);
+            sys::print(b" spawn-failed, ");
+            print_num(s.dep_failed as u32);
+            sys::print(b" dep-failed\n");
+        }
 
         // Idle: block on our endpoint and discard. Post-boot traffic
         // has no consumer yet.
@@ -146,7 +165,10 @@ mod svc {
 
     /// Drive the engine over the boot wave: one spawn in flight at a
     /// time, readiness matched by kernel-stamped sender AID.
+    #[cfg(feature = "supervise")]
     fn supervise(m: &Manifest<'_>, eng: &mut SupervisorEngine, init_ep: u32) {
+        use cambios_init::engine::{Action, EngineError, Event};
+        use cambios_manifest::READY_PING_TAG;
         loop {
             match eng.next_action() {
                 Action::Spawn { idx } => {

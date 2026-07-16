@@ -290,6 +290,9 @@ make symbols
 # Standalone builds
 make fs-service                  # user/fs-service — separate crate, uses CARGO_ENCODED_RUSTFLAGS to override parent .cargo/config.toml
 make sign-tool                   # tools/sign-elf — host-side, own .cargo/config.toml targeting aarch64-apple-darwin
+make manifest                    # ADR-018: emit manifest.bin from manifest.toml via tools/build-manifest, sign with sign-elf (full reservation set — ships at the step-8 cutover)
+make manifest-step7              # ADR-018 step-7 coexistence variant (what `make iso` stages): --init-only-reservations suppresses entry endpoint reservations so only init's endpoint 1 is reserved; retires at cutover
+make init                        # user/init — PID 1 supervisor (init-aarch64 / init-riscv64 for other arches); host tests: cd user/init && cargo test --target aarch64-apple-darwin
 make gen-dev-piv-keys            # tools/gen-dev-piv-keys — derives dev Ed25519+X25519 keys from a persistent per-developer seed at tools/gen-dev-piv-keys/.dev-seed.bin (gitignored); writes dev_bootstrap_pubkey.bin (workspace root) + dev_slot_9c_seed.bin (workspace root, for sign-elf via SIGN_MODE=dev-piv) + user/key-store-service/dev_piv_secret.bin. Idempotent; required before any `--features dev-piv` build (kernel + key-store-service must both be built with this feature for SwPivBackend's pubkey to match the kernel-baked bootstrap pubkey).
 make format-volume               # tools/format-volume — host tool that writes a fresh signed ADR-032 volume header to a raw disk image. Run as `tools/format-volume/target/aarch64-apple-darwin/release/format-volume <disk-image>`. Requires gen-dev-piv-keys to have run first. The header pairs with the dev_bootstrap_pubkey.bin baked into the kernel under `--features dev-piv`; fde-mount reads + verifies + unwraps the master key at boot. Stream A A-v.e.
 
@@ -455,7 +458,7 @@ Run `tree -L 2 src/ user/ tools/` for the current layout; file names and purpose
 
 - **`build.rs`** reads `CAMBIOS_TIER` (default `tier3`) and emits `--cfg tierN` for `src/config/tier.rs`. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) / [ADR-009](docs/adr/009-purpose-tiers-scope.md).
 - **Arch split:** portable modules (`scheduler/`, `ipc/`, `process.rs`, `loader/elf.rs`, `memory/buddy_allocator.rs` + `frame_allocator.rs`, `syscalls/mod.rs`) contain no arch-specific code. All arch backends live under `src/arch/<target>/`. `src/arch/mod.rs` is the cfg-gated shim.
-- **Service endpoints (load-bearing numbers):** fs-service=16, key-store-service=17, virtio-net=20, udp-stack=21, virtio-blk=24 (user clients, `recv_verified`) + 26 (kernel-only commands, `recv_msg`, no cap check) + 25 (kernel's reply endpoint, `handle_write` intercept), scanout-virtio-gpu=27, compositor=28, compositor-input=30.
+- **Service endpoints (load-bearing numbers):** init=1 (ADR-018 readiness pings; reserved to init's AID via the boot manifest — the only reservation during step-7 coexistence), fs-service=16, key-store-service=17, virtio-net=20, udp-stack=21, virtio-blk=24 (user clients, `recv_verified`) + 26 (kernel-only commands, `recv_msg`, no cap check) + 25 (kernel's reply endpoint, `handle_write` intercept), scanout-virtio-gpu=27, compositor=28, compositor-input=30. Endpoint 0 is the REPLY_ENDPOINT "unset" sentinel — structurally unusable.
 - **`tools/sign-elf/`** — host-side Ed25519 ELF signer (YubiKey or seed), produces the ARCSIG trailer. Own `.cargo/config.toml` targeting `aarch64-apple-darwin`.
 
 ## Key Technical Details

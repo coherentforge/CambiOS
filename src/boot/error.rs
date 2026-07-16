@@ -122,6 +122,20 @@ pub enum BootError {
     /// not depend on their caller.
     /// Site: `src/manifest.rs` populate helpers.
     ManifestTranscriptionFailed,
+
+    /// A manifest was transcribed but no boot module named
+    /// `INIT_MODULE_NAME` is present. The manifest exists to be
+    /// executed by init (ADR-018 § 4); a boot image shipping one
+    /// without the other is broken, and continuing would silently
+    /// leave the described services unsupervised.
+    /// Site: `src/microkernel/main.rs` `load_boot_modules`.
+    InitModuleMissing,
+
+    /// Creating init as PID 1 failed after a manifest was transcribed
+    /// (ELF load/verify, manifest-blob mapping, or capability setup).
+    /// The step detail is printed at the site before this is returned.
+    /// Site: `src/microkernel/main.rs` `create_init_process`.
+    InitCreationFailed,
 }
 
 /// Halt the system on a typed boot-path failure.
@@ -162,6 +176,10 @@ pub fn boot_failed(err: BootError) -> ! {
             "boot manifest failed cross-record validation (duplicate name/endpoint)",
         BootError::ManifestTranscriptionFailed =>
             "boot manifest transcription failed (table install rejected a row)",
+        BootError::InitModuleMissing =>
+            "boot manifest present but no init boot module — broken boot image",
+        BootError::InitCreationFailed =>
+            "creating init (PID 1) failed after manifest transcription",
     };
     crate::println!("[BOOT FAIL] {}", msg);
     crate::halt()
@@ -177,6 +195,8 @@ mod tests {
 
     /// Every variant round-trips as its own discriminant — catches
     /// accidental duplicate assignments on `#[repr(...)]` bumps.
+    /// (The list drifted at the step-4 manifest variants; caught up
+    /// with the step-7 init variants — keep it exhaustive.)
     #[test]
     fn variants_are_distinct() {
         let all = [
@@ -190,6 +210,12 @@ mod tests {
             BootError::TimerFrequencyMissing,
             BootError::TimerFrequencyTooLow,
             BootError::TimerInvariantViolation,
+            BootError::ManifestSignatureInvalid,
+            BootError::ManifestMalformed,
+            BootError::ManifestInconsistent,
+            BootError::ManifestTranscriptionFailed,
+            BootError::InitModuleMissing,
+            BootError::InitCreationFailed,
         ];
         // Every pair of variants must be distinct under Eq.
         for (i, a) in all.iter().enumerate() {
@@ -220,6 +246,12 @@ mod tests {
             BootError::TimerFrequencyMissing,
             BootError::TimerFrequencyTooLow,
             BootError::TimerInvariantViolation,
+            BootError::ManifestSignatureInvalid,
+            BootError::ManifestMalformed,
+            BootError::ManifestInconsistent,
+            BootError::ManifestTranscriptionFailed,
+            BootError::InitModuleMissing,
+            BootError::InitCreationFailed,
         ] {
             buf.clear();
             write!(buf, "{:?}", variant).unwrap();

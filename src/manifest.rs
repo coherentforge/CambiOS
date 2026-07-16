@@ -419,6 +419,29 @@ pub fn install_manifest_row(
 // Init identity
 // ============================================================================
 
+/// Init's manifest-declared identity, captured at transcription: the
+/// AID the kernel binds to PID 1 and the endpoint init listens on
+/// (both from the verified header — the manifest signature is the
+/// authorization, ADR-018 § 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitIdentity {
+    pub aid: [u8; 32],
+    pub endpoint: u32,
+}
+
+/// `BOOTSTRAP_PRINCIPAL` lifecycle: written once by
+/// [`transcribe_manifest_module`] during single-threaded boot,
+/// read-only thereafter, outside the lock hierarchy. `None` means no
+/// manifest was transcribed — the boot path must not create init.
+static INIT_MANIFEST_IDENTITY: crate::arch::spinlock::Spinlock<Option<InitIdentity>> =
+    crate::arch::spinlock::Spinlock::new(None);
+
+/// The identity the kernel binds when it creates init, if a manifest
+/// declared one this boot.
+pub fn init_identity() -> Option<InitIdentity> {
+    *INIT_MANIFEST_IDENTITY.lock()
+}
+
 /// The init process's kernel identity (ADR-018 § 4). `BOOTSTRAP_PRINCIPAL`
 /// lifecycle: written exactly once when the kernel creates init during
 /// single-threaded boot (migration step 7), read-only thereafter,
@@ -607,6 +630,11 @@ pub fn transcribe_manifest_module(
     let reservations = crate::ipc::endpoint_reservation::ENDPOINT_RESERVATIONS
         .with_table(|t| populate_reservations(&m, t))?;
     let spawn_rows = SPAWN_GRANTS.with_table(|t| populate_spawn_grants(&m, t))?;
+
+    // Step 4: capture init's identity for the boot path's PID-1
+    // creation (same write-once discipline as the tables above).
+    *INIT_MANIFEST_IDENTITY.lock() =
+        Some(InitIdentity { aid: m.init_aid(), endpoint: m.init_endpoint() });
 
     Ok((spawn_rows, reservations))
 }

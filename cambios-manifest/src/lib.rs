@@ -48,6 +48,13 @@ pub const VERSION: u32 = 1;
 /// only the `.elf` suffix is stripped, so the `.bin` stays).
 pub const MANIFEST_MODULE_NAME: &str = "manifest.bin";
 
+/// Boot-module name the kernel recognizes as the init ELF
+/// (`strip_module_name` output for `boot():/boot/init.elf`). The
+/// kernel registers it spawn-only during module load, then creates it
+/// as PID 1 after manifest transcription (ADR-018 § 6 step 4) — never
+/// through the legacy auto-start chain.
+pub const INIT_MODULE_NAME: &str = "init";
+
 /// Fixed user-space virtual address at which the kernel maps the
 /// manifest blob read-only into init's address space (ADR-018 § 6).
 /// Chosen clear of the user code base (0x400000) and the user stack
