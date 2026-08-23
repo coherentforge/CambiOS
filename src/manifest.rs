@@ -114,6 +114,7 @@ fn kernel_system_kind(kind: u32) -> Option<CapabilityKind> {
         system_caps::SET_WALLCLOCK => CapabilityKind::SetWallclock,
         system_caps::CREATE_CLUSTER => CapabilityKind::CreateCluster,
         system_caps::CLUSTER_REVOKE => CapabilityKind::ClusterRevoke,
+        system_caps::UNLOCK_VOLUME => CapabilityKind::UnlockVolume,
         _ => return None,
     })
 }

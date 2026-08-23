@@ -120,6 +120,7 @@ fn system_cap_id(name: &str) -> Option<u32> {
         "set-wallclock" => system_caps::SET_WALLCLOCK,
         "create-cluster" => system_caps::CREATE_CLUSTER,
         "cluster-revoke" => system_caps::CLUSTER_REVOKE,
+        "unlock-volume" => system_caps::UNLOCK_VOLUME,
         _ => return None,
     })
 }

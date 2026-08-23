@@ -63,6 +63,9 @@ endpoints = [24, 25, 26]
 [[service]]
 name = "fde-mount"
 endpoints = [32]
+# unlock-volume gates SYS_READ_VOLUME_HEADER + SYS_INSTALL_MASTER_KEY
+# (replaces the bootstrap-equality check those handlers used pre-cutover).
+system = ["unlock-volume"]
 lifetime = "one-shot"
 depends_on = ["virtio-blk", "key-store-service"]
 

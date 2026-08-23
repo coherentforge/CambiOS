@@ -108,7 +108,7 @@ pub const RESERVED_ENDPOINTS_MAX: usize = 16;
 /// Why: structurally coupled, not workload-scaled — the narrow-receive
 ///      default grants one `Endpoint{receive}` per reserved endpoint
 ///      (≤ RESERVED_ENDPOINTS_MAX) plus one `AllEndpoints{send}` plus
-///      a handful of System grants (10 kinds exist today).
+///      a handful of System grants (11 kinds exist today).
 /// Replace when: RESERVED_ENDPOINTS_MAX grows past 16 or the System
 ///      capability count approaches 15.
 pub const GRANTS_MAX: usize = 32;
@@ -248,10 +248,11 @@ pub mod system_caps {
     pub const SET_WALLCLOCK: u32 = 7;
     pub const CREATE_CLUSTER: u32 = 8;
     pub const CLUSTER_REVOKE: u32 = 9;
+    pub const UNLOCK_VOLUME: u32 = 10;
 
     /// Highest assigned identifier. `Manifest::parse` rejects System
     /// grants above this; bump when appending a new kind.
-    pub const MAX: u32 = CLUSTER_REVOKE;
+    pub const MAX: u32 = UNLOCK_VOLUME;
 }
 
 // ============================================================================

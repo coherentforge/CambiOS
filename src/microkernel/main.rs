@@ -1837,6 +1837,29 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
                     }
                 }
 
+                // ADR-032: grant `UnlockVolume` to fde-mount — gates
+                // SYS_READ_VOLUME_HEADER + SYS_INSTALL_MASTER_KEY
+                // (bootstrap-equality gates retired by the ADR-018
+                // step-8 sweep). Name-based pattern matches
+                // MapFramebuffer / AuditConsumer / SetWallclock above;
+                // this grant dies with the auto-start chain at the
+                // cutover, where the manifest's `unlock-volume` grant
+                // takes over.
+                if short_name == b"fde-mount" {
+                    use cambios_core::ipc::capability::CapabilityKind;
+                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
+                    if let Some(cap_mgr) = cap_guard.as_mut() {
+                        let _ = cap_mgr.grant_system_capability(
+                            process_id,
+                            CapabilityKind::UnlockVolume,
+                        );
+                        println!(
+                            "    ✓ Granted UnlockVolume to fde-mount (process {})",
+                            process_id.slot(),
+                        );
+                    }
+                }
+
                 println!(
                     "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
                     result.task_id.slot(), result.process_id.slot(), result.entry_point

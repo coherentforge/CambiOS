@@ -4071,14 +4071,24 @@ impl SyscallDispatcher {
         // BindPrincipal had stamped ctx.cr3 onto the syscall entry path;
         // surfaced at A-v.d.3 end-to-end as `read_volume_header: -1`.
 
-        // Bootstrap-Principal-only — same gating shape as BindPrincipal.
-        let caller = ctx
-            .caller_principal
-            .as_ref()
-            .ok_or(SyscallError::PermissionDenied)?;
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        if *caller != bootstrap {
-            return Err(SyscallError::PermissionDenied);
+        // Gated on the UnlockVolume capability (granted to fde-mount
+        // by name during coexistence, via the boot manifest after the
+        // ADR-018 cutover). Replaces the bootstrap-Principal-equality
+        // check, which stops holding once fde-mount runs under its
+        // own derived AID — same migration shape as AuditConsumer
+        // replacing the bootstrap-only SYS_AUDIT_ATTACH gate (ADR-023).
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(
+                    ctx.process_id,
+                    crate::ipc::capability::CapabilityKind::UnlockVolume,
+                )
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
         }
 
         // Open the virtio-blk kernel-cmd channel. Per the
@@ -4177,15 +4187,21 @@ impl SyscallDispatcher {
         /// addresses raw LBA 4, never aliasing the header.
         const FDE_SUBSTRATE_LBA_OFFSET: u64 = 4;
 
-        // Bootstrap-Principal-only — same gating shape as
-        // BindPrincipal / ReadVolumeHeader.
-        let caller = ctx
-            .caller_principal
-            .as_ref()
-            .ok_or(SyscallError::PermissionDenied)?;
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        if *caller != bootstrap {
-            return Err(SyscallError::PermissionDenied);
+        // Gated on the UnlockVolume capability — same gate (and same
+        // rationale) as ReadVolumeHeader above: the two syscalls are
+        // one flow, walked only by fde-mount.
+        {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::PermissionDenied)?;
+            let has_cap = cap_mgr
+                .has_system_capability(
+                    ctx.process_id,
+                    crate::ipc::capability::CapabilityKind::UnlockVolume,
+                )
+                .unwrap_or(false);
+            if !has_cap {
+                return Err(SyscallError::PermissionDenied);
+            }
         }
 
         let master_ptr = args.arg1;
@@ -4255,7 +4271,15 @@ impl SyscallDispatcher {
         let store = if is_fresh_wrap {
             match DiskObjectStore::format_with_auto_geometry(encrypted, substrate_capacity) {
                 Ok(s) => s,
-                Err(_) => return Err(SyscallError::OutOfMemory),
+                Err(e) => {
+                    // Surface the real cause — the blanket OutOfMemory
+                    // return is indistinguishable from a dozen other
+                    // failures at the fde-mount log line (observed as
+                    // an unexplained transient during the UnlockVolume
+                    // gate verification, 2026-08-23).
+                    crate::println!("  [InstallMasterKey] fresh-wrap format failed: {:?}", e);
+                    return Err(SyscallError::OutOfMemory);
+                }
             }
         } else {
             match DiskObjectStore::open_strict(encrypted) {

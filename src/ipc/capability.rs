@@ -89,6 +89,18 @@ pub enum CapabilityKind {
     /// can call `SYS_CLUSTER_REVOKE` without holding this cap; this
     /// kind covers the non-creator authority path.
     ClusterRevoke,
+    /// Right to walk the full-disk-encryption unlock flow:
+    /// `SYS_READ_VOLUME_HEADER` + `SYS_INSTALL_MASTER_KEY`
+    /// ([ADR-032](../../docs/adr/032-full-disk-encryption-below-substrate.md)).
+    /// Replaces those handlers' bootstrap-Principal-equality gates —
+    /// the ADR-018 cutover gives fde-mount its own derived AID, so
+    /// "caller is the operator" stops being true for the one service
+    /// whose job this is (bootstrap-equality sweep, 2026-07-16; same
+    /// migration shape as `AuditConsumer` replacing the bootstrap-only
+    /// `SYS_AUDIT_ATTACH` check per ADR-023). Granted to `fde-mount`
+    /// by name during coexistence and via the boot manifest after
+    /// cutover.
+    UnlockVolume,
 }
 
 /// Errors from capability operations
@@ -199,6 +211,10 @@ pub struct ProcessCapabilities {
     /// the cluster's policy (typically only the coordinator role).
     /// Cluster creators can revoke without this cap.
     cluster_revoke: bool,
+    /// System capability: can this process walk the FDE unlock flow
+    /// (`SYS_READ_VOLUME_HEADER` + `SYS_INSTALL_MASTER_KEY`)?
+    /// ADR-032; granted to `fde-mount` only.
+    unlock_volume: bool,
 }
 
 impl ProcessCapabilities {
@@ -219,6 +235,7 @@ impl ProcessCapabilities {
             set_wallclock: false,
             create_cluster: false,
             cluster_revoke: false,
+            unlock_volume: false,
         }
     }
 
@@ -364,6 +381,7 @@ impl ProcessCapabilities {
             CapabilityKind::SetWallclock => self.set_wallclock = true,
             CapabilityKind::CreateCluster => self.create_cluster = true,
             CapabilityKind::ClusterRevoke => self.cluster_revoke = true,
+            CapabilityKind::UnlockVolume => self.unlock_volume = true,
             CapabilityKind::Endpoint => {}
         }
     }
@@ -381,6 +399,7 @@ impl ProcessCapabilities {
             CapabilityKind::SetWallclock => self.set_wallclock,
             CapabilityKind::CreateCluster => self.create_cluster,
             CapabilityKind::ClusterRevoke => self.cluster_revoke,
+            CapabilityKind::UnlockVolume => self.unlock_volume,
             CapabilityKind::Endpoint => false,
         }
     }
@@ -398,6 +417,7 @@ impl ProcessCapabilities {
             CapabilityKind::SetWallclock => self.set_wallclock = false,
             CapabilityKind::CreateCluster => self.create_cluster = false,
             CapabilityKind::ClusterRevoke => self.cluster_revoke = false,
+            CapabilityKind::UnlockVolume => self.unlock_volume = false,
             CapabilityKind::Endpoint => {}
         }
     }
