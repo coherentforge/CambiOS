@@ -225,7 +225,9 @@ fn unlock_flow() -> UnlockOutcome {
     // PIV backend. Authorization happens server-side via
     // Vault::authorize on the kernel-stamped sender_principal —
     // fde-mount is bound to the bootstrap AID at spawn, so
-    // authorize accepts.
+    // authorize accepts. That coincidence ends at the ADR-018
+    // cutover (derived AID); see the Deferred note on
+    // Vault::authorize for the cutover obligation.
     let mut shared = [0u8; 32];
     let n = match vault_decrypt_with(
         FDE_MOUNT_ENDPOINT,

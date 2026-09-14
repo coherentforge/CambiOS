@@ -31,26 +31,6 @@ use cambios_libsys as sys;
 
 const FS_ENDPOINT: u32 = proto::FS_ENDPOINT;
 
-/// Ask the vault to sign `content` with the bootstrap AID's signing
-/// key (slot 9C under `--features dev-piv`, `TokenAbsent` otherwise).
-/// Returns `Some(sig)` on success, `None` on any failure — caller
-/// surfaces the latter as `STATUS_DENIED` per the existing wire
-/// contract.
-///
-/// The signature is over the **content bytes** directly — same shape
-/// as the pre-Frame-A `request_sign` and the same shape the kernel
-/// verifies inside `handle_obj_put_signed` (signature checked against
-/// caller's bound Principal over the full content). Wire constraint:
-/// content ≤ `MAX_VAULT_SIGN_MSG_LEN` bytes (220), which fits within
-/// the existing `MAX_CONTENT_LEN` ceiling clients already observe.
-fn sign_via_vault(bootstrap_aid: &[u8; 32], content: &[u8]) -> Option<[u8; 64]> {
-    use cambios_libsys::vault::vault_sign_with;
-    match vault_sign_with(FS_ENDPOINT, bootstrap_aid, content) {
-        Ok(sig) => Some(sig.0),
-        Err(_) => None,
-    }
-}
-
 // ============================================================================
 // Name table (Phase 3 in-memory stub)
 // ============================================================================
@@ -190,24 +170,25 @@ use proto::{
     STAT_OFF_NAME, STAT_OFF_NAME_LEN, STAT_OFF_OWNER, STAT_OFF_SIZE,
 };
 
-fn handle_put(
-    bootstrap_aid: &[u8; 32],
-    payload: &[u8],
-    response: &mut [u8],
-) -> usize {
+// Deferred: saves are unsigned (`obj_put`, not `obj_put_signed`).
+// Why: the ADR-018 cutover binds fs-service to a derived AID — a blake3
+// name-tag with no private key — so no signature it produces can verify
+// against its own Principal. The retired sign-via-vault path worked only
+// while fs-service shared the bootstrap AID, and its guarantee was
+// already "the vault agreed to sign", not end-user authorship. The
+// kernel still stamps the caller's Principal as author + owner on every
+// unsigned put, so ownership enforcement is unchanged.
+// Revisit when: ADR-033's real-per-service-keys phase lands
+// (`bind_for_spawn` mints real keypairs; kernel verify resolves
+// AID → current pubkey) — restore `obj_put_signed` here and at the two
+// sites that point at this note (handle_put_by_name, seed_demo_objects).
+fn handle_put(payload: &[u8], response: &mut [u8]) -> usize {
     if payload.is_empty() {
         response[0] = STATUS_INVALID;
         return 1;
     }
-    let sig = match sign_via_vault(bootstrap_aid, payload) {
-        Some(sig) => sig,
-        None => {
-            response[0] = STATUS_DENIED;
-            return 1;
-        }
-    };
     let mut hash = [0u8; 32];
-    let ret = sys::obj_put_signed(payload, &sig, &mut hash);
+    let ret = sys::obj_put(payload, &mut hash);
     if ret < 0 {
         response[0] = STATUS_FULL;
         return 1;
@@ -325,7 +306,6 @@ fn handle_get_by_name(payload: &[u8], response: &mut [u8]) -> usize {
 }
 
 fn handle_put_by_name(
-    bootstrap_aid: &[u8; 32],
     payload: &[u8],
     sender: &[u8; 32],
     response: &mut [u8],
@@ -360,17 +340,10 @@ fn handle_put_by_name(
     let name = &payload[name_off..name_off + name_len];
     let content = &payload[name_off + name_len..name_off + name_len + content_len];
 
-    // Sign + put into the underlying ObjectStore (matches handle_put
-    // shape; bind_name layered on top for the name index).
-    let sig = match sign_via_vault(bootstrap_aid, content) {
-        Some(sig) => sig,
-        None => {
-            response[0] = STATUS_DENIED;
-            return 1;
-        }
-    };
+    // Unsigned put — see the unsigned-saves note on handle_put.
+    // bind_name is layered on top for the name index.
     let mut hash = [0u8; 32];
-    if sys::obj_put_signed(content, &sig, &mut hash) < 0 {
+    if sys::obj_put(content, &mut hash) < 0 {
         response[0] = STATUS_FULL;
         return 1;
     }
@@ -554,14 +527,16 @@ fn handle_transfer(_payload: &[u8], response: &mut [u8]) -> usize {
 
 /// Seed the name table with a handful of demo objects so the shell's
 /// `ls` / `cat` / `stat` commands have something to render even before a
-/// client has saved anything. Routes signing through the vault per
-/// ADR-033 — fs-service authors as its own bound Principal (the
-/// bootstrap AID in v1).
-fn seed_demo_objects(bootstrap_aid: &[u8; 32]) {
-    // Use the FS-service's own bound Principal as author. Same value
-    // as `bootstrap_aid` in v1, but reading it back via get_principal
-    // keeps the data self-consistent if a future multi-Principal
-    // boot binds fs-service to a non-bootstrap AID.
+/// client has saved anything. Saves are unsigned — see the
+/// unsigned-saves note on handle_put. (Before that change, seeding
+/// silently no-oped on every default boot: the vault's PIN gate is
+/// still closed when fs-service starts, so the sign step always failed
+/// with TokenAbsent. The demo objects actually exist now.)
+fn seed_demo_objects() {
+    // Author/owner in the name index = this service's own bound
+    // Principal, read back via get_principal so the data stays
+    // self-consistent when the ADR-018 cutover rebinds fs-service to
+    // its derived AID.
     let mut author = [0u8; 32];
     let _ = sys::get_principal(&mut author);
 
@@ -575,15 +550,8 @@ fn seed_demo_objects(bootstrap_aid: &[u8; 32]) {
         if content.len() > proto::MAX_CONTENT_LEN {
             continue;
         }
-        let sig = match sign_via_vault(bootstrap_aid, content) {
-            Some(s) => s,
-            None => {
-                sys::print(b"[FS] seed: vault sign unavailable, skipping\n");
-                return;
-            }
-        };
         let mut hash = [0u8; 32];
-        if sys::obj_put_signed(content, &sig, &mut hash) < 0 {
+        if sys::obj_put(content, &mut hash) < 0 {
             sys::print(b"[FS] seed: obj_put failed\n");
             return;
         }
@@ -617,22 +585,11 @@ fn run() -> ! {
     sys::register_endpoint(FS_ENDPOINT);
     sys::print(b"[FS] ready on endpoint 16\n");
 
-    // Query this process's bound Principal — the AID the vault
-    // recognizes for signing operations. v1: bootstrap AID; threaded
-    // to handlers + seed_demo_objects.
-    let mut bootstrap_aid = [0u8; 32];
-    let _ = sys::get_principal(&mut bootstrap_aid);
-
-    // Best-effort seed. Under v1 boot order (fs-service starts before
-    // fde-mount runs `piv_verify_pin`), this silently no-ops with
-    // `TokenAbsent` because the PIV backend's PIN gate is closed.
-    // Matches pre-cleanup behavior exactly — seed has always been
-    // best-effort. handle_put / handle_put_by_name paths work
-    // normally after fde-mount completes.
-    // Revisit when: boot order moves fs-service after fde-mount, OR
-    // seed_demo_objects switches to lazy / on-first-request seeding,
-    // OR a "vault ready" boot-gate primitive lands.
-    seed_demo_objects(&bootstrap_aid);
+    // Seed the demo objects. Unsigned saves (see the note on
+    // handle_put) removed the vault dependency, so this no longer
+    // needs to wait for fde-mount's PIN unlock and succeeds on every
+    // boot.
+    seed_demo_objects();
 
     sys::module_ready();
 
@@ -655,12 +612,12 @@ fn run() -> ! {
         let sender = msg.sender().as_bytes();
 
         let resp_len = match cmd {
-            CMD_PUT => handle_put(&bootstrap_aid, cmd_data, &mut resp_buf),
+            CMD_PUT => handle_put(cmd_data, &mut resp_buf),
             CMD_GET => handle_get(cmd_data, &mut resp_buf),
             CMD_DELETE => handle_delete(cmd_data, &mut resp_buf),
             CMD_LIST => handle_list(&mut resp_buf),
             CMD_GET_BY_NAME => handle_get_by_name(cmd_data, &mut resp_buf),
-            CMD_PUT_BY_NAME => handle_put_by_name(&bootstrap_aid, cmd_data, sender, &mut resp_buf),
+            CMD_PUT_BY_NAME => handle_put_by_name(cmd_data, sender, &mut resp_buf),
             CMD_STAT => handle_stat(cmd_data, &mut resp_buf),
             CMD_LIST_NAMED => handle_list_named(cmd_data, &mut resp_buf),
             CMD_REMOVE => handle_remove(cmd_data, &mut resp_buf),

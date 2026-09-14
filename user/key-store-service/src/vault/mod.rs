@@ -165,6 +165,19 @@ impl Vault {
     /// dispatch arm; factored into the vault module so the three arms
     /// (1C-B bind_for_spawn, 1C-C sign_with + decrypt_with) share one
     /// authority check.
+    /// Deferred: this gate admits only the bootstrap AID + directory
+    /// entries, and the directory holds only the bootstrap entry today.
+    /// Why: every caller is still bootstrap-bound. The ADR-018 cutover
+    /// rebinds services to derived AIDs, and the one remaining vault
+    /// consumer — fde-mount's `decrypt_with` during FDE unlock — will
+    /// then present a derived AID and be refused here, breaking disk
+    /// unlock one layer below the (already fixed) UnlockVolume syscall
+    /// gates. fs-service stopped calling the vault entirely (unsigned
+    /// saves), so fde-mount is the only caller this affects.
+    /// Revisit when: ADR-018 step-8 cutover lands — the cutover change
+    /// must teach this matrix fde-mount's derived AID (directory entry
+    /// or allowed-caller row; pairs with ADR-033's caller/target
+    /// matrix design).
     pub fn authorize(&self, caller_aid: &AID) -> Result<(), VaultError> {
         if caller_aid == &self.bootstrap_aid {
             return Ok(());
