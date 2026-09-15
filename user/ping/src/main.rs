@@ -126,7 +126,7 @@ fn run() -> ! {
     // Leaf boot module — release the boot gate immediately so
     // downstream modules (shell, anything after ping in the manifest)
     // don't block on our compositor round-trip.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut client = match Client::open(render::WINDOW_W, render::WINDOW_H, PONG_ENDPOINT) {
         Ok(c) => c,

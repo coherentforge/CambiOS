@@ -48,6 +48,7 @@ name = "cambios-libsys-rt"
 version = "0.1.0"
 dependencies = [
  "cambios-libsys",
+ "cambios-manifest",
 ]
 
 [[package]]

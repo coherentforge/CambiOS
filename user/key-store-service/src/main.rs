@@ -84,7 +84,7 @@ fn run() -> ! {
     };
 
     sys::print(b"[KS] ready on endpoint 17\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     // Step 4: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];

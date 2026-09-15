@@ -36,7 +36,7 @@ fn run() -> ! {
     // Release the boot gate up-front. fb-demo is a leaf — nothing
     // downstream depends on its completion — so signalling ready
     // immediately lets shell come up in parallel.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut desc = FramebufferDescriptor::default();
     if let Err(rc) = sys::map_framebuffer(0, &mut desc) {

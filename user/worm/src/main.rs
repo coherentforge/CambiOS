@@ -118,7 +118,7 @@ fn run() -> ! {
     // the compositor handshake. Matches Tree / hello-window; lets
     // the next module in limine.conf (shell) start in parallel with
     // our CreateWindow round-trip.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut client = match Client::open(render::WINDOW_W, render::WINDOW_H, WORM_ENDPOINT) {
         Ok(c) => c,

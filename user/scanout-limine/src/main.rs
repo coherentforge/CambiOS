@@ -98,7 +98,7 @@ fn run() -> ! {
 
     // Release the boot gate. scanout-limine doesn't gate downstream
     // services; they should come up in parallel.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut state = DriverState {
         fb,

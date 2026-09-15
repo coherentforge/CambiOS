@@ -997,7 +997,7 @@ fn run() -> ! {
     // maintain. Pre-Phase-B this was a one-shot `run_ntp_demo` that
     // discarded the result; ADR-022 makes the response load-bearing.
     sys::print(b"[UDP] ready on endpoint 21\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
     service_loop(&mut cache, &our_mac)
 }
 
@@ -1005,7 +1005,7 @@ fn error_loop() -> ! {
     // Release the boot gate even in the error path — the module is
     // observably up (endpoint registered) and holding the gate would
     // deadlock every subsequent boot module.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
     let mut recv_buf = [0u8; 292];
     let resp = [STATUS_ERROR];
 

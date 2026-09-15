@@ -520,7 +520,7 @@ fn run() -> ! {
     // Step 4: Register IPC endpoint
     sys::register_endpoint(NET_ENDPOINT);
     sys::print(b"[NET] ready on endpoint 20 (virtio-net)\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     // Step 5: Service loop — recv_verified rejects anonymous senders.
     let mut recv_buf = [0u8; 256];
@@ -559,7 +559,7 @@ fn no_device_loop() -> ! {
     // Release the boot gate so the next module can start. Every entry point
     // into this function has already registered NET_ENDPOINT, so the module
     // is observably up even though it has no device to serve.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut recv_buf = [0u8; 256];
     let resp_buf = [STATUS_NO_DEVICE; 1];

@@ -46,7 +46,7 @@ fn run() -> ! {
     // Release the boot gate immediately — audit-tail is a leaf consumer.
     // Calling module_ready before audit_attach means a failure to attach
     // doesn't park the rest of the boot chain.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let vaddr = sys::audit_attach();
     if vaddr < 0 {

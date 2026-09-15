@@ -157,9 +157,32 @@ mod svc {
         // has no consumer yet.
         // Revisit when: ADR-019 restart policy lands (migration step
         // 10) — this loop becomes the supervision wake point.
+        //
+        // Coexistence probe (compiled out with `supervise`): prove the
+        // step-8 ready-ping path live while the legacy chain still
+        // governs — print once when the first verified ping lands.
+        // Retires at the cutover, where the supervise wave consumes
+        // pings before this loop runs.
+        #[cfg_attr(feature = "supervise", allow(unused_mut, unused_variables))]
+        let mut probe_pending = true;
         loop {
             let mut buf = [0u8; RECV_BUF];
-            let _ = sys::recv_msg(init_ep, &mut buf);
+            #[cfg(not(feature = "supervise"))]
+            {
+                if let Some(msg) = sys::recv_verified(init_ep, &mut buf) {
+                    if probe_pending
+                        && msg.command().map(|(c, _)| c)
+                            == Some(cambios_manifest::READY_PING_TAG)
+                    {
+                        probe_pending = false;
+                        sys::print(b"[init] ready pings arriving (coexistence probe)\n");
+                    }
+                }
+            }
+            #[cfg(feature = "supervise")]
+            {
+                let _ = sys::recv_msg(init_ep, &mut buf);
+            }
         }
     }
 

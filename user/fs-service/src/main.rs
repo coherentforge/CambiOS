@@ -591,7 +591,7 @@ fn run() -> ! {
     // boot.
     seed_demo_objects();
 
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];

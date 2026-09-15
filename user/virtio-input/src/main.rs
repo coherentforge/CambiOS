@@ -188,7 +188,7 @@ fn run() -> ! {
 
     // Leaf module — no one waits on us — so release the boot gate
     // immediately and move into the poll loop.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     // Poll each device in round-robin. `yield_now` between rounds
     // prevents a tight spin when there's no input.

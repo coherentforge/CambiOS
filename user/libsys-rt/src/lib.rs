@@ -4,7 +4,7 @@
 //! CambiOS service runtime — L0 of the native app framework (ADR-037).
 //!
 //! Collapses the entry ritual every service hand-rolls (`_start` →
-//! `register_endpoint` → `module_ready` → main loop, plus the panic
+//! `register_endpoint` → readiness signal → main loop, plus the panic
 //! handler) into one [`service_main!`] invocation. Pure `macro_rules!` —
 //! no proc-macro crate in the build graph, per ADR-037 L0.
 //!
@@ -30,8 +30,8 @@
 //!
 //! The macro emits, at module scope in the consumer crate:
 //! - `_start`: registers each endpoint in order, calls
-//!   `sys::module_ready()` (releasing the next module behind the boot
-//!   gate), then tail-calls the given `main: fn() -> !`.
+//!   [`ready()`] (readiness ping to init + legacy boot-gate release),
+//!   then tail-calls the given `main: fn() -> !`.
 //! - a `#[panic_handler]` that prints `[NAME] PANIC!` to serial and
 //!   calls `sys::exit(1)` — byte-identical in behavior to the handler
 //!   all 23 services carried by hand.
@@ -69,12 +69,35 @@
 #[doc(hidden)]
 pub use cambios_libsys as __sys;
 
+/// Signal service readiness — the one call every service makes when it
+/// is up and serving (ADR-018 § 4 / ADR-037: the runtime emits the
+/// readiness signal).
+///
+/// Coexistence shape (ADR-018 migration step 8, commit B): readiness is
+/// told to both worlds —
+/// 1. a ready ping (`[READY_PING_TAG]`, one byte) to init's endpoint;
+///    *which* service is ready comes from the kernel-stamped
+///    `sender_principal`, never the payload. Fire-and-forget: before
+///    the cutover init drains and ignores these; a send failure must
+///    not block a service that is otherwise up.
+/// 2. `SYS_MODULE_READY`, releasing the next module behind the legacy
+///    boot gate.
+/// Migration step 9 deletes (2) with the rest of the chain; this
+/// function body shrinks to the ping.
+pub fn ready() {
+    let _ = __sys::write(
+        cambios_manifest::INIT_ENDPOINT,
+        &[cambios_manifest::READY_PING_TAG],
+    );
+    __sys::module_ready();
+}
+
 #[cfg(feature = "heap")]
 #[doc(hidden)]
 pub use linked_list_allocator as __alloc;
 
 /// Emit the service entry ritual: `_start` (endpoint registration +
-/// `module_ready` + jump to `main`) and the standard panic handler.
+/// [`ready()`] + jump to `main`) and the standard panic handler.
 ///
 /// Arms:
 /// - `name: "SVC", endpoint: E, main: f` — single endpoint.
@@ -85,8 +108,8 @@ pub use linked_list_allocator as __alloc;
 ///   apps register reply endpoints inside `libgui::Client::open`, and
 ///   gate readiness on window setup). The macro emits only `_start`
 ///   (+ heap) and the panic handler; **`main` MUST call
-///   `sys::module_ready()` itself once ready**, or the boot gate holds
-///   every later module forever.
+///   `cambios_libsys_rt::ready()` itself once ready**, or the boot gate
+///   holds every later module forever.
 /// - Add `heap: SIZE` (requires the `heap` feature) to any form for
 ///   `alloc` consumers; SIZE is the static arena in bytes.
 ///
@@ -114,13 +137,13 @@ macro_rules! service_main {
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() -> ! {
             $( let _ = $crate::__sys::register_endpoint($ep); )+
-            $crate::__sys::module_ready();
+            $crate::ready();
             $main()
         }
     };
 
-    // --- no-endpoint arms: registration + module_ready stay in `main`
-    //     (GUI apps — see the macro docs; `main` must call module_ready) ---
+    // --- no-endpoint arms: registration + readiness stay in `main`
+    //     (GUI apps — see the macro docs; `main` must call ready()) ---
     (name: $name:literal, main: $main:path $(,)?) => {
         #[panic_handler]
         fn __cambios_rt_panic(_info: &::core::panic::PanicInfo) -> ! {
@@ -192,7 +215,7 @@ macro_rules! service_main {
                 );
             }
             $( let _ = $crate::__sys::register_endpoint($ep); )+
-            $crate::__sys::module_ready();
+            $crate::ready();
             $main()
         }
     };

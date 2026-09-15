@@ -91,7 +91,7 @@ fn run() -> ! {
     sys::print(b"[SPROUTY] booting\r\n");
 
     // Leaf boot module — release the boot gate immediately.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     // Allocate + populate the sprite sheet OUT of `.rodata`. The
     // embedded buffer would push our R PT_LOAD segment to 4 pages,

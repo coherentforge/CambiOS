@@ -40,7 +40,7 @@ fn run() -> ! {
     // with our compositor handshake. (`libgui::Client` intentionally
     // does NOT call `module_ready`; that's a boot-ordering concern
     // orthogonal to what libgui wraps.)
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut client = match Client::open(WINDOW_WIDTH, WINDOW_HEIGHT, HELLO_WINDOW_ENDPOINT) {
         Ok(c) => c,

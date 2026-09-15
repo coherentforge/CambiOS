@@ -159,7 +159,7 @@ fn run() -> ! {
     // Release the boot gate now. hello-window and any other clients
     // can start sending CreateWindow messages; the dispatch loop is
     // next.
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     // Main dispatch loop. Drains scanout-driver events (FrameDisplayed
     // acks today, hotplug in future) *and* client requests

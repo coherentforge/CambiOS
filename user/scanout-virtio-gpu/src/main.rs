@@ -152,7 +152,7 @@ fn run() -> ! {
             // Register the endpoint anyway so the compositor's
             // handshake timeout (not our own) governs the behavior.
             let _ = sys::register_endpoint(SCANOUT_DRIVER_ENDPOINT);
-            sys::module_ready();
+            cambios_libsys_rt::ready();
             idle_loop();
         }
     };
@@ -161,11 +161,11 @@ fn run() -> ! {
     // (next in BOOT_MODULE_ORDER) can come up and send RegisterCompositor.
     if sys::register_endpoint(SCANOUT_DRIVER_ENDPOINT) < 0 {
         sys::print(b"[SCANOUT-VGPU] register_endpoint(27) failed\r\n");
-        sys::module_ready();
+        cambios_libsys_rt::ready();
         idle_loop();
     }
     sys::print(b"[SCANOUT-VGPU] registered endpoint 27\r\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     // Main control loop.
     let mut binding: Option<CompositorBinding> = None;

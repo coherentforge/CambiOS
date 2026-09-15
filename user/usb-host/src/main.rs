@@ -106,7 +106,7 @@ fn run() -> ! {
         None => {
             sys::print(b"[USB-HOST] no xHCI controller found, idling on ep 31\n");
             sys::register_endpoint(USB_HOST_ENDPOINT);
-            sys::module_ready();
+            cambios_libsys_rt::ready();
             idle_loop();
         }
     };
@@ -127,7 +127,7 @@ fn run() -> ! {
     if mmio_paddr == 0 {
         sys::print(b"[USB-HOST] ERROR: xHCI found but no MMIO BAR, idling\n");
         sys::register_endpoint(USB_HOST_ENDPOINT);
-        sys::module_ready();
+        cambios_libsys_rt::ready();
         idle_loop();
     }
 
@@ -143,7 +143,7 @@ fn run() -> ! {
         log_dec(b"[USB-HOST] ERROR: map_mmio failed with rc=-", (-mapped) as u32);
         sys::print(b"[USB-HOST] idling on ep 31\n");
         sys::register_endpoint(USB_HOST_ENDPOINT);
-        sys::module_ready();
+        cambios_libsys_rt::ready();
         idle_loop();
     }
     let mmio_vaddr = mapped as u64;
@@ -190,7 +190,7 @@ fn run() -> ! {
     // Step 7: register IPC endpoint and release boot gate.
     sys::register_endpoint(USB_HOST_ENDPOINT);
     sys::print(b"[USB-HOST] ready on endpoint 31\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     match live_ctl {
         Some(mut ctl) => serve_loop(&mut ctl),

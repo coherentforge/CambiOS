@@ -118,7 +118,7 @@ fn run() -> ! {
     };
 
     sys::print(b"[terminal-window] both layers open\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut terminal = Terminal::new(backend);
     let mut editor = LineEditor::new(64);

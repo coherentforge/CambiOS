@@ -701,7 +701,7 @@ fn run() -> ! {
     sys::register_endpoint(BLK_KERNEL_CMD_ENDPOINT);
     sys::print(b"[BLK] ready on endpoint 24 (virtio-blk)\n");
     sys::print(b"[BLK] ready on endpoint 26 (virtio-blk / kernel)\n");
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let mut resp_buf = [0u8; 256];
@@ -755,7 +755,7 @@ fn no_device_loop() -> ! {
     // response instead of timing out after ~100s. Signal boot-chain ready
     // so downstream modules are released.
     sys::register_endpoint(BLK_KERNEL_CMD_ENDPOINT);
-    sys::module_ready();
+    cambios_libsys_rt::ready();
 
     let mut recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let mut kern_recv_buf = [0u8; ipc::RECV_BUF_SIZE];
