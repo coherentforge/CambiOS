@@ -77,6 +77,14 @@ pub struct KeyHandle {
     pub decrypt_slot: Option<PivSlot>,
 }
 
+/// Failure of [`Vault::register_caller`]. A boot-time outcome, not a
+/// wire error — the caller logs and continues (the vault still serves
+/// the bootstrap entry).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RegisterCallerError {
+    DirectoryFull,
+}
+
 /// One entry in the vault directory. Per ADR-033, v1 carries
 /// `aid + key_handle`; `InceptionEvent` and `RotationEvent` arrive with
 /// the first key-rotation consumer.
@@ -159,25 +167,47 @@ impl Vault {
         &self.bootstrap_aid
     }
 
+    /// Register `aid` as a recognized caller by inserting a keyless
+    /// directory entry (Sentinel device, no slots). The AID passes
+    /// `authorize` as a caller but resolves to `TokenAbsent` as a
+    /// sign/decrypt target — it may ask the vault to use *other*
+    /// entries' keys, it holds none of its own. Idempotent: an AID
+    /// already present (keyed or keyless) is `Ok` with no change.
+    /// Boot-time API; the dispatch loop never calls this.
+    pub fn register_caller(&mut self, aid: AID) -> Result<(), RegisterCallerError> {
+        if self.entry_for(&aid).is_some() {
+            return Ok(());
+        }
+        for slot in self.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(VaultEntry {
+                    aid,
+                    key_handle: KeyHandle {
+                        device_id: HardwareDeviceId::Sentinel,
+                        sign_slot: None,
+                        decrypt_slot: None,
+                    },
+                });
+                return Ok(());
+            }
+        }
+        Err(RegisterCallerError::DirectoryFull)
+    }
+
     /// Trust-boundary check per ADR-033 § 4. Recognized callers are
     /// (a) the bootstrap Principal, (b) any AID in the vault's directory.
     /// Anything else gets `NotAuthorized`. Called by every vault IPC
     /// dispatch arm; factored into the vault module so the three arms
     /// (1C-B bind_for_spawn, 1C-C sign_with + decrypt_with) share one
     /// authority check.
-    /// Deferred: this gate admits only the bootstrap AID + directory
-    /// entries, and the directory holds only the bootstrap entry today.
-    /// Why: every caller is still bootstrap-bound. The ADR-018 cutover
-    /// rebinds services to derived AIDs, and the one remaining vault
-    /// consumer — fde-mount's `decrypt_with` during FDE unlock — will
-    /// then present a derived AID and be refused here, breaking disk
-    /// unlock one layer below the (already fixed) UnlockVolume syscall
-    /// gates. fs-service stopped calling the vault entirely (unsigned
-    /// saves), so fde-mount is the only caller this affects.
-    /// Revisit when: ADR-018 step-8 cutover lands — the cutover change
-    /// must teach this matrix fde-mount's derived AID (directory entry
-    /// or allowed-caller row; pairs with ADR-033's caller/target
-    /// matrix design).
+    /// Admits the bootstrap AID + any AID in the directory. The
+    /// directory holds the bootstrap entry (with the operator's
+    /// `KeyHandle`) plus keyless caller entries registered via
+    /// [`Vault::register_caller`] — today that is fde-mount's derived
+    /// AID, so its `decrypt_with` keeps working when the ADR-018
+    /// cutover rebinds it away from the bootstrap Principal. A keyless
+    /// entry authorizes an AID as *caller* only; as a *target* it
+    /// resolves to `TokenAbsent` (no key material).
     pub fn authorize(&self, caller_aid: &AID) -> Result<(), VaultError> {
         if caller_aid == &self.bootstrap_aid {
             return Ok(());
