@@ -57,15 +57,16 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Boot stack size for the BSP. 16 KiB suffices for early init
-/// (panic frames + DTB walk) before per-task kernel stacks exist.
-///
-/// SCAFFOLDING: small fixed boot stack used only by the early entry
-/// path on the BSP.
-/// Why: 16 KiB matches the AArch64 boot stack convention; the
-///      scheduler creates per-task stacks once it's live.
-/// Replace when: per-CPU / per-task kernel stacks land.
-pub const BOOT_STACK_SIZE: usize = 16 * 1024;
+/// SCAFFOLDING: BSP boot stack size — parity with the 256 KiB Limine
+/// `StackSizeRequest` on x86_64 / aarch64 (the boot path is shared
+/// tri-arch, so its deepest frames are too).
+/// Why: 16 KiB was the riscv64 boot rot (2026-09-14): 17–75 KiB stack
+///      transients overflowed into the `.data` statics linked below.
+///      Constructors are in-place now; the parity margin stays.
+///      Full history: ASSUMPTIONS.md. Memory cost: 256 KiB of .bss.
+/// Replace when: per-task kernel stacks gain guard pages — then size
+///      from measured boot-path depth instead of parity.
+pub const BOOT_STACK_SIZE: usize = 256 * 1024;
 
 #[unsafe(link_section = ".bss.boot_stack")]
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
@@ -84,10 +85,14 @@ static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
 pub const MAX_AP_BOOT_STACKS: usize = 8;
 
 /// SCAFFOLDING: per-AP boot stack size.
-/// Why: matches `BOOT_STACK_SIZE` — same workload (percpu init, trap
-///      vector install, timer init, scheduler install, idle loop).
-///      Per-task kernel stacks replace this once the scheduler
+/// Why: the AP bring-up path is small — percpu init, trap vector,
+///      SBI timer, a boxed Scheduler (~200 B on the stack) and Timer,
+///      then the idle loop. Deliberately NOT the BSP size: 8 × 256 KiB
+///      would be 2 MiB of .bss for frames that never exist on this
+///      path. Per-task kernel stacks replace this once the scheduler
 ///      dispatches the AP's first task.
+/// Replace when: APs run any part of the shared boot path, or a frame
+///      over ~4 KiB lands on the AP bring-up path (measure, then size).
 pub const AP_BOOT_STACK_SIZE: usize = 16 * 1024;
 
 /// Per-AP boot stack pool. Indexed by `cpu_index` (the `opaque`

@@ -302,15 +302,33 @@ pub struct BootInfo {
     virtio_mmio_count: usize,
 }
 
+/// All-zero region used to fill `BootInfo::memory_regions` before any
+/// region is pushed; `memory_region_count` bounds what is meaningful.
+const ZERO_REGION: MemoryRegion = MemoryRegion {
+    base: 0,
+    length: 0,
+    kind: MemoryRegionKind::Reserved,
+};
+
 impl BootInfo {
-    /// Empty BootInfo builder. Adapter populates fields then calls
-    /// [`install`].
-    pub const fn empty() -> Self {
-        const ZERO_REGION: MemoryRegion = MemoryRegion {
-            base: 0,
-            length: 0,
-            kind: MemoryRegionKind::Reserved,
-        };
+    /// Host-test constructor. Builds through [`Self::init_empty_at`] so
+    /// the single field-list source of truth is what tests exercise;
+    /// the kernel boot path must not use this (it is a ~17 KiB stack
+    /// local — see `init_empty_at`).
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        let mut slot = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: slot is a valid, aligned, exclusively owned uninit Self.
+        unsafe { Self::init_empty_at(slot.as_mut_ptr()) };
+        // SAFETY: init_empty_at fully initialized every field.
+        unsafe { slot.assume_init() }
+    }
+
+    /// Reference field initializer, kept as a compile-time-checked
+    /// exhaustive struct literal so a new field cannot be forgotten by
+    /// [`Self::init_empty_at`] without this failing to compile.
+    #[allow(dead_code)]
+    const fn empty_literal() -> Self {
         Self {
             hhdm_offset: 0,
             rsdp_phys: None,
@@ -328,6 +346,121 @@ impl BootInfo {
             virtio_mmio_devices: [const { None }; MAX_VIRTIO_MMIO_DEVICES],
             virtio_mmio_count: 0,
         }
+    }
+
+    /// Initialize a `BootInfo` in place at `dst`, field by field.
+    ///
+    /// The ONLY constructor the kernel boot path uses. `BootInfo` is
+    /// ~17 KiB; building it as a stack local and moving it into the
+    /// static was one of the three stack transients behind the riscv64
+    /// boot rot found 2026-09-14 (16 KiB boot stack with `.data`
+    /// statics linked just below it). Every field is written exactly
+    /// once; `Option` arrays are written element-wise (Convention 7:
+    /// zeroed memory is not `None`). [`Self::empty_literal`] is the
+    /// exhaustive field list this must stay in step with.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `size_of::<BootInfo>()` bytes,
+    /// properly aligned, and exclusively owned by the caller for the
+    /// duration of the call. After it returns, `*dst` is fully
+    /// initialized.
+    pub unsafe fn init_empty_at(dst: *mut BootInfo) {
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).hhdm_offset) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).rsdp_phys) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(None) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).timer_base_frequency_hz) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(None) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).plic_mmio) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(None) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).console_irq) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(None) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let harts = unsafe { core::ptr::addr_of_mut!((*dst).harts) } as *mut Option<u64>;
+        for i in 0..MAX_HARTS {
+            // SAFETY: i < MAX_HARTS keeps the element in bounds.
+            let el = unsafe { harts.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(None) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).hart_count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let regions = unsafe { core::ptr::addr_of_mut!((*dst).memory_regions) } as *mut MemoryRegion;
+        for i in 0..MAX_MEMORY_REGIONS {
+            // SAFETY: i < MAX_MEMORY_REGIONS keeps the element in bounds.
+            let el = unsafe { regions.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(ZERO_REGION) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).memory_region_count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let fbs = unsafe { core::ptr::addr_of_mut!((*dst).framebuffers) } as *mut Option<FramebufferInfo>;
+        for i in 0..MAX_FRAMEBUFFERS {
+            // SAFETY: i < MAX_FRAMEBUFFERS keeps the element in bounds.
+            let el = unsafe { fbs.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(None) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).framebuffer_count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let mods = unsafe { core::ptr::addr_of_mut!((*dst).modules) } as *mut Option<ModuleInfo>;
+        for i in 0..MAX_BOOT_MODULES {
+            // SAFETY: i < MAX_BOOT_MODULES keeps the element in bounds.
+            let el = unsafe { mods.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(None) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).module_count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let vdevs = unsafe { core::ptr::addr_of_mut!((*dst).virtio_mmio_devices) }
+            as *mut Option<VirtioMmioInfo>;
+        for i in 0..MAX_VIRTIO_MMIO_DEVICES {
+            // SAFETY: i < MAX_VIRTIO_MMIO_DEVICES keeps the element in bounds.
+            let el = unsafe { vdevs.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(None) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).virtio_mmio_count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
     }
 
     /// Append a memory region. Returns false if the table is full.
@@ -442,6 +575,10 @@ impl BootInfo {
 /// hot path.
 struct OnceBootInfo {
     cell: UnsafeCell<MaybeUninit<BootInfo>>,
+    /// Set when a builder has claimed the cell (in-place population in
+    /// progress or complete). Distinct from `initialized`: readers must
+    /// never observe a half-populated BootInfo.
+    claimed: AtomicBool,
     initialized: AtomicBool,
 }
 
@@ -455,11 +592,31 @@ impl OnceBootInfo {
     const fn new() -> Self {
         Self {
             cell: UnsafeCell::new(MaybeUninit::uninit()),
+            claimed: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
         }
     }
 
+    /// Claim the cell and initialize it in place. `None` if a builder
+    /// was already handed out (typed refusal — the adapter decides).
+    fn begin_install(&self) -> Option<BootInfoBuilder> {
+        if self.claimed.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        // SAFETY: we just won the one-shot claim, so no other reference
+        // to the cell exists; the pointer is valid for the static's
+        // lifetime and properly aligned.
+        let cell = unsafe { &mut *self.cell.get() };
+        let dst = cell.as_mut_ptr();
+        // SAFETY: dst is valid, aligned and exclusively ours;
+        // init_empty_at writes every field.
+        unsafe { BootInfo::init_empty_at(dst) };
+        Some(BootInfoBuilder { _priv: () })
+    }
+
+    #[cfg(test)]
     fn install(&self, info: BootInfo) {
+        let _ = self.claimed.swap(true, Ordering::AcqRel);
         let was_init = self.initialized.swap(true, Ordering::AcqRel);
         assert!(!was_init, "boot::install called twice");
         // SAFETY: The cell pointer comes from &self so is valid for
@@ -490,8 +647,58 @@ impl OnceBootInfo {
 
 static BOOT_INFO: OnceBootInfo = OnceBootInfo::new();
 
-/// Install the populated BootInfo. Called exactly once, by the active
-/// boot adapter, at very early boot. Panics if called twice.
+/// Exclusive handle to the BootInfo singleton while a boot adapter
+/// populates it in place. Obtained from [`begin_install`]; derefs to
+/// the (already empty-initialized) `BootInfo`; [`finish`](Self::finish)
+/// publishes it for [`info`] readers. The handle carries no reference,
+/// so no mutable path can outlive `finish` — it is consumed.
+pub struct BootInfoBuilder {
+    _priv: (),
+}
+
+impl core::ops::Deref for BootInfoBuilder {
+    type Target = BootInfo;
+    fn deref(&self) -> &BootInfo {
+        // SAFETY: exactly one builder exists (one-shot claim); the cell
+        // was fully initialized by `begin_install`; readers through
+        // `info()` are gated by `initialized`, which `finish` sets only
+        // after this builder is consumed.
+        let cell = unsafe { &*BOOT_INFO.cell.get() };
+        // SAFETY: `begin_install` fully initialized the cell before any
+        // builder existed.
+        unsafe { cell.assume_init_ref() }
+    }
+}
+
+impl core::ops::DerefMut for BootInfoBuilder {
+    fn deref_mut(&mut self) -> &mut BootInfo {
+        // SAFETY: as in `deref`; `&mut self` is the unique mutable path
+        // to the cell while the builder lives.
+        let cell = unsafe { &mut *BOOT_INFO.cell.get() };
+        // SAFETY: `begin_install` fully initialized the cell before any
+        // builder existed.
+        unsafe { cell.assume_init_mut() }
+    }
+}
+
+impl BootInfoBuilder {
+    /// Publish the populated BootInfo. Consumes the builder, so no
+    /// mutable path remains once readers can observe the cell.
+    pub fn finish(self) {
+        BOOT_INFO.initialized.store(true, Ordering::Release);
+    }
+}
+
+/// Begin in-place population of the BootInfo singleton. Called exactly
+/// once, by the active boot adapter, at very early boot. `None` on a
+/// second call (typed, not a panic — the adapter decides).
+pub fn begin_install() -> Option<BootInfoBuilder> {
+    BOOT_INFO.begin_install()
+}
+
+/// Test-only by-value install (host tests build a `BootInfo` on the
+/// host stack; the kernel path uses [`begin_install`]).
+#[cfg(test)]
 pub fn install(info: BootInfo) {
     BOOT_INFO.install(info)
 }

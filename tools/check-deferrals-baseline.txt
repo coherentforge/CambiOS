@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:373:eventually
-CLAUDE.md:389:deferred
+CLAUDE.md:375:eventually
+CLAUDE.md:391:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -84,7 +84,7 @@ src/audit/drain.rs:359:for-now
 src/boot/limine.rs:15:deferred
 src/boot/limine.rs:16:for-now
 src/boot/riscv.rs:24:deferred
-src/boot/riscv.rs:742:deferred
+src/boot/riscv.rs:750:deferred
 src/fs/block.rs:174:eventually
 src/fs/virtio_blk_device.rs:80:deferred
 src/ipc/capability.rs:747:deferred
@@ -96,12 +96,12 @@ src/lib.rs:1021:deferred
 src/lib.rs:1029:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
-src/microkernel/main.rs:950:for-now
-src/microkernel/main.rs:1042:for-now
-src/microkernel/main.rs:1717:deferred
-src/microkernel/main.rs:2406:deferred
-src/microkernel/main.rs:2435:deferred
-src/microkernel/main.rs:2742:for-now
+src/microkernel/main.rs:953:for-now
+src/microkernel/main.rs:1045:for-now
+src/microkernel/main.rs:1731:deferred
+src/microkernel/main.rs:2420:deferred
+src/microkernel/main.rs:2449:deferred
+src/microkernel/main.rs:2756:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:994:deferred
 src/process.rs:995:deferred

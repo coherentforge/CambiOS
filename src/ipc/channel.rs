@@ -20,6 +20,7 @@
 //! See [ADR-005](../../docs/adr/005-ipc-primitives-control-and-bulk.md)
 //! for the design.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use cambios_abi::{StreamCapShape, StreamState};
 use crate::ipc::{ProcessId, Principal};
@@ -448,6 +449,55 @@ pub struct ChannelManager {
 
 impl Default for ChannelManager {
     fn default() -> Self { Self::new() }
+}
+
+impl ChannelManager {
+    /// Construct directly on the heap, field by field.
+    ///
+    /// `Box::new(Self::new())` is NOT equivalent: it builds the whole
+    /// struct on the caller's stack first and then copies it into the
+    /// box. `ChannelManager` is tens of KiB; on the riscv64 boot stack that
+    /// transient overflowed into the `.data` statics linked just below
+    /// the stack (POLICY_ROUTER, TASK_CPU_MAP, AUDIT_RING) — the root
+    /// cause of the riscv64 boot rot found 2026-09-14. Same shape as
+    /// `IpcManager::new_boxed`. Every field is written explicitly
+    /// (Convention 7: zeroed memory is not assumed to be `None`).
+    ///
+    /// Returns `None` if the allocation fails.
+    pub fn new_boxed() -> Option<Box<Self>> {
+        use alloc::alloc::{alloc, Layout};
+        let layout = Layout::new::<Self>();
+        // SAFETY: Self is non-zero-sized (it contains fixed arrays).
+        let ptr = unsafe { alloc(layout) as *mut Self };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ptr is a fresh, exclusively owned allocation with
+        // Self's layout; addr_of_mut! projects without creating a
+        // reference to the uninitialized struct.
+        let slots = unsafe { core::ptr::addr_of_mut!((*ptr).channels) } as *mut Option<ChannelRecord>;
+        for i in 0..MAX_CHANNELS {
+            // SAFETY: i < MAX_CHANNELS, so the projected element is in bounds.
+            let slot = unsafe { slots.add(i) };
+            // SAFETY: slot is a valid, aligned, exclusively owned element.
+            unsafe { slot.write(None) };
+        }
+        // SAFETY: same projection argument as `slots` above.
+        let gens = unsafe { core::ptr::addr_of_mut!((*ptr).generations) } as *mut u32;
+        for i in 0..MAX_CHANNELS {
+            // SAFETY: i < MAX_CHANNELS, so the projected element is in bounds.
+            let g = unsafe { gens.add(i) };
+            // SAFETY: g is a valid, aligned, exclusively owned element.
+            unsafe { g.write(0) };
+        }
+        // SAFETY: same projection argument; `count` is a plain usize.
+        let count = unsafe { core::ptr::addr_of_mut!((*ptr).count) };
+        // SAFETY: count is valid and exclusively owned.
+        unsafe { count.write(0) };
+        // SAFETY: every field of Self has now been written exactly once
+        // and ptr came from `alloc` with Self's layout.
+        Some(unsafe { Box::from_raw(ptr) })
+    }
 }
 
 impl ChannelManager {

@@ -136,6 +136,14 @@ pub enum BootError {
     /// The step detail is printed at the site before this is returned.
     /// Site: `src/microkernel/main.rs` `create_init_process`.
     InitCreationFailed,
+
+    /// `boot::begin_install` was called a second time — two boot
+    /// adapters (or one adapter twice) tried to populate the BootInfo
+    /// singleton. A programming error in the boot path, surfaced typed
+    /// rather than as a panic (ADR-021).
+    /// Site: `src/boot/mod.rs` `begin_install`; the Limine adapter
+    /// returns it, the riscv64 adapter halts with a message.
+    BootInfoAlreadyClaimed,
 }
 
 /// Halt the system on a typed boot-path failure.
@@ -180,6 +188,8 @@ pub fn boot_failed(err: BootError) -> ! {
             "boot manifest present but no init boot module — broken boot image",
         BootError::InitCreationFailed =>
             "creating init (PID 1) failed after manifest transcription",
+        BootError::BootInfoAlreadyClaimed =>
+            "BootInfo populated twice — boot adapter called begin_install again",
     };
     crate::println!("[BOOT FAIL] {}", msg);
     crate::halt()
@@ -216,6 +226,7 @@ mod tests {
             BootError::ManifestTranscriptionFailed,
             BootError::InitModuleMissing,
             BootError::InitCreationFailed,
+            BootError::BootInfoAlreadyClaimed,
         ];
         // Every pair of variants must be distinct under Eq.
         for (i, a) in all.iter().enumerate() {
@@ -252,6 +263,7 @@ mod tests {
             BootError::ManifestTranscriptionFailed,
             BootError::InitModuleMissing,
             BootError::InitCreationFailed,
+            BootError::BootInfoAlreadyClaimed,
         ] {
             buf.clear();
             write!(buf, "{:?}", variant).unwrap();

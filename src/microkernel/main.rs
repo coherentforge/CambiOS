@@ -27,7 +27,6 @@ extern crate alloc;
 // hierarchy here — duplicates drift, and CLAUDE.md's Post-Change Review §3
 // explicitly forbids it.
 
-use alloc::boxed::Box;
 use limine::BaseRevision;
 use limine::request::{
     FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RsdpRequest,
@@ -713,6 +712,10 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // up — kmain_riscv64 just needs to call them after the frame
     // allocator is live and before any user task spawns.
     init_kernel_object_tables();
+    // ADR-007: the global audit ring. Missing from this sequence until
+    // 2026-09-14 — audit-tail's attach failed typed (rc=-1) on every
+    // riscv64 boot; parity with the x86_64 / aarch64 sequence.
+    audit_init();
     process_table_init();
 
     // ADR-007 Divergence entry 7: tombstone for channel teardown.
@@ -1378,15 +1381,25 @@ fn init_kernel_object_tables() {
     *PROCESS_TABLE.lock() = Some(process_table);
     *CAPABILITY_MANAGER.lock() = Some(capability_manager);
 
-    // Initialize the cluster manager (lock position 5, ADR-027 § Architecture).
-    *CLUSTER_MANAGER.lock() = Some(Box::new(
-        cambios_core::ipc::cluster::ClusterManager::new(),
-    ));
-
-    // Initialize the channel manager (lock position 6, was 5 before ADR-027).
-    *CHANNEL_MANAGER.lock() = Some(Box::new(
-        cambios_core::ipc::channel::ChannelManager::new(),
-    ));
+    // Initialize the cluster manager (lock position 5, ADR-027 § Architecture)
+    // and the channel manager (lock position 6). In-place constructors:
+    // `Box::new(X::new())` would materialize the 58–75 KiB managers on
+    // the boot stack first — the riscv64 boot-rot root cause (2026-09-14;
+    // Convention 4).
+    match cambios_core::ipc::cluster::ClusterManager::new_boxed() {
+        Some(cm) => *CLUSTER_MANAGER.lock() = Some(cm),
+        None => {
+            println!("✗ ClusterManager allocation failed — halting");
+            cambios_core::halt();
+        }
+    }
+    match cambios_core::ipc::channel::ChannelManager::new_boxed() {
+        Some(chm) => *CHANNEL_MANAGER.lock() = Some(chm),
+        None => {
+            println!("✗ ChannelManager allocation failed — halting");
+            cambios_core::halt();
+        }
+    }
 }
 
 /// ADR-007: allocate global audit ring buffer from the frame
@@ -1413,10 +1426,11 @@ fn audit_init() {
 
     let capacity = ring.capacity();
     let pages = ring.page_count();
+    let ring_phys = ring.physical_base();
     *cambios_core::AUDIT_RING.lock() = Some(ring);
 
-    println!("✓ Audit: initialized ({} pages, {} event slots)",
-        pages, capacity);
+    println!("✓ Audit: initialized ({} pages, {} event slots, ring phys={:#x})",
+        pages, capacity, ring_phys);
 }
 
 /// Map ACPI-related physical memory into the HHDM (x86_64 only).

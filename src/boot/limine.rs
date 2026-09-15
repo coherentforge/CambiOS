@@ -25,7 +25,7 @@ use limine::request::{
 };
 
 use crate::boot::{
-    BootError, BootInfo, FramebufferInfo, MAX_MODULE_NAME_LEN, MemoryRegion, MemoryRegionKind,
+    BootError, FramebufferInfo, MAX_MODULE_NAME_LEN, MemoryRegion, MemoryRegionKind,
     ModuleInfo,
 };
 use crate::boot_modules::strip_module_name;
@@ -58,7 +58,10 @@ pub fn populate(
     rsdp: &RsdpRequest,
     modules: &ModuleRequest,
 ) -> Result<(), BootError> {
-    let mut info = BootInfo::empty();
+    // In-place population of the BootInfo singleton (never a ~17 KiB
+    // stack local — see BootInfo::init_empty_at). A second call is a
+    // typed boot error, not a panic.
+    let mut info = crate::boot::begin_install().ok_or(BootError::BootInfoAlreadyClaimed)?;
 
     info.hhdm_offset = hhdm
         .get_response()
@@ -156,7 +159,7 @@ pub fn populate(
         }
     }
 
-    crate::boot::install(info);
+    info.finish();
     Ok(())
 }
 

@@ -32,7 +32,7 @@
 // `#[path]`-include this file without dragging in `super::BootInfo` and
 // its kernel-graph tentacles. Same pattern as verification/capability-proofs.
 #[cfg(not(any(test, fuzzing)))]
-use super::{BootInfo, MemoryRegion, MemoryRegionKind};
+use super::{MemoryRegion, MemoryRegionKind};
 
 // ============================================================================
 // FDT header + tokens
@@ -644,7 +644,15 @@ pub(crate) fn walk_dtb_slice(blob: &[u8]) -> Option<DtbFacts> {
 /// - Must be called exactly once, before [`super::info`] is read.
 #[cfg(not(any(test, fuzzing)))]
 pub unsafe fn populate(dtb_phys: u64) {
-    let mut info = BootInfo::empty();
+    // In-place population: the ~17 KiB BootInfo is never a stack local
+    // on the riscv64 boot stack (see BootInfo::init_empty_at).
+    let mut info = match super::begin_install() {
+        Some(b) => b,
+        None => {
+            crate::println!("[boot::riscv] BootInfo already claimed — halting");
+            crate::halt();
+        }
+    };
 
     // HHDM offset was set by `kmain_riscv64` before this call (it
     // matches the value in src/arch/riscv64/entry.rs). Record it so
@@ -786,5 +794,5 @@ pub unsafe fn populate(dtb_phys: u64) {
         });
     }
 
-    super::install(info);
+    info.finish();
 }

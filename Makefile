@@ -1671,21 +1671,15 @@ kernel-riscv64:
 # img-riscv64 deps, copy + sign + --module here, and pick the right
 # slot in BOOT_MODULE_ORDER (between compositor's last GUI dep and
 # shell, mirroring x86_64).
-img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 fde-mount-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
+img-riscv64: init-riscv64 manifest-riscv64 policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 fde-mount-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 audit-tail-riscv64 sign-tool mkinitrd
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64
 	mkdir -p initrd_root_riscv64
-	# ADR-018 step 8: riscv64 stays on the legacy-chain fallback for
-	# now — the first-ever exercise of handle_spawn on riscv64 (init's
-	# supervised wave) hit kernel-memory corruption (SPAWN_GRANTS count
-	# garbage, spawned task running the wrong module's bytes, init
-	# context reset; signature in STATUS Known Issues). Until that
-	# kernel bug is fixed, manifest.bin + init deliberately do NOT
-	# enter the initrd: absent manifest ⇒ legacy boot, by design.
-	# The manifest-riscv64 target stays buildable for the fix.
-	# Revisit when: the riscv64 spawn-path corruption is fixed —
-	# staging is then: cp init + `--module manifest.bin=` +
-	# `--module init=` lines here (see img-aarch64 for the shape).
+	# ADR-018 step 8: init rides the initrd signed like any module;
+	# manifest-riscv64.bin arrives signed by its prerequisite (no
+	# re-sign — stacked trailers break verification) and enters the
+	# archive under the name MANIFEST_MODULE_NAME expects. Both first.
+	cp $(INIT_ELF_RISCV64)           initrd_root_riscv64/init.elf
 	cp $(POLICY_SERVICE_ELF_RISCV64) initrd_root_riscv64/policy-service.elf
 	cp $(KS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/key-store-service.elf
 	cp $(FS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/fs-service.elf
@@ -1697,6 +1691,7 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	cp $(UDP_STACK_ELF_RISCV64)      initrd_root_riscv64/udp-stack.elf
 	cp $(SHELL_ELF_RISCV64)          initrd_root_riscv64/shell.elf
 	cp $(AUDIT_TAIL_ELF_RISCV64)     initrd_root_riscv64/audit-tail.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/init.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/policy-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fs-service.elf
@@ -1713,6 +1708,8 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	# roster must be identical across arches (future ADR-018 manifest
 	# will make this explicit).
 	$(MKINITRD) --out $(INITRD_RISCV64) \
+		--module manifest.bin=manifest-riscv64.bin \
+		--module init=initrd_root_riscv64/init.elf \
 		--module policy-service=initrd_root_riscv64/policy-service.elf \
 		--module key-store-service=initrd_root_riscv64/key-store-service.elf \
 		--module fs-service=initrd_root_riscv64/fs-service.elf \
