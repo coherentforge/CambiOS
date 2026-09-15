@@ -68,8 +68,8 @@ pub const MAX_CHANNEL_PAGES: u32 = 65536;
 pub const MIN_CHANNEL_PAGES: u32 = 1;
 
 /// SCAFFOLDING: per-channel quiesce timeout (10 ticks = 100ms @ 100Hz).
-/// ADR-027 Phase 1 — bounds the wait `SYS_CHANNEL_REVOKE` and the
-/// `revoke_all_for_process` sweep do for the peer to park before the
+/// ADR-027 Phase 1 — bounds the wait the `revoke_all_for_process`
+/// sweep and cluster revoke do for the peer to park before the
 /// kernel proceeds with unmap. Sized so ≥ 1 tick (10ms) lets next-ISR
 /// preempt catch the peer (10× headroom for slow yields), and < 150ms
 /// application-response threshold leaves the compositor #PF resolution

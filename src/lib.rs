@@ -589,9 +589,9 @@ pub fn task_parent_and_state(
 ///
 /// Performance: O(MAX_CPUS × MAX_TASKS) worst case (scanning every
 /// per-CPU scheduler). With realistic v1 CPU counts (4-8) and task
-/// counts (~32 active), this is sub-millisecond. Called from
-/// `SYS_CHANNEL_REVOKE` and the `revoke_all_for_process` sweep on
-/// `SYS_EXIT` — slow paths where the cost is invisible.
+/// counts (~32 active), this is sub-millisecond. Called from the
+/// `revoke_all_for_process` sweep on `SYS_EXIT` and the cluster
+/// revoke path — slow paths where the cost is invisible.
 #[cfg(not(test))]
 pub fn arm_quiesce_for_process(
     peer_pid: ipc::ProcessId,
@@ -771,9 +771,12 @@ pub fn try_load_balance() {
 
 /// Bootstrap Principal — the first identity in the system.
 ///
-/// Generated at boot from a deterministic seed or device entropy.
-/// Used to restrict BindPrincipal syscall: only the bootstrap Principal can
-/// bind identities to processes. Written once during boot, read-only after.
+/// The kernel-baked bootstrap public key as a Principal (ADR-032:
+/// AID equals pubkey). The trust anchor for every signed artifact
+/// (service ELFs, init, the boot manifest, the volume header). No
+/// process is bound to it since the ADR-018 cutover — it is a
+/// verification key, not a runtime identity. Written once during
+/// boot, read-only after.
 pub static BOOTSTRAP_PRINCIPAL: BootstrapPrincipal = BootstrapPrincipal::new();
 
 /// Atomic-like wrapper for the bootstrap Principal.

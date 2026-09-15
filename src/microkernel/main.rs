@@ -2051,8 +2051,9 @@ fn bootstrap_identity_init() {
 
     let bootstrap = Principal::from_aid(BOOTSTRAP_PUBKEY);
 
-    // Store globally for BindPrincipal restriction check and ELF signature verification.
-    // No secret key stored — the signing key lives on the hardware YubiKey.
+    // Store globally as the signature-verification anchor (ELFs, manifest,
+    // volume header). No secret key stored — the signing key lives on the
+    // hardware YubiKey.
     BOOTSTRAP_PRINCIPAL.store(bootstrap);
 
     // Bind the bootstrap Principal to all kernel processes (0-2)

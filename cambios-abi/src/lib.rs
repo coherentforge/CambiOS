@@ -95,10 +95,14 @@ pub enum SyscallNumber {
     /// Print a string to the kernel serial console (for debugging)
     Print = 10,
 
-    /// bind_principal(process_id: u32, pubkey_ptr: *const u8, pubkey_len: u32) -> i32
-    /// Bind a cryptographic Principal to a process. Restricted to the bootstrap
-    /// Principal (identity service). pubkey_len must be 32.
-    BindPrincipal = 11,
+    // Slot 11 deliberately vacated: was `BindPrincipal`, the "identity
+    // service binds a Principal to a process" call, gated on the caller
+    // being the bootstrap Principal. Retired 2026-09-15: since the
+    // ADR-018 cutover every process is bound at spawn from its manifest
+    // row (kernel-internal `CapabilityManager::bind_principal`), no
+    // process is bootstrap-bound, and the gate was unsatisfiable. Do NOT
+    // reuse this slot — the slot-18 discipline. New syscalls take new
+    // numbers.
 
     /// get_principal(out_buf: *mut u8, buf_len: u32) -> i32
     /// Read the calling process's bound Principal (32-byte public key).
@@ -183,13 +187,15 @@ pub enum SyscallNumber {
 
     /// revoke_capability(target_process_id: u32, endpoint_id: u32) -> i32
     /// Revoke a capability held by another process on a given endpoint.
-    /// Per ADR-007 §"Who can revoke", Phase 3.1 restricts this to the bootstrap
-    /// Principal; other authority paths (original grantor, holder of `revoke`
-    /// right, policy service) land in Phase 3.4.
+    /// Authority (ADR-007 §"Who can revoke"): the caller must itself hold
+    /// a capability on `endpoint_id` carrying the `revoke` right — the
+    /// manifest's `Rights::revoke` bit is how a service is granted that
+    /// authority. The original bootstrap-Principal-only gate was retired
+    /// 2026-09-15 (no process is bootstrap-bound after the ADR-018
+    /// cutover); the grantor and policy-service paths remain future work.
     ///
-    /// Args are `(target_process_id, endpoint_id)` in Phase 3.1 for simplicity.
-    /// Phase 3.2d refactors this to a single `CapabilityHandle` once channels
-    /// force a system-wide capability registry into existence.
+    /// Args are `(target_process_id, endpoint_id)`; a single
+    /// `CapabilityHandle` refactor is deferred to the post-v1 handle table.
     ///
     /// Returns 0 on success, negative error code on failure.
     RevokeCapability = 27,
@@ -217,11 +223,12 @@ pub enum SyscallNumber {
     /// creator or peer may call this. Returns 0 on success.
     ChannelClose = 30,
 
-    /// channel_revoke(channel_id: u64) -> i32
-    /// Force-close a channel from a third party (bootstrap/policy
-    /// authority). Same teardown as close but no caller-identity check.
-    /// Returns 0 on success.
-    ChannelRevoke = 31,
+    // Slot 31 deliberately vacated: was `ChannelRevoke`, a third-party
+    // force-close gated on the bootstrap Principal. Retired 2026-09-15:
+    // zero userspace callers ever existed, the kernel's own revoke-on-exit
+    // sweep never routed through it, and after the ADR-018 cutover the
+    // gate was unsatisfiable. Do NOT reuse this slot — the slot-18
+    // discipline. A future policy-mediated force-close takes a new number.
 
     /// channel_info(channel_id: u64, out_buf: *mut u8, buf_len: u32) -> i32
     /// Read channel metadata (size, state, principals, byte counters)
@@ -525,10 +532,11 @@ pub enum SyscallNumber {
     /// is rejected with `InvalidArg` (slot already gone).
     ///
     /// Authority: caller must be the channel's creator or peer
-    /// (same shape as `ChannelClose`). Bootstrap-Principal authority
-    /// continues to use `ChannelRevoke` (single-phase) for forced
-    /// teardown; this two-phase API is for cooperative teardown
-    /// initiated by an endpoint.
+    /// (same shape as `ChannelClose`). There is no third-party forced
+    /// teardown syscall (slot 31 retired); the kernel's own
+    /// revoke-on-exit sweep is the only non-endpoint teardown path.
+    /// This two-phase API is for cooperative teardown initiated by an
+    /// endpoint.
     ///
     /// Returns: 0 (Immediate, slot already torn down), 1 (Quiesce,
     /// peer arming in flight, must call complete_teardown next),
@@ -777,11 +785,10 @@ pub enum SyscallNumber {
     /// not the bootstrap Principal; `Enosys` if virtio-blk's
     /// kernel-cmd path isn't initialized yet.
     ///
-    /// Identity-required: yes. Authority is bootstrap-Principal-only
-    /// — the syscall reads raw disk bytes before any volume layer
-    /// has authenticated them, so it must be tightly scoped to the
-    /// signed `fde-mount` boot module. Same gating shape as
-    /// `BindPrincipal`.
+    /// Identity-required: yes. Authority: the `UnlockVolume` system
+    /// capability (manifest `unlock-volume`, held by fde-mount) — the
+    /// syscall reads raw disk bytes before any volume layer has
+    /// authenticated them, so it must be tightly scoped.
     ReadVolumeHeader = 74,
 
     /// SYS_INSTALL_MASTER_KEY (75): hand the kernel the unwrapped
@@ -810,11 +817,10 @@ pub enum SyscallNumber {
     ///          `OutOfMemory` if `DiskObjectStore::open_or_format`
     ///          fails to allocate kernel-side state.
     ///
-    /// Identity-required: yes. Authority is bootstrap-Principal-
-    /// only — the master key is the load-bearing secret guarding
-    /// every block of persistent state; it must be tightly scoped
-    /// to the signed `fde-mount` boot module. Same gating shape as
-    /// `BindPrincipal`, `VerifyVolumeHeader`, and `ReadVolumeHeader`.
+    /// Identity-required: yes. Authority: the `UnlockVolume` system
+    /// capability (same gate as `ReadVolumeHeader`) — the master key
+    /// is the load-bearing secret guarding every block of persistent
+    /// state; it must be tightly scoped to fde-mount.
     ///
     /// Idempotency: one-shot. After the first successful call, all
     /// subsequent calls fail `PermissionDenied`. The kernel does not
@@ -843,12 +849,11 @@ impl SyscallNumber {
             Self::DeviceInfo | Self::PortIo |
             Self::ObjPut | Self::ObjGet | Self::ObjDelete |
             Self::ObjList | Self::ObjPutSigned |
-            Self::BindPrincipal |
             Self::Spawn | Self::WaitTask |
             Self::ConsoleRead |
             Self::RevokeCapability |
             Self::ChannelCreate | Self::ChannelAttach |
-            Self::ChannelClose | Self::ChannelRevoke | Self::ChannelInfo |
+            Self::ChannelClose | Self::ChannelInfo |
             Self::AuditAttach | Self::AuditInfo |
             Self::MapFramebuffer |
             Self::VirtioModernCaps |
@@ -889,7 +894,7 @@ impl SyscallNumber {
             8 => Some(Self::GetPid),
             9 => Some(Self::GetTime),
             10 => Some(Self::Print),
-            11 => Some(Self::BindPrincipal),
+            // 11 = removed (was BindPrincipal; see slot comment above).
             12 => Some(Self::GetPrincipal),
             13 => Some(Self::RecvMsg),
             14 => Some(Self::ObjPut),
@@ -909,7 +914,7 @@ impl SyscallNumber {
             28 => Some(Self::ChannelCreate),
             29 => Some(Self::ChannelAttach),
             30 => Some(Self::ChannelClose),
-            31 => Some(Self::ChannelRevoke),
+            // 31 = removed (was ChannelRevoke; see slot comment above).
             32 => Some(Self::ChannelInfo),
             33 => Some(Self::AuditAttach),
             34 => Some(Self::AuditInfo),
@@ -1626,7 +1631,7 @@ mod tests {
             SyscallNumber::Allocate, SyscallNumber::Free, SyscallNumber::WaitIrq,
             SyscallNumber::RegisterEndpoint, SyscallNumber::Yield,
             SyscallNumber::GetPid, SyscallNumber::GetTime, SyscallNumber::Print,
-            SyscallNumber::BindPrincipal, SyscallNumber::GetPrincipal,
+            SyscallNumber::GetPrincipal,
             SyscallNumber::RecvMsg, SyscallNumber::ObjPut, SyscallNumber::ObjGet,
             SyscallNumber::ObjDelete, SyscallNumber::ObjList,
             SyscallNumber::ObjPutSigned,
@@ -1635,7 +1640,7 @@ mod tests {
             SyscallNumber::ConsoleRead, SyscallNumber::Spawn,
             SyscallNumber::WaitTask, SyscallNumber::RevokeCapability,
             SyscallNumber::ChannelCreate, SyscallNumber::ChannelAttach,
-            SyscallNumber::ChannelClose, SyscallNumber::ChannelRevoke,
+            SyscallNumber::ChannelClose,
             SyscallNumber::ChannelInfo, SyscallNumber::AuditAttach,
             SyscallNumber::AuditInfo,
             SyscallNumber::MapFramebuffer,
@@ -1704,14 +1709,16 @@ mod tests {
         // ReadVolumeHeader, 75 InstallMasterKey) round out the
         // current high-water mark.
         //
-        // Slots 18 and 36 are deliberate gaps: 18 was `ClaimBootstrapKey`
-        // until the Frame-A vestige cleanup, 36 was `ModuleReady` until
-        // ADR-018 step 9 deleted the boot-release chain; reuse of either
-        // is prohibited (see the slot comments up by the variant
-        // definitions). `from_u64` must return None for both and they
-        // are excluded from the sweep.
+        // Slots 11, 18, 31 and 36 are deliberate gaps: 11 was
+        // `BindPrincipal` and 31 `ChannelRevoke` (bootstrap-only gates,
+        // unsatisfiable after the ADR-018 cutover; retired 2026-09-15),
+        // 18 was `ClaimBootstrapKey` until the Frame-A vestige cleanup,
+        // 36 was `ModuleReady` until ADR-018 step 9 deleted the
+        // boot-release chain. Reuse of any is prohibited (see the slot
+        // comments up by the variant definitions). `from_u64` must
+        // return None for each and they are excluded from the sweep.
         for i in 0..=75u64 {
-            if i == 18 || i == 36 {
+            if matches!(i, 11 | 18 | 31 | 36) {
                 assert!(SyscallNumber::from_u64(i).is_none(),
                     "slot {} must remain vacated; reuse is prohibited", i);
                 continue;

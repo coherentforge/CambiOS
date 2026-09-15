@@ -526,7 +526,7 @@ Handlers live in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs). All I
 
 - **Exit**: calls `CapabilityManager::revoke_all_for_process()` ([ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial.
 - **Allocate**: rolls back on OOM.
-- **BindPrincipal**, **AuditAttach**, **ChannelRevoke**, early **RevokeCapability**: **bootstrap-Principal-only**.
+- **No syscall is bootstrap-Principal-gated any more** (slots 11 `BindPrincipal` and 31 `ChannelRevoke` retired 2026-09-15; never reused). Principals are bound kernel-internally at spawn from the manifest row. **AuditAttach** is gated by `AuditConsumer`, the FDE pair by `UnlockVolume`, cluster create/revoke by `CreateCluster` / `ClusterRevoke` (or being the cluster's creator), and **RevokeCapability** by holding the `revoke` right on the target endpoint (ADR-007 § "Who can revoke", path 2).
 - **RecvMsg**: wire format is `[sender_principal:32][from_endpoint:4][payload:N]`. Blocks on `MessageWait(endpoint)`.
 - **TryRecvMsg** (Phase 4b): non-blocking RecvMsg. Required for services polling multiple endpoints (virtio-blk ep24+ep26). `from_endpoint` is the sender's **reply endpoint** (first registered endpoint, tracked in `REPLY_ENDPOINT`) — before Phase 4b, `from = pid_slot` sent replies into a queue nobody read.
 - **ObjPutSigned**: caller supplies an Ed25519 signature; kernel verifies against caller's Principal before storing.

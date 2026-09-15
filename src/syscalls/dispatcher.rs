@@ -211,7 +211,6 @@ impl SyscallDispatcher {
             SyscallNumber::GetPid => Self::handle_get_pid(args, &ctx),
             SyscallNumber::GetTime => Self::handle_get_time(args, &ctx),
             SyscallNumber::Print => Self::handle_print(args, &ctx),
-            SyscallNumber::BindPrincipal => Self::handle_bind_principal(args, &ctx),
             SyscallNumber::GetPrincipal => Self::handle_get_principal(args, &ctx),
             SyscallNumber::RecvMsg => Self::handle_recv_msg(args, &ctx),
             SyscallNumber::TryRecvMsg => Self::handle_try_recv_msg(args, &ctx),
@@ -233,7 +232,6 @@ impl SyscallDispatcher {
             SyscallNumber::ChannelCreate => Self::handle_channel_create(args, &ctx),
             SyscallNumber::ChannelAttach => Self::handle_channel_attach(args, &ctx),
             SyscallNumber::ChannelClose => Self::handle_channel_close(args, &ctx),
-            SyscallNumber::ChannelRevoke => Self::handle_channel_revoke(args, &ctx),
             SyscallNumber::ChannelInfo => Self::handle_channel_info(args, &ctx),
 
             // Audit infrastructure (ADR-007)
@@ -1235,53 +1233,6 @@ impl SyscallDispatcher {
     // ========================================================================
     // Identity syscalls
     // ========================================================================
-
-    /// SYS_BIND_PRINCIPAL: Bind a cryptographic Principal to a process.
-    ///
-    /// Args: arg1 = target process_id, arg2 = pubkey_ptr (user vaddr),
-    ///        arg3 = pubkey_len (must be 32)
-    ///
-    /// Restricted: only the bootstrap Principal can call this. This is the
-    /// identity service's privilege — it binds Principals to processes on
-    /// behalf of the system.
-    ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) only.
-    fn handle_bind_principal(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        let target_pid = args.arg1_u32();
-        let pubkey_ptr = args.arg2;
-        let pubkey_len = args.arg_usize(3);
-
-        // Public key must be exactly 32 bytes (Ed25519)
-        if pubkey_len != 32 {
-            return Err(SyscallError::InvalidArg);
-        }
-
-        // ADR-020 Phase B: read 32-byte public key via typed slice.
-        let pubkey_slice = UserReadSlice::validate(ctx, pubkey_ptr, 32)?;
-        let mut pubkey = [0u8; 32];
-        pubkey_slice.read_into(&mut pubkey)?;
-
-        // Restriction: only the bootstrap Principal can bind Principals.
-        // caller_principal is already resolved by dispatch().
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        let caller = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
-        if *caller != bootstrap {
-            return Err(SyscallError::PermissionDenied);
-        }
-
-        // Bind the Principal to the target process
-        let target = ProcessId::new(target_pid, 0);
-        let principal = crate::ipc::Principal::from_public_key(pubkey);
-
-        let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
-        let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
-
-        cap_mgr
-            .bind_principal(target, principal)
-            .map_err(|_| SyscallError::PermissionDenied)?;
-
-        Ok(0)
-    }
 
     /// SYS_GET_PRINCIPAL: Read the calling process's bound Principal.
     ///
@@ -2743,13 +2694,12 @@ impl SyscallDispatcher {
     ///
     /// Args: arg1 = target_process_id (u32), arg2 = endpoint_id (u32)
     ///
-    /// Authority — v0 (per ADR-007 §"Who can revoke"):
-    ///   Only the bootstrap Principal can call this. Matches the restriction
-    ///   pattern of `handle_bind_principal`.
-    ///
-    /// Future work will relax this to also accept: the original grantor of the
-    /// capability, and any process holding the `revoke` right on the endpoint
-    /// (once the policy service exists as the mediator for those paths).
+    /// Authority (ADR-007 §"Who can revoke", path 2): the caller holds a
+    /// capability on `endpoint_id` carrying the `revoke` right — granted
+    /// by the manifest's `Rights::revoke` bit. Checked inside
+    /// `CapabilityManager::revoke` atomically with the table mutation.
+    /// The original-grantor path and policy-service mediation remain
+    /// future work (see the primitive's doc for the trigger).
     ///
     /// The argument shape will refactor from `(pid, endpoint)` to a single
     /// `CapabilityHandle` once channels force a system-wide capability
@@ -2760,23 +2710,15 @@ impl SyscallDispatcher {
         let target_pid = crate::ipc::ProcessId::new(args.arg1_u32(), 0);
         let endpoint_id = crate::ipc::EndpointId(args.arg2_u32());
 
-        // Read the bootstrap Principal once at the syscall boundary.
-        // Passed into CapabilityManager::revoke() as the authority reference,
-        // so the primitive stays testable without touching globals.
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-
         // Lock ordering: CAPABILITY_MANAGER(4)
         let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
         let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        // caller_principal already resolved by dispatch()
-        let revoker_principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
-
         // Delegate to the primitive. revoke() performs the authority check
-        // (revoker_principal == bootstrap) and the table mutation atomically
-        // under the lock we hold.
+        // (caller holds the `revoke` right on the endpoint) and the table
+        // mutation atomically under the lock we hold.
         cap_mgr
-            .revoke(target_pid, endpoint_id, revoker_principal, bootstrap)
+            .revoke(target_pid, endpoint_id, ctx.process_id)
             .map_err(|e| match e {
                 crate::ipc::capability::CapabilityError::AccessDenied => SyscallError::PermissionDenied,
                 crate::ipc::capability::CapabilityError::ProcessNotFound => SyscallError::InvalidArg,
@@ -3078,46 +3020,6 @@ impl SyscallDispatcher {
 
         crate::println!(
             "  [ChannelClose] pid={} channel={} pages={}",
-            ctx.process_id.slot(),
-            channel_id.as_raw(),
-            record.num_pages,
-        );
-
-        Ok(0)
-    }
-
-    /// SYS_CHANNEL_REVOKE: Force-close a channel (bootstrap authority).
-    ///
-    /// Args: arg1 = channel_id (u64)
-    ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) →
-    /// PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
-    fn handle_channel_revoke(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
-        use crate::ipc::channel::ChannelId;
-
-        let channel_id = ChannelId::from_raw(args.arg1);
-
-        // --- Authority check: bootstrap Principal only (v0 pattern) ---
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-        let caller_principal = ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
-        if *caller_principal != bootstrap {
-            return Err(SyscallError::PermissionDenied);
-        }
-
-        // --- Revoke in ChannelManager ---
-        let record = {
-            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
-            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
-            chan_mgr
-                .revoke(channel_id)
-                .map_err(|_| SyscallError::InvalidArg)?
-        }; // drop CHANNEL_MANAGER(5)
-
-        // --- Teardown ---
-        Self::teardown_channel_mappings(&record);
-
-        crate::println!(
-            "  [ChannelRevoke] pid={} channel={} pages={}",
             ctx.process_id.slot(),
             channel_id.as_raw(),
             record.num_pages,
@@ -3588,10 +3490,10 @@ impl SyscallDispatcher {
     ///
     /// Returns: `ClusterId` raw `u64` on success.
     ///
-    /// Authority: `CapabilityKind::CreateCluster` OR bootstrap
-    /// Principal (the bootstrap path is the v1 fallback until the
-    /// boot manifest grants the cap to `init` — see ADR-027 §
-    /// Migration Path step 6).
+    /// Authority: `CapabilityKind::CreateCluster` (manifest
+    /// `create-cluster`). The bootstrap-Principal fallback ADR-027 §
+    /// Migration Path step 6 allowed for was retired 2026-09-15 — the
+    /// manifest is the grant path now.
     ///
     /// Lock ordering: `CAPABILITY_MANAGER(4)` → `CLUSTER_MANAGER(5)`.
     fn handle_cluster_create(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
@@ -3614,7 +3516,7 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Authority: CreateCluster cap OR bootstrap Principal.
+        // Authority: CreateCluster cap.
         {
             let cap_guard = crate::CAPABILITY_MANAGER.lock();
             let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
@@ -3625,14 +3527,7 @@ impl SyscallDispatcher {
                 )
                 .unwrap_or(false);
             if !has_cap {
-                let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
-                let caller_principal = ctx
-                    .caller_principal
-                    .as_ref()
-                    .ok_or(SyscallError::PermissionDenied)?;
-                if *caller_principal != bootstrap {
-                    return Err(SyscallError::PermissionDenied);
-                }
+                return Err(SyscallError::PermissionDenied);
             }
         } // drop CAPABILITY_MANAGER
 
@@ -3785,7 +3680,7 @@ impl SyscallDispatcher {
     /// Returns: 0 on success.
     ///
     /// Authority: cluster's creator OR `CapabilityKind::ClusterRevoke`
-    /// OR bootstrap Principal.
+    /// (manifest `cluster-revoke`).
     ///
     /// Lock-acquisition: see [`Dispatcher::do_cluster_revoke`].
     fn handle_cluster_revoke(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
@@ -3801,14 +3696,8 @@ impl SyscallDispatcher {
                 .creator_pid
         };
 
-        let caller_principal = *ctx
-            .caller_principal
-            .as_ref()
-            .ok_or(SyscallError::PermissionDenied)?;
-        let bootstrap = crate::BOOTSTRAP_PRINCIPAL.load();
         let is_creator = ctx.process_id == creator_pid;
-        let is_bootstrap = caller_principal == bootstrap;
-        let has_cap = if !is_creator && !is_bootstrap {
+        let has_cap = if !is_creator {
             let cap_guard = crate::CAPABILITY_MANAGER.lock();
             let cap_mgr = cap_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
             cap_mgr
@@ -3820,7 +3709,7 @@ impl SyscallDispatcher {
         } else {
             false
         };
-        if !is_creator && !is_bootstrap && !has_cap {
+        if !is_creator && !has_cap {
             return Err(SyscallError::PermissionDenied);
         }
 
@@ -4014,10 +3903,10 @@ impl SyscallDispatcher {
     ///          AArch64 with no virtio-blk device); `OutOfMemory`
     ///          if a block read fails mid-read.
     ///
-    /// Authority: bootstrap-Principal-only. Reads raw disk bytes
+    /// Authority: the `UnlockVolume` system capability (manifest
+    /// `unlock-volume`, held by fde-mount). Reads raw disk bytes
     /// before any volume layer has authenticated them, so it must
-    /// be tightly scoped to the signed `fde-mount` boot module.
-    /// Same gating shape as `BindPrincipal`.
+    /// be tightly scoped.
     ///
     /// Lock ordering: none directly. `VirtioBlkDevice::call`
     /// yields the calling task via `yield_save_and_switch` while
@@ -4132,9 +4021,9 @@ impl SyscallDispatcher {
     ///       arg2 = byte length (must equal 64).
     /// Returns: 0 on success.
     ///
-    /// Authority: bootstrap-Principal-only. The master key
-    /// unlocks every block of persistent state; gating must be
-    /// as tight as `BindPrincipal`.
+    /// Authority: the `UnlockVolume` system capability (same gate
+    /// as `ReadVolumeHeader`). The master key unlocks every block
+    /// of persistent state; gating must be that tight.
     ///
     /// Idempotency: one-shot. If `OBJECT_STORE` already holds a
     /// `LazyDisk` variant, the call fails `PermissionDenied`. The
@@ -4879,37 +4768,6 @@ mod tests {
         let ctx = fake_ctx();
         assert_eq!(
             SyscallDispatcher::handle_print(args(0x1000, 257, 0), &ctx),
-            Err(SyscallError::InvalidArg),
-        );
-    }
-
-    // ---- handle_bind_principal validation ----------------------------------
-
-    #[test]
-    fn handle_bind_principal_pubkey_len_zero_invalid() {
-        let ctx = fake_ctx();
-        // arg1=target_pid, arg2=pubkey_ptr, arg3=pubkey_len=0.
-        assert_eq!(
-            SyscallDispatcher::handle_bind_principal(args(1, 0x1000, 0), &ctx),
-            Err(SyscallError::InvalidArg),
-        );
-    }
-
-    #[test]
-    fn handle_bind_principal_pubkey_len_31_invalid() {
-        let ctx = fake_ctx();
-        assert_eq!(
-            SyscallDispatcher::handle_bind_principal(args(1, 0x1000, 31), &ctx),
-            Err(SyscallError::InvalidArg),
-        );
-    }
-
-    #[test]
-    fn handle_bind_principal_pubkey_len_64_invalid() {
-        let ctx = fake_ctx();
-        // Common confusion with secret-key length — must still reject.
-        assert_eq!(
-            SyscallDispatcher::handle_bind_principal(args(1, 0x1000, 64), &ctx),
             Err(SyscallError::InvalidArg),
         );
     }

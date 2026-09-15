@@ -760,8 +760,8 @@ impl Scheduler {
     /// locate a peer task by its `ChannelRecord::peer_pid` without
     /// maintaining a global pid→task map. The kernel's task↔process
     /// linkage is 1:1 today, so the first match is the only match.
-    /// O(MAX_TASKS) scan; called from the slow path
-    /// (`SYS_CHANNEL_REVOKE`, process exit).
+    /// O(MAX_TASKS) scan; called from the slow path (channel
+    /// revoke-on-exit, cluster revoke).
     pub fn find_task_for_process(
         &self,
         process_id: crate::ipc::ProcessId,

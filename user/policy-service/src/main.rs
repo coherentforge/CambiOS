@@ -83,7 +83,6 @@ const HELLO_PROFILE: Profile = DEFAULT_PROFILE;
 const KEY_STORE_PROFILE: Profile = DEFAULT_PROFILE
     | profile(&[
         SyscallNumber::Write, SyscallNumber::RegisterEndpoint, SyscallNumber::RecvMsg,
-        SyscallNumber::BindPrincipal,
     ]);
 
 /// FS service — ObjectStore gateway.

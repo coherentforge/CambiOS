@@ -166,8 +166,9 @@ pub struct ProcessCapabilities {
     /// Number of active capabilities
     count: u8,
     /// Cryptographic identity bound to this process.
-    /// Set via BindPrincipal syscall. Once bound, cannot be rebound without
-    /// explicit unbind (prevents identity theft).
+    /// Set by the kernel at spawn from the manifest row (ADR-018) —
+    /// there is no userspace binding syscall. Once bound, cannot be
+    /// rebound without explicit unbind (prevents identity theft).
     principal: Option<Principal>,
     /// System capability: can this process create new processes?
     /// ADR-008 § Migration Path. Checked at process-creation call sites
@@ -732,12 +733,8 @@ impl CapabilityManager {
     /// This is the ADR-007 revocation primitive — the authority-checked
     /// counterpart to the low-level [`revoke_capability`] table mutation.
     ///
-    /// The `bootstrap` parameter is the current bootstrap Principal, loaded
-    /// by the caller from [`crate::BOOTSTRAP_PRINCIPAL`]. Passing it in (rather
-    /// than having this method read the global) keeps the method testable in
-    /// unit tests without depending on shared mutable global state, and
-    /// matches the pattern of the existing `handle_bind_principal`
-    /// dispatcher which also loads the bootstrap once at the syscall boundary.
+    /// `revoker` is the calling process. The method takes no globals so
+    /// it stays testable on a local manager instance.
     ///
     /// After a successful return:
     /// - The capability is removed from the holder's [`ProcessCapabilities`] table.
@@ -746,13 +743,17 @@ impl CapabilityManager {
     ///   which is the current v0 signal. (Active control-IPC notification is
     ///   deferred — see the policy-service stub below.)
     ///
-    /// # Authority — v0
+    /// # Authority
     ///
-    /// Only the bootstrap Principal can revoke. This matches the existing
-    /// pattern for `SyscallNumber::BindPrincipal`. ADR-007 §"Who can revoke" specifies
-    /// three authority paths (original grantor, holder of `revoke` right,
-    /// bootstrap/policy service); the other two land when the policy service
-    /// exists as the mediator.
+    /// The revoker must itself hold a capability on `endpoint` carrying
+    /// the `revoke` right — ADR-007 §"Who can revoke" path 2. The manifest
+    /// grants that right (`Rights::revoke`) to whichever service is meant
+    /// to police an endpoint. The original bootstrap-Principal-only gate
+    /// (path 3's v0 stand-in) was retired 2026-09-15: after the ADR-018
+    /// cutover no process is bootstrap-bound, so it admitted nobody. The
+    /// original-grantor path (1) and the policy-service mediation of
+    /// path 3 remain future work.
+    /// Revisit when: the policy service (ADR-006) issues its first revoke.
     ///
     /// # Stubbed behavior (documented, not workarounds)
     ///
@@ -784,13 +785,15 @@ impl CapabilityManager {
         &mut self,
         holder: ProcessId,
         endpoint: EndpointId,
-        revoker_principal: Principal,
-        bootstrap: Principal,
+        revoker: ProcessId,
     ) -> Result<(), CapabilityError> {
-        // Authority check — v0: bootstrap Principal only.
-        // TODO: also accept the original grantor and any holder of the
-        // `revoke` right on `endpoint`, per ADR-007 §"Who can revoke".
-        if revoker_principal != bootstrap {
+        // Authority: the revoker holds the `revoke` right on `endpoint`.
+        // Any failure to establish that (unregistered revoker, no
+        // capability, capability without the right) is one answer:
+        // denied. A revoker may not be its own target — self-revocation
+        // is `revoke_capability`'s job via process exit, not this path.
+        let revoke_right = CapabilityRights { send: false, receive: false, delegate: false, revoke: true };
+        if revoker == holder || self.verify_access(revoker, endpoint, revoke_right).is_err() {
             return Err(CapabilityError::AccessDenied);
         }
 
@@ -805,9 +808,7 @@ impl CapabilityManager {
         // Emit audit event for revocation.
         #[cfg(not(any(test, fuzzing)))]
         crate::audit::emit(crate::audit::RawAuditEvent::capability_revoked(
-            // revoker_principal is the caller's identity; for now pass the
-            // holder as a proxy since we don't track the revoker PID here.
-            holder, holder, endpoint,
+            revoker, holder, endpoint,
             crate::scheduler::Timer::get_ticks(), 0,
         ));
 
@@ -1149,14 +1150,18 @@ mod tests {
     // revoke_all_for_process(). See ADR-007 for the design.
     // ========================================================================
 
-    /// Helper: a holder process with one granted endpoint capability and a
-    /// distinct "attacker" principal, plus a known bootstrap Principal to pass
-    /// to `revoke()`. Returns (manager, holder_pid, endpoint, bootstrap).
-    fn revoke_test_fixture() -> (Box<CapabilityManager>, ProcessId, EndpointId, Principal) {
+    /// Holds the `revoke` right and nothing else.
+    const REVOKE_RIGHT: CapabilityRights =
+        CapabilityRights { send: false, receive: false, delegate: false, revoke: true };
+
+    /// Helper: a holder process with one granted endpoint capability and
+    /// a distinct "policing" process holding the `revoke` right on that
+    /// endpoint. Returns (manager, holder_pid, endpoint, revoker_pid).
+    fn revoke_test_fixture() -> (Box<CapabilityManager>, ProcessId, EndpointId, ProcessId) {
         let mut mgr = CapabilityManager::new_for_test();
         let holder = ProcessId::new(1, 0);
+        let revoker = ProcessId::new(2, 0);
         let endpoint = EndpointId(10);
-        let bootstrap = Principal::from_public_key([0xAA; 32]);
 
         mgr.register_process(holder).unwrap();
         mgr.grant_capability(
@@ -1170,16 +1175,18 @@ mod tests {
             },
         )
         .unwrap();
+        mgr.register_process(revoker).unwrap();
+        mgr.grant_capability(revoker, endpoint, REVOKE_RIGHT).unwrap();
 
-        (mgr, holder, endpoint, bootstrap)
+        (mgr, holder, endpoint, revoker)
     }
 
     #[test]
-    fn test_revoke_by_bootstrap_succeeds() {
-        let (mut mgr, holder, endpoint, bootstrap) = revoke_test_fixture();
+    fn test_revoke_by_revoke_right_holder_succeeds() {
+        let (mut mgr, holder, endpoint, revoker) = revoke_test_fixture();
 
-        // Bootstrap revokes the capability.
-        mgr.revoke(holder, endpoint, bootstrap, bootstrap).unwrap();
+        // The revoke-right holder revokes the capability.
+        mgr.revoke(holder, endpoint, revoker).unwrap();
 
         // Holder's next verify_access fails.
         let check = CapabilityRights {
@@ -1195,13 +1202,40 @@ mod tests {
     }
 
     #[test]
-    fn test_revoke_by_non_bootstrap_rejected() {
-        let (mut mgr, holder, endpoint, bootstrap) = revoke_test_fixture();
-        let attacker = Principal::from_public_key([0xBB; 32]);
+    fn test_revoke_without_revoke_right_rejected() {
+        let (mut mgr, holder, endpoint, _revoker) = revoke_test_fixture();
 
-        // Attacker tries to revoke — rejected.
+        // A process with send/receive/delegate on the endpoint but no
+        // `revoke` bit — rejected.
+        let attacker = ProcessId::new(3, 0);
+        mgr.register_process(attacker).unwrap();
+        mgr.grant_capability(
+            attacker,
+            endpoint,
+            CapabilityRights { send: true, receive: true, delegate: true, revoke: false },
+        )
+        .unwrap();
         assert_eq!(
-            mgr.revoke(holder, endpoint, attacker, bootstrap),
+            mgr.revoke(holder, endpoint, attacker),
+            Err(CapabilityError::AccessDenied)
+        );
+        // An unregistered process — rejected the same way (no leak of
+        // registration state through the error).
+        assert_eq!(
+            mgr.revoke(holder, endpoint, ProcessId::new(7, 0)),
+            Err(CapabilityError::AccessDenied)
+        );
+        // The revoke right on a DIFFERENT endpoint does not carry over.
+        let elsewhere = ProcessId::new(4, 0);
+        mgr.register_process(elsewhere).unwrap();
+        mgr.grant_capability(elsewhere, EndpointId(11), REVOKE_RIGHT).unwrap();
+        assert_eq!(
+            mgr.revoke(holder, endpoint, elsewhere),
+            Err(CapabilityError::AccessDenied)
+        );
+        // Self-revocation is not this path.
+        assert_eq!(
+            mgr.revoke(holder, endpoint, holder),
             Err(CapabilityError::AccessDenied)
         );
 
@@ -1221,50 +1255,51 @@ mod tests {
 
     #[test]
     fn test_revoke_nonexistent_endpoint_returns_endpoint_not_found() {
-        let (mut mgr, holder, _endpoint, bootstrap) = revoke_test_fixture();
+        let (mut mgr, holder, _endpoint, revoker) = revoke_test_fixture();
         let other = EndpointId(99);
+        mgr.grant_capability(revoker, other, REVOKE_RIGHT).unwrap();
 
         assert_eq!(
-            mgr.revoke(holder, other, bootstrap, bootstrap),
+            mgr.revoke(holder, other, revoker),
             Err(CapabilityError::EndpointNotFound)
         );
     }
 
     #[test]
     fn test_revoke_unregistered_process_returns_process_not_found() {
-        let (mut mgr, _holder, endpoint, bootstrap) = revoke_test_fixture();
-        // In-range ProcessId but not registered (fixture only registers PID 1).
+        let (mut mgr, _holder, endpoint, revoker) = revoke_test_fixture();
+        // In-range ProcessId but not registered (fixture registers PIDs 1, 2).
         let ghost = ProcessId::new(5, 0);
 
         assert_eq!(
-            mgr.revoke(ghost, endpoint, bootstrap, bootstrap),
+            mgr.revoke(ghost, endpoint, revoker),
             Err(CapabilityError::ProcessNotFound)
         );
     }
 
     #[test]
     fn test_revoke_out_of_range_pid_returns_invalid_operation() {
-        let (mut mgr, _holder, endpoint, bootstrap) = revoke_test_fixture();
+        let (mut mgr, _holder, endpoint, revoker) = revoke_test_fixture();
         // Beyond the manager's capacity — distinct code path from ProcessNotFound.
         let out_of_range = ProcessId::new(mgr.capacity() as u32, 0);
 
         assert_eq!(
-            mgr.revoke(out_of_range, endpoint, bootstrap, bootstrap),
+            mgr.revoke(out_of_range, endpoint, revoker),
             Err(CapabilityError::InvalidOperation)
         );
     }
 
     #[test]
     fn test_revoke_is_idempotent_failure() {
-        let (mut mgr, holder, endpoint, bootstrap) = revoke_test_fixture();
+        let (mut mgr, holder, endpoint, revoker) = revoke_test_fixture();
 
         // First revoke succeeds.
-        mgr.revoke(holder, endpoint, bootstrap, bootstrap).unwrap();
+        mgr.revoke(holder, endpoint, revoker).unwrap();
 
         // Second revoke returns EndpointNotFound — the capability is gone,
         // there is nothing to revoke. Intentional failure, not silent success.
         assert_eq!(
-            mgr.revoke(holder, endpoint, bootstrap, bootstrap),
+            mgr.revoke(holder, endpoint, revoker),
             Err(CapabilityError::EndpointNotFound)
         );
     }
@@ -1670,14 +1705,16 @@ mod tests {
         let mut mgr = CapabilityManager::new_for_test();
         let gen0 = ProcessId::new(1, 0);
         let stale = ProcessId::new(1, 1);
-        let bootstrap = Principal::from_public_key([0xAA; 32]);
+        let revoker = ProcessId::new(2, 0);
 
         mgr.register_process(gen0).unwrap();
         mgr.grant_capability(gen0, EndpointId(10), CapabilityRights::SEND_ONLY).unwrap();
+        mgr.register_process(revoker).unwrap();
+        mgr.grant_capability(revoker, EndpointId(10), REVOKE_RIGHT).unwrap();
 
-        // Revoke via stale id is rejected even with bootstrap authority.
+        // Revoke via stale id is rejected even with valid authority.
         assert_eq!(
-            mgr.revoke(stale, EndpointId(10), bootstrap, bootstrap),
+            mgr.revoke(stale, EndpointId(10), revoker),
             Err(CapabilityError::ProcessNotFound)
         );
 

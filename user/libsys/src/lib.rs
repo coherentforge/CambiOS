@@ -313,7 +313,7 @@ pub fn get_pid() -> u32 {
 
 /// Read this process's bound Principal (32-byte Ed25519 public key).
 /// Returns 32 on success (caller buffer must be ≥32 bytes), or negative
-/// error. Unbound processes (no `BindPrincipal` at boot) see
+/// error. Unbound processes (no manifest row bound at spawn) see
 /// `Principal::ANONYMOUS` — 32 zero bytes.
 pub fn get_principal(out: &mut [u8; 32]) -> i64 {
     syscall_raw3(SyscallNumber::GetPrincipal as u64, out.as_mut_ptr() as u64, 32, 0)
@@ -405,9 +405,9 @@ pub fn read_volume_header(out: &mut [u8]) -> i64 {
 /// FDE master key (`K1 || K2` per NIST SP 800-38E). The kernel
 /// constructs an `EncryptedBlockDevice<VirtioBlkDevice>`, builds a
 /// `DiskObjectStore` on top, and installs the result as the
-/// kernel's persistent ObjectStore backend. One-shot,
-/// bootstrap-Principal-only. Stream A substage A-v.d per ADR-032
-/// § Architecture.
+/// kernel's persistent ObjectStore backend. One-shot; gated by the
+/// `UnlockVolume` capability (manifest `unlock-volume`). Stream A
+/// substage A-v.d per ADR-032 § Architecture.
 ///
 /// Returns 0 on success; negative `SyscallError` on
 /// `InvalidArg` (key length not 64),
@@ -1203,13 +1203,6 @@ pub fn channel_attach(channel_id: u64) -> i64 {
 /// Only the creator or peer may call this. Returns 0 on success.
 pub fn channel_close(channel_id: u64) -> i64 {
     syscall_raw3(SyscallNumber::ChannelClose as u64, channel_id, 0, 0)
-}
-
-/// Force-revoke a channel (bootstrap/policy authority required).
-///
-/// Returns 0 on success.
-pub fn channel_revoke(channel_id: u64) -> i64 {
-    syscall_raw3(SyscallNumber::ChannelRevoke as u64, channel_id, 0, 0)
 }
 
 /// `TeardownKind` discriminants for the two-phase teardown syscall

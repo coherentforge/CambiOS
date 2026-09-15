@@ -298,10 +298,11 @@ pub trait MessageQueue {
 /// may be permitted to share authority without being permitted to take it
 /// back, which is the right behavior for audit-trail-style delegations.
 ///
-/// The `revoke` field exists but no policy path consults it yet.
-/// `SYS_REVOKE_CAPABILITY` is bootstrap-Principal-only until the policy
-/// service lands to mediate the "holder-of-revoke-right can call revoke"
-/// path described in ADR-007 §"Who can revoke".
+/// The `revoke` field is the authority `SYS_REVOKE_CAPABILITY` checks:
+/// a caller holding it on an endpoint may revoke other processes'
+/// capabilities on that endpoint (ADR-007 §"Who can revoke", path 2).
+/// The manifest grants it via `Rights::revoke`; no entry declares it
+/// yet, so the syscall admits nobody until one does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityRights {
     pub send: bool,

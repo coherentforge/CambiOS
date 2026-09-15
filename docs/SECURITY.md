@@ -33,12 +33,12 @@ This table maps every enforcement point to its code location and *what* it does.
 | Interceptor: IPC recv policy | **Enforced** | `PermissionDenied` | `ipc/mod.rs`, `ipc/interceptor.rs` |
 | Interceptor: delegation policy | **Enforced** | `AccessDenied` | `ipc/capability.rs` |
 | IPC sender_principal stamping | **Enforced** | N/A (kernel stamps unconditionally) | `ipc/mod.rs` |
-| BindPrincipal restricted to bootstrap | **Enforced** | `PermissionDenied` | `syscalls/dispatcher.rs` |
+| Principal binding is kernel-internal (bound at spawn from the signed manifest row; no userspace binding syscall — slot 11 retired) | **Enforced** | N/A (structural) | `manifest.rs::install_manifest_row`, `microkernel/main.rs::create_init_process` |
 | ObjPut Ed25519 signature verification | **Enforced** | `PermissionDenied` | `syscalls/dispatcher.rs` (`ObjPutSigned`) |
 | ObjDelete ownership enforcement | **Enforced** | `PermissionDenied` | `syscalls/dispatcher.rs` |
 | FS service principal-based access | **Enforced** | Error response to caller | `user/fs-service/src/main.rs` |
 | Bulk-data channel capability checks | **Enforced** (creator + peer-Principal match at attach) | `ChannelError::*` | `ipc/channel.rs` |
-| Capability revocation (`SYS_REVOKE_CAPABILITY`) | **Enforced** (bootstrap-only authority for now per ADR-007 Phase 3.1) | `PermissionDenied` | `syscalls/dispatcher.rs`, `ipc/capability.rs::revoke` |
+| Capability revocation (`SYS_REVOKE_CAPABILITY`) | **Enforced** (caller must hold the `revoke` right on the endpoint — ADR-007 path 2; grantor + policy-service paths pending) | `PermissionDenied` | `syscalls/dispatcher.rs`, `ipc/capability.rs::revoke` |
 | Audit telemetry channel | **Enforced** (per-CPU SPSC buffers → BSP drain → `AUDIT_RING`; consumer reads via `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO`) | N/A (best-effort, drops counted) | `audit/{mod,buffer,drain}.rs`, `syscalls/dispatcher.rs` |
 | Audit on input focus transition (T-7 Phase A) | **Enforced** (compositor emits `InputFocusChange` via `SYS_AUDIT_EMIT_INPUT_FOCUS`; capability narrowed to compositor only) | `PermissionDenied` if non-compositor | `syscalls/dispatcher.rs::handle_audit_emit_input_focus`, `microkernel/main.rs::register_process_capabilities` |
 | Audit drain-skip counter (T-8) | **Enforced** (lock-free `AUDIT_DRAIN_SKIPS` atomic; surfaced through `SYS_AUDIT_INFO` offset 44..48) | N/A (visibility primitive) | `audit/drain.rs`, `syscalls/dispatcher.rs::handle_audit_info` |
@@ -246,7 +246,7 @@ The receiving process (via `SYS_RECV_MSG`, syscall 13) gets the 32-byte `sender_
 | Attack | Enforcement | Result |
 |---|---|---|
 | Process claims to be another identity | Kernel stamps real Principal | Forgery impossible |
-| Unauthorized process binds identities | Only bootstrap Principal can call BindPrincipal | `PermissionDenied` |
+| Unauthorized process binds identities | No binding syscall exists; the kernel binds at spawn from the signed manifest | Structurally impossible |
 | Process reads another's identity | GetPrincipal returns caller's own | No cross-process read |
 
 ---
@@ -349,7 +349,7 @@ What channels do *not* change: the verification stance for control-path messages
 
 Three architectural moves shift how security policy is decided and observed without changing what the kernel enforces. Two have shipped; one remains in design:
 
-**Capability revocation ([ADR-007](adr/007-capability-revocation-and-telemetry.md)) — shipped.** `SYS_REVOKE_CAPABILITY` lives in `syscalls/dispatcher.rs`, backed by `CapabilityManager::revoke` with audit emission. Authority is bootstrap-only in Phase 3.1; the broader authority surface called for in ADR-007 (original grantor, holders of the new `revoke` right, the policy service) is queued for Phase 3.4. Atomic teardown of in-flight references is in place via the existing channel close path + capability table mutation. This was the prerequisite for everything else in Phase 3 — without revocation, the AI's recommendations would have no teeth and the policy service could only deny *new* operations, never undo prior grants.
+**Capability revocation ([ADR-007](adr/007-capability-revocation-and-telemetry.md)) — shipped.** `SYS_REVOKE_CAPABILITY` lives in `syscalls/dispatcher.rs`, backed by `CapabilityManager::revoke` with audit emission. Authority is the `revoke` right on the endpoint (ADR-007 path 2, granted through the manifest's `Rights::revoke` bit; the bootstrap-only stand-in was retired 2026-09-15 once no process was bootstrap-bound); the original-grantor and policy-service paths are still queued. Atomic teardown of in-flight references is in place via the existing channel close path + capability table mutation. This was the prerequisite for everything else in Phase 3 — without revocation, the AI's recommendations would have no teeth and the policy service could only deny *new* operations, never undo prior grants.
 
 **Audit telemetry ([ADR-007](adr/007-capability-revocation-and-telemetry.md)) — shipped.** Capability grant / revocation / denial, IPC send/recv (sampled), channel create/attach/close, syscall denial, binary load/reject, process create/exit, and (T-7 Phase A, 2026-04-25) input focus transitions all produce audit events. Events flow through per-CPU lock-free SPSC staging buffers → BSP-driven `drain_tick` → a global `AUDIT_RING`. User-space consumers attach via `SYS_AUDIT_ATTACH` (bootstrap-only) and read offsets via `SYS_AUDIT_INFO`. Best-effort delivery: dropped events are counted both per-buffer (`AuditDropped` synthetic event) and at drain time (T-8 `AUDIT_DRAIN_SKIPS` lock-free counter, `SYS_AUDIT_INFO` offset 44..48). The audit channel is the *only* way the AI security service learns what's happening on the system — there is no kernel hook the AI can call directly, no capability the AI holds to suspend a process, no out-of-band introspection. The AI is a user-space process that reads an event stream and emits recommendations into the policy service's input queue.
 
@@ -385,16 +385,16 @@ The gaps below are organized by whether they have a design (ADR drafted) or are 
 - ~~**Bootstrap Principal hardening**~~ — Hardware-backed YubiKey root of trust. Secret key never enters kernel memory. Boot modules signed at build time, verified at load time.
 - ~~**ELF signature verification**~~ — `SignedBinaryVerifier` enforces Ed25519 signatures (ARCSIG trailer) on all boot modules.
 - ~~**IPC sender_principal stamping**~~ — Kernel stamps unforgeable identity on every control-IPC message.
-- ~~**Capability revocation primitive**~~ — `SYS_REVOKE_CAPABILITY` lives at `syscalls/dispatcher.rs`; backed by `CapabilityManager::revoke` with audit emission. Authority is bootstrap-only for Phase 3.1 (broader authority queued — see Gap Analysis above).
+- ~~**Capability revocation primitive**~~ — `SYS_REVOKE_CAPABILITY` lives at `syscalls/dispatcher.rs`; backed by `CapabilityManager::revoke` with audit emission. Authority is the `revoke` right on the endpoint (grantor + policy-service paths queued — see Gap Analysis above).
 - ~~**Audit telemetry channel**~~ — Per-CPU lock-free SPSC staging buffers + BSP-driven `drain_tick` → `AUDIT_RING` consumer. 17 event kinds wired (see [threat-model.md T-7 / T-8](threat-model.md#t-7--virtio-input-focus-hijack)). Best-effort delivery: drops are counted (per-buffer staging-drop counter + `AUDIT_DRAIN_SKIPS` lock-free leading-indicator counter, surfaced through `SYS_AUDIT_INFO`).
-- ~~**Bulk-data shared-memory channels (control-path)**~~ — `SYS_CHANNEL_CREATE` / `SYS_CHANNEL_ATTACH` / `SYS_CHANNEL_REVOKE` ship per [ADR-005](adr/005-ipc-primitives-control-and-bulk.md). Kernel-mediated creation, capability-gated allocation, peer-Principal match at attach. The pages flow user-to-user; the create/attach/close events flow through the audit ring.
+- ~~**Bulk-data shared-memory channels (control-path)**~~ — `SYS_CHANNEL_CREATE` / `SYS_CHANNEL_ATTACH` / `SYS_CHANNEL_CLOSE` (+ the two-phase teardown pair) ship per [ADR-005](adr/005-ipc-primitives-control-and-bulk.md). Kernel-mediated creation, capability-gated allocation, peer-Principal match at attach. The pages flow user-to-user; the create/attach/close events flow through the audit ring.
 - ~~**ELF page-permission conflict rejection (T-5)**~~ — `DefaultVerifier` rejects any pair of `PT_LOAD` segments whose page-aligned ranges overlap with conflicting permissions (`DenyReason::PagePermConflict`). Closes the build-time hygiene gap that signed binaries could otherwise sneak through.
 
 ### Priority Order for Phase 3
 
 Items 1–3 below have shipped (see "Done (Historical)"); items 4–6 are what's left, in dependency order. Tracked alongside the project-wide phase markers in [STATUS.md § Phase markers](../STATUS.md#phase-markers).
 
-1. ~~**Capability revocation** — every other Phase 3 item depended on this.~~ Shipped (bootstrap-only authority in Phase 3.1; broader authority surface tracked under Gap Analysis).
+1. ~~**Capability revocation** — every other Phase 3 item depended on this.~~ Shipped (`revoke`-right authority; grantor + policy-service paths tracked under Gap Analysis).
 2. ~~**Audit telemetry channel**~~ — shipped (per-CPU buffers + drain + ring + `SYS_AUDIT_*` consumer surface).
 3. ~~**Channels** — bulk-data path.~~ Shipped (control-path: create/attach/close/revoke through capabilities; bulk pages flow user-to-user).
 4. **Policy service** — boot-module shipped and identified at `POLICY_SERVICE_PID`; the `policy::policy_check` decision path is still permissive scaffolding. Externalizing the actual decisions is what's left.
