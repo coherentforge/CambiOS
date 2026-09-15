@@ -45,8 +45,12 @@
 # NOT dependencies; the kernel's fail-open policy window covers them.
 #
 # `arch` tags select per-deployment manifests (`--arch`); `profile`
-# tags keep an entry out of the default images (`--profile`, default
-# "default") while still declaring it in the registry.
+# tags select between entries that fill the same role (`--profile`,
+# default "default"). A dependant names a ROLE by the endpoint it
+# talks to — `depends_on_endpoints = [27]` — and build-manifest
+# resolves that to whichever kept entry owns the endpoint, so the
+# emitted manifest is always a plain name dependency on the one
+# driver this image carries.
 
 [init]
 endpoint = 1
@@ -93,6 +97,9 @@ depends_on = ["virtio-net"]
 
 # --- GUI stack -----------------------------------------------------------------
 
+# Endpoint 27 is the scanout-driver ROLE: exactly one driver owns it
+# per profile. scanout-virtio-gpu fills it in the default profile;
+# scanout-limine (below) under `framebuffer-fallback`.
 [[service]]
 name = "scanout-virtio-gpu"
 endpoints = [27]
@@ -102,12 +109,15 @@ system = ["create-channel"]
 # init never reports phantom spawn failures for services that are
 # not staged there.
 arch = ["x86_64", "aarch64"]
+profile = ["default"]
 
 [[service]]
 name = "compositor"
 endpoints = [28, 30]
 system = ["create-channel", "emit-input-audit"]
-depends_on = ["scanout-virtio-gpu"]
+# Depends on whoever serves endpoint 27 (RegisterCompositor goes
+# there), not on a driver by name — see the header comment.
+depends_on_endpoints = [27]
 arch = ["x86_64", "aarch64"]
 
 [[service]]
@@ -125,12 +135,11 @@ arch = ["x86_64", "aarch64"]
 # scanout-limine — the FALLBACK scanout driver: same compositor↔driver
 # protocol as scanout-virtio-gpu, writing into the bootloader's linear
 # framebuffer. The driver that matters on real hardware without
-# virtio-gpu (UEFI GOP). Declared here so its identity + grants exist;
-# kept out of every default image because it and scanout-virtio-gpu
-# both own endpoint 27 and the compositor's dependency names the
-# virtio driver — selecting the fallback is a whole-profile decision.
-# Revisit when: a board/profile dimension swaps the compositor's
-# driver dependency (first bare-metal GOP boot).
+# virtio-gpu (UEFI GOP). Fills the endpoint-27 role under the
+# `framebuffer-fallback` profile (`build-manifest --profile
+# framebuffer-fallback`); no image target stages it yet.
+# Revisit when: the first bare-metal GOP boot needs an image (add a
+# `manifest-gop` / image target that stages scanout-limine.elf).
 [[service]]
 name = "scanout-limine"
 endpoints = [27]

@@ -87,6 +87,16 @@ struct ServiceDef {
     restart: RestartDef,
     #[serde(default)]
     depends_on: Vec<String>,
+    /// Dependencies by *endpoint*: "whoever serves endpoint N must be
+    /// ready before I spawn". Resolved to the owning entry's name after
+    /// the arch/profile filters, so a role several entries can fill
+    /// (the scanout driver on endpoint 27: virtio-gpu by default, the
+    /// linear-framebuffer fallback under another profile) is named by
+    /// the thing the dependant actually talks to. The wire manifest
+    /// still carries a plain name dependency; init and the kernel are
+    /// unaware of this field.
+    #[serde(default)]
+    depends_on_endpoints: Vec<u32>,
     /// Architectures this service ships on. Empty (default) = all
     /// arches. `--arch <name>` filters the emitted manifest to entries
     /// whose list is empty or contains the name — the ADR-018 rule
@@ -271,6 +281,69 @@ fn main() {
     }
     filter_registry(&mut registry, "profile", &profile, |s| &s.profile);
 
+    // Resolve endpoint dependencies against the KEPT set: exactly one
+    // kept entry owns each endpoint (validate_unique enforces this on
+    // the emitted blob too), so the owner's name is the dependency.
+    // Owned storage: the resolved list is `depends_on` + the owners.
+    let resolved_deps: Vec<Vec<String>> = registry
+        .services
+        .iter()
+        .map(|svc| {
+            let mut deps = svc.depends_on.clone();
+            for &ep in &svc.depends_on_endpoints {
+                if ep == registry.init.endpoint {
+                    eprintln!(
+                        "service '{}' depends on endpoint {}, which is init's — init is \
+                         not a spawnable dependency",
+                        svc.name, ep
+                    );
+                    exit(1);
+                }
+                let owners: Vec<&str> = registry
+                    .services
+                    .iter()
+                    .filter(|o| o.endpoints.contains(&ep))
+                    .map(|o| o.name.as_str())
+                    .collect();
+                match owners.as_slice() {
+                    [owner] => {
+                        if *owner == svc.name {
+                            eprintln!(
+                                "service '{}' depends on its own endpoint {}",
+                                svc.name, ep
+                            );
+                            exit(1);
+                        }
+                        deps.push((*owner).to_string());
+                    }
+                    [] => {
+                        eprintln!(
+                            "service '{}' depends on endpoint {}, but no kept entry serves it \
+                             (arch '{}', profile '{}') — tag an owner into this build",
+                            svc.name,
+                            ep,
+                            arch.as_deref().unwrap_or("any"),
+                            profile
+                        );
+                        exit(1);
+                    }
+                    many => {
+                        eprintln!(
+                            "service '{}' depends on endpoint {}, which {} kept entries claim \
+                             ({}) — the profile tags must select exactly one",
+                            svc.name,
+                            ep,
+                            many.len(),
+                            many.join(", ")
+                        );
+                        exit(1);
+                    }
+                }
+            }
+            deps
+        })
+        .collect();
+
     if registry.services.len() > MAX_MANIFEST_ENTRIES {
         eprintln!(
             "{} services exceeds MAX_MANIFEST_ENTRIES = {}",
@@ -317,7 +390,9 @@ fn main() {
             }
         }
         grants_store.push(grants);
-        deps_store.push(svc.depends_on.iter().map(String::as_str).collect());
+    }
+    for deps in &resolved_deps {
+        deps_store.push(deps.iter().map(String::as_str).collect());
     }
 
     // On-demand entries sit outside init's boot wave, so they can
@@ -329,16 +404,16 @@ fn main() {
         .filter(|s| s.lifetime == "on-demand")
         .map(|s| s.name.as_str())
         .collect();
-    for svc in &registry.services {
-        if svc.lifetime == "on-demand" && !svc.depends_on.is_empty() {
+    for (svc, deps) in registry.services.iter().zip(&resolved_deps) {
+        if svc.lifetime == "on-demand" && !deps.is_empty() {
             eprintln!(
-                "service '{}' is on-demand but declares depends_on — init never \
+                "service '{}' is on-demand but declares dependencies — init never \
                  sequences on-demand entries, so dependencies cannot be honored",
                 svc.name
             );
             exit(1);
         }
-        for dep in &svc.depends_on {
+        for dep in deps {
             if on_demand.contains(&dep.as_str()) {
                 eprintln!(
                     "service '{}' depends on '{}', which is on-demand — the boot \
