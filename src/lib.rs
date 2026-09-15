@@ -446,6 +446,34 @@ pub fn wake_task_on_cpu(task_id: scheduler::TaskId) -> bool {
     }
 }
 
+/// Wake every task blocked on `MessageWait(endpoint)` on EVERY online
+/// CPU's scheduler. Endpoint waiters — unlike task waiters — cannot be
+/// resolved through `TASK_CPU_MAP` (the key is an endpoint, not a task),
+/// so the wake must scan all per-CPU schedulers: a waiter blocked on
+/// CPU 1 is invisible to a wake that only scans the sender's local
+/// scheduler. That local-only shape was the ADR-018 boot-wave stall:
+/// init (migrated to CPU 1) blocked on its endpoint; a service's ready
+/// ping sent from CPU 0 woke nobody; the wave hung.
+///
+/// Locks each scheduler in turn with a PLAIN lock (never two at once —
+/// same-level sequential acquisition). Plain, not `try_lock`: a skipped
+/// wake is a lost wake; the receiver-side lost-wakeup guard in
+/// `handle_recv_msg` closes the check-then-block race only if the
+/// sender's wake cannot silently skip a mid-block receiver. Syscall /
+/// kernel-thread context only — ISR wakers must keep the `try_lock`
+/// discipline and must not call this.
+#[cfg(not(test))]
+pub fn wake_message_waiters_all_cpus(endpoint: u32) -> usize {
+    let mut woken = 0;
+    for cpu in 0..online_cpu_count().min(MAX_CPUS) {
+        let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+        if let Some(sched) = guard.as_mut() {
+            woken += sched.wake_message_waiters(endpoint);
+        }
+    }
+    woken
+}
+
 /// Wake `parent_id` iff it is Blocked waiting on the child in `child_slot`
 /// (ADR-034 Phase B). Cross-CPU: resolves the parent's owning CPU via
 /// `TASK_CPU_MAP` and applies the selective wake under that CPU's scheduler
@@ -516,6 +544,14 @@ pub fn terminate_current_task() -> Option<scheduler::TaskId> {
 #[cfg(test)]
 pub fn wake_task_on_cpu(_task_id: scheduler::TaskId) -> bool {
     false
+}
+
+/// Test stub for wake_message_waiters_all_cpus — per-CPU scheduler array
+/// unavailable under host tests. `Scheduler::wake_message_waiters` is
+/// exercised directly in `src/scheduler/mod.rs::tests`.
+#[cfg(test)]
+pub fn wake_message_waiters_all_cpus(_endpoint: u32) -> usize {
+    0
 }
 
 /// Test stub for wake_child_waiter — per-CPU scheduler array unavailable

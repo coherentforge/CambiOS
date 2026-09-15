@@ -808,14 +808,11 @@ impl SyscallDispatcher {
             }
         }
 
-        // Wake any tasks blocked waiting for a message on this endpoint.
-        // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held.
-        {
-            let mut sched_guard = crate::local_scheduler().lock();
-            if let Some(sched) = sched_guard.as_mut() {
-                sched.wake_message_waiters(endpoint_id);
-            }
-        }
+        // Wake any tasks blocked waiting for a message on this endpoint —
+        // on EVERY CPU. A local-only wake here was the ADR-018 boot-wave
+        // stall: init blocked on CPU 1, a ready ping sent from CPU 0 woke
+        // nobody (see wake_message_waiters_all_cpus). No higher locks held.
+        crate::wake_message_waiters_all_cpus(endpoint_id);
 
         Ok(len as u64)
     }
@@ -1428,18 +1425,32 @@ impl SyscallDispatcher {
             }
 
             // No message — block and yield. The IPC send path
-            // (handle_write) calls wake_message_waiters() after enqueue.
+            // (handle_write) calls wake_message_waiters_all_cpus() after
+            // enqueue.
             //
-            // CRITICAL: Disable interrupts BEFORE block_task to prevent a
-            // race with the timer ISR. If the ISR fires between block_task
-            // (state=Blocked) and yield_save_and_switch (saves saved_rsp),
-            // the ISR skips saving RSP (because !Running), leaving stale
-            // saved_rsp. When the task is later woken, iretq restores from
-            // garbage → triple fault. cli ensures the ISR cannot observe
-            // the Blocked state before yield saves the correct context.
-            // IrqSpinlock preserves the disabled state on drop.
-            // yield_save_and_switch also does cli (redundant) then saves
-            // and switches. .Lyield_resume does sti on wake.
+            // CRITICAL (timer race): Disable interrupts BEFORE block_task
+            // to prevent a race with the timer ISR. If the ISR fires
+            // between block_task (state=Blocked) and yield_save_and_switch
+            // (saves saved_rsp), the ISR skips saving RSP (because
+            // !Running), leaving stale saved_rsp. When the task is later
+            // woken, iretq restores from garbage → triple fault. cli
+            // ensures the ISR cannot observe the Blocked state before
+            // yield saves the correct context. IrqSpinlock preserves the
+            // disabled state on drop. yield_save_and_switch also does cli
+            // (redundant) then saves and switches. .Lyield_resume does
+            // sti on wake.
+            //
+            // CRITICAL (lost-wakeup race): the first queue check above
+            // dropped the IPC lock before this point. A sender on another
+            // CPU can enqueue + wake in that gap — the wake finds this
+            // task still Running (a no-op) and this task then blocks on a
+            // non-empty queue, forever (the ADR-018 boot-wave stall).
+            // Guard: re-check the queue with the IPC lock held ACROSS
+            // block_task (SCHEDULER(1) → IPC_MANAGER(3), downward). The
+            // sender enqueues under the IPC lock, so either its message
+            // is visible to this re-check (skip the block), or its
+            // enqueue happens after this task is already Blocked and its
+            // all-CPU wake finds it.
             #[cfg(target_arch = "x86_64")]
             // SAFETY: `cli` is safe at kernel privilege (ring 0); local to this CPU.
             unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
@@ -1449,15 +1460,42 @@ impl SyscallDispatcher {
             #[cfg(target_arch = "riscv64")]
             // SAFETY: clearing sstatus.SIE is safe at S-mode; local to this hart.
             unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack)); }
-            {
+            let blocked = {
                 let mut sched_guard = crate::local_scheduler().lock();
-                if let Some(sched) = sched_guard.as_mut() {
+                let ipc_guard = crate::IPC_MANAGER.lock();
+                let queued = ipc_guard
+                    .as_ref()
+                    .map(|m| m.has_message(endpoint))
+                    .unwrap_or(false)
+                    || (endpoint_id == BLK_KERNEL_CMD_ENDPOINT
+                        && crate::SHARDED_IPC.has_message(endpoint));
+                if queued {
+                    false
+                } else if let Some(sched) = sched_guard.as_mut() {
                     let _ = sched.block_task(
                         ctx.task_id,
                         crate::scheduler::BlockReason::MessageWait(endpoint_id),
                     );
+                    true
+                } else {
+                    false
                 }
-                // IrqSpinlock drop: restores IF to our cli state (disabled)
+                // Guard drops: IPC(3) then SCHEDULER(1); IrqSpinlock drop
+                // restores IF to our cli state (disabled)
+            };
+            if !blocked {
+                // Message arrived in the gap (or no scheduler — boot
+                // path): re-enable interrupts and re-run the receive.
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: restoring IF at ring 0; matches the cli above.
+                unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: unmasking DAIF.I at EL1; matches the mask above.
+                unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+                #[cfg(target_arch = "riscv64")]
+                // SAFETY: setting sstatus.SIE at S-mode; matches the clear above.
+                unsafe { core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack)); }
+                continue;
             }
             // Interrupts still disabled — yield_save_and_switch saves
             // correct context before any ISR can see the Blocked state.

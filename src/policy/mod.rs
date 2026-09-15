@@ -502,17 +502,11 @@ pub fn policy_check(
         return InterceptDecision::Allow;
     }
 
-    // Wake the policy service if it's blocked waiting for queries
-    {
-        let cpu_count = crate::online_cpu_count();
-        for i in 0..cpu_count {
-            if let Some(mut sched_guard) = crate::PER_CPU_SCHEDULER[i].try_lock() {
-                if let Some(sched) = sched_guard.as_mut() {
-                    sched.wake_message_waiters(POLICY_QUERY_ENDPOINT);
-                }
-            }
-        }
-    }
+    // Wake the policy service if it's blocked waiting for queries.
+    // Plain-lock all-CPU wake: the prior try_lock loop could silently
+    // skip a contended scheduler, losing the wake (see
+    // wake_message_waiters_all_cpus). Syscall context — no lock held.
+    crate::wake_message_waiters_all_cpus(POLICY_QUERY_ENDPOINT);
 
     // Block and yield — same pattern as handle_recv_msg
     //

@@ -142,16 +142,10 @@ impl VirtioBlkDevice {
         // 3. Wake any task blocked on the driver's command endpoint (the
         //    driver's service loop uses `recv_verified(24)` / `recv_msg(26)`
         //    which blocks on `MessageWait` when both queues are empty).
-        {
-            let cpu_count = crate::online_cpu_count();
-            for i in 0..cpu_count {
-                if let Some(mut g) = crate::PER_CPU_SCHEDULER[i].try_lock() {
-                    if let Some(s) = g.as_mut() {
-                        s.wake_message_waiters(self.driver_cmd_endpoint);
-                    }
-                }
-            }
-        }
+        //    Plain-lock all-CPU wake — the prior try_lock loop could
+        //    silently skip a contended scheduler, losing the wake (see
+        //    wake_message_waiters_all_cpus). Syscall context, no lock held.
+        crate::wake_message_waiters_all_cpus(self.driver_cmd_endpoint);
 
         // 4. Poll the response endpoint with cooperative yields. Each yield
         //    hands the CPU back to the scheduler; virtio-blk (polling both
