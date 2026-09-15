@@ -117,7 +117,9 @@ pub struct ManifestEntry {
     /// name-based narrow grants in load_boot_modules.
     pub granted_capabilities: BoundedVec<CapabilityGrant, GRANTS_MAX>,
 
-    /// Lifecycle policy — init-interpreted; the kernel ignores it.
+    /// Lifecycle policy — init-interpreted, except that the kernel reads
+    /// the `OnDemand` tag to decide who may spawn the row (a security
+    /// fact, transcribed as `SpawnAuthority`; migration step 9).
     pub lifetime: ServiceLifetime,
 
     /// Names of services that must reach steady state before this one
@@ -140,6 +142,12 @@ pub enum ServiceLifetime {
         max_restarts: u16,
         failure_window_ms: u32,
     },
+    /// Not part of init's boot wave. Spawned by name, later, by any
+    /// `CreateProcess` holder (the shell launching a game); the kernel
+    /// admits non-init callers for exactly these rows and still binds
+    /// the entry's AID + installs exactly its grants — "tree runs as
+    /// tree". May not declare or be named in `depends_on`.
+    OnDemand,
 }
 
 pub enum CapabilityGrant {
@@ -163,8 +171,8 @@ All bounds (`MODULE_NAME_MAX`, `RESERVED_ENDPOINTS_MAX`, `GRANTS_MAX`, `DEPS_MAX
 
 Explicitly out of scope, to avoid the "describe the whole process tree" trap:
 
-- **Unreserved endpoints** — processes spawned post-boot (shells, apps, PE-compat sandboxes, transient workers) register self-chosen endpoint numbers from the unreserved range via `SYS_REGISTER_ENDPOINT`, exactly as today (first-come). There is no dynamic endpoint allocator yet; when one is needed it allocates from the unreserved range and the reservation table needs no change.
-- **User-spawned processes** — the shell spawning a game, a build system spawning `cargo`, an app spawning a worker. These are not init's concern; the spawner is the parent and owns lifecycle. They take the legacy spawn path (today's blanket-grant posture, bootstrap-bound) until a policy-mediated grant flow narrows it — that is [ADR-006](006-policy-service.md)'s territory, not this ADR's.
+- **Unreserved endpoints** — processes the manifest does not describe (PE-compat sandboxes, transient workers, anything a manifest-declared process spawns that is not itself a manifest entry — no such spawner exists at v1) register self-chosen endpoint numbers from the unreserved range via `SYS_REGISTER_ENDPOINT` (first-come). There is no dynamic endpoint allocator yet; when one is needed it allocates from the unreserved range and the reservation table needs no change.
+- **Lifecycle of on-demand entries** — the shell spawning a game, the terminal spawning hello-window. These *are* manifest entries (lifetime `OnDemand`: derived AID, reserved endpoints, narrow grants — "tree runs as tree"), but they are not init's concern: the spawner is the parent and owns lifecycle. Which *Principal* an app acts for is the vault's later, additive axis ([ADR-033](033-multi-principal-vault.md) `bind_for_spawn`), not a manifest field. A spawn of a name the manifest does not declare is a typed reject — since migration step 9 there is no other spawn path. Subsequent grant decisions remain [ADR-006](006-policy-service.md)'s territory.
 - **Policy** — who can call which syscall, who can create channels, who can delegate capabilities. That's the policy service's job ([ADR-006](006-policy-service.md)). The manifest declares *initial* capabilities at spawn; policy decides *subsequent* grants and revocations.
 - **Table sizing until post-v1** — ADR-008 § 7 commits that `TableSizingPolicy` moves into the manifest eventually. This ADR defines the manifest shape that migration targets, but does not land the migration itself. See the Migration Path section.
 
@@ -173,7 +181,7 @@ Explicitly out of scope, to avoid the "describe the whole process tree" trap:
 Init is a user-space ELF (`user/init/`), signed by the bootstrap key, loaded as a boot module. It is the first and only process the kernel creates directly. It is bound at creation to **its own AID**, carried in the manifest header — audit shows init's actions as init, not as the operator. Its responsibilities:
 
 1. **Parse the manifest's policy fields.** The same blob the kernel verified and transcribed, via the same `cambios-manifest` parser. Reject on any structural error (unknown version, oversize bounds, cyclic `depends_on`, missing module). Init's parse cannot affect security state — grants, reservations, and identity were transcribed by the kernel before init's first instruction. A buggy init parse can mis-order or refuse to spawn; it cannot mis-grant.
-2. **Spawn services in DAG order.** For each service in topological order of `depends_on`: call `SYS_SPAWN(module_name)` — the existing syscall, unchanged ABI. The kernel recognizes manifest-listed names when the caller is init and atomically binds the entry's AID + installs exactly the entry's grants (see § 5). Block on the service's readiness signal — a minimal "I'm up" IPC to init's endpoint (endpoint 1, reserved to init's AID), emitted by the service runtime entry macro ([ADR-037](037-native-app-framework.md) `service_main!`) where `SYS_MODULE_READY` is emitted today — before spawning dependents.
+2. **Spawn services in DAG order.** For each service in topological order of `depends_on`: call `SYS_SPAWN(module_name)` — the existing syscall, unchanged ABI. The kernel recognizes manifest-listed names when the caller is init and atomically binds the entry's AID + installs exactly the entry's grants (see § 5). Block on the service's readiness signal — a minimal "I'm up" IPC to init's endpoint (endpoint 1, reserved to init's AID), emitted by the service runtime entry macro ([ADR-037](037-native-app-framework.md) `service_main!`, `cambios_libsys_rt::ready()`) — before spawning dependents.
 3. **Own post-boot service lifecycle.** When a Persistent service exits, apply the service's restart policy. OneShot services are logged and not restarted. Prerequisite: [ADR-019](019-process-fault-reaping-and-peer-generation.md) phases A/B make faults reap and wake the parent at all (today they do neither), and phase D distinguishes fault from clean exit.
    > **Deferred decision.** Init's steady-state wake model — it must observe N children's exits *and* readiness pings on its endpoint with one blocking primitive. Candidates: a kernel-authored exit-notification message to init's endpoint (single RecvMsg loop; precedent: the kernel already writes IPC on the virtio-blk kernel-cmd path), or a wait-any variant of `SYS_WAIT_TASK`. **Revisit when:** migration step 10 starts.
 4. **Audit.** Spawns and exits are already kernel-audited (`ProcessCreated`, `ProcessTerminated`; ADR-019 adds `ProcessFaulted`). The genuinely new event is init's *decision* audit — restart-gave-up (`ServiceDead`) — which lands with migration step 10 through the `cambios-abi` audit taxonomy; the emission mechanism (narrow emit syscall vs kernel-emitted on wait outcome) is decided there.
@@ -182,7 +190,7 @@ Init holds exactly **one** privileged capability at boot: `CreateProcess`. It ho
 
 ### 5. The kernel's boot surface: what is removed, what is added
 
-The kernel removes:
+The kernel removed (migration step 9, 2026-09-15):
 
 - `BOOT_MODULE_ORDER` in [src/lib.rs](../../src/lib.rs) and `BootModuleOrder` in [src/boot_modules.rs](../../src/boot_modules.rs)
 - `BlockReason::BootGate` in [src/scheduler/task.rs](../../src/scheduler/task.rs)
@@ -194,8 +202,8 @@ The kernel adds:
 
 - The **endpoint-reservation table**: dense `[EndpointReservation; MAX_ENDPOINTS]`, each slot `Unreserved` (first-come, as today) or `Reserved(aid)`. Checked inside `SYS_REGISTER_ENDPOINT` before the existing self-grant logic. Write-once at boot.
 - The **spawn-grant table**: module name → (AID, grants). Write-once at boot.
-- The **manifest transcription path** in boot-module load: identify the manifest module by name, verify ARCSIG, parse via `cambios-manifest`, populate both tables. Invalid manifest → typed boot error ([ADR-021](021-typed-boot-error-propagation.md); `make check-boot-panics` applies). Absent manifest → empty tables, behavior identical to today.
-- A **manifest branch in `handle_spawn`**: if the requested name is in the spawn-grant table *and* the caller is init (PID 1 — structural, kernel-created), bind the table's AID and install exactly the table's grants instead of the legacy blanket. All other callers take today's path unchanged.
+- The **manifest transcription path** in boot-module load: identify the manifest module by name, verify ARCSIG, parse via `cambios-manifest`, populate both tables. Invalid manifest → typed boot error ([ADR-021](021-typed-boot-error-propagation.md); `make check-boot-panics` applies). Absent manifest → typed `ManifestModuleMissing` boot failure (since step 9 nothing else starts services).
+- **`handle_spawn` is manifest-only**: the requested name must be in the spawn-grant table (else `InvalidArg`); the row's transcribed `SpawnAuthority` decides who may spawn it (`InitOnly` for boot-wave rows — init is PID 1, structural, kernel-created; `AnyCreateProcessHolder` for `OnDemand` rows); then bind the row's AID and install exactly the row's grants. There is no other path.
 
 No new syscall. `SYS_SPAWN`'s ABI is untouched; the libsys wrapper is untouched.
 
@@ -409,7 +417,7 @@ Sequenced to be landable in bounded commits with no regressions between them. Th
 6. **`user/init/`** — policy-field parse, DAG resolver, spawn + readiness loop. Host tests for parser and DAG logic. No allocator.
 7. **Boot integration, coexistence.** `limine.conf` gains `init.elf` and `manifest.bin`. The kernel transcribes (step 4 goes live), maps the blob into init, spawns init as PID 1 with its manifest AID + `CreateProcess`. **The step-7 manifest reserves only endpoint 1 (init's)** — old-chain services are still bootstrap-bound, so reserving their endpoints to per-service AIDs would make their own registrations fail. Init parses, validates, and idles; the `BOOT_MODULE_ORDER` chain still starts every service. Zero behavior change, full machinery exercised.
 8. **Cutover.** Manifest-listed services leave the boot chain (the kernel loads them registry-only); init spawns them in DAG order; the full reservation set and per-service AIDs ship in this step's manifest; `service_main!`'s `module_ready()` becomes the readiness ping to endpoint 1 (one macro edit + the explicit call in no-endpoint-form services). **Required sweep:** per-service AIDs change `sender_principal` values peers observe — audit every bootstrap-equality assumption (channel `peer_principal` flows, any service checking sender == bootstrap). Cutover lands as one step with heavy boot proof (`make run-quiet` + interactive), with dependency-closed waves as the fallback plan if it fights back.
-9. **Delete the scaffolding.** Remove `BOOT_MODULE_ORDER`, `BootModuleOrder`, `BlockReason::BootGate`, `SyscallNumber::ModuleReady` (slot 36 retired with a tombstone comment, never reused — the slot-18 discipline), `handle_module_ready`, the libsys wrapper, `SPAWN_ONLY_MODULES`, and the blanket boot-grant path. Update CLAUDE.md, STATUS.md, the ABI tests (36 is in the identity-exempt set today), and dependent tests. This is the irreversible commit.
+9. **Delete the scaffolding.** Remove `BOOT_MODULE_ORDER`, `BootModuleOrder`, `BlockReason::BootGate`, `SyscallNumber::ModuleReady` (slot 36 retired with a tombstone comment, never reused — the slot-18 discipline), `handle_module_ready`, the libsys wrapper, `SPAWN_ONLY_MODULES`, and the blanket boot-grant path. Update CLAUDE.md, STATUS.md, the ABI tests (36 is in the identity-exempt set today), and dependent tests. This is the irreversible commit. *Landed 2026-09-15 (77f1616) together with the `OnDemand` lifetime — apps are manifest entries, not a legacy path (see § Divergence).*
 10. **Wire restart policy.** Backoff loop in init, the wake-model decision (see § 4 deferred decision), `ServiceDead` audit via the `cambios-abi` taxonomy, integration test that kills a boot service and asserts init restarts it. **Prerequisite:** ADR-019 acceptance + phases A/B/D — reviewed as its own gate before this step starts.
 11. **Move `TableSizingPolicy` into the manifest.** Add a top-level manifest field, have the kernel pass it to ADR-008's sizing path, and demote the compile-time const to a fallback default. Fulfills ADR-008 § 7.
 12. **Post-v1: migrate the manifest source.** When the persistent ObjectStore ([ADR-010](010-persistent-object-store-on-disk-format.md)) is the trusted source for system configuration, the manifest moves there. The parser stays. The loader path (boot module → ObjectStore lookup) is the only change.
@@ -444,3 +452,13 @@ Updates required as the implementation lands:
 - **§ "Platform Gotchas"** — note that the manifest blob is a required boot module post-cutover; missing manifest ⇒ kernel refuses to spawn init (step 8)
 - **§ "Deep Reference" / directory layout** — add `cambios-manifest/`, `user/init/`, `tools/build-manifest/`
 - **Worked example "Adding a new syscall"** — unaffected (this ADR adds none); the boot-module walkthroughs that mention `module_ready` update at step 9
+
+## Divergence
+
+Body edits after acceptance; the prior wording is preserved here.
+
+### 2026-09-15 — step 9 landed; apps are manifest entries (commit 77f1616)
+
+§ 3 originally said, under **User-spawned processes**: "the shell spawning a game, a build system spawning `cargo`, an app spawning a worker. These are not init's concern; the spawner is the parent and owns lifecycle. They take the legacy spawn path (today's blanket-grant posture, bootstrap-bound) until a policy-mediated grant flow narrows it — that is ADR-006's territory, not this ADR's." Its **Unreserved endpoints** bullet listed "shells, apps" among the processes registering first-come from the unreserved range. § 5 described the addition as "a manifest branch in `handle_spawn`: if the requested name is in the spawn-grant table *and* the caller is init … All other callers take today's path unchanged", and "Absent manifest → empty tables, behavior identical to today." § 2's `lifetime` field was documented as "init-interpreted; the kernel ignores it", with only `OneShot` and `Persistent` variants. § 4 point 2 located the readiness signal "where `SYS_MODULE_READY` is emitted today".
+
+Deleting the legacy path at step 9 required an answer for apps. The answer chosen (decision 2026-09-15) is apps-as-manifest-entries with an `OnDemand` lifetime — declared, reserved, narrowly granted, spawnable by any `CreateProcess` holder, never by init. The kernel reads exactly that one lifetime bit, because who may spawn a row is a security fact; it is transcribed as `SpawnAuthority` in the spawn table, keeping the transcribe-don't-interpret posture for everything else. A policy-mediated grant flow was *not* adopted for apps; ADR-006 keeps *subsequent* grants. Which Principal an app acts for remains the vault's future axis (ADR-033 `bind_for_spawn`).
