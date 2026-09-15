@@ -50,3 +50,5 @@ tools/gen-dev-piv-keys/.dev-seed.bin
 # The source of truth is manifest.toml (committed); the signed blob is
 # regenerated per build like the ISOs.
 manifest.bin
+manifest-aarch64.bin
+manifest-riscv64.bin

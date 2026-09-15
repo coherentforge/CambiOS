@@ -67,13 +67,18 @@ const fn align8(n: usize) -> usize {
 }
 
 /// Parse an initrd archive whose bytes are live at `archive_bytes` and
-/// whose physical base is `archive_phys`. For each valid entry, call
-/// `on_module` with a populated `ModuleInfo`.
+/// whose base pointer value is `archive_base`. For each valid entry,
+/// call `on_module` with a populated `ModuleInfo`.
 ///
-/// `archive_phys` is added to the byte offset of the entry's data to
-/// produce the phys_addr exposed through [`ModuleInfo`] — matching the
-/// Limine adapter's phys_addr semantics so the boot_modules registry
-/// and the loader treat both archs identically.
+/// `archive_base` is added to the byte offset of the entry's data to
+/// produce the `phys_addr` exposed through [`ModuleInfo`]. Callers
+/// MUST pass the same address the archive is readable at (the riscv64
+/// adapter passes the HHDM-virtual base): `ModuleInfo.phys_addr` is —
+/// despite its name — a directly-dereferenceable pointer on every
+/// arch (Limine populates it that way on x86_64/aarch64), and the
+/// module loop, spawn registry, and create_init_process blob mapping
+/// all rely on that convention. The name is a known wart (rename
+/// sweep pending).
 ///
 /// Returns the number of entries successfully parsed. On a format
 /// error (bad magic, unsupported version, count exceeds remaining
@@ -86,7 +91,7 @@ const fn align8(n: usize) -> usize {
 /// function is safe to call even on a malicious archive.
 pub fn parse(
     archive_bytes: &[u8],
-    archive_phys: u64,
+    archive_base: u64,
     max_entries: usize,
     mut on_module: impl FnMut(ModuleInfo),
 ) -> usize {
@@ -147,7 +152,7 @@ pub fn parse(
             .copy_from_slice(&archive_bytes[name_start..name_start + name_len]);
 
         on_module(ModuleInfo {
-            phys_addr: archive_phys + data_start as u64,
+            phys_addr: archive_base + data_start as u64,
             size: data_size as u64,
             name: name_buf,
             name_len: name_len as u8,

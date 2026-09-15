@@ -2072,24 +2072,57 @@ fn create_init_process(
     // segments at 0x400000 and the stack at 0x800000).
     {
         let mut fa_guard = FRAME_ALLOCATOR.lock();
-        // Limine module addresses are HHDM virtual pointers (that is
-        // what lets the module loop read them directly); the page
-        // tables need the physical address back out.
+        // Module addresses are HHDM virtual pointers on every arch
+        // (Limine populates them that way; the riscv64 initrd adapter
+        // normalizes to match); the page tables need the physical
+        // address back out.
         let blob_phys_base = (blob_addr as u64) - cambios_core::hhdm_offset();
         let num_pages = blob_size.div_ceil(4096);
+        // Limine hands each module its own page-aligned allocation, but
+        // the riscv64 initrd packs modules 8-byte-aligned inside one
+        // archive — the blob may start mid-page, and page tables map
+        // whole pages only. Mapping the containing page would hand init
+        // a view offset from the real blob (init read garbage at
+        // MANIFEST_USER_VADDR — the ADR-018 all-arch staging bug).
+        // Unaligned ⇒ copy the blob into fresh page-aligned frames and
+        // map those instead. Like the zero-copy mapping, the copy is
+        // deliberately not VMA-tracked and never freed: init is PID 1
+        // for the system's lifetime.
+        let map_phys_base = if blob_phys_base % 4096 == 0 {
+            blob_phys_base
+        } else {
+            let frames = match fa_guard.allocate_contiguous(num_pages) {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("✗ manifest blob realignment alloc failed: {:?}", e);
+                    return Err(BootError::InitCreationFailed);
+                }
+            };
+            let dst = (frames.addr + cambios_core::hhdm_offset()) as *mut u8;
+            // SAFETY: `dst` is `num_pages` freshly allocated frames
+            // (≥ blob_size bytes) accessed via the HHDM; `blob_addr`
+            // is the module's readable HHDM pointer for `blob_size`
+            // bytes (the transcription pass already read the whole
+            // blob through it). The regions cannot overlap: one is
+            // allocator-owned RAM, the other boot-module memory
+            // outside the allocator's range.
+            unsafe { core::ptr::copy_nonoverlapping(blob_addr, dst, blob_size) };
+            frames.addr
+        };
         for i in 0..num_pages as u64 {
             // SAFETY: result.cr3 is the fresh page-table root
             // load_elf_process just created, and no other reference to
             // it exists (init cannot run while the boot path holds the
-            // scheduler). blob_phys_base derives from a boot-protocol
-            // module address, page-aligned by the bootloader; the
-            // frames are module memory, never handed to the frame
-            // allocator, so mapping them read-only aliases nothing.
+            // scheduler). map_phys_base is page-aligned by
+            // construction (bootloader module allocation, or the
+            // realignment copy above); the frames are module memory or
+            // the never-freed copy, so mapping them read-only aliases
+            // nothing.
             let mut pt = unsafe { cambios_core::memory::paging::page_table_from_cr3(result.cr3) };
             if let Err(e) = cambios_core::memory::paging::map_page(
                 &mut pt,
                 cambios_manifest::MANIFEST_USER_VADDR + i * 4096,
-                blob_phys_base + i * 4096,
+                map_phys_base + i * 4096,
                 cambios_core::memory::paging::flags::user_ro(),
                 &mut fa_guard,
             ) {

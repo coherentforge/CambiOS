@@ -697,9 +697,20 @@ pub unsafe fn populate(dtb_phys: u64) {
                 let archive_bytes = unsafe {
                     core::slice::from_raw_parts(vbase as *const u8, size)
                 };
+                // Pass the HHDM-VIRTUAL archive base, not the physical
+                // `start`. `ModuleInfo.phys_addr` is (despite the name)
+                // a directly-dereferenceable pointer on the Limine
+                // arches — the module loop, the spawn registry, and
+                // create_init_process's `addr - hhdm_offset()` blob
+                // mapping all assume that convention. Passing the
+                // physical base here would make riscv64 the one arch
+                // whose module addresses mean something different, and
+                // the manifest-blob mapping would subtract hhdm_offset
+                // from an already-physical address (ADR-018 step-8
+                // all-arch staging caught this).
                 let parsed = super::initrd::parse(
                     archive_bytes,
-                    start,
+                    vbase,
                     super::MAX_BOOT_MODULES,
                     |m| {
                         let _ = info.push_module(m);

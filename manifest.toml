@@ -87,22 +87,30 @@ depends_on = ["virtio-net"]
 name = "scanout-virtio-gpu"
 endpoints = [27]
 system = ["create-channel"]
+# GUI stack ships on x86_64 + aarch64 only — riscv64 has no scanout
+# path yet (ADR-014 4.c+). The riscv64 manifest omits these four so
+# init never reports phantom spawn failures for services that are
+# not staged there.
+arch = ["x86_64", "aarch64"]
 
 [[service]]
 name = "compositor"
 endpoints = [28, 30]
 system = ["create-channel", "emit-input-audit"]
 depends_on = ["scanout-virtio-gpu"]
+arch = ["x86_64", "aarch64"]
 
 [[service]]
 name = "virtio-input"
 depends_on = ["compositor"]
+arch = ["x86_64", "aarch64"]
 
 [[service]]
 name = "terminal-window"
 endpoints = [14, 15]
 system = ["create-process", "set-wallclock"]
 depends_on = ["compositor"]
+arch = ["x86_64", "aarch64"]
 
 # --- USB / PIV chain -------------------------------------------------------------
 

@@ -85,6 +85,14 @@ struct ServiceDef {
     restart: RestartDef,
     #[serde(default)]
     depends_on: Vec<String>,
+    /// Architectures this service ships on. Empty (default) = all
+    /// arches. `--arch <name>` filters the emitted manifest to entries
+    /// whose list is empty or contains the name — the ADR-018 rule
+    /// that each deployment's manifest matches its reality (riscv64
+    /// carries no GUI stack; a manifest that lists it would make init
+    /// report phantom spawn failures every boot).
+    #[serde(default)]
+    arch: Vec<String>,
 }
 
 fn default_lifetime() -> String {
@@ -145,10 +153,15 @@ fn init_aid() -> [u8; 32] {
 // ============================================================================
 
 fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {} <registry.toml> [-o <manifest.bin>]", prog);
+    eprintln!("Usage: {} <registry.toml> [-o <manifest.bin>] [--arch <name>]", prog);
     eprintln!();
     eprintln!("Emits an UNSIGNED CBOSMANI manifest blob. Sign it with:");
     eprintln!("  sign-elf [--seed <hex>] <manifest.bin>");
+    eprintln!();
+    eprintln!("--arch <name>: emit only services whose `arch` list is empty");
+    eprintln!("  (all arches) or contains <name>. A kept service depending on");
+    eprintln!("  a filtered-out one is an error — the emitted dependency graph");
+    eprintln!("  must be closed. Omitted = no filtering (every entry emits).");
     exit(2);
 }
 
@@ -158,6 +171,7 @@ fn main() {
 
     let mut input: Option<&str> = None;
     let mut output = "manifest.bin".to_string();
+    let mut arch: Option<String> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -165,6 +179,13 @@ fn main() {
                 i += 1;
                 match argv.get(i) {
                     Some(p) => output = p.clone(),
+                    None => usage(prog),
+                }
+            }
+            "--arch" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(a) => arch = Some(a.clone()),
                     None => usage(prog),
                 }
             }
@@ -180,10 +201,38 @@ fn main() {
         eprintln!("Failed to read '{}': {}", input, e);
         exit(1);
     });
-    let registry: Registry = toml::from_str(&toml_text).unwrap_or_else(|e| {
+    let mut registry: Registry = toml::from_str(&toml_text).unwrap_or_else(|e| {
         eprintln!("Failed to parse '{}': {}", input, e);
         exit(1);
     });
+
+    // --arch filter: keep entries with an empty arch list (all arches)
+    // or one naming the target. Then require the kept set's dependency
+    // graph to be closed — a kept service depending on a filtered-out
+    // one means the registry's arch tags are wrong, not that the
+    // dependency should silently vanish.
+    if let Some(target) = &arch {
+        let kept: Vec<String> = registry
+            .services
+            .iter()
+            .filter(|s| s.arch.is_empty() || s.arch.iter().any(|a| a == target))
+            .map(|s| s.name.clone())
+            .collect();
+        registry.services.retain(|s| kept.contains(&s.name));
+        for svc in &registry.services {
+            for dep in &svc.depends_on {
+                if !kept.contains(dep) {
+                    eprintln!(
+                        "service '{}' depends on '{}', which is filtered out \
+                         for arch '{}' — fix the arch tags in the registry",
+                        svc.name, dep, target
+                    );
+                    exit(1);
+                }
+            }
+        }
+        eprintln!("arch filter '{}': {} service(s) kept", target, registry.services.len());
+    }
 
     if registry.services.len() > MAX_MANIFEST_ENTRIES {
         eprintln!(

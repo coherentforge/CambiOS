@@ -57,6 +57,8 @@ POLICY_SERVICE_DIR := user/policy-service
 POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-policy-service
 INIT_DIR := user/init
 INIT_ELF := $(INIT_DIR)/target/x86_64-unknown-none/release/cambios-init
+INIT_ELF_AARCH64 := $(INIT_DIR)/target/aarch64-unknown-none/release/cambios-init
+INIT_ELF_RISCV64 := $(INIT_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-init
 FB_DEMO_DIR := user/fb-demo
 FB_DEMO_ELF := $(FB_DEMO_DIR)/target/x86_64-unknown-none/release/cambios-fb-demo
 COMPOSITOR_DIR := user/compositor
@@ -206,7 +208,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init fb-demo compositor scanout-limine scanout-virtio-gpu hello-window tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 fb-demo-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -745,10 +747,26 @@ sign-tool:
 manifest: sign-tool
 	@echo "=== Building build-manifest tool ==="
 	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
-	@echo "=== Emitting + signing manifest.bin ==="
-	$(BUILD_MANIFEST) manifest.toml -o manifest.bin
+	@echo "=== Emitting + signing manifest.bin (x86_64) ==="
+	$(BUILD_MANIFEST) manifest.toml -o manifest.bin --arch x86_64
 	$(SIGN_ELF) $(SIGN_FLAGS) manifest.bin
 	@echo "=== manifest.bin ready (signed) ==="
+
+manifest-aarch64: sign-tool
+	@echo "=== Building build-manifest tool ==="
+	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
+	@echo "=== Emitting + signing manifest-aarch64.bin ==="
+	$(BUILD_MANIFEST) manifest.toml -o manifest-aarch64.bin --arch aarch64
+	$(SIGN_ELF) $(SIGN_FLAGS) manifest-aarch64.bin
+	@echo "=== manifest-aarch64.bin ready (signed) ==="
+
+manifest-riscv64: sign-tool
+	@echo "=== Building build-manifest tool ==="
+	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
+	@echo "=== Emitting + signing manifest-riscv64.bin ==="
+	$(BUILD_MANIFEST) manifest.toml -o manifest-riscv64.bin --arch riscv64
+	$(SIGN_ELF) $(SIGN_FLAGS) manifest-riscv64.bin
+	@echo "=== manifest-riscv64.bin ready (signed) ==="
 
 mkinitrd:
 	@echo "=== Building mkinitrd host tool ==="
@@ -1493,7 +1511,7 @@ EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-cod
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 fde-mount-aarch64 usb-host-aarch64 ccid-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 init-aarch64 manifest-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 fde-mount-aarch64 usb-host-aarch64 ccid-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1562,6 +1580,15 @@ img-aarch64: kernel-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-
 	mcopy -i $(IMG_AARCH64) /tmp/sprouty-signed.elf ::/boot/sprouty.elf
 	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
 	mcopy -i $(IMG_AARCH64) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
+	# ADR-018 step 8 (commit D): init + the signed manifest blob.
+	# manifest-aarch64.bin arrives signed by its prerequisite — do NOT
+	# re-sign (stacked ARCSIG trailers break verification). Staged as
+	# /boot/manifest.bin so the module name matches MANIFEST_MODULE_NAME.
+	cp $(INIT_ELF_AARCH64) /tmp/init-signed.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/init-signed.elf
+	mcopy -i $(IMG_AARCH64) /tmp/init-signed.elf ::/boot/init.elf
+	rm -f /tmp/init-signed.elf
+	mcopy -i $(IMG_AARCH64) manifest-aarch64.bin ::/boot/manifest.bin
 	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/fde-mount-signed.elf /tmp/usb-host-signed.elf /tmp/ccid-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/worm-signed.elf /tmp/ping-signed.elf /tmp/sprouty-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
@@ -1648,6 +1675,17 @@ img-riscv64: policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64
 	mkdir -p initrd_root_riscv64
+	# ADR-018 step 8: riscv64 stays on the legacy-chain fallback for
+	# now — the first-ever exercise of handle_spawn on riscv64 (init's
+	# supervised wave) hit kernel-memory corruption (SPAWN_GRANTS count
+	# garbage, spawned task running the wrong module's bytes, init
+	# context reset; signature in STATUS Known Issues). Until that
+	# kernel bug is fixed, manifest.bin + init deliberately do NOT
+	# enter the initrd: absent manifest ⇒ legacy boot, by design.
+	# The manifest-riscv64 target stays buildable for the fix.
+	# Revisit when: the riscv64 spawn-path corruption is fixed —
+	# staging is then: cp init + `--module manifest.bin=` +
+	# `--module init=` lines here (see img-aarch64 for the shape).
 	cp $(POLICY_SERVICE_ELF_RISCV64) initrd_root_riscv64/policy-service.elf
 	cp $(KS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/key-store-service.elf
 	cp $(FS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/fs-service.elf
