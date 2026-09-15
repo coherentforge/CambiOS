@@ -73,7 +73,8 @@ const BANNER: &[u8] =
 // Entry point — _start, heap arena + init, and the panic handler are
 // emitted by `service_main!` (ADR-037 L0, no-endpoint + heap form).
 // libgui's Client::open registers the reply endpoints, and readiness is
-// gated on window setup, so `run` calls `sys::module_ready()` itself.
+// gated on window setup, so `run` calls `cambios_libsys_rt::ready()`
+// itself.
 // ============================================================================
 
 cambios_libsys_rt::service_main! {

@@ -907,18 +907,6 @@ pub static JOURNAL_LOCK: Spinlock<Option<fs::journal::Journal>> = Spinlock::new(
 pub static BOOT_MODULE_REGISTRY: Spinlock<boot_modules::BootModuleRegistry> =
     Spinlock::new(boot_modules::BootModuleRegistry::new());
 
-/// Sequential boot-release chain state. `load_boot_modules` pushes each
-/// loaded task's TaskId into this roster in limine.conf order; module 0
-/// runs `Ready` from boot while modules 1..N start `Blocked` on
-/// `BlockReason::BootGate`. Each module's `SYS_MODULE_READY` call
-/// advances the cursor and unblocks the next one.
-///
-/// Independent lock domain — acquired briefly by the `SYS_MODULE_READY`
-/// handler and released before calling into the scheduler to wake the
-/// released task. Not part of the main lock hierarchy.
-pub static BOOT_MODULE_ORDER: Spinlock<boot_modules::BootModuleOrder> =
-    Spinlock::new(boot_modules::BootModuleOrder::new());
-
 /// Per-process reply-endpoint registry. Indexed by `ProcessId::slot()`.
 /// Stores the first endpoint the process registered via `SYS_REGISTER_ENDPOINT`
 /// — this becomes the `from` field of messages the process sends, so that

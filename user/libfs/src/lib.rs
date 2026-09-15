@@ -159,7 +159,7 @@ static REPLY_ENDPOINT: AtomicU32 = AtomicU32::new(0);
 /// const MY_EP: u32 = 42;
 /// sys::register_endpoint(MY_EP);
 /// libfs::init(MY_EP);
-/// sys::module_ready();
+/// cambios_libsys_rt::ready();
 /// // ... libfs::open / save / ... ready for use.
 /// ```
 #[cfg(not(test))]

@@ -123,9 +123,9 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[PING] booting\r\n");
 
-    // Leaf boot module — release the boot gate immediately so
-    // downstream modules (shell, anything after ping in the manifest)
-    // don't block on our compositor round-trip.
+    // On-demand app (ADR-018 step 9) — spawned by `play`, not by
+    // init's wave. Send the readiness ping immediately; init discards
+    // it, and nothing waits on our compositor round-trip.
     cambios_libsys_rt::ready();
 
     let mut client = match Client::open(render::WINDOW_W, render::WINDOW_H, PONG_ENDPOINT) {

@@ -43,9 +43,9 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[AUDIT-TAIL] starting\r\n");
 
-    // Release the boot gate immediately — audit-tail is a leaf consumer.
-    // Calling module_ready before audit_attach means a failure to attach
-    // doesn't park the rest of the boot chain.
+    // Signal readiness to init immediately — audit-tail is a leaf
+    // consumer. Pinging before audit_attach means a failure to attach
+    // doesn't stall the rest of init's boot wave.
     cambios_libsys_rt::ready();
 
     let vaddr = sys::audit_attach();

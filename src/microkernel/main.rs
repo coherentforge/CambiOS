@@ -897,9 +897,9 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     unsafe { start_application_processors(); }
 
     println!();
-    println!("✓ SMP live + signed boot modules loaded from initrd.");
-    println!("Each hart runs its own scheduler + timer; the BOOT_MODULE_ORDER chain");
-    println!("releases services in roster order. Cross-hart TLB shootdowns fire");
+    println!("✓ SMP live + signed boot modules registered from initrd.");
+    println!("Each hart runs its own scheduler + timer; init (PID 1) spawns the");
+    println!("manifest's service wave. Cross-hart TLB shootdowns fire");
     println!("organically from the loader path — every process exit unmaps its ELF");
     println!("segments + user stack, each unmap_page broadcasts the SBI IPI.");
     println!("Console RX still routed: press a key → '[R-3 RX] 0xNN'.");
@@ -942,9 +942,8 @@ fn scheduler_init_riscv64() {
 
     // Load signed boot modules from the initrd (BootInfo.modules).
     // `load_boot_modules` is arch-independent: same SignedBinaryVerifier,
-    // same capability / BOOT_MODULE_ORDER wiring as x86_64 / aarch64 —
-    // including the ADR-018 manifest transcription and its fatal
-    // invalid-manifest path.
+    // same registry + manifest transcription + create-init wiring as
+    // x86_64 / aarch64, including the fatal invalid-manifest path.
     if let Err(e) = load_boot_modules(&mut scheduler) {
         cambios_core::boot::error::boot_failed(e);
     }
@@ -1552,102 +1551,44 @@ fn scheduler_init() {
 
 /// Register send+receive capabilities for a user process on all endpoints.
 ///
-/// Called when creating user-mode processes (boot modules) so their
-/// capabilities are registered after the process table entry exists.
+/// Register the boot modules and create init (ADR-018).
 ///
-/// Grants send/receive on endpoints 0-31 (full range) and binds the
-/// bootstrap Principal to the process (boot modules are trusted).
-fn register_process_capabilities(process_id: ProcessId) {
-    use cambios_core::ipc::capability::CapabilityKind;
-
-    let mut guard = CAPABILITY_MANAGER.lock();
-    let cap_mgr = match guard.as_mut() {
-        Some(m) => m,
-        None => return,
-    };
-    if let Err(e) = cap_mgr.register_process(process_id) {
-        println!("  ✗ Failed to register caps for process {}: {}", process_id.slot(), e);
-        return;
-    }
-    // Grant send/receive on all endpoints (boot modules are trusted)
-    for endpoint_id in 0..cambios_core::ipc::MAX_ENDPOINTS as u32 {
-        let _ = cap_mgr.grant_capability(
-            process_id,
-            EndpointId(endpoint_id),
-            CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
-        );
-    }
-    // ADR-008: boot modules are trusted and may spawn child processes
-    // (e.g., the shell uses SYS_SPAWN).
-    let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateProcess);
-    // ADR-005: boot modules may create shared-memory channels.
-    let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateChannel);
-    // ADR-027: boot modules may register service clusters. Same trust
-    // posture as CreateChannel — clusters are bookkeeping over channels
-    // (ADR-027 § Decision 1), so the cap-promotion granularity matches.
-    // Tighter name-based grant (compositor-only, or a future userspace
-    // init) can replace the universal grant when a misuse pattern
-    // surfaces; until then, the bootstrap-Principal fallback in
-    // handle_cluster_create is the safety net.
-    let _ = cap_mgr.grant_system_capability(process_id, CapabilityKind::CreateCluster);
-    // Bind bootstrap Principal to boot module processes (they're trusted)
-    let bootstrap = BOOTSTRAP_PRINCIPAL.load();
-    if !bootstrap.is_zero() {
-        let _ = cap_mgr.bind_principal(process_id, bootstrap);
-    }
-}
-
-/// Load ELF binaries from Limine boot modules.
-///
-/// Iterates all modules provided by the bootloader (specified in limine.conf
-/// via `module_path` directives). Each module is treated as a complete ELF
-/// binary and loaded through the full verify-before-execute pipeline.
-///
-/// Process IDs are assigned starting at 5 (0-4 are used by kernel tasks
-/// and the existing hand-built user tasks).
+/// Since migration step 9 the kernel starts no service itself. Every
+/// module the bootloader handed over (limine.conf `module_path` lines;
+/// the riscv64 initrd) is verified-signed only when it is spawned, and
+/// is registered here by name so `SYS_SPAWN` can find its bytes. Two
+/// modules are special: `manifest.bin` (data — ARCSIG-verified and
+/// transcribed into the enforcement tables) and `init.elf` (created as
+/// PID 1 after the scan). Both are required; either missing is a typed
+/// boot failure, never a fallback.
 fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot::error::BootError> {
-    use cambios_core::loader::{self, SignedBinaryVerifier};
-    use cambios_core::FRAME_ALLOCATOR;
+    use cambios_core::boot::error::BootError;
+    use cambios_core::loader::SignedBinaryVerifier;
 
     let info = cambios_core::boot::info();
-    if info.module_count() == 0 {
-        println!("  No boot modules found");
-        return Ok(());
-    }
+    println!("Registering {} boot module(s)...", info.module_count());
 
-    println!("Loading {} boot module(s)...", info.module_count());
-
-    // Use SignedBinaryVerifier with the bootstrap public key as the trust anchor.
-    // All boot modules must be signed by the bootstrap key (via sign-elf tool).
+    // Bootstrap public key = trust anchor for every signed artifact:
+    // the manifest blob here, init's ELF in create_init_process, every
+    // service ELF at spawn.
     let bootstrap = BOOTSTRAP_PRINCIPAL.load();
     let verifier = SignedBinaryVerifier::with_key(*bootstrap.current_key_bytes());
-    let mut loaded_count = 0u32;
 
-    // ADR-018 step 7: the manifest arm below stashes the transcribed
-    // blob's module bytes (init needs them mapped at
-    // MANIFEST_USER_VADDR — a DIFFERENT buffer from init's own ELF);
-    // the init arm stashes init's ELF bytes. After the loop the pair
-    // decides whether the kernel creates init as PID 1 — manifest
-    // without init module is a broken boot image (typed boot error),
-    // init module without manifest is registered-but-never-created
-    // (harmless; legacy boot proceeds).
+    // The manifest arm below stashes the transcribed blob's module
+    // bytes (init needs them mapped at MANIFEST_USER_VADDR — a
+    // DIFFERENT buffer from init's own ELF); the init arm stashes
+    // init's ELF bytes. Conflating the two was the first-boot bug of
+    // step 7; the pair of named slots keeps it unrepresentable.
     let mut manifest_module: Option<(*const u8, usize)> = None;
     let mut init_module: Option<(*const u8, usize)> = None;
 
-    // ADR-018 step 8, pass 1: find the manifest + init modules before
-    // touching any service module. Whether this boot is init-supervised
-    // must be known up front — the decision governs how every other
-    // module is treated below, and hanging it on staging order (the
-    // manifest happening to be listed first in limine.conf) would make
-    // a misordered boot config silently fall back to the legacy chain.
-    //
-    // The boot-manifest module is data, not an ELF. Verify its ARCSIG
-    // trailer against the same bootstrap key and transcribe its
-    // security sections into the write-once enforcement tables
-    // (endpoint reservations + spawn grants). A present-but-invalid
-    // manifest aborts boot via the typed error path — booting
-    // permissively on corrupt security configuration would be the
-    // vulnerability. Absent ⇒ tables stay empty ⇒ legacy boot.
+    // Pass 1: the manifest + init modules, before any service module.
+    // The manifest is data, not an ELF. Verify its ARCSIG trailer
+    // against the bootstrap key and transcribe its security sections
+    // into the write-once enforcement tables (endpoint reservations +
+    // spawn grants + spawn authority). A present-but-invalid manifest
+    // aborts boot via the typed error path — booting permissively on
+    // corrupt security configuration would be the vulnerability.
     for module in info.modules() {
         let size = module.size;
         let addr = module.phys_addr as *const u8;
@@ -1678,15 +1619,13 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
         }
     }
 
-    // ADR-018 step 8: when both are present, this is an init-supervised
-    // boot — the kernel loads NO service as a process. Every module is
-    // registered spawn-only and init spawns the manifest-listed set in
-    // dependency order (each spawn binding the entry's derived AID +
-    // exactly its grants via handle_spawn's manifest arm). The legacy
-    // auto-start chain below still runs when either module is absent;
-    // it is deleted at migration step 9.
-    let supervised_boot = manifest_module.is_some() && init_module.is_some();
-
+    // Pass 2: register every other ELF module spawn-only. Nothing is
+    // loaded as a process here — init spawns the manifest's boot wave
+    // in dependency order, and CreateProcess holders spawn on-demand
+    // entries (apps) later; handle_spawn binds each row's derived AID
+    // and installs exactly its grants. A module the manifest does not
+    // declare is registered but unspawnable (typed reject at spawn).
+    let mut registered = 0u32;
     for (i, module) in info.modules().enumerate() {
         let size = module.size;
         let addr = module.phys_addr as *const u8;
@@ -1708,263 +1647,32 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
             continue;
         }
 
-        // SAFETY: Limine loaded this module into memory and provides a valid
-        // address and size. The memory is part of the bootloader-reclaimable
-        // region and is accessible via the HHDM. We create a read-only slice
-        // for the duration of ELF loading.
+        // SAFETY: the bootloader loaded this module into memory and
+        // provides a valid address and size, accessible via the HHDM;
+        // read-only slice for the duration of the magic check.
         let binary = unsafe { core::slice::from_raw_parts(addr, size as usize) };
 
-        // Check for ELF magic before attempting to load
+        // Check for ELF magic before registering
         if binary.len() < 4 || &binary[0..4] != b"\x7fELF" {
             println!("    ✗ Skipped (not an ELF binary)");
             continue;
         }
 
-        if supervised_boot {
-            BOOT_MODULE_REGISTRY
-                .lock()
-                .register(short_name, addr, size as usize);
-            println!("    ✓ Registered (init spawns per manifest)");
-            continue;
-        }
-
-        // Deferred: hardcoded name list couples the kernel boot loop to
-        // the user-space app registry. Cleaner shapes would be a limine
-        // per-module cmdline flag, a `game-` filename prefix convention,
-        // or a manifest file read at boot.
-        // Why: the shell `play` launcher UX needs "load-but-don't-start"
-        // semantics so boot lands at `cambios>` rather than in a game;
-        // the cleaner mechanisms are larger scope than the HN launcher
-        // arc.
-        // Revisit when: the sprouty launcher arc closes within
-        // this session — followup scheduled to replace this list with a
-        // config-driven mechanism.
-        const SPAWN_ONLY_MODULES: &[&[u8]] =
-            &[b"tree", b"worm", b"ping", b"sprouty"];
-
-        if SPAWN_ONLY_MODULES.contains(&short_name) {
-            BOOT_MODULE_REGISTRY
-                .lock()
-                .register(short_name, addr, size as usize);
-            println!("    ✓ Registered as spawn-only (not auto-started)");
-            continue;
-        }
-
-        let mut pt_guard = PROCESS_TABLE.lock();
-        let mut fa_guard = FRAME_ALLOCATOR.lock();
-        let pt = match pt_guard.as_mut() {
-            Some(pt) => pt,
-            None => {
-                println!("    ✗ ProcessTable not initialized");
-                continue;
-            }
-        };
-
-        // Process table allocates slot + generation internally.
-        match loader::load_elf_process(
-            binary,
-            Priority::NORMAL,
-            &verifier,
-            pt,
-            &mut fa_guard,
-            scheduler,
-        ) {
-            Ok(result) => {
-                let process_id = result.process_id;
-                // Drop locks before acquiring CAPABILITY_MANAGER
-                drop(fa_guard);
-                drop(pt_guard);
-                register_process_capabilities(process_id);
-
-                // Register in boot module registry for runtime Spawn syscall
-                BOOT_MODULE_REGISTRY.lock().register(short_name, addr, size as usize);
-
-                // Identify the policy service by module name.
-                if short_name == b"policy-service" {
-                    cambios_core::POLICY_SERVICE_PID.store(
-                        process_id.as_raw(),
-                        core::sync::atomic::Ordering::Release,
-                    );
-                    println!("    ✓ Policy service identified as process {}", process_id.slot());
-                }
-
-                // ADR-011, ADR-014: grant the `MapFramebuffer` system
-                // capability to modules that need to call
-                // `SYS_MAP_FRAMEBUFFER`. Today fb-demo (one-shot
-                // smoke test) and scanout-limine (fallback driver).
-                // Per ADR-014 the compositor never holds this
-                // capability — only scanout-driver services do.
-                // Grant is name-based rather than all-boot-modules
-                // because MapFramebuffer is a hardware-access
-                // capability, narrower than the default
-                // send/receive + CreateProcess grant.
-                if short_name == b"fb-demo" || short_name == b"scanout-limine" {
-                    use cambios_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
-                    if let Some(cap_mgr) = cap_guard.as_mut() {
-                        let _ = cap_mgr.grant_system_capability(
-                            process_id,
-                            CapabilityKind::MapFramebuffer,
-                        );
-                        println!(
-                            "    ✓ Granted MapFramebuffer to {} (process {})",
-                            core::str::from_utf8(short_name).unwrap_or("?"),
-                            process_id.slot(),
-                        );
-                    }
-                }
-
-                // ADR-023: grant `AuditConsumer` to the audit-tail boot
-                // module. AuditConsumer gates SYS_AUDIT_ATTACH (replacing
-                // the bootstrap-Principal-only check from ADR-007 §"Audit
-                // channel boot sequence") and SYS_GET_PROCESS_PRINCIPAL.
-                // Name-based grant matches the MapFramebuffer pattern —
-                // narrow capability, single trusted holder, no need for a
-                // dynamic policy until a second consumer (kernelvisor)
-                // appears.
-                if short_name == b"audit-tail" {
-                    use cambios_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
-                    if let Some(cap_mgr) = cap_guard.as_mut() {
-                        let _ = cap_mgr.grant_system_capability(
-                            process_id,
-                            CapabilityKind::AuditConsumer,
-                        );
-                        println!(
-                            "    ✓ Granted AuditConsumer to audit-tail (process {})",
-                            process_id.slot(),
-                        );
-                    }
-                }
-
-                // ADR-022: grant `SetWallclock` to udp-stack so it can
-                // republish the kernel's Unix-seconds baseline after
-                // each NTP refresh. udp-stack is the day-1 setter; future
-                // signed-time / Roughtime / peer-attestation collectors
-                // will land alongside this grant. Name-based pattern
-                // matches MapFramebuffer / AuditConsumer above.
-                if short_name == b"udp-stack" {
-                    use cambios_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
-                    if let Some(cap_mgr) = cap_guard.as_mut() {
-                        let _ = cap_mgr.grant_system_capability(
-                            process_id,
-                            CapabilityKind::SetWallclock,
-                        );
-                        println!(
-                            "    ✓ Granted SetWallclock to udp-stack (process {})",
-                            process_id.slot(),
-                        );
-                    }
-                }
-
-                // Demo path: terminal-window also gets `SetWallclock`
-                // so an operator can manually set the wall clock from
-                // the GUI shell when NTP is unavailable — e.g., the
-                // default `make run` QEMU args attach virtio-net-pci
-                // without a paired `-netdev` backend, so udp-stack's
-                // NTP query goes into the void and the clock never
-                // populates. Same name-match pattern as udp-stack /
-                // MapFramebuffer / AuditConsumer above. Acceptable
-                // because terminal-window is identity-bound at boot
-                // and the audit ring still records every SetWallclock
-                // invocation. Revisit when: NTP works reliably in the
-                // demo build OR a dedicated time-management service
-                // takes over (no reason for the shell to hold this
-                // cap once a proper time service exists).
-                if short_name == b"terminal-window" {
-                    use cambios_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
-                    if let Some(cap_mgr) = cap_guard.as_mut() {
-                        let _ = cap_mgr.grant_system_capability(
-                            process_id,
-                            CapabilityKind::SetWallclock,
-                        );
-                        println!(
-                            "    ✓ Granted SetWallclock to terminal-window (process {})",
-                            process_id.slot(),
-                        );
-                    }
-                }
-
-                // ADR-032: grant `UnlockVolume` to fde-mount — gates
-                // SYS_READ_VOLUME_HEADER + SYS_INSTALL_MASTER_KEY
-                // (bootstrap-equality gates retired by the ADR-018
-                // step-8 sweep). Name-based pattern matches
-                // MapFramebuffer / AuditConsumer / SetWallclock above;
-                // this grant dies with the auto-start chain at the
-                // cutover, where the manifest's `unlock-volume` grant
-                // takes over.
-                if short_name == b"fde-mount" {
-                    use cambios_core::ipc::capability::CapabilityKind;
-                    let mut cap_guard = cambios_core::CAPABILITY_MANAGER.lock();
-                    if let Some(cap_mgr) = cap_guard.as_mut() {
-                        let _ = cap_mgr.grant_system_capability(
-                            process_id,
-                            CapabilityKind::UnlockVolume,
-                        );
-                        println!(
-                            "    ✓ Granted UnlockVolume to fde-mount (process {})",
-                            process_id.slot(),
-                        );
-                    }
-                }
-
-                println!(
-                    "    ✓ Loaded as task {} → process {} (entry={:#x}, signed)",
-                    result.task_id.slot(), result.process_id.slot(), result.entry_point
-                );
-
-                // Sequential boot-release chain: append this task to the
-                // ordered roster. Every loaded module after the first
-                // starts Blocked on `BootGate` — it stays parked until
-                // its predecessor calls `sys::module_ready()`, at which
-                // point `handle_module_ready` wakes it.
-                //
-                // Module 0 (`loaded_count == 0` at this point) runs
-                // Ready as before. This preserves the invariant the
-                // scheduler already relies on: at least one task
-                // (besides idle) is runnable at boot.
-                cambios_core::BOOT_MODULE_ORDER.lock().push(result.task_id);
-                if loaded_count > 0 {
-                    let _ = scheduler.block_task(
-                        result.task_id,
-                        cambios_core::scheduler::BlockReason::BootGate,
-                    );
-                }
-
-                loaded_count += 1;
-            }
-            Err(e) => {
-                println!("    ✗ ELF load failed: {}", e);
-            }
-        }
+        BOOT_MODULE_REGISTRY
+            .lock()
+            .register(short_name, addr, size as usize);
+        registered += 1;
+        println!("    ✓ Registered (spawned per manifest)");
     }
+    println!("✓ {} module(s) registered; nothing auto-started — init spawns per manifest", registered);
 
-    if loaded_count > 0 {
-        println!("✓ Loaded {} signed module(s) as user processes", loaded_count);
-        // Enable policy enforcement if the policy service was loaded.
-        // The fail-open timeout handles the startup window before the policy
-        // service processes its first query.
-        if cambios_core::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire) != u64::MAX {
-            cambios_core::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
-            println!("✓ Policy enforcement enabled (fail-open until service starts)");
-        }
-    }
-    if supervised_boot {
-        // Policy identification + enforcement enablement happen in
-        // handle_spawn's manifest arm when init spawns policy-service
-        // (the fail-open window covers the gap, exactly as it covered
-        // the auto-start world's pre-first-query window).
-        println!("✓ Init-supervised boot: no module auto-started; init spawns per manifest");
-    }
-
-    // ADR-018 step 7: create init as PID 1 iff a manifest described
-    // this boot. Runs while the caller still exclusively borrows the
-    // BSP scheduler, so init cannot be scheduled before its blob
-    // mapping, grants, and identity are installed — the same ordering
-    // guarantee the module loop above relies on for its own
-    // post-load capability grants.
+    // Create init as PID 1. Runs while the caller still exclusively
+    // borrows the BSP scheduler, so init cannot be scheduled before its
+    // blob mapping, grants, and identity are installed. Policy
+    // identification + enforcement enablement happen in handle_spawn
+    // when init spawns policy-service (the fail-open window covers the
+    // gap, exactly as it covered the old chain's pre-first-query
+    // window).
     match (manifest_module, init_module) {
         (Some(manifest), Some(init)) => {
             create_init_process(init, manifest, &verifier, scheduler)?;
@@ -1972,14 +1680,13 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
         (Some(_), None) => {
             println!("✗ Boot manifest transcribed but no '{}' boot module",
                 cambios_manifest::INIT_MODULE_NAME);
-            return Err(cambios_core::boot::error::BootError::InitModuleMissing);
+            return Err(BootError::InitModuleMissing);
         }
-        (None, Some(_)) => {
-            // Registered spawn-only above; without a manifest there is
-            // no identity to bind or table to execute — legacy boot.
-            println!("  init module present but no manifest — init not created");
+        (None, _) => {
+            println!("✗ No '{}' boot module — nothing describes what to run",
+                cambios_manifest::MANIFEST_MODULE_NAME);
+            return Err(BootError::ManifestModuleMissing);
         }
-        (None, None) => {}
     }
 
     // NEXT_PROCESS_ID removed — process table allocates slots
@@ -2234,9 +1941,9 @@ fn ipc_init() {
 /// `init_kernel_object_tables` with slice-backed storage. This step
 /// only registers processes 0-2 (kernel tasks created in
 /// process_table_init) and grants their initial capabilities.
-/// Boot module processes are registered later when load_boot_modules
-/// calls register_process_capabilities after their process table
-/// entries exist.
+/// Every user process is registered at its spawn (init by
+/// `create_init_process`, everything else by `handle_spawn`'s
+/// manifest path) after its process table entry exists.
 fn capability_manager_init() {
     use cambios_core::ipc::capability::CapabilityKind;
 

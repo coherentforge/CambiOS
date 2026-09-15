@@ -556,8 +556,8 @@ fn run() -> ! {
 }
 
 fn no_device_loop() -> ! {
-    // Release the boot gate so the next module can start. Every entry point
-    // into this function has already registered NET_ENDPOINT, so the module
+    // Ping init ready so dependents (udp-stack) can spawn. Every entry point
+    // into this function has already registered NET_ENDPOINT, so the service
     // is observably up even though it has no device to serve.
     cambios_libsys_rt::ready();
 

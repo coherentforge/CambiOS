@@ -515,11 +515,6 @@ pub enum BlockReason {
     ChildWait(u32),
     /// Waiting for policy service to respond to a syscall query
     PolicyWait(u64),
-    /// Boot-time gate: module loaded but not yet released. `load_boot_modules`
-    /// parks modules 1..N in this state; each predecessor's `sys_module_ready`
-    /// call wakes the next module in the chain. See `BOOT_MODULE_ORDER` in
-    /// `src/lib.rs`.
-    BootGate,
     /// Parked by the per-channel quiesce protocol (ADR-027 Phase 1). The
     /// kernel armed quiesce on this task because it is the peer of a
     /// channel transitioning from Active to Revoking. The task is held
@@ -544,7 +539,6 @@ impl fmt::Display for BlockReason {
             BlockReason::DebuggerWait => write!(f, "DebuggerWait"),
             BlockReason::ChildWait(slot) => write!(f, "ChildWait(slot {})", slot),
             BlockReason::PolicyWait(qid) => write!(f, "PolicyWait({})", qid),
-            BlockReason::BootGate => write!(f, "BootGate"),
             BlockReason::ChannelQuiesceWait(id) => write!(f, "ChannelQuiesceWait({})", id),
         }
     }

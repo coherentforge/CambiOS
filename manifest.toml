@@ -20,23 +20,33 @@
 #   21 udp-stack                       31 usb-host
 #   22/23 policy query/response        32 fde-mount
 #                                      33 ccid
-# User-spawned apps (games 61-63, ping 19, hello-window 29) are NOT
-# manifest entries — they take the legacy spawn path and register from
-# the unreserved range, first-come (ADR-018 § 3).
+#   19 ping                            61 tree   62 worm   63 sprouty
+#   29 hello-window
+# Apps (games, hello-window) are manifest entries with
+# `lifetime = "on-demand"` (ADR-018 step 9): init does NOT spawn them;
+# any CreateProcess holder (shell, terminal-window) spawns them by
+# name, and the kernel binds the entry's derived AID + exactly its
+# grants — "tree runs as tree". Their endpoints are reserved like any
+# service's. On-demand entries can neither declare nor be named in
+# depends_on (build-manifest and init's engine both reject that).
 #
 # Grant posture per entry (assembled by build-manifest, ADR-018 § 2):
 # receive on each reserved endpoint + send on all endpoints (replies
 # target clients' self-chosen reply endpoints) + the System caps named
-# here. `system` entries below mirror today's name-based grants in
-# load_boot_modules and the code-verified channel_create / spawn call
-# sites (grep 2026-07-08: create-channel = compositor + scanout drivers;
-# create-process = shell + terminal-window).
+# here. `system` entries mirror the code-verified channel_create /
+# spawn / map-framebuffer call sites (create-channel = compositor +
+# scanout drivers; create-process = shell + terminal-window;
+# map-framebuffer = scanout-limine). Since step 9 this file is the
+# ONLY grant authority — the kernel has no name-based grants left.
 #
 # depends_on = hard startup dependencies only (init spawns in DAG
-# order and gates on readiness pings). Soft orderings the old
-# BOOT_MODULE_ORDER chain encoded (e.g. "policy first so enforcement
-# is warm") are NOT dependencies; the kernel's fail-open policy window
-# covers them.
+# order and gates on readiness pings). Soft orderings the retired
+# boot chain encoded (e.g. "policy first so enforcement is warm") are
+# NOT dependencies; the kernel's fail-open policy window covers them.
+#
+# `arch` tags select per-deployment manifests (`--arch`); `profile`
+# tags keep an entry out of the default images (`--profile`, default
+# "default") while still declaring it in the registry.
 
 [init]
 endpoint = 1
@@ -110,6 +120,55 @@ name = "terminal-window"
 endpoints = [14, 15]
 system = ["create-process", "set-wallclock"]
 depends_on = ["compositor"]
+arch = ["x86_64", "aarch64"]
+
+# scanout-limine — the FALLBACK scanout driver: same compositor↔driver
+# protocol as scanout-virtio-gpu, writing into the bootloader's linear
+# framebuffer. The driver that matters on real hardware without
+# virtio-gpu (UEFI GOP). Declared here so its identity + grants exist;
+# kept out of every default image because it and scanout-virtio-gpu
+# both own endpoint 27 and the compositor's dependency names the
+# virtio driver — selecting the fallback is a whole-profile decision.
+# Revisit when: a board/profile dimension swaps the compositor's
+# driver dependency (first bare-metal GOP boot).
+[[service]]
+name = "scanout-limine"
+endpoints = [27]
+system = ["create-channel", "map-framebuffer"]
+profile = ["framebuffer-fallback"]
+arch = ["x86_64", "aarch64"]
+
+# --- on-demand apps (spawned by `play` / the terminal, never by init) ---------
+
+[[service]]
+name = "tree"
+endpoints = [61]
+lifetime = "on-demand"
+arch = ["x86_64", "aarch64"]
+
+[[service]]
+name = "worm"
+endpoints = [62]
+lifetime = "on-demand"
+arch = ["x86_64", "aarch64"]
+
+[[service]]
+name = "sprouty"
+endpoints = [63]
+lifetime = "on-demand"
+arch = ["x86_64", "aarch64"]
+
+[[service]]
+name = "ping"
+endpoints = [19]
+lifetime = "on-demand"
+arch = ["x86_64", "aarch64"]
+
+# hello-window — the canonical libgui client / regression canary.
+[[service]]
+name = "hello-window"
+endpoints = [29]
+lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
 
 # --- USB / PIV chain -------------------------------------------------------------

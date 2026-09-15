@@ -617,7 +617,7 @@ fn handle_kernel_cmd(driver: &mut BlkDriver, payload: &[u8], response: &mut [u8]
 // ============================================================================
 // Entry point — _start and the panic handler are emitted by
 // `service_main!` (ADR-037 L0, no-endpoint form: registration order and
-// the module_ready point depend on device probing below, so `run` owns
+// the `ready()` point depend on device probing below, so `run` owns
 // both).
 // ============================================================================
 

@@ -9,7 +9,9 @@
 //!   (endpoint reservations, per-module AID + capability grants) into
 //!   write-once enforcement tables at boot;
 //! - **init** (PID 1) parses the same blob for its policy sections
-//!   (`depends_on` DAG, lifetime / restart parameters);
+//!   (`depends_on` DAG, lifetime / restart parameters — the one
+//!   lifetime bit the kernel also reads is `OnDemand`, which decides
+//!   *who may spawn* the entry, see [`ServiceLifetime`]);
 //! - **tools/build-manifest** emits the blob from the endpoint-registry
 //!   source artifact and signs it (ARCSIG, outside this crate).
 //!
@@ -211,6 +213,7 @@ const L_OFF_FAILURE_WINDOW: usize = 12;
 
 const LIFETIME_TAG_ONESHOT: u8 = 0;
 const LIFETIME_TAG_PERSISTENT: u8 = 1;
+const LIFETIME_TAG_ONDEMAND: u8 = 2;
 
 /// Grant sub-record layout (8 bytes): kind u8 @0, rights u8 @1,
 /// pad u16 @2 (0), target u32 @4.
@@ -308,8 +311,19 @@ pub enum CapabilityGrant {
     System { kind: u32 },
 }
 
-/// Lifecycle policy for a manifest entry — interpreted by init only;
-/// the kernel ignores it (ADR-018 § 2).
+/// Lifecycle policy for a manifest entry (ADR-018 § 2).
+///
+/// `OneShot` and `Persistent` are init's business (spawned in the
+/// boot wave; restart parameters interpreted by init, ignored by the
+/// kernel). `OnDemand` is the one variant the kernel also reads: an
+/// on-demand entry is *not* part of init's boot wave — it is spawned
+/// by name, later, by any `CreateProcess` holder (the shell launching
+/// a game), and the kernel's spawn path admits non-init callers for
+/// exactly these rows. The entry is otherwise a full manifest row:
+/// derived AID, reserved endpoints, narrow grants — "tree runs as
+/// tree". On-demand entries may not appear in any `depends_on` list
+/// and may not declare dependencies themselves (init never sequences
+/// them); `build-manifest` and init's engine both reject that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceLifetime {
     OneShot,
@@ -319,6 +333,14 @@ pub enum ServiceLifetime {
         max_restarts: u16,
         failure_window_ms: u32,
     },
+    OnDemand,
+}
+
+impl ServiceLifetime {
+    /// Is this entry spawned on demand (outside init's boot wave)?
+    pub const fn is_on_demand(&self) -> bool {
+        matches!(self, ServiceLifetime::OnDemand)
+    }
 }
 
 // ============================================================================
@@ -359,8 +381,8 @@ pub enum EntryError {
     GrantPad(u8),
     /// Lifetime tag byte is not a known discriminant.
     LifetimeTag(u8),
-    /// OneShot lifetime carries nonzero restart fields, or the
-    /// lifetime pad byte is nonzero.
+    /// OneShot / OnDemand lifetime carries nonzero restart fields, or
+    /// the lifetime pad byte is nonzero.
     LifetimeFields,
     /// Entry pad or reserved bytes are nonzero.
     PadNonZero,
@@ -614,14 +636,14 @@ impl<'a> Manifest<'a> {
             }
         }
 
-        // Lifetime: known tag; OneShot must carry zeroed fields; the
-        // pad byte must be zero for both tags.
+        // Lifetime: known tag; OneShot and OnDemand must carry zeroed
+        // fields; the pad byte must be zero for every tag.
         let l = base + E_OFF_LIFETIME;
         if b[l + L_OFF_PAD] != 0 {
             return Err(EntryError::LifetimeFields);
         }
         match b[l + L_OFF_TAG] {
-            LIFETIME_TAG_ONESHOT => {
+            LIFETIME_TAG_ONESHOT | LIFETIME_TAG_ONDEMAND => {
                 let all_zero = read_u16(b, l + L_OFF_MAX_RESTARTS) == 0
                     && read_u32(b, l + L_OFF_INITIAL_DELAY) == 0
                     && read_u32(b, l + L_OFF_MAX_DELAY) == 0
@@ -754,6 +776,7 @@ impl<'a> EntryView<'a> {
                 max_delay_ms: read_u32(b, l + L_OFF_MAX_DELAY),
                 failure_window_ms: read_u32(b, l + L_OFF_FAILURE_WINDOW),
             },
+            LIFETIME_TAG_ONDEMAND => ServiceLifetime::OnDemand,
             // Tag validated at parse; anything else decodes as OneShot
             // to keep the projection total.
             _ => ServiceLifetime::OneShot,
@@ -1076,6 +1099,7 @@ pub fn emit_manifest(
         let l = base + E_OFF_LIFETIME;
         match e.lifetime {
             ServiceLifetime::OneShot => out[l + L_OFF_TAG] = LIFETIME_TAG_ONESHOT,
+            ServiceLifetime::OnDemand => out[l + L_OFF_TAG] = LIFETIME_TAG_ONDEMAND,
             ServiceLifetime::Persistent {
                 initial_delay_ms,
                 max_delay_ms,
@@ -1538,6 +1562,35 @@ mod tests {
             Manifest::parse(&blob).unwrap_err(),
             ManifestError::Entry(2, EntryError::LifetimeFields)
         ));
+
+        // OnDemand carries zeroed restart fields exactly like OneShot.
+        let mut blob = build_sample();
+        blob[entry_base(2) + E_OFF_LIFETIME + L_OFF_TAG] = LIFETIME_TAG_ONDEMAND;
+        write_u32(&mut blob, entry_base(2) + E_OFF_LIFETIME + L_OFF_MAX_DELAY, 1);
+        assert!(matches!(
+            Manifest::parse(&blob).unwrap_err(),
+            ManifestError::Entry(2, EntryError::LifetimeFields)
+        ));
+    }
+
+    #[test]
+    fn on_demand_lifetime_round_trips() {
+        let defs = [EntryDef {
+            module_name: "tree",
+            principal: aid(7),
+            reserved_endpoints: &[61],
+            grants: &[],
+            lifetime: ServiceLifetime::OnDemand,
+            depends_on: &[],
+        }];
+        let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
+        emit_manifest(aid(0xEE), INIT_ENDPOINT, &defs, &mut buf).unwrap();
+        let m = Manifest::parse(&buf).unwrap();
+        let e = m.entry(0).unwrap();
+        assert_eq!(e.lifetime(), ServiceLifetime::OnDemand);
+        assert!(e.lifetime().is_on_demand());
+        assert!(!ServiceLifetime::OneShot.is_on_demand());
+        assert_eq!(buf[entry_base(0) + E_OFF_LIFETIME + L_OFF_TAG], LIFETIME_TAG_ONDEMAND);
     }
 
     #[test]

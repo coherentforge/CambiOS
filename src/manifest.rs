@@ -4,11 +4,14 @@
 //! Boot-manifest transcription (ADR-018 § 5, migration step 4).
 //!
 //! The kernel *transcribes* the manifest's security sections —
-//! endpoint reservations and the per-module (AID, grants) spawn table
-//! — into write-once kernel tables during boot-module load, before
-//! any user task exists. It never *interprets* the manifest's policy
-//! sections (`depends_on`, lifetimes, backoff): those are init's
-//! (ADR-026 transcribe-don't-interpret, applied to boot config).
+//! endpoint reservations and the per-module (AID, grants, spawn
+//! authority) spawn table — into write-once kernel tables during
+//! boot-module load, before any user task exists. It never
+//! *interprets* the manifest's policy sections (`depends_on`, restart
+//! backoff): those are init's (ADR-026 transcribe-don't-interpret,
+//! applied to boot config). The one lifetime bit the kernel reads is
+//! `OnDemand`, because it decides *who may spawn* the row — a
+//! security fact, transcribed as [`SpawnAuthority`].
 //!
 //! Flow, called from `load_boot_modules` when a module named
 //! [`cambios_manifest::MANIFEST_MODULE_NAME`] appears:
@@ -24,17 +27,17 @@
 //!    kernel types and rights-normalized by
 //!    [`SpawnGrantTable::install`]).
 //!
-//! `handle_spawn`'s manifest arm consumes the spawn table: when the
-//! caller [`is_init_process`] and the manifest declared the module,
-//! [`install_manifest_row`] installs exactly the row's grants and
-//! binds the row's AID. The arm is dormant until migration step 7
-//! creates init and calls [`set_init_process`].
+//! `handle_spawn` consumes the spawn table (since migration step 9 it
+//! is the ONLY spawn path — an undeclared name is a typed error): the
+//! row's [`SpawnAuthority`] decides who may spawn it (init only for
+//! boot-wave rows, any `CreateProcess` holder for on-demand rows —
+//! [`is_init_process`] is the gate), then [`install_manifest_row`]
+//! installs exactly the row's grants and binds the row's AID.
 //!
 //! A **present-but-invalid** manifest is a fatal [`BootError`] —
 //! booting permissively on corrupt security configuration would be
-//! the vulnerability. An **absent** manifest module leaves both
-//! tables empty, which is behavior-identical to the pre-ADR-018
-//! kernel.
+//! the vulnerability. An **absent** manifest module is equally fatal
+//! since step 9: nothing else starts services.
 //!
 //! Both tables follow the `BOOTSTRAP_PRINCIPAL` lifecycle: written
 //! once here (single-threaded boot), read-only thereafter, outside
@@ -119,14 +122,28 @@ fn kernel_system_kind(kind: u32) -> Option<CapabilityKind> {
     })
 }
 
-/// One transcribed spawn-table row: the AID the kernel binds and the
-/// kernel-typed grants it installs when init spawns this module
-/// (step 5).
+/// Who may spawn a manifest row (ADR-018 step 9). Transcribed from
+/// the entry's lifetime: boot-wave rows (`OneShot` / `Persistent`)
+/// are init's to spawn, and only init's — a shell asking for
+/// `fs-service` gets `PermissionDenied`; on-demand rows (apps) are
+/// spawnable by any `CreateProcess` holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnAuthority {
+    /// Boot-wave entry: only the init process may spawn it.
+    InitOnly,
+    /// On-demand entry: any process holding `CreateProcess` may spawn
+    /// it (the syscall's capability check is the whole gate).
+    AnyCreateProcessHolder,
+}
+
+/// One transcribed spawn-table row: the AID the kernel binds, the
+/// kernel-typed grants it installs, and who may spawn it.
 #[derive(Clone, Copy)]
 pub struct SpawnGrantEntry {
     name: [u8; MODULE_NAME_MAX],
     name_len: u8,
     aid: [u8; 32],
+    authority: SpawnAuthority,
     /// Normalized dense prefix, ordered: the `AllEndpoints` grant (if
     /// any) first, then `Endpoint` grants (unique targets, pre-unioned
     /// rights), then `System` grants. The wide-before-narrow order and
@@ -142,6 +159,10 @@ impl SpawnGrantEntry {
 
     pub fn aid(&self) -> &[u8; 32] {
         &self.aid
+    }
+
+    pub fn authority(&self) -> SpawnAuthority {
+        self.authority
     }
 
     /// Iterator over the transcribed grants (dense prefix of the array).
@@ -219,6 +240,7 @@ impl SpawnGrantTable {
         &mut self,
         name: &[u8],
         aid: [u8; 32],
+        authority: SpawnAuthority,
         grants: impl Iterator<Item = CapabilityGrant>,
     ) -> Result<(), SpawnTableError> {
         if name.len() > MODULE_NAME_MAX {
@@ -296,6 +318,7 @@ impl SpawnGrantTable {
             name: [0u8; MODULE_NAME_MAX],
             name_len: name.len() as u8,
             aid,
+            authority,
             grants: [const { None }; GRANTS_MAX],
         };
         entry.name[..name.len()].copy_from_slice(name);
@@ -377,6 +400,8 @@ pub static SPAWN_GRANTS: SpawnGrants = SpawnGrants::new();
 /// exactly the row's grants, then bind the row's AID as the process
 /// Principal (ADR-018 § 4 — the manifest signature is the
 /// authorization; no blanket endpoint loop, no inherited system caps).
+/// The caller has already checked the row's [`SpawnAuthority`]
+/// against the spawning process.
 ///
 /// Caller holds `CAPABILITY_MANAGER` (level 4) and nothing else; this
 /// function takes no locks. Two passes because the per-process
@@ -567,9 +592,17 @@ fn populate_spawn_grants(
             Some(e) => e,
             None => continue, // unreachable: i < entry_count
         };
-        if let Err(e) =
-            table.install(entry.module_name().as_bytes(), entry.principal(), entry.grants())
-        {
+        let authority = if entry.lifetime().is_on_demand() {
+            SpawnAuthority::AnyCreateProcessHolder
+        } else {
+            SpawnAuthority::InitOnly
+        };
+        if let Err(e) = table.install(
+            entry.module_name().as_bytes(),
+            entry.principal(),
+            authority,
+            entry.grants(),
+        ) {
             crate::println!(
                 "    ✗ spawn-table install failed for '{}': {:?}",
                 entry.module_name(), e
@@ -689,6 +722,7 @@ mod tests {
         assert_eq!(populate_spawn_grants(&m, &mut table).unwrap(), 1);
         let row = table.lookup(b"fs-service").unwrap();
         assert_eq!(row.aid(), &aid(2));
+        assert_eq!(row.authority(), SpawnAuthority::InitOnly);
         // Wire order was narrow-then-wide (the emitter's real order);
         // the transcribed row is normalized: wide first, then the
         // endpoint grant carrying declared ∪ wide rights.
@@ -740,6 +774,7 @@ mod tests {
             t.install(
                 b"a",
                 aid(1),
+                SpawnAuthority::InitOnly,
                 core::iter::once(CapabilityGrant::System { kind: system_caps::MAX + 7 }),
             ),
             Err(SpawnTableError::UnknownSystemKind(system_caps::MAX + 7))
@@ -748,6 +783,7 @@ mod tests {
             t.install(
                 b"a",
                 aid(1),
+                SpawnAuthority::InitOnly,
                 core::iter::once(CapabilityGrant::Endpoint {
                     endpoint: MAX_ENDPOINTS as u32,
                     rights: Rights::RECEIVE,
@@ -764,6 +800,7 @@ mod tests {
         t.install(
             b"svc",
             aid(1),
+            SpawnAuthority::InitOnly,
             [
                 CapabilityGrant::Endpoint { endpoint: 5, rights: Rights::RECEIVE },
                 CapabilityGrant::Endpoint { endpoint: 5, rights: Rights::SEND },
@@ -847,6 +884,7 @@ mod tests {
         t.install(
             b"svc",
             aid(9),
+            SpawnAuthority::InitOnly,
             [
                 CapabilityGrant::AllEndpoints { rights: Rights::SEND },
                 CapabilityGrant::Endpoint { endpoint: 40, rights: Rights::RECEIVE },
@@ -946,16 +984,50 @@ mod tests {
     #[test]
     fn spawn_table_rejects_duplicates_and_overflow_name() {
         let mut t = SpawnGrantTable::new();
-        t.install(b"a", aid(1), core::iter::empty()).unwrap();
+        t.install(b"a", aid(1), SpawnAuthority::InitOnly, core::iter::empty()).unwrap();
         assert_eq!(
-            t.install(b"a", aid(2), core::iter::empty()),
+            t.install(b"a", aid(2), SpawnAuthority::InitOnly, core::iter::empty()),
             Err(SpawnTableError::DuplicateName)
         );
         let long = [b'x'; MODULE_NAME_MAX + 1];
         assert_eq!(
-            t.install(&long, aid(3), core::iter::empty()),
+            t.install(&long, aid(3), SpawnAuthority::InitOnly, core::iter::empty()),
             Err(SpawnTableError::NameTooLong)
         );
         assert_eq!(t.count(), 1);
+    }
+
+    #[test]
+    fn on_demand_rows_transcribe_open_spawn_authority() {
+        // ADR-018 step 9: the lifetime tag is the one policy field the
+        // kernel reads, and only to decide who may spawn the row.
+        let defs = [
+            EntryDef {
+                module_name: "shell",
+                principal: aid(3),
+                reserved_endpoints: &[18],
+                grants: &[],
+                lifetime: ServiceLifetime::OneShot,
+                depends_on: &[],
+            },
+            EntryDef {
+                module_name: "tree",
+                principal: aid(7),
+                reserved_endpoints: &[61],
+                grants: &[],
+                lifetime: ServiceLifetime::OnDemand,
+                depends_on: &[],
+            },
+        ];
+        let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
+        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        let m = validate_payload(&buf).unwrap();
+        let mut table = SpawnGrantTable::new();
+        assert_eq!(populate_spawn_grants(&m, &mut table).unwrap(), 2);
+        assert_eq!(table.lookup(b"shell").unwrap().authority(), SpawnAuthority::InitOnly);
+        assert_eq!(
+            table.lookup(b"tree").unwrap().authority(),
+            SpawnAuthority::AnyCreateProcessHolder
+        );
     }
 }

@@ -186,7 +186,7 @@ fn run() -> ! {
         sys::print(b" device(s) online\r\n");
     }
 
-    // Leaf module — no one waits on us — so release the boot gate
+    // Leaf service — no dependent waits on us — so ping init ready
     // immediately and move into the poll loop.
     cambios_libsys_rt::ready();
 

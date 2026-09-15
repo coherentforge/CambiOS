@@ -571,7 +571,7 @@ fn seed_demo_objects() {
 // ============================================================================
 // Entry point — _start + panic handler emitted by `service_main!`
 // (ADR-037 L0, no-endpoint form: principal query + demo seeding sit
-// between registration and module_ready, so `run` owns the ordering).
+// between registration and `ready()`, so `run` owns the ordering).
 // ============================================================================
 
 cambios_libsys_rt::service_main! {

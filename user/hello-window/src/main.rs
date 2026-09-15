@@ -35,11 +35,11 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[HELLO-WINDOW] libgui v0 client\r\n");
 
-    // hello-window is a leaf boot module — release the boot gate
-    // immediately so the next module (shell) can start, in parallel
-    // with our compositor handshake. (`libgui::Client` intentionally
-    // does NOT call `module_ready`; that's a boot-ordering concern
-    // orthogonal to what libgui wraps.)
+    // hello-window is an on-demand app (ADR-018 step 9): spawned by a
+    // CreateProcess holder, never by init's boot wave. `ready()` is
+    // still the runtime's readiness signal; init discards the ping.
+    // (`libgui::Client` intentionally does NOT call `ready()`; that's
+    // a lifecycle concern orthogonal to what libgui wraps.)
     cambios_libsys_rt::ready();
 
     let mut client = match Client::open(WINDOW_WIDTH, WINDOW_HEIGHT, HELLO_WINDOW_ENDPOINT) {

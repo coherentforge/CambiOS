@@ -8,11 +8,11 @@
 //! references the attached channel memory, and exposes `submit*`
 //! helpers that encode and send `FrameReady`.
 //!
-//! A `Client` does NOT call `sys::module_ready()` — that signal
-//! belongs to boot-gate ordering, which only boot modules care
-//! about. The caller decides when (if ever) to release its boot
-//! gate. Same rationale as libsys: single-responsibility wrappers
-//! don't hide protocol primitives.
+//! A `Client` does NOT call `cambios_libsys_rt::ready()` — that
+//! signal is the process's readiness contract with init, which only
+//! the process itself can judge. The caller decides when (if ever)
+//! to send it. Same rationale as libsys: single-responsibility
+//! wrappers don't hide protocol primitives.
 
 use cambios_libgui_proto::{
     decode_input_event, decode_welcome_client, decode_window_resized, encode_create_window,

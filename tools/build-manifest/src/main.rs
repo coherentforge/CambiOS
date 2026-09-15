@@ -77,7 +77,9 @@ struct ServiceDef {
     /// System capabilities by kebab-case name (see `system_cap_id`).
     #[serde(default)]
     system: Vec<String>,
-    /// "persistent" (default) or "one-shot".
+    /// "persistent" (default), "one-shot", or "on-demand" (not part
+    /// of init's boot wave — spawned later by a CreateProcess holder;
+    /// may not declare or be named in `depends_on`).
     #[serde(default = "default_lifetime")]
     lifetime: String,
     /// Restart/backoff parameters — only meaningful for persistent.
@@ -93,6 +95,14 @@ struct ServiceDef {
     /// report phantom spawn failures every boot).
     #[serde(default)]
     arch: Vec<String>,
+    /// Deployment profiles this service ships in. Empty (default) =
+    /// every profile. `--profile <name>` (default `default`) keeps
+    /// entries whose list is empty or contains the name — the seam for
+    /// declaring a service the default images must not carry (the
+    /// framebuffer-fallback scanout driver for hosts without
+    /// virtio-gpu) without hiding it from the registry.
+    #[serde(default)]
+    profile: Vec<String>,
 }
 
 fn default_lifetime() -> String {
@@ -153,7 +163,10 @@ fn init_aid() -> [u8; 32] {
 // ============================================================================
 
 fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {} <registry.toml> [-o <manifest.bin>] [--arch <name>]", prog);
+    eprintln!(
+        "Usage: {} <registry.toml> [-o <manifest.bin>] [--arch <name>] [--profile <name>]",
+        prog
+    );
     eprintln!();
     eprintln!("Emits an UNSIGNED CBOSMANI manifest blob. Sign it with:");
     eprintln!("  sign-elf [--seed <hex>] <manifest.bin>");
@@ -162,7 +175,41 @@ fn usage(prog: &str) -> ! {
     eprintln!("  (all arches) or contains <name>. A kept service depending on");
     eprintln!("  a filtered-out one is an error — the emitted dependency graph");
     eprintln!("  must be closed. Omitted = no filtering (every entry emits).");
+    eprintln!("--profile <name>: emit only services whose `profile` list is");
+    eprintln!("  empty (every profile) or contains <name>. Same closure rule.");
+    eprintln!("  Omitted = `default`, so profile-tagged entries never emit by");
+    eprintln!("  accident.");
     exit(2);
+}
+
+/// Keep the services whose `tags(s)` list is empty or names `target`;
+/// then require the kept set's `depends_on` graph to be closed.
+fn filter_registry(
+    registry: &mut Registry,
+    dimension: &str,
+    target: &str,
+    tags: impl Fn(&ServiceDef) -> &Vec<String>,
+) {
+    let kept: Vec<String> = registry
+        .services
+        .iter()
+        .filter(|s| tags(s).is_empty() || tags(s).iter().any(|t| t == target))
+        .map(|s| s.name.clone())
+        .collect();
+    registry.services.retain(|s| kept.contains(&s.name));
+    for svc in &registry.services {
+        for dep in &svc.depends_on {
+            if !kept.contains(dep) {
+                eprintln!(
+                    "service '{}' depends on '{}', which is filtered out \
+                     for {} '{}' — fix the {} tags in the registry",
+                    svc.name, dep, dimension, target, dimension
+                );
+                exit(1);
+            }
+        }
+    }
+    eprintln!("{} filter '{}': {} service(s) kept", dimension, target, registry.services.len());
 }
 
 fn main() {
@@ -172,6 +219,7 @@ fn main() {
     let mut input: Option<&str> = None;
     let mut output = "manifest.bin".to_string();
     let mut arch: Option<String> = None;
+    let mut profile = "default".to_string();
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -186,6 +234,13 @@ fn main() {
                 i += 1;
                 match argv.get(i) {
                     Some(a) => arch = Some(a.clone()),
+                    None => usage(prog),
+                }
+            }
+            "--profile" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(p) => profile = p.clone(),
                     None => usage(prog),
                 }
             }
@@ -206,33 +261,15 @@ fn main() {
         exit(1);
     });
 
-    // --arch filter: keep entries with an empty arch list (all arches)
-    // or one naming the target. Then require the kept set's dependency
-    // graph to be closed — a kept service depending on a filtered-out
-    // one means the registry's arch tags are wrong, not that the
-    // dependency should silently vanish.
+    // --arch / --profile filters: keep entries with an empty tag list
+    // (all arches / all profiles) or one naming the target. Then
+    // require the kept set's dependency graph to be closed — a kept
+    // service depending on a filtered-out one means the registry's
+    // tags are wrong, not that the dependency should silently vanish.
     if let Some(target) = &arch {
-        let kept: Vec<String> = registry
-            .services
-            .iter()
-            .filter(|s| s.arch.is_empty() || s.arch.iter().any(|a| a == target))
-            .map(|s| s.name.clone())
-            .collect();
-        registry.services.retain(|s| kept.contains(&s.name));
-        for svc in &registry.services {
-            for dep in &svc.depends_on {
-                if !kept.contains(dep) {
-                    eprintln!(
-                        "service '{}' depends on '{}', which is filtered out \
-                         for arch '{}' — fix the arch tags in the registry",
-                        svc.name, dep, target
-                    );
-                    exit(1);
-                }
-            }
-        }
-        eprintln!("arch filter '{}': {} service(s) kept", target, registry.services.len());
+        filter_registry(&mut registry, "arch", target, |s| &s.arch);
     }
+    filter_registry(&mut registry, "profile", &profile, |s| &s.profile);
 
     if registry.services.len() > MAX_MANIFEST_ENTRIES {
         eprintln!(
@@ -283,10 +320,41 @@ fn main() {
         deps_store.push(svc.depends_on.iter().map(String::as_str).collect());
     }
 
+    // On-demand entries sit outside init's boot wave, so they can
+    // neither wait on anything nor be waited on. Both directions are
+    // registry errors here (init's engine re-checks the same rule).
+    let on_demand: Vec<&str> = registry
+        .services
+        .iter()
+        .filter(|s| s.lifetime == "on-demand")
+        .map(|s| s.name.as_str())
+        .collect();
+    for svc in &registry.services {
+        if svc.lifetime == "on-demand" && !svc.depends_on.is_empty() {
+            eprintln!(
+                "service '{}' is on-demand but declares depends_on — init never \
+                 sequences on-demand entries, so dependencies cannot be honored",
+                svc.name
+            );
+            exit(1);
+        }
+        for dep in &svc.depends_on {
+            if on_demand.contains(&dep.as_str()) {
+                eprintln!(
+                    "service '{}' depends on '{}', which is on-demand — the boot \
+                     wave can never satisfy that dependency",
+                    svc.name, dep
+                );
+                exit(1);
+            }
+        }
+    }
+
     let mut defs: Vec<EntryDef> = Vec::new();
     for (i, svc) in registry.services.iter().enumerate() {
         let lifetime = match svc.lifetime.as_str() {
             "one-shot" => ServiceLifetime::OneShot,
+            "on-demand" => ServiceLifetime::OnDemand,
             "persistent" => ServiceLifetime::Persistent {
                 initial_delay_ms: svc.restart.initial_ms,
                 max_delay_ms: svc.restart.max_ms,
@@ -295,7 +363,8 @@ fn main() {
             },
             other => {
                 eprintln!(
-                    "service '{}': lifetime must be 'persistent' or 'one-shot', got '{}'",
+                    "service '{}': lifetime must be 'persistent', 'one-shot', or \
+                     'on-demand', got '{}'",
                     svc.name, other
                 );
                 exit(1);
@@ -350,8 +419,14 @@ fn main() {
         output
     );
     println!("  init endpoint: {}", parsed.init_endpoint());
-    println!("  spawn order:");
-    for &idx in &order[..n] {
+    println!("  spawn order (on-demand entries listed last; init does not spawn them):");
+    let boot_wave = order[..n].iter().filter(|&&i| {
+        parsed.entry(i as usize).map(|e| !e.lifetime().is_on_demand()).unwrap_or(false)
+    });
+    let on_demand_idx = order[..n].iter().filter(|&&i| {
+        parsed.entry(i as usize).map(|e| e.lifetime().is_on_demand()).unwrap_or(false)
+    });
+    for &idx in boot_wave.chain(on_demand_idx) {
         if let Some(e) = parsed.entry(idx as usize) {
             let eps: Vec<String> =
                 e.reserved_endpoints().map(|ep| ep.to_string()).collect();
@@ -362,6 +437,7 @@ fn main() {
                 eps.join(","),
                 match e.lifetime() {
                     ServiceLifetime::OneShot => "one-shot".to_string(),
+                    ServiceLifetime::OnDemand => "on-demand".to_string(),
                     ServiceLifetime::Persistent { max_restarts, .. } =>
                         format!("persistent(max_restarts={})", max_restarts),
                 }

@@ -77,9 +77,9 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[TREE] booting\r\n");
 
-    // Leaf boot module — release the boot gate immediately, before
-    // the compositor handshake. hello-window does the same; lets the
-    // next module in limine.conf (shell) start in parallel with our
+    // On-demand app (ADR-018 step 9) — spawned by `play`, not by
+    // init's wave. Ping readiness immediately, before the compositor
+    // handshake; init discards it and nothing waits on our
     // CreateWindow round-trip.
     cambios_libsys_rt::ready();
 

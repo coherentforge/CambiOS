@@ -114,10 +114,9 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[WORM] booting\r\n");
 
-    // Leaf boot module — release the boot gate immediately, before
-    // the compositor handshake. Matches Tree / hello-window; lets
-    // the next module in limine.conf (shell) start in parallel with
-    // our CreateWindow round-trip.
+    // On-demand app (ADR-018 step 9) — spawned by `play`, not by
+    // init's wave. Ping readiness immediately, before the compositor
+    // handshake (matches tree / hello-window); init discards it.
     cambios_libsys_rt::ready();
 
     let mut client = match Client::open(render::WINDOW_W, render::WINDOW_H, WORM_ENDPOINT) {

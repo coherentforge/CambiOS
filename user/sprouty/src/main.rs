@@ -90,7 +90,8 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[SPROUTY] booting\r\n");
 
-    // Leaf boot module — release the boot gate immediately.
+    // On-demand app (ADR-018 step 9) — ping readiness immediately;
+    // init discards it, nothing waits on us.
     cambios_libsys_rt::ready();
 
     // Allocate + populate the sprite sheet OUT of `.rodata`. The

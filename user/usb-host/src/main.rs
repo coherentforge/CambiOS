@@ -22,8 +22,8 @@
 //!
 //! On platforms where no xHCI controller is discovered (e.g. aarch64 /
 //! riscv64 QEMU without `-device qemu-xhci`), the driver logs a single
-//! line and idles cleanly so the boot gate still releases the next
-//! module.
+//! line and idles cleanly, still pinging init ready so the boot wave
+//! (ccid depends on us) proceeds.
 //!
 //! ## IPC protocol
 //!
@@ -166,8 +166,8 @@ fn run() -> ! {
     // Step 6 (B-ii): HCRESET → CONFIG → DCBAA → command ring →
     // event ring → ERST → RUN. Either the full sequence succeeds and
     // we land at HCH=0 with rings live, or we log the failure mode
-    // and idle. Idle-on-fail keeps the boot gate happy so downstream
-    // modules still load.
+    // and idle. Idle-on-fail still pings init ready so dependents
+    // (ccid) still spawn.
     let live_ctl = match xhci::XhciController::bring_up(mmio_vaddr, caps) {
         Ok(mut ctl) => {
             sys::print(b"[USB-HOST] controller bring-up OK\n");
@@ -187,7 +187,7 @@ fn run() -> ! {
         }
     };
 
-    // Step 7: register IPC endpoint and release boot gate.
+    // Step 7: register IPC endpoint and ping init ready.
     sys::register_endpoint(USB_HOST_ENDPOINT);
     sys::print(b"[USB-HOST] ready on endpoint 31\n");
     cambios_libsys_rt::ready();
@@ -754,8 +754,8 @@ fn reply_status(reply_ep: u32, status: u8) {
 }
 
 /// Idle for boots where no xHCI controller was found / bring-up
-/// failed. usb-host still registers its endpoint so the boot gate
-/// can release downstream modules, but every incoming request gets
+/// failed. usb-host still registers its endpoint and pings init ready
+/// so dependents still spawn, but every incoming request gets
 /// `STATUS_DEVICE_NOT_READY`.
 fn idle_loop() -> ! {
     let mut recv_buf = [0u8; RECV_BUF_SIZE];

@@ -10,10 +10,11 @@
 //!
 //! Sequencing implements ADR-018 § 4 exactly: one spawn in flight at
 //! a time, blocking on the spawned service's readiness ping before
-//! any dependent (or successor) spawns — like-for-like with the
-//! `BOOT_MODULE_ORDER` gate semantics it replaces at cutover.
-//! Readiness is matched by the kernel-stamped sender AID against the
-//! entry AID, never by anything the payload claims.
+//! any dependent (or successor) spawns. Readiness is matched by the
+//! kernel-stamped sender AID against the entry AID, never by anything
+//! the payload claims. On-demand entries (apps) are not part of the
+//! wave: they enter as terminal [`ServiceState::OnDemand`] and are
+//! spawned later by CreateProcess holders, never by init.
 //!
 //! No allocator, by policy (ADR-018 migration step 6): every bound
 //! here is a wire-format bound. Revisit only if init ever needs a
@@ -47,6 +48,9 @@ pub enum ServiceState {
     /// Never spawned: a transitive dependency is `SpawnFailed` or
     /// `DepFailed`, so this entry's turn can never come.
     DepFailed,
+    /// Not init's to spawn: an on-demand entry (ADR-018 step 9), left
+    /// to CreateProcess holders. Terminal from construction.
+    OnDemand,
 }
 
 /// What the shell should do next. Exactly one of these is pending at
@@ -96,6 +100,11 @@ pub enum EngineError {
     /// at the shell: something unexpected holds send access to init's
     /// endpoint.
     UnknownSender,
+    /// A `depends_on` edge touches an on-demand entry (as source or
+    /// target). Init never sequences on-demand entries, so such an
+    /// edge can never be honored; `build-manifest` rejects it first,
+    /// this is the defensive re-check.
+    OnDemandDependency,
 }
 
 /// Outcome counts for the boot wave, for init's summary line.
@@ -105,6 +114,8 @@ pub struct Summary {
     pub spawn_failed: u16,
     pub dep_failed: u16,
     pub pending: u16,
+    /// Entries init deliberately did not spawn (on-demand apps).
+    pub on_demand: u16,
 }
 
 /// Pure supervisor over the manifest's entries. ~10 KiB of fixed
@@ -163,10 +174,20 @@ impl SupervisorEngine {
                 None => continue, // unreachable: i < entry_count
             };
             eng.aid[i] = entry.principal();
+            let on_demand = entry.lifetime().is_on_demand();
+            if on_demand {
+                eng.state[i] = ServiceState::OnDemand;
+            }
             let n_deps = entry.depends_on_len();
+            if on_demand && n_deps > 0 {
+                return Err(EngineError::OnDemandDependency);
+            }
             for j in 0..n_deps {
                 let name = entry.depends_on(j).ok_or(EngineError::UnknownDependency)?;
                 let dep_idx = Self::find_by_name(m, name)?;
+                if m.entry(dep_idx as usize).is_some_and(|d| d.lifetime().is_on_demand()) {
+                    return Err(EngineError::OnDemandDependency);
+                }
                 eng.deps[i][j] = dep_idx;
                 eng.dep_len[i] = (j + 1) as u8;
             }
@@ -198,7 +219,10 @@ impl SupervisorEngine {
             match self.state[idx as usize] {
                 ServiceState::Spawned { .. } => return Action::AwaitReady { idx },
                 ServiceState::NotSpawned => return Action::Spawn { idx },
-                ServiceState::Ready | ServiceState::SpawnFailed | ServiceState::DepFailed => {}
+                ServiceState::Ready
+                | ServiceState::SpawnFailed
+                | ServiceState::DepFailed
+                | ServiceState::OnDemand => {}
             }
         }
         Action::Done
@@ -298,6 +322,7 @@ impl SupervisorEngine {
                 ServiceState::Ready => s.ready += 1,
                 ServiceState::SpawnFailed => s.spawn_failed += 1,
                 ServiceState::DepFailed => s.dep_failed += 1,
+                ServiceState::OnDemand => s.on_demand += 1,
                 ServiceState::NotSpawned | ServiceState::Spawned { .. } => s.pending += 1,
             }
         }
@@ -321,14 +346,25 @@ mod tests {
     /// Emit a manifest from (name, aid_tag, deps) triples and hand
     /// back (blob, topo order).
     fn build(entries: &[(&str, u8, &[&str])]) -> (Vec<u8>, Vec<u16>) {
+        let with_lifetime: Vec<(&str, u8, &[&str], ServiceLifetime)> = entries
+            .iter()
+            .map(|&(n, t, d)| (n, t, d, ServiceLifetime::OneShot))
+            .collect();
+        build_with_lifetimes(&with_lifetime)
+    }
+
+    /// `build` with an explicit lifetime per entry.
+    fn build_with_lifetimes(
+        entries: &[(&str, u8, &[&str], ServiceLifetime)],
+    ) -> (Vec<u8>, Vec<u16>) {
         let defs: Vec<EntryDef> = entries
             .iter()
-            .map(|&(name, tag, deps)| EntryDef {
+            .map(|&(name, tag, deps, lifetime)| EntryDef {
                 module_name: name,
                 principal: aid(tag),
                 reserved_endpoints: &[],
                 grants: &[],
-                lifetime: ServiceLifetime::OneShot,
+                lifetime,
                 depends_on: deps,
             })
             .collect();
@@ -452,7 +488,7 @@ mod tests {
         assert_eq!(eng.state(3), Some(ServiceState::Ready));
         assert_eq!(
             eng.summary(),
-            Summary { ready: 1, spawn_failed: 1, dep_failed: 2, pending: 0 }
+            Summary { ready: 1, spawn_failed: 1, dep_failed: 2, pending: 0, on_demand: 0 }
         );
     }
 
@@ -505,6 +541,61 @@ mod tests {
         assert_eq!(
             SupervisorEngine::new(&m, &[0, 7]).map(|_| ()),
             Err(EngineError::BadOrder)
+        );
+    }
+
+    #[test]
+    fn on_demand_entries_sit_outside_the_wave() {
+        use ServiceLifetime::{OnDemand, OneShot};
+        let (blob, order) = build_with_lifetimes(&[
+            ("tree", 7, &[], OnDemand),
+            ("a", 1, &[], OneShot),
+            ("b", 2, &["a"], OneShot),
+        ]);
+        let m = Manifest::parse(&blob).unwrap();
+        let mut eng = SupervisorEngine::new(&m, &order).unwrap();
+        assert_eq!(eng.state(0), Some(ServiceState::OnDemand));
+        let spawned = run_happy(&mut eng);
+        let names: Vec<&str> = spawned
+            .iter()
+            .map(|&i| m.entry(i as usize).unwrap().module_name())
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(
+            eng.summary(),
+            Summary { ready: 2, on_demand: 1, ..Default::default() }
+        );
+        // A late ping from the app (it calls ready() like any service)
+        // is an anomaly to log, not a state change.
+        assert_eq!(
+            eng.on_event(Event::ReadyPing { sender_aid: aid(7) }),
+            Err(EngineError::UnexpectedEvent)
+        );
+        assert_eq!(eng.state(0), Some(ServiceState::OnDemand));
+    }
+
+    #[test]
+    fn on_demand_dependency_edges_are_rejected() {
+        use ServiceLifetime::{OnDemand, OneShot};
+        // Boot-wave entry depending on an on-demand one.
+        let (blob, order) = build_with_lifetimes(&[
+            ("tree", 7, &[], OnDemand),
+            ("a", 1, &["tree"], OneShot),
+        ]);
+        let m = Manifest::parse(&blob).unwrap();
+        assert_eq!(
+            SupervisorEngine::new(&m, &order).map(|_| ()),
+            Err(EngineError::OnDemandDependency)
+        );
+        // On-demand entry declaring a dependency.
+        let (blob, order) = build_with_lifetimes(&[
+            ("a", 1, &[], OneShot),
+            ("tree", 7, &["a"], OnDemand),
+        ]);
+        let m = Manifest::parse(&blob).unwrap();
+        assert_eq!(
+            SupervisorEngine::new(&m, &order).map(|_| ()),
+            Err(EngineError::OnDemandDependency)
         );
     }
 

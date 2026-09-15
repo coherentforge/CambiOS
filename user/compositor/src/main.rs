@@ -124,8 +124,8 @@ fn run() -> ! {
         }
     };
 
-    // Boot-gate ordering: do the scanout handshake BEFORE calling
-    // `module_ready()`. Downstream modules include hello-window
+    // Readiness ordering: do the scanout handshake BEFORE calling
+    // `ready()`. Later spawns include hello-window
     // (Scanout-3), which immediately sends `CreateWindow` to ep28 —
     // if it arrives while we're blocked in `recv_verified` for
     // `WelcomeCompositor`, the handshake reads the client message
@@ -156,7 +156,7 @@ fn run() -> ! {
     // backend; not invoked from the boot path.
     let mut window_table = WindowTable::new();
 
-    // Release the boot gate now. hello-window and any other clients
+    // Signal readiness to init now. hello-window and any other clients
     // can start sending CreateWindow messages; the dispatch loop is
     // next.
     cambios_libsys_rt::ready();

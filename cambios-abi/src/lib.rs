@@ -253,15 +253,14 @@ pub enum SyscallNumber {
     /// Capability-gated: requires `CapabilityKind::MapFramebuffer`.
     /// Phase GUI-0 ([ADR-011](docs/adr/011-graphics-architecture-and-scaling.md)).
     MapFramebuffer = 35,
-    /// SYS_MODULE_READY (36): signal that this boot module has finished
-    /// initialization. The kernel's boot-release chain advances: the next
-    /// module in `BOOT_MODULE_ORDER` (if any) is unblocked from
-    /// `BlockReason::BootGate` so it can run its own `_start`.
-    /// No arguments, no return payload (returns 0).
-    /// Intentionally identity-exempt — boot modules can call this before
-    /// the rest of the trusted-service chain is up (e.g., key-store
-    /// isn't needed for signing a no-op call).
-    ModuleReady = 36,
+    // Slot 36 deliberately vacated: was `ModuleReady`, the sequential
+    // boot-release chain's advance call, retired at ADR-018 migration
+    // step 9 when init's readiness ping (an ordinary IPC write to
+    // endpoint 1) replaced the kernel-sequenced chain. Do NOT reuse this
+    // slot — the slot-18 discipline: old binaries, audit logs, and
+    // verification harnesses reference 36 as ModuleReady, and
+    // reassignment would silently shift their semantics. New syscalls
+    // take new numbers.
     /// SYS_TRY_RECV_MSG (37): non-blocking variant of RecvMsg. Returns 0
     /// immediately if no message is queued, instead of parking the task
     /// on `MessageWait(endpoint)`. Required for services that must poll
@@ -829,8 +828,7 @@ pub enum SyscallNumber {
 impl SyscallNumber {
     /// Returns `true` for syscalls that require the caller to have a bound,
     /// non-zero Principal. Unidentified processes may only use the exempt
-    /// set: Exit, Yield, GetPid, GetTime, GetWallclock, Print, GetPrincipal,
-    /// ModuleReady.
+    /// set: Exit, Yield, GetPid, GetTime, GetWallclock, Print, GetPrincipal.
     ///
     /// This is the kernel-side half of the "identity is load-bearing" invariant.
     /// The userspace half is `recv_verified()` in libsys, which rejects
@@ -916,7 +914,7 @@ impl SyscallNumber {
             33 => Some(Self::AuditAttach),
             34 => Some(Self::AuditInfo),
             35 => Some(Self::MapFramebuffer),
-            36 => Some(Self::ModuleReady),
+            // 36 = removed (was ModuleReady; see slot comment above).
             37 => Some(Self::TryRecvMsg),
             38 => Some(Self::VirtioModernCaps),
             39 => Some(Self::SetWallclock),
@@ -1603,11 +1601,6 @@ mod tests {
         SyscallNumber::GetTime,
         SyscallNumber::Print,
         SyscallNumber::GetPrincipal,
-        // `ModuleReady` is called by every boot module at the end of its
-        // own init, including modules that run before the key-store /
-        // identity infrastructure is fully up. Making it identity-gated
-        // would create a bootstrap circular dependency.
-        SyscallNumber::ModuleReady,
         // `GetWallclock` is a *read* of a value the kernel already chose
         // to publish — there is no integrity surface to protect, and
         // pre-bind boot modules legitimately need to render the clock.
@@ -1645,7 +1638,7 @@ mod tests {
             SyscallNumber::ChannelClose, SyscallNumber::ChannelRevoke,
             SyscallNumber::ChannelInfo, SyscallNumber::AuditAttach,
             SyscallNumber::AuditInfo,
-            SyscallNumber::MapFramebuffer, SyscallNumber::ModuleReady,
+            SyscallNumber::MapFramebuffer,
             SyscallNumber::TryRecvMsg, SyscallNumber::VirtioModernCaps,
             SyscallNumber::SetWallclock, SyscallNumber::GetWallclock,
             SyscallNumber::AuditEmitInputFocus,
@@ -1689,11 +1682,12 @@ mod tests {
 
     #[test]
     fn exempt_set_is_minimal() {
-        // The exempt set must be exactly 8 syscalls (Exit, Yield, GetPid,
-        // GetTime, Print, GetPrincipal, ModuleReady, GetWallclock). If
-        // this test fails, someone added a new exempt syscall — that
-        // requires justification.
-        assert_eq!(EXEMPT.len(), 8, "exempt set size changed — review required");
+        // The exempt set must be exactly 7 syscalls (Exit, Yield, GetPid,
+        // GetTime, Print, GetPrincipal, GetWallclock). If this test
+        // fails, someone added a new exempt syscall — that requires
+        // justification. (ModuleReady left the set with slot 36's
+        // retirement at ADR-018 step 9.)
+        assert_eq!(EXEMPT.len(), 7, "exempt set size changed — review required");
     }
 
     #[test]
@@ -1710,14 +1704,16 @@ mod tests {
         // ReadVolumeHeader, 75 InstallMasterKey) round out the
         // current high-water mark.
         //
-        // Slot 18 is a deliberate gap: was `ClaimBootstrapKey` until the
-        // Frame-A vestige cleanup; reuse is prohibited (see the slot-18
-        // comment up by the variant definitions). `from_u64(18)` must
-        // return None and is excluded from the sweep.
+        // Slots 18 and 36 are deliberate gaps: 18 was `ClaimBootstrapKey`
+        // until the Frame-A vestige cleanup, 36 was `ModuleReady` until
+        // ADR-018 step 9 deleted the boot-release chain; reuse of either
+        // is prohibited (see the slot comments up by the variant
+        // definitions). `from_u64` must return None for both and they
+        // are excluded from the sweep.
         for i in 0..=75u64 {
-            if i == 18 {
+            if i == 18 || i == 36 {
                 assert!(SyscallNumber::from_u64(i).is_none(),
-                    "slot 18 must remain vacated; reuse is prohibited");
+                    "slot {} must remain vacated; reuse is prohibited", i);
                 continue;
             }
             let num = SyscallNumber::from_u64(i);

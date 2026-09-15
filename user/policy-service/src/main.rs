@@ -68,11 +68,10 @@ const fn profile(syscalls: &[SyscallNumber]) -> Profile {
 
 /// Default profile — common syscalls every identified process may use.
 /// Covers panic (Exit), cooperation (Yield), identity (GetPid, GetPrincipal,
-/// GetTime), diagnostic output (Print), and the boot-chain release call
-/// (ModuleReady). Nothing that touches shared state or hardware.
+/// GetTime), and diagnostic output (Print). Nothing that touches shared
+/// state or hardware.
 const DEFAULT_PROFILE: Profile = profile(&[
     SyscallNumber::Exit, SyscallNumber::Yield, SyscallNumber::GetPid, SyscallNumber::GetTime, SyscallNumber::Print, SyscallNumber::GetPrincipal,
-    SyscallNumber::ModuleReady,
 ]);
 
 /// Hello test module — minimal profile (print and exit). Removed from
@@ -199,8 +198,8 @@ fn is_allowed(profile: Profile, syscall_num: u32) -> bool {
 }
 
 // ============================================================================
-// Entry point — the ritual (_start, endpoint registration, boot-gate
-// release, panic handler) is emitted by `service_main!` (ADR-037 L0).
+// Entry point — the ritual (_start, endpoint registration, readiness
+// ping, panic handler) is emitted by `service_main!` (ADR-037 L0).
 // ============================================================================
 
 cambios_libsys_rt::service_main! {
@@ -210,7 +209,7 @@ cambios_libsys_rt::service_main! {
 }
 
 /// Steady-state query loop. `service_main!` has already registered the
-/// query endpoint and released the boot gate; `ServiceLoop` owns
+/// query endpoint and pinged init ready; `ServiceLoop` owns
 /// recv → dispatch → yield (ADR-037 L1).
 fn service_loop() -> ! {
     sys::print(b"[POLICY] ready on endpoint 22\n");

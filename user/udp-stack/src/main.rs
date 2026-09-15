@@ -957,7 +957,7 @@ fn print_mac(mac: &[u8; 6]) {
 // ============================================================================
 // Entry point — _start + panic handler emitted by `service_main!`
 // (ADR-037 L0, no-endpoint form: DHCP/ARP bring-up sits between
-// registration and module_ready, so `run` owns the ordering).
+// registration and `ready()`, so `run` owns the ordering).
 // ============================================================================
 
 cambios_libsys_rt::service_main! {
@@ -1002,9 +1002,9 @@ fn run() -> ! {
 }
 
 fn error_loop() -> ! {
-    // Release the boot gate even in the error path — the module is
-    // observably up (endpoint registered) and holding the gate would
-    // deadlock every subsequent boot module.
+    // Ping init ready even in the error path — the service is
+    // observably up (endpoint registered), and withholding the ping
+    // would stall init's wave at every dependent of udp-stack.
     cambios_libsys_rt::ready();
     let mut recv_buf = [0u8; 292];
     let resp = [STATUS_ERROR];

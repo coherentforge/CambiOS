@@ -302,27 +302,6 @@ pub fn register_endpoint(endpoint_id: u32) -> i64 {
     syscall_raw3(SyscallNumber::RegisterEndpoint as u64, endpoint_id as u64, 0, 0)
 }
 
-
-/// Signal to the kernel that this boot module has finished initialization
-/// and is about to enter its service loop.
-///
-/// The kernel's sequential boot-release chain: modules 1..N of the
-/// `limine.conf` roster start `Blocked` on `BootGate`. Each module's
-/// `module_ready()` call advances the cursor and wakes the next module,
-/// guaranteeing deterministic boot ordering — each service's
-/// "[X] ready on endpoint N\n" print appears in strict limine.conf
-/// order, and the shell's `cambios>` prompt arrives only after everything
-/// it depends on is up.
-///
-/// Identity-exempt (does not require a bound Principal). Safe to call
-/// before the key-store / signing infrastructure is reachable.
-///
-/// Always returns 0. Idempotent at the kernel side: a second call from
-/// the same module, or a call from a late-loaded module, is a no-op.
-pub fn module_ready() {
-    syscall_raw3(SyscallNumber::ModuleReady as u64, 0, 0, 0);
-}
-
 pub fn yield_now() {
     syscall_raw3(SyscallNumber::Yield as u64, 0, 0, 0);
 }

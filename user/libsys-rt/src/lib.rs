@@ -30,8 +30,8 @@
 //!
 //! The macro emits, at module scope in the consumer crate:
 //! - `_start`: registers each endpoint in order, calls
-//!   [`ready()`] (readiness ping to init + legacy boot-gate release),
-//!   then tail-calls the given `main: fn() -> !`.
+//!   [`ready()`] (the readiness ping to init), then tail-calls the
+//!   given `main: fn() -> !`.
 //! - a `#[panic_handler]` that prints `[NAME] PANIC!` to serial and
 //!   calls `sys::exit(1)` — byte-identical in behavior to the handler
 //!   all 23 services carried by hand.
@@ -73,23 +73,17 @@ pub use cambios_libsys as __sys;
 /// is up and serving (ADR-018 § 4 / ADR-037: the runtime emits the
 /// readiness signal).
 ///
-/// Coexistence shape (ADR-018 migration step 8, commit B): readiness is
-/// told to both worlds —
-/// 1. a ready ping (`[READY_PING_TAG]`, one byte) to init's endpoint;
-///    *which* service is ready comes from the kernel-stamped
-///    `sender_principal`, never the payload. Fire-and-forget: before
-///    the cutover init drains and ignores these; a send failure must
-///    not block a service that is otherwise up.
-/// 2. `SYS_MODULE_READY`, releasing the next module behind the legacy
-///    boot gate.
-/// Migration step 9 deletes (2) with the rest of the chain; this
-/// function body shrinks to the ping.
+/// A ready ping (`[READY_PING_TAG]`, one byte) to init's endpoint;
+/// *which* service is ready comes from the kernel-stamped
+/// `sender_principal`, never the payload. Init gates the next spawn of
+/// its boot wave on this ping. Fire-and-forget: a send failure must not
+/// block a service that is otherwise up, and on-demand apps (spawned
+/// outside the wave) ping an init that simply discards it.
 pub fn ready() {
     let _ = __sys::write(
         cambios_manifest::INIT_ENDPOINT,
         &[cambios_manifest::READY_PING_TAG],
     );
-    __sys::module_ready();
 }
 
 #[cfg(feature = "heap")]
@@ -108,8 +102,8 @@ pub use linked_list_allocator as __alloc;
 ///   apps register reply endpoints inside `libgui::Client::open`, and
 ///   gate readiness on window setup). The macro emits only `_start`
 ///   (+ heap) and the panic handler; **`main` MUST call
-///   `cambios_libsys_rt::ready()` itself once ready**, or the boot gate
-///   holds every later module forever.
+///   `cambios_libsys_rt::ready()` itself once ready**, or init waits on
+///   the readiness ping forever and never spawns the rest of the wave.
 /// - Add `heap: SIZE` (requires the `heap` feature) to any form for
 ///   `alloc` consumers; SIZE is the static arena in bytes.
 ///

@@ -96,8 +96,8 @@ fn run() -> ! {
     }
     sys::print(b"[SCANOUT-LIMINE] registered endpoint 27\r\n");
 
-    // Release the boot gate. scanout-limine doesn't gate downstream
-    // services; they should come up in parallel.
+    // Signal readiness to init; the compositor (which depends on the
+    // scanout driver) is spawned after this ping.
     cambios_libsys_rt::ready();
 
     let mut state = DriverState {

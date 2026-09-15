@@ -123,6 +123,14 @@ pub enum BootError {
     /// Site: `src/manifest.rs` populate helpers.
     ManifestTranscriptionFailed,
 
+    /// No boot module named `MANIFEST_MODULE_NAME` is present. Since
+    /// ADR-018 migration step 9 the manifest is the only thing that
+    /// starts services (the auto-start chain is gone), so a boot
+    /// image without one describes nothing to run — a typed refusal,
+    /// not a silent fallback.
+    /// Site: `src/microkernel/main.rs` `load_boot_modules`.
+    ManifestModuleMissing,
+
     /// A manifest was transcribed but no boot module named
     /// `INIT_MODULE_NAME` is present. The manifest exists to be
     /// executed by init (ADR-018 § 4); a boot image shipping one
@@ -184,6 +192,8 @@ pub fn boot_failed(err: BootError) -> ! {
             "boot manifest failed cross-record validation (duplicate name/endpoint)",
         BootError::ManifestTranscriptionFailed =>
             "boot manifest transcription failed (table install rejected a row)",
+        BootError::ManifestModuleMissing =>
+            "no boot manifest module — supervised boot needs manifest.bin + init.elf staged",
         BootError::InitModuleMissing =>
             "boot manifest present but no init boot module — broken boot image",
         BootError::InitCreationFailed =>
@@ -224,6 +234,7 @@ mod tests {
             BootError::ManifestMalformed,
             BootError::ManifestInconsistent,
             BootError::ManifestTranscriptionFailed,
+            BootError::ManifestModuleMissing,
             BootError::InitModuleMissing,
             BootError::InitCreationFailed,
             BootError::BootInfoAlreadyClaimed,
@@ -261,6 +272,7 @@ mod tests {
             BootError::ManifestMalformed,
             BootError::ManifestInconsistent,
             BootError::ManifestTranscriptionFailed,
+            BootError::ManifestModuleMissing,
             BootError::InitModuleMissing,
             BootError::InitCreationFailed,
             BootError::BootInfoAlreadyClaimed,

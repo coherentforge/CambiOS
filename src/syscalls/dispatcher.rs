@@ -242,7 +242,6 @@ impl SyscallDispatcher {
 
             // Graphics primitives (ADR-011)
             SyscallNumber::MapFramebuffer => Self::handle_map_framebuffer(args, &ctx),
-            SyscallNumber::ModuleReady => Self::handle_module_ready(args, &ctx),
 
             // Virtio-modern PCI capability discovery (ADR-014)
             SyscallNumber::VirtioModernCaps => Self::handle_virtio_modern_caps(args, &ctx),
@@ -626,31 +625,6 @@ impl SyscallDispatcher {
             // never re-enqueued so this loop does not return.
             unsafe { crate::arch::yield_save_and_switch(); }
         }
-    }
-
-    /// SYS_MODULE_READY (36): advance the sequential boot-release chain.
-    ///
-    /// Called by each boot module's `_start` after it has finished init
-    /// (endpoint registration, state setup, any other one-shot work) and
-    /// is about to enter its service loop. The handler advances the
-    /// `BOOT_MODULE_ORDER` cursor and wakes the next module in the
-    /// roster, which was parked in `BlockReason::BootGate` by
-    /// `load_boot_modules`.
-    ///
-    /// No arguments, no return payload. Identity-exempt (see
-    /// `SyscallNumber::requires_identity`).
-    ///
-    /// Idempotent: if the chain is already complete or the calling task
-    /// isn't a boot module, the call is a no-op.
-    fn handle_module_ready(_args: SyscallArgs, _ctx: &SyscallContext) -> SyscallResult {
-        let next_tid = {
-            let mut order = crate::BOOT_MODULE_ORDER.lock();
-            order.advance()
-        };
-        if let Some(tid) = next_tid {
-            crate::wake_task_on_cpu(tid);
-        }
-        Ok(0)
     }
 
     // ========================================================================
@@ -2488,26 +2462,35 @@ impl SyscallDispatcher {
         name_slice.read_into(&mut name_buf[..name_len])?;
         let name = &name_buf[..name_len];
 
-        // Look up module in boot module registry
+        // ADR-018 step 9: the manifest is the only spawn authority. An
+        // undeclared name is a typed reject (the shell renders it as
+        // "Unknown command"); a declared one carries who may spawn it —
+        // boot-wave rows are init's alone, on-demand rows (apps) are
+        // open to any CreateProcess holder (checked above). The spawn
+        // then binds the row's derived AID and installs exactly the
+        // row's transcribed grants — no blanket endpoint loop, no
+        // inherited system caps. Both lookups touch only
+        // outside-the-hierarchy locks and run before any hierarchy lock
+        // is held.
+        let manifest_row = crate::manifest::SPAWN_GRANTS
+            .lookup(name)
+            .ok_or(SyscallError::InvalidArg)?;
+        match manifest_row.authority() {
+            crate::manifest::SpawnAuthority::AnyCreateProcessHolder => {}
+            crate::manifest::SpawnAuthority::InitOnly => {
+                if !crate::manifest::is_init_process(ctx.process_id) {
+                    return Err(SyscallError::PermissionDenied);
+                }
+            }
+        }
+
+        // Look up the module bytes in the boot module registry. A
+        // declared-but-unstaged module (a registry entry the image does
+        // not carry) fails here, cleanly.
         let (module_addr, module_size) = crate::BOOT_MODULE_REGISTRY
             .lock()
             .find_by_name(name)
             .ok_or(SyscallError::InvalidArg)?;
-
-        // ADR-018 step 5: when the caller is init and the boot manifest
-        // declared this module, the spawn binds the entry's derived AID
-        // and installs exactly the entry's transcribed grants — no
-        // blanket endpoint loop, no inherited system caps. Dormant
-        // until migration step 7 creates init and records its identity:
-        // with INIT_PROCESS never set, is_init_process is false for
-        // every caller and every spawn takes the legacy arm below. Both
-        // lookups touch only outside-the-hierarchy locks and run before
-        // any hierarchy lock is held.
-        let manifest_row = if crate::manifest::is_init_process(ctx.process_id) {
-            crate::manifest::SPAWN_GRANTS.lookup(name)
-        } else {
-            None
-        };
 
         // SAFETY: module_addr points to Limine EXECUTABLE_AND_MODULES memory,
         // which is valid for the kernel's lifetime via HHDM.
@@ -2572,87 +2555,34 @@ impl SyscallDispatcher {
             let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
             if let Some(cap_mgr) = cap_guard.as_mut() {
                 let _ = cap_mgr.register_process(process_id);
-                if let Some(row) = &manifest_row {
-                    // Manifest arm (ADR-018 step 5): exactly the entry's
-                    // grants + the entry's AID. Failure here means a
-                    // kernel invariant broke (the row was validated at
-                    // boot; the process is fresh) — report it loudly;
-                    // the under-granted process is fail-safe (it can
-                    // compute and exit, nothing else) and teardown
-                    // policy is init's, via the restart machinery.
-                    // Revisit when: ADR-019 restart policy lands
-                    // (migration step 10).
-                    if let Err(e) =
-                        crate::manifest::install_manifest_row(cap_mgr, process_id, row)
-                    {
-                        crate::println!(
-                            "  [Spawn] manifest grant install FAILED for '{}': {}",
-                            core::str::from_utf8(name).unwrap_or("?"), e
-                        );
-                    }
-                } else {
-                    // Legacy arm: blanket grants for old-chain boot modules.
-                    // Deleted at migration step 9 with BOOT_MODULE_ORDER.
-                    // Grant send/receive on all endpoints (spawned processes are trusted boot modules)
-                    for ep in 0..crate::ipc::MAX_ENDPOINTS as u32 {
-                        let _ = cap_mgr.grant_capability(
-                            process_id,
-                            crate::ipc::EndpointId(ep),
-                            crate::ipc::CapabilityRights { send: true, receive: true, delegate: false, revoke: false },
-                        );
-                    }
-                    // ADR-008: spawned processes inherit CreateProcess
-                    // (trusted boot modules only for now).
-                    let _ = cap_mgr.grant_system_capability(
-                        process_id,
-                        CapabilityKind::CreateProcess,
+                // Exactly the entry's grants + the entry's AID. Failure
+                // here means a kernel invariant broke (the row was
+                // validated at boot; the process is fresh) — report it
+                // loudly; the under-granted process is fail-safe (it can
+                // compute and exit, nothing else) and teardown policy is
+                // the spawner's (init's, via the restart machinery, for
+                // boot-wave rows).
+                // Revisit when: ADR-019 restart policy lands
+                // (migration step 10).
+                if let Err(e) =
+                    crate::manifest::install_manifest_row(cap_mgr, process_id, &manifest_row)
+                {
+                    crate::println!(
+                        "  [Spawn] manifest grant install FAILED for '{}': {}",
+                        core::str::from_utf8(name).unwrap_or("?"), e
                     );
-                    // ADR-005: spawned processes may create channels.
-                    let _ = cap_mgr.grant_system_capability(
-                        process_id,
-                        CapabilityKind::CreateChannel,
-                    );
-                    // ADR-027: spawned processes may register service clusters
-                    // (same trust posture as CreateChannel — clusters are
-                    // bookkeeping over channels per ADR-027 § Decision 1).
-                    let _ = cap_mgr.grant_system_capability(
-                        process_id,
-                        CapabilityKind::CreateCluster,
-                    );
-                    // T-7 Phase A (docs/threat-model.md): only the compositor
-                    // gets EmitInputAudit. The cap was over-granted to every
-                    // spawned module in the original landing (mirroring
-                    // CreateProcess / CreateChannel) — security-review
-                    // 2026-04-25 caught the forgery surface that creates: any
-                    // shell-spawned app (games, terminal-window) holding the
-                    // cap could call SYS_AUDIT_EMIT_INPUT_FOCUS with an
-                    // arbitrary owner_principal, fabricating focus-transition
-                    // audit entries that look like legitimate compositor
-                    // emissions. Narrowing to name == "compositor" closes the
-                    // forgery vector now without waiting for Frame-B.
-                    if name == b"compositor" {
-                        let _ = cap_mgr.grant_system_capability(
-                            process_id,
-                            CapabilityKind::EmitInputAudit,
-                        );
-                    }
-                    // Bind bootstrap Principal
-                    if !bootstrap.is_zero() {
-                        let _ = cap_mgr.bind_principal(process_id, bootstrap);
-                    }
                 }
             }
         }
 
-        // ADR-018 step 8: with the auto-start chain gone, the policy
-        // service arrives via init's manifest-driven spawn, so the
-        // identification that load_boot_modules performed at auto-start
-        // (POLICY_SERVICE_PID for the response-endpoint write gate +
-        // interceptor reentrancy bypass, POLICY_SERVICE_READY to end
-        // the fail-open window) happens here, keyed off the same
-        // manifest name that keyed the grants. Manifest arm only —
-        // nothing shell-spawned can claim the identity.
-        if manifest_row.is_some() && name == b"policy-service" {
+        // The policy service arrives via init's manifest-driven spawn,
+        // so its identification (POLICY_SERVICE_PID for the
+        // response-endpoint write gate + interceptor reentrancy bypass,
+        // POLICY_SERVICE_READY to end the fail-open window) happens
+        // here, keyed off the same manifest name that keyed the grants.
+        // Its row is init-only, so nothing shell-spawned can claim the
+        // identity.
+        if name == b"policy-service" {
             crate::POLICY_SERVICE_PID.store(
                 process_id.as_raw(),
                 core::sync::atomic::Ordering::Release,

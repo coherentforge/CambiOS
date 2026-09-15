@@ -43,7 +43,7 @@ const STATUS_ERROR: u8 = 1;
 // ============================================================================
 // Entry point — _start + panic handler emitted by `service_main!`
 // (ADR-037 L0, no-endpoint form: the PIV backend must be live before
-// module_ready releases fde-mount, so `run` owns the ordering).
+// `ready()` lets init spawn fde-mount, so `run` owns the ordering).
 // ============================================================================
 
 cambios_libsys_rt::service_main! {

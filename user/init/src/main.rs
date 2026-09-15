@@ -8,16 +8,14 @@
 //! endpoint, and runs the three-line supervision loop: ask the
 //! engine, perform the syscall, feed back the event.
 //!
-//! Entry is hand-rolled rather than `service_main!`: init is
-//! kernel-created PID 1, outside the `BOOT_MODULE_ORDER` gate, so it
-//! must not call `module_ready()` (both macro arms do — correctly,
-//! for gated services; the syscall itself retires at migration
-//! step 9). One binary of ritual does not meet the framework's
-//! second-consumer bar for a new macro arm.
+//! Entry is hand-rolled rather than `service_main!`: init is the
+//! *receiver* of readiness pings, not a sender of one (both macro arms
+//! emit `ready()` — correctly, for supervised services). One binary of
+//! ritual does not meet the framework's second-consumer bar for a new
+//! macro arm.
 //!
-//! Dormant until migration step 7: nothing loads this ELF or maps the
-//! blob before then, so nothing here runs. It compiles for all three
-//! kernel targets and its logic is host-tested through the lib crate.
+//! Compiles for all three kernel targets; the engine's logic is
+//! host-tested through the lib crate.
 
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
@@ -134,11 +132,13 @@ mod svc {
         print_num(s.spawn_failed as u32);
         sys::print(b" spawn-failed, ");
         print_num(s.dep_failed as u32);
-        sys::print(b" dep-failed\n");
+        sys::print(b" dep-failed, ");
+        print_num(s.on_demand as u32);
+        sys::print(b" on-demand\n");
 
         // Idle: block on our endpoint and discard. Post-boot traffic
-        // (late ready pings from shell-spawned apps) has no consumer
-        // yet.
+        // (ready pings from on-demand apps, which call ready() like
+        // any service) has no consumer yet.
         // Revisit when: ADR-019 restart policy lands (migration step
         // 10) — this loop becomes the supervision wake point.
         loop {

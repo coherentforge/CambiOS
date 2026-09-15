@@ -157,8 +157,9 @@ fn run() -> ! {
         }
     };
 
-    // Register our endpoint. Release the boot gate so the compositor
-    // (next in BOOT_MODULE_ORDER) can come up and send RegisterCompositor.
+    // Register our endpoint. Ping init ready so the compositor (which
+    // depends on us in the manifest) is spawned and sends
+    // RegisterCompositor.
     if sys::register_endpoint(SCANOUT_DRIVER_ENDPOINT) < 0 {
         sys::print(b"[SCANOUT-VGPU] register_endpoint(27) failed\r\n");
         cambios_libsys_rt::ready();
