@@ -114,10 +114,6 @@ mod svc {
                 sys::exit(1)
             }
         };
-        // Construction validates the DAG order + dependency edges even
-        // when the wave below is compiled out — step 7 exercises the
-        // full parse/validate machinery with zero behavior change.
-        #[cfg_attr(not(feature = "supervise"), allow(unused_mut, unused_variables))]
         let mut eng = match SupervisorEngine::new(&m, &order[..n]) {
             Ok(e) => e,
             Err(_) => {
@@ -126,69 +122,33 @@ mod svc {
             }
         };
 
-        // ADR-018 step-7 coexistence: the spawn wave is compiled out
-        // (see the `supervise` feature in Cargo.toml) — the legacy
-        // boot chain still starts every service, and running the wave
-        // here would double-spawn them all. Step 8 flips the feature
-        // and removes the chain.
-        #[cfg(not(feature = "supervise"))]
-        {
-            sys::print(b"[init] manifest valid: ");
-            print_num(n as u32);
-            sys::print(b" service(s) described; supervision starts at the step-8 cutover\n");
-        }
+        // ADR-018 step 8: the kernel auto-starts nothing on a
+        // supervised boot — this wave is what brings the system up.
+        sys::print(b"[init] manifest parsed; supervising boot wave\n");
+        supervise(&m, &mut eng, init_ep);
 
-        #[cfg(feature = "supervise")]
-        {
-            sys::print(b"[init] manifest parsed; supervising boot wave\n");
-            supervise(&m, &mut eng, init_ep);
-
-            let s = eng.summary();
-            sys::print(b"[init] boot wave settled: ");
-            print_num(s.ready as u32);
-            sys::print(b" ready, ");
-            print_num(s.spawn_failed as u32);
-            sys::print(b" spawn-failed, ");
-            print_num(s.dep_failed as u32);
-            sys::print(b" dep-failed\n");
-        }
+        let s = eng.summary();
+        sys::print(b"[init] boot wave settled: ");
+        print_num(s.ready as u32);
+        sys::print(b" ready, ");
+        print_num(s.spawn_failed as u32);
+        sys::print(b" spawn-failed, ");
+        print_num(s.dep_failed as u32);
+        sys::print(b" dep-failed\n");
 
         // Idle: block on our endpoint and discard. Post-boot traffic
-        // has no consumer yet.
+        // (late ready pings from shell-spawned apps) has no consumer
+        // yet.
         // Revisit when: ADR-019 restart policy lands (migration step
         // 10) — this loop becomes the supervision wake point.
-        //
-        // Coexistence probe (compiled out with `supervise`): prove the
-        // step-8 ready-ping path live while the legacy chain still
-        // governs — print once when the first verified ping lands.
-        // Retires at the cutover, where the supervise wave consumes
-        // pings before this loop runs.
-        #[cfg_attr(feature = "supervise", allow(unused_mut, unused_variables))]
-        let mut probe_pending = true;
         loop {
             let mut buf = [0u8; RECV_BUF];
-            #[cfg(not(feature = "supervise"))]
-            {
-                if let Some(msg) = sys::recv_verified(init_ep, &mut buf) {
-                    if probe_pending
-                        && msg.command().map(|(c, _)| c)
-                            == Some(cambios_manifest::READY_PING_TAG)
-                    {
-                        probe_pending = false;
-                        sys::print(b"[init] ready pings arriving (coexistence probe)\n");
-                    }
-                }
-            }
-            #[cfg(feature = "supervise")]
-            {
-                let _ = sys::recv_msg(init_ep, &mut buf);
-            }
+            let _ = sys::recv_msg(init_ep, &mut buf);
         }
     }
 
     /// Drive the engine over the boot wave: one spawn in flight at a
     /// time, readiness matched by kernel-stamped sender AID.
-    #[cfg(feature = "supervise")]
     fn supervise(m: &Manifest<'_>, eng: &mut SupervisorEngine, init_ep: u32) {
         use cambios_init::engine::{Action, EngineError, Event};
         use cambios_manifest::READY_PING_TAG;

@@ -3,7 +3,7 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:373:eventually
+CLAUDE.md:372:eventually
 CLAUDE.md:388:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
@@ -98,10 +98,10 @@ src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
 src/microkernel/main.rs:950:for-now
 src/microkernel/main.rs:1042:for-now
-src/microkernel/main.rs:1681:deferred
-src/microkernel/main.rs:2330:deferred
-src/microkernel/main.rs:2359:deferred
-src/microkernel/main.rs:2666:for-now
+src/microkernel/main.rs:1717:deferred
+src/microkernel/main.rs:2373:deferred
+src/microkernel/main.rs:2402:deferred
+src/microkernel/main.rs:2709:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:994:deferred
 src/process.rs:995:deferred
@@ -111,7 +111,7 @@ src/reaper.rs:43:deferred
 src/reaper.rs:65:deferred
 src/scheduler/mod.rs:282:placeholder
 src/scheduler/mod.rs:283:placeholder
-src/syscalls/dispatcher.rs:4561:for-now
+src/syscalls/dispatcher.rs:4578:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now

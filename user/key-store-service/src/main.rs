@@ -69,19 +69,37 @@ fn run() -> ! {
         }
     };
 
-    // Vault directory (ADR-033). v1 single-entry: bootstrap AID → active
-    // backend's KeyHandle. The IPC primitives that consume it land in
-    // later 1C stages; today the binding exists so the directory is
-    // ready when bind_for_spawn / sign_with / decrypt_with arrive.
-    let mut bootstrap_aid = [0u8; 32];
-    let rc = sys::get_principal(&mut bootstrap_aid);
-    let vault = if rc == 32 {
-        sys::print(b"[KS] vault initialized (1 entry, bootstrap)\n");
-        Some(init_vault(bootstrap_aid))
+    // Vault directory (ADR-033). The operator entry is keyed by the
+    // OPERATOR's AID — the active backend's slot-9C (Signature)
+    // public key, the same 32 bytes the kernel bakes as the bootstrap
+    // pubkey (ADR-025 / ADR-032: bootstrap AID = pubkey, verbatim).
+    // NOT this process's own Principal: post-ADR-018-cutover
+    // key-store runs as its derived AID, which owns no keys — keying
+    // the directory by get_principal filed the operator's keys under
+    // the wrong name the moment identities diverged. With no live
+    // backend there is no operator key material: the entry is keyed
+    // by the zero AID (unmatchable — recv_verified rejects zero
+    // principals), registered callers still authorize, and every key
+    // operation answers TokenAbsent structurally.
+    let operator_aid: [u8; 32] = piv_backend
+        .as_ref()
+        .and_then(|b| b.get_pubkey(cambios_libsys::keystore::PivSlot::Signature).ok())
+        .and_then(|pk| {
+            if pk.len == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&pk.bytes[..32]);
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .unwrap_or([0u8; 32]);
+    if operator_aid == [0u8; 32] {
+        sys::print(b"[KS] vault initialized (no operator key; caller entries only)\n");
     } else {
-        sys::print(b"[KS] WARNING: get_principal failed; vault not initialized\n");
-        None
-    };
+        sys::print(b"[KS] vault initialized (operator entry = slot-9C pubkey)\n");
+    }
+    let vault = Some(init_vault(operator_aid));
 
     sys::print(b"[KS] ready on endpoint 17\n");
     cambios_libsys_rt::ready();

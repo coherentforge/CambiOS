@@ -147,16 +147,12 @@ fn run() -> ! {
 // ============================================================================
 
 fn unlock_flow() -> UnlockOutcome {
-    // Step 0: this process's bound Principal. For the dev-piv boot
-    // flow that's the bootstrap AID; the vault recognizes it as the
-    // entry it was initialized with and routes operations to slot
-    // 9C / 9D under the active backend. Required up-front for the
-    // vault_decrypt_with call in Step 7.
-    let mut bootstrap_aid = [0u8; 32];
-    let rc = sys::get_principal(&mut bootstrap_aid);
-    if rc != 32 {
-        return UnlockOutcome::Failure(b"get_principal", rc);
-    }
+    // (The decrypt target for Step 7 is the live slot's
+    // slot_principal — the operator AID the kernel-verified header
+    // names — NOT this process's own Principal. Pre-cutover the two
+    // coincided because fde-mount ran as the operator; post-ADR-018
+    // fde-mount's own Principal is its derived AID, which owns no
+    // keys.)
 
     // Step 1: PIV health probe. Stays on the PIV layer — health and
     // PIN are PIV-specific concerns the vault does not speak.
@@ -219,20 +215,20 @@ fn unlock_flow() -> UnlockOutcome {
         [WRAP_ENV_CIPHERTEXT_OFF..WRAP_ENV_CIPHERTEXT_OFF + WRAP_ENV_CIPHERTEXT_LEN];
 
     // Step 7: ECDH via vault_decrypt_with (first real vault consumer
-    // per ADR-033 § Positive Consequences). The vault resolves
-    // bootstrap_aid → KeyHandle.decrypt_slot (0x9D under
-    // --features dev-piv, sentinel otherwise) and drives the active
-    // PIV backend. Authorization happens server-side via
-    // Vault::authorize on the kernel-stamped sender_principal —
-    // fde-mount is bound to the bootstrap AID at spawn, so
-    // authorize accepts — and post-cutover, fde-mount's derived AID
-    // is a registered keyless caller entry (see Vault::register_caller
-    // + CALLER_SERVICES in the key-store), so the flow survives the
-    // ADR-018 rebind.
+    // per ADR-033 § Positive Consequences). The decrypt target is the
+    // slot's declared owner (`slot_principal` from the header the
+    // kernel verified in Step 4 — for the v1 operator slot that is
+    // the bootstrap AID, per the ADR-032 AID-equals-pubkey
+    // invariant); the vault resolves it → KeyHandle.decrypt_slot
+    // (0x9D under --features dev-piv) and drives the active PIV
+    // backend. Authorization happens server-side via Vault::authorize
+    // on the kernel-stamped sender_principal — fde-mount's derived
+    // AID is a registered keyless caller entry (Vault::register_caller
+    // + CALLER_SERVICES in the key-store).
     let mut shared = [0u8; 32];
     let n = match vault_decrypt_with(
         FDE_MOUNT_ENDPOINT,
-        &bootstrap_aid,
+        &live_slot.slot_principal,
         eph_pk,
         &mut shared,
     ) {

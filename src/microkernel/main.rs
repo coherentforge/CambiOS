@@ -1620,6 +1620,59 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
     let mut manifest_module: Option<(*const u8, usize)> = None;
     let mut init_module: Option<(*const u8, usize)> = None;
 
+    // ADR-018 step 8, pass 1: find the manifest + init modules before
+    // touching any service module. Whether this boot is init-supervised
+    // must be known up front — the decision governs how every other
+    // module is treated below, and hanging it on staging order (the
+    // manifest happening to be listed first in limine.conf) would make
+    // a misordered boot config silently fall back to the legacy chain.
+    //
+    // The boot-manifest module is data, not an ELF. Verify its ARCSIG
+    // trailer against the same bootstrap key and transcribe its
+    // security sections into the write-once enforcement tables
+    // (endpoint reservations + spawn grants). A present-but-invalid
+    // manifest aborts boot via the typed error path — booting
+    // permissively on corrupt security configuration would be the
+    // vulnerability. Absent ⇒ tables stay empty ⇒ legacy boot.
+    for module in info.modules() {
+        let size = module.size;
+        let addr = module.phys_addr as *const u8;
+        let short_name = module.name_bytes();
+        if size == 0 {
+            continue;
+        }
+        if short_name == cambios_manifest::MANIFEST_MODULE_NAME.as_bytes() {
+            // SAFETY: Limine loaded this module and provides a valid
+            // address + size, accessible via the HHDM; read-only slice
+            // for the duration of transcription.
+            let binary = unsafe { core::slice::from_raw_parts(addr, size as usize) };
+            let (spawn_rows, reservations) = cambios_core::manifest::transcribe_manifest_module(
+                binary,
+                bootstrap.current_key_bytes(),
+            )?;
+            println!(
+                "  ✓ Boot manifest transcribed: {} spawn row(s), {} reserved endpoint(s)",
+                spawn_rows, reservations
+            );
+            manifest_module = Some((addr, size as usize));
+        } else if short_name == cambios_manifest::INIT_MODULE_NAME.as_bytes() {
+            BOOT_MODULE_REGISTRY
+                .lock()
+                .register(short_name, addr, size as usize);
+            init_module = Some((addr, size as usize));
+            println!("  ✓ Registered init (created after the module loop)");
+        }
+    }
+
+    // ADR-018 step 8: when both are present, this is an init-supervised
+    // boot — the kernel loads NO service as a process. Every module is
+    // registered spawn-only and init spawns the manifest-listed set in
+    // dependency order (each spawn binding the entry's derived AID +
+    // exactly its grants via handle_spawn's manifest arm). The legacy
+    // auto-start chain below still runs when either module is absent;
+    // it is deleted at migration step 9.
+    let supervised_boot = manifest_module.is_some() && init_module.is_some();
+
     for (i, module) in info.modules().enumerate() {
         let size = module.size;
         let addr = module.phys_addr as *const u8;
@@ -1633,48 +1686,31 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
             continue;
         }
 
+        // Handled in pass 1.
+        if short_name == cambios_manifest::MANIFEST_MODULE_NAME.as_bytes()
+            || short_name == cambios_manifest::INIT_MODULE_NAME.as_bytes()
+        {
+            println!("    ✓ (pass 1)");
+            continue;
+        }
+
         // SAFETY: Limine loaded this module into memory and provides a valid
         // address and size. The memory is part of the bootloader-reclaimable
         // region and is accessible via the HHDM. We create a read-only slice
         // for the duration of ELF loading.
         let binary = unsafe { core::slice::from_raw_parts(addr, size as usize) };
 
-        // ADR-018: the boot-manifest module is data, not an ELF. Verify
-        // its ARCSIG trailer against the same bootstrap key and
-        // transcribe its security sections into the write-once
-        // enforcement tables (endpoint reservations + spawn grants).
-        // A present-but-invalid manifest aborts boot via the typed
-        // error path — booting permissively on corrupt security
-        // configuration would be the vulnerability. Absent module ⇒
-        // this arm never runs ⇒ tables stay empty ⇒ behavior today.
-        if short_name == cambios_manifest::MANIFEST_MODULE_NAME.as_bytes() {
-            let (spawn_rows, reservations) = cambios_core::manifest::transcribe_manifest_module(
-                binary,
-                bootstrap.current_key_bytes(),
-            )?;
-            println!(
-                "    ✓ Boot manifest transcribed: {} spawn row(s), {} reserved endpoint(s)",
-                spawn_rows, reservations
-            );
-            manifest_module = Some((addr, size as usize));
-            continue;
-        }
-
-        // ADR-018 step 7: init never rides the legacy auto-start chain
-        // — register spawn-only here, create it as PID 1 after the
-        // loop (only if a manifest was transcribed).
-        if short_name == cambios_manifest::INIT_MODULE_NAME.as_bytes() {
-            BOOT_MODULE_REGISTRY
-                .lock()
-                .register(short_name, addr, size as usize);
-            init_module = Some((addr, size as usize));
-            println!("    ✓ Registered init (created after manifest transcription)");
-            continue;
-        }
-
         // Check for ELF magic before attempting to load
         if binary.len() < 4 || &binary[0..4] != b"\x7fELF" {
             println!("    ✗ Skipped (not an ELF binary)");
+            continue;
+        }
+
+        if supervised_boot {
+            BOOT_MODULE_REGISTRY
+                .lock()
+                .register(short_name, addr, size as usize);
+            println!("    ✓ Registered (init spawns per manifest)");
             continue;
         }
 
@@ -1900,6 +1936,13 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
             cambios_core::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
             println!("✓ Policy enforcement enabled (fail-open until service starts)");
         }
+    }
+    if supervised_boot {
+        // Policy identification + enforcement enablement happen in
+        // handle_spawn's manifest arm when init spawns policy-service
+        // (the fail-open window covers the gap, exactly as it covered
+        // the auto-start world's pre-first-query window).
+        println!("✓ Init-supervised boot: no module auto-started; init spawns per manifest");
     }
 
     // ADR-018 step 7: create init as PID 1 iff a manifest described

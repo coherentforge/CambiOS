@@ -2606,6 +2606,23 @@ impl SyscallDispatcher {
             }
         }
 
+        // ADR-018 step 8: with the auto-start chain gone, the policy
+        // service arrives via init's manifest-driven spawn, so the
+        // identification that load_boot_modules performed at auto-start
+        // (POLICY_SERVICE_PID for the response-endpoint write gate +
+        // interceptor reentrancy bypass, POLICY_SERVICE_READY to end
+        // the fail-open window) happens here, keyed off the same
+        // manifest name that keyed the grants. Manifest arm only —
+        // nothing shell-spawned can claim the identity.
+        if manifest_row.is_some() && name == b"policy-service" {
+            crate::POLICY_SERVICE_PID.store(
+                process_id.as_raw(),
+                core::sync::atomic::Ordering::Release,
+            );
+            crate::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
+            crate::println!("  [Spawn] policy service identified; enforcement enabled");
+        }
+
         crate::audit::emit(crate::audit::RawAuditEvent::process_created(
             process_id, ctx.process_id, crate::audit::now(), 0,
         ));
