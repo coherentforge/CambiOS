@@ -38,6 +38,7 @@ pub mod loader;
 pub mod syscalls;
 pub mod process;
 pub mod reaper;
+pub mod reap;
 pub mod acpi;
 pub mod fs;
 pub mod crypto;
