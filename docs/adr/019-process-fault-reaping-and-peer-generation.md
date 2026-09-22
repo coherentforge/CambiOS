@@ -1,10 +1,20 @@
 # ADR-019: Process Fault Reaping and Peer-Generation Signaling
 
-- **Status:** Proposed
-- **Date:** 2026-04-19
-- **Depends on:** [ADR-007](007-capability-revocation-and-telemetry.md) (Revocation + audit telemetry), [ADR-008](008-boot-time-sized-object-tables.md) (Generation counters on ProcessId), [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC primitives — Principal-stamped messages)
-- **Related:** [ADR-018](018-init-process-and-boot-manifest.md) (Init process and boot manifest — owns the **supervisor policy** half), [ADR-002](002-three-layer-enforcement-pipeline.md) (policy-as-userspace pattern this follows)
+- **Status:** Accepted
+- **Date:** 2026-04-19 (drafted); accepted 2026-09-22
+- **Depends on:** [ADR-007](007-capability-revocation-and-telemetry.md) (Revocation + audit telemetry), [ADR-008](008-boot-time-sized-object-tables.md) (Generation counters on ProcessId), [ADR-005](005-ipc-primitives-control-and-bulk.md) (IPC primitives — Principal-stamped messages), [ADR-034](034-deferred-task-resource-reclamation.md) (the exit path this ADR's reap function is extracted from: enqueue-once transition, exit ring, selective parent wake, deferred root/stack/slot)
+- **Related:** [ADR-018](018-init-process-and-boot-manifest.md) (Init process and boot manifest — owns the **supervisor policy** half; its migration step 10 is gated on phases A–D here), [ADR-002](002-three-layer-enforcement-pipeline.md) (policy-as-userspace pattern this follows)
 - **Supersedes:** N/A
+
+> Body revised at acceptance (2026-09-22) against the tree as of the
+> ADR-018 step-9 landing: ADR-034 reshaped the clean-exit path the reap
+> function is extracted from, `SYS_WAIT_TASK` now takes generation-
+> carrying handles and reads an exit ring, riscv64 turned out to have no
+> user-fault kill path at all, the audit taxonomy moved into
+> `cambios-abi`, and the fault handlers must reap with interrupts
+> enabled (the draft claimed the opposite). The drafting-time text is in
+> git history (this ADR was never previously Accepted, so no Divergence
+> appendix applies).
 
 ## Scope Boundary (read this first)
 
@@ -26,12 +36,12 @@ The rule is the same one ADR-002 and ADR-006 already follow: **kernel makes mech
 
 Today, two user-process death paths exist with asymmetric cleanup:
 
-- `SYS_EXIT` (clean exit, [src/syscalls/dispatcher.rs](../../src/syscalls/dispatcher.rs) `handle_exit`) performs full reclamation: capability table, channel mappings (with TLB shootdown), VMA-tracked frames, page tables, 4 MiB contiguous heap. Wakes the parent task. Emits an `AuditEventKind::ProcessTerminated` event. Yields.
-- User fault (GPF / page-fault / UD, [src/interrupts/mod.rs](../../src/interrupts/mod.rs) `exceptions::*`) calls `crate::terminate_current_task()`, which marks `TaskState::Terminated` and returns — and then yields. Nothing else.
+- `SYS_EXIT` (clean exit, [src/syscalls/dispatcher.rs](../../src/syscalls/dispatcher.rs) `handle_exit`) is, since [ADR-034](034-deferred-task-resource-reclamation.md): mark `Terminated` + `purge_task` under `SCHEDULER(1)`, winning the `Running → Terminated` transition exactly once; latch `(exit_code, parent)` into `TASK_EXIT_RING` keyed by the generation-carrying `TaskId`; selectively wake a parent blocked in `ChildWait` on this child; then inline reclamation — capability table, reply-endpoint slot, channel mappings (with TLB shootdown), cluster departure, VMA-tracked frames, heap — with the self-referential set (page-table root, kernel stack, task slot) enqueued once for the per-CPU reaper. Emits `AuditEventKind::ProcessTerminated`. Yields.
+- User fault on x86_64 (GPF / page-fault / UD / divide, [src/interrupts/mod.rs](../../src/interrupts/mod.rs) `exceptions::*`) and aarch64 (EL0 sync abort, `src/arch/aarch64/mod.rs`) calls `crate::terminate_current_task()`, which marks `TaskState::Terminated` and returns — and then yields. Nothing else. On riscv64 there is no user-fault kill path at all: every S-mode fault routes to `trap.rs::report_and_halt` (a typed `TrapError`, deliberately left with a "per-process kill-rather-than-halt path attaches here" seam) — a game page-faulting on riscv64 halts the machine.
 
-The fault path leaks every resource `handle_exit` reclaims. It never wakes the parent, so a hypothetical init watching via `SYS_WAIT_TASK` never learns the service died. It emits no audit event, so a user-space observer subscribing to the audit ring ([ADR-007](007-capability-revocation-and-telemetry.md)) sees no fault.
+The fault path leaks every resource `handle_exit` reclaims, records nothing in the exit ring, and never wakes the parent, so init — which since the ADR-018 step-8 cutover holds every service's task handle for exactly this purpose — never learns the service died. It emits no audit event, so a user-space observer subscribing to the audit ring ([ADR-007](007-capability-revocation-and-telemetry.md)) sees no fault.
 
-[ADR-018 § 4 "The init process"](018-init-process-and-boot-manifest.md) and [§ "Restart and backoff"](018-init-process-and-boot-manifest.md) assume `SYS_WAIT_TASK` *does* return on service fault. That assumption is currently false. This ADR makes it true.
+[ADR-018 § 4 "The init process"](018-init-process-and-boot-manifest.md) and [§ "Restart and backoff"](018-init-process-and-boot-manifest.md) assume `SYS_WAIT_TASK` *does* return on service fault. That assumption is currently false. This ADR makes it true; ADR-018 migration step 10 is gated on phases A–D below.
 
 Separately, even once fault reap is correct, a surviving client that held a stable reference to a now-restarted peer (for example, a shell holding an fs-service endpoint handle across an fs-service restart) has no primitive to notice the peer is a different incarnation. The ProcessId generation counter ([ADR-008 § Open Problem 9](008-boot-time-sized-object-tables.md)) solves stale ProcessIds at the slot level — it does not solve stale *endpoint* references, because clients address peers by endpoint, not by pid.
 
@@ -39,9 +49,9 @@ Separately, even once fault reap is correct, a surviving client that held a stab
 
 Four specific mechanical problems, each needed independently but composing into one coherent fix.
 
-**Problem 1 — fault path is not a reap.** `terminate_current_task()` in [src/lib.rs:262](../../src/lib.rs#L262) marks one boolean and returns. Every resource the process held stays held. Frames leak, peers see stale shared-memory mappings, capability slots stay occupied. A malicious or buggy process can exhaust kernel memory by repeatedly faulting via spawned children.
+**Problem 1 — fault path is not a reap.** `terminate_current_task()` in [src/lib.rs](../../src/lib.rs) marks the task `Terminated` and returns (and riscv64 does not even get that far — see Context). Every resource the process held stays held. Frames leak, peers see stale shared-memory mappings, capability slots stay occupied. A malicious or buggy process can exhaust kernel memory by repeatedly faulting via spawned children.
 
-**Problem 2 — no parent notification on fault.** `SYS_WAIT_TASK` only wakes on `SYS_EXIT` (via the parent-wake path in `handle_exit`). A parent — whether init or a user-space spawner — cannot observe a child's fault. Restart policy ([ADR-018](018-init-process-and-boot-manifest.md) § Restart and backoff) requires this observation.
+**Problem 2 — no parent notification on fault.** `SYS_WAIT_TASK` only returns on `SYS_EXIT` (via the exit-ring record + selective parent wake in `handle_exit`). A parent — init, the shell, or terminal-window — blocked in `ChildWait` on a child that faults blocks forever; a parent that asks later finds no ring record. Restart policy ([ADR-018](018-init-process-and-boot-manifest.md) § Restart and backoff) requires this observation.
 
 **Problem 3 — fault-kill is indistinguishable from clean exit.** Even if `SYS_WAIT_TASK` fired on fault, today's ABI surfaces only a `u32` exit code. A peer has no way to distinguish "process exited voluntarily with code 1" from "process faulted with a page fault at RIP 0x402300." The restart policy in [ADR-018](018-init-process-and-boot-manifest.md) wants to treat these differently: clean exit of a `OneShot` service is success; fault of a `OneShot` service may warrant a giveup. Today they are the same code path at the wire format.
 
@@ -65,7 +75,7 @@ None of this requires a new kernel subsystem. The mechanisms (audit events, capa
 
 ### 1. Unify the reap path
 
-Extract the body of `handle_exit` (from the scheduler-state update through `destroy_process`) into a single function:
+Extract the body of `handle_exit` — the ADR-034 sequence exactly as it stands: the enqueue-once `Running → Terminated` transition + `purge_task`, the exit-ring record, the selective parent wake, the inline reclamation (capabilities, reply-endpoint slot, channels, clusters, VMAs, heap), and the reaper enqueue of the self-referential set — into a single function:
 
 ```rust
 // In src/process.rs or a new src/process/reap.rs.
@@ -76,7 +86,7 @@ pub fn reap_process(
 );
 ```
 
-`handle_exit` calls `reap_process(..., ExitReason::Exited(code))`. The fault handlers call `reap_process(..., ExitReason::Faulted(fault_kind, fault_addr, pc))` and then yield, replacing today's `terminate_current_task()` + bare yield loop.
+`handle_exit` calls `reap_process(..., ExitReason::Exited(code))`. The fault handlers call `reap_process(..., ExitReason::Faulted { .. })` and then yield, replacing today's `terminate_current_task()` + bare yield loop (x86_64, aarch64) and the `report_and_halt` routing of U-mode faults (riscv64). The fault entry goes through the same enqueue-once gate: a fault racing a clean exit must not enqueue the root/stack twice — ADR-034 § Decision already requires this and names the fault path as the race it guards against. `terminate_current_task()` is deleted; no second "mark dead" path survives.
 
 ### 2. `ExitReason` enum
 
@@ -94,29 +104,31 @@ pub enum ExitReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum FaultKind {
-    PageFault = 0,
-    GeneralProtection = 1,
-    InvalidOpcode = 2,
-    StackOverflow = 3,      // emitted by a future guard-page handler
-    DivideByZero = 4,
-    // Reserved range for arch-specific faults not in the common set.
+    PageFault,
+    GeneralProtection,
+    InvalidOpcode,
+    StackOverflow,          // emitted by a future guard-page handler
+    DivideByZero,
+    /// A fault outside the common set, carrying the architecture's raw
+    /// code (x86 vector, aarch64 ESR_EL1.EC/DFSC, riscv64 scause). Keeps
+    /// the enum total without a reserved numeric range.
+    ArchSpecific(u8),
 }
 ```
 
-Exhaustive `match` on `FaultKind` is a verification target — no unknown/default case.
+Wire form (in `ExitInfo` and the audit event): `fault_kind: u8` tag with the common kinds at 0–4 and `ArchSpecific` at 5 with its raw code in the adjacent byte. Exhaustive `match` on `FaultKind` is a verification target — no unknown/default case; `ArchSpecific` is the one arm that carries the "we do not classify this" information instead of dropping it.
 
 ### 3. New audit variant
 
-Add to `AuditEventKind` in [src/audit/mod.rs](../../src/audit/mod.rs):
+Add one row to the `audit_taxonomy!` table in `cambios-abi/src/audit.rs` (the canonical `AuditEventKind` + name + class + field legend; [ADR-007](007-capability-revocation-and-telemetry.md) amendment 2026-06). Next free kind number at landing time (kinds run 0..=20 as of acceptance):
 
-```rust
-/// Kernel reaped the process due to an unrecoverable fault.
-ProcessFaulted = 16,
+```text
+ProcessFaulted = <next free> => "proc.faulted", Lifecycle,
+    "subject=pid arg0=fault_kind arg1=fault_addr arg2=pc arg3=runtime_ticks";
 ```
 
-Builder signature:
+`audit-tail` renders by taxonomy name, so consumers are additive-compatible. Builder signature in `src/audit/mod.rs`:
 
 ```rust
 pub fn process_faulted(
@@ -130,11 +142,11 @@ pub fn process_faulted(
 ) -> Self;
 ```
 
-The existing `ProcessTerminated = 12` keeps its current meaning (clean `SYS_EXIT`). Keeping them distinct means a policy-service or supervisor consuming audit can pattern-match on event kind without inspecting exit-code bits. Kind 15 is already `AuditDropped`; 16 is the next free slot.
+The existing `ProcessTerminated = 12` keeps its current meaning (clean `SYS_EXIT`). Keeping them distinct means a policy-service or supervisor consuming audit can pattern-match on event kind without inspecting exit-code bits.
 
 ### 4. `SYS_WAIT_TASK` ABI shift
 
-Current: `SYS_WAIT_TASK` returns a single `i32` exit code. New: it writes an `ExitInfo` struct (24 bytes) to a caller-provided buffer and returns 0/error.
+Current: `SYS_WAIT_TASK(task_handle)` returns a single `i32` exit code, read from `TASK_EXIT_RING` by the generation-carrying `(slot, generation)` handle the spawn returned ([ADR-034](034-deferred-task-resource-reclamation.md) Phase B — the handle is what makes a reaped-and-reused slot detectable). New: `SYS_WAIT_TASK(task_handle, out_buf, out_len)` writes an `ExitInfo` struct (24 bytes) to the caller-provided buffer and returns 0/error. The ring entry grows from `i32` to the `ExitInfo` record — the ring is bounded, so the cost is `ring_len × 24` bytes.
 
 ```rust
 #[repr(C)]
@@ -148,7 +160,9 @@ pub struct ExitInfo {
 }
 ```
 
-This is a breaking ABI change to one syscall. Every current caller (only shell today, soon init per ADR-018) must update. Worked-example discipline from CLAUDE.md applies — all seven syscall-landing steps get re-run.
+This is a breaking ABI change to one syscall. Every current caller must update in the same commit: the shell (`cmd_spawn`), terminal-window (`play`), and init (its engine already holds each service's task handle in `Spawned { task }` for exactly this). Worked-example discipline from CLAUDE.md applies — all seven syscall-landing steps get re-run.
+
+`ExitInfo` is also the payload of the kernel-authored exit notification that ADR-018 § 4's deferred wake-model decision may choose at step 10 (a message to init's endpoint carrying the child's handle + `ExitInfo`). One record, two transports — step 10 must not mint a second format.
 
 Scope note: `ExitInfo` deliberately does **not** carry a register-file snapshot. A full register snapshot belongs in the crash-dump-as-CambiObject design (flagged in Open Problems) where it can be paired with VMA snapshots, an audit slice, and signing — not in every `SYS_WAIT_TASK` return payload. Supervisors that only need to decide "restart or give up" have no use for register state; supervisors that need to diagnose get it from the future dump object, not from this syscall.
 
@@ -169,11 +183,12 @@ Scope note: endpoint-level generation is deliberately the only generation-counte
 
 ### 6. Fault handler changes (per arch)
 
-Each arch's user-fault handlers ([src/interrupts/mod.rs](../../src/interrupts/mod.rs) x86, the AArch64 EL0 sync handler, the RISC-V trap dispatch) replaces its `terminate_current_task() + yield` sequence with:
+Each arch's user-fault handlers ([src/interrupts/mod.rs](../../src/interrupts/mod.rs) x86_64; the AArch64 EL0 sync handler in `src/arch/aarch64/mod.rs`; the RISC-V U-mode arms of `src/arch/riscv64/trap.rs`, which today do not exist — `report_and_halt` takes every fault, so on riscv64 this phase *adds* the user/kernel discrimination via `sstatus.SPP` + `scause` decode rather than swapping one call for another) replaces its `terminate_current_task() + yield` sequence with:
 
 ```rust
-if is_user_mode(&stack_frame) {
-    let ctx = capture_syscall_context_from_fault();
+if is_user_mode(&frame) {
+    arch::enable_interrupts();   // see below — the reap must not run masked
+    let ctx = capture_context_from_fault();
     reap_process(
         ctx.process_id,
         ctx.task_id,
@@ -183,27 +198,33 @@ if is_user_mode(&stack_frame) {
 }
 ```
 
+**Interrupts are re-enabled before the reap.** The exception gate delivers the fault with interrupts masked; `handle_exit` runs with them enabled (the syscall path does `sti` after the stack switch) and the reap must match it, because channel teardown issues TLB-shootdown IPIs and the initiating CPU spins until every other CPU acknowledges. A CPU sitting in a fault handler with interrupts masked cannot acknowledge anyone else's shootdown; if it is also spinning on its own, two CPUs tearing down channels concurrently deadlock. Re-enabling is safe here: the handler runs on the faulting task's own kernel stack (TSS `RSP0` / the EL0-sync stack / the riscv trap stack after the `sscratch` swap), the task is about to be marked `Terminated` so nothing re-enters it, and every lock the reap takes is a plain spinlock below `SCHEDULER(1)` or the `IrqSpinlock`s that mask on their own.
+
 Kernel-mode faults retain today's `halt()` behavior — a kernel fault is unrecoverable regardless, and ADR-019 is not the place to add kernel fault recovery.
 
 ## Architecture
 
 ### Reap-path lock order
 
-The reap path runs the same locks `handle_exit` runs, in the same order:
+The reap path runs the same locks `handle_exit` runs, in the same order (numbers per CLAUDE.md § Lock Ordering):
 
 ```
-SCHEDULER(1) → [purge_task] → release
-CAPABILITY_MANAGER(4) → [revoke_all_for_process] → release
-CHANNEL_MANAGER(5) → [revoke_all_for_process] → release → teardown_channel_mappings
-PROCESS_TABLE(6) → FRAME_ALLOCATOR(7) → [destroy_process] → release
+SCHEDULER(1)          → [mark Terminated, purge_task, enqueue-once decision] → release
+TASK_EXIT_RING        → [record (handle, ExitInfo, parent)]            (own domain)
+SCHEDULER(1) of parent's CPU → [wake_child_waiter]                     → release
+CAPABILITY_MANAGER(4) → [revoke_all_for_process, unregister_process]   → release
+CHANNEL_MANAGER(6)    → [revoke_all_for_process]                       → release → teardown_channel_mappings (TLB shootdown IPIs)
+CLUSTER_MANAGER(5) / CAPABILITY_MANAGER(4)  → [cluster departure]      → release
+PROCESS_TABLE(7) → FRAME_ALLOCATOR(8) → [destroy_process: VMAs, heap]  → release
+REAPER queue          → [root, kernel stack, task slot]                (ADR-034, lock-isolated)
 AUDIT (lock-free per-CPU staging)
 ```
 
-No new locks. No reordering. The fault-entry version runs in interrupt context with interrupts disabled on entry; it must not acquire a lock that an interrupt-disabled context cannot take. The existing `handle_exit` is already callable with interrupts enabled (it's a syscall), and switching to disabled-on-entry is strictly safer because no nested interrupt can preempt a partial reap.
+No new locks. No reordering. The fault-entry version arrives in exception context with interrupts masked and **re-enables them before calling `reap_process`** (Decision 6): the reap spins on cross-CPU TLB-shootdown acknowledgements, and a masked CPU can neither acknowledge nor be acknowledged. The draft of this ADR claimed disabled-on-entry was "strictly safer"; it is a cross-CPU deadlock. Nested-interrupt preemption of a partial reap is not a hazard — `handle_exit` has always been preemptible and every step is under its own lock.
 
 ### Audit emission in fault context
 
-`emit()` in [src/audit/mod.rs:592](../../src/audit/mod.rs#L592) is already safe to call from any context that has a valid GS base / TPIDR_EL1. Fault handlers run with per-CPU state initialized (we are well past early boot by the time a user process can fault), so emission is straightforward. The event is produced **before** the structural reclamation that destroys the process — otherwise the runtime-ticks field would be indeterminate and the ProcessId might refer to a slot already being marked free. Order inside `reap_process`:
+`emit()` in [src/audit/mod.rs](../../src/audit/mod.rs) is already safe to call from any context that has a valid GS base / TPIDR_EL1 / `tp`. Fault handlers run with per-CPU state initialized (we are well past early boot by the time a user process can fault), so emission is straightforward. The event is produced **before** the structural reclamation that destroys the process — otherwise the runtime-ticks field would be indeterminate and the ProcessId might refer to a slot already being marked free. Order inside `reap_process`:
 
 1. Mark task `Terminated`, capture exit metadata, wake parent.
 2. Emit audit event (`ProcessTerminated` or `ProcessFaulted`).
@@ -288,13 +309,15 @@ A **single commit-boundary landing** is not appropriate — the ABI change to `S
 
 **Phase 019.A — Reap-path refactor.** Extract `reap_process` from `handle_exit`. `handle_exit` is a thin wrapper that calls `reap_process(ExitReason::Exited(code))`. No behavior change. Green across all three arches (tri-arch gate). Lands a commit.
 
-**Phase 019.B — Fault handlers call `reap_process`.** x86_64 GPF + page-fault + UD, AArch64 EL0 sync, RISC-V U-mode trap dispatch. Today's `terminate_current_task` is removed. Each arch's commit verifies the existing "user fault kills task" integration still works plus new leakless behavior.
+**Phase 019.B — Fault handlers call `reap_process`.** x86_64 GPF + page-fault + UD + divide, AArch64 EL0 sync; RISC-V gains its first U-mode fault arm (user/kernel discrimination + `scause` decode — today every riscv64 fault halts the hart). Interrupts re-enabled before the reap on every arch. `terminate_current_task` is deleted. Each arch's commit verifies "user fault kills task, system survives" (a deliberately-faulting on-demand app is the natural fixture) plus leakless behavior (a second `play` of the same app succeeds — the pre-ADR-034 "second play fails" symptom is the regression test).
 
 **Phase 019.C — `ProcessFaulted` audit variant + fault-context fields.** Additive to AuditEventKind. User-space audit consumers that don't know the new variant see a kind byte = 16 and can ignore. Backward compatible.
 
-**Phase 019.D — `SYS_WAIT_TASK` ABI shift to `ExitInfo`.** Breaking change. Land in the same commit as every caller's update. Today's callers: shell (user-facing `wait` command). Init-the-process doesn't exist yet per [ADR-018](018-init-process-and-boot-manifest.md).
+**Phase 019.D — `SYS_WAIT_TASK` ABI shift to `ExitInfo`.** Breaking change. Land in the same commit as every caller's update: shell `cmd_spawn`, terminal-window `play`, init's supervise loop (which only logs the outcome until step 10 gives it a policy). The `TASK_EXIT_RING` entry becomes the `ExitInfo` record.
 
-**Phase 019.E — Endpoint generation counter.** Additive field on recv-side syscalls + `VerifiedMessage`. Clients that ignore the new field see no regression; clients that check it gain restart-detection.
+**Phases A–D are the prerequisite for [ADR-018](018-init-process-and-boot-manifest.md) migration step 10.** Step 10's own first decision (init's steady-state wake model) is taken there, on top of `ExitInfo`.
+
+**Phase 019.E — Endpoint generation counter.** Additive field on recv-side syscalls + `VerifiedMessage` (the 36-byte verified header grows to 40; one parser site in libsys — `parse_verified`, shared by `recv_verified` / `try_recv_verified` / the libipc polls — plus the kernel writer). Clients that ignore the new field see no regression; clients that check it gain restart-detection. **Deliberately decoupled from step 10:** restart *policy* needs A–D, not E. **Revisit when:** the step-10 integration test restarts a stateful service (fs-service) and a client (the shell's `arcobj`) must notice — that is the first consumer of the generation, and the phase lands then.
 
 Each phase is independently testable, independently revertable, and each one moves the state of the art forward without requiring the next to be ready.
 
