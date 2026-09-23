@@ -552,6 +552,37 @@ impl RawAuditEvent {
         )
     }
 
+    /// `PROCESS_FAULTED`: the kernel reaped the process for an
+    /// unrecoverable user-mode fault (ADR-019 § Decision 3).
+    ///
+    /// - `subject_pid`: the reaped process
+    /// - `arg0`: `FaultKind::wire()`
+    /// - `arg1`: faulting address (CR2 / FAR_EL1 / stval; GPF error code on x86)
+    /// - `arg2`: program counter at the fault
+    /// - `arg3`: runtime ticks
+    pub fn process_faulted(
+        pid: ProcessId,
+        fault_kind: u64,
+        fault_addr: u64,
+        pc: u64,
+        runtime_ticks: u64,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ProcessFaulted,
+            0,
+            sequence,
+            timestamp,
+            pid.as_raw(),
+            0,
+            fault_kind,
+            fault_addr,
+            pc,
+            runtime_ticks,
+        )
+    }
+
     /// `PROCESS_TERMINATED`: after process exit.
     ///
     /// - `subject_pid`: the exiting process

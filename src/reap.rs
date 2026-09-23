@@ -43,13 +43,92 @@ use crate::ipc::{Principal, ProcessId};
 use crate::scheduler::TaskId;
 use crate::syscalls::dispatcher::SyscallDispatcher;
 
-/// Why a process is being reaped. `Faulted` lands with ADR-019 phase B
-/// (the fault handlers) together with `FaultKind`; until then the only
-/// producer is `SYS_EXIT`.
+/// Why a process is being reaped (ADR-019 § Decision 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     /// The process called `SYS_EXIT` with this code.
     Exited(i32),
+    /// The kernel killed the process for an unrecoverable user-mode
+    /// fault. `fault_addr` is CR2 / FAR_EL1 / stval (the GPF arm on
+    /// x86_64 carries the error code instead — there is no address);
+    /// `pc` is RIP / ELR_EL1 / sepc at the fault.
+    Faulted { kind: FaultKind, fault_addr: u64, pc: u64 },
+}
+
+/// The common fault vocabulary across the three architectures
+/// (ADR-019 § Decision 2). `ArchSpecific` carries the architecture's
+/// raw code for anything outside the common set, so every `match` on
+/// this enum is exhaustive without dropping information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    PageFault,
+    GeneralProtection,
+    InvalidOpcode,
+    /// Reserved for a future guard-page handler; no producer yet.
+    StackOverflow,
+    DivideByZero,
+    /// x86 vector, aarch64 `ESR_EL1.EC`, or riscv64 `scause` code.
+    ArchSpecific(u8),
+}
+
+impl FaultKind {
+    /// Wire form for the audit event (`proc.faulted` arg0) and, from
+    /// ADR-019 phase D, `ExitInfo`: common kinds are tags 0–4,
+    /// `ArchSpecific` is tag 5 with the raw code in bits 8..16.
+    pub const fn wire(self) -> u64 {
+        match self {
+            FaultKind::PageFault => 0,
+            FaultKind::GeneralProtection => 1,
+            FaultKind::InvalidOpcode => 2,
+            FaultKind::StackOverflow => 3,
+            FaultKind::DivideByZero => 4,
+            FaultKind::ArchSpecific(raw) => 5 | ((raw as u64) << 8),
+        }
+    }
+}
+
+/// SCAFFOLDING: the exit code recorded in `TASK_EXIT_RING` for a
+/// faulted process until ADR-019 phase D widens the ring entry to
+/// `ExitInfo`. `i32::MIN` is deliberately not a value any process
+/// passes to `SYS_EXIT`. A parent reading it through today's
+/// `SYS_WAIT_TASK` sees "the child did not exit normally" and nothing
+/// more — which is already the difference between a parent that
+/// unblocks and one that waits forever.
+/// Replace when: ADR-019 phase D lands (`ExitInfo` out-buffer).
+pub const FAULTED_EXIT_CODE: i32 = i32::MIN;
+
+/// Reap the current task on this CPU for a user-mode fault (ADR-019
+/// § Decision 6 — the fault-handler entry point). Resolves the task,
+/// its process, and its bound Principal, then runs [`reap_process`].
+/// Returns `false` if this CPU has no current task with a process
+/// (a user-mode fault with nobody to blame is a kernel invariant
+/// violation; the caller halts).
+///
+/// The arch handler MUST re-enable interrupts before calling: the
+/// reap spins on cross-CPU TLB-shootdown acknowledgements.
+pub fn reap_faulting_current(kind: FaultKind, fault_addr: u64, pc: u64) -> bool {
+    let Some((task_id, process_id)) = crate::current_task_process() else {
+        return false;
+    };
+    let caller_principal = {
+        let cap_guard = crate::CAPABILITY_MANAGER.lock();
+        cap_guard.as_ref().and_then(|cm| cm.get_principal(process_id).ok())
+    };
+    crate::println!(
+        "  [Fault] pid={} task={} {:?} at {:#x} (pc={:#x}) — reaping",
+        process_id.slot(),
+        task_id.slot(),
+        kind,
+        fault_addr,
+        pc
+    );
+    reap_process(
+        process_id,
+        task_id,
+        caller_principal,
+        ExitReason::Faulted { kind, fault_addr, pc },
+    );
+    true
 }
 
 /// Reap `process_id` / `task_id` (the current task on this CPU) for
@@ -62,7 +141,12 @@ pub fn reap_process(
     caller_principal: Option<Principal>,
     reason: ExitReason,
 ) {
-    let ExitReason::Exited(code) = reason;
+    // The ring carries an i32 until phase D; a fault records
+    // `FAULTED_EXIT_CODE` so the parent still unblocks (Problem 2).
+    let code = match reason {
+        ExitReason::Exited(code) => code,
+        ExitReason::Faulted { .. } => FAULTED_EXIT_CODE,
+    };
 
     // Lock ordering: PER_CPU_SCHEDULER(1) — no higher locks held.
     //
@@ -286,12 +370,28 @@ pub fn reap_process(
     };
 
 
-    crate::audit::emit(crate::audit::RawAuditEvent::process_terminated(
-        process_id, code, 0, crate::audit::now(), 0,
-    ));
+    // Distinct audit kinds so a supervisor can pattern-match on the
+    // kind byte without inspecting exit-code bits (ADR-019 § Decision 3).
+    match reason {
+        ExitReason::Exited(code) => {
+            crate::audit::emit(crate::audit::RawAuditEvent::process_terminated(
+                process_id, code, 0, crate::audit::now(), 0,
+            ));
+        }
+        ExitReason::Faulted { kind, fault_addr, pc } => {
+            crate::audit::emit(crate::audit::RawAuditEvent::process_faulted(
+                process_id, kind.wire(), fault_addr, pc, 0, crate::audit::now(), 0,
+            ));
+        }
+    }
 
+    let tag = match reason {
+        ExitReason::Exited(_) => "Exit",
+        ExitReason::Faulted { .. } => "Fault",
+    };
     crate::println!(
-        "  [Exit] pid={} task={} code={} (reclaimed {} cap(s), {} chan(s), {} cluster(s){})",
+        "  [{}] pid={} task={} code={} (reclaimed {} cap(s), {} chan(s), {} cluster(s){})",
+        tag,
         process_id.slot(),
         task_id.slot(),
         code,

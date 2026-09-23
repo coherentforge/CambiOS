@@ -42,3 +42,4 @@ security, dataflow, lifecycle, anomaly, meta, context
 | 19 | `chan.teardown.started` | lifecycle | subject=initiator object=channel arg0=teardown_kind(0=Close,1=Revoke) |
 | 20 | `chan.teardown.completed` | lifecycle | subject=completer object=channel arg0=teardown_kind(0=Close,1=Revoke) arg1=num_pages |
 | 21 | `meta.reap_would_free_active_root` | meta | subject=0(kernel) arg0=active_root_phys |
+| 22 | `proc.faulted` | lifecycle | subject=pid arg0=fault_kind arg1=fault_addr arg2=pc arg3=runtime_ticks |

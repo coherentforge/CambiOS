@@ -84,27 +84,47 @@ static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 pub mod exceptions {
     use x86_64::structures::idt::InterruptStackFrame;
 
+    /// Reap the current user task for a fault and never return
+    /// (ADR-019 § Decision 6). Runs on the faulting task's own kernel
+    /// stack (the CPL3→0 transition loaded TSS RSP0), so re-enabling
+    /// interrupts here is exactly the syscall path's posture — and it is
+    /// required: the reap spins on cross-CPU TLB-shootdown acks, which a
+    /// masked CPU can neither send nor answer. The task is about to be
+    /// marked Terminated, so nothing re-enters it; the terminal yield
+    /// loop never returns. Callers must have read CR2 (page faults)
+    /// before this, since a nested #PF would clobber it.
+    fn reap_user_fault(kind: crate::reap::FaultKind, fault_addr: u64, pc: u64) -> ! {
+        x86_64::instructions::interrupts::enable();
+        if !crate::reap::reap_faulting_current(kind, fault_addr, pc) {
+            // A user-mode fault with no current process is a broken
+            // kernel invariant; iretq would re-fault at hardware speed.
+            crate::println!(
+                "\n!!! USER FAULT WITH NO CURRENT PROCESS !!!\n  {:?} at {:#x} (RIP={:#x})",
+                kind, fault_addr, pc
+            );
+            crate::halt();
+        }
+        loop {
+            // SAFETY: Kernel stack, scheduler lock not held. The task is
+            // Terminated and never re-scheduled, so this does not return.
+            unsafe { crate::arch::yield_save_and_switch(); }
+        }
+    }
+
     /// Division by zero exception handler.
     ///
-    /// User-mode: terminate the faulting task.
+    /// User-mode: reap the faulting task (ADR-019).
     /// Kernel-mode: unrecoverable — halt.
     pub extern "x86-interrupt" fn divide_by_zero(stack_frame: InterruptStackFrame) {
         let cs = stack_frame.code_segment;
         let is_user = (cs & 0x3) == 3;
 
         if is_user {
-            if let Some(task_id) = crate::terminate_current_task() {
-                crate::println!(
-                    "  [DivZero] Task {} killed: RIP={:#x}",
-                    task_id.slot(), stack_frame.instruction_pointer.as_u64()
-                );
-                // Yield away immediately — without this, iretq returns to
-                // the faulting instruction and re-faults at hardware speed.
-                loop {
-                    // SAFETY: Kernel stack, scheduler lock not held.
-                    unsafe { crate::arch::yield_save_and_switch(); }
-                }
-            }
+            reap_user_fault(
+                crate::reap::FaultKind::DivideByZero,
+                0,
+                stack_frame.instruction_pointer.as_u64(),
+            );
         } else {
             crate::println!(
                 "\n!!! KERNEL DIVIDE BY ZERO !!!\n{:#?}",
@@ -116,7 +136,8 @@ pub mod exceptions {
 
     /// General protection fault handler.
     ///
-    /// User-mode GPF: terminate the faulting task.
+    /// User-mode GPF: reap the faulting task (ADR-019); the error code
+    /// rides in the `fault_addr` slot (a GPF has no faulting address).
     /// Kernel-mode GPF: unrecoverable — halt with diagnostics.
     pub extern "x86-interrupt" fn general_protection_fault(
         stack_frame: InterruptStackFrame,
@@ -128,18 +149,11 @@ pub mod exceptions {
         let is_user = (cs & 0x3) == 3;
 
         if is_user {
-            if let Some(task_id) = crate::terminate_current_task() {
-                crate::println!(
-                    "  [GPF] Task {} killed: code={:#x} RIP={:#x}",
-                    task_id.slot(), error_code, stack_frame.instruction_pointer.as_u64()
-                );
-                // Yield away immediately — without this, iretq returns to
-                // the faulting instruction and re-faults at hardware speed.
-                loop {
-                    // SAFETY: Kernel stack, scheduler lock not held.
-                    unsafe { crate::arch::yield_save_and_switch(); }
-                }
-            }
+            reap_user_fault(
+                crate::reap::FaultKind::GeneralProtection,
+                error_code,
+                stack_frame.instruction_pointer.as_u64(),
+            );
         } else {
             crate::println!(
                 "\n!!! KERNEL GPF !!!\n  Error code: {:#x}\n{:#?}",
@@ -151,8 +165,8 @@ pub mod exceptions {
 
     /// Page fault handler (vector 14).
     ///
-    /// Distinguishes user-mode faults (terminate the offending task) from
-    /// kernel-mode faults (unrecoverable — panic with diagnostics).
+    /// Distinguishes user-mode faults (reap the offending task, ADR-019)
+    /// from kernel-mode faults (unrecoverable — halt with diagnostics).
     ///
     /// ## Error code bits (x86_64)
     /// - Bit 0 (PRESENT): 0 = page not present, 1 = protection violation
@@ -173,27 +187,19 @@ pub mod exceptions {
         let is_fetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
 
         if is_user {
-            // User-mode page fault: terminate the faulting task
+            // User-mode page fault: reap the faulting task. CR2 was read
+            // above, before interrupts are re-enabled inside the reap.
             let fault_type = if is_present { "protection" } else { "not-present" };
             let access = if is_fetch { "execute" } else if is_write { "write" } else { "read" };
-
-            if let Some(task_id) = crate::terminate_current_task() {
-                crate::println!(
-                    "  [PageFault] Task {} killed: {} {} at {:#x} (RIP={:#x})",
-                    task_id.slot(), fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
-                );
-                // Yield away immediately — without this, iretq returns to
-                // the faulting instruction and re-faults at hardware speed.
-                loop {
-                    // SAFETY: Kernel stack, scheduler lock not held.
-                    unsafe { crate::arch::yield_save_and_switch(); }
-                }
-            } else {
-                crate::println!(
-                    "  [PageFault] User fault at {:#x} but no current task to kill",
-                    faulting_addr
-                );
-            }
+            crate::println!(
+                "  [PageFault] user {} {} at {:#x} (RIP={:#x})",
+                fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
+            );
+            reap_user_fault(
+                crate::reap::FaultKind::PageFault,
+                faulting_addr,
+                stack_frame.instruction_pointer.as_u64(),
+            );
         } else {
             // Kernel-mode page fault: unrecoverable — halt with diagnostics
             let fault_type = if is_present { "protection" } else { "not-present" };

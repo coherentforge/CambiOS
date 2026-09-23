@@ -334,6 +334,15 @@ audit_taxonomy! {
     /// fast-fails dev builds.
     ReapWouldFreeActiveRoot = 21 => "meta.reap_would_free_active_root", Meta,
         "subject=0(kernel) arg0=active_root_phys";
+
+    /// The kernel reaped a process for an unrecoverable user-mode fault
+    /// (ADR-019). Distinct from `proc.terminated` (clean `SYS_EXIT`) so
+    /// supervisors match on the kind, not on exit-code bits. `arg0` is
+    /// the `FaultKind` wire tag (0 page fault, 1 general protection,
+    /// 2 invalid opcode, 3 stack overflow, 4 divide by zero, 5 arch-
+    /// specific with the raw code in bits 8..16).
+    ProcessFaulted = 22 => "proc.faulted", Lifecycle,
+        "subject=pid arg0=fault_kind arg1=fault_addr arg2=pc arg3=runtime_ticks";
 }
 
 /// Number of assigned audit event kinds. Derived from [`TAXONOMY`] —
@@ -363,7 +372,8 @@ mod tests {
         assert_eq!(AuditEventKind::AuditDropped as u8, 15);
         assert_eq!(AuditEventKind::InputFocusChange as u8, 16);
         assert_eq!(AuditEventKind::ReapWouldFreeActiveRoot as u8, 21);
-        assert_eq!(AUDIT_EVENT_KIND_COUNT, 22);
+        assert_eq!(AuditEventKind::ProcessFaulted as u8, 22);
+        assert_eq!(AUDIT_EVENT_KIND_COUNT, 23);
     }
 
     /// TAXONOMY is dense and ordered: entry `i` has discriminant `i`,

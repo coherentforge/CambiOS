@@ -180,6 +180,13 @@ endpoints = [29]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
 
+# faultme — ADR-019 fixture: takes a deliberate user page fault so the
+# kernel's fault-reap path is exercisable from the shell on every arch.
+# No endpoints; send-only grants (the readiness ping).
+[[service]]
+name = "faultme"
+lifetime = "on-demand"
+
 # --- USB / PIV chain -------------------------------------------------------------
 
 [[service]]

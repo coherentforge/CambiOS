@@ -512,32 +512,25 @@ pub fn block_local_task(
     }
 }
 
-/// Terminate the current task on this CPU.
+/// The current task on this CPU and the process it belongs to.
 ///
-/// Called from exception handlers (page fault, data abort) when the faulting
-/// task cannot be recovered. Marks the task as Terminated so the scheduler
-/// skips it on the next tick. The next timer interrupt will context-switch
-/// to a Ready task.
-///
-/// Returns the TaskId of the terminated task, or None if no current task.
+/// The fault handlers' one question before handing a user-mode fault to
+/// [`reap::reap_faulting_current`] (ADR-019). `None` if this CPU has no
+/// current task or it is a kernel task with no process. Takes and
+/// releases `SCHEDULER(1)` only.
 #[cfg(not(test))]
-pub fn terminate_current_task() -> Option<scheduler::TaskId> {
-    let mut guard = local_scheduler().lock();
-    if let Some(sched) = guard.as_mut() {
-        if let Some(task_id) = sched.current_task() {
-            if let Some(task) = sched.get_task_mut_pub(task_id) {
-                task.state = scheduler::TaskState::Terminated;
-                return Some(task_id);
-            }
-        }
-    }
-    None
+pub fn current_task_process() -> Option<(scheduler::TaskId, ipc::ProcessId)> {
+    let guard = local_scheduler().lock();
+    let sched = guard.as_ref()?;
+    let task_id = sched.current_task()?;
+    let task = sched.get_task_pub(task_id)?;
+    Some((task_id, task.process_id?))
 }
 
-/// Test stub — exception handlers compile on macOS x86_64 test target
-/// but per-CPU scheduler infrastructure is not available.
+/// Test stub — the fault path compiles under host tests but the per-CPU
+/// scheduler infrastructure is not available there.
 #[cfg(test)]
-pub fn terminate_current_task() -> Option<scheduler::TaskId> {
+pub fn current_task_process() -> Option<(scheduler::TaskId, ipc::ProcessId)> {
     None
 }
 

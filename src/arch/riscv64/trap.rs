@@ -336,6 +336,48 @@ pub enum TrapError {
     UnexpectedInterrupt { code: u64 },
 }
 
+/// Map a U-mode `scause` code onto the portable fault vocabulary
+/// (ADR-019 § Decision 2). Page faults (12/13/15) and illegal
+/// instruction (2) have common-set names; access faults, misaligned
+/// accesses, breakpoints and reserved codes keep their raw code.
+pub(super) fn user_fault_kind(code: u64) -> crate::reap::FaultKind {
+    match code {
+        12 | 13 | 15 => crate::reap::FaultKind::PageFault,
+        2 => crate::reap::FaultKind::InvalidOpcode,
+        other => crate::reap::FaultKind::ArchSpecific(other as u8),
+    }
+}
+
+/// Reap the current task for a U-mode fault and never return (ADR-019
+/// § Decision 6). We are on the hart's kernel stack (the trap vector
+/// swapped `tp`/`sp` on U→S entry) with the full frame saved, so
+/// re-enabling S-mode interrupts here is the same posture the ecall
+/// path takes — and it is required: the reap spins on cross-hart
+/// TLB-shootdown IPIs that a masked hart could neither send nor answer.
+/// `sepc`/`stval` were captured at entry, before any nested trap.
+fn reap_user_fault(code: u64, sepc: u64, stval: u64) -> ! {
+    let kind = user_fault_kind(code);
+    crate::println!(
+        "  [Fault] U-mode scause={} {:?} stval={:#x} sepc={:#x}",
+        code, kind, stval, sepc
+    );
+    // SAFETY: setting sstatus.SIE on a valid kernel stack with the trap
+    // frame fully saved; interrupts were masked only by trap entry.
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack));
+    }
+    if !crate::reap::reap_faulting_current(kind, stval, sepc) {
+        // A U-mode fault with no current process is a broken kernel
+        // invariant; sret would re-fault at hardware speed.
+        report_and_halt(classify_sync_fault(code, sepc, stval));
+    }
+    // The task is Terminated and will never be re-scheduled.
+    loop {
+        // SAFETY: kernel stack, no scheduler lock held.
+        unsafe { crate::arch::yield_save_and_switch(); }
+    }
+}
+
 /// Classify a synchronous exception (scause's INTERRUPT bit clear) into
 /// a [`TrapError`]. Pure function over the trap-time CSR snapshot — host-
 /// testable and free of side effects, so the typed boundary above can be
@@ -516,16 +558,20 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
             other => report_and_halt(TrapError::UnexpectedInterrupt { code: other }),
         }
     } else {
-        // Synchronous exception. Everything listed below — except the
-        // ECALL-from-U syscall path — is a kernel bug: ECALL-from-U is
-        // the only legitimate user-originated entry, and any page
-        // fault / illegal instruction in S-mode signals a kernel
-        // problem.
+        // Synchronous exception. Two user-originated arms are
+        // recoverable: ECALL-from-U (the syscall path) and any other
+        // fault taken in U-mode (the process is reaped, ADR-019). A
+        // fault taken in S-mode is a kernel bug and halts.
         //
         // SAFETY: `saved` was populated by the trap vector before this
         // function was called; the pointer is valid for the duration
         // of the handler and the memory is not aliased.
         let sepc = unsafe { (*saved).sepc };
+        // SAFETY: same object as the read above; sstatus is a plain u64
+        // in the saved frame.
+        let sstatus = unsafe { (*saved).sstatus };
+        // sstatus.SPP (bit 8): privilege before the trap. 0 = U-mode.
+        let from_user = sstatus & (1 << 8) == 0;
         // ECALL from U-mode is the only recoverable arm — handle it
         // before classify_sync_fault, which would otherwise have to
         // model the syscall path.
@@ -538,6 +584,9 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
             // SAFETY: ISR context; `saved` was populated by the
             // trap vector's U→S entry path.
             return unsafe { super::syscall::ecall_handler_inner(saved as u64) };
+        }
+        if from_user {
+            reap_user_fault(code, sepc, stval);
         }
         report_and_halt(classify_sync_fault(code, sepc, stval));
     }

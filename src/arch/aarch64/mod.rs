@@ -712,7 +712,7 @@ core::arch::global_asm!(
 /// Rust handler for synchronous exceptions from EL0 (user mode).
 ///
 /// Called for data aborts, instruction aborts, and other non-SVC synchronous
-/// exceptions from user space. Terminates the faulting task.
+/// exceptions from user space. Reaps the faulting task (ADR-019).
 ///
 /// ## ESR_EL1 Exception Classes
 /// - `0x20`: Instruction Abort from lower EL
@@ -761,24 +761,37 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
         _ => "other fault",
     };
 
-    if let Some(task_id) = crate::terminate_current_task() {
-        crate::println!(
-            "  [Fault] Task {} killed: {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
-            task_id.slot(), ec_name, fault_type, access, far, elr, dfsc
-        );
-        // Yield away immediately. The task is Terminated and will never be
-        // re-scheduled, so this loop does not return. Without this, the
-        // exception return (eret) goes back to the faulting PC and the
-        // task re-faults at hardware speed until the next timer tick.
-        loop {
-            // SAFETY: We are on the kernel stack, scheduler lock is not held.
-            unsafe { crate::arch::yield_save_and_switch(); }
-        }
-    } else {
-        crate::println!(
-            "  [Fault] {} at {:#x} (PC={:#x}) but no current task",
-            ec_name, far, elr
-        );
+    crate::println!(
+        "  [Fault] EL0 {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
+        ec_name, fault_type, access, far, elr, dfsc
+    );
+    let kind = match ec {
+        0x20 | 0x24 => crate::reap::FaultKind::PageFault,
+        other => crate::reap::FaultKind::ArchSpecific(other as u8),
+    };
+
+    // ADR-019 § Decision 6: re-enable IRQs before reaping. We are on the
+    // faulting task's kernel stack (the EL0 sync stub switched to SP_EL0's
+    // kernel stack and saved the full frame); the reap spins on cross-CPU
+    // TLB-shootdown acks that a masked CPU could neither send nor answer.
+    // FAR_EL1 / ELR_EL1 were read above, before any nested exception can
+    // clobber them.
+    // SAFETY: clearing DAIF.I at EL1 on a valid kernel stack with the
+    // trap frame fully saved — the same posture the SVC path takes.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+    }
+    if !crate::reap::reap_faulting_current(kind, far, elr) {
+        // A user-mode fault with no current process is a broken kernel
+        // invariant; eret would re-fault at hardware speed.
+        crate::println!("\n!!! EL0 FAULT WITH NO CURRENT PROCESS !!!");
+        crate::halt();
+    }
+    // The task is Terminated and will never be re-scheduled, so this
+    // loop does not return.
+    loop {
+        // SAFETY: We are on the kernel stack, scheduler lock is not held.
+        unsafe { crate::arch::yield_save_and_switch(); }
     }
 }
 

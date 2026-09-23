@@ -74,7 +74,7 @@ src/arch/aarch64/mod.rs:126:placeholder
 src/arch/aarch64/mod.rs:128:placeholder
 src/arch/aarch64/mod.rs:130:placeholder
 src/arch/aarch64/mod.rs:482:placeholder
-src/arch/aarch64/mod.rs:1081:eventually
+src/arch/aarch64/mod.rs:1094:eventually
 src/arch/riscv64/mod.rs:119:placeholder
 src/arch/riscv64/mod.rs:121:placeholder
 src/arch/riscv64/mod.rs:123:placeholder
@@ -90,9 +90,9 @@ src/fs/virtio_blk_device.rs:80:deferred
 src/ipc/capability.rs:744:deferred
 src/ipc/capability.rs:803:TODO
 src/lib.rs:107:TBD
-src/lib.rs:1005:deferred
-src/lib.rs:1013:deferred
-src/lib.rs:1021:deferred
+src/lib.rs:998:deferred
+src/lib.rs:1006:deferred
+src/lib.rs:1014:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
 src/microkernel/main.rs:952:for-now

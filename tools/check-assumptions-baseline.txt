@@ -14,11 +14,11 @@ src/arch/aarch64/mod.rs:125:USER_CS
 src/arch/aarch64/mod.rs:127:USER_SS
 src/arch/aarch64/mod.rs:129:KERNEL_CS
 src/arch/aarch64/mod.rs:131:KERNEL_SS
-src/arch/aarch64/mod.rs:820:SAVED_CTX_ELR_INDEX
-src/arch/aarch64/mod.rs:822:SAVED_CTX_SPSR_INDEX
-src/arch/aarch64/mod.rs:824:SAVED_CTX_SP_EL0_INDEX
-src/arch/aarch64/mod.rs:827:PL011_PHYS
-src/arch/aarch64/mod.rs:837:MAX_DEBUG_SWITCHES
+src/arch/aarch64/mod.rs:833:SAVED_CTX_ELR_INDEX
+src/arch/aarch64/mod.rs:835:SAVED_CTX_SPSR_INDEX
+src/arch/aarch64/mod.rs:837:SAVED_CTX_SP_EL0_INDEX
+src/arch/aarch64/mod.rs:840:PL011_PHYS
+src/arch/aarch64/mod.rs:850:MAX_DEBUG_SWITCHES
 src/arch/aarch64/paging.rs:49:DESC_VALID
 src/arch/aarch64/paging.rs:51:DESC_TABLE
 src/arch/aarch64/paging.rs:53:DESC_AF
@@ -254,7 +254,7 @@ src/io/mod.rs:160:NS16550_PHYS_BASE
 src/io/mod.rs:287:UARTFR_RXFE
 src/ipc/channel.rs:46:MAX_CHANNELS
 src/ipc/channel.rs:62:MAX_CHANNEL_PAGES
-src/lib.rs:679:BALANCE_INTERVAL_TICKS
+src/lib.rs:672:BALANCE_INTERVAL_TICKS
 src/loader/elf.rs:15:ELF_CLASS_64BIT
 src/loader/elf.rs:16:ELF_DATA_LITTLE_ENDIAN
 src/loader/elf.rs:17:ELF_TYPE_EXECUTABLE
