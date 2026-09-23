@@ -51,6 +51,19 @@
 # resolves that to whichever kept entry owns the endpoint, so the
 # emitted manifest is always a plain name dependency on the one
 # driver this image carries.
+#
+# Profiles in use:
+#   default              QEMU with virtio-gpu (make run / run-gui).
+#   framebuffer-fallback GOP linear framebuffer (scanout-limine);
+#                        declared, no image target yet.
+#   headless             no display stack at all — serial console only.
+#                        The bare-metal first-boot image (make img-x86
+#                        / img-usb) uses this: on a machine with no
+#                        scanout device the compositor's handshake
+#                        never completes and init's wave would stall
+#                        before the shell. GUI entries are tagged with
+#                        the profiles that carry a display; untagged
+#                        entries ship everywhere.
 
 [init]
 endpoint = 1
@@ -119,11 +132,13 @@ system = ["create-channel", "emit-input-audit"]
 # there), not on a driver by name — see the header comment.
 depends_on_endpoints = [27]
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "virtio-input"
 depends_on = ["compositor"]
 arch = ["x86_64", "aarch64"]
+profile = ["default"]
 
 [[service]]
 name = "terminal-window"
@@ -131,6 +146,7 @@ endpoints = [14, 15]
 system = ["create-process", "set-wallclock"]
 depends_on = ["compositor"]
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 # scanout-limine — the FALLBACK scanout driver: same compositor↔driver
 # protocol as scanout-virtio-gpu, writing into the bootloader's linear
@@ -154,24 +170,28 @@ name = "tree"
 endpoints = [61]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "worm"
 endpoints = [62]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "sprouty"
 endpoints = [63]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "ping"
 endpoints = [19]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 # hello-window — the canonical libgui client / regression canary.
 [[service]]
@@ -179,6 +199,7 @@ name = "hello-window"
 endpoints = [29]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
+profile = ["default", "framebuffer-fallback"]
 
 # faultme — ADR-019 fixture: takes a deliberate user page fault so the
 # kernel's fault-reap path is exercisable from the shell on every arch.

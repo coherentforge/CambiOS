@@ -52,3 +52,4 @@ tools/gen-dev-piv-keys/.dev-seed.bin
 manifest.bin
 manifest-aarch64.bin
 manifest-riscv64.bin
+manifest-headless.bin

@@ -209,7 +209,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -760,6 +760,15 @@ manifest: sign-tool
 	$(SIGN_ELF) $(SIGN_FLAGS) manifest.bin
 	@echo "=== manifest.bin ready (signed) ==="
 
+# Serial-console-only manifest for bare-metal first boot (see img-x86).
+manifest-headless: sign-tool
+	@echo "=== Building build-manifest tool ==="
+	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
+	@echo "=== Emitting + signing manifest-headless.bin (x86_64, --profile headless) ==="
+	$(BUILD_MANIFEST) manifest.toml -o manifest-headless.bin --arch x86_64 --profile headless
+	$(SIGN_ELF) $(SIGN_FLAGS) manifest-headless.bin
+	@echo "=== manifest-headless.bin ready (signed) ==="
+
 manifest-aarch64: sign-tool
 	@echo "=== Building build-manifest tool ==="
 	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
@@ -938,7 +947,8 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 		iso_root -o $(ISO) 2>&1
 	# Install Limine BIOS stages
 	$(LIMINE_DIR)/limine bios-install $(ISO)
-	rm -rf iso_root
+	# iso_root is kept: img-x86 mirrors it into the FAT/USB image. It is
+	# rebuilt from scratch at the top of this recipe and removed by clean.
 	@echo "=== $(ISO) ready ==="
 
 # Persistent backing file for the virtio-blk device. 64 MiB is enough for
@@ -1082,56 +1092,24 @@ run-uefi: iso
 # Usage: make img-x86 && sudo dd if=cambios-x86.img of=/dev/diskN bs=1M
 IMG_X86 := cambios-x86.img
 
-img-x86: kernel user-elf fs-service key-store-service virtio-net i219-net udp-stack shell policy-service virtio-blk compositor audit-tail sign-tool limine
-	@echo "=== Building x86_64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
+img-x86: iso manifest-headless
+	@echo "=== Building x86_64 FAT boot image from iso_root (signing mode: $(SIGN_MODE)) ==="
+	# The FAT image is the ISO's staging tree verbatim (kernel, every
+	# signed module, init, Limine UEFI/BIOS files, limine.conf), so the
+	# USB stick and the ISO can never drift apart — with ONE swap: the
+	# manifest is the `headless` profile. Bare metal has no virtio-gpu,
+	# and with the default manifest the compositor's scanout handshake
+	# never completes and init's wave stalls before the shell. The GUI
+	# modules are still staged (harmless: undeclared modules are
+	# registered but unspawnable) so a GOP profile can reuse this image
+	# later by swapping the manifest again.
 	rm -f $(IMG_X86)
 	dd if=/dev/zero of=$(IMG_X86) bs=1M count=64
 	mformat -i $(IMG_X86) -F ::
-	mmd -i $(IMG_X86) ::/EFI
-	mmd -i $(IMG_X86) ::/EFI/BOOT
-	mmd -i $(IMG_X86) ::/boot
-	mmd -i $(IMG_X86) ::/boot/limine
-	mcopy -i $(IMG_X86) $(LIMINE_DIR)/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy -i $(IMG_X86) $(KERNEL) ::/boot/cambios_microkernel
-	# Copy + sign all x86_64 user-space modules
-	cp $(USER_ELF) /tmp/hello-signed.elf
-	cp $(KS_SERVICE_ELF) /tmp/key-store-service-signed.elf
-	cp $(FS_SERVICE_ELF) /tmp/fs-service-signed.elf
-	cp $(NET_DRIVER_ELF) /tmp/virtio-net-signed.elf
-	cp $(I219_DRIVER_ELF) /tmp/i219-net-signed.elf
-	cp $(UDP_STACK_ELF) /tmp/udp-stack-signed.elf
-	cp $(SHELL_ELF) /tmp/shell-signed.elf
-	cp $(POLICY_SERVICE_ELF) /tmp/policy-service-signed.elf
-	cp $(BLK_DRIVER_ELF) /tmp/virtio-blk-signed.elf
-	cp $(COMPOSITOR_ELF) /tmp/compositor-signed.elf
-	cp $(AUDIT_TAIL_ELF) /tmp/audit-tail-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/i219-net-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/audit-tail-signed.elf
-	mcopy -i $(IMG_X86) /tmp/hello-signed.elf ::/boot/hello.elf
-	mcopy -i $(IMG_X86) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
-	mcopy -i $(IMG_X86) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
-	mcopy -i $(IMG_X86) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
-	mcopy -i $(IMG_X86) /tmp/i219-net-signed.elf ::/boot/i219-net.elf
-	mcopy -i $(IMG_X86) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
-	mcopy -i $(IMG_X86) /tmp/shell-signed.elf ::/boot/shell.elf
-	mcopy -i $(IMG_X86) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
-	mcopy -i $(IMG_X86) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
-	mcopy -i $(IMG_X86) /tmp/compositor-signed.elf ::/boot/compositor.elf
-	mcopy -i $(IMG_X86) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
-	rm -f /tmp/hello-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-net-signed.elf /tmp/i219-net-signed.elf /tmp/udp-stack-signed.elf /tmp/shell-signed.elf /tmp/policy-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/compositor-signed.elf /tmp/audit-tail-signed.elf
-	mcopy -i $(IMG_X86) limine.conf ::/limine.conf
-	mcopy -i $(IMG_X86) limine.conf ::/boot/limine/limine.conf
-	@echo "=== $(IMG_X86) ready ==="
-	@echo "To write to USB: sudo dd if=$(IMG_X86) of=/dev/diskN bs=1M"
+	mcopy -s -i $(IMG_X86) iso_root/EFI iso_root/boot iso_root/limine.conf ::/
+	mcopy -o -i $(IMG_X86) manifest-headless.bin ::/boot/manifest.bin
+	@echo "=== $(IMG_X86) ready (headless manifest) ==="
+	@echo "To write to USB: make usb DEVICE=/dev/diskN  (or: sudo dd if=$(IMG_X86) of=/dev/diskN bs=1M)"
 
 # UEFI firmware paths (resolved via Homebrew Cellar for QEMU 10.x)
 # QEMU 10.x requires pflash loading (not -bios) per firmware/*.json descriptors.
