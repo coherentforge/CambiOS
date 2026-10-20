@@ -1861,6 +1861,14 @@ impl SyscallDispatcher {
         let desc_slice = UserWriteSlice::validate(ctx, out_desc_ptr, FB_DESC_SIZE)?;
         desc_slice.write_from(&desc)?;
 
+        // The display now belongs to userspace: the kernel's framebuffer
+        // text console stops drawing for the rest of this boot so it can
+        // never paint over a scanout driver (ADR-011 — the kernel owns no
+        // graphics; the boot console is an I/O device that yields here).
+        if index == 0 {
+            crate::io::fbcon::release();
+        }
+
         Ok(0)
     }
 

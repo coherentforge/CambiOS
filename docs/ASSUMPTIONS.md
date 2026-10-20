@@ -148,6 +148,8 @@ These are the ones that will need to grow as the system matures. They are correc
 | Boot stack | 256 KiB | [src/microkernel/main.rs:129](../src/microkernel/main.rs#L129) | Limine StackSizeRequest. Forces large structs onto the heap (already a kernel-wide convention). | Stack overflow at boot. Currently fine because of the heap-allocate-everything-large pattern. |
 | `BOOT_STACK_SIZE` (riscv64 BSP) | 256 KiB | [src/arch/riscv64/entry.rs](../src/arch/riscv64/entry.rs) | Parity with the Limine boot stack above — the boot path is shared tri-arch, so its deepest frames are. Was 16 KiB until 2026-09-14: the 17 KiB `BootInfo` and the 58–75 KiB channel/cluster managers overflowed it into the `.data` statics linked just below (`POLICY_ROUTER`, `TASK_CPU_MAP`, `AUDIT_RING`) — the riscv64 boot rot. Those constructors are now in-place; the parity margin stays. Memory cost: 256 KiB of .bss. | Per-task kernel stacks gain guard pages; then size from measured boot-path depth instead of parity. |
 | `AP_BOOT_STACK_SIZE` (riscv64 APs) | 16 KiB | [src/arch/riscv64/entry.rs](../src/arch/riscv64/entry.rs) | AP bring-up constructs only a boxed Scheduler (~200 B on the stack) + Timer before its idle loop; 8 × 256 KiB would be 2 MiB of .bss for frames that never exist there. | APs run any part of the shared boot path, or a frame over ~4 KiB lands on the AP path. |
+| `MAX_COLS` (fbcon) | 256 | [src/io/fbcon.rs](../src/io/fbcon.rs) | Framebuffer text-console grid capacity in columns. 256 × 16 px cells = 4096 px, so a 4K panel at `SCALE` 2 fits exactly; wider panels clamp (right margin unused). Memory cost shared with `MAX_ROWS`: the `cells` array is 256 × 160 = 40 KiB of .bss, const-initialized in place. | A panel wider than 4096 px at `SCALE` 2 becomes a target. |
+| `MAX_ROWS` (fbcon) | 160 | [src/io/fbcon.rs](../src/io/fbcon.rs) | Grid capacity in rows. 160 × 16 px = 2560 px; 4K (2160) fits with margin, taller clamps. | A panel taller than 2560 px at `SCALE` 2 becomes a target. |
 
 ### ARCHITECTURAL — real invariants
 
@@ -184,6 +186,7 @@ These are facts about the world. CambiOS has no leverage to change them.
 | `MAX_IO_APICS` | 4 | [src/acpi/mod.rs:184](../src/acpi/mod.rs#L184) | Realistic upper bound for x86 server hardware. Defensible until somebody hands us a chassis with 5. |
 | `SIGNATURE_TRAILER_SIZE` | 72 (64 + 8) | [src/loader/mod.rs:232](../src/loader/mod.rs#L232) | Ed25519 signature (64 B) + ARCSIG magic (8 B). Fixed by the on-disk format. |
 | `BLOCK_SIZE` | 4096 | [src/fs/block.rs:30](../src/fs/block.rs#L30) | On-disk sector size for the persistent ObjectStore ([ADR-010](adr/010-persistent-object-store-on-disk-format.md)). Matches x86_64 page size and is a multiple of every common physical sector size (512 B and 4K-native). All `BlockDevice` I/O is sized at this boundary regardless of whether the underlying hardware reports 512-byte or 4K-native sectors. |
+| `GLYPH_W` / `GLYPH_H` (fbcon) | 8 / 8 | [src/io/fbcon.rs](../src/io/fbcon.rs) | The built-in bitmap face is 8×8 per glyph (bit 7 = leftmost pixel); fixed by the bitmap data, which is byte-identical to libgui's `FONT_8X8_DATA`. |
 
 ### TUNING — needs benchmarks, not opinion
 
@@ -197,6 +200,8 @@ These are performance knobs. Picking a number without measurements is guessing. 
 | `MAX_OVERRIDES` (ACPI MADT) | 16 | [src/acpi/mod.rs:187](../src/acpi/mod.rs#L187) | Realistic firmware override count. |
 | `DRAIN_BATCH_SIZE` (audit) | 64 | [src/audit/drain.rs:59](../src/audit/drain.rs#L59) | Max events drained from all per-CPU staging buffers per timer tick. Bounds ISR time: 64 events × 64 bytes = 4 KiB of copies. |
 | `AUDIT_IPC_SAMPLE_RATE` | 100 | [src/audit/mod.rs:393](../src/audit/mod.rs) | IPC send/recv sampling: emit 1 audit event per 100 operations. At ~1000 IPC/sec, produces ~10 events/sec — informative for pattern detection without flooding. |
+| `SCALE` (fbcon) | 2 | [src/io/fbcon.rs](../src/io/fbcon.rs) | Integer scale of the 8×8 face: 2 → 16×16 cells, ~80 columns on 1280 px / ~120 on 1920 px. Legibility at a desk vs. columns per line; 1 is unreadable on 4K, 3 wastes a 1024 px panel. |
+| `SCROLL_DIVISOR` (fbcon) | 4 | [src/io/fbcon.rs](../src/io/fbcon.rs) | Rows scrolled per scroll event = visible rows / 4. The console never reads the framebuffer (uncached memory reads are slow), so a scroll re-renders the whole grid; a quarter-screen block amortizes one full redraw over ~12–16 lines instead of one per line. |
 
 #### Tier policies
 

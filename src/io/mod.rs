@@ -14,6 +14,12 @@
 //!   only applies if DTB parse is unavailable).
 //!
 //! In all cases, SERIAL1 is protected by a spinlock for multicore safety.
+//!
+//! [`fbcon`] mirrors the same stream onto the boot framebuffer as text,
+//! so a monitor with no serial cable still shows the boot log and the
+//! shell (x86_64; brought up by `kmain` once `BootInfo` is populated).
+
+pub mod fbcon;
 
 use core::fmt;
 #[cfg(target_arch = "x86_64")]
@@ -199,13 +205,19 @@ pub unsafe fn init() {
     }
 }
 
-/// Print to serial output
+/// Print to the console: the serial port, then the framebuffer mirror.
+///
+/// The two sinks have independent locks and are never held together —
+/// the serial guard is dropped before the framebuffer console is taken.
 pub fn print(args: fmt::Arguments) {
     use core::fmt::Write;
-    let mut guard = SERIAL1.lock();
-    if let Some(serial) = guard.as_mut() {
-        let _ = write!(serial, "{}", args);
+    {
+        let mut guard = SERIAL1.lock();
+        if let Some(serial) = guard.as_mut() {
+            let _ = write!(serial, "{}", args);
+        }
     }
+    fbcon::print(args);
 }
 
 #[macro_export]

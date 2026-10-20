@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:375:eventually
-CLAUDE.md:391:deferred
+CLAUDE.md:376:eventually
+CLAUDE.md:392:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -95,11 +95,11 @@ src/lib.rs:1006:deferred
 src/lib.rs:1014:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
-src/microkernel/main.rs:952:for-now
-src/microkernel/main.rs:1044:for-now
-src/microkernel/main.rs:2128:deferred
-src/microkernel/main.rs:2157:deferred
-src/microkernel/main.rs:2464:for-now
+src/microkernel/main.rs:967:for-now
+src/microkernel/main.rs:1059:for-now
+src/microkernel/main.rs:2143:deferred
+src/microkernel/main.rs:2172:deferred
+src/microkernel/main.rs:2479:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:994:deferred
 src/process.rs:995:deferred
@@ -109,7 +109,7 @@ src/reaper.rs:43:deferred
 src/reaper.rs:65:deferred
 src/scheduler/mod.rs:282:placeholder
 src/scheduler/mod.rs:283:placeholder
-src/syscalls/dispatcher.rs:4170:for-now
+src/syscalls/dispatcher.rs:4178:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now

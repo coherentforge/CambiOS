@@ -284,6 +284,21 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
+    // Framebuffer text console: from here on every println (kernel and
+    // SYS_PRINT) is mirrored onto the panel, so a monitor without a
+    // serial cable shows the boot log and the shell. x86_64 only for
+    // now — Limine maps the framebuffer into the HHDM there and the
+    // kernel keeps those upper-half tables.
+    // Deferred: aarch64 (Limine's aarch64 HHDM covers RAM only, so the
+    // framebuffer needs an explicit early_map_mmio before any write).
+    // Revisit when: an aarch64 board with a GOP/ramfb framebuffer is a
+    // target (the RK3588 board).
+    #[cfg(target_arch = "x86_64")]
+    match cambios_core::io::fbcon::init() {
+        Ok((cols, rows)) => println!("[fbcon] console on framebuffer 0: {}x{} cells", cols, rows),
+        Err(e) => println!("[fbcon] inactive: {:?}", e),
+    }
+
     println!();
 
     // Initialize kernel heap allocator from Limine memory map
