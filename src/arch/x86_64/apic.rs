@@ -26,6 +26,23 @@ const IA32_APIC_BASE_MSR: u32 = 0x1B;
 
 /// APIC global enable bit in IA32_APIC_BASE
 const APIC_BASE_ENABLE: u64 = 1 << 11;
+/// HARDWARE: IA32_APIC_BASE bit 10 — x2APIC mode. While set, the APIC is
+/// reachable only through MSRs and the MMIO window at `phys_base` is
+/// not decoded (Intel SDM vol. 3 § 10.12). Firmware occasionally hands
+/// the OS a BSP already in x2APIC mode; this kernel drives the xAPIC MMIO
+/// interface, so it has to leave that mode first — and the legal
+/// transition is x2APIC → disabled → xAPIC (a direct x2APIC → xAPIC write
+/// is #GP).
+const APIC_BASE_X2APIC: u64 = 1 << 10;
+/// SCAFFOLDING: upper bound on PIT read-back polls during APIC timer
+/// calibration. The ~10 ms window needs on the order of 10⁴ polls (each
+/// is three port I/Os); 10⁷ is seconds of spinning — far past any real
+/// window, so hitting it means the 8254 is not counting (modern Intel
+/// PCHs clock-gate the legacy timer when firmware enables that option)
+/// and the result is a typed `ApicCalibrationFailed` boot error instead
+/// of a silent hang. Replace when: a TSC-deadline / CPUID-leaf-0x15
+/// frequency path lands and the PIT is no longer the calibration source.
+const PIT_CALIBRATION_MAX_POLLS: u32 = 10_000_000;
 
 // ============================================================================
 // APIC register values
@@ -236,6 +253,18 @@ pub unsafe fn detect_and_init() -> Result<(), &'static str> {
     // Read APIC base MSR
     // SAFETY: IA32_APIC_BASE is a valid MSR on all x86_64 with APIC (checked above).
     let mut apic_base = unsafe { super::msr::read(IA32_APIC_BASE_MSR) };
+    crate::println!("  IA32_APIC_BASE = {:#x}", apic_base);
+
+    // Firmware may leave the BSP in x2APIC mode (bit 10). The MMIO window
+    // this driver uses is not decoded in that mode, so step down first:
+    // clear both mode bits (APIC disabled), then re-enable in xAPIC mode.
+    if apic_base & APIC_BASE_X2APIC != 0 {
+        crate::println!("  x2APIC mode enabled by firmware — switching to xAPIC");
+        apic_base &= !(APIC_BASE_X2APIC | APIC_BASE_ENABLE);
+        // SAFETY: clearing EN and EXTD together is the architecturally
+        // permitted path out of x2APIC mode (SDM vol. 3 § 10.12.5.1).
+        unsafe { super::msr::write(IA32_APIC_BASE_MSR, apic_base) };
+    }
 
     // Ensure global enable bit is set
     if apic_base & APIC_BASE_ENABLE == 0 {
@@ -264,12 +293,19 @@ pub unsafe fn detect_and_init() -> Result<(), &'static str> {
         // SAFETY: Active page table is the kernel PML4 (single-threaded boot).
         // phys_base is the APIC MMIO address from the MSR. virt_base is the
         // HHDM-mapped address. The page may already be mapped (some firmware
-        // configurations), so we ignore AlreadyMapped errors.
+        // configurations), which is reported, not fatal.
         let mut pt = unsafe { crate::memory::paging::active_page_table() };
-        let _ = crate::memory::paging::map_page(&mut pt, virt_base, phys_base, flags, &mut fa_guard);
+        match crate::memory::paging::map_page(&mut pt, virt_base, phys_base, flags, &mut fa_guard) {
+            Ok(()) => crate::println!("  APIC MMIO mapped: phys={:#x} virt={:#x}", phys_base, virt_base),
+            Err(e) => crate::println!(
+                "  APIC MMIO map at phys={:#x} returned {:?} — using the existing mapping",
+                phys_base, e
+            ),
+        }
     }
 
     APIC_BASE_VIRT.store(virt_base, Ordering::Release);
+    crate::println!("  Enabling APIC via SIVR...");
 
     // SAFETY: APIC MMIO is now mapped and APIC_BASE_VIRT is set (ADR-036 § 3).
     // One construction; field accesses below are safe.
@@ -348,11 +384,13 @@ pub struct ApicCalibrationFailed;
 /// Must be called during single-threaded boot with interrupts disabled.
 /// PIC must be disabled first (PIT Channel 0 won't generate an IRQ).
 pub unsafe fn configure_timer(frequency_hz: u32) -> Result<(), ApicCalibrationFailed> {
+    crate::println!("  Calibrating APIC timer against the PIT (~10 ms window)...");
     // SAFETY: Called during single-threaded boot with interrupts disabled.
     // PIT calibration is valid at this point.
     let bus_freq = unsafe { calibrate_against_pit() };
 
     if bus_freq == 0 {
+        crate::println!("  PIT never counted down — the 8254 is not running on this platform");
         return Err(ApicCalibrationFailed);
     }
 
@@ -417,8 +455,13 @@ unsafe fn calibrate_against_pit() -> u32 {
     pit_ch0.write((PIT_CALIBRATION_DIVISOR >> 8) as u8);
 
     // Step 5: Busy-wait until PIT Channel 0 counts down to 0.
-    // Read-back: latch channel 0 count, read lo/hi.
-    loop {
+    // Read-back: latch channel 0 count, read lo/hi. Bounded: a PIT that
+    // is clock-gated by firmware never reaches 0, and an unbounded loop
+    // here was a silent hang on real hardware (Dell Precision 3630,
+    // 2026-10-22). Exhausting the bound reports bus frequency 0, which
+    // the caller turns into the typed `ApicCalibrationFailed`.
+    let mut polls = 0u32;
+    let counted_down = loop {
         // Latch Channel 0 counter
         pit_cmd.write(0x00);
         let lo = pit_ch0.read() as u16;
@@ -428,8 +471,16 @@ unsafe fn calibrate_against_pit() -> u32 {
         // PIT mode 0: counter decrements to 0 then output goes high.
         // When count wraps very low (or we read 0), calibration window is done.
         if count <= 1 {
-            break;
+            break true;
         }
+        polls += 1;
+        if polls >= PIT_CALIBRATION_MAX_POLLS {
+            break false;
+        }
+    };
+    if !counted_down {
+        regs.timer_icr.write(0);
+        return 0;
     }
 
     // Step 6: Read how many APIC ticks elapsed

@@ -388,6 +388,11 @@ impl Grid {
                 self.cells[self.cur_row][self.cur_col] = b' ';
                 Redraw::Cell { col: self.cur_col, row: self.cur_row }
             }
+            // UTF-8: a lead byte becomes one replacement glyph and its
+            // continuation bytes are dropped, so a multi-byte character
+            // (the boot log's ✓ / → / —) occupies one cell, not three.
+            0xC0..=0xFF => self.put(b'?'),
+            0x80..=0xBF => Redraw::None,
             b'\t' => {
                 // Advance to the next multiple of 8, writing spaces.
                 let target = ((self.cur_col / 8) + 1) * 8;
@@ -824,6 +829,14 @@ mod tests {
         feed_str(&mut g, "a\tb");
         assert_eq!(g.cursor(), (9, 0));
         assert_eq!(g.cell(8, 0), b'b');
+    }
+
+    #[test]
+    fn multibyte_utf8_renders_as_one_replacement_cell() {
+        let mut g = grid(16, 1);
+        feed_str(&mut g, "a✓b→c");
+        assert_eq!(&row_text(&g, 0)[..5], "a?b?c");
+        assert_eq!(g.cursor(), (5, 0));
     }
 
     #[test]
