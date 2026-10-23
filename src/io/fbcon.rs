@@ -51,7 +51,7 @@
 //! [ADR-011]: ../../docs/adr/011-graphics-architecture-and-scaling.md
 
 use crate::boot::FramebufferInfo;
-use crate::Spinlock;
+use crate::IrqSpinlock;
 
 // ============================================================================
 // Bounds
@@ -602,9 +602,13 @@ impl Console {
 /// Independent lock domain (like `SERIAL1`): taken by `io::print` after
 /// the serial guard is dropped, by `init` during single-threaded boot,
 /// and by `release` from the map-framebuffer syscall. Never held with
-/// any hierarchy lock. The `Console` is const-initialized in place
-/// (40 KiB grid in .bss) — never constructed on a stack.
-static FBCON: Spinlock<Console> = Spinlock::new(Console::new());
+/// any hierarchy lock. An `IrqSpinlock` because `println!` runs from
+/// every context including exception handlers: a plain spinlock here
+/// deadlocks the moment an interrupt whose handler prints lands on the
+/// CPU mid-render (interrupts are masked for the duration of a print).
+/// The `Console` is const-initialized in place (40 KiB grid in .bss) —
+/// never constructed on a stack.
+static FBCON: IrqSpinlock<Console> = IrqSpinlock::new(Console::new());
 
 /// Geometry check shared by `init` and the tests.
 pub fn geometry(fb: &FramebufferInfo) -> Result<(usize, usize, Packing), InitError> {
@@ -676,6 +680,18 @@ impl core::fmt::Write for Writer<'_> {
 pub fn print(args: core::fmt::Arguments) {
     use core::fmt::Write;
     let mut con = FBCON.lock();
+    if con.state != State::Active {
+        return;
+    }
+    let Some(dev) = con.fb else { return };
+    let _ = write!(Writer { con: &mut con, dev }, "{}", args);
+}
+
+/// Best-effort variant for interrupt context: drops the output if the
+/// console is held by another CPU instead of spinning.
+pub fn try_print(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let Some(mut con) = FBCON.try_lock() else { return };
     if con.state != State::Active {
         return;
     }

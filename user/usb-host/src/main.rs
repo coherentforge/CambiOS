@@ -163,14 +163,28 @@ fn run() -> ! {
     log_hex64(b"[USB-HOST]   DBOFF      = ", caps.doorbell_offset as u64);
     log_hex64(b"[USB-HOST]   RTSOFF     = ", caps.runtime_offset as u64);
 
-    // Step 6 (B-ii): HCRESET → CONFIG → DCBAA → command ring →
-    // event ring → ERST → RUN. Either the full sequence succeeds and
-    // we land at HCH=0 with rings live, or we log the failure mode
+    // Step 5b: take the controller from firmware BEFORE resetting it
+    // (xHCI § 4.22.1). Real BIOSes own the xHCI for keyboard emulation
+    // and get an SMI on controller events; resetting it while they own
+    // it stalls the CPU in System Management Mode.
+    let handoff = xhci::bios_handoff(mmio_vaddr, &caps);
+    sys::print(b"[USB-HOST] BIOS handoff: ");
+    sys::print(match handoff {
+        xhci::Handoff::NoLegacyCapability => b"no legacy-support capability\n" as &[u8],
+        xhci::Handoff::NotOwnedByBios => b"firmware did not own it; OS owner now\n",
+        xhci::Handoff::Released => b"firmware released it; OS owner now\n",
+        xhci::Handoff::ForcedAfterTimeout => b"firmware did not release in time; taken anyway, SMIs disabled\n",
+    });
+
+    // Step 6 (B-ii): HCRESET → CONFIG → DCBAA (+ scratchpads) → command
+    // ring → event ring → ERST → RUN. Either the full sequence succeeds
+    // and we land at HCH=0 with rings live, or we log the failure mode
     // and idle. Idle-on-fail still pings init ready so dependents
     // (ccid) still spawn.
     let live_ctl = match xhci::XhciController::bring_up(mmio_vaddr, caps) {
         Ok(mut ctl) => {
             sys::print(b"[USB-HOST] controller bring-up OK\n");
+            log_dec(b"[USB-HOST]   scratchpad pages = ", ctl.scratchpad_pages);
             log_hex64(b"[USB-HOST]   DCBAA paddr      = ", ctl.dcbaa_paddr);
             log_hex64(b"[USB-HOST]   command ring     = ", ctl.command_ring.paddr);
             log_hex64(b"[USB-HOST]   event ring       = ", ctl.event_ring.paddr);

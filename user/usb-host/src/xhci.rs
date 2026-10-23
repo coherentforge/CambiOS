@@ -43,6 +43,13 @@ use crate::ring::{CommandRing, EventRing, Erst, TransferRing, Trb};
 /// reliably under N iterations and we want to tighten the timeout
 /// for faster failure detection.
 const MAX_POLL_ITERATIONS: u32 = 1000;
+/// SCAFFOLDING: ceiling on scratchpad pages honored. HCSPARAMS2 can
+/// express up to 1023; the Dell 3630's controller asks for 65, Linux
+/// sees ≤ 32 on most parts. 256 pages (1 MiB of DMA) bounds the single
+/// contiguous allocation; a controller asking for more fails bring-up
+/// with a typed error rather than taking a quarter of the DMA pool.
+/// Replace when: a target controller reports more than 256.
+const MAX_SCRATCHPAD_PAGES: u32 = 256;
 
 /// SCAFFOLDING: number of device slots we enable in CONFIG.MaxSlotsEn.
 /// xHCI 1.2 § 4.3.3 — must be ≤ HCSPARAMS1.MaxSlots (qemu-xhci reports
@@ -116,6 +123,118 @@ pub struct XhciCapabilities {
     /// RTSOFF (offset 0x18) — byte offset from MMIO base to the Runtime
     /// register block. Low five bits are reserved and masked off.
     pub runtime_offset: u32,
+    /// HCCPARAMS1 [31:16] — xECP: offset of the Extended Capabilities
+    /// list from the MMIO base, in dwords (0 = no list). The list holds
+    /// the USB Legacy Support capability real firmware uses to keep
+    /// ownership of the controller until the OS asks for it.
+    pub xecp_dwords: u32,
+}
+
+/// Outcome of the BIOS → OS ownership hand-off (xHCI 1.2 § 4.22.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handoff {
+    /// No USB Legacy Support capability — nothing to take over
+    /// (qemu-xhci, and some firmware that never claimed the controller).
+    NoLegacyCapability,
+    /// Firmware did not own the controller; OS ownership set.
+    NotOwnedByBios,
+    /// Firmware owned it and released it within the poll bound.
+    Released,
+    /// Firmware did not release within the bound; ownership was taken
+    /// anyway (Linux does the same) and SMI sources were disabled.
+    ForcedAfterTimeout,
+}
+
+/// SCAFFOLDING: upper bound on Extended Capability list entries walked.
+/// Real controllers carry a handful (legacy support, supported
+/// protocols per port speed, debug); 64 is far past any seen list and
+/// stops a corrupt `next` pointer from looping forever.
+/// Replace when: a controller reports more than 64 entries.
+const MAX_XECP_ENTRIES: u32 = 64;
+
+/// Extended Capability IDs (xHCI 1.2 § 7).
+const XECP_ID_USB_LEGACY_SUPPORT: u32 = 1;
+/// USBLEGSUP bit 16: HC BIOS Owned Semaphore.
+const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
+/// USBLEGSUP bit 24: HC OS Owned Semaphore.
+const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
+/// USBLEGCTLSTS (USBLEGSUP + 4): the bits to PRESERVE on write — every
+/// SMI-enable bit (0, 4, 13, 14, 15) is deliberately absent so firmware
+/// stops receiving SMIs for controller events it no longer owns. Mirrors
+/// Linux's `XHCI_LEGACY_DISABLE_SMI`.
+const USBLEGCTLSTS_PRESERVE: u32 = (0x7 << 1) | (0xFF << 5) | (0x7 << 17);
+/// USBLEGCTLSTS bits 29..31: RW1C SMI status bits; written as 1 to clear.
+const USBLEGCTLSTS_SMI_EVENTS: u32 = 0x7 << 29;
+
+/// Take ownership of the controller from firmware before touching it
+/// (xHCI 1.2 § 4.22.1). On real machines the BIOS owns the xHCI for
+/// legacy keyboard emulation and is wired to receive an SMI on
+/// controller events; resetting a BIOS-owned controller pulls the CPU
+/// into System Management Mode from the middle of whatever it was
+/// doing — the Dell Precision 3630's first boot froze mid-print at
+/// exactly that point (2026-10-22). QEMU's xhci has no legacy
+/// capability, so this path was never exercised before. Idempotent;
+/// bounded by `MAX_XECP_ENTRIES` + `MAX_POLL_ITERATIONS`.
+///
+/// `mmio_vaddr` must cover the Extended Capability list (the whole BAR
+/// is mapped at the call site).
+pub fn bios_handoff(mmio_vaddr: u64, cap: &XhciCapabilities) -> Handoff {
+    if cap.xecp_dwords == 0 {
+        return Handoff::NoLegacyCapability;
+    }
+    let mut off = cap.xecp_dwords as u64 * 4;
+    for _ in 0..MAX_XECP_ENTRIES {
+        let p = mmio_vaddr + off;
+        // SAFETY: `p` is inside the mapped BAR (the list offset comes
+        // from HCCPARAMS1 and the whole BAR is mapped); a naturally
+        // aligned volatile u32 read of a capability header.
+        let header = unsafe { core::ptr::read_volatile(p as *const u32) };
+        let id = header & 0xFF;
+        let next = (header >> 8) & 0xFF;
+        if id == XECP_ID_USB_LEGACY_SUPPORT {
+            let bios_owned_initially = header & USBLEGSUP_BIOS_OWNED != 0;
+            // SAFETY: same register; setting the OS Owned Semaphore is
+            // the documented request for ownership.
+            unsafe { core::ptr::write_volatile(p as *mut u32, header | USBLEGSUP_OS_OWNED) };
+            let released = XhciController::poll_until(MAX_POLL_ITERATIONS, || {
+                // SAFETY: same register, volatile read.
+                let v = unsafe { core::ptr::read_volatile(p as *const u32) };
+                v & USBLEGSUP_BIOS_OWNED == 0
+            })
+            .is_some();
+            if !released {
+                // Firmware is not answering; take the controller anyway
+                // (Linux: "xHCI BIOS handoff failed… taking it over").
+                // SAFETY: same register; clearing the BIOS semaphore.
+                unsafe {
+                    let v = core::ptr::read_volatile(p as *const u32);
+                    core::ptr::write_volatile(p as *mut u32, v & !USBLEGSUP_BIOS_OWNED);
+                }
+            }
+            // Disable every SMI source and acknowledge pending ones so
+            // firmware never re-enters on our controller's events.
+            let ctl = p + 4;
+            // SAFETY: USBLEGCTLSTS is the dword right after USBLEGSUP;
+            // volatile read-modify-write with the documented masks.
+            unsafe {
+                let v = core::ptr::read_volatile(ctl as *const u32);
+                let v = (v & USBLEGCTLSTS_PRESERVE) | USBLEGCTLSTS_SMI_EVENTS;
+                core::ptr::write_volatile(ctl as *mut u32, v);
+            }
+            return if !released {
+                Handoff::ForcedAfterTimeout
+            } else if bios_owned_initially {
+                Handoff::Released
+            } else {
+                Handoff::NotOwnedByBios
+            };
+        }
+        if next == 0 {
+            break;
+        }
+        off += next as u64 * 4;
+    }
+    Handoff::NoLegacyCapability
 }
 
 /// Read the capability register block from a mapped xHCI MMIO region.
@@ -171,6 +290,7 @@ pub fn parse_capabilities(mmio_vaddr: u64) -> XhciCapabilities {
             csz: (hccparams1 & 0x4) != 0,
             doorbell_offset: dboff & !0x3,
             runtime_offset: rtsoff & !0x1F,
+            xecp_dwords: hccparams1 >> 16,
         }
     }
 }
@@ -358,6 +478,8 @@ pub struct XhciController {
     /// vaddr retained for slot-context installation in B-iii).
     pub dcbaa_paddr: u64,
     pub dcbaa_vaddr: u64,
+    /// Scratchpad pages handed to the controller (0 on qemu-xhci).
+    pub scratchpad_pages: u32,
     pub command_ring: CommandRing,
     pub event_ring: EventRing,
     pub erst: Erst,
@@ -440,12 +562,13 @@ impl XhciController {
         // Step 3: allocate + install the Device Context Base Address
         // Array. Size = 8 bytes × (MaxSlots + 1) — slot 0 is the
         // Scratchpad Buffer Array pointer (per xHCI 1.2 § 6.1.1).
-        // QEMU's xhci reports MaxScratchpadBufs = 0, so slot 0 stays
-        // NULL. Scratchpad buffer allocation lands at B-iii.
-        // Revisit when: HCSPARAMS2.MaxScratchpadBufs read shows
-        // non-zero on the target controller (real-hardware bring-up
-        // or qemu-xhci flag change).
+        // QEMU's xhci reports MaxScratchpadBufs = 0 (slot 0 stays NULL);
+        // the Dell Precision 3630's controller asks for 65, and a real
+        // controller run with DCBAA[0] NULL while it wants scratchpad
+        // memory is outside the spec — so the buffers are allocated
+        // here whenever the count is non-zero.
         let (dcbaa_paddr, dcbaa_vaddr) = Self::alloc_dcbaa()?;
+        let scratchpad_pages = Self::alloc_scratchpads(dcbaa_vaddr, cap.max_scratchpad_bufs)?;
         Self::write_dcbaap(op_vaddr, dcbaa_paddr);
 
         // Step 4: allocate the command ring and install its base into
@@ -489,6 +612,7 @@ impl XhciController {
             doorbell_vaddr,
             dcbaa_paddr,
             dcbaa_vaddr,
+            scratchpad_pages,
             command_ring,
             event_ring,
             erst,
@@ -1531,6 +1655,51 @@ impl XhciController {
         Ok(())
     }
 
+    /// Allocate the Scratchpad Buffer Array + `count` 4 KiB scratchpad
+    /// pages the controller demands (xHCI 1.2 § 4.20) and point
+    /// DCBAA[0] at the array. `count == 0` leaves DCBAA[0] NULL. The
+    /// controller owns this memory for as long as it runs; it is never
+    /// freed (the driver lives for the boot). Returns the page count.
+    fn alloc_scratchpads(dcbaa_vaddr: u64, count: u32) -> Result<u32, XhciError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        if count > MAX_SCRATCHPAD_PAGES {
+            return Err(XhciError::DmaAllocFailed);
+        }
+        // The array: up to 1023 × 8 B fits in one page.
+        let mut array_paddr: u64 = 0;
+        let ret = sys::alloc_dma(1, &mut array_paddr);
+        if ret < 0 {
+            return Err(XhciError::DmaAllocFailed);
+        }
+        let array_vaddr = ret as u64;
+        // The buffers: `count` contiguous pages (one allocation).
+        let mut bufs_paddr: u64 = 0;
+        let ret = sys::alloc_dma(count, &mut bufs_paddr);
+        if ret < 0 {
+            return Err(XhciError::DmaAllocFailed);
+        }
+        let bufs_vaddr = ret as u64;
+        // SAFETY: both regions were just returned by alloc_dma, mapped
+        // at the given vaddrs and exclusively ours; the array page holds
+        // `count` ≤ MAX_SCRATCHPAD_PAGES 8-byte entries (≤ 4 KiB), and
+        // the buffer region spans exactly `count` pages. The controller
+        // reads the array after DCBAAP is written, so the entries are
+        // complete before that store.
+        unsafe {
+            core::ptr::write_bytes(array_vaddr as *mut u8, 0, 4096);
+            core::ptr::write_bytes(bufs_vaddr as *mut u8, 0, count as usize * 4096);
+            let entries = array_vaddr as *mut u64;
+            for i in 0..count as usize {
+                core::ptr::write_volatile(entries.add(i), bufs_paddr + (i as u64) * 4096);
+            }
+            // DCBAA[0] = scratchpad array pointer.
+            core::ptr::write_volatile(dcbaa_vaddr as *mut u64, array_paddr);
+        }
+        Ok(count)
+    }
+
     fn alloc_dcbaa() -> Result<(u64, u64), XhciError> {
         // One page is far more than the (MAX_SLOTS_ENABLED + 1) × 8 B
         // we actually need; alloc_dma's granularity is the page.
@@ -1542,9 +1711,9 @@ impl XhciController {
         let vaddr = ret as u64;
         // SAFETY: alloc_dma returned a fresh 4 KiB region mapped at
         // `vaddr`; we own it exclusively until exit. Zeroing
-        // initializes all DCBAA slot pointers to NULL — slot 0
-        // (scratchpad pointer) stays NULL because qemu-xhci reports
-        // MaxScratchpadBufs = 0; B-iii revisits if non-zero.
+        // initializes all DCBAA slot pointers to NULL — slot 0 is
+        // filled in by `alloc_scratchpads` when the controller asks
+        // for scratchpad memory.
         unsafe {
             core::ptr::write_bytes(vaddr as *mut u8, 0, 4096);
         }

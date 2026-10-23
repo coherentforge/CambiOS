@@ -261,12 +261,17 @@ pub mod device_irqs {
     /// for registered device IRQs.
     fn device_irq_handler(gsi: u32) {
         let mut woken = false;
+        // Did the routing table name a driver for this GSI? `None` also
+        // when the router lock was contended — in which case we must not
+        // treat the IRQ as stray (see below).
+        let mut registered: Option<bool> = None;
 
         // Fast path: look up the registered handler task for this IRQ and
         // wake only on its owning CPU (avoids N-CPU scan).
         if let Some(router_guard) = crate::INTERRUPT_ROUTER.try_lock() {
             let irq = crate::interrupts::routing::IrqNumber(gsi as u8);
             if let Some(route) = router_guard.lookup(irq) {
+                registered = Some(true);
                 let task_id = route.handler_task;
                 drop(router_guard);
                 if let Some(cpu) = crate::get_task_cpu(task_id.slot()) {
@@ -278,6 +283,8 @@ pub mod device_irqs {
                         }
                     }
                 }
+            } else {
+                registered = Some(false);
             }
         }
 
@@ -287,9 +294,36 @@ pub mod device_irqs {
             for cpu in 0..count {
                 if let Some(mut sched_guard) = crate::PER_CPU_SCHEDULER[cpu].try_lock() {
                     if let Some(sched) = sched_guard.as_mut() {
-                        sched.wake_irq_waiters(gsi);
+                        if sched.wake_irq_waiters(gsi) > 0 {
+                            woken = true;
+                        }
                     }
                 }
+            }
+        }
+
+        // Stray-interrupt storm protection. A level-triggered line that
+        // no driver has claimed stays asserted after EOI and re-enters
+        // this handler immediately, forever — the CPU never returns to
+        // the context it interrupted. Real hardware does this (the Dell
+        // Precision 3630's xHCI after RUN, 2026-10-22); QEMU never did.
+        // If the routing table has no owner for the GSI and nobody was
+        // woken, mask the pin; `SYS_WAIT_IRQ` unmasks it when a driver
+        // registers. A contended router lock is NOT evidence of
+        // strayness, so `None` leaves the pin alone.
+        if registered == Some(false) && !woken {
+            let idx = (gsi as usize).min(STRAY_IRQ_MASKED.len() - 1);
+            // SAFETY: I/O APIC is initialized before device IRQs are
+            // delivered; masking a pin from its own handler is the
+            // documented way to quiesce a stray line.
+            unsafe { crate::arch::x86_64::ioapic::mask_irq(gsi); }
+            let prior = STRAY_IRQ_MASKED[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if prior == 0 {
+                // First time only; best-effort (never spins in a handler).
+                crate::io::try_print(format_args!(
+                    "  [IRQ] stray GSI {} (no driver registered) — masked until a driver claims it\n",
+                    gsi
+                ));
             }
         }
 
@@ -299,6 +333,13 @@ pub mod device_irqs {
         // which requires EOI to clear the in-service bit.
         unsafe { crate::arch::x86_64::apic::write_eoi(); }
     }
+
+    /// Per-GSI count of stray-interrupt maskings (diagnostic; the first
+    /// masking of each pin is logged). Sized to the I/O APIC's pins.
+    /// HARDWARE: 24 redirection entries on the primary I/O APIC
+    /// (`MAX_GSI_PINS`).
+    static STRAY_IRQ_MASKED: [core::sync::atomic::AtomicU32; 24] =
+        [const { core::sync::atomic::AtomicU32::new(0) }; 24];
 
     // Generate per-GSI ISR handlers via macro.
     // Each handler is a thin trampoline that calls device_irq_handler(N).

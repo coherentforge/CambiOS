@@ -873,6 +873,13 @@ impl SyscallDispatcher {
                     unsafe {
                         crate::arch::x86_64::ioapic::set_irq_destination(irq_num, local_apic_id);
                     }
+                    // The pin may have been masked as a stray before this
+                    // driver claimed it (device_irq_handler's storm
+                    // protection) — claiming it re-enables delivery.
+                    // SAFETY: same precondition; the pin is configured.
+                    unsafe {
+                        crate::arch::x86_64::ioapic::unmask_irq(irq_num);
+                    }
                 }
                 #[cfg(target_arch = "aarch64")]
                 {

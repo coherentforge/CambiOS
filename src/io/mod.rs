@@ -24,7 +24,7 @@ pub mod fbcon;
 use core::fmt;
 #[cfg(target_arch = "x86_64")]
 use uart_16550::SerialPort;
-use crate::Spinlock;
+use crate::IrqSpinlock;
 
 // ============================================================================
 // x86_64: uart_16550 (port I/O)
@@ -34,8 +34,12 @@ use crate::Spinlock;
 ///
 /// Initialized once during boot via `init()`. All subsequent access
 /// (print!, println!) goes through `lock()`.
+/// `IrqSpinlock`: `println!` runs from syscall, boot, and exception
+/// context alike, and an interrupt landing on the CPU that holds the
+/// console while its handler also prints would deadlock a plain
+/// spinlock. Interrupts are masked for the duration of one print.
 #[cfg(target_arch = "x86_64")]
-static SERIAL1: Spinlock<Option<SerialPort>> = Spinlock::new(None);
+static SERIAL1: IrqSpinlock<Option<SerialPort>> = IrqSpinlock::new(None);
 
 // ============================================================================
 // AArch64: PL011 UART (MMIO)
@@ -95,7 +99,7 @@ const PL011_PHYS_BASE: u64 = 0x0900_0000;
 
 /// Global PL011 serial port, spinlock-protected for multicore safety.
 #[cfg(target_arch = "aarch64")]
-static SERIAL1: Spinlock<Option<Pl011>> = Spinlock::new(None);
+static SERIAL1: IrqSpinlock<Option<Pl011>> = IrqSpinlock::new(None);
 
 // ============================================================================
 // RISC-V: NS16550-compatible UART (MMIO, 8-bit registers)
@@ -167,7 +171,7 @@ const NS16550_PHYS_BASE: u64 = 0x1000_0000;
 
 /// Global NS16550 serial port, spinlock-protected for multicore safety.
 #[cfg(target_arch = "riscv64")]
-static SERIAL1: Spinlock<Option<Ns16550>> = Spinlock::new(None);
+static SERIAL1: IrqSpinlock<Option<Ns16550>> = IrqSpinlock::new(None);
 
 /// Initialize the I/O subsystem
 ///
@@ -207,8 +211,9 @@ pub unsafe fn init() {
 
 /// Print to the console: the serial port, then the framebuffer mirror.
 ///
-/// The two sinks have independent locks and are never held together —
-/// the serial guard is dropped before the framebuffer console is taken.
+/// The two sinks have independent `IrqSpinlock`s and are never held
+/// together — the serial guard is dropped before the framebuffer
+/// console is taken.
 pub fn print(args: fmt::Arguments) {
     use core::fmt::Write;
     {
@@ -218,6 +223,19 @@ pub fn print(args: fmt::Arguments) {
         }
     }
     fbcon::print(args);
+}
+
+/// Best-effort print for interrupt context: never spins on a console
+/// lock another CPU holds. Output is dropped on contention — a handler
+/// must not stall its CPU for a diagnostic.
+pub fn try_print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    if let Some(mut guard) = SERIAL1.try_lock() {
+        if let Some(serial) = guard.as_mut() {
+            let _ = write!(serial, "{}", args);
+        }
+    }
+    fbcon::try_print(args);
 }
 
 #[macro_export]
