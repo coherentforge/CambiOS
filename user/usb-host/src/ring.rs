@@ -365,17 +365,31 @@ impl TransferRing {
     ///
     /// Returns the physical address of the TRB slot written, so
     /// callers can match Transfer Events on the TRB pointer field.
-    /// Returns `None` if the next write would land in the Link TRB
-    /// slot (slot `TRANSFER_RING_TRBS - 1`). Link-wrap is
-    /// unimplemented — see [`CommandRing::enqueue`] for the same
-    /// rationale; transfer rings are bounded by hand-written EP0
-    /// transfers in B-v (3 TRBs per GET_DESCRIPTOR).
-    /// Revisit when: a runtime path (bulk endpoints with IRQ-driven
-    /// queue refill at B-vi) auto-issues transfers beyond hand-written
-    /// driver call sites.
+    ///
+    /// Wraps through the Link TRB (xHCI 1.2 § 4.11.5.1): when the
+    /// producer reaches the last slot it hands the Link TRB the
+    /// current cycle bit so the controller follows it, toggles the
+    /// producer cycle (the Link TRB carries TC=1, so the controller
+    /// toggles too), and continues from slot 0. The HID interrupt
+    /// endpoint issues one TRB per report for the life of the device,
+    /// which is what made wrap necessary; the single-in-flight
+    /// discipline of every caller keeps the ring from overrunning
+    /// unconsumed slots. The `Option` return is kept for API
+    /// stability; it is always `Some` now.
     pub fn enqueue(&mut self, trb: Trb) -> Option<u64> {
         if self.producer >= TRANSFER_RING_TRBS - 1 {
-            return None;
+            let link_vaddr = self.vaddr
+                + ((TRANSFER_RING_TRBS - 1) * core::mem::size_of::<Trb>()) as u64;
+            let link_control =
+                (1 << 1) | ((trb_type::LINK as u32) << 10) | (self.cycle as u32 & 0x1);
+            // SAFETY: the Link TRB slot was installed by `new` at the
+            // last 16-byte slot of this ring's DMA page; only its
+            // control DWord (offset 12, u32-aligned) changes here.
+            unsafe {
+                core::ptr::write_volatile((link_vaddr + 12) as *mut u32, link_control);
+            }
+            self.cycle ^= 1;
+            self.producer = 0;
         }
 
         let trb_paddr = self.paddr + (self.producer * core::mem::size_of::<Trb>()) as u64;

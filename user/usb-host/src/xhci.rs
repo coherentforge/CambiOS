@@ -25,6 +25,7 @@
 use cambios_libsys as sys;
 
 use crate::descriptors::CcidEndpoints;
+use crate::descriptors::EndpointDescriptor;
 use crate::ring::{CommandRing, EventRing, Erst, TransferRing, Trb};
 
 // ---------------------------------------------------------------------------
@@ -582,7 +583,42 @@ pub struct XhciController {
     /// installed by Configure Endpoint. Consumed by B-vi.c's first
     /// bulk transfer.
     pub ccid_bulk: Option<CcidBulkRings>,
+    /// HID boot-keyboard interrupt IN endpoint, installed by
+    /// `configure_interrupt_in`. Driven asynchronously: one report
+    /// transfer in flight at a time, completed by `interrupt_in_poll`.
+    pub hid_kbd: Option<InterruptInEndpoint>,
 }
+
+/// One interrupt IN endpoint driven one transfer at a time. The
+/// report buffer is a DMA page reused for every transfer; `in_flight`
+/// is the paddr of the queued Normal TRB, matched against Transfer
+/// Events. `stashed` holds a completion that a *synchronous* wait
+/// (command completion, control/bulk transfer) consumed off the
+/// event ring on this endpoint's behalf, so CCID traffic cannot lose
+/// a keystroke.
+pub struct InterruptInEndpoint {
+    pub dci: u8,
+    pub mps: u16,
+    ring: TransferRing,
+    buf_paddr: u64,
+    buf_vaddr: u64,
+    in_flight: Option<u64>,
+    stashed: Option<Trb>,
+}
+
+/// A completed interrupt IN report: the bytes the device delivered
+/// (first `len` of `data` are valid).
+#[derive(Clone, Copy, Debug)]
+pub struct InterruptReport {
+    pub data: [u8; INTERRUPT_REPORT_MAX],
+    pub len: usize,
+}
+
+/// HARDWARE: bytes copied out of an interrupt IN completion. A boot
+/// keyboard report is 8 bytes and a boot mouse report 3-4; full-speed
+/// interrupt endpoints cap wMaxPacketSize at 64 (USB 2.0 § 5.7.3),
+/// which this also bounds the per-transfer request to.
+pub const INTERRUPT_REPORT_MAX: usize = 64;
 
 /// Per-slot bulk endpoint state for the CCID interface — DCIs +
 /// transfer rings + Max Packet Sizes. Populated by
@@ -694,6 +730,7 @@ impl XhciController {
             port_idx: None,
             port_speed: None,
             ccid_bulk: None,
+            hid_kbd: None,
         })
     }
 
@@ -833,8 +870,12 @@ impl XhciController {
                 }
                 // Non-matching event (e.g. Port Status Change at
                 // boot, or a stray PSC after our port reset)
-                // consumed and dropped. ERDP is updated when we
-                // return so the controller sees the consumption.
+                // consumed and dropped — unless it completes the
+                // interrupt endpoint's in-flight report, which is
+                // stashed for `interrupt_in_poll`. ERDP is updated
+                // when we return so the controller sees the
+                // consumption.
+                self.stash_if_interrupt_completion(&event);
                 continue;
             }
             sys::yield_now();
@@ -1522,6 +1563,220 @@ impl XhciController {
     }
 
     // -----------------------------------------------------------------
+    // HID class requests (HID 1.11 § 7.2)
+    // -----------------------------------------------------------------
+
+    /// SET_PROTOCOL(Boot) on a HID interface: bmRequestType 0x21
+    /// (host-to-device, class, interface), bRequest 0x0B, wValue 0 =
+    /// Boot Protocol, wIndex = interface. HID 1.11 § 7.2.6. Boot
+    /// devices start in Report Protocol; this selects the fixed
+    /// 8-byte keyboard report.
+    pub fn set_protocol_boot(&mut self, interface: u8) -> Result<(), XhciError> {
+        let setup_packet: u64 = 0x21u64 | (0x0Bu64 << 8) | ((interface as u64) << 32);
+        self.control_transfer_no_data(setup_packet)
+    }
+
+    /// SET_IDLE(0) on a HID interface: bRequest 0x0A, wValue =
+    /// (duration 0 << 8) | report id 0 — report only when the state
+    /// changes, so the interrupt endpoint NAKs while nothing is
+    /// pressed. HID 1.11 § 7.2.4.
+    pub fn set_idle_on_change(&mut self, interface: u8) -> Result<(), XhciError> {
+        let setup_packet: u64 = 0x21u64 | (0x0Au64 << 8) | ((interface as u64) << 32);
+        self.control_transfer_no_data(setup_packet)
+    }
+
+    // -----------------------------------------------------------------
+    // Interrupt IN endpoint (HID reports)
+    // -----------------------------------------------------------------
+
+    /// xHCI Endpoint Context `Interval` field for an interrupt
+    /// endpoint (xHCI 1.2 § 6.2.3.6, Table 6-12). The field is a
+    /// power of two in 125 µs units. Full/low speed: bInterval is in
+    /// frames (1 ms), so 2^Interval × 125 µs ≥ bInterval ms gives
+    /// Interval = 3 + floor(log2(bInterval)), range 3..=10. High /
+    /// super speed: bInterval is 2^(n-1) microframes, so Interval =
+    /// bInterval - 1, range 0..=15.
+    fn interrupt_interval_field(speed: u8, b_interval: u8) -> u32 {
+        match speed {
+            1 | 2 => {
+                let b = b_interval.max(1) as u32;
+                let log2 = 31 - b.leading_zeros();
+                (3 + log2).min(10)
+            }
+            _ => (b_interval.max(1) as u32 - 1).min(15),
+        }
+    }
+
+    /// Build an Input Context adding one Interrupt IN endpoint, issue
+    /// Configure Endpoint (xHCI 1.2 § 4.6.6), and allocate its
+    /// transfer ring and report buffer. Same shape as the CCID
+    /// `configure_endpoint`; the slot must already be Addressed.
+    /// Returns the post-command Slot State (3 = Configured).
+    pub fn configure_interrupt_in(&mut self, ep: &EndpointDescriptor) -> Result<u8, XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+        let ic_paddr = self.input_context_paddr.ok_or(XhciError::EpNotReady)?;
+        let ic_vaddr = self.input_context_vaddr.ok_or(XhciError::EpNotReady)?;
+        let dc_vaddr = self.device_context_vaddr.ok_or(XhciError::EpNotReady)?;
+        let port_idx = self.port_idx.ok_or(XhciError::EpNotReady)?;
+        let speed = self.port_speed.ok_or(XhciError::EpNotReady)?;
+
+        let dci = (ep.endpoint_number() as u32) * 2 + 1;
+        let mps = ep.max_packet_size_bytes().min(INTERRUPT_REPORT_MAX as u16);
+        let interval = Self::interrupt_interval_field(speed, ep.interval);
+        // Context Entries must cover every live endpoint; CCID bulk
+        // endpoints, if any, were installed by an earlier command.
+        let existing_max_dci = self
+            .ccid_bulk
+            .as_ref()
+            .map(|b| core::cmp::max(b.in_dci, b.out_dci) as u32)
+            .unwrap_or(1);
+        let max_dci = core::cmp::max(dci, existing_max_dci);
+
+        let ring = TransferRing::new().ok_or(XhciError::DmaAllocFailed)?;
+        let (buf_paddr, buf_vaddr) = Self::alloc_zeroed_page()?;
+        let ctx_size: u64 = if self.cap.csz { 64 } else { 32 };
+
+        // SAFETY: ic_vaddr is the Input Context page allocated by
+        // address_device, owned exclusively by this driver; every
+        // offset written below is inside the 4 KiB page (ICC + Slot +
+        // DCI ≤ 31 endpoint contexts at 64-byte stride = 2112 B).
+        unsafe {
+            core::ptr::write_bytes(ic_vaddr as *mut u8, 0, 4096);
+
+            // Input Control Context: add Slot (A0) + this endpoint.
+            let icc = ic_vaddr as *mut u32;
+            core::ptr::write_volatile(icc.add(1), 0x1u32 | (1u32 << dci));
+
+            // Slot Context: speed, Context Entries = max DCI, root port.
+            let slot = (ic_vaddr + ctx_size) as *mut u32;
+            let slot_dw0 = ((speed as u32 & 0xF) << 20) | ((max_dci & 0x1F) << 27);
+            let slot_dw1 = ((port_idx as u32 + 1) & 0xFF) << 16;
+            core::ptr::write_volatile(slot.add(0), slot_dw0);
+            core::ptr::write_volatile(slot.add(1), slot_dw1);
+
+            // Endpoint Context (xHCI 1.2 § 6.2.3) at (dci + 1) × ctx_size.
+            //   DWord 0: Interval [23:16]
+            //   DWord 1: CErr=3 [2:1], EP Type=7 (Interrupt IN) [5:3],
+            //            Max Packet Size [31:16]
+            //   DWord 2-3: TR Dequeue Pointer | DCS=1
+            //   DWord 4: Average TRB Length [15:0] = MPS,
+            //            Max ESIT Payload Lo [31:16] = MPS
+            let epc = (ic_vaddr + (dci as u64 + 1) * ctx_size) as *mut u32;
+            core::ptr::write_volatile(epc.add(0), (interval & 0xFF) << 16);
+            core::ptr::write_volatile(
+                epc.add(1),
+                (3u32 << 1) | (7u32 << 3) | ((mps as u32) << 16),
+            );
+            let dq = ring.paddr | 0x1;
+            core::ptr::write_volatile(epc.add(2), dq as u32);
+            core::ptr::write_volatile(epc.add(3), (dq >> 32) as u32);
+            core::ptr::write_volatile(epc.add(4), (mps as u32) | ((mps as u32) << 16));
+        }
+
+        let trb = Trb {
+            parameter: ic_paddr,
+            status: 0,
+            control: (12u32 << 10) | ((slot_id as u32) << 24),
+        };
+        self.submit_command(trb)?;
+
+        self.hid_kbd = Some(InterruptInEndpoint {
+            dci: dci as u8,
+            mps,
+            ring,
+            buf_paddr,
+            buf_vaddr,
+            in_flight: None,
+            stashed: None,
+        });
+
+        // SAFETY: dc_vaddr is the Device Context page allocated by
+        // address_device; Slot Context DWord 3 is at offset 12.
+        let slot_state = unsafe {
+            let dw3 = core::ptr::read_volatile((dc_vaddr + 12) as *const u32);
+            ((dw3 >> 27) & 0x1F) as u8
+        };
+        Ok(slot_state)
+    }
+
+    /// Queue one report transfer on the interrupt IN endpoint if none
+    /// is in flight. Returns immediately; the completion is collected
+    /// by `interrupt_in_poll`.
+    pub fn interrupt_in_submit(&mut self) -> Result<(), XhciError> {
+        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
+        let (dci, trb_paddr) = {
+            let kbd = self.hid_kbd.as_mut().ok_or(XhciError::EpNotReady)?;
+            if kbd.in_flight.is_some() {
+                return Ok(());
+            }
+            let trb = Trb {
+                parameter: kbd.buf_paddr,
+                status: kbd.mps as u32,
+                control: (1u32 << 5) | ((trb_type::NORMAL as u32) << 10),
+            };
+            let paddr = kbd.ring.enqueue(trb).ok_or(XhciError::TransferRingFull)?;
+            kbd.in_flight = Some(paddr);
+            (kbd.dci, paddr)
+        };
+        let _ = trb_paddr;
+        self.ring_doorbell(slot_id, dci as u32);
+        Ok(())
+    }
+
+    /// Non-blocking: if the in-flight report transfer has completed,
+    /// copy the report out and return it. Drains the event ring once;
+    /// unrelated events (port status changes) are dropped, the way
+    /// the synchronous waits drop them. A failed transfer is returned
+    /// as `TransferFailed(code)` with the endpoint left idle; the
+    /// caller decides whether to re-arm.
+    pub fn interrupt_in_poll(&mut self) -> Result<Option<InterruptReport>, XhciError> {
+        let in_flight = match self.hid_kbd.as_ref() {
+            Some(k) => match k.in_flight {
+                Some(p) => p,
+                None => return Ok(None),
+            },
+            None => return Err(XhciError::EpNotReady),
+        };
+
+        let mut completion: Option<Trb> = None;
+        if let Some(stashed) = self.hid_kbd.as_mut().and_then(|k| k.stashed.take()) {
+            completion = Some(stashed);
+        } else {
+            while let Some(event) = self.event_ring.poll_next() {
+                let trb_type_ = ((event.control >> 10) & 0x3F) as u8;
+                if trb_type_ == trb_type::TRANSFER_EVENT && event.parameter == in_flight {
+                    completion = Some(event);
+                    break;
+                }
+                // Anything else arriving while no synchronous wait is
+                // running has no consumer; dropped.
+            }
+            self.write_erdp_to_current();
+        }
+
+        let event = match completion {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let kbd = self.hid_kbd.as_mut().ok_or(XhciError::EpNotReady)?;
+        kbd.in_flight = None;
+        let code = (event.status >> 24) as u8;
+        if code != completion_code::SUCCESS && code != completion_code::SHORT_PACKET {
+            return Err(XhciError::TransferFailed(code));
+        }
+        let residual = (event.status & 0x00FF_FFFF) as usize;
+        let len = (kbd.mps as usize).saturating_sub(residual).min(INTERRUPT_REPORT_MAX);
+        let mut data = [0u8; INTERRUPT_REPORT_MAX];
+        // SAFETY: buf_vaddr is the report DMA page allocated by
+        // configure_interrupt_in; the controller has finished writing
+        // it (Transfer Event observed) and `len` ≤ one page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(kbd.buf_vaddr as *const u8, data.as_mut_ptr(), len);
+        }
+        Ok(Some(InterruptReport { data, len }))
+    }
+
+    // -----------------------------------------------------------------
     // Bulk endpoint transfers
     // -----------------------------------------------------------------
 
@@ -1632,12 +1887,27 @@ impl XhciController {
                         return Err(XhciError::TransferFailed(code));
                     }
                 }
+                self.stash_if_interrupt_completion(&event);
                 continue;
             }
             sys::yield_now();
         }
         self.write_erdp_to_current();
         Err(XhciError::TransferTimeout)
+    }
+
+    /// If `event` is the Transfer Event for the interrupt endpoint's
+    /// in-flight TRB, keep it for `interrupt_in_poll`.
+    fn stash_if_interrupt_completion(&mut self, event: &Trb) {
+        let trb_type_ = ((event.control >> 10) & 0x3F) as u8;
+        if trb_type_ != trb_type::TRANSFER_EVENT {
+            return;
+        }
+        if let Some(kbd) = self.hid_kbd.as_mut() {
+            if kbd.in_flight == Some(event.parameter) {
+                kbd.stashed = Some(*event);
+            }
+        }
     }
 
     /// Allocate one 4 KiB DMA page and zero it. Returns (paddr, vaddr).

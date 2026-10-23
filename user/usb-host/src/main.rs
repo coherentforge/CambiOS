@@ -39,6 +39,7 @@
 #![deny(unsafe_code)]
 
 mod descriptors;
+mod hid_kbd;
 mod pci;
 #[allow(unsafe_code)]
 mod ring;
@@ -48,6 +49,18 @@ mod xhci;
 use cambios_libsys as sys;
 
 const USB_HOST_ENDPOINT: u32 = 31;
+
+/// The compositor's dedicated input endpoint (ADR-012 § Divergence
+/// 2026-04-21; the Input Hub takes it over when it lands). Same
+/// value virtio-input uses; writes are best-effort — on a headless
+/// image nobody owns it and events are dropped.
+const COMPOSITOR_INPUT_ENDPOINT: u32 = 30;
+
+/// `InputEvent.device_id` for the boot keyboard behind this driver.
+/// Cosmetic until the Input Hub assigns ids (ADR-012 Input-2);
+/// distinct from virtio-input's 1-based ids so a mixed QEMU run
+/// tells the two apart.
+const HID_KEYBOARD_DEVICE_ID: u32 = 0x100;
 
 
 // ---------------------------------------------------------------------------
@@ -379,10 +392,11 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     };
 
-    // Walk the blob for the CCID interface and its bulk IN + OUT
-    // endpoints. CCID 1.1 § 4: bInterfaceClass = 0x0B identifies the
-    // smart-card / CCID class; the interface is followed by class-
-    // specific descriptors then the bulk endpoint pair.
+    // Walk the blob for a class this driver speaks. CCID 1.1 § 4:
+    // bInterfaceClass = 0x0B is the smart-card class (bulk pair);
+    // HID 1.11 § 4: class 0x03 / subclass Boot / protocol Keyboard
+    // is a keyboard the host can drive without a report-descriptor
+    // parser (one interrupt IN endpoint).
     let ccid = match descriptors::find_ccid_interface(&blob[..blob_len]) {
         Ok(ccid) => {
             log_ccid_endpoints(&ccid);
@@ -390,6 +404,12 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
         Err(_) => {
             sys::print(b"[USB-HOST]   no CCID interface found in config blob\n");
+            match descriptors::find_hid_boot_keyboard(&blob[..blob_len]) {
+                Ok(kbd) => bring_up_hid_keyboard(ctl, &kbd),
+                Err(_) => {
+                    sys::print(b"[USB-HOST]   no HID boot keyboard interface either; device left addressed\n");
+                }
+            }
             return;
         }
     };
@@ -431,6 +451,54 @@ fn run_b3(ctl: &mut xhci::XhciController) {
     // CCID semantics + first bulk exchange live in the `user/ccid`
     // module; usb-host serves bulk OUT / bulk IN requests via the
     // IPC dispatch in `serve_loop` once boot completes.
+}
+
+/// HID boot keyboard: configure, select Boot Protocol, idle-on-change,
+/// install the interrupt IN endpoint, and queue the first report
+/// transfer. Reports are then collected by `poll_keyboard` from the
+/// serve loop.
+fn bring_up_hid_keyboard(ctl: &mut xhci::XhciController, kbd: &descriptors::HidBootKeyboard) {
+    sys::print(b"[USB-HOST]   HID boot keyboard interface found:\n");
+    sys::print(b"[USB-HOST]     bInterfaceNumber = ");
+    log_dec(b"", kbd.interface_number as u32);
+    sys::print(b"[USB-HOST]     interrupt IN addr = ");
+    log_hex64(b"", kbd.interrupt_in.address as u64);
+    sys::print(b"[USB-HOST]              MPS  = ");
+    log_dec(b"", kbd.interrupt_in.max_packet_size_bytes() as u32);
+    sys::print(b"[USB-HOST]              bInterval = ");
+    log_dec(b"", kbd.interrupt_in.interval as u32);
+
+    sys::print(b"[USB-HOST] SET_CONFIGURATION; bConfigurationValue = ");
+    log_dec(b"", kbd.configuration_value as u32);
+    if let Err(e) = ctl.set_configuration(kbd.configuration_value) {
+        log_b3_error(b"[USB-HOST] set_configuration:", e);
+        return;
+    }
+    sys::print(b"[USB-HOST] SET_PROTOCOL(Boot)...\n");
+    if let Err(e) = ctl.set_protocol_boot(kbd.interface_number) {
+        log_b3_error(b"[USB-HOST] set_protocol_boot:", e);
+        return;
+    }
+    sys::print(b"[USB-HOST] SET_IDLE(on change)...\n");
+    if let Err(e) = ctl.set_idle_on_change(kbd.interface_number) {
+        // Optional for a boot keyboard; log and continue without it.
+        log_b3_error(b"[USB-HOST] set_idle (ignored):", e);
+    }
+    sys::print(b"[USB-HOST] Configure Endpoint (interrupt IN)...\n");
+    match ctl.configure_interrupt_in(&kbd.interrupt_in) {
+        Ok(slot_state) => {
+            sys::print(b"[USB-HOST]   Configure Endpoint OK; slot state = ");
+            log_dec(b"", slot_state as u32);
+        }
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] configure_interrupt_in:", e);
+            return;
+        }
+    }
+    match ctl.interrupt_in_submit() {
+        Ok(()) => sys::print(b"[USB-HOST]   keyboard armed; reports go to the input endpoint\n"),
+        Err(e) => log_b3_error(b"[USB-HOST] interrupt_in_submit:", e),
+    }
 }
 
 fn log_ccid_endpoints(ccid: &descriptors::CcidEndpoints) {
@@ -632,23 +700,109 @@ const MAX_BULK_PAYLOAD: usize = 192;
 /// caps recv_msg at 256 anyway.
 const RECV_BUF_SIZE: usize = 256;
 
+/// Keyboard side of the serve loop. `Armed` while a report transfer
+/// is queued or re-queued after each completion; `Dead` after a
+/// transfer error (device gone, STALL), logged once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyboardPump {
+    Absent,
+    Armed,
+    Dead,
+}
+
+struct KeyboardSession {
+    pump: KeyboardPump,
+    state: hid_kbd::BootKeyboardState,
+    seq: u16,
+    reports_seen: u32,
+}
+
 #[allow(unsafe_code)]
 fn serve_loop(ctl: &mut xhci::XhciController) -> ! {
     let mut recv_buf = [0u8; RECV_BUF_SIZE];
+    let mut kbd = KeyboardSession {
+        pump: if ctl.hid_kbd.is_some() { KeyboardPump::Armed } else { KeyboardPump::Absent },
+        state: hid_kbd::BootKeyboardState::new(),
+        seq: 0,
+        reports_seen: 0,
+    };
     loop {
-        // `recv_verified` blocks until a non-anonymous sender's
-        // message arrives. Anonymous callers (None return path)
-        // get silently dropped — no auth, no reply. This is the
-        // "no identity, no participation" floor: the bulk transport
-        // is downstream of the vault's authority check (ADR-033),
-        // and refusing anonymous senders here closes the bypass
-        // path that would otherwise let a process skip the vault
-        // and drive the hardware token directly.
-        let msg = match sys::recv_verified(USB_HOST_ENDPOINT, &mut recv_buf) {
-            Some(m) => m,
-            None => continue,
-        };
-        handle_request(ctl, msg.from_endpoint(), msg.payload());
+        // Anonymous callers (None return path) get silently dropped —
+        // no auth, no reply. This is the "no identity, no
+        // participation" floor: the bulk transport is downstream of
+        // the vault's authority check (ADR-033), and refusing
+        // anonymous senders here closes the bypass path that would
+        // otherwise let a process skip the vault and drive the
+        // hardware token directly. Non-blocking so the keyboard pump
+        // below keeps running between requests.
+        if let Some(msg) = sys::try_recv_verified(USB_HOST_ENDPOINT, &mut recv_buf) {
+            handle_request(ctl, msg.from_endpoint(), msg.payload());
+        }
+        if kbd.pump == KeyboardPump::Armed {
+            poll_keyboard(ctl, &mut kbd);
+        }
+        sys::yield_now();
+    }
+}
+
+/// Collect a completed report, turn it into key transitions, send
+/// each as an ADR-012 `InputEvent`, and re-arm the transfer.
+fn poll_keyboard(ctl: &mut xhci::XhciController, kbd: &mut KeyboardSession) {
+    use cambios_libinput_proto::{
+        encode_event, hid_to_ascii_us, EventType, InputEvent, KeyboardPayload, EVENT_SIZE,
+    };
+    use hid_kbd::{KeyTransition, BOOT_REPORT_LEN, MAX_TRANSITIONS};
+
+    let report = match ctl.interrupt_in_poll() {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            log_b3_error(b"[USB-HOST] keyboard transfer failed; keyboard stopped:", e);
+            kbd.pump = KeyboardPump::Dead;
+            return;
+        }
+    };
+    if kbd.reports_seen == 0 {
+        sys::print(b"[USB-HOST] keyboard: first report received\n");
+    }
+    kbd.reports_seen = kbd.reports_seen.wrapping_add(1);
+
+    if report.len >= BOOT_REPORT_LEN {
+        let mut boot = [0u8; BOOT_REPORT_LEN];
+        boot.copy_from_slice(&report.data[..BOOT_REPORT_LEN]);
+        let mut transitions = [KeyTransition::Up(0); MAX_TRANSITIONS];
+        let n = kbd.state.apply(&boot, &mut transitions);
+        let modifiers = kbd.state.modifiers() as u16;
+        for t in transitions.iter().take(n) {
+            let (event_type, usage) = match *t {
+                KeyTransition::Down(u) => (EventType::KeyDown, u),
+                KeyTransition::Up(u) => (EventType::KeyUp, u),
+            };
+            let payload = KeyboardPayload {
+                keycode: usage as u32,
+                modifiers,
+                unicode: hid_to_ascii_us(usage as u32, modifiers),
+            };
+            kbd.seq = kbd.seq.wrapping_add(1);
+            let event = InputEvent::key(
+                event_type,
+                HID_KEYBOARD_DEVICE_ID,
+                kbd.seq,
+                sys::get_time(),
+                payload,
+            );
+            let mut buf = [0u8; EVENT_SIZE];
+            if let Some(len) = encode_event(&mut buf, &event) {
+                // Best-effort: input is lossy by nature, and on a
+                // headless image nobody owns the endpoint.
+                let _ = sys::write(COMPOSITOR_INPUT_ENDPOINT, &buf[..len]);
+            }
+        }
+    }
+
+    if let Err(e) = ctl.interrupt_in_submit() {
+        log_b3_error(b"[USB-HOST] keyboard re-arm failed; keyboard stopped:", e);
+        kbd.pump = KeyboardPump::Dead;
     }
 }
 

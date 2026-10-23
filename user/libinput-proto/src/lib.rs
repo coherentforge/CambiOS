@@ -416,6 +416,55 @@ pub fn decode_event(buf: &[u8]) -> Option<InputEvent> {
 // Tests
 // ============================================================================
 
+/// Translate a USB HID usage code plus the live modifier bits into a
+/// US-QWERTY Unicode codepoint, or 0 for keys with no text meaning
+/// (Enter, Tab, Escape, Backspace, arrows, modifiers, function keys —
+/// consumers handle those off `keycode`). Shared by every keyboard
+/// driver (virtio-input, usb-host HID) so the `unicode` field means
+/// the same thing regardless of transport.
+///
+/// CapsLock is ignored: drivers track Shift/Ctrl/Alt/GUI in
+/// `modifiers`, and a layout-aware translation (non-US layouts,
+/// dead keys) belongs to a userspace keymap service, not the driver.
+/// Revisit when: a second keyboard layout is wanted.
+pub fn hid_to_ascii_us(hid: u32, modifiers: u16) -> u32 {
+    let shift = (modifiers & (modifier::LEFT_SHIFT | modifier::RIGHT_SHIFT)) != 0;
+
+    // Letters: 0x04..=0x1D map to a..z. Shift uppercases.
+    if (0x04..=0x1D).contains(&hid) {
+        let base = hid - 0x04;
+        return if shift { b'A' as u32 + base } else { b'a' as u32 + base };
+    }
+
+    // Top-row numbers and their shift symbols. US QWERTY: 1!2@3#4$5%6^7&8*9(0)
+    let unshifted = b"1234567890";
+    let shifted = b"!@#$%^&*()";
+    if (0x1E..=0x26).contains(&hid) {
+        let i = (hid - 0x1E) as usize;
+        return if shift { shifted[i] as u32 } else { unshifted[i] as u32 };
+    }
+    if hid == 0x27 {
+        return if shift { b')' as u32 } else { b'0' as u32 };
+    }
+
+    // Punctuation / space.
+    match hid {
+        0x2C => b' ' as u32, // Space (shift-space is still space)
+        0x2D => if shift { b'_' as u32 } else { b'-' as u32 },
+        0x2E => if shift { b'+' as u32 } else { b'=' as u32 },
+        0x2F => if shift { b'{' as u32 } else { b'[' as u32 },
+        0x30 => if shift { b'}' as u32 } else { b']' as u32 },
+        0x31 => if shift { b'|' as u32 } else { b'\\' as u32 },
+        0x33 => if shift { b':' as u32 } else { b';' as u32 },
+        0x34 => if shift { b'"' as u32 } else { b'\'' as u32 },
+        0x35 => if shift { b'~' as u32 } else { b'`' as u32 },
+        0x36 => if shift { b'<' as u32 } else { b',' as u32 },
+        0x37 => if shift { b'>' as u32 } else { b'.' as u32 },
+        0x38 => if shift { b'?' as u32 } else { b'/' as u32 },
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +574,31 @@ mod tests {
         // ADR-012 rationale: 96 × 2 = 192 bytes, leaves 64 bytes for
         // a batching header if ever added. Sanity check the math.
         assert!(EVENT_SIZE * 2 <= 256);
+    }
+
+    #[test]
+    fn hid_to_ascii_letters() {
+        assert_eq!(hid_to_ascii_us(0x04, 0), b'a' as u32);
+        assert_eq!(hid_to_ascii_us(0x1D, 0), b'z' as u32);
+        assert_eq!(hid_to_ascii_us(0x04, modifier::LEFT_SHIFT), b'A' as u32);
+        assert_eq!(hid_to_ascii_us(0x1D, modifier::RIGHT_SHIFT), b'Z' as u32);
+    }
+
+    #[test]
+    fn hid_to_ascii_digits_symbols_punctuation() {
+        assert_eq!(hid_to_ascii_us(0x1E, 0), b'1' as u32);
+        assert_eq!(hid_to_ascii_us(0x1E, modifier::LEFT_SHIFT), b'!' as u32);
+        assert_eq!(hid_to_ascii_us(0x27, 0), b'0' as u32);
+        assert_eq!(hid_to_ascii_us(0x27, modifier::LEFT_SHIFT), b')' as u32);
+        assert_eq!(hid_to_ascii_us(0x36, 0), b',' as u32);
+        assert_eq!(hid_to_ascii_us(0x36, modifier::LEFT_SHIFT), b'<' as u32);
+        assert_eq!(hid_to_ascii_us(0x2C, modifier::LEFT_SHIFT), b' ' as u32);
+    }
+
+    #[test]
+    fn hid_to_ascii_named_keys_return_zero() {
+        for hid in [0x28u32, 0x29, 0x2A, 0x2B, 0x52, 0xE1] {
+            assert_eq!(hid_to_ascii_us(hid, 0), 0);
+        }
     }
 }

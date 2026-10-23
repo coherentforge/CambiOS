@@ -7,6 +7,10 @@ name = "cambios-abi"
 version = "0.1.0"
 
 [[package]]
+name = "cambios-libinput-proto"
+version = "0.1.0"
+
+[[package]]
 name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
@@ -29,6 +33,7 @@ version = "0.1.0"
 name = "cambios-usb-host"
 version = "0.1.0"
 dependencies = [
+ "cambios-libinput-proto",
  "cambios-libsys",
  "cambios-libsys-rt",
 ]

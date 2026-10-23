@@ -26,9 +26,23 @@ pub mod desc_type {
 
 /// USB class codes (usb.org assignments).
 pub mod usb_class {
+    /// Human Interface Device — USB-IF base class assignment.
+    /// HID 1.11 specification § 4.1.
+    pub const HID: u8 = 0x03;
     /// Smart Card / CCID — USB-IF base class assignment.
     /// CCID 1.1 specification § 4.
     pub const CCID: u8 = 0x0B;
+}
+
+/// HID interface subclass / protocol codes (HID 1.11 § 4.2, § 4.3).
+/// A boot-subclass interface speaks the fixed 8-byte keyboard or
+/// 3-byte mouse report without a report-descriptor parser, which is
+/// what lets a host handle keyboards before it has one.
+#[allow(dead_code)] // PROTOCOL_MOUSE: read when the boot-mouse path lands.
+pub mod hid {
+    pub const SUBCLASS_BOOT: u8 = 0x01;
+    pub const PROTOCOL_KEYBOARD: u8 = 0x01;
+    pub const PROTOCOL_MOUSE: u8 = 0x02;
 }
 
 /// USB endpoint direction (USB 2.0 § 9.6.6, bEndpointAddress bit 7).
@@ -116,6 +130,15 @@ pub struct CcidEndpoints {
     pub bulk_out: EndpointDescriptor,
 }
 
+/// HID boot-protocol keyboard interface + its interrupt IN endpoint
+/// found in a parsed config blob.
+#[derive(Clone, Copy, Debug)]
+pub struct HidBootKeyboard {
+    pub configuration_value: u8,
+    pub interface_number: u8,
+    pub interrupt_in: EndpointDescriptor,
+}
+
 /// Errors surfaced by the configuration-descriptor blob walk.
 #[derive(Clone, Copy, Debug)]
 pub enum DescriptorError {
@@ -133,6 +156,10 @@ pub enum DescriptorError {
     /// the matching interface lacks the required bulk IN + bulk OUT
     /// endpoint pair.
     NoCcidInterface,
+    /// No interface with class HID, subclass Boot, protocol Keyboard
+    /// (alternate setting 0) found, or it lacks an interrupt IN
+    /// endpoint.
+    NoHidBootKeyboard,
 }
 
 /// Parse the top-level Configuration Descriptor from a blob and return
@@ -269,5 +296,122 @@ pub fn find_ccid_interface(blob: &[u8]) -> Result<CcidEndpoints, DescriptorError
             bulk_out: b_out,
         }),
         _ => Err(DescriptorError::NoCcidInterface),
+    }
+}
+
+/// Walk the post-Configuration-Descriptor body of a config blob and
+/// return the first HID boot-protocol keyboard interface (class 0x03,
+/// subclass 0x01, protocol 0x01, alternate setting 0) together with
+/// its interrupt IN endpoint (HID 1.11 § 4.2, § 7.2.6).
+///
+/// A combined receiver (keyboard + mouse dongle) carries one such
+/// interface per device class; the keyboard one is taken, the mouse
+/// interface is skipped. The HID class descriptor (type 0x21) that
+/// sits between the interface and its endpoint is skipped via
+/// `bLength` like any class-specific descriptor.
+pub fn find_hid_boot_keyboard(blob: &[u8]) -> Result<HidBootKeyboard, DescriptorError> {
+    let (config, mut body) = parse_configuration(blob)?;
+    let mut keyboard_iface: Option<InterfaceDescriptor> = None;
+    let mut interrupt_in: Option<EndpointDescriptor> = None;
+    let mut in_keyboard = false;
+
+    while !body.is_empty() {
+        let b_length = body[0] as usize;
+        if b_length == 0 || b_length > body.len() {
+            return Err(DescriptorError::BadLength);
+        }
+        let b_type = body[1];
+        match b_type {
+            desc_type::INTERFACE => {
+                if in_keyboard && interrupt_in.is_some() {
+                    break;
+                }
+                let iface = parse_interface(&body[..b_length])?;
+                in_keyboard = iface.interface_class == usb_class::HID
+                    && iface.interface_subclass == hid::SUBCLASS_BOOT
+                    && iface.interface_protocol == hid::PROTOCOL_KEYBOARD
+                    && iface.alternate_setting == 0;
+                if in_keyboard {
+                    keyboard_iface = Some(iface);
+                    interrupt_in = None;
+                }
+            }
+            desc_type::ENDPOINT if in_keyboard => {
+                let ep = parse_endpoint(&body[..b_length])?;
+                if ep.transfer_type() == EndpointType::Interrupt
+                    && ep.direction() == EndpointDirection::In
+                    && interrupt_in.is_none()
+                {
+                    interrupt_in = Some(ep);
+                }
+            }
+            _ => {}
+        }
+        body = &body[b_length..];
+    }
+
+    match (keyboard_iface, interrupt_in) {
+        (Some(iface), Some(ep)) => Ok(HidBootKeyboard {
+            configuration_value: config.configuration_value,
+            interface_number: iface.interface_number,
+            interrupt_in: ep,
+        }),
+        _ => Err(DescriptorError::NoHidBootKeyboard),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Logitech Unifying receiver-shaped blob (046d:c534, as read on
+    /// the Dell 3630): config + [kbd iface, HID desc, int IN ep 1] +
+    /// [mouse iface, HID desc, int IN ep 2]; wTotalLength 59.
+    fn unifying_receiver_blob() -> [u8; 59] {
+        let mut b = [0u8; 59];
+        b[..9].copy_from_slice(&[9, 0x02, 59, 0, 2, 1, 4, 0xA0, 49]);
+        b[9..18].copy_from_slice(&[9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0]);
+        b[18..27].copy_from_slice(&[9, 0x21, 0x11, 0x01, 0, 1, 0x22, 59, 0]);
+        b[27..34].copy_from_slice(&[7, 0x05, 0x81, 0x03, 8, 0, 8]);
+        b[34..43].copy_from_slice(&[9, 0x04, 1, 0, 1, 0x03, 0x01, 0x02, 0]);
+        b[43..52].copy_from_slice(&[9, 0x21, 0x11, 0x01, 0, 1, 0x22, 177, 0]);
+        b[52..59].copy_from_slice(&[7, 0x05, 0x82, 0x03, 8, 0, 2]);
+        b
+    }
+
+    #[test]
+    fn finds_boot_keyboard_in_unifying_receiver() {
+        let blob = unifying_receiver_blob();
+        let kbd = find_hid_boot_keyboard(&blob).expect("keyboard interface");
+        assert_eq!(kbd.configuration_value, 1);
+        assert_eq!(kbd.interface_number, 0);
+        assert_eq!(kbd.interrupt_in.endpoint_number(), 1);
+        assert_eq!(kbd.interrupt_in.direction(), EndpointDirection::In);
+        assert_eq!(kbd.interrupt_in.transfer_type(), EndpointType::Interrupt);
+        assert_eq!(kbd.interrupt_in.max_packet_size_bytes(), 8);
+        assert_eq!(kbd.interrupt_in.interval, 8);
+    }
+
+    #[test]
+    fn mouse_only_blob_has_no_keyboard() {
+        let full = unifying_receiver_blob();
+        let mut b = [0u8; 34];
+        b[..9].copy_from_slice(&full[..9]);
+        b[2] = 34;
+        b[4] = 1;
+        b[9..34].copy_from_slice(&full[34..59]);
+        assert!(matches!(
+            find_hid_boot_keyboard(&b),
+            Err(DescriptorError::NoHidBootKeyboard)
+        ));
+    }
+
+    #[test]
+    fn ccid_walk_still_rejects_hid_blob() {
+        let blob = unifying_receiver_blob();
+        assert!(matches!(
+            find_ccid_interface(&blob),
+            Err(DescriptorError::NoCcidInterface)
+        ));
     }
 }
