@@ -395,17 +395,31 @@ pub mod regs {
     pub const PORTSC_SPEED_MASK: u32 = 0xF << 10;
     pub const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change
 
-    // PORTSC RW1C status-change bits — must be masked off when
-    // writing PORTSC so an unrelated write doesn't accidentally
-    // clear a change bit the driver hasn't read yet.
-    pub const PORTSC_RW1C_MASK: u32 =
-        (1 << 17) | // CSC
-        (1 << 18) | // PEC
-        (1 << 19) | // WRC
-        (1 << 20) | // OCC
-        (1 << 21) | // PRC
-        (1 << 22) | // PLC
-        (1 << 23);  // CEC
+    // Bits of PORTSC that a write may echo back unchanged: the
+    // read-only fields and the read-write-sticky fields (xHCI 1.2
+    // § 5.4.8). Everything else has a write side effect and must be
+    // written as 0 unless that effect is wanted: PED (bit 1) is
+    // write-1-to-DISABLE, PR (4) and WPR (31) are write-1-to-start,
+    // LWS (16) makes the PLS write take effect, and 17..23 are the
+    // write-1-to-clear change flags. Echoing PED=1 after a successful
+    // reset disabled the port on the Dell 3630's xHCI (2026-10-23;
+    // Address Device then failed with a USB Transaction Error). QEMU
+    // ignores a 1 written to PED, so only hardware shows it.
+    pub const PORTSC_WRITE_PRESERVE_MASK: u32 =
+        (1 << 0)  | // CCS   (RO)
+        (1 << 3)  | // OCA   (RO)
+        (0xF << 5) | // PLS  (RWS; inert without LWS)
+        (1 << 9)  | // PP    (RWS)
+        (0xF << 10) | // Port Speed (RO)
+        (0x3 << 14) | // PIC (RWS)
+        (0x7 << 25) | // WCE / WDE / WOE (RWS)
+        (1 << 30);  // DR    (RO)
+
+    /// The value to write back to PORTSC that changes nothing: the
+    /// current value with every side-effecting bit cleared.
+    pub const fn portsc_neutral(cur: u32) -> u32 {
+        cur & PORTSC_WRITE_PRESERVE_MASK
+    }
 
     // CRCR bit 0: Ring Cycle State — written together with the ring
     // base pointer; the cycle bit must match the producer's initial
@@ -726,11 +740,10 @@ impl XhciController {
             + regs::PORT_PORTSC;
         let portsc_addr = self.op_vaddr + off as u64;
 
-        // Preserve non-RW1C control bits, mask off RW1C status-change
-        // bits (writing 1 to a change bit clears it; we'd race the
-        // controller's notification), then OR in PR=1.
+        // Write back only the side-effect-free bits (see
+        // `PORTSC_WRITE_PRESERVE_MASK`), then OR in PR=1.
         let cur = self.read_portsc(port_idx);
-        let new = (cur & !regs::PORTSC_RW1C_MASK) | regs::PORTSC_PR;
+        let new = regs::portsc_neutral(cur) | regs::PORTSC_PR;
 
         // SAFETY: portsc_addr inside MMIO mapping (bounded by max_ports).
         unsafe {
@@ -745,10 +758,11 @@ impl XhciController {
         .ok_or(XhciError::PortResetTimeout)?;
 
         // Clear PRC (RW1C: write 1 to clear) so a future poll doesn't
-        // see a stale change bit. Write current value with PRC set —
-        // PRC is the only RW1C bit we want cleared right now.
+        // see a stale change bit. Neutral value plus PRC — in
+        // particular PED, now 1 after the reset, must NOT be echoed:
+        // writing it back as 1 disables the port.
         let cur2 = self.read_portsc(port_idx);
-        let clear = (cur2 & !regs::PORTSC_RW1C_MASK) | regs::PORTSC_PRC;
+        let clear = regs::portsc_neutral(cur2) | regs::PORTSC_PRC;
         // SAFETY: as above.
         unsafe {
             core::ptr::write_volatile(portsc_addr as *mut u32, clear);
