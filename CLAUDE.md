@@ -286,6 +286,7 @@ make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only
 make img-aarch64                 # AArch64 FAT image only
 make disk-img                    # 64 MiB raw backing for virtio-blk (idempotent; `make run` depends on it)
+make img-usb [PROFILE=headless]  # bare-metal USB image: iso_root + the signed manifest for PROFILE (headless = text shell on the framebuffer console; framebuffer-fallback = scanout-limine + compositor + terminal-window, keyboard via usb-host HID). `make usb DEVICE=/dev/diskN PROFILE=…` writes it.
 
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols

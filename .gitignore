@@ -53,3 +53,4 @@ manifest.bin
 manifest-aarch64.bin
 manifest-riscv64.bin
 manifest-headless.bin
+manifest-framebuffer-fallback.bin
