@@ -24,7 +24,7 @@ pub mod fbcon;
 use core::fmt;
 #[cfg(target_arch = "x86_64")]
 use uart_16550::SerialPort;
-use crate::IrqSpinlock;
+use crate::Spinlock;
 
 // ============================================================================
 // x86_64: uart_16550 (port I/O)
@@ -34,12 +34,15 @@ use crate::IrqSpinlock;
 ///
 /// Initialized once during boot via `init()`. All subsequent access
 /// (print!, println!) goes through `lock()`.
-/// `IrqSpinlock`: `println!` runs from syscall, boot, and exception
-/// context alike, and an interrupt landing on the CPU that holds the
-/// console while its handler also prints would deadlock a plain
-/// spinlock. Interrupts are masked for the duration of one print.
+/// Plain `Spinlock`, deliberately: interrupt handlers never call
+/// `print` — they use [`try_print`], which drops output rather than
+/// spin — so a handler landing on the CPU that holds the console cannot
+/// deadlock on it. (An interrupt-masking lock was tried on the Dell
+/// 3630, 2026-10-22, and the boot froze mid-print; keeping interrupts
+/// live during the slow real-hardware serial + framebuffer writes is
+/// the known-good configuration.)
 #[cfg(target_arch = "x86_64")]
-static SERIAL1: IrqSpinlock<Option<SerialPort>> = IrqSpinlock::new(None);
+static SERIAL1: Spinlock<Option<SerialPort>> = Spinlock::new(None);
 
 // ============================================================================
 // AArch64: PL011 UART (MMIO)
@@ -99,7 +102,7 @@ const PL011_PHYS_BASE: u64 = 0x0900_0000;
 
 /// Global PL011 serial port, spinlock-protected for multicore safety.
 #[cfg(target_arch = "aarch64")]
-static SERIAL1: IrqSpinlock<Option<Pl011>> = IrqSpinlock::new(None);
+static SERIAL1: Spinlock<Option<Pl011>> = Spinlock::new(None);
 
 // ============================================================================
 // RISC-V: NS16550-compatible UART (MMIO, 8-bit registers)
@@ -171,7 +174,7 @@ const NS16550_PHYS_BASE: u64 = 0x1000_0000;
 
 /// Global NS16550 serial port, spinlock-protected for multicore safety.
 #[cfg(target_arch = "riscv64")]
-static SERIAL1: IrqSpinlock<Option<Ns16550>> = IrqSpinlock::new(None);
+static SERIAL1: Spinlock<Option<Ns16550>> = Spinlock::new(None);
 
 /// Initialize the I/O subsystem
 ///
@@ -211,9 +214,9 @@ pub unsafe fn init() {
 
 /// Print to the console: the serial port, then the framebuffer mirror.
 ///
-/// The two sinks have independent `IrqSpinlock`s and are never held
-/// together — the serial guard is dropped before the framebuffer
-/// console is taken.
+/// The two sinks have independent locks and are never held together —
+/// the serial guard is dropped before the framebuffer console is taken.
+/// Never call from interrupt context; use [`try_print`] there.
 pub fn print(args: fmt::Arguments) {
     use core::fmt::Write;
     {

@@ -552,10 +552,12 @@ impl Scheduler {
                 if let Some(task) = self.get_task(next_task) {
                     let rsp = task.saved_rsp;
                     if rsp == 0 {
-                        crate::println!(
-                            "\n!!! ZERO RSP: schedule picked task {} (state={:?}, kstack_top={:#x}, saved_rsp=0) !!!",
+                        // ISR context: best-effort print, never spin on
+                        // the console the interrupted context may hold.
+                        crate::io::try_print(format_args!(
+                            "\n!!! ZERO RSP: schedule picked task {} (state={:?}, kstack_top={:#x}, saved_rsp=0) !!!\n",
                             next_task.slot(), task.state, task.kernel_stack_top
-                        );
+                        ));
                     }
                     rsp
                 } else {
