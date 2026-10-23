@@ -42,7 +42,103 @@ use crate::Spinlock;
 /// live during the slow real-hardware serial + framebuffer writes is
 /// the known-good configuration.)
 #[cfg(target_arch = "x86_64")]
-static SERIAL1: Spinlock<Option<SerialPort>> = Spinlock::new(None);
+static SERIAL1: Spinlock<Option<Com1>> = Spinlock::new(None);
+
+/// HARDWARE: polls of the line-status register before a byte that will
+/// not leave COM1 is declared stuck. At 38400 baud a byte occupies the
+/// line for ~260 µs and a port-I/O read costs ~1-2 µs, so a healthy UART
+/// clears within a few hundred polls; 200 000 polls (~0.2-0.4 s) is a
+/// ceiling only a dead transmitter reaches, after which the sink goes
+/// `Dead` and output is dropped rather than the kernel spinning forever
+/// on its first print before the framebuffer console exists.
+#[cfg(target_arch = "x86_64")]
+const SERIAL_TX_MAX_POLLS: u32 = 200_000;
+
+/// Transmit state of the COM1 sink.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TxState {
+    /// Bytes are leaving the UART within `SERIAL_TX_MAX_POLLS`.
+    Live,
+    /// A byte never left; every later write is dropped.
+    Dead,
+}
+
+/// COM1 with a bounded transmit: the UART crate's own `send` spins
+/// unboundedly on the transmit-holding-register-empty bit, which is a
+/// hang on a port that decodes but never drains.
+#[cfg(target_arch = "x86_64")]
+pub struct Com1 {
+    port: SerialPort,
+    state: TxState,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Com1 {
+    fn send(&mut self, byte: u8) {
+        if self.state == TxState::Dead {
+            return;
+        }
+        for _ in 0..SERIAL_TX_MAX_POLLS {
+            if self.port.try_send_raw(byte).is_ok() {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        self.state = TxState::Dead;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl fmt::Write for Com1 {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            self.send(byte);
+        }
+        Ok(())
+    }
+}
+
+/// Whether COM1 answered the probe but then never accepted a byte.
+/// Distinguishes "no UART" from "UART present, transmitter dead" in the
+/// boot log once the framebuffer console is up.
+#[cfg(target_arch = "x86_64")]
+pub fn serial_tx_dead() -> bool {
+    SERIAL1
+        .lock()
+        .as_ref()
+        .is_some_and(|c| c.state == TxState::Dead)
+}
+
+/// HARDWARE: legacy COM1 base I/O port (PC/AT convention).
+#[cfg(target_arch = "x86_64")]
+const COM1_BASE: u16 = 0x3F8;
+
+/// Probe for a 16550-class UART at `base` via its scratch register
+/// (base + 7): a real UART stores and returns an arbitrary byte, while
+/// an undecoded port returns the same floating value (0xFF or 0x00)
+/// regardless of what was written. Two complementary patterns rule
+/// out a stuck line matching one of them by accident. The scratch
+/// register has no side effects on the UART, so probing is safe before
+/// `SerialPort::init`.
+#[cfg(target_arch = "x86_64")]
+fn probe_16550(base: u16) -> bool {
+    // SAFETY: base + 7 is the 16550 scratch register of the port the
+    // caller is about to drive; reads and writes to it change no UART
+    // state and are harmless if nothing decodes the address.
+    let scratch = unsafe { crate::arch::x86_64::portio::Port8::new(base + 7) };
+    scratch.write(0xA5);
+    let first = scratch.read();
+    scratch.write(0x5A);
+    let second = scratch.read();
+    first == 0xA5 && second == 0x5A
+}
+
+/// Whether `init` found a serial port to drive. Lets the boot log
+/// record a missing COM1 once the framebuffer console is up.
+pub fn serial_present() -> bool {
+    SERIAL1.lock().is_some()
+}
 
 // ============================================================================
 // AArch64: PL011 UART (MMIO)
@@ -184,11 +280,21 @@ pub unsafe fn init() {
     #[cfg(target_arch = "x86_64")]
     {
         let mut guard = SERIAL1.lock();
-        // SAFETY: 0x3F8 is the standard COM1 I/O port address.
-        // Called once during single-core boot.
-        let mut port = unsafe { SerialPort::new(0x3f8) };
-        port.init();
-        *guard = Some(port);
+        // Only drive a UART that answers. A board with COM1 disabled
+        // in firmware (or no SuperIO at all) returns whatever the bus
+        // floats to on these ports; if the line-status register reads
+        // as "never ready", the blocking transmit loop below spins on
+        // the very first byte, before the framebuffer console exists,
+        // and the machine looks dead. The Dell 3630 did exactly that
+        // with COM1 disabled (2026-10-22).
+        if probe_16550(COM1_BASE) {
+            // SAFETY: COM1_BASE is the standard COM1 I/O port address and
+            // the probe above confirmed a 16550-class UART decodes it.
+            // Called once during single-core boot.
+            let mut port = unsafe { SerialPort::new(COM1_BASE) };
+            port.init();
+            *guard = Some(Com1 { port, state: TxState::Live });
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -358,7 +464,7 @@ pub trait OutputWriter {
 }
 
 #[cfg(target_arch = "x86_64")]
-impl OutputWriter for SerialPort {
+impl OutputWriter for Com1 {
     fn write_byte(&mut self, byte: u8) {
         self.send(byte);
     }

@@ -298,6 +298,12 @@ unsafe extern "C" fn kmain() -> ! {
         Ok((cols, rows)) => println!("[fbcon] console on framebuffer 0: {}x{} cells", cols, rows),
         Err(e) => println!("[fbcon] inactive: {:?}", e),
     }
+    #[cfg(target_arch = "x86_64")]
+    if !cambios_core::io::serial_present() {
+        println!("[io] no COM1 UART answered the probe; serial console disabled");
+    } else if cambios_core::io::serial_tx_dead() {
+        println!("[io] COM1 answered the probe but never accepted a byte; serial console disabled");
+    }
 
     println!();
 

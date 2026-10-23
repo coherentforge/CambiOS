@@ -28,21 +28,59 @@ use crate::descriptors::CcidEndpoints;
 use crate::ring::{CommandRing, EventRing, Erst, TransferRing, Trb};
 
 // ---------------------------------------------------------------------------
-// Bound: poll iteration ceiling for HCRESET / RUN waits
+// Bound: wait budget for controller / port / event transitions
 // ---------------------------------------------------------------------------
 
-/// SCAFFOLDING: poll iterations before declaring an xHCI state
-/// transition timed out. Each iteration calls `sys::yield_now()` so
-/// the wall-clock cost is roughly `iterations × scheduler-tick`
-/// (~10 ms on our 100 Hz timer). 1000 iterations ≈ 10 s, well past
-/// the few-millisecond budget the spec gives HCRST / RUN.
-/// Why: a verifier can reason about bounded loops; an unbounded
-/// `while !ready {}` cannot. The bound holds even under a
-/// degenerate-slow CI host.
-/// Replace when: real-hardware bring-up shows HCRESET completing
-/// reliably under N iterations and we want to tighten the timeout
-/// for faster failure detection.
-const MAX_POLL_ITERATIONS: u32 = 1000;
+/// HARDWARE: wall-clock budget, in scheduler ticks (100 Hz, so 10 ms
+/// each), for any single xHCI transition the driver waits on: HCRST,
+/// RUN/HCH, CNR, BIOS hand-off, port reset, command completion, and
+/// a control/bulk transfer. The slowest of these is a USB2 port reset
+/// — xHCI 1.2 § 4.19.5 holds the port in reset for at least 50 ms
+/// before PRC fires — and USB 2.0 § 9.2.6 allows a device 5 s to
+/// answer a request after reset. 100 ticks = 1 s covers every
+/// controller-side transition with margin; the device-side 5 s case
+/// is a hot-plug concern for later.
+/// Replace when: a real device takes longer than 1 s to answer a
+/// SET_ADDRESS / GET_DESCRIPTOR (the transfer timeout is the one that
+/// would fire first), or the scheduler tick rate changes.
+const POLL_TIMEOUT_TICKS: u64 = 100;
+
+/// SCAFFOLDING: iteration backstop under `POLL_TIMEOUT_TICKS`. Each
+/// iteration is one `sys::yield_now()`; the wall-clock bound above is
+/// what ends a wait in practice, but a verifier wants a loop bound
+/// that holds even if the tick counter stalls. 10^7 yields is minutes
+/// of wall clock, so it never fires before the tick budget on a
+/// working system. The earlier 1000-iteration bound assumed a yield
+/// cost one tick; on the Dell 3630 (2026-10-22) a yield on an idle
+/// CPU returns in microseconds, so port reset timed out after ~1 ms
+/// against a 50 ms hardware minimum.
+/// Replace when: the driver sleeps on a timer instead of yielding
+/// (then a deadline needs no iteration backstop at all).
+const MAX_POLL_ITERATIONS: u32 = 10_000_000;
+
+/// A bounded wait: expires when either `POLL_TIMEOUT_TICKS` of wall
+/// clock have elapsed since construction or `MAX_POLL_ITERATIONS`
+/// checks have been made, whichever comes first.
+struct Deadline {
+    start_tick: u64,
+    checks: u32,
+}
+
+impl Deadline {
+    fn start() -> Self {
+        Self { start_tick: sys::get_time(), checks: 0 }
+    }
+
+    /// One poll step. Returns `true` while the budget remains. Call
+    /// once per loop iteration, before the condition check.
+    fn tick(&mut self) -> bool {
+        if self.checks >= MAX_POLL_ITERATIONS {
+            return false;
+        }
+        self.checks += 1;
+        sys::get_time().wrapping_sub(self.start_tick) < POLL_TIMEOUT_TICKS
+    }
+}
 /// SCAFFOLDING: ceiling on scratchpad pages honored. HCSPARAMS2 can
 /// express up to 1023; the Dell 3630's controller asks for 65, Linux
 /// sees ≤ 32 on most parts. 256 pages (1 MiB of DMA) bounds the single
@@ -174,7 +212,7 @@ const USBLEGCTLSTS_SMI_EVENTS: u32 = 0x7 << 29;
 /// doing — the Dell Precision 3630's first boot froze mid-print at
 /// exactly that point (2026-10-22). QEMU's xhci has no legacy
 /// capability, so this path was never exercised before. Idempotent;
-/// bounded by `MAX_XECP_ENTRIES` + `MAX_POLL_ITERATIONS`.
+/// bounded by `MAX_XECP_ENTRIES` + one `Deadline` per hand-off wait.
 ///
 /// `mmio_vaddr` must cover the Extended Capability list (the whole BAR
 /// is mapped at the call site).
@@ -196,7 +234,7 @@ pub fn bios_handoff(mmio_vaddr: u64, cap: &XhciCapabilities) -> Handoff {
             // SAFETY: same register; setting the OS Owned Semaphore is
             // the documented request for ownership.
             unsafe { core::ptr::write_volatile(p as *mut u32, header | USBLEGSUP_OS_OWNED) };
-            let released = XhciController::poll_until(MAX_POLL_ITERATIONS, || {
+            let released = XhciController::poll_until(|| {
                 // SAFETY: same register, volatile read.
                 let v = unsafe { core::ptr::read_volatile(p as *const u32) };
                 v & USBLEGSUP_BIOS_OWNED == 0
@@ -675,7 +713,7 @@ impl XhciController {
 
         // Wait for PRC (Port Reset Change) — the controller sets PRC
         // when its internal reset finishes. PED then transitions to 1.
-        Self::poll_until(MAX_POLL_ITERATIONS, || {
+        Self::poll_until(|| {
             self.read_portsc(port_idx) & regs::PORTSC_PRC != 0
         })
         .ok_or(XhciError::PortResetTimeout)?;
@@ -738,7 +776,8 @@ impl XhciController {
     /// is updated when polling completes (or after each consumed
     /// event, whichever comes first — here we batch on completion).
     fn wait_for_command_completion(&mut self, cmd_paddr: u64) -> Result<Trb, XhciError> {
-        for _ in 0..MAX_POLL_ITERATIONS {
+        let mut deadline = Deadline::start();
+        while deadline.tick() {
             if let Some(event) = self.event_ring.poll_next() {
                 let trb_type = ((event.control >> 10) & 0x3F) as u8;
                 if trb_type == trb_type::COMMAND_COMPLETION_EVENT
@@ -1530,7 +1569,8 @@ impl XhciController {
         &mut self,
         expected_trb_paddr: u64,
     ) -> Result<Trb, XhciError> {
-        for _ in 0..MAX_POLL_ITERATIONS {
+        let mut deadline = Deadline::start();
+        while deadline.tick() {
             if let Some(event) = self.event_ring.poll_next() {
                 let trb_type_ = ((event.control >> 10) & 0x3F) as u8;
                 if trb_type_ == trb_type::TRANSFER_EVENT
@@ -1596,7 +1636,7 @@ impl XhciController {
                 cur & !regs::USBCMD_RUN,
             );
         }
-        Self::poll_until(MAX_POLL_ITERATIONS, || {
+        Self::poll_until(|| {
             // SAFETY: as above.
             let sts = unsafe {
                 core::ptr::read_volatile((op_vaddr + regs::USBSTS as u64) as *const u32)
@@ -1613,7 +1653,7 @@ impl XhciController {
                 regs::USBCMD_HCRST,
             );
         }
-        Self::poll_until(MAX_POLL_ITERATIONS, || {
+        Self::poll_until(|| {
             // SAFETY: as above.
             let cmd = unsafe {
                 core::ptr::read_volatile((op_vaddr + regs::USBCMD as u64) as *const u32)
@@ -1623,7 +1663,7 @@ impl XhciController {
         .ok_or(XhciError::ResetTimeout)?;
 
         // Wait for Controller Not Ready to clear.
-        Self::poll_until(MAX_POLL_ITERATIONS, || {
+        Self::poll_until(|| {
             // SAFETY: as above.
             let sts = unsafe {
                 core::ptr::read_volatile((op_vaddr + regs::USBSTS as u64) as *const u32)
@@ -1644,7 +1684,7 @@ impl XhciController {
                 cur | regs::USBCMD_RUN,
             );
         }
-        Self::poll_until(MAX_POLL_ITERATIONS, || {
+        Self::poll_until(|| {
             // SAFETY: as above.
             let sts = unsafe {
                 core::ptr::read_volatile((op_vaddr + regs::USBSTS as u64) as *const u32)
@@ -1786,11 +1826,12 @@ impl XhciController {
         }
     }
 
-    /// Bounded poll for a condition. Calls `cond` up to `max` times,
-    /// yielding between attempts. Returns `Some(())` if `cond` ever
-    /// returned `true`; `None` if the iteration budget was exhausted.
-    fn poll_until<F: FnMut() -> bool>(max: u32, mut cond: F) -> Option<()> {
-        for _ in 0..max {
+    /// Bounded poll for a condition: checks `cond` until it holds or
+    /// a [`Deadline`] expires, yielding between attempts. Returns
+    /// `Some(())` if `cond` ever returned `true`; `None` on timeout.
+    fn poll_until<F: FnMut() -> bool>(mut cond: F) -> Option<()> {
+        let mut deadline = Deadline::start();
+        while deadline.tick() {
             if cond() {
                 return Some(());
             }
