@@ -1221,6 +1221,18 @@ usb: img-usb
 	@echo "Writing $(IMG_USB) to $(DEVICE) (this may take a minute)..."
 	sudo dd if=$(IMG_USB) of=$(DEVICE) bs=1M
 	sync
+	# The image's GPT backup header sits at the $(IMG_USB_SIZE_MB) MiB mark.
+	# A real stick is larger, so after dd the backup header is not in the
+	# device's last sector — a layout some firmware (Dell UEFI, observed
+	# 2026-10-22 on a Precision 3630) treats as a corrupt GPT and silently
+	# refuses to list as a boot device. QEMU's edk2 tolerated it because
+	# the virtual disk was exactly image-sized. Relocate the backup
+	# header + table to the end of the actual device (`sgdisk -e`) and
+	# re-verify the table before ejecting.
+	@echo "Relocating the GPT backup header to the end of $(DEVICE)..."
+	sudo sgdisk -e $(DEVICE)
+	sync
+	sudo sgdisk -v $(DEVICE)
 	@echo "Ejecting $(DEVICE)..."
 	@diskutil eject $(DEVICE) 2>/dev/null || true
 	@echo ""
@@ -1237,12 +1249,19 @@ verify-usb:
 		echo "ERROR: $(IMG_USB) not found. Run 'make img-usb' first."; \
 		exit 1; \
 	fi
-	@echo "Reading $(IMG_USB_SIZE_MB) MiB from $(DEVICE)..."
+	@echo "Reading the ESP ($(ESP_SIZE_MB) MiB at +1 MiB) from $(DEVICE)..."
 	@diskutil unmountDisk $(DEVICE) 2>/dev/null || true
-	sudo dd if=$(DEVICE) of=/tmp/cambios-usb-readback.img bs=1M count=$(IMG_USB_SIZE_MB) status=progress
+	# ESP payload only (1 MiB .. 1 + ESP_SIZE_MB MiB): `make usb` relocates
+	# the GPT backup header to the end of the device, which rewrites the
+	# primary header's backup pointer + CRC in sector 1, so a whole-image
+	# compare would always fail on a correctly written stick. The partition
+	# table itself is checked by `sgdisk -v` below.
+	sudo dd if=$(DEVICE) of=/tmp/cambios-usb-readback.img bs=1M skip=1 count=$(ESP_SIZE_MB) status=progress
+	dd if=$(IMG_USB) of=/tmp/cambios-usb-expected.img bs=1M skip=1 count=$(ESP_SIZE_MB) status=none
+	sudo sgdisk -v $(DEVICE)
 	@echo "Comparing to $(IMG_USB)..."
-	@if cmp -s /tmp/cambios-usb-readback.img $(IMG_USB); then \
-		echo "✓ USB matches source image (verified $(IMG_USB_SIZE_MB) MiB)"; \
+	@if cmp -s /tmp/cambios-usb-readback.img /tmp/cambios-usb-expected.img; then \
+		echo "✓ USB ESP matches source image (verified $(ESP_SIZE_MB) MiB)"; \
 		rm -f /tmp/cambios-usb-readback.img; \
 	else \
 		echo "✗ MISMATCH: USB does not match $(IMG_USB)"; \
