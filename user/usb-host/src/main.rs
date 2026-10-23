@@ -220,7 +220,10 @@ fn run_b3(ctl: &mut xhci::XhciController) {
     use xhci::regs::{PORTSC_CCS, PORTSC_PED, PORTSC_PP, PORTSC_PR,
                      PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT};
 
-    // Step 1: walk the root hub ports, log each.
+    // Step 1: let connect detection settle, then walk the root hub
+    // ports, logging each.
+    sys::print(b"[USB-HOST] settling ports (connect debounce)\n");
+    ctl.settle_ports();
     let max_ports = ctl.cap.max_ports;
     sys::print(b"[USB-HOST] port enumeration:\n");
     let mut first_connected: Option<u8> = None;

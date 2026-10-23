@@ -58,17 +58,34 @@ const POLL_TIMEOUT_TICKS: u64 = 100;
 /// (then a deadline needs no iteration backstop at all).
 const MAX_POLL_ITERATIONS: u32 = 10_000_000;
 
-/// A bounded wait: expires when either `POLL_TIMEOUT_TICKS` of wall
-/// clock have elapsed since construction or `MAX_POLL_ITERATIONS`
-/// checks have been made, whichever comes first.
+/// HARDWARE: ticks to let root-hub ports settle after the controller
+/// starts before the first port scan. USB 2.0 § 7.1.7.3 gives a
+/// connection a 100 ms debounce (T_DCNN) after port power before CCS
+/// is trustworthy; 20 ticks = 200 ms covers that plus the
+/// controller's own post-reset port power-up. Without this the scan
+/// ran microseconds after RUN and saw no device on a machine with
+/// three plugged in (the Dell 3630, 2026-10-22) — it had only ever
+/// worked because seven lines of serial logging at 38400 baud
+/// happened to take ~100 ms.
+const PORT_CONNECT_SETTLE_TICKS: u64 = 20;
+
+/// A bounded wait: expires when either its tick budget of wall clock
+/// has elapsed since construction or `MAX_POLL_ITERATIONS` checks
+/// have been made, whichever comes first.
 struct Deadline {
     start_tick: u64,
+    budget_ticks: u64,
     checks: u32,
 }
 
 impl Deadline {
+    /// The standard transition budget, `POLL_TIMEOUT_TICKS`.
     fn start() -> Self {
-        Self { start_tick: sys::get_time(), checks: 0 }
+        Self::for_ticks(POLL_TIMEOUT_TICKS)
+    }
+
+    fn for_ticks(budget_ticks: u64) -> Self {
+        Self { start_tick: sys::get_time(), budget_ticks, checks: 0 }
     }
 
     /// One poll step. Returns `true` while the budget remains. Call
@@ -78,7 +95,7 @@ impl Deadline {
             return false;
         }
         self.checks += 1;
-        sys::get_time().wrapping_sub(self.start_tick) < POLL_TIMEOUT_TICKS
+        sys::get_time().wrapping_sub(self.start_tick) < self.budget_ticks
     }
 }
 /// SCAFFOLDING: ceiling on scratchpad pages honored. HCSPARAMS2 can
@@ -679,6 +696,15 @@ impl XhciController {
     // -----------------------------------------------------------------
     // B-iii: port enumeration
     // -----------------------------------------------------------------
+
+    /// Let the root-hub ports settle for `PORT_CONNECT_SETTLE_TICKS`
+    /// so the first scan sees devices that were already plugged in.
+    pub fn settle_ports(&self) {
+        let mut deadline = Deadline::for_ticks(PORT_CONNECT_SETTLE_TICKS);
+        while deadline.tick() {
+            sys::yield_now();
+        }
+    }
 
     /// Read PORTSC for the given 0-indexed port (spec port N+1).
     pub fn read_portsc(&self, port_idx: u8) -> u32 {
