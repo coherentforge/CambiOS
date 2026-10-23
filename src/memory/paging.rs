@@ -170,6 +170,55 @@ pub fn unmap_page(
     })
 }
 
+/// How [`claim_mmio_page`] obtained the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioClaim {
+    /// The page was unmapped; a fresh uncacheable mapping was created.
+    Mapped,
+    /// Something had mapped the page earlier with unknown attributes
+    /// (the Reserved-region sweep, or firmware tables); it was unmapped
+    /// and remapped uncacheable + writable.
+    Remapped,
+}
+
+/// Claim a 4 KiB device-register page for the kernel at `virt_addr`:
+/// guarantee it is mapped to `phys_addr` with [`flags::kernel_mmio`]
+/// (present, writable, uncacheable, no-execute), whatever mapping may
+/// already exist.
+///
+/// Device registers must never be reached through a cacheable
+/// mapping — Intel leaves APIC access with any memory type but UC
+/// undefined, and on the Dell Precision 3630 (2026-10-22) a cached read
+/// of the Local APIC hung the core: the page had already been mapped
+/// cacheable by the boot-time Reserved-region sweep, and the APIC driver
+/// used that mapping because `map_page` reported `AlreadyMapped`. This
+/// is the one primitive drivers use for their MMIO pages so that case
+/// is handled in one place.
+///
+/// Returns `NotMapped` if the existing mapping cannot be torn down at
+/// 4 KiB granularity (a huge page covers it) — the caller reports it as
+/// its typed init error rather than touching the device.
+///
+/// SMP note: performs a local TLB flush only; call during single-
+/// threaded boot (every current caller) or follow with a shootdown.
+pub fn claim_mmio_page(
+    page_table: &mut OffsetPageTable,
+    virt_addr: u64,
+    phys_addr: u64,
+    frame_alloc: &mut FrameAllocator,
+) -> Result<MmioClaim, PagingError> {
+    let flags = flags::kernel_mmio();
+    match map_page(page_table, virt_addr, phys_addr, flags, frame_alloc) {
+        Ok(()) => Ok(MmioClaim::Mapped),
+        Err(PagingError::AlreadyMapped) => {
+            unmap_page(page_table, virt_addr)?;
+            map_page(page_table, virt_addr, phys_addr, flags, frame_alloc)?;
+            Ok(MmioClaim::Remapped)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Map a contiguous range of virtual pages to contiguous physical frames.
 ///
 /// Maps `count` 4 KiB pages starting at `virt_base` → `phys_base`.
@@ -410,6 +459,17 @@ pub mod flags {
     /// User data: present, writable, user-accessible
     pub fn user_rw() -> PageTableFlags {
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
+    }
+
+    /// Kernel MMIO: present, writable, uncacheable (NO_CACHE +
+    /// WRITE_THROUGH), never executable. The only attribute set device
+    /// registers may be reached through — see [`super::claim_mmio_page`].
+    pub fn kernel_mmio() -> PageTableFlags {
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::WRITE_THROUGH
+            | PageTableFlags::NO_EXECUTE
     }
 
     /// User MMIO: present, writable, user-accessible, uncacheable (NO_CACHE).

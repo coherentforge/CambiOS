@@ -1462,7 +1462,18 @@ fn map_acpi_regions(rsdp_phys: u64) {
     use x86_64::structures::paging::PageTableFlags;
 
     let hhdm = cambios_core::hhdm_offset();
-    let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+    // ACPI table regions are RAM: cacheable, read-only. Reserved regions
+    // are memory the firmware declined to describe — on real machines
+    // that includes device register windows (the Local APIC page at
+    // 0xFEE00000 on the Dell Precision 3630), which must never be
+    // reached through a cacheable mapping — so they are mapped
+    // uncacheable, read-only. Drivers that own a page inside such a
+    // region claim it writable through `paging::claim_mmio_page`.
+    let acpi_flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+    let reserved_flags = PageTableFlags::PRESENT
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::WRITE_THROUGH;
 
     let mut fa_guard = FRAME_ALLOCATOR.lock();
 
@@ -1472,7 +1483,7 @@ fn map_acpi_regions(rsdp_phys: u64) {
     // Map the page containing the RSDP (often in BIOS RESERVED area, not in HHDM)
     if rsdp_phys != 0 {
         let page_phys = rsdp_phys & !0xFFF;
-        let _ = paging::map_page(&mut pt, page_phys + hhdm, page_phys, flags, &mut fa_guard);
+        let _ = paging::map_page(&mut pt, page_phys + hhdm, page_phys, reserved_flags, &mut fa_guard);
     }
 
     // Map all ACPI-related and small Reserved regions.
@@ -1489,22 +1500,25 @@ fn map_acpi_regions(rsdp_phys: u64) {
     const MAX_RESERVED_MAP_SIZE: u64 = 1024 * 1024; // 1 MB
     let mut mapped_pages = 0usize;
     for region in cambios_core::boot::info().memory_regions() {
-        let should_map = match region.kind {
-            MemoryRegionKind::AcpiReclaimable | MemoryRegionKind::AcpiNvs => true,
-            MemoryRegionKind::Reserved if region.length <= MAX_RESERVED_MAP_SIZE => true,
-            _ => false,
+        let flags = match region.kind {
+            MemoryRegionKind::AcpiReclaimable | MemoryRegionKind::AcpiNvs => acpi_flags,
+            MemoryRegionKind::Reserved if region.length <= MAX_RESERVED_MAP_SIZE => reserved_flags,
+            _ => continue,
         };
-        if should_map {
-            let base = region.base & !0xFFF;
-            let end = (region.base + region.length + 0xFFF) & !0xFFF;
-            let page_count = ((end - base) / 4096) as usize;
-            for i in 0..page_count {
-                let phys = base + (i as u64) * 4096;
-                // Ignore AlreadyMapped — page may overlap with an existing mapping
-                let _ = paging::map_page(&mut pt, phys + hhdm, phys, flags, &mut fa_guard);
-            }
-            mapped_pages += page_count;
+        let base = region.base & !0xFFF;
+        let end = (region.base + region.length + 0xFFF) & !0xFFF;
+        let page_count = ((end - base) / 4096) as usize;
+        for i in 0..page_count {
+            let phys = base + (i as u64) * 4096;
+            // Ignore AlreadyMapped — page may overlap with an existing mapping
+            let _ = paging::map_page(&mut pt, phys + hhdm, phys, flags, &mut fa_guard);
         }
+        println!(
+            "  {:#x}..{:#x} {} ({} pages, {})",
+            base, end, region.kind.as_str(), page_count,
+            if flags.contains(PageTableFlags::NO_CACHE) { "uncacheable" } else { "cacheable" }
+        );
+        mapped_pages += page_count;
     }
 
     println!("✓ ACPI regions mapped into HHDM ({} pages)", mapped_pages);

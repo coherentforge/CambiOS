@@ -276,31 +276,32 @@ pub unsafe fn detect_and_init() -> Result<(), &'static str> {
     // Extract physical base (bits 12..51, page-aligned)
     let phys_base = apic_base & 0x000F_FFFF_FFFF_F000;
 
-    // Map APIC MMIO page into the kernel page table.
-    // Limine's HHDM only covers RAM from the memory map; device MMIO regions
-    // like the APIC (typically at 0xFEE00000) are not mapped. We must create
-    // the mapping explicitly with uncacheable flags.
+    // Claim the APIC MMIO page in the kernel page table — uncacheable,
+    // writable, whatever mapping may already exist. Limine's HHDM does
+    // not cover device MMIO, but the boot-time Reserved-region sweep may
+    // have mapped this page cacheable + read-only (it did on the Dell
+    // Precision 3630), and the APIC must never be touched through such a
+    // mapping. `claim_mmio_page` remaps in that case.
     let hhdm = crate::hhdm_offset();
     let virt_base = phys_base + hhdm;
     {
-        use x86_64::structures::paging::PageTableFlags;
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_CACHE
-            | PageTableFlags::WRITE_THROUGH;
-
         let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
         // SAFETY: Active page table is the kernel PML4 (single-threaded boot).
-        // phys_base is the APIC MMIO address from the MSR. virt_base is the
-        // HHDM-mapped address. The page may already be mapped (some firmware
-        // configurations), which is reported, not fatal.
+        // phys_base is the APIC MMIO address from the MSR; virt_base is its
+        // HHDM address.
         let mut pt = unsafe { crate::memory::paging::active_page_table() };
-        match crate::memory::paging::map_page(&mut pt, virt_base, phys_base, flags, &mut fa_guard) {
-            Ok(()) => crate::println!("  APIC MMIO mapped: phys={:#x} virt={:#x}", phys_base, virt_base),
-            Err(e) => crate::println!(
-                "  APIC MMIO map at phys={:#x} returned {:?} — using the existing mapping",
-                phys_base, e
+        match crate::memory::paging::claim_mmio_page(&mut pt, virt_base, phys_base, &mut fa_guard) {
+            Ok(claim) => crate::println!(
+                "  APIC MMIO {:?}: phys={:#x} virt={:#x} (uncacheable)",
+                claim, phys_base, virt_base
             ),
+            Err(e) => {
+                crate::println!(
+                    "  APIC MMIO page at phys={:#x} could not be claimed: {} — not touching the APIC",
+                    phys_base, e
+                );
+                return Err("APIC MMIO page could not be claimed uncacheable");
+            }
         }
     }
 

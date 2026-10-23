@@ -159,22 +159,22 @@ pub unsafe fn init(acpi_info: &AcpiInterruptInfo) -> Result<(), &'static str> {
     let hhdm = crate::hhdm_offset();
     let virt_base = phys_base + hhdm;
 
-    // Map the I/O APIC MMIO page into the kernel page table
+    // Claim the I/O APIC MMIO page uncacheable + writable, remapping any
+    // earlier cacheable mapping (the Reserved-region sweep can cover
+    // 0xFEC00000 on real firmware — same hazard as the Local APIC).
     {
-        use x86_64::structures::paging::PageTableFlags;
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_CACHE
-            | PageTableFlags::WRITE_THROUGH;
-
         let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
-        // SAFETY: phys_base is the I/O APIC address from ACPI MADT.
-        // We map it uncached for MMIO access. AlreadyMapped is OK.
-        // active_page_table() reads CR3 which requires ring 0.
+        // SAFETY: phys_base is the I/O APIC address from ACPI MADT;
+        // active_page_table() reads CR3 which requires ring 0; single-
+        // threaded boot.
         let mut pt = unsafe { crate::memory::paging::active_page_table() };
-        let _ = crate::memory::paging::map_page(
-            &mut pt, virt_base, phys_base, flags, &mut fa_guard,
-        );
+        match crate::memory::paging::claim_mmio_page(&mut pt, virt_base, phys_base, &mut fa_guard) {
+            Ok(claim) => crate::println!("  I/O APIC MMIO {:?}: phys={:#x}", claim, phys_base),
+            Err(e) => {
+                crate::println!("  I/O APIC MMIO page at phys={:#x} could not be claimed: {}", phys_base, e);
+                return Err("I/O APIC MMIO page could not be claimed uncacheable");
+            }
+        }
     }
 
     IO_APIC_BASE_VIRT.store(virt_base, Ordering::Release);

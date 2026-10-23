@@ -97,9 +97,9 @@ src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
 src/microkernel/main.rs:967:for-now
 src/microkernel/main.rs:1059:for-now
-src/microkernel/main.rs:2143:deferred
-src/microkernel/main.rs:2172:deferred
-src/microkernel/main.rs:2479:for-now
+src/microkernel/main.rs:2157:deferred
+src/microkernel/main.rs:2186:deferred
+src/microkernel/main.rs:2493:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:994:deferred
 src/process.rs:995:deferred
