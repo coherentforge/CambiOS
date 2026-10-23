@@ -26,6 +26,26 @@ pub const MAX_CPUS: usize = 256;
 /// IA32_GS_BASE MSR — holds the base address for GS segment reads
 const IA32_GS_BASE: u32 = 0xC000_0101;
 
+/// HARDWARE: IA32_PAT MSR index (Intel SDM Vol. 3A § 12.12). Eight
+/// 8-bit entries select the memory type a page-table entry's
+/// PAT/PCD/PWT bits name.
+const IA32_PAT: u32 = 0x277;
+
+/// The BSP's IA32_PAT, captured by `init_bsp` and replicated onto every
+/// AP by `init_ap`. The SDM (Vol. 3A § 12.12.4) requires an identical
+/// PAT on all processors; the bootloader programs the BSP's (Limine:
+/// PAT5 = write-combining, which is how it maps the framebuffer) and
+/// synchronises the APs' MTRRs but not their PAT. An AP left at the
+/// reset default sees PAT5 as write-through, so every framebuffer
+/// store it makes is a separate uncombined bus transaction — a console
+/// scroll from an AP cost ~1 s on the Dell 3630 (2026-10-23).
+static BSP_PAT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The PAT the BSP booted with (0 before `init_bsp`).
+pub fn bsp_pat() -> u64 {
+    BSP_PAT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 // Assembly-visible field offsets (must match #[repr(C)] layout above).
 // Used by `syscall_entry` to access kernel_rsp0 and user_rsp_scratch via GS.
 /// GS-relative offset of `PerCpu.kernel_rsp0`
@@ -206,6 +226,11 @@ pub unsafe fn init_bsp(apic_id: u32) {
     // SAFETY: IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
     unsafe { super::msr::write(IA32_GS_BASE, percpu as u64) };
 
+    // SAFETY: IA32_PAT is a valid architectural MSR on every x86_64
+    // CPU; reading it has no side effects. Single-threaded boot.
+    let pat = unsafe { super::msr::read(IA32_PAT) };
+    BSP_PAT.store(pat, core::sync::atomic::Ordering::Release);
+
     CPU_COUNT.store(1, core::sync::atomic::Ordering::Release);
 }
 
@@ -233,6 +258,18 @@ pub unsafe fn init_ap(cpu_index: usize, apic_id: u32) {
 
     // SAFETY: IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
     unsafe { super::msr::write(IA32_GS_BASE, percpu as u64) };
+
+    // Replicate the BSP's PAT (see `BSP_PAT`). Runs before this AP
+    // touches any WC-mapped memory and before its caches hold lines
+    // from such pages, which is the SDM's precondition for changing
+    // the PAT without a flush.
+    let pat = BSP_PAT.load(core::sync::atomic::Ordering::Acquire);
+    if pat != 0 {
+        // SAFETY: IA32_PAT is a valid architectural MSR; the value is
+        // the one the BSP is already running with, so every memory
+        // type it names is one the platform supports. AP-local, once.
+        unsafe { super::msr::write(IA32_PAT, pat) };
+    }
 
     CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 }

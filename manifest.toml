@@ -224,6 +224,10 @@ depends_on = ["usb-host"]
 [[service]]
 name = "audit-tail"
 system = ["audit-consumer"]
+# Not in the headless (bare-metal bring-up) profile: with no scrollback
+# and no keyboard yet, its event stream pushes the driver bring-up lines
+# off the only console there is.
+profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "shell"

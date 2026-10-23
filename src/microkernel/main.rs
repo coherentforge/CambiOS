@@ -576,6 +576,11 @@ unsafe extern "C" fn kmain() -> ! {
     // ================================================================
     // Start Application Processors (SMP)
     // ================================================================
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "PAT (BSP) = {:#018x}; APs inherit it",
+        cambios_core::arch::x86_64::percpu::bsp_pat()
+    );
     println!("Starting application processors...");
     // SAFETY: All BSP subsystems initialized (GDT, IDT, APIC, scheduler, heap).
     // APs will load the shared IDT, initialize their own GDT/TSS, APIC, and percpu.

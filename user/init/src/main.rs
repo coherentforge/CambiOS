@@ -123,7 +123,9 @@ mod svc {
         // ADR-018 step 8: the kernel auto-starts nothing on a
         // supervised boot — this wave is what brings the system up.
         sys::print(b"[init] manifest parsed; supervising boot wave\n");
+        let wave_start = sys::get_time();
         supervise(&m, &mut eng, init_ep);
+        let wave_ticks = sys::get_time().wrapping_sub(wave_start);
 
         let s = eng.summary();
         sys::print(b"[init] boot wave settled: ");
@@ -134,7 +136,9 @@ mod svc {
         print_num(s.dep_failed as u32);
         sys::print(b" dep-failed, ");
         print_num(s.on_demand as u32);
-        sys::print(b" on-demand\n");
+        sys::print(b" on-demand; ");
+        print_num(wave_ticks as u32);
+        sys::print(b" ticks since init started\n");
 
         // Idle: block on our endpoint and discard. Post-boot traffic
         // (ready pings from on-demand apps, which call ready() like
