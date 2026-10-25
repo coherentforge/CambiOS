@@ -270,4 +270,16 @@ pub mod flags {
     pub fn user_mmio() -> PageFlags {
         PageFlags(PTE_R | PTE_W | PTE_U)
     }
+
+    /// User framebuffer. Same bits as `user_mmio`: base Sv39/Sv48 page
+    /// tables carry no cacheability attribute (that is the optional
+    /// Svpbmt extension), so there is no write-combining to select.
+    /// Deferred: Svpbmt `NC` for framebuffer pages when the backend
+    /// detects the extension.
+    /// Why: no riscv64 target with a framebuffer exists yet.
+    /// Revisit when: a riscv64 board with a framebuffer is a target
+    /// (the JH7110 board).
+    pub fn user_framebuffer() -> PageFlags {
+        user_mmio()
+    }
 }

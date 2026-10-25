@@ -4,7 +4,7 @@
 
 CLAUDE.md:11:eventually
 CLAUDE.md:377:eventually
-CLAUDE.md:393:deferred
+CLAUDE.md:394:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -109,7 +109,7 @@ src/reaper.rs:43:deferred
 src/reaper.rs:65:deferred
 src/scheduler/mod.rs:282:placeholder
 src/scheduler/mod.rs:283:placeholder
-src/syscalls/dispatcher.rs:4185:for-now
+src/syscalls/dispatcher.rs:4187:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO
 src/syscalls/userspace.rs:54:for-now

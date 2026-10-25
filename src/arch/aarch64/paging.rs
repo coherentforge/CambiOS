@@ -301,4 +301,18 @@ pub mod flags {
     pub fn user_mmio() -> PageFlags {
         PageFlags(DESC_AP_EL0 | DESC_UXN | DESC_PXN | DEVICE_MEMORY_FLAG)
     }
+
+    /// User framebuffer. On x86_64 this is write-combining; here it is
+    /// the same device mapping as `user_mmio` because the boot MAIR
+    /// carries only Device and Normal-WB entries, and a framebuffer
+    /// wants Normal Non-cacheable.
+    /// Deferred: a Normal-NC MAIR index (early boot config) selected here.
+    /// Why: no aarch64 target with a framebuffer exists yet; MAIR is
+    /// boot-config, not a flags-module change.
+    /// Revisit when: an aarch64 board with a GOP/ramfb framebuffer is a
+    /// target (the RK3588 board) — same trigger as the framebuffer-console
+    /// mapping in `main.rs`.
+    pub fn user_framebuffer() -> PageFlags {
+        user_mmio()
+    }
 }

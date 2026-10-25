@@ -31,8 +31,21 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 /// PAT/PCD/PWT bits name.
 const IA32_PAT: u32 = 0x277;
 
-/// The BSP's IA32_PAT, captured by `init_bsp` and replicated onto every
-/// AP by `init_ap`. The SDM (Vol. 3A § 12.12.4) requires an identical
+/// HARDWARE: PAT entry index whose memory type the kernel sets to
+/// write-combining (Intel SDM Vol. 3A § 12.12.3, encoding 0x01). Index 1
+/// is selected by a page-table entry with PWT=1, PCD=0 and PAT=0, so a
+/// 4 KiB leaf can name it without the PAT bit — which the `x86_64`
+/// crate reads as HUGE_PAGE on any entry and refuses to unmap. Limine
+/// leaves index 1 at write-through and maps nothing through it, so the
+/// change touches no live mapping; its own write-combining index (5)
+/// stays as it is for the framebuffer mapping the kernel console uses.
+const PAT_INDEX_WC: u32 = 1;
+/// HARDWARE: IA32_PAT memory-type encoding for write-combining.
+const PAT_TYPE_WC: u64 = 0x01;
+
+/// The BSP's IA32_PAT, captured by `init_bsp` (after the index-1
+/// write-combining entry is set) and replicated onto every AP by
+/// `init_ap`. The SDM (Vol. 3A § 12.12.4) requires an identical
 /// PAT on all processors; the bootloader programs the BSP's (Limine:
 /// PAT5 = write-combining, which is how it maps the framebuffer) and
 /// synchronises the APs' MTRRs but not their PAT. An AP left at the
@@ -228,7 +241,16 @@ pub unsafe fn init_bsp(apic_id: u32) {
 
     // SAFETY: IA32_PAT is a valid architectural MSR on every x86_64
     // CPU; reading it has no side effects. Single-threaded boot.
-    let pat = unsafe { super::msr::read(IA32_PAT) };
+    let booted_pat = unsafe { super::msr::read(IA32_PAT) };
+    let shift = PAT_INDEX_WC * 8;
+    let pat = (booted_pat & !(0xFFu64 << shift)) | (PAT_TYPE_WC << shift);
+    if pat != booted_pat {
+        // SAFETY: same MSR; the only entry changed is one no mapping
+        // uses yet (see `PAT_INDEX_WC`), so no cache line holds data
+        // under the old type and the SDM's flush procedure is moot.
+        // Single-threaded boot, before any user framebuffer mapping.
+        unsafe { super::msr::write(IA32_PAT, pat) };
+    }
     BSP_PAT.store(pat, core::sync::atomic::Ordering::Release);
 
     CPU_COUNT.store(1, core::sync::atomic::Ordering::Release);

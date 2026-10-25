@@ -1819,7 +1819,9 @@ impl SyscallDispatcher {
             .allocate_region(num_pages)
             .ok_or(SyscallError::OutOfMemory)?;
 
-        // Map each page with uncacheable (MMIO) flags.
+        // Map each page write-combining: a framebuffer is written as
+        // whole frames, never read back, and has no register semantics
+        // (see `flags::user_framebuffer`).
         let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
         for i in 0..num_pages as u64 {
             let page_vaddr = region_vaddr + i * 4096;
@@ -1835,7 +1837,7 @@ impl SyscallDispatcher {
                     &mut pt,
                     page_vaddr,
                     page_phys,
-                    crate::memory::paging::flags::user_mmio(),
+                    crate::memory::paging::flags::user_framebuffer(),
                     &mut fa_guard,
                 )
                 .map_err(|_| SyscallError::OutOfMemory)?;

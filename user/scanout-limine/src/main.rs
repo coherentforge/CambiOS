@@ -255,7 +255,7 @@ fn handle_frame_ready(state: &mut DriverState, msg: &VerifiedMessage) {
     //   the channel is closed (which we never do in this loop).
     // - state.fb.vaddr is the driver's framebuffer mapping, returned by
     //   sys::map_framebuffer. Valid for `pitch × height` bytes of write
-    //   access (uncacheable MMIO flags) for the kernel's lifetime.
+    //   access (write-combining) for the kernel's lifetime.
     // - Both regions are exactly `scanout.size_bytes` bytes (we sized
     //   the channel to match the framebuffer at RegisterCompositor time)
     //   so the copy stays within both mappings.

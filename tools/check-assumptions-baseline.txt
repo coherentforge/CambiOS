@@ -107,8 +107,8 @@ src/arch/x86_64/ioapic.rs:40:IOAPICVER
 src/arch/x86_64/ioapic.rs:53:DEVICE_VECTOR_BASE
 src/arch/x86_64/percpu.rs:24:MAX_CPUS
 src/arch/x86_64/percpu.rs:27:IA32_GS_BASE
-src/arch/x86_64/percpu.rs:52:PERCPU_KERNEL_RSP0
-src/arch/x86_64/percpu.rs:54:PERCPU_USER_RSP_SCRATCH
+src/arch/x86_64/percpu.rs:65:PERCPU_KERNEL_RSP0
+src/arch/x86_64/percpu.rs:67:PERCPU_USER_RSP_SCRATCH
 src/arch/x86_64/syscall.rs:35:MSR_EFER
 src/arch/x86_64/syscall.rs:36:MSR_STAR
 src/arch/x86_64/syscall.rs:37:MSR_LSTAR

@@ -480,4 +480,19 @@ pub mod flags {
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::NO_CACHE
     }
+
+    /// User framebuffer: present, writable, user-accessible,
+    /// **write-combining** — PWT=1 / PCD=0 selects PAT index 1, which
+    /// `arch::x86_64::percpu::init_bsp` programs to WC on every CPU.
+    /// A scanout driver writes whole frames here; under `user_mmio`
+    /// (uncacheable) every 4-byte store was its own bus transaction and
+    /// a 4 MB frame took on the order of a second on the Dell 3630
+    /// (2026-10-24). Device *registers* must never use this: WC
+    /// reorders and merges stores.
+    pub fn user_framebuffer() -> PageTableFlags {
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITE_THROUGH
+    }
 }
