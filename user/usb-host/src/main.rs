@@ -56,10 +56,10 @@ const USB_HOST_ENDPOINT: u32 = 31;
 /// image nobody owns it and events are dropped.
 const COMPOSITOR_INPUT_ENDPOINT: u32 = 30;
 
-/// `InputEvent.device_id` for the boot keyboard behind this driver.
-/// Cosmetic until the Input Hub assigns ids (ADR-012 Input-2);
-/// distinct from virtio-input's 1-based ids so a mixed QEMU run
-/// tells the two apart.
+/// `InputEvent.device_id` base for boot keyboards behind this driver:
+/// base + device-table index. Cosmetic until the Input Hub assigns
+/// ids (ADR-012 Input-2); distinct from virtio-input's 1-based ids so
+/// a mixed QEMU run tells the two apart.
 const HID_KEYBOARD_DEVICE_ID: u32 = 0x100;
 
 
@@ -229,17 +229,28 @@ fn run() -> ! {
 // B-iii sequence: port enumeration + NoOp + Enable Slot
 // ---------------------------------------------------------------------------
 
+/// A root port the scan found a device on.
+#[derive(Clone, Copy)]
+struct ConnectedPort {
+    port_idx: u8,
+    portsc: u32,
+}
+
 fn run_b3(ctl: &mut xhci::XhciController) {
     use xhci::regs::{PORTSC_CCS, PORTSC_PED, PORTSC_PP, PORTSC_PR,
                      PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT};
 
     // Step 1: let connect detection settle, then walk the root hub
-    // ports, logging each.
+    // ports, logging each and collecting the connected ones. The
+    // table is bounded by the device table: a port beyond it could
+    // not be given a slot anyway.
     sys::print(b"[USB-HOST] settling ports (connect debounce)\n");
     ctl.settle_ports();
     let max_ports = ctl.cap.max_ports;
     sys::print(b"[USB-HOST] port enumeration:\n");
-    let mut first_connected: Option<u8> = None;
+    let mut connected: [Option<ConnectedPort>; xhci::MAX_DEVICES] = [None; xhci::MAX_DEVICES];
+    let mut n_connected = 0usize;
+    let mut overflow = false;
     for i in 0..max_ports {
         let portsc = ctl.read_portsc(i);
         let ccs = portsc & PORTSC_CCS != 0;
@@ -261,40 +272,23 @@ fn run_b3(ctl: &mut xhci::XhciController) {
             log_dec(b"", pr as u32);
             sys::print(b"[USB-HOST]     speed=");
             log_dec(b"", speed as u32);
-            if first_connected.is_none() {
-                first_connected = Some(i);
+            if n_connected < connected.len() {
+                connected[n_connected] = Some(ConnectedPort { port_idx: i, portsc });
+                n_connected += 1;
+            } else {
+                overflow = true;
             }
         }
     }
+    if overflow {
+        sys::print(b"[USB-HOST] more connected ports than device-table entries; later ports skipped\n");
+    }
+    if n_connected == 0 {
+        sys::print(b"[USB-HOST] no connected port; skipping reset + slot ops\n");
+        return;
+    }
 
-    // Step 2: reset the first connected port (if any).
-    let port_idx = match first_connected {
-        Some(idx) => idx,
-        None => {
-            sys::print(b"[USB-HOST] no connected port; skipping reset + slot ops\n");
-            return;
-        }
-    };
-
-    sys::print(b"[USB-HOST] resetting port ");
-    log_dec(b"", (port_idx + 1) as u32);
-    let port_speed: u8 = match ctl.reset_port(port_idx) {
-        Ok(post_portsc) => {
-            let ped = post_portsc & PORTSC_PED != 0;
-            let speed = ((post_portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
-            sys::print(b"[USB-HOST]   reset OK; PED=");
-            log_dec(b"", ped as u32);
-            sys::print(b"[USB-HOST]   port speed = ");
-            log_dec(b"", speed as u32);
-            speed
-        }
-        Err(e) => {
-            log_b3_error(b"[USB-HOST] reset_port:", e);
-            return;
-        }
-    };
-
-    // Step 3: NoOp Command smoke test — proves command/event flow
+    // Step 2: NoOp Command smoke test — proves command/event flow
     // independently of slot semantics. xHCI 1.2 § 4.6.2.
     sys::print(b"[USB-HOST] NoOp Command...\n");
     match ctl.noop_command() {
@@ -305,41 +299,90 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     }
 
-    // Step 4: Enable Slot Command → log returned Slot ID.
+    // Step 3: bring up every connected port in turn. A failure on one
+    // device is logged and the next port still gets its turn.
+    for port in connected.iter().flatten() {
+        bring_up_device(ctl, *port);
+    }
+}
+
+/// Reset (USB2) or accept (USB3) the port, give the device a slot and
+/// an address, read its descriptors, and hand it to the class handler
+/// its configuration names. Every failure is logged and returns; the
+/// device stays wherever it got to (a slot with no class handler is
+/// left addressed).
+fn bring_up_device(ctl: &mut xhci::XhciController, port: ConnectedPort) {
+    use xhci::regs::{PORTSC_PED, PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT};
+
+    let port_idx = port.port_idx;
+    let ped = port.portsc & PORTSC_PED != 0;
+    let speed = ((port.portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+    sys::print(b"[USB-HOST] -- device on port ");
+    log_dec(b"", (port_idx + 1) as u32);
+
+    // USB3 ports train their link themselves: PED=1 means enabled and
+    // the speed field is valid, no reset needed (xHCI 1.2 § 4.19.1.2).
+    // USB2 ports need a reset to enable and to learn the speed.
+    let port_speed: u8 = if speed >= 4 {
+        if !ped {
+            sys::print(b"[USB-HOST]   SuperSpeed port not enabled; skipping\n");
+            return;
+        }
+        sys::print(b"[USB-HOST]   SuperSpeed port already enabled; speed = ");
+        log_dec(b"", speed as u32);
+        speed
+    } else {
+        sys::print(b"[USB-HOST] resetting port ");
+        log_dec(b"", (port_idx + 1) as u32);
+        match ctl.reset_port(port_idx) {
+            Ok(post_portsc) => {
+                let ped = post_portsc & PORTSC_PED != 0;
+                let speed = ((post_portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) as u8;
+                sys::print(b"[USB-HOST]   reset OK; PED=");
+                log_dec(b"", ped as u32);
+                sys::print(b"[USB-HOST]   port speed = ");
+                log_dec(b"", speed as u32);
+                speed
+            }
+            Err(e) => {
+                log_b3_error(b"[USB-HOST] reset_port:", e);
+                return;
+            }
+        }
+    };
+
+    // Enable Slot Command → Slot ID.
     sys::print(b"[USB-HOST] Enable Slot Command...\n");
-    match ctl.enable_slot() {
+    let slot_id = match ctl.enable_slot() {
         Ok(slot_id) => {
             sys::print(b"[USB-HOST]   Enable Slot OK; slot_id = ");
             log_dec(b"", slot_id as u32);
-            // B-iv consumes this via XhciController state.
-            ctl.slot_id = Some(slot_id);
+            slot_id
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] enable_slot:", e);
             return;
         }
-    }
+    };
 
-    // Step 5 (B-iv): Address Device — set up Input/Device Contexts +
-    // EP0 transfer ring, install Device Context into DCBAA, issue
-    // Address Device. xHCI 1.2 § 4.6.5.
+    // Address Device — Input/Device Contexts + EP0 transfer ring,
+    // Device Context into DCBAA, SET_ADDRESS on the bus. xHCI 1.2 § 4.6.5.
     sys::print(b"[USB-HOST] Address Device Command...\n");
-    match ctl.address_device(port_idx, port_speed) {
-        Ok(slot_state) => {
+    let dev = match ctl.address_device(slot_id, port_idx, port_speed) {
+        Ok((dev, slot_state)) => {
             sys::print(b"[USB-HOST]   Address Device OK; slot state = ");
             log_dec(b"", slot_state as u32);
+            dev
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] address_device:", e);
             return;
         }
-    }
+    };
 
-    // Step 6 (B-v): GET_DESCRIPTOR(Device) on EP0 — 3-TRB control
-    // transfer (Setup / Data / Status). USB 2.0 § 9.4.3 + xHCI 1.2
-    // § 4.11.2.
+    // GET_DESCRIPTOR(Device) on EP0. USB 2.0 § 9.4.3 + xHCI 1.2 § 4.11.2.
     sys::print(b"[USB-HOST] GET_DESCRIPTOR(Device)...\n");
-    let device_desc = match ctl.get_descriptor_device() {
+    let device_desc = match ctl.get_descriptor_device(dev) {
         Ok(desc) => {
             log_device_descriptor(&desc);
             desc
@@ -350,11 +393,8 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     };
 
-    // Reconcile EP0 Max Packet Size with the device's actual value.
-    // `address_device` set a speed-default (FS=8, HS=64, SS/SS+=512)
-    // because the real value can't be known until GET_DESCRIPTOR
-    // returns. xHCI 1.2 § 4.6.7's Evaluate Context Command updates
-    // the EP0 endpoint context in place.
+    // Reconcile EP0 Max Packet Size with the device's actual value
+    // (xHCI 1.2 § 4.6.7 Evaluate Context).
     let speed_default_mps = match port_speed {
         3 => 64,
         4 | 5 => 512,
@@ -366,7 +406,7 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         log_dec(b"", speed_default_mps as u32);
         sys::print(b"[USB-HOST]                  -> ");
         log_dec(b"", actual_mps as u32);
-        match ctl.evaluate_ep0_context(actual_mps) {
+        match ctl.evaluate_ep0_context(dev, actual_mps) {
             Ok(()) => sys::print(b"[USB-HOST]   Evaluate Context OK\n"),
             Err(e) => {
                 log_b3_error(b"[USB-HOST] evaluate_ep0_context:", e);
@@ -375,12 +415,10 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     }
 
-    // GET_DESCRIPTOR(Configuration): two-pass read of the full nested
-    // descriptor blob (Configuration + Interface + Endpoint + class-
-    // specific). USB 2.0 § 9.4.3.
+    // GET_DESCRIPTOR(Configuration): full nested blob. USB 2.0 § 9.4.3.
     sys::print(b"[USB-HOST] GET_DESCRIPTOR(Configuration)...\n");
     let mut blob = [0u8; xhci::MAX_CONFIG_DESCRIPTOR_SIZE];
-    let blob_len = match ctl.get_descriptor_configuration(&mut blob) {
+    let blob_len = match ctl.get_descriptor_configuration(dev, &mut blob) {
         Ok(n) => {
             sys::print(b"[USB-HOST]   wTotalLength = ");
             log_dec(b"", n as u32);
@@ -392,34 +430,26 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     };
 
-    // Walk the blob for a class this driver speaks. CCID 1.1 § 4:
-    // bInterfaceClass = 0x0B is the smart-card class (bulk pair);
-    // HID 1.11 § 4: class 0x03 / subclass Boot / protocol Keyboard
-    // is a keyboard the host can drive without a report-descriptor
-    // parser (one interrupt IN endpoint).
-    let ccid = match descriptors::find_ccid_interface(&blob[..blob_len]) {
-        Ok(ccid) => {
-            log_ccid_endpoints(&ccid);
-            ccid
-        }
-        Err(_) => {
-            sys::print(b"[USB-HOST]   no CCID interface found in config blob\n");
-            match descriptors::find_hid_boot_keyboard(&blob[..blob_len]) {
-                Ok(kbd) => bring_up_hid_keyboard(ctl, &kbd),
-                Err(_) => {
-                    sys::print(b"[USB-HOST]   no HID boot keyboard interface either; device left addressed\n");
-                }
-            }
-            return;
-        }
-    };
+    // Class dispatch. CCID 1.1 § 4: class 0x0B, bulk pair. HID 1.11
+    // § 4: class 0x03 / Boot / Keyboard, one interrupt IN endpoint.
+    if let Ok(ccid) = descriptors::find_ccid_interface(&blob[..blob_len]) {
+        bring_up_ccid(ctl, dev, &ccid);
+    } else if let Ok(kbd) = descriptors::find_hid_boot_keyboard(&blob[..blob_len]) {
+        bring_up_hid_keyboard(ctl, dev, &kbd);
+    } else {
+        sys::print(b"[USB-HOST]   no class handler for this device; left addressed\n");
+    }
+}
 
-    // SET_CONFIGURATION standard request — 2-TRB no-data control
-    // transfer that puts the device in Configured state. USB 2.0
-    // § 9.4.7.
+/// CCID: configure, then install the bulk IN + OUT endpoints. The
+/// `ccid` service drives them over IPC once boot completes.
+fn bring_up_ccid(ctl: &mut xhci::XhciController, dev: usize, ccid: &descriptors::CcidEndpoints) {
+    log_ccid_endpoints(ccid);
+
+    // SET_CONFIGURATION — puts the device in Configured state. USB 2.0 § 9.4.7.
     sys::print(b"[USB-HOST] SET_CONFIGURATION; bConfigurationValue = ");
     log_dec(b"", ccid.configuration_value as u32);
-    match ctl.set_configuration(ccid.configuration_value) {
+    match ctl.set_configuration(dev, ccid.configuration_value) {
         Ok(()) => sys::print(b"[USB-HOST]   SET_CONFIGURATION OK\n"),
         Err(e) => {
             log_b3_error(b"[USB-HOST] set_configuration:", e);
@@ -427,37 +457,34 @@ fn run_b3(ctl: &mut xhci::XhciController) {
         }
     }
 
-    // Configure Endpoint Command — installs the CCID bulk IN + bulk
-    // OUT endpoint contexts in the Device Context and allocates the
-    // per-endpoint transfer rings. xHCI 1.2 § 4.6.6.
+    // Configure Endpoint — bulk IN + OUT contexts + transfer rings. xHCI 1.2 § 4.6.6.
     sys::print(b"[USB-HOST] Configure Endpoint Command...\n");
-    match ctl.configure_endpoint(&ccid) {
+    match ctl.configure_endpoint(dev, ccid) {
         Ok(slot_state) => {
             sys::print(b"[USB-HOST]   Configure Endpoint OK; slot state = ");
             log_dec(b"", slot_state as u32);
-            if let Some(bulk) = ctl.ccid_bulk.as_ref() {
+            if let Some((in_dci, out_dci)) = ctl.device(dev).ok().and_then(|d| d.ccid_dcis()) {
                 sys::print(b"[USB-HOST]   bulk IN  DCI=");
-                log_dec(b"", bulk.in_dci as u32);
+                log_dec(b"", in_dci as u32);
                 sys::print(b"[USB-HOST]   bulk OUT DCI=");
-                log_dec(b"", bulk.out_dci as u32);
+                log_dec(b"", out_dci as u32);
             }
         }
         Err(e) => {
             log_b3_error(b"[USB-HOST] configure_endpoint:", e);
-            return;
         }
     }
-
-    // CCID semantics + first bulk exchange live in the `user/ccid`
-    // module; usb-host serves bulk OUT / bulk IN requests via the
-    // IPC dispatch in `serve_loop` once boot completes.
 }
 
 /// HID boot keyboard: configure, select Boot Protocol, idle-on-change,
 /// install the interrupt IN endpoint, and queue the first report
 /// transfer. Reports are then collected by `poll_keyboard` from the
 /// serve loop.
-fn bring_up_hid_keyboard(ctl: &mut xhci::XhciController, kbd: &descriptors::HidBootKeyboard) {
+fn bring_up_hid_keyboard(
+    ctl: &mut xhci::XhciController,
+    dev: usize,
+    kbd: &descriptors::HidBootKeyboard,
+) {
     sys::print(b"[USB-HOST]   HID boot keyboard interface found:\n");
     sys::print(b"[USB-HOST]     bInterfaceNumber = ");
     log_dec(b"", kbd.interface_number as u32);
@@ -470,22 +497,22 @@ fn bring_up_hid_keyboard(ctl: &mut xhci::XhciController, kbd: &descriptors::HidB
 
     sys::print(b"[USB-HOST] SET_CONFIGURATION; bConfigurationValue = ");
     log_dec(b"", kbd.configuration_value as u32);
-    if let Err(e) = ctl.set_configuration(kbd.configuration_value) {
+    if let Err(e) = ctl.set_configuration(dev, kbd.configuration_value) {
         log_b3_error(b"[USB-HOST] set_configuration:", e);
         return;
     }
     sys::print(b"[USB-HOST] SET_PROTOCOL(Boot)...\n");
-    if let Err(e) = ctl.set_protocol_boot(kbd.interface_number) {
+    if let Err(e) = ctl.set_protocol_boot(dev, kbd.interface_number) {
         log_b3_error(b"[USB-HOST] set_protocol_boot:", e);
         return;
     }
     sys::print(b"[USB-HOST] SET_IDLE(on change)...\n");
-    if let Err(e) = ctl.set_idle_on_change(kbd.interface_number) {
+    if let Err(e) = ctl.set_idle_on_change(dev, kbd.interface_number) {
         // Optional for a boot keyboard; log and continue without it.
         log_b3_error(b"[USB-HOST] set_idle (ignored):", e);
     }
     sys::print(b"[USB-HOST] Configure Endpoint (interrupt IN)...\n");
-    match ctl.configure_interrupt_in(&kbd.interrupt_in) {
+    match ctl.configure_interrupt_in(dev, &kbd.interrupt_in) {
         Ok(slot_state) => {
             sys::print(b"[USB-HOST]   Configure Endpoint OK; slot state = ");
             log_dec(b"", slot_state as u32);
@@ -495,7 +522,7 @@ fn bring_up_hid_keyboard(ctl: &mut xhci::XhciController, kbd: &descriptors::HidB
             return;
         }
     }
-    match ctl.interrupt_in_submit() {
+    match ctl.interrupt_in_submit(dev) {
         Ok(()) => sys::print(b"[USB-HOST]   keyboard armed; reports go to the input endpoint\n"),
         Err(e) => log_b3_error(b"[USB-HOST] interrupt_in_submit:", e),
     }
@@ -594,11 +621,11 @@ fn log_bringup_error(e: xhci::XhciError) {
         xhci::XhciError::CommandRingFull |
         xhci::XhciError::CommandTimeout |
         xhci::XhciError::CommandFailed(_) |
-        xhci::XhciError::SlotNotEnabled |
         xhci::XhciError::EpNotReady |
         xhci::XhciError::TransferRingFull |
         xhci::XhciError::TransferTimeout |
-        xhci::XhciError::TransferFailed(_) =>
+        xhci::XhciError::TransferFailed(_) |
+        xhci::XhciError::DeviceTableFull =>
             sys::print(b"[USB-HOST] ERROR: unexpected post-bring-up error during bring-up\n"),
     }
 }
@@ -616,14 +643,15 @@ fn log_b3_error(prefix: &[u8], e: xhci::XhciError) {
             sys::print(b" command failed, completion code = ");
             log_dec(b"", code as u32);
         }
-        xhci::XhciError::SlotNotEnabled =>
-            sys::print(b" slot not enabled (Address Device before Enable Slot)\n"),
         xhci::XhciError::EpNotReady =>
             sys::print(b" EP0 not ready (GET_DESCRIPTOR before Address Device)\n"),
         xhci::XhciError::TransferRingFull =>
             sys::print(b" EP0 transfer ring full (Link-wrap unimplemented)\n"),
         xhci::XhciError::TransferTimeout =>
             sys::print(b" transfer timeout (no Transfer Event)\n"),
+        xhci::XhciError::DeviceTableFull => {
+            sys::print(b" device table full\n");
+        }
         xhci::XhciError::TransferFailed(code) => {
             sys::print(b" transfer failed, completion code = ");
             log_dec(b"", code as u32);
@@ -665,11 +693,11 @@ fn log_b3_error(prefix: &[u8], e: xhci::XhciError) {
 //   STATUS_DEVICE_NOT_READY = 4 (no controller / no bulk endpoints)
 //   STATUS_XHCI_ERROR      = 5  (any XhciError; details in serial log)
 //
-// Slot ID is currently always 1 (the single device usb-host knows
-// about), but the field is present from day one so multi-device
-// support doesn't need an ABI change.
-// Revisit when: usb-host enumerates a second attached device and
-// the slot_id field starts carrying non-trivial values.
+// The slot byte is carried but not consulted: usb-host enumerates
+// every connected root port, and routes bulk requests to the one
+// device whose class handler is CCID (`XhciController::ccid_device`).
+// Revisit when: a second CCID-class device is attached at once and
+// the ccid service needs to name which one.
 
 const OP_BULK_OUT: u8 = 0x01;
 const OP_BULK_IN: u8 = 0x02;
@@ -717,15 +745,24 @@ struct KeyboardSession {
     reports_seen: u32,
 }
 
+impl KeyboardSession {
+    fn for_device(ctl: &xhci::XhciController, dev: usize) -> Self {
+        let is_keyboard = ctl.device(dev).map(|d| d.is_keyboard()).unwrap_or(false);
+        Self {
+            pump: if is_keyboard { KeyboardPump::Armed } else { KeyboardPump::Absent },
+            state: hid_kbd::BootKeyboardState::new(),
+            seq: 0,
+            reports_seen: 0,
+        }
+    }
+}
+
 #[allow(unsafe_code)]
 fn serve_loop(ctl: &mut xhci::XhciController) -> ! {
     let mut recv_buf = [0u8; RECV_BUF_SIZE];
-    let mut kbd = KeyboardSession {
-        pump: if ctl.hid_kbd.is_some() { KeyboardPump::Armed } else { KeyboardPump::Absent },
-        state: hid_kbd::BootKeyboardState::new(),
-        seq: 0,
-        reports_seen: 0,
-    };
+    // One session per device-table entry; only keyboards are Armed.
+    let mut sessions: [KeyboardSession; xhci::MAX_DEVICES] =
+        core::array::from_fn(|dev| KeyboardSession::for_device(ctl, dev));
     loop {
         // Anonymous callers (None return path) get silently dropped —
         // no auth, no reply. This is the "no identity, no
@@ -738,8 +775,10 @@ fn serve_loop(ctl: &mut xhci::XhciController) -> ! {
         if let Some(msg) = sys::try_recv_verified(USB_HOST_ENDPOINT, &mut recv_buf) {
             handle_request(ctl, msg.from_endpoint(), msg.payload());
         }
-        if kbd.pump == KeyboardPump::Armed {
-            poll_keyboard(ctl, &mut kbd);
+        for (dev, session) in sessions.iter_mut().enumerate() {
+            if session.pump == KeyboardPump::Armed {
+                poll_keyboard(ctl, dev, session);
+            }
         }
         sys::yield_now();
     }
@@ -747,13 +786,13 @@ fn serve_loop(ctl: &mut xhci::XhciController) -> ! {
 
 /// Collect a completed report, turn it into key transitions, send
 /// each as an ADR-012 `InputEvent`, and re-arm the transfer.
-fn poll_keyboard(ctl: &mut xhci::XhciController, kbd: &mut KeyboardSession) {
+fn poll_keyboard(ctl: &mut xhci::XhciController, dev: usize, kbd: &mut KeyboardSession) {
     use cambios_libinput_proto::{
         encode_event, hid_to_ascii_us, EventType, InputEvent, KeyboardPayload, EVENT_SIZE,
     };
     use hid_kbd::{KeyTransition, BOOT_REPORT_LEN, MAX_TRANSITIONS};
 
-    let report = match ctl.interrupt_in_poll() {
+    let report = match ctl.interrupt_in_poll(dev) {
         Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
@@ -786,7 +825,7 @@ fn poll_keyboard(ctl: &mut xhci::XhciController, kbd: &mut KeyboardSession) {
             kbd.seq = kbd.seq.wrapping_add(1);
             let event = InputEvent::key(
                 event_type,
-                HID_KEYBOARD_DEVICE_ID,
+                HID_KEYBOARD_DEVICE_ID + dev as u32,
                 kbd.seq,
                 sys::get_time(),
                 payload,
@@ -800,7 +839,7 @@ fn poll_keyboard(ctl: &mut xhci::XhciController, kbd: &mut KeyboardSession) {
         }
     }
 
-    if let Err(e) = ctl.interrupt_in_submit() {
+    if let Err(e) = ctl.interrupt_in_submit(dev) {
         log_b3_error(b"[USB-HOST] keyboard re-arm failed; keyboard stopped:", e);
         kbd.pump = KeyboardPump::Dead;
     }
@@ -817,7 +856,7 @@ fn handle_request(
         return;
     }
     let opcode = payload[0];
-    let _slot = payload[1]; // reserved for multi-device (see Revisit-when above)
+    let _slot = payload[1]; // usb-host routes to its one CCID device (see Revisit-when above)
     let rest = &payload[2..];
     match opcode {
         OP_BULK_OUT => handle_bulk_out(ctl, reply_ep, rest),
@@ -836,10 +875,13 @@ fn handle_bulk_out(
         reply_status(reply_ep, STATUS_PAYLOAD_TOO_BIG);
         return;
     }
-    if ctl.ccid_bulk.is_none() {
-        reply_status(reply_ep, STATUS_DEVICE_NOT_READY);
-        return;
-    }
+    let dev = match ctl.ccid_device() {
+        Some(d) => d,
+        None => {
+            reply_status(reply_ep, STATUS_DEVICE_NOT_READY);
+            return;
+        }
+    };
     // Copy payload into a DMA page, then issue bulk OUT.
     let (paddr, vaddr) = match xhci::XhciController::alloc_zeroed_page() {
         Ok(p) => p,
@@ -856,7 +898,7 @@ fn handle_bulk_out(
             core::ptr::write_volatile(dst.add(i), *b);
         }
     }
-    let written = match ctl.bulk_transfer(xhci::BulkDir::Out, paddr, bytes.len() as u32) {
+    let written = match ctl.bulk_transfer(dev, xhci::BulkDir::Out, paddr, bytes.len() as u32) {
         Ok(n) => n,
         Err(_) => {
             reply_status(reply_ep, STATUS_XHCI_ERROR);
@@ -886,10 +928,13 @@ fn handle_bulk_in(
         reply_status(reply_ep, STATUS_PAYLOAD_TOO_BIG);
         return;
     }
-    if ctl.ccid_bulk.is_none() {
-        reply_status(reply_ep, STATUS_DEVICE_NOT_READY);
-        return;
-    }
+    let dev = match ctl.ccid_device() {
+        Some(d) => d,
+        None => {
+            reply_status(reply_ep, STATUS_DEVICE_NOT_READY);
+            return;
+        }
+    };
     let (paddr, vaddr) = match xhci::XhciController::alloc_zeroed_page() {
         Ok(p) => p,
         Err(_) => {
@@ -897,7 +942,7 @@ fn handle_bulk_in(
             return;
         }
     };
-    let actual = match ctl.bulk_transfer(xhci::BulkDir::In, paddr, requested_len as u32) {
+    let actual = match ctl.bulk_transfer(dev, xhci::BulkDir::In, paddr, requested_len as u32) {
         Ok(n) => n as usize,
         Err(_) => {
             reply_status(reply_ep, STATUS_XHCI_ERROR);

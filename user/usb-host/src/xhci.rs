@@ -119,6 +119,12 @@ const MAX_SCRATCHPAD_PAGES: u32 = 256;
 /// CCID, signed-carrier input device + keyboard + mouse + …).
 pub const MAX_SLOTS_ENABLED: u8 = 8;
 
+/// ARCHITECTURAL: one device-table entry per enableable slot. The
+/// controller allocates at most CONFIG.MaxSlotsEn slots, so the table
+/// that keys on them is bounded by the same number; a bigger table
+/// could never fill and a smaller one would strand enabled slots.
+pub const MAX_DEVICES: usize = MAX_SLOTS_ENABLED as usize;
+
 /// SCAFFOLDING: max bytes the driver will read for a single
 /// configuration-descriptor blob (config + nested interface +
 /// endpoint + class-specific descriptors). The USB 2.0 spec gives
@@ -506,9 +512,6 @@ pub enum XhciError {
     /// Command completed with a non-Success completion code.
     /// The inner `u8` carries the actual code (see `completion_code` module).
     CommandFailed(u8),
-    /// Address Device called before Enable Slot — controller has no
-    /// slot ID for the input/device context to live under.
-    SlotNotEnabled,
     /// EP0 control transfer attempted before Address Device set up
     /// the slot's EP0 transfer ring + Device Context.
     EpNotReady,
@@ -520,6 +523,9 @@ pub enum XhciError {
     /// Transfer completed with a non-Success completion code.
     /// The inner `u8` carries the actual code (see `completion_code`).
     TransferFailed(u8),
+    /// Every entry of the device table is in use; the slot the
+    /// controller just enabled cannot be tracked.
+    DeviceTableFull,
 }
 
 // ---------------------------------------------------------------------------
@@ -553,40 +559,49 @@ pub struct XhciController {
     pub command_ring: CommandRing,
     pub event_ring: EventRing,
     pub erst: Erst,
-    /// Slot ID returned by Enable Slot Command (B-iii). Threaded
-    /// forward to B-iv's Address Device + B-v's GET_DESCRIPTOR.
-    pub slot_id: Option<u8>,
-    /// Input Context (xHCI 1.2 § 6.2.5) — scratch structure passed to
-    /// Address Device and Configure Endpoint commands. Single-slot
-    /// today; allocated lazily in `address_device`.
-    /// Revisit when: multi-device discovery lands (B-vi) — these +
-    /// the device context + EP0 ring belong in a slot-indexed table.
-    pub input_context_paddr: Option<u64>,
-    pub input_context_vaddr: Option<u64>,
-    /// Device Context (xHCI 1.2 § 6.2.1) — controller writes here;
-    /// installed in DCBAA at slot_id.
-    pub device_context_paddr: Option<u64>,
-    pub device_context_vaddr: Option<u64>,
-    /// EP0 transfer ring — set up by Address Device, used by B-v
-    /// GET_DESCRIPTOR control transfers.
-    pub ep0_transfer_ring: Option<TransferRing>,
-    /// Root hub port the slot lives on (0-indexed). Populated by
-    /// `address_device`; reused by Configure Endpoint when the Input
-    /// Context's Slot Context needs to be re-filled with current
-    /// state (xHCI 1.2 § 4.6.6 requires A0=1 + Slot Context valid
-    /// when adding endpoints that bump Context Entries).
-    pub port_idx: Option<u8>,
-    /// PORTSC speed field captured at port reset (1=FS, 3=HS,
-    /// 4=SS, 5=SS+). Same purpose as `port_idx`.
-    pub port_speed: Option<u8>,
-    /// CCID bulk endpoint pair (IN + OUT) + their transfer rings,
-    /// installed by Configure Endpoint. Consumed by B-vi.c's first
-    /// bulk transfer.
-    pub ccid_bulk: Option<CcidBulkRings>,
-    /// HID boot-keyboard interrupt IN endpoint, installed by
-    /// `configure_interrupt_in`. Driven asynchronously: one report
-    /// transfer in flight at a time, completed by `interrupt_in_poll`.
-    pub hid_kbd: Option<InterruptInEndpoint>,
+    /// Addressed devices, one per enabled slot. The index is the
+    /// driver's device handle (`dev` in every per-device method); the
+    /// controller's Slot ID lives inside the entry.
+    pub devices: [Option<UsbDevice>; MAX_DEVICES],
+}
+
+/// One addressed USB device: its slot, root port and speed, the Input
+/// and Device Context pages, the EP0 transfer ring, and whatever class
+/// handler claimed it.
+pub struct UsbDevice {
+    pub slot_id: u8,
+    pub port_idx: u8,
+    pub speed: u8,
+    input_context_paddr: u64,
+    input_context_vaddr: u64,
+    device_context_vaddr: u64,
+    /// `Option` so EP0 transfers can move the ring out while the
+    /// event-ring wait borrows the controller; restored on every path.
+    ep0_transfer_ring: Option<TransferRing>,
+    pub class: DeviceClass,
+}
+
+/// What usb-host drives on a device. Exhaustive; one class per device
+/// (a combined receiver's second interface is a later class handler).
+pub enum DeviceClass {
+    /// Addressed and described; no class handler claimed it.
+    Unclassified,
+    Ccid(CcidBulkRings),
+    HidKeyboard(InterruptInEndpoint),
+}
+
+impl UsbDevice {
+    pub fn is_keyboard(&self) -> bool {
+        matches!(self.class, DeviceClass::HidKeyboard(_))
+    }
+
+    /// Bulk IN / OUT DCIs if this is a configured CCID device.
+    pub fn ccid_dcis(&self) -> Option<(u8, u8)> {
+        match &self.class {
+            DeviceClass::Ccid(c) => Some((c.in_dci, c.out_dci)),
+            _ => None,
+        }
+    }
 }
 
 /// One interrupt IN endpoint driven one transfer at a time. The
@@ -721,17 +736,45 @@ impl XhciController {
             command_ring,
             event_ring,
             erst,
-            slot_id: None,
-            input_context_paddr: None,
-            input_context_vaddr: None,
-            device_context_paddr: None,
-            device_context_vaddr: None,
-            ep0_transfer_ring: None,
-            port_idx: None,
-            port_speed: None,
-            ccid_bulk: None,
-            hid_kbd: None,
+            devices: core::array::from_fn(|_| None),
         })
+    }
+
+    /// The device behind handle `dev`.
+    pub fn device(&self, dev: usize) -> Result<&UsbDevice, XhciError> {
+        self.devices
+            .get(dev)
+            .and_then(|d| d.as_ref())
+            .ok_or(XhciError::EpNotReady)
+    }
+
+    fn device_mut(&mut self, dev: usize) -> Result<&mut UsbDevice, XhciError> {
+        self.devices
+            .get_mut(dev)
+            .and_then(|d| d.as_mut())
+            .ok_or(XhciError::EpNotReady)
+    }
+
+    /// Handle of the configured CCID device, if any (the IPC bulk
+    /// requests name no device yet — see main.rs `handle_request`).
+    pub fn ccid_device(&self) -> Option<usize> {
+        self.devices
+            .iter()
+            .position(|d| matches!(d, Some(UsbDevice { class: DeviceClass::Ccid(_), .. })))
+    }
+
+    /// Move the EP0 ring out of `dev` for a transfer; `restore_ep0`
+    /// puts it back. Returns the slot too, since every caller needs it.
+    fn take_ep0(&mut self, dev: usize) -> Result<(u8, TransferRing), XhciError> {
+        let d = self.device_mut(dev)?;
+        let ring = d.ep0_transfer_ring.take().ok_or(XhciError::EpNotReady)?;
+        Ok((d.slot_id, ring))
+    }
+
+    fn restore_ep0(&mut self, dev: usize, ring: TransferRing) {
+        if let Ok(d) = self.device_mut(dev) {
+            d.ep0_transfer_ring = Some(ring);
+        }
     }
 
     /// Read USBSTS as a single u32 — diagnostic helper for the success
@@ -951,13 +994,24 @@ impl XhciController {
     /// `speed` is the PORTSC Speed field value from the post-reset
     /// PORTSC read (1 = FS, 2 = LS, 3 = HS, 4 = SS, 5 = SS+).
     ///
-    /// Returns the post-Address-Device Slot State from the device
-    /// context (2 = Addressed on success). EP0 Max Packet Size is set
+    /// Returns the device handle and the post-Address-Device Slot
+    /// State from the device context (2 = Addressed on success). EP0 Max Packet Size is set
     /// to a speed-appropriate default (FS/LS = 8, HS = 64, SS/SS+ =
     /// 512); B-v's GET_DESCRIPTOR may refine via Evaluate Context if
     /// the device descriptor disagrees.
-    pub fn address_device(&mut self, port_idx: u8, speed: u8) -> Result<u8, XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::SlotNotEnabled)?;
+    pub fn address_device(
+        &mut self,
+        slot_id: u8,
+        port_idx: u8,
+        speed: u8,
+    ) -> Result<(usize, u8), XhciError> {
+        // Claim the table entry before allocating DMA pages so a full
+        // table leaks nothing.
+        let dev = self
+            .devices
+            .iter()
+            .position(|d| d.is_none())
+            .ok_or(XhciError::DeviceTableFull)?;
 
         // Allocate Input Context + Device Context (one page each).
         let (ic_paddr, ic_vaddr) = Self::alloc_zeroed_page()?;
@@ -1050,14 +1104,16 @@ impl XhciController {
         };
         self.submit_command(trb)?;
 
-        // Stash handles for downstream substages.
-        self.input_context_paddr = Some(ic_paddr);
-        self.input_context_vaddr = Some(ic_vaddr);
-        self.device_context_paddr = Some(dc_paddr);
-        self.device_context_vaddr = Some(dc_vaddr);
-        self.ep0_transfer_ring = Some(ep0_ring);
-        self.port_idx = Some(port_idx);
-        self.port_speed = Some(speed);
+        self.devices[dev] = Some(UsbDevice {
+            slot_id,
+            port_idx,
+            speed,
+            input_context_paddr: ic_paddr,
+            input_context_vaddr: ic_vaddr,
+            device_context_vaddr: dc_vaddr,
+            ep0_transfer_ring: Some(ep0_ring),
+            class: DeviceClass::Unclassified,
+        });
 
         // Read back the Device Context's Slot Context DWord 3 to
         // report Slot State. Slot State is bits [31:27]. On success
@@ -1069,7 +1125,7 @@ impl XhciController {
             let dw3 = core::ptr::read_volatile((dc_vaddr + 12) as *const u32);
             ((dw3 >> 27) & 0x1F) as u8
         };
-        Ok(slot_state)
+        Ok((dev, slot_state))
     }
 
     // -----------------------------------------------------------------
@@ -1091,15 +1147,16 @@ impl XhciController {
     /// `length` is the Data Stage transfer length (≤ `wLength`).
     fn control_transfer_in(
         &mut self,
+        dev: usize,
         setup_packet: u64,
         buf_paddr: u64,
         length: u16,
     ) -> Result<(), XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
-        // The EP0 ring lives on `self`; take a brief move-out to enqueue
-        // on it without mutably borrowing the whole controller for the
-        // wait-for-event loop. Restored before return on every path.
-        let mut ring = self.ep0_transfer_ring.take().ok_or(XhciError::EpNotReady)?;
+        // The EP0 ring lives on the device entry; take a brief move-out
+        // to enqueue on it without mutably borrowing the whole
+        // controller for the wait-for-event loop. Restored before
+        // return on every path.
+        let (slot_id, mut ring) = self.take_ep0(dev)?;
 
         // Setup Stage TRB (xHCI 1.2 § 6.4.1.2.1).
         //   parameter : 8-byte SETUP packet (IDT means TRB-resident)
@@ -1153,14 +1210,14 @@ impl XhciController {
         ) {
             (Some(_), Some(_), Some(p)) => p,
             _ => {
-                self.ep0_transfer_ring = Some(ring);
+                self.restore_ep0(dev, ring);
                 return Err(XhciError::TransferRingFull);
             }
         };
 
-        // Restore the ring on self before the wait — wait_for_*
-        // borrows the event ring through &mut self.
-        self.ep0_transfer_ring = Some(ring);
+        // Restore the ring before the wait — wait_for_* borrows the
+        // event ring through &mut self.
+        self.restore_ep0(dev, ring);
 
         // Ring the device's EP0 doorbell. Target = slot_id; value =
         // endpoint ID (1 = DCI 1 = EP0 bidirectional control endpoint).
@@ -1182,7 +1239,7 @@ impl XhciController {
     /// returned `bMaxPacketSize0` against the speed-default used in
     /// `address_device`; mismatch requires `evaluate_ep0_context`
     /// to be issued before subsequent EP0 transfers.
-    pub fn get_descriptor_device(&mut self) -> Result<[u8; 18], XhciError> {
+    pub fn get_descriptor_device(&mut self, dev: usize) -> Result<[u8; 18], XhciError> {
         // Per-transfer DMA buffer alloc (alloc_dma's granularity is
         // one page; we only read 18 bytes from it). EP0 control
         // transfers are infrequent; a buffer pool would be premature
@@ -1203,7 +1260,7 @@ impl XhciController {
             | (0x0100u64 << 16)
             | (0x0012u64 << 48);
 
-        self.control_transfer_in(setup_packet, buf_paddr, 18)?;
+        self.control_transfer_in(dev, setup_packet, buf_paddr, 18)?;
 
         // Copy the 18-byte device descriptor out of the DMA buffer.
         // SAFETY: buf_vaddr is the page we allocated above (still
@@ -1233,6 +1290,7 @@ impl XhciController {
     /// `TransferFailed` so the caller knows to raise the cap.
     pub fn get_descriptor_configuration(
         &mut self,
+        dev: usize,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
         if out.len() < 9 {
@@ -1253,7 +1311,7 @@ impl XhciController {
             | (0x06u64 << 8)
             | (0x0200u64 << 16)
             | (0x0009u64 << 48);
-        self.control_transfer_in(setup_short, buf_paddr, 9)?;
+        self.control_transfer_in(dev, setup_short, buf_paddr, 9)?;
 
         // SAFETY: buf_vaddr is the page we allocated. The 9-byte
         // Configuration Descriptor lives at offset 0; bytes 2-3 hold
@@ -1275,7 +1333,7 @@ impl XhciController {
             | (0x06u64 << 8)
             | (0x0200u64 << 16)
             | ((total_length as u64) << 48);
-        self.control_transfer_in(setup_full, buf_paddr, total_length as u16)?;
+        self.control_transfer_in(dev, setup_full, buf_paddr, total_length as u16)?;
 
         // SAFETY: as above; the page is at least total_length bytes
         // wide because total_length ≤ MAX_CONFIG_DESCRIPTOR_SIZE
@@ -1298,10 +1356,12 @@ impl XhciController {
     /// Drop flags: all zero. The Slot Context region is left zeroed
     /// from `address_device`'s allocation; the controller ignores it
     /// when A0=0.
-    pub fn evaluate_ep0_context(&mut self, new_mps: u16) -> Result<(), XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
-        let ic_paddr = self.input_context_paddr.ok_or(XhciError::EpNotReady)?;
-        let ic_vaddr = self.input_context_vaddr.ok_or(XhciError::EpNotReady)?;
+    pub fn evaluate_ep0_context(&mut self, dev: usize, new_mps: u16) -> Result<(), XhciError> {
+        let (slot_id, ic_paddr, ic_vaddr, ep0_paddr) = {
+            let d = self.device(dev)?;
+            let ring = d.ep0_transfer_ring.as_ref().ok_or(XhciError::EpNotReady)?;
+            (d.slot_id, d.input_context_paddr, d.input_context_vaddr, ring.paddr)
+        };
 
         let ctx_size: u64 = if self.cap.csz { 64 } else { 32 };
 
@@ -1320,16 +1380,12 @@ impl XhciController {
             // EP0 Endpoint Context: same shape as address_device's
             // fill but with the new MPS. CErr=3, EP Type=4 (Control),
             // TR Dequeue Pointer | DCS=1, Avg TRB Length = 8.
-            let ep0_ring = self
-                .ep0_transfer_ring
-                .as_ref()
-                .ok_or(XhciError::EpNotReady)?;
             let ep0 = (ic_vaddr + 2 * ctx_size) as *mut u32;
             let ep0_dw1 =
                 (3u32 << 1)                  // CErr = 3
                 | (4u32 << 3)                // EP Type = Control
                 | ((new_mps as u32) << 16);
-            let dq = ep0_ring.paddr | 0x1;
+            let dq = ep0_paddr | 0x1;
             core::ptr::write_volatile(ep0.add(1), ep0_dw1);
             core::ptr::write_volatile(ep0.add(2), dq as u32);
             core::ptr::write_volatile(ep0.add(3), (dq >> 32) as u32);
@@ -1355,10 +1411,10 @@ impl XhciController {
     /// + Status TRBs are issued; the Status Stage direction is IN.
     fn control_transfer_no_data(
         &mut self,
+        dev: usize,
         setup_packet: u64,
     ) -> Result<(), XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
-        let mut ring = self.ep0_transfer_ring.take().ok_or(XhciError::EpNotReady)?;
+        let (slot_id, mut ring) = self.take_ep0(dev)?;
 
         // Setup Stage TRB: IDT=1, TRT=0 (No Data Stage), Type=2.
         let setup_trb = Trb {
@@ -1388,12 +1444,12 @@ impl XhciController {
         ) {
             (Some(_), Some(p)) => p,
             _ => {
-                self.ep0_transfer_ring = Some(ring);
+                self.restore_ep0(dev, ring);
                 return Err(XhciError::TransferRingFull);
             }
         };
 
-        self.ep0_transfer_ring = Some(ring);
+        self.restore_ep0(dev, ring);
 
         // Doorbell + wait for completion (Status TRB is the only one
         // with IOC=1, so the matching Transfer Event carries its paddr).
@@ -1406,7 +1462,7 @@ impl XhciController {
     /// § 9.4.7). After this completes successfully the device is in
     /// the Configured state and the host can issue Configure
     /// Endpoint to bring up data endpoints.
-    pub fn set_configuration(&mut self, config_value: u8) -> Result<(), XhciError> {
+    pub fn set_configuration(&mut self, dev: usize, config_value: u8) -> Result<(), XhciError> {
         // SETUP packet for SET_CONFIGURATION:
         //   bmRequestType = 0x00 (host-to-device, standard, recipient=device)
         //   bRequest      = 0x09 (SET_CONFIGURATION)
@@ -1417,7 +1473,7 @@ impl XhciController {
             0x00u64
             | (0x09u64 << 8)
             | ((config_value as u64) << 16);
-        self.control_transfer_no_data(setup_packet)
+        self.control_transfer_no_data(dev, setup_packet)
     }
 
     // -----------------------------------------------------------------
@@ -1433,13 +1489,12 @@ impl XhciController {
     /// Returns the post-command Slot State from the Device Context
     /// for logging (3 = Configured on success per xHCI 1.2 § 6.2.2
     /// Slot State enum).
-    pub fn configure_endpoint(&mut self, ccid: &CcidEndpoints) -> Result<u8, XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
-        let ic_paddr = self.input_context_paddr.ok_or(XhciError::EpNotReady)?;
-        let ic_vaddr = self.input_context_vaddr.ok_or(XhciError::EpNotReady)?;
-        let dc_vaddr = self.device_context_vaddr.ok_or(XhciError::EpNotReady)?;
-        let port_idx = self.port_idx.ok_or(XhciError::EpNotReady)?;
-        let speed = self.port_speed.ok_or(XhciError::EpNotReady)?;
+    pub fn configure_endpoint(&mut self, dev: usize, ccid: &CcidEndpoints) -> Result<u8, XhciError> {
+        let (slot_id, ic_paddr, ic_vaddr, dc_vaddr, port_idx, speed) = {
+            let d = self.device(dev)?;
+            (d.slot_id, d.input_context_paddr, d.input_context_vaddr,
+             d.device_context_vaddr, d.port_idx, d.speed)
+        };
 
         // DCI mapping (xHCI 1.2 § 4.5.1): DCI = 2 * ep_num + dir_bit
         // (dir_bit = 1 for IN, 0 for OUT). Endpoint number is the
@@ -1541,8 +1596,7 @@ impl XhciController {
         };
         self.submit_command(trb)?;
 
-        // Stash bulk ring state for downstream substages.
-        self.ccid_bulk = Some(CcidBulkRings {
+        self.device_mut(dev)?.class = DeviceClass::Ccid(CcidBulkRings {
             in_dci: in_dci as u8,
             in_mps,
             in_ring,
@@ -1571,18 +1625,18 @@ impl XhciController {
     /// Boot Protocol, wIndex = interface. HID 1.11 § 7.2.6. Boot
     /// devices start in Report Protocol; this selects the fixed
     /// 8-byte keyboard report.
-    pub fn set_protocol_boot(&mut self, interface: u8) -> Result<(), XhciError> {
+    pub fn set_protocol_boot(&mut self, dev: usize, interface: u8) -> Result<(), XhciError> {
         let setup_packet: u64 = 0x21u64 | (0x0Bu64 << 8) | ((interface as u64) << 32);
-        self.control_transfer_no_data(setup_packet)
+        self.control_transfer_no_data(dev, setup_packet)
     }
 
     /// SET_IDLE(0) on a HID interface: bRequest 0x0A, wValue =
     /// (duration 0 << 8) | report id 0 — report only when the state
     /// changes, so the interrupt endpoint NAKs while nothing is
     /// pressed. HID 1.11 § 7.2.4.
-    pub fn set_idle_on_change(&mut self, interface: u8) -> Result<(), XhciError> {
+    pub fn set_idle_on_change(&mut self, dev: usize, interface: u8) -> Result<(), XhciError> {
         let setup_packet: u64 = 0x21u64 | (0x0Au64 << 8) | ((interface as u64) << 32);
-        self.control_transfer_no_data(setup_packet)
+        self.control_transfer_no_data(dev, setup_packet)
     }
 
     // -----------------------------------------------------------------
@@ -1612,25 +1666,19 @@ impl XhciController {
     /// transfer ring and report buffer. Same shape as the CCID
     /// `configure_endpoint`; the slot must already be Addressed.
     /// Returns the post-command Slot State (3 = Configured).
-    pub fn configure_interrupt_in(&mut self, ep: &EndpointDescriptor) -> Result<u8, XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
-        let ic_paddr = self.input_context_paddr.ok_or(XhciError::EpNotReady)?;
-        let ic_vaddr = self.input_context_vaddr.ok_or(XhciError::EpNotReady)?;
-        let dc_vaddr = self.device_context_vaddr.ok_or(XhciError::EpNotReady)?;
-        let port_idx = self.port_idx.ok_or(XhciError::EpNotReady)?;
-        let speed = self.port_speed.ok_or(XhciError::EpNotReady)?;
+    pub fn configure_interrupt_in(&mut self, dev: usize, ep: &EndpointDescriptor) -> Result<u8, XhciError> {
+        let (slot_id, ic_paddr, ic_vaddr, dc_vaddr, port_idx, speed) = {
+            let d = self.device(dev)?;
+            (d.slot_id, d.input_context_paddr, d.input_context_vaddr,
+             d.device_context_vaddr, d.port_idx, d.speed)
+        };
 
         let dci = (ep.endpoint_number() as u32) * 2 + 1;
         let mps = ep.max_packet_size_bytes().min(INTERRUPT_REPORT_MAX as u16);
         let interval = Self::interrupt_interval_field(speed, ep.interval);
-        // Context Entries must cover every live endpoint; CCID bulk
-        // endpoints, if any, were installed by an earlier command.
-        let existing_max_dci = self
-            .ccid_bulk
-            .as_ref()
-            .map(|b| core::cmp::max(b.in_dci, b.out_dci) as u32)
-            .unwrap_or(1);
-        let max_dci = core::cmp::max(dci, existing_max_dci);
+        // Context Entries must cover every live endpoint. One class per
+        // device, so this endpoint is the only one beyond EP0.
+        let max_dci = dci;
 
         let ring = TransferRing::new().ok_or(XhciError::DmaAllocFailed)?;
         let (buf_paddr, buf_vaddr) = Self::alloc_zeroed_page()?;
@@ -1680,7 +1728,7 @@ impl XhciController {
         };
         self.submit_command(trb)?;
 
-        self.hid_kbd = Some(InterruptInEndpoint {
+        self.device_mut(dev)?.class = DeviceClass::HidKeyboard(InterruptInEndpoint {
             dci: dci as u8,
             mps,
             ring,
@@ -1702,10 +1750,14 @@ impl XhciController {
     /// Queue one report transfer on the interrupt IN endpoint if none
     /// is in flight. Returns immediately; the completion is collected
     /// by `interrupt_in_poll`.
-    pub fn interrupt_in_submit(&mut self) -> Result<(), XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
-        let (dci, trb_paddr) = {
-            let kbd = self.hid_kbd.as_mut().ok_or(XhciError::EpNotReady)?;
+    pub fn interrupt_in_submit(&mut self, dev: usize) -> Result<(), XhciError> {
+        let (slot_id, dci, trb_paddr) = {
+            let d = self.device_mut(dev)?;
+            let slot_id = d.slot_id;
+            let kbd = match &mut d.class {
+                DeviceClass::HidKeyboard(k) => k,
+                _ => return Err(XhciError::EpNotReady),
+            };
             if kbd.in_flight.is_some() {
                 return Ok(());
             }
@@ -1716,7 +1768,7 @@ impl XhciController {
             };
             let paddr = kbd.ring.enqueue(trb).ok_or(XhciError::TransferRingFull)?;
             kbd.in_flight = Some(paddr);
-            (kbd.dci, paddr)
+            (slot_id, kbd.dci, paddr)
         };
         let _ = trb_paddr;
         self.ring_doorbell(slot_id, dci as u32);
@@ -1729,27 +1781,30 @@ impl XhciController {
     /// the synchronous waits drop them. A failed transfer is returned
     /// as `TransferFailed(code)` with the endpoint left idle; the
     /// caller decides whether to re-arm.
-    pub fn interrupt_in_poll(&mut self) -> Result<Option<InterruptReport>, XhciError> {
-        let in_flight = match self.hid_kbd.as_ref() {
-            Some(k) => match k.in_flight {
-                Some(p) => p,
-                None => return Ok(None),
-            },
-            None => return Err(XhciError::EpNotReady),
+    pub fn interrupt_in_poll(&mut self, dev: usize) -> Result<Option<InterruptReport>, XhciError> {
+        let (in_flight, stashed) = {
+            let d = self.device_mut(dev)?;
+            match &mut d.class {
+                DeviceClass::HidKeyboard(k) => match k.in_flight {
+                    Some(p) => (p, k.stashed.take()),
+                    None => return Ok(None),
+                },
+                _ => return Err(XhciError::EpNotReady),
+            }
         };
 
-        let mut completion: Option<Trb> = None;
-        if let Some(stashed) = self.hid_kbd.as_mut().and_then(|k| k.stashed.take()) {
-            completion = Some(stashed);
-        } else {
+        let mut completion: Option<Trb> = stashed;
+        if completion.is_none() {
             while let Some(event) = self.event_ring.poll_next() {
                 let trb_type_ = ((event.control >> 10) & 0x3F) as u8;
                 if trb_type_ == trb_type::TRANSFER_EVENT && event.parameter == in_flight {
                     completion = Some(event);
                     break;
                 }
-                // Anything else arriving while no synchronous wait is
-                // running has no consumer; dropped.
+                // Another device's report completion is kept for its
+                // own poll; anything else arriving while no
+                // synchronous wait is running has no consumer.
+                self.stash_if_interrupt_completion(&event);
             }
             self.write_erdp_to_current();
         }
@@ -1758,7 +1813,10 @@ impl XhciController {
             Some(e) => e,
             None => return Ok(None),
         };
-        let kbd = self.hid_kbd.as_mut().ok_or(XhciError::EpNotReady)?;
+        let kbd = match &mut self.device_mut(dev)?.class {
+            DeviceClass::HidKeyboard(k) => k,
+            _ => return Err(XhciError::EpNotReady),
+        };
         kbd.in_flight = None;
         let code = (event.status >> 24) as u8;
         if code != completion_code::SUCCESS && code != completion_code::SHORT_PACKET {
@@ -1804,11 +1862,11 @@ impl XhciController {
     /// per-transfer DMA-page allocation a measurable cost.
     pub fn bulk_transfer(
         &mut self,
+        dev: usize,
         dir: BulkDir,
         buf_paddr: u64,
         requested_len: u32,
     ) -> Result<u32, XhciError> {
-        let slot_id = self.slot_id.ok_or(XhciError::EpNotReady)?;
 
         // Normal TRB:
         //   parameter : buffer paddr
@@ -1824,15 +1882,20 @@ impl XhciController {
 
         // Enqueue on the requested direction's ring, capture DCI for
         // the doorbell. The inner block releases the &mut borrow on
-        // self.ccid_bulk before we call &mut-self methods below.
-        let (dci, trb_paddr) = {
-            let ccid = self.ccid_bulk.as_mut().ok_or(XhciError::EpNotReady)?;
+        // the device entry before we call &mut-self methods below.
+        let (slot_id, dci, trb_paddr) = {
+            let d = self.device_mut(dev)?;
+            let slot_id = d.slot_id;
+            let ccid = match &mut d.class {
+                DeviceClass::Ccid(c) => c,
+                _ => return Err(XhciError::EpNotReady),
+            };
             let (dci, ring) = match dir {
                 BulkDir::In => (ccid.in_dci, &mut ccid.in_ring),
                 BulkDir::Out => (ccid.out_dci, &mut ccid.out_ring),
             };
             let paddr = ring.enqueue(trb).ok_or(XhciError::TransferRingFull)?;
-            (dci, paddr)
+            (slot_id, dci, paddr)
         };
 
         // Ring the bulk endpoint's doorbell (target = slot_id, value
@@ -1903,9 +1966,12 @@ impl XhciController {
         if trb_type_ != trb_type::TRANSFER_EVENT {
             return;
         }
-        if let Some(kbd) = self.hid_kbd.as_mut() {
-            if kbd.in_flight == Some(event.parameter) {
-                kbd.stashed = Some(*event);
+        for d in self.devices.iter_mut().flatten() {
+            if let DeviceClass::HidKeyboard(kbd) = &mut d.class {
+                if kbd.in_flight == Some(event.parameter) {
+                    kbd.stashed = Some(*event);
+                    return;
+                }
             }
         }
     }
