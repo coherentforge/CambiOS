@@ -689,14 +689,15 @@ pub fn print(args: core::fmt::Arguments) {
 
 /// Best-effort variant for interrupt context: drops the output if the
 /// console is held by another CPU instead of spinning.
-pub fn try_print(args: core::fmt::Arguments) {
+pub fn try_print(args: core::fmt::Arguments) -> bool {
     use core::fmt::Write;
-    let Some(mut con) = FBCON.try_lock() else { return };
+    let Some(mut con) = FBCON.try_lock() else { return false };
     if con.state != State::Active {
-        return;
+        return false;
     }
-    let Some(dev) = con.fb else { return };
+    let Some(dev) = con.fb else { return false };
     let _ = write!(Writer { con: &mut con, dev }, "{}", args);
+    true
 }
 
 /// Mirror a plain string onto the panel (same contract as [`print`]).

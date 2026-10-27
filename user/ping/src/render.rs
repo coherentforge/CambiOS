@@ -73,14 +73,14 @@ const COLOR_WIN_BANNER: Color = Color::rgb(0xFF, 0xC8, 0x80);
 
 // --- top-level ---
 
-pub fn draw(surf: &mut Surface, ping: &Ping) {
+pub fn draw(surf: &mut Surface, ping: &Ping, fps: u32) {
     surf.clear(COLOR_BG);
     draw_court(surf);
     draw_centerline(surf);
     draw_log_paddle(surf, LEFT_PADDLE_X, ping.left_paddle());
     draw_log_paddle(surf, RIGHT_PADDLE_X, ping.right_paddle());
     draw_acorn(surf, ping.ball());
-    draw_status_bar(surf, ping);
+    draw_status_bar(surf, ping, fps);
 
     match ping.state() {
         State::Serving { ticks_remaining, .. } => {
@@ -95,7 +95,7 @@ pub fn draw(surf: &mut Surface, ping: &Ping) {
 
 // --- status bar ---
 
-fn draw_status_bar(surf: &mut Surface, ping: &Ping) {
+fn draw_status_bar(surf: &mut Surface, ping: &Ping, fps: u32) {
     surf.fill_rect(
         Rect { x: 0, y: 0, w: WINDOW_W as u16, h: STATUS_BAR_H },
         COLOR_STATUS_BG,
@@ -109,6 +109,11 @@ fn draw_status_bar(surf: &mut Surface, ping: &Ping) {
     let title_w = title.len() as i32 * 8;
     let title_x = (WINDOW_W as i32 - title_w) / 2;
     surf.draw_text_builtin(title_x, 16, title, COLOR_TITLE);
+
+    // Frames presented over the last 100 ticks (1 s): the number that
+    // says whether a slow game is the game, the pipeline, or the eye.
+    let fps_text = format_fps_label(fps);
+    draw_bytes(surf, title_x + title_w + 24, 16, &fps_text, COLOR_TEXT);
 
     let right_text = format_score_label(b"RIGHT", ping.right_score());
     let right_w = right_text_len(&right_text) as i32 * 8;
@@ -363,6 +368,33 @@ fn format_score_label(label: &[u8], score: u8) -> [u8; 16] {
     out[n] = b'0' + score;
     // Remaining bytes stay zero (array was default-initialised) so
     // the renderer can walk until the first NUL.
+    out
+}
+
+/// "FPS: N" with N in decimal (capped at 999 — three digits is the
+/// honest range for a software-composited window). NUL-padded like
+/// `format_score_label`.
+fn format_fps_label(fps: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..5].copy_from_slice(b"FPS: ");
+    let mut n = 5;
+    let v = fps.min(999);
+    let mut digits = [0u8; 3];
+    let mut d = 0;
+    let mut x = v;
+    loop {
+        digits[d] = b'0' + (x % 10) as u8;
+        d += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        out[n] = digits[d];
+        n += 1;
+    }
     out
 }
 

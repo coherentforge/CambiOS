@@ -158,12 +158,25 @@ fn run() -> ! {
     let mut clock = FrameClock::new(STEP_TICKS);
     clock.seed(sys::get_time());
 
-    redraw(&mut client, &ping);
+    // Presented-frame counter: frames per 100-tick window, shown in the
+    // status bar so a slow game can be read off the panel.
+    let mut fps: u32 = 0;
+    let mut frames_this_window: u32 = 0;
+    let mut fps_window_start = sys::get_time();
+
+    redraw(&mut client, &ping, fps);
 
     sys::print(b"[PING] entering event loop\r\n");
     loop {
         let mut dirty = false;
         let mut drained = false;
+        let now = sys::get_time();
+        if now.wrapping_sub(fps_window_start) >= 100 {
+            fps = frames_this_window;
+            frames_this_window = 0;
+            fps_window_start = now;
+            dirty = true;
+        }
         // Resize is ignored here (no `take_resize_pending()` call).
         // libgui's `poll_event` consumes `WindowResized` and re-attaches
         // the surface; on grow, the unrendered area is black until the
@@ -185,7 +198,8 @@ fn run() -> ! {
         }
 
         if dirty {
-            redraw(&mut client, &ping);
+            redraw(&mut client, &ping, fps);
+            frames_this_window = frames_this_window.saturating_add(1);
         }
 
         if !drained && !dirty {
@@ -249,10 +263,10 @@ fn handle_event(
     }
 }
 
-fn redraw(client: &mut Client, ping: &Ping) {
+fn redraw(client: &mut Client, ping: &Ping, fps: u32) {
     {
         let mut surf = client.surface_mut();
-        render::draw(&mut surf, ping);
+        render::draw(&mut surf, ping, fps);
     }
     if client.submit_full().is_err() {
         sys::log_error(b"PING", b"submit_full failed");

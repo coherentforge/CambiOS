@@ -77,6 +77,26 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
         if cpu_id == 0 {
             crate::audit::drain::drain_tick();
             crate::policy::expire_pending_queries();
+            // Reschedule-kick diagnostic, once, ~20 s in (past the boot
+            // wave): how many cross-CPU wakes kicked a core and how
+            // many kicks switched tasks. From the ISR (try_print)
+            // because the BSP's idle loop may never run on a busy
+            // machine. Zero `sent` on a many-core box means the kick
+            // path is not firing; `sent` without `switched` means it
+            // fires but never finds a halted core.
+            if Timer::get_ticks() >= RESCHED_DIAG_TICK
+                && !RESCHED_DIAG_PRINTED.load(core::sync::atomic::Ordering::Relaxed)
+            {
+                let accepted = crate::io::try_print(format_args!(
+                    "[sched] reschedule kicks: sent {}, handled {}, switched {}\n",
+                    crate::RESCHED_KICKS_SENT.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::RESCHED_KICKS_HANDLED.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::RESCHED_KICKS_SWITCHED.load(core::sync::atomic::Ordering::Relaxed),
+                ));
+                if accepted {
+                    RESCHED_DIAG_PRINTED.store(true, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
     }
     #[cfg(all(not(test), target_arch = "aarch64"))]
@@ -136,6 +156,16 @@ fn switch_hint_for_current(sched: &Scheduler) -> Option<ContextSwitchHint> {
         }
     })
 }
+
+/// TUNING: tick at which the BSP prints the one-shot reschedule-kick
+/// diagnostic — 20 s at 100 Hz, past every boot wave measured so far
+/// (QEMU ~18 s, Dell 3630 ~16 s) so the counts cover the whole wave.
+const RESCHED_DIAG_TICK: u64 = 2000;
+
+/// Set once the diagnostic line found a console sink; until then the
+/// BSP retries on every tick (a `try_print` under contention drops).
+static RESCHED_DIAG_PRINTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Reschedule-IPI handler, portable half. A CPU receives this interrupt
 /// when another CPU woke a task that lives on this CPU's scheduler

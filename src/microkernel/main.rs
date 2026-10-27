@@ -98,6 +98,18 @@ static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
+/// Cycle count at `kmain` entry (x86_64), so boot-phase lines can say
+/// how long the kernel has been running before any timer exists.
+#[cfg(target_arch = "x86_64")]
+static KMAIN_TSC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Millions of cycles since `kmain` entry (x86_64).
+#[cfg(target_arch = "x86_64")]
+fn mcycles_since_kmain() -> u64 {
+    let t0 = KMAIN_TSC.load(core::sync::atomic::Ordering::Relaxed);
+    cambios_core::arch::x86_64::rdtsc().wrapping_sub(t0) / 1_000_000
+}
+
 /// Microkernel entry point (called by Limine bootloader).
 ///
 /// Limine invokes this as a raw function pointer: `extern "C" fn() -> !`.
@@ -109,6 +121,8 @@ unsafe extern "C" fn kmain() -> ! {
     // Disable interrupts immediately — no exception vector table is loaded yet.
     #[cfg(target_arch = "x86_64")]
     x86_64::instructions::interrupts::disable();
+    #[cfg(target_arch = "x86_64")]
+    KMAIN_TSC.store(cambios_core::arch::x86_64::rdtsc(), core::sync::atomic::Ordering::Relaxed);
     #[cfg(target_arch = "aarch64")]
     // SAFETY: Masking DAIF at EL1 boot is always safe. Limine should have
     // already done this, but be defensive.
@@ -295,7 +309,10 @@ unsafe extern "C" fn kmain() -> ! {
     // target (the RK3588 board).
     #[cfg(target_arch = "x86_64")]
     match cambios_core::io::fbcon::init() {
-        Ok((cols, rows)) => println!("[fbcon] console on framebuffer 0: {}x{} cells", cols, rows),
+        Ok((cols, rows)) => println!(
+            "[fbcon] console on framebuffer 0: {}x{} cells (+{} Mcycles since kmain)",
+            cols, rows, mcycles_since_kmain()
+        ),
         Err(e) => println!("[fbcon] inactive: {:?}", e),
     }
     #[cfg(target_arch = "x86_64")]
@@ -397,6 +414,8 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    println!("[boot] +{} Mcycles since kmain", mcycles_since_kmain());
     println!("\nStarting scheduler event loop...\n");
 
     // Initialize hardware interrupts — architecture-specific
@@ -2662,6 +2681,8 @@ unsafe fn start_application_processors() {
     }
 
     let ready = AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire);
+    #[cfg(target_arch = "x86_64")]
+    println!("[boot] APs online at +{} Mcycles since kmain", mcycles_since_kmain());
     println!(
         "  ✓ {}/{} AP(s) online (total CPUs: {})",
         ready, expected, ready as usize + 1

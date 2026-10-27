@@ -336,15 +336,19 @@ pub fn print(args: fmt::Arguments) {
 
 /// Best-effort print for interrupt context: never spins on a console
 /// lock another CPU holds. Output is dropped on contention — a handler
-/// must not stall its CPU for a diagnostic.
-pub fn try_print(args: fmt::Arguments) {
+/// must not stall its CPU for a diagnostic. Returns `true` if at least
+/// one sink accepted the text, so a one-shot diagnostic can retry on a
+/// later tick instead of being lost.
+pub fn try_print(args: fmt::Arguments) -> bool {
     use core::fmt::Write;
+    let mut accepted = false;
     if let Some(mut guard) = SERIAL1.try_lock() {
         if let Some(serial) = guard.as_mut() {
             let _ = write!(serial, "{}", args);
+            accepted = true;
         }
     }
-    fbcon::try_print(args);
+    accepted | fbcon::try_print(args)
 }
 
 #[macro_export]

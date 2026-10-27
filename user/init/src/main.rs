@@ -156,6 +156,10 @@ mod svc {
     fn supervise(m: &Manifest<'_>, eng: &mut SupervisorEngine, init_ep: u32) {
         use cambios_init::engine::{Action, EngineError, Event};
         use cambios_manifest::READY_PING_TAG;
+        // Tick at which the in-flight spawn was issued, for the
+        // "ready after N ticks" line: the per-service breakdown of
+        // the boot wave, readable off a photo of the console.
+        let mut spawn_tick: u64 = 0;
         loop {
             match eng.next_action() {
                 Action::Spawn { idx } => {
@@ -166,6 +170,7 @@ mod svc {
                     sys::print(b"[init] spawning ");
                     sys::print(name.as_bytes());
                     sys::print(b"\n");
+                    spawn_tick = sys::get_time();
                     let ret = sys::spawn(name.as_bytes());
                     let ev = if ret < 0 {
                         sys::print(b"[init] spawn FAILED: ");
@@ -181,7 +186,7 @@ mod svc {
                         sys::print(b"[init] BUG: spawn report rejected by engine\n");
                     }
                 }
-                Action::AwaitReady { .. } => {
+                Action::AwaitReady { idx } => {
                     let mut buf = [0u8; RECV_BUF];
                     let Some(msg) = sys::recv_verified(init_ep, &mut buf) else {
                         // Anonymous or malformed sender — recv_verified
@@ -194,7 +199,17 @@ mod svc {
                         Some((READY_PING_TAG, _)) => {
                             let sender_aid = *msg.sender().as_bytes();
                             match eng.on_event(Event::ReadyPing { sender_aid }) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    let name = m
+                                        .entry(idx as usize)
+                                        .map(|e| e.module_name())
+                                        .unwrap_or("");
+                                    sys::print(b"[init]   ");
+                                    sys::print(name.as_bytes());
+                                    sys::print(b" ready after ");
+                                    print_num(sys::get_time().wrapping_sub(spawn_tick) as u32);
+                                    sys::print(b" ticks\n");
+                                }
                                 Err(EngineError::UnknownSender) => {
                                     // Something outside the manifest
                                     // holds send access to init's

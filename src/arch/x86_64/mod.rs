@@ -487,6 +487,10 @@ pub const RESCHED_VECTOR: u8 = 0xFD;
 #[unsafe(no_mangle)]
 extern "C" fn resched_isr_inner(current_rsp: u64) -> u64 {
     let (new_rsp, hint) = crate::scheduler::on_resched_ipi(current_rsp);
+    crate::RESCHED_KICKS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if new_rsp != current_rsp {
+        crate::RESCHED_KICKS_SWITCHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(hint) = hint {
         apply_switch_hint(&hint);
     }
@@ -496,6 +500,19 @@ extern "C" fn resched_isr_inner(current_rsp: u64) -> u64 {
         apic::write_eoi();
     }
     new_rsp
+}
+
+/// Time-stamp counter, for boot-phase timing before any timer exists.
+/// Raw cycles; the kernel never converts, it prints deltas.
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: RDTSC reads a counter and writes EDX:EAX; no memory or
+    // flags are touched. CR4.TSD is clear (ring 0 regardless).
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | lo as u64
 }
 
 /// Kick `cpu` so a task just woken onto its scheduler runs now rather
@@ -520,6 +537,7 @@ pub fn kick_cpu(cpu: usize) {
     // Revisit when: a target boots with more than 255 logical CPUs or
     // firmware leaves x2APIC mode on.
     let Ok(dest) = u8::try_from(apic_id) else { return };
+    crate::RESCHED_KICKS_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     x86_64::instructions::interrupts::without_interrupts(|| {
         // SAFETY: APIC initialized (APs online); RESCHED_VECTOR is in
         // the shared IDT every CPU loaded; interrupts are masked around

@@ -466,6 +466,13 @@ pub fn wake_task_on_cpu(task_id: scheduler::TaskId) -> bool {
 pub static CPU_IDLE: [core::sync::atomic::AtomicBool; MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(true) }; MAX_CPUS];
 
+/// Reschedule-kick accounting, read by the BSP idle loop's one-shot
+/// diagnostic line: IPIs sent by the wake helpers, handled by the
+/// kicked CPUs, and how many of those actually switched tasks.
+pub static RESCHED_KICKS_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RESCHED_KICKS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RESCHED_KICKS_SWITCHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Record whether the calling CPU's scheduler just settled on its idle task.
 #[cfg(not(test))]
 pub fn set_local_cpu_idle(idle: bool) {
