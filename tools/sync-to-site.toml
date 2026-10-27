@@ -56,6 +56,8 @@ github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
 "033-multi-principal-vault" = "033-multi-principal-vault"
 "034-deferred-task-resource-reclamation" = "034-deferred-task-resource-reclamation"
 "035-translation-layer-compatibility" = "035-translation-layer-compatibility"
+"036-typed-mmio-register-blocks" = "036-typed-mmio-register-blocks"
+"037-native-app-framework" = "037-native-app-framework"
 
 # Kernel docs/<FOO>.md references in ADR bodies (`](../FOO.md)`) -> site URL.
 # Anything not listed falls through to a GitHub blob link.
@@ -87,3 +89,4 @@ github_blob_url = "https://github.com/coherentforge/cambios/blob/main"
 # sibling FOO.md) are rewritten to site URLs the same way ADR links are.
 [docs_sync]
 "identity-synthesis" = "identity-synthesis"
+"identity" = "identity"

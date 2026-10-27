@@ -2,8 +2,9 @@
 
 This document captures the design thinking behind CambiOS identity — what identity means in CambiOS, how it relates to files, keys, biology, and social context, and what gets built in what order. It is a living design document, not a specification. When implementation decisions are made, this document gets updated to reflect them.
 
-For the foundational security architecture this plugs into, see [security.md](security.md).
+For the foundational security architecture this plugs into, see [SECURITY.md](SECURITY.md).
 For the filesystem object model that depends on identity, see [filesystem.md](filesystem.md) (forthcoming).
+For how this model interoperates with external decentralized-identity ecosystems — the First Person Network, the ToIP stack, KERI — without being defined by any of them, see [identity-synthesis.md](identity-synthesis.md).
 
 ---
 
