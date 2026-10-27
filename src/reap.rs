@@ -234,6 +234,33 @@ pub fn reap_process(
         }
     };
 
+    // Clear the queues of every endpoint this process registered, so the
+    // next process to register one of them starts empty. Lock ordering:
+    // PROCESS_TABLE(7) to copy the bitmask out, released, then
+    // IPC_MANAGER(3) alone; the sharded manager's per-endpoint locks are
+    // an independent domain. (Observed before this: a relaunched game
+    // read the previous instance's leftover input event where it
+    // expected the compositor's welcome.)
+    let registered = {
+        let pt_guard = crate::PROCESS_TABLE.lock();
+        pt_guard
+            .as_ref()
+            .map(|pt| pt.registered_endpoints(process_id))
+            .unwrap_or(0)
+    };
+    if registered != 0 {
+        let mut ipc_guard = crate::IPC_MANAGER.lock();
+        for ep in 0..crate::ipc::MAX_ENDPOINTS as u32 {
+            if registered & (1u64 << ep) != 0 {
+                let endpoint = crate::ipc::EndpointId(ep);
+                if let Some(mgr) = ipc_guard.as_mut() {
+                    mgr.clear_endpoint(endpoint);
+                }
+                crate::SHARDED_IPC.clear_endpoint(endpoint);
+            }
+        }
+    }
+
     // Clear this pid slot's reply-endpoint registration. REPLY_ENDPOINT
     // is set by register_endpoint via compare_exchange(0, ep), which
     // silently fails if a stale non-zero remains from a previous

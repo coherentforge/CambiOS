@@ -716,6 +716,21 @@ impl IpcManager {
         self.queues[endpoint.0 as usize].dequeue()
     }
 
+    /// Discard everything queued on `endpoint` and reset its sync
+    /// channel. An endpoint queue belongs to the process that registered
+    /// the endpoint; when that process exits, messages still queued
+    /// (input events, window-closed notices, late replies) must not be
+    /// delivered to the next process that registers the same endpoint —
+    /// a relaunched app read a stale event where it expected the
+    /// compositor's welcome and gave up (Dell 3630, 2026-10-26).
+    pub fn clear_endpoint(&mut self, endpoint: EndpointId) {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return;
+        }
+        self.queues[endpoint.0 as usize] = EndpointQueue::new();
+        self.sync_channels[endpoint.0 as usize] = SyncChannel::new();
+    }
+
     /// Check if endpoint has pending messages
     pub fn has_message(&self, endpoint: EndpointId) -> bool {
         if endpoint.0 >= MAX_ENDPOINTS as u32 {
@@ -1033,6 +1048,16 @@ impl ShardedIpcManager {
         !self.shards[endpoint.0 as usize].lock().queue.is_empty()
     }
 
+    /// Discard everything queued on `endpoint` and reset its sync
+    /// channel. Called when the registering process exits, so the next
+    /// registrant starts from an empty queue (see `IpcManager::clear_endpoint`).
+    pub fn clear_endpoint(&self, endpoint: EndpointId) {
+        if endpoint.0 as usize >= MAX_ENDPOINTS {
+            return;
+        }
+        *self.shards[endpoint.0 as usize].lock() = EndpointShard::new();
+    }
+
     /// Synchronous send on a specific endpoint.
     pub fn sync_send(
         &self,
@@ -1112,6 +1137,30 @@ unsafe impl Sync for ShardedIpcManager {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clear_endpoint_discards_queued_messages() {
+        let mut mgr = IpcManager::new();
+        let ep = EndpointId(5);
+        mgr.send_message(ep, Message::new(EndpointId(1), ep)).unwrap();
+        mgr.send_message(ep, Message::new(EndpointId(1), ep)).unwrap();
+        assert!(mgr.has_message(ep));
+        mgr.clear_endpoint(ep);
+        assert!(!mgr.has_message(ep));
+        assert!(mgr.recv_message(ep).is_none());
+        // Out-of-range is a no-op, not a panic.
+        mgr.clear_endpoint(EndpointId(MAX_ENDPOINTS as u32));
+    }
+
+    #[test]
+    fn sharded_clear_endpoint_discards_queued_messages() {
+        let mgr = ShardedIpcManager::new();
+        let ep = EndpointId(7);
+        mgr.send_message(ep, Message::new(EndpointId(1), ep)).unwrap();
+        assert!(mgr.has_message(ep));
+        mgr.clear_endpoint(ep);
+        assert!(!mgr.has_message(ep));
+    }
+
     use super::*;
 
     // ========================================================================

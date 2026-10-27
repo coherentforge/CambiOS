@@ -651,6 +651,16 @@ impl SyscallDispatcher {
             ctx.process_id, ctx.process_id, endpoint, 0x0F, crate::audit::now(), 0,
         ));
 
+        // Remember the registration so `reap_process` can clear this
+        // endpoint's queue when the process exits. Lock ordering:
+        // PROCESS_TABLE(7) alone; nothing else held here.
+        {
+            let mut pt_guard = crate::PROCESS_TABLE.lock();
+            if let Some(pt) = pt_guard.as_mut() {
+                pt.note_registered_endpoint(ctx.process_id, endpoint_id);
+            }
+        }
+
         // Record the first-registered endpoint as this process's reply
         // endpoint. Subsequent register_endpoint calls do not overwrite
         // it — the first one wins. Receivers use msg.from_endpoint() to

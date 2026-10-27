@@ -444,7 +444,15 @@ pub struct ProcessDescriptor {
     /// in (ADR-029 step 6+). Reclaimed on process exit alongside the
     /// VMA tracker.
     pub fds: FdTable,
+    /// Endpoints this process has registered, one bit per endpoint id.
+    /// Read by `reap_process` to clear their queues on exit so the
+    /// next registrant never sees this process's leftovers.
+    /// ARCHITECTURAL: `MAX_ENDPOINTS` (64) is exactly one `u64` of bits;
+    /// the assertion below pins that.
+    pub registered_endpoints: u64,
 }
+
+const _: () = assert!(crate::ipc::MAX_ENDPOINTS <= 64);
 
 impl ProcessDescriptor {
     /// Create a new process descriptor, dynamically allocating its
@@ -528,6 +536,7 @@ impl ProcessDescriptor {
             cr3: 0, // 0 = uses kernel page table (no per-process table yet)
             vma: VmaTracker::new(),
             fds: FdTable::new(),
+            registered_endpoints: 0,
         })
     }
 
@@ -1080,6 +1089,32 @@ impl ProcessTable {
         let idx = self.resolve(process_id)?;
         self.processes[idx].as_ref().map(|p| &p.vma)
     }
+
+    /// Record that `process_id` registered `endpoint`. `false` for a
+    /// stale / unknown `process_id` or an endpoint id past the bitmask.
+    pub fn note_registered_endpoint(&mut self, process_id: ProcessId, endpoint: u32) -> bool {
+        if endpoint as usize >= crate::ipc::MAX_ENDPOINTS {
+            return false;
+        }
+        let Some(idx) = self.resolve(process_id) else { return false };
+        match self.processes[idx].as_mut() {
+            Some(p) => {
+                p.registered_endpoints |= 1u64 << endpoint;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The endpoints `process_id` registered, one bit per id; 0 for a
+    /// stale / unknown `process_id`.
+    pub fn registered_endpoints(&self, process_id: ProcessId) -> u64 {
+        let Some(idx) = self.resolve(process_id) else { return 0 };
+        self.processes[idx]
+            .as_ref()
+            .map(|p| p.registered_endpoints)
+            .unwrap_or(0)
+    }
 }
 
 // ============================================================================
@@ -1247,6 +1282,7 @@ mod tests {
             cr3: 0x2000_0000, // non-zero → has per-process PT
             vma: VmaTracker::new(),
             fds: FdTable::new(),
+            registered_endpoints: 0,
         }
     }
 
