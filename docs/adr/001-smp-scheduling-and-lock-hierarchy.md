@@ -419,3 +419,11 @@ The ADR's examples (GS base, `IA32_GS_BASE`, TSS.RSP0, APIC timer, naked-ASM `ir
 - **Work stealing** — not pursued. Push-based balancer remains adequate at current core counts.
 - **NUMA awareness** — not pursued. No ACPI SRAT parsing yet.
 - **Priority-aware migration** — not pursued. `pick_migratable_task()` still returns the first Ready non-idle task.
+
+### 2026-10-26 — Cross-CPU wake sends a reschedule IPI (commit 3d0e3cf)
+
+**What changed from the plan.** § "Wake and block primitives" has `wake_task_on_cpu` acquire the target CPU's scheduler and mark the task Ready, and leaves it there: the target noticed the wake at its next timer tick (`hlt` in the idle loop; preemption is timer-driven). With one service per hardware thread on the Dell 3630 that put up to 10 ms on every IPC hop. The helpers (`wake_task_on_cpu`, `wake_message_waiters_all_cpus`, `wake_child_waiter`) now release the target's lock and, if that CPU was last seen idle (`CPU_IDLE`, published by the three scheduling entry points after each decision), send it a reschedule IPI (`arch::kick_cpu`; x86_64 vector 0xFD, `RESCHED_VECTOR`). The handler reuses the timer ISR's frame and post-switch work and calls `Scheduler::isr_kick`, which switches only off the idle task or a no-longer-Running current task — preemption stays the timer's. The `try_lock` rule for ISR-side scheduler access is unchanged, which is why the waker must drop the lock before kicking. Device ISRs keep the no-kick shape (ICR reentrancy); their remote wakes ride the tick as before. aarch64 / riscv64 `kick_cpu` are no-ops with Revisit-when triggers (GICv3 SGI / SBI IPI).
+
+**Unchanged.** Lock hierarchy, `TASK_CPU_MAP`, the all-CPU scan for endpoint waiters, and the ISR `try_lock` discipline.
+
+**Prior wording (for the record).** § "Wake and block primitives": "`wake_task_on_cpu(task_id)` — looks up the task's home CPU in the lock-free `TASK_CPU_MAP`, acquires that CPU's scheduler, and wakes the task." Nothing in the section said how the target CPU learned of the wake; the timer tick was the implicit answer.
