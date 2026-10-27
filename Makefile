@@ -1270,13 +1270,17 @@ verify-usb:
 	# primary header's backup pointer + CRC in sector 1, so a whole-image
 	# compare would always fail on a correctly written stick. The partition
 	# table itself is checked by `sgdisk -v` below.
-	sudo dd if=$(DEVICE) of=/tmp/cambios-usb-readback.img bs=1M skip=1 count=$(ESP_SIZE_MB) status=progress
+	# Only the read of the raw device needs root; the readback file is
+	# written by an unprivileged dd on the far side of the pipe so the
+	# user owns it and the cleanup below can remove it.
+	sudo dd if=$(DEVICE) bs=1M skip=1 count=$(ESP_SIZE_MB) status=none \
+		| dd of=/tmp/cambios-usb-readback.img bs=1M status=none
 	dd if=$(IMG_USB) of=/tmp/cambios-usb-expected.img bs=1M skip=1 count=$(ESP_SIZE_MB) status=none
 	sudo sgdisk -v $(DEVICE)
 	@echo "Comparing to $(IMG_USB)..."
 	@if cmp -s /tmp/cambios-usb-readback.img /tmp/cambios-usb-expected.img; then \
 		echo "✓ USB ESP matches source image (verified $(ESP_SIZE_MB) MiB)"; \
-		rm -f /tmp/cambios-usb-readback.img; \
+		rm -f /tmp/cambios-usb-readback.img /tmp/cambios-usb-expected.img; \
 	else \
 		echo "✗ MISMATCH: USB does not match $(IMG_USB)"; \
 		echo "  Readback saved to /tmp/cambios-usb-readback.img for inspection"; \
