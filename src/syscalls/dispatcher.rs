@@ -651,6 +651,22 @@ impl SyscallDispatcher {
             ctx.process_id, ctx.process_id, endpoint, 0x0F, crate::audit::now(), 0,
         ));
 
+        // Registration starts a fresh queue. `reap_process` clears the
+        // queues of an exiting registrant, but a message can still land
+        // between that reap and the next registration (the compositor's
+        // reaction to a window going away, delivered promptly now that
+        // cross-CPU wakes kick); whatever is queued at this moment was
+        // addressed to a previous registrant and is never this one's to
+        // read. Lock ordering: IPC_MANAGER(3) alone, then the sharded
+        // manager's own per-endpoint lock; nothing else held.
+        {
+            let mut ipc_guard = crate::IPC_MANAGER.lock();
+            if let Some(mgr) = ipc_guard.as_mut() {
+                mgr.clear_endpoint(endpoint);
+            }
+        }
+        crate::SHARDED_IPC.clear_endpoint(endpoint);
+
         // Remember the registration so `reap_process` can clear this
         // endpoint's queue when the process exits. Lock ordering:
         // PROCESS_TABLE(7) alone; nothing else held here.

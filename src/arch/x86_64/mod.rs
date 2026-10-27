@@ -435,6 +435,99 @@ core::arch::global_asm!(
     "iretq",
 );
 
+core::arch::global_asm!(
+    ".global resched_isr_stub",
+    "resched_isr_stub:",
+    // Identical frame to timer_isr_stub: the handler may switch tasks.
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rdi, rsp",
+    "cld",
+    "call resched_isr_inner",
+    "mov rsp, rax",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "iretq",
+);
+
+/// ARCHITECTURAL: IPI vector for the cross-CPU reschedule kick. Sits
+/// just below the TLB-shootdown IPI (0xFE) and the spurious vector
+/// (0xFF), above every device vector the I/O APIC hands out (33..56).
+pub const RESCHED_VECTOR: u8 = 0xFD;
+
+/// Rust handler called from `resched_isr_stub` on the CPU that was
+/// kicked. Reschedules if this CPU was idle (or its current task is no
+/// longer Running), applies the switch hint, and acknowledges the IPI.
+#[unsafe(no_mangle)]
+extern "C" fn resched_isr_inner(current_rsp: u64) -> u64 {
+    let (new_rsp, hint) = crate::scheduler::on_resched_ipi(current_rsp);
+    if let Some(hint) = hint {
+        apply_switch_hint(&hint);
+    }
+    // SAFETY: we are in the APIC-delivered reschedule IPI handler; the
+    // APIC was initialized before any IPI could be sent.
+    unsafe {
+        apic::write_eoi();
+    }
+    new_rsp
+}
+
+/// Kick `cpu` so a task just woken onto its scheduler runs now rather
+/// than at that CPU's next timer tick. No-op for the calling CPU, for
+/// a CPU index past the online count, and before the APs are up (the
+/// APIC is not necessarily initialized then). Must be called with no
+/// scheduler lock held: the target's handler `try_lock`s its scheduler
+/// and a held lock turns the kick into a no-op.
+pub fn kick_cpu(cpu: usize) {
+    if crate::online_cpu_count() <= 1 || cpu >= crate::online_cpu_count() {
+        return;
+    }
+    // SAFETY: GS base is initialized on every CPU that can run kernel
+    // code once the APs are online, which the gate above requires.
+    let me = unsafe { percpu::current_cpu_id() } as usize;
+    if cpu == me {
+        return;
+    }
+    let Some(apic_id) = percpu::apic_id_of(cpu) else { return };
+    // Deferred: x2APIC (wider than 8-bit) destination ids get no kick
+    // and ride the timer tick; the IPI primitive is xAPIC-only today.
+    // Revisit when: a target boots with more than 255 logical CPUs or
+    // firmware leaves x2APIC mode on.
+    let Ok(dest) = u8::try_from(apic_id) else { return };
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // SAFETY: APIC initialized (APs online); RESCHED_VECTOR is in
+        // the shared IDT every CPU loaded; interrupts are masked around
+        // the two ICR writes so no handler on this CPU can interleave.
+        unsafe { apic::send_ipi(dest, RESCHED_VECTOR) };
+    });
+}
+
 /// Rust handler called from the timer ISR stub.
 ///
 /// Receives the current task's saved RSP (pointing to SavedContext on its stack).
@@ -449,36 +542,7 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
 
     // x86-specific post-switch: update TSS and CR3
     if let Some(hint) = hint {
-        if hint.kernel_stack_top != 0 {
-            // SAFETY: Called from the timer ISR with interrupts disabled.
-            // hint.kernel_stack_top is the top of the next task's kernel stack,
-            // written during task creation (alloc_task_stack / create_user_task).
-            unsafe { crate::arch::gdt::set_kernel_stack(hint.kernel_stack_top); }
-        }
-        if hint.page_table_root != 0 {
-            let current_cr3: u64;
-            // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
-            unsafe {
-                core::arch::asm!(
-                    "mov {}, cr3",
-                    out(reg) current_cr3,
-                    options(nostack, nomem),
-                );
-            }
-            if current_cr3 != hint.page_table_root {
-                // SAFETY: hint.page_table_root is the physical address of a valid
-                // PML4 set up by create_process_page_table(). Writing CR3 flushes
-                // the TLB and switches address spaces. Kernel mappings (upper half)
-                // are shared across all page tables.
-                unsafe {
-                    core::arch::asm!(
-                        "mov cr3, {}",
-                        in(reg) hint.page_table_root,
-                        options(nostack, preserves_flags),
-                    );
-                }
-            }
-        }
+        apply_switch_hint(&hint);
     }
 
     // Per-CPU timer-ISR tick bump. Portable SMP diagnostic — see
@@ -500,6 +564,42 @@ extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
     }
 
     new_rsp
+}
+
+/// x86-specific post-switch work shared by every ISR that may switch
+/// tasks: point the TSS at the next task's kernel stack and load its
+/// page-table root if it differs from the current one.
+fn apply_switch_hint(hint: &crate::scheduler::ContextSwitchHint) {
+    if hint.kernel_stack_top != 0 {
+        // SAFETY: Called from an ISR with interrupts disabled.
+        // hint.kernel_stack_top is the top of the next task's kernel stack,
+        // written during task creation (alloc_task_stack / create_user_task).
+        unsafe { crate::arch::gdt::set_kernel_stack(hint.kernel_stack_top); }
+    }
+    if hint.page_table_root != 0 {
+        let current_cr3: u64;
+        // SAFETY: Reading CR3 is always safe at ring 0 with interrupts disabled.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) current_cr3,
+                options(nostack, nomem),
+            );
+        }
+        if current_cr3 != hint.page_table_root {
+            // SAFETY: hint.page_table_root is the physical address of a valid
+            // PML4 set up by create_process_page_table(). Writing CR3 flushes
+            // the TLB and switches address spaces. Kernel mappings (upper half)
+            // are shared across all page tables.
+            unsafe {
+                core::arch::asm!(
+                    "mov cr3, {}",
+                    in(reg) hint.page_table_root,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
 }
 
 /// Halt with interrupts enabled until preempted by the timer ISR.

@@ -439,12 +439,57 @@ pub fn wake_task_on_cpu(task_id: scheduler::TaskId) -> bool {
         Some(c) => c as usize,
         None => return false,
     };
-    let mut guard = PER_CPU_SCHEDULER[cpu].lock();
-    if let Some(sched) = guard.as_mut() {
-        sched.wake_task(task_id).is_ok()
-    } else {
-        false
+    let woken = {
+        let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+        if let Some(sched) = guard.as_mut() {
+            sched.wake_task(task_id).is_ok()
+        } else {
+            false
+        }
+    };
+    // Lock dropped: the kicked CPU's handler try_locks this scheduler.
+    if woken && cpu_is_idle(cpu) {
+        arch::kick_cpu(cpu);
     }
+    woken
+}
+
+/// Which CPUs are running their idle task. Published by the three
+/// scheduling entry points (`on_timer_isr`, `on_resched_ipi`,
+/// `on_voluntary_yield`) after every decision, read by the wake helpers
+/// to decide whether a reschedule kick is worth sending: a kick to a
+/// CPU running a task is a no-op by construction (the kick never
+/// preempts a Running task), and under TCG every IPI is a full vCPU
+/// exit. A CPU that goes idle just after the read is caught by its next
+/// timer tick, the same bound as before kicks existed. Starts `true`:
+/// a CPU is idle until its first task runs.
+pub static CPU_IDLE: [core::sync::atomic::AtomicBool; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(true) }; MAX_CPUS];
+
+/// Record whether the calling CPU's scheduler just settled on its idle task.
+#[cfg(not(test))]
+pub fn set_local_cpu_idle(idle: bool) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: GS base initialized before any scheduling entry point runs.
+    let cpu = unsafe { arch::x86_64::percpu::current_percpu().cpu_id() } as usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: TPIDR_EL1 initialized before any scheduling entry point runs.
+    let cpu = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: `tp` initialized before any scheduling entry point runs.
+    let cpu = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
+    if cpu < MAX_CPUS {
+        CPU_IDLE[cpu].store(idle, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Host-test stub: there is no per-CPU block to resolve.
+#[cfg(test)]
+pub fn set_local_cpu_idle(_idle: bool) {}
+
+/// Whether `cpu` was last seen running its idle task.
+pub fn cpu_is_idle(cpu: usize) -> bool {
+    cpu < MAX_CPUS && CPU_IDLE[cpu].load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Wake every task blocked on `MessageWait(endpoint)` on EVERY online
@@ -467,10 +512,19 @@ pub fn wake_task_on_cpu(task_id: scheduler::TaskId) -> bool {
 pub fn wake_message_waiters_all_cpus(endpoint: u32) -> usize {
     let mut woken = 0;
     for cpu in 0..online_cpu_count().min(MAX_CPUS) {
-        let mut guard = PER_CPU_SCHEDULER[cpu].lock();
-        if let Some(sched) = guard.as_mut() {
-            woken += sched.wake_message_waiters(endpoint);
+        let woken_here = {
+            let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+            if let Some(sched) = guard.as_mut() {
+                sched.wake_message_waiters(endpoint)
+            } else {
+                0
+            }
+        };
+        // Lock dropped before the kick (see `wake_task_on_cpu`).
+        if woken_here > 0 && cpu_is_idle(cpu) {
+            arch::kick_cpu(cpu);
         }
+        woken += woken_here;
     }
     woken
 }
@@ -487,12 +541,18 @@ pub fn wake_child_waiter(parent_id: scheduler::TaskId, child_slot: u32) -> bool 
         Some(c) if (c as usize) < MAX_CPUS => c as usize,
         _ => return false,
     };
-    let mut guard = PER_CPU_SCHEDULER[cpu].lock();
-    if let Some(sched) = guard.as_mut() {
-        sched.wake_child_waiter(parent_id, child_slot)
-    } else {
-        false
+    let woken = {
+        let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+        if let Some(sched) = guard.as_mut() {
+            sched.wake_child_waiter(parent_id, child_slot)
+        } else {
+            false
+        }
+    };
+    if woken && cpu_is_idle(cpu) {
+        arch::kick_cpu(cpu);
     }
+    woken
 }
 
 /// Block a task on the current CPU's scheduler.

@@ -1085,6 +1085,16 @@ extern "C" fn svc_handler_inner(saved_sp: u64) -> u64 {
 /// the stack to different physical memory. The kernel stack is in the
 /// HHDM, which is mapped identically across all page tables.
 ///
+/// Kick `cpu` after waking a task onto its scheduler (see the x86_64
+/// backend). A no-op here: the woken task runs at that core's next
+/// timer tick.
+/// Deferred: a GICv3 SGI to the target core with a handler that
+/// reschedules like the timer path (no aarch64 target with enough
+/// cores for the tick latency to matter is in hand yet).
+/// Revisit when: an aarch64 board with more than two cores is a target
+/// (the RK3588 board), or the QEMU 8-core wave count is checked there.
+pub fn kick_cpu(_cpu: usize) {}
+
 /// # Safety
 /// `kernel_stack_top` must be a valid, mapped kernel stack address (HHDM).
 /// The scheduler lock must NOT be held.

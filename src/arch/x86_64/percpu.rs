@@ -342,6 +342,24 @@ pub unsafe fn current_percpu_mut() -> &'static mut PerCpu {
     unsafe { &mut *ptr }
 }
 
+/// Hardware APIC ID of logical CPU `cpu`, for addressing an IPI to it.
+/// `None` for an index outside the table. Callers kick only CPUs that
+/// own a task (`TASK_CPU_MAP`), which means that CPU ran `init_ap` /
+/// `init_bsp` before it went online, so the entry is populated.
+pub fn apic_id_of(cpu: usize) -> Option<u32> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    // SAFETY: forming a raw pointer into the static creates no reference;
+    // `cpu < MAX_CPUS` was checked above.
+    let p = unsafe { core::ptr::addr_of!(PER_CPU_DATA[cpu].apic_id) };
+    // SAFETY: PER_CPU_DATA[cpu].apic_id is written exactly once, by that
+    // CPU during its own init before it is counted online, and never
+    // written again; a volatile read of a plain u32 through `p`.
+    let apic_id = unsafe { p.read_volatile() };
+    Some(apic_id)
+}
+
 /// Convenience: get the current CPU's logical ID.
 ///
 /// # Safety

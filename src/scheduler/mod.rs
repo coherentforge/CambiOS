@@ -105,21 +105,11 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
             sched.wake_irq_waiters(0);
 
             let new_rsp = sched.isr_tick_and_schedule(current_rsp);
+            crate::set_local_cpu_idle(sched.current_is_idle());
 
             if new_rsp != current_rsp {
                 // Context switch occurred — collect platform hint
-                let hint = sched.current_task_ref().map(|task| {
-                    let page_table_root = if task.cr3 != 0 {
-                        task.cr3
-                    } else {
-                        crate::kernel_cr3()
-                    };
-                    ContextSwitchHint {
-                        kernel_stack_top: task.kernel_stack_top,
-                        page_table_root,
-                    }
-                });
-                (new_rsp, hint)
+                (new_rsp, switch_hint_for_current(sched))
             } else {
                 (current_rsp, None)
             }
@@ -129,6 +119,45 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
     } else {
         (current_rsp, None) // Lock contention — skip this tick
     }
+}
+
+/// The platform hint for the task the scheduler just made current:
+/// its kernel stack top and the page-table root to load.
+fn switch_hint_for_current(sched: &Scheduler) -> Option<ContextSwitchHint> {
+    sched.current_task_ref().map(|task| {
+        let page_table_root = if task.cr3 != 0 {
+            task.cr3
+        } else {
+            crate::kernel_cr3()
+        };
+        ContextSwitchHint {
+            kernel_stack_top: task.kernel_stack_top,
+            page_table_root,
+        }
+    })
+}
+
+/// Reschedule-IPI handler, portable half. A CPU receives this interrupt
+/// when another CPU woke a task that lives on this CPU's scheduler
+/// (`crate::wake_task_on_cpu` and friends send it after dropping the
+/// scheduler lock). Without it a core sitting in `hlt` noticed a wake
+/// only at its next timer tick — up to 10 ms per IPC hop, which on a
+/// 12-thread machine made every service-to-service exchange crawl.
+///
+/// Same lock discipline as `on_timer_isr`: `try_lock`, and a contended
+/// lock means the wake is picked up at the next tick instead. No timer
+/// tick, no time-slice accounting, no EOI here (the arch half does EOI).
+pub fn on_resched_ipi(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
+    if let Some(mut sched_guard) = crate::local_scheduler().try_lock() {
+        if let Some(sched) = sched_guard.as_mut() {
+            let new_rsp = sched.isr_kick(current_rsp);
+            crate::set_local_cpu_idle(sched.current_is_idle());
+            if new_rsp != current_rsp {
+                return (new_rsp, switch_hint_for_current(sched));
+            }
+        }
+    }
+    (current_rsp, None)
 }
 
 /// Voluntary yield handler: save context and schedule next task.
@@ -146,6 +175,7 @@ pub fn on_voluntary_yield(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) 
     let mut sched_guard = crate::local_scheduler().lock();
     if let Some(sched) = sched_guard.as_mut() {
         let new_rsp = sched.voluntary_yield(current_rsp);
+        crate::set_local_cpu_idle(sched.current_is_idle());
 
         if new_rsp != current_rsp {
             // Context switch occurred — collect platform hint
@@ -565,6 +595,44 @@ impl Scheduler {
                 }
             }
             Err(_) => current_rsp, // Schedule failed, keep current
+        }
+    }
+
+    /// Whether the current task is the idle task (slot 0) or there is
+    /// no current task — i.e. a reschedule kick would be acted on.
+    pub fn current_is_idle(&self) -> bool {
+        self.current_task.map(|t| t.slot() == 0).unwrap_or(true)
+    }
+
+    /// Reschedule-IPI entry: switch away from an idle or no-longer-Running
+    /// current task to the best Ready task, now. A task that is Running
+    /// keeps the CPU — the kick exists to wake a halted core, not to
+    /// preempt work; preemption stays the timer's job. Mirrors the
+    /// expiry branch of `isr_tick_and_schedule` without the tick.
+    pub fn isr_kick(&mut self, current_rsp: u64) -> u64 {
+        let current_keeps_cpu = match self.current_task {
+            Some(t) if t.slot() != 0 => self
+                .get_task(t)
+                .map(|task| task.state == TaskState::Running)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if current_keeps_cpu {
+            return current_rsp;
+        }
+        if let Some(task_id) = self.current_task {
+            if let Some(task) = self.get_task_mut(task_id) {
+                if task.state == TaskState::Running {
+                    task.saved_rsp = current_rsp;
+                }
+            }
+        }
+        match self.schedule() {
+            Ok(next_task) => match self.get_task(next_task) {
+                Some(task) if task.saved_rsp != 0 => task.saved_rsp,
+                _ => current_rsp,
+            },
+            Err(_) => current_rsp,
         }
     }
 
@@ -2233,6 +2301,40 @@ mod tests {
         );
         // Hint consumed by hook.
         assert_eq!(task.pending_quiesce_channel, None);
+    }
+
+    #[test]
+    fn test_isr_kick_switches_idle_cpu_to_ready_task() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        assert_eq!(sched.current_task, Some(TaskId::new(0, 0)));
+        let tid = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        // Give the new task a context to resume, as the loader would.
+        sched.get_task_mut(tid).unwrap().saved_rsp = 0xCAFE;
+
+        let rsp = sched.isr_kick(0xDEAD_BEEF);
+        assert_eq!(rsp, 0xCAFE);
+        assert_eq!(sched.current_task, Some(tid));
+        assert_eq!(sched.get_task_pub(tid).unwrap().state, TaskState::Running);
+        // The idle task's context was saved where it was interrupted.
+        assert_eq!(sched.get_task_pub(TaskId::new(0, 0)).unwrap().saved_rsp, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn test_isr_kick_leaves_running_task_alone() {
+        let mut sched = Scheduler::new();
+        sched.init().unwrap();
+        let t1 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.get_task_mut(t1).unwrap().saved_rsp = 0x1111;
+        sched.schedule().unwrap();
+        assert_eq!(sched.current_task, Some(t1));
+        let t2 = sched.create_task(0x100000, 0x200000, Priority::NORMAL).unwrap();
+        sched.get_task_mut(t2).unwrap().saved_rsp = 0x2222;
+
+        let rsp = sched.isr_kick(0xDEAD_BEEF);
+        assert_eq!(rsp, 0xDEAD_BEEF);
+        assert_eq!(sched.current_task, Some(t1));
+        assert_eq!(sched.get_task_pub(t1).unwrap().state, TaskState::Running);
     }
 
     #[test]

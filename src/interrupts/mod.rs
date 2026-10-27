@@ -535,6 +535,22 @@ pub unsafe fn init_hardware_interrupts(
         crate::println!("  TLB shootdown handler registered (vector {:#x})", tlb::TLB_SHOOTDOWN_VECTOR);
     }
 
+    // Step 4e: Register the reschedule-kick IPI at vector 0xFD. Same
+    // naked-stub shape as the timer ISR because the handler may switch
+    // tasks.
+    {
+        extern "C" {
+            fn resched_isr_stub();
+        }
+        // SAFETY: Single-threaded init, interrupts disabled; the stub
+        // follows the x86-interrupt frame contract like timer_isr_stub.
+        unsafe {
+            idt[crate::arch::x86_64::RESCHED_VECTOR as usize]
+                .set_handler_addr(x86_64::VirtAddr::new(resched_isr_stub as *const () as u64));
+        }
+        crate::println!("  Reschedule IPI handler registered (vector {:#x})", crate::arch::x86_64::RESCHED_VECTOR);
+    }
+
     // Step 5: Allocate IST stack for double-fault (4 KB)
     {
         use alloc::alloc::{alloc, Layout};

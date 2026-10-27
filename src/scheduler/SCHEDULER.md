@@ -193,8 +193,11 @@ unsafe { yield_save_and_switch(); }
 
 Cross-CPU wake is mediated through `lib.rs` helpers:
 
-- `wake_task_on_cpu(task_id)` — looks up the task's home CPU in the lock-free `TASK_CPU_MAP`, acquires that CPU's scheduler, and wakes the task
+- `wake_task_on_cpu(task_id)` — looks up the task's home CPU in the lock-free `TASK_CPU_MAP`, acquires that CPU's scheduler, wakes the task, **drops the lock, then kicks that CPU** (`arch::kick_cpu`) if it was last seen idle
+- `wake_message_waiters_all_cpus(endpoint)` / `wake_child_waiter(..)` — same shape: wake under that CPU's lock, release, kick if idle
 - `block_local_task(task_id, reason)` — always operates on the calling CPU's scheduler
+
+**The reschedule kick.** A CPU with nothing to run sits in `hlt`. Before the kick existed it noticed a cross-CPU wake only at its own next timer tick, so every IPC hop between services on different CPUs cost up to 10 ms; on a 12-thread machine where each service has its own core that made a game frame (four or five hops) crawl and stretched the boot wave to ~16 s. `kick_cpu` sends a dedicated IPI (x86_64: `RESCHED_VECTOR` = 0xFD, handled by `resched_isr_stub` → `on_resched_ipi` → `Scheduler::isr_kick`). `isr_kick` switches only when the current task is the idle task or is no longer Running; a Running task keeps its slice — the kick wakes a halted core, it does not preempt. Same `try_lock` discipline as the timer ISR, which is why the waker must drop the scheduler lock before kicking. Kicks are gated on `CPU_IDLE[cpu]`, published by all three scheduling entry points after each decision: a kick to a busy CPU would be a no-op anyway, and under TCG every IPI is a vCPU exit. aarch64 / riscv64 `kick_cpu` are no-ops with Revisit-when triggers (GICv3 SGI / SBI IPI).
 
 The IPC layer uses these helpers exclusively — there is no hardcoded `PER_CPU_SCHEDULER[0]` access for cross-CPU wake. See [ADR-001](../../docs/adr/001-smp-scheduling-and-lock-hierarchy.md) § "Wake and block primitives."
 

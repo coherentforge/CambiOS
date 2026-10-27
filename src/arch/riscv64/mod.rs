@@ -671,6 +671,16 @@ extern "C" fn yield_inner(current_sp: u64) -> u64 {
 /// Loops on `wfi` from S-mode. The trap handler resumes scheduling
 /// when the next timer tick fires.
 ///
+/// Kick `cpu` after waking a task onto its scheduler (see the x86_64
+/// backend). A no-op here: the woken task runs at that hart's next
+/// timer tick.
+/// Deferred: an SBI `send_ipi` to the target hart with a software-
+/// interrupt handler that reschedules like the timer path (no riscv64
+/// target with enough harts for the tick latency to matter yet).
+/// Revisit when: a riscv64 board with more than two harts is a target
+/// (the JH7110 board).
+pub fn kick_cpu(_cpu: usize) {}
+
 /// # Safety
 /// `kernel_stack_top` must point to the top of a valid kernel stack for
 /// this hart, or zero if no stack switch is desired.
