@@ -2271,6 +2271,41 @@ impl SyscallDispatcher {
         };
         crate::set_task_cpu(new_task_id.slot(), cpu_id as u16);
 
+        // Spawn-time placement: home the new task on the online CPU with
+        // the fewest tasks. The push balancer counts only Ready tasks and
+        // services are Blocked most of the time, so without this every
+        // task init spawns stays on CPU 0 for good (QEMU: tasks/cpu
+        // [17, 0]; Dell 3630: one reschedule kick in 20 s on twelve
+        // threads, 2026-10-27). A never-run Ready task is the safest
+        // thing to move. Lock ordering: scheduler locks are taken in
+        // ascending CPU index, so a higher target is locked now, under
+        // our own; a lower target is handled after our lock drops via
+        // `migrate_task` (which may find the task already Running and
+        // decline — then it simply stays here).
+        let target_cpu = {
+            let online = crate::online_cpu_count().min(crate::MAX_CPUS);
+            let mut counts = [0u16; crate::MAX_CPUS];
+            crate::tasks_per_cpu(&mut counts[..online]);
+            let mut best = cpu_id as usize;
+            for (cpu, &n) in counts.iter().enumerate().take(online) {
+                if n < counts[best] {
+                    best = cpu;
+                }
+            }
+            best
+        };
+        let mut migrate_after_unlock: Option<usize> = None;
+        if target_cpu > cpu_id as usize {
+            let mut dst_guard = crate::PER_CPU_SCHEDULER[target_cpu].lock();
+            if let Some(dst) = dst_guard.as_mut() {
+                let _ = crate::scheduler::migrate_task_between(
+                    sched, dst, new_task_id, target_cpu as u16,
+                );
+            }
+        } else if target_cpu < cpu_id as usize {
+            migrate_after_unlock = Some(target_cpu);
+        }
+
         // Drop all locks before acquiring CAPABILITY_MANAGER(4)
         // Note: CAPABILITY_MANAGER is level 4, lower than SCHEDULER(1), but
         // we already released SCHEDULER. The ordering constraint is about
@@ -2278,6 +2313,17 @@ impl SyscallDispatcher {
         drop(sched_guard);
         drop(fa_guard);
         drop(pt_guard);
+
+        #[cfg(not(test))]
+        if let Some(target) = migrate_after_unlock {
+            let _ = crate::scheduler::migrate_task(new_task_id, cpu_id as usize, target);
+        }
+        #[cfg(test)]
+        let _ = migrate_after_unlock;
+        // The task is Ready on a core that may be halted: kick it.
+        if target_cpu != cpu_id as usize && crate::cpu_is_idle(target_cpu) {
+            crate::arch::kick_cpu(target_cpu);
+        }
 
         // Register capabilities for the new process (CAPABILITY_MANAGER lock = level 4)
         {
