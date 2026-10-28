@@ -33,10 +33,15 @@ name = "build-manifest"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "cambios-abi",
  "cambios-manifest",
  "serde",
  "toml",
 ]
+
+[[package]]
+name = "cambios-abi"
+version = "0.1.0"
 
 [[package]]
 name = "cambios-manifest"

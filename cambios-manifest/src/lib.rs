@@ -43,7 +43,7 @@
 pub const MAGIC: [u8; 8] = *b"CBOSMANI";
 
 /// Wire-format version this crate reads and writes.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Boot-module name the kernel recognizes as the manifest blob
 /// (`strip_module_name` output for `boot():/boot/manifest.bin` —
@@ -144,7 +144,13 @@ pub const MODULE_NAME_MAX: usize = 64;
 /// | 24     | 4    | strings_len     |
 /// | 28     | 4    | init_endpoint   |
 /// | 32     | 32   | init_aid        |
-pub const HEADER_LEN: usize = 64;
+/// | 64     | 16   | init_syscalls (`[u64; 2]` bitmap, bit N = syscall N allowed) |
+///
+/// Version 2 added `init_syscalls` and the per-entry `syscalls` set:
+/// the manifest is the authority for which syscalls each entry may
+/// make, enforced by the policy service (ADR-006), as it already is
+/// for endpoints and capability grants.
+pub const HEADER_LEN: usize = 80;
 
 const OFF_VERSION: usize = 8;
 const OFF_ENTRY_COUNT: usize = 12;
@@ -153,6 +159,30 @@ const OFF_STRINGS_OFFSET: usize = 20;
 const OFF_STRINGS_LEN: usize = 24;
 const OFF_INIT_ENDPOINT: usize = 28;
 const OFF_INIT_AID: usize = 32;
+const OFF_INIT_SYSCALLS: usize = 64;
+
+/// Syscall-set bitmap: two little-endian u64 words, bit N of the
+/// whole 128-bit value = syscall number N allowed. ARCHITECTURAL: the
+/// syscall number space is bounded at 128 by this width; numbers run
+/// to 75 today (cambios-abi).
+pub const SYSCALL_MASK_WORDS: usize = 2;
+
+/// Whether syscall `num` is set in `mask`.
+pub const fn syscall_mask_allows(mask: &[u64; SYSCALL_MASK_WORDS], num: u32) -> bool {
+    let word = (num / 64) as usize;
+    if word >= SYSCALL_MASK_WORDS {
+        return false;
+    }
+    (mask[word] >> (num % 64)) & 1 == 1
+}
+
+/// Set syscall `num` in `mask`; numbers past the bitmap are ignored.
+pub fn syscall_mask_set(mask: &mut [u64; SYSCALL_MASK_WORDS], num: u32) {
+    let word = (num / 64) as usize;
+    if word < SYSCALL_MASK_WORDS {
+        mask[word] |= 1u64 << (num % 64);
+    }
+}
 
 // ----------------------------------------------------------------------------
 // Fixed layout: entry
@@ -172,7 +202,8 @@ const OFF_INIT_AID: usize = 32;
 /// | 108    | 16   | lifetime (see `LIFETIME_*` offsets)        |
 /// | 124    | 256  | granted_capabilities `[grant 8B; 32]`      |
 /// | 380    | 128  | depends_on `[StringRef 8B; 16]`            |
-/// | 508    | 20   | reserved (must be 0 in v1)                 |
+/// | 508    | 16   | syscalls (`[u64; 2]` bitmap, v2)           |
+/// | 524    | 4    | reserved (must be 0)                       |
 pub const ENTRY_LEN: usize = 528;
 
 /// ARCHITECTURAL: upper bound on a well-formed manifest payload,
@@ -199,7 +230,8 @@ const E_OFF_PAD: usize = 107;
 const E_OFF_LIFETIME: usize = 108;
 const E_OFF_GRANTS: usize = 124;
 const E_OFF_DEPS: usize = 380;
-const E_OFF_RESERVED: usize = 508;
+const E_OFF_SYSCALLS: usize = 508;
+const E_OFF_RESERVED: usize = 524;
 
 /// Lifetime sub-record layout, relative to `E_OFF_LIFETIME`:
 /// tag u8 @0, pad u8 @1 (0), max_restarts u16 @2, initial_delay_ms
@@ -674,6 +706,11 @@ impl<'a> Manifest<'a> {
         self.init_endpoint
     }
 
+    /// The syscall set init may use (v2).
+    pub fn init_syscalls(&self) -> [u64; SYSCALL_MASK_WORDS] {
+        read_mask(self.bytes, OFF_INIT_SYSCALLS)
+    }
+
     /// View of entry `i`; `None` past `entry_count`.
     pub fn entry(&self, i: usize) -> Option<EntryView<'a>> {
         if i >= self.entry_count as usize {
@@ -710,6 +747,16 @@ impl<'a> EntryView<'a> {
         let off = self.base + E_OFF_PRINCIPAL;
         aid.copy_from_slice(&self.m.bytes[off..off + 32]);
         aid
+    }
+
+    /// The syscall set this entry may use (v2): bit N = syscall N.
+    pub fn syscalls(&self) -> [u64; SYSCALL_MASK_WORDS] {
+        read_mask(self.m.bytes, self.base + E_OFF_SYSCALLS)
+    }
+
+    /// Whether this entry may make syscall `num`.
+    pub fn syscall_allowed(&self, num: u32) -> bool {
+        syscall_mask_allows(&self.syscalls(), num)
     }
 
     /// Module name (validated UTF-8 at parse).
@@ -975,6 +1022,8 @@ pub struct EntryDef<'a> {
     pub grants: &'a [CapabilityGrant],
     pub lifetime: ServiceLifetime,
     pub depends_on: &'a [&'a str],
+    /// Allowed syscalls, bit N = syscall N (see `syscall_mask_set`).
+    pub syscalls: [u64; SYSCALL_MASK_WORDS],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1017,6 +1066,22 @@ pub fn emitted_size(entries: &[EntryDef<'_>]) -> Result<usize, EmitError> {
     Ok(HEADER_LEN + entries.len() * ENTRY_LEN + strings)
 }
 
+fn write_mask(out: &mut [u8], off: usize, mask: &[u64; SYSCALL_MASK_WORDS]) {
+    for (w, v) in mask.iter().enumerate() {
+        out[off + w * 8..off + w * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn read_mask(bytes: &[u8], off: usize) -> [u64; SYSCALL_MASK_WORDS] {
+    let mut mask = [0u64; SYSCALL_MASK_WORDS];
+    for (w, slot) in mask.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[off + w * 8..off + w * 8 + 8]);
+        *slot = u64::from_le_bytes(b);
+    }
+    mask
+}
+
 fn write_u32(out: &mut [u8], off: usize, v: u32) {
     out[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
@@ -1034,6 +1099,7 @@ fn write_u16(out: &mut [u8], off: usize, v: u16) {
 pub fn emit_manifest(
     init_aid: [u8; 32],
     init_endpoint: u32,
+    init_syscalls: [u64; SYSCALL_MASK_WORDS],
     entries: &[EntryDef<'_>],
     out: &mut [u8],
 ) -> Result<usize, EmitError> {
@@ -1070,6 +1136,7 @@ pub fn emit_manifest(
     write_u32(out, OFF_STRINGS_OFFSET, strings_offset as u32);
     write_u32(out, OFF_STRINGS_LEN, cursor as u32);
     write_u32(out, OFF_INIT_ENDPOINT, init_endpoint);
+    write_mask(out, OFF_INIT_SYSCALLS, &init_syscalls);
     out[OFF_INIT_AID..OFF_INIT_AID + 32].copy_from_slice(&init_aid);
 
     // Entries.
@@ -1095,6 +1162,7 @@ pub fn emit_manifest(
         out[base + E_OFF_ENDPOINTS_LEN] = e.reserved_endpoints.len() as u8;
         out[base + E_OFF_GRANTS_LEN] = e.grants.len() as u8;
         out[base + E_OFF_DEPS_LEN] = e.depends_on.len() as u8;
+        write_mask(out, base + E_OFF_SYSCALLS, &e.syscalls);
 
         let l = base + E_OFF_LIFETIME;
         match e.lifetime {
@@ -1196,6 +1264,7 @@ mod tests {
                     failure_window_ms: 60_000,
                 },
                 depends_on: &[],
+                syscalls: [0x3FF, 0],
             },
             EntryDef {
                 module_name: "fs-service",
@@ -1209,6 +1278,7 @@ mod tests {
                     failure_window_ms: 60_000,
                 },
                 depends_on: &["virtio-blk"],
+                syscalls: [0x3FF, 0],
             },
             EntryDef {
                 module_name: "shell",
@@ -1217,6 +1287,7 @@ mod tests {
                 grants: &SHELL_GRANTS,
                 lifetime: ServiceLifetime::OneShot,
                 depends_on: &["fs-service"],
+                syscalls: [0x3FF, 0],
             },
         ]
     }
@@ -1224,12 +1295,39 @@ mod tests {
     fn build_sample() -> Vec<u8> {
         let defs = sample_defs();
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        let n = emit_manifest(aid(0xEE), INIT_ENDPOINT, &defs, &mut buf).unwrap();
+        let n = emit_manifest(aid(0xEE), INIT_ENDPOINT, [0x7, 0x1], &defs, &mut buf).unwrap();
         assert_eq!(n, buf.len());
         buf
     }
 
     // ---------------- round-trip ----------------
+
+    #[test]
+    fn syscall_masks_round_trip() {
+        let blob = build_sample();
+        let m = Manifest::parse(&blob).unwrap();
+        assert_eq!(m.init_syscalls(), [0x7, 0x1]);
+        let e = m.entry(0).unwrap();
+        assert_eq!(e.syscalls(), [0x3FF, 0]);
+        assert!(e.syscall_allowed(0));
+        assert!(e.syscall_allowed(9));
+        assert!(!e.syscall_allowed(10));
+        assert!(!e.syscall_allowed(64));
+        assert!(!e.syscall_allowed(200));
+        let mut mask = [0u64; SYSCALL_MASK_WORDS];
+        syscall_mask_set(&mut mask, 75);
+        syscall_mask_set(&mut mask, 3);
+        syscall_mask_set(&mut mask, 500);
+        assert!(syscall_mask_allows(&mask, 75) && syscall_mask_allows(&mask, 3));
+        assert!(!syscall_mask_allows(&mask, 74));
+    }
+
+    #[test]
+    fn version_one_blob_is_rejected() {
+        let mut blob = build_sample();
+        blob[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(Manifest::parse(&blob), Err(ManifestError::BadVersion(1))));
+    }
 
     #[test]
     fn round_trip_header() {
@@ -1306,7 +1404,7 @@ mod tests {
 
         // Empty manifest: extent is exactly the header.
         let mut buf = vec![0u8; emitted_size(&[]).unwrap()];
-        let n = emit_manifest(aid(9), 1, &[], &mut buf).unwrap();
+        let n = emit_manifest(aid(9), 1, [0x7, 0x1], &[], &mut buf).unwrap();
         assert_eq!(payload_extent(&buf), Some(n));
     }
 
@@ -1354,6 +1452,7 @@ mod tests {
                 grants: &[],
                 lifetime: ServiceLifetime::OneShot,
                 depends_on: &dep_lists[i],
+                syscalls: [0x3FF, 0],
             });
         }
         let size = emitted_size(&defs).unwrap();
@@ -1364,14 +1463,14 @@ mod tests {
             MANIFEST_MAX_BYTES
         );
         let mut buf = vec![0u8; size];
-        let n = emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        let n = emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         assert_eq!(payload_extent(&buf[..HEADER_LEN]), Some(n));
     }
 
     #[test]
     fn empty_manifest_round_trips() {
         let mut buf = vec![0u8; emitted_size(&[]).unwrap()];
-        let n = emit_manifest(aid(9), 1, &[], &mut buf).unwrap();
+        let n = emit_manifest(aid(9), 1, [0x7, 0x1], &[], &mut buf).unwrap();
         assert_eq!(n, HEADER_LEN);
         let m = Manifest::parse(&buf).unwrap();
         assert_eq!(m.entry_count(), 0);
@@ -1391,8 +1490,8 @@ mod tests {
         assert_eq!(Manifest::parse(&blob).unwrap_err(), ManifestError::BadMagic);
 
         let mut blob = build_sample();
-        blob[OFF_VERSION] = 2;
-        assert_eq!(Manifest::parse(&blob).unwrap_err(), ManifestError::BadVersion(2));
+        blob[OFF_VERSION] = 3;
+        assert_eq!(Manifest::parse(&blob).unwrap_err(), ManifestError::BadVersion(3));
     }
 
     #[test]
@@ -1435,7 +1534,7 @@ mod tests {
         let defs = sample_defs();
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
         assert_eq!(
-            emit_manifest(aid(0), 0, &defs, &mut buf).unwrap_err(),
+            emit_manifest(aid(0), 0, [0x7, 0x1], &defs, &mut buf).unwrap_err(),
             EmitError::InitEndpointZero
         );
         // And on the parse side, via a hand-corrupted header.
@@ -1582,9 +1681,10 @@ mod tests {
             grants: &[],
             lifetime: ServiceLifetime::OnDemand,
             depends_on: &[],
+            syscalls: [0x3FF, 0],
         }];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), INIT_ENDPOINT, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), INIT_ENDPOINT, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         let e = m.entry(0).unwrap();
         assert_eq!(e.lifetime(), ServiceLifetime::OnDemand);
@@ -1603,7 +1703,7 @@ mod tests {
         ));
 
         let mut blob = build_sample();
-        blob[entry_base(1) + E_OFF_RESERVED + 5] = 1;
+        blob[entry_base(1) + E_OFF_RESERVED + 1] = 1;
         assert!(matches!(
             Manifest::parse(&blob).unwrap_err(),
             ManifestError::Entry(1, EntryError::PadNonZero)
@@ -1624,7 +1724,7 @@ mod tests {
         let mut defs = sample_defs();
         defs[1].reserved_endpoints = &[24]; // collides with virtio-blk
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         assert_eq!(validate_unique(&m).unwrap_err(), ValidateError::DuplicateEndpoint(24));
     }
@@ -1634,7 +1734,7 @@ mod tests {
         let mut defs = sample_defs();
         defs[2].reserved_endpoints = &[INIT_ENDPOINT];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), INIT_ENDPOINT, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), INIT_ENDPOINT, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         assert_eq!(
             validate_unique(&m).unwrap_err(),
@@ -1648,7 +1748,7 @@ mod tests {
         defs[2].module_name = "fs-service";
         defs[2].depends_on = &[]; // avoid self-dep noise
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         assert_eq!(validate_unique(&m).unwrap_err(), ValidateError::DuplicateName(1, 2));
     }
@@ -1674,7 +1774,7 @@ mod tests {
         let mut defs = sample_defs();
         defs[0].depends_on = &["fs-service"];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         let mut order = [0u16; MAX_MANIFEST_ENTRIES];
         assert!(matches!(topo_order(&m, &mut order).unwrap_err(), DagError::Cycle(_)));
@@ -1685,7 +1785,7 @@ mod tests {
         let mut defs = sample_defs();
         defs[0].depends_on = &["virtio-blk"];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         let mut order = [0u16; MAX_MANIFEST_ENTRIES];
         assert_eq!(topo_order(&m, &mut order).unwrap_err(), DagError::Cycle(0));
@@ -1715,7 +1815,7 @@ mod tests {
         defs[2].depends_on = &["no-such-module"];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
         assert_eq!(
-            emit_manifest(aid(0), 1, &defs, &mut buf).unwrap_err(),
+            emit_manifest(aid(0), 1, [0x7, 0x1], &defs, &mut buf).unwrap_err(),
             EmitError::UnknownDep(2, 0)
         );
     }
@@ -1725,7 +1825,7 @@ mod tests {
         let defs = sample_defs();
         let mut buf = vec![0u8; emitted_size(&defs).unwrap() - 1];
         assert_eq!(
-            emit_manifest(aid(0), 1, &defs, &mut buf).unwrap_err(),
+            emit_manifest(aid(0), 1, [0x7, 0x1], &defs, &mut buf).unwrap_err(),
             EmitError::BufferTooSmall
         );
 
@@ -1737,6 +1837,7 @@ mod tests {
             grants: &[],
             lifetime: ServiceLifetime::OneShot,
             depends_on: &[],
+            syscalls: [0x3FF, 0],
         }];
         assert_eq!(emitted_size(&defs2).unwrap_err(), EmitError::NameTooLong(0));
     }
@@ -1749,10 +1850,12 @@ mod tests {
         assert_eq!(E_OFF_ENDPOINTS + RESERVED_ENDPOINTS_MAX * 4, E_OFF_ENDPOINTS_LEN);
         assert_eq!(E_OFF_LIFETIME + 16, E_OFF_GRANTS);
         assert_eq!(E_OFF_GRANTS + GRANTS_MAX * GRANT_LEN, E_OFF_DEPS);
-        assert_eq!(E_OFF_DEPS + DEPS_MAX * STRING_REF_LEN, E_OFF_RESERVED);
-        assert_eq!(E_OFF_RESERVED + 20, ENTRY_LEN);
-        // Header init AID is the trailing field.
-        assert_eq!(OFF_INIT_AID + 32, HEADER_LEN);
+        assert_eq!(E_OFF_DEPS + DEPS_MAX * STRING_REF_LEN, E_OFF_SYSCALLS);
+        assert_eq!(E_OFF_SYSCALLS + SYSCALL_MASK_WORDS * 8, E_OFF_RESERVED);
+        assert_eq!(E_OFF_RESERVED + 4, ENTRY_LEN);
+        // Header: init AID then the init syscall set, which is the trailing field.
+        assert_eq!(OFF_INIT_AID + 32, OFF_INIT_SYSCALLS);
+        assert_eq!(OFF_INIT_SYSCALLS + SYSCALL_MASK_WORDS * 8, HEADER_LEN);
     }
 
     #[test]

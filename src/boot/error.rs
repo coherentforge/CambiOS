@@ -123,6 +123,13 @@ pub enum BootError {
     /// Site: `src/manifest.rs` populate helpers.
     ManifestTranscriptionFailed,
 
+    /// Retaining the verified manifest blob for mapping into its
+    /// interpreters (init at creation, the policy service at every
+    /// spawn) failed: size outside the mapping budget, the
+    /// realignment-copy allocation failed, or a second retain.
+    /// Site: `src/manifest.rs` `retain_blob`.
+    ManifestRetainFailed,
+
     /// No boot module named `MANIFEST_MODULE_NAME` is present. Since
     /// ADR-018 migration step 9 the manifest is the only thing that
     /// starts services (the auto-start chain is gone), so a boot
@@ -192,6 +199,8 @@ pub fn boot_failed(err: BootError) -> ! {
             "boot manifest failed cross-record validation (duplicate name/endpoint)",
         BootError::ManifestTranscriptionFailed =>
             "boot manifest transcription failed (table install rejected a row)",
+        BootError::ManifestRetainFailed =>
+            "boot manifest blob could not be retained for mapping (size budget or realignment alloc)",
         BootError::ManifestModuleMissing =>
             "no boot manifest module — supervised boot needs manifest.bin + init.elf staged",
         BootError::InitModuleMissing =>
@@ -234,6 +243,7 @@ mod tests {
             BootError::ManifestMalformed,
             BootError::ManifestInconsistent,
             BootError::ManifestTranscriptionFailed,
+            BootError::ManifestRetainFailed,
             BootError::ManifestModuleMissing,
             BootError::InitModuleMissing,
             BootError::InitCreationFailed,

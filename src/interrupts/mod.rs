@@ -468,6 +468,9 @@ pub unsafe fn init_hardware_interrupts(
     {
         // SAFETY: Single-threaded boot, BSP only, APIC ID is valid.
         unsafe { crate::arch::x86_64::percpu::init_bsp(bsp_apic_id); }
+        // The boot CPU can name itself from here on: spinlocks start
+        // counting their holders (PREEMPT_DEPTH).
+        crate::preempt_depth_go_live();
         crate::println!("  Per-CPU data initialized (BSP, APIC ID={})", bsp_apic_id);
     }
 

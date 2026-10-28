@@ -14,8 +14,16 @@
 //!
 //! The policy service is a user-space process (endpoint 22) that receives
 //! structured queries and returns Allow/Deny decisions. The kernel caches
-//! decisions per-CPU and only upcalls on cache miss. Fail-open: if the policy
-//! service is unavailable, the kernel falls back to Allow (current behavior).
+//! decisions per-CPU and only upcalls on cache miss.
+//!
+//! **Fail closed.** Once the policy service has been identified
+//! (`POLICY_SERVICE_READY`), every path that cannot obtain a decision —
+//! pending table full, query queue full, response timeout — is a Deny,
+//! audited as `SyscallDenied`, and never cached (the next attempt asks
+//! again). Enforcement availability may degrade a service into retrying;
+//! it may not degrade into permission. The one structural bypass is the
+//! window before the policy service exists, in which the only user task
+//! is init spawning it (ADR-018 boot wave): there is no one to ask.
 
 use crate::ipc::interceptor::InterceptDecision;
 use crate::ipc::{EndpointId, Message, ProcessId};
@@ -35,10 +43,20 @@ pub const POLICY_QUERY_ENDPOINT: u32 = 22;
 /// they never enter the IPC queue.
 pub const POLICY_RESP_ENDPOINT: u32 = 23;
 
-/// TUNING: ticks before a pending policy query expires and falls back to Allow.
-/// At 100 Hz timer, 100 ticks = 1 second. Chosen to be long enough for the
-/// policy service to respond under normal conditions, short enough that a hung
-/// policy service doesn't block tasks indefinitely.
+/// Diagnostic counters for the policy upcall path, printed once by the
+/// reschedule diagnostic: queries submitted to the service, answered by
+/// it, and expired (woken to Deny). `expired` ≈ `submitted` means the
+/// service never answers and every gated syscall costs the full
+/// timeout — the shape the per-service boot times showed.
+pub static POLICY_QUERIES_SUBMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POLICY_QUERIES_ANSWERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POLICY_QUERIES_EXPIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// TUNING: ticks before a pending policy query expires and the blocked
+/// caller is woken with a Deny. At 100 Hz timer, 100 ticks = 1 second.
+/// Long enough for the policy service to respond under normal conditions,
+/// short enough that a hung policy service doesn't block tasks indefinitely
+/// (they are denied, loudly, and may retry).
 pub const POLICY_TIMEOUT_TICKS: u64 = 100;
 
 /// TUNING: time-to-live for cached policy decisions (in ticks).
@@ -67,7 +85,8 @@ pub const MAX_PENDING_QUERIES: usize = 32;
 /// Per-task decision slots. The response handler writes before waking a task;
 /// the woken task reads after resuming.
 ///
-/// Values: 0 = no decision (timeout/expired → Allow), 1 = Allow, 2 = Deny.
+/// Values: 0 = no decision, 1 = Allow, 2 = Deny, 3 = expired by the sweep.
+/// Anything but Allow/Deny is a Deny the caller does not cache.
 pub static POLICY_DECISIONS: [AtomicU8; crate::MAX_TASKS] =
     [const { AtomicU8::new(0) }; crate::MAX_TASKS];
 
@@ -75,6 +94,9 @@ pub static POLICY_DECISIONS: [AtomicU8; crate::MAX_TASKS] =
 pub const DECISION_NONE: u8 = 0;
 pub const DECISION_ALLOW: u8 = 1;
 pub const DECISION_DENY: u8 = 2;
+/// Written by the expiry sweep, under the waiter's scheduler lock, just
+/// before it wakes the waiter.
+pub const DECISION_EXPIRED: u8 = 3;
 
 // ============================================================================
 // Wire format
@@ -99,6 +121,17 @@ pub fn build_query_message(
         EndpointId(POLICY_RESP_ENDPOINT),   // from: response endpoint
         EndpointId(POLICY_QUERY_ENDPOINT),  // to: query endpoint
     );
+    // The kernel is the sender. Stamp the bootstrap Principal so the
+    // policy service's verified receive (libipc `ServiceLoop`, which
+    // drops anonymous messages by design) accepts the query. Without
+    // this no query was ever answered: every gated syscall sat out the
+    // full `POLICY_TIMEOUT_TICKS` and failed open — one second per
+    // gated syscall, on QEMU and on the Dell 3630 alike (found
+    // 2026-10-27 via the per-service boot times).
+    #[cfg(not(test))]
+    {
+        msg.sender_principal = Some(crate::BOOTSTRAP_PRINCIPAL.load());
+    }
 
     let mut payload = [0u8; 48];
     payload[0..8].copy_from_slice(&query_id.to_le_bytes());
@@ -212,10 +245,44 @@ impl PolicyRouter {
         None
     }
 
+    /// Pending queries older than `timeout` ticks, left in the table:
+    /// `(query_id, task_id)` pairs, up to `MAX_PENDING_QUERIES`. The
+    /// caller wakes each task without this lock held and then calls
+    /// `remove_query` for the ones it managed to wake; the rest are
+    /// reported again next tick.
+    pub fn expired_queries(
+        &self,
+        current_tick: u64,
+        timeout: u64,
+    ) -> ([Option<(u64, TaskId)>; MAX_PENDING_QUERIES], usize) {
+        let mut expired = [None; MAX_PENDING_QUERIES];
+        let mut count = 0;
+        for pq in self.pending.iter().flatten() {
+            if current_tick.saturating_sub(pq.submitted_at) >= timeout && count < MAX_PENDING_QUERIES {
+                expired[count] = Some((pq.query_id, pq.task_id));
+                count += 1;
+            }
+        }
+        (expired, count)
+    }
+
+    /// Remove a pending query by id without reporting its task.
+    pub fn remove_query(&mut self, query_id: u64) {
+        for slot in self.pending.iter_mut() {
+            if matches!(slot, Some(pq) if pq.query_id == query_id) {
+                *slot = None;
+                return;
+            }
+        }
+    }
+
     /// Find and remove all pending queries older than `timeout` ticks.
     /// Returns the TaskIds of expired queries (up to MAX_PENDING_QUERIES).
     ///
     /// The caller MUST drop the PolicyRouter lock before waking tasks.
+    /// Kept for the unit tests; the ISR path uses `expired_queries` +
+    /// `remove_query` so a task it cannot wake this tick stays pending.
+    #[allow(dead_code)]
     pub fn expire_stale(
         &mut self,
         current_tick: u64,
@@ -387,9 +454,19 @@ unsafe impl Sync for PolicyCacheCell {}
 ///
 /// # Fast-path bypasses (no locks)
 ///
-/// - `POLICY_SERVICE_READY` is false → Allow (pre-boot or policy service down)
+/// - `POLICY_SERVICE_READY` is false → Allow. Structural: before the
+///   policy service is spawned the only user task is init, and nothing
+///   else can be asked. The flag is never cleared, so a policy service
+///   that later dies leaves enforcement on (queries time out → Deny)
+///   until init restarts it.
 /// - Caller is the policy service → Allow (reentrancy prevention)
 /// - Caller is a kernel task (cr3 == 0) → Allow
+///
+/// # Fail closed
+///
+/// Pending table full, query queue full, and response timeout all
+/// return `Deny(SyscallNotPermitted)`; the dispatcher audits it. None
+/// of these is cached — the next call asks again.
 ///
 /// # Cache path (per-CPU, interrupts disabled)
 ///
@@ -483,11 +560,12 @@ pub fn policy_check(
         match router.submit_query(task_id, current_tick) {
             Some(qid) => qid,
             None => {
-                // Pending table full — fail-open
-                return InterceptDecision::Allow;
+                // Pending table full — no way to ask, so no permission.
+                return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
             }
         }
     };
+    POLICY_QUERIES_SUBMITTED.fetch_add(1, Ordering::Relaxed);
     // POLICY_ROUTER lock dropped
 
     // Build and send query message
@@ -496,10 +574,10 @@ pub fn policy_check(
         .send_message(EndpointId(POLICY_QUERY_ENDPOINT), msg)
         .is_err()
     {
-        // Queue full — remove the pending query and fail-open
+        // Queue full — withdraw the pending query; no decision, no permission.
         let mut router = crate::POLICY_ROUTER.lock();
         router.complete_query(query_id);
-        return InterceptDecision::Allow;
+        return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
     }
 
     // Wake the policy service if it's blocked waiting for queries.
@@ -508,11 +586,22 @@ pub fn policy_check(
     // wake_message_waiters_all_cpus). Syscall context — no lock held.
     crate::wake_message_waiters_all_cpus(POLICY_QUERY_ENDPOINT);
 
-    // Block and yield — same pattern as handle_recv_msg
+    // Block and yield — unless the answer has already landed.
     //
-    // CRITICAL: Disable interrupts BEFORE block_task to prevent the timer
-    // ISR from observing Blocked state before yield saves the correct context.
-    // See handle_recv_msg for the full race prevention explanation.
+    // The decision check and the block are ONE critical section under
+    // this CPU's scheduler lock (CLAUDE.md Blocking pattern: a condition
+    // another CPU signals must be re-checked atomically with
+    // block_task). The responder stores the decision and then takes this
+    // same lock to wake us; if it ran between our send and our block,
+    // its wake found us Running and did nothing — and complete_query had
+    // already removed the query, so the expiry sweep could never rescue
+    // us. Init slept forever in PolicyWait on the first boot that
+    // delivered an answer (QEMU, two CPUs, 2026-10-27).
+    //
+    // CRITICAL: interrupts off BEFORE block_task, or the timer ISR can
+    // see Blocked state before yield saves the correct context (see
+    // handle_recv_msg). The IrqSpinlock restores the flags it saved, so
+    // taking it after the disable keeps them off through the yield.
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Disabling interrupts is safe at kernel privilege level.
     unsafe {
@@ -523,20 +612,65 @@ pub fn policy_check(
     unsafe {
         core::arch::asm!("msr daifset, #2", options(nomem, nostack));
     }
-    {
-        crate::block_local_task(task_id, BlockReason::PolicyWait(query_id));
-    }
-    // SAFETY: We are on the kernel stack, no locks held.
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: `csrci sstatus, 2` clears SIE at S-mode; same contract as
+    // the dispatcher's blocking sites.
     unsafe {
-        crate::arch::yield_save_and_switch();
+        core::arch::asm!("csrci sstatus, 2", options(nomem, nostack));
+    }
+    let blocked = {
+        let mut guard = crate::local_scheduler().lock();
+        if POLICY_DECISIONS[task_id.slot() as usize].load(Ordering::Acquire) == DECISION_NONE {
+            match guard.as_mut() {
+                Some(sched) => sched.block_task(task_id, BlockReason::PolicyWait(query_id)).is_ok(),
+                None => false,
+            }
+        } else {
+            false
+        }
+    };
+    if blocked {
+        // SAFETY: We are on the kernel stack, no locks held.
+        unsafe {
+            crate::arch::yield_save_and_switch();
+        }
+    } else {
+        // The decision beat us to the block: no yield, so restore the
+        // interrupt state the syscall path runs with.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: Re-enabling interrupts is safe at kernel privilege level.
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: Unmasking IRQs is safe at EL1.
+        unsafe {
+            core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+        }
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: `csrsi sstatus, 2` sets SIE at S-mode.
+        unsafe {
+            core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack));
+        }
     }
 
     // --- Woken: read decision from POLICY_DECISIONS ---
 
     let decision_val = POLICY_DECISIONS[task_id.slot() as usize].swap(DECISION_NONE, Ordering::Acquire);
-    let allowed = decision_val != DECISION_DENY; // 0 (timeout) and 1 (Allow) → Allow
+    let allowed = match decision_val {
+        DECISION_ALLOW => true,
+        DECISION_DENY => false,
+        _ => {
+            // Expired (or no decision at all): the policy service never
+            // answered. Deny without caching — the next attempt asks
+            // again, so a recovered or restarted policy service is
+            // consulted, and a dead one keeps denying instead of being
+            // promoted to permission.
+            return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
+        }
+    };
 
-    // Cache the result
+    // Cache the answered result
     #[cfg(target_arch = "x86_64")]
     // SAFETY: per-CPU read — we're running on this CPU after wake.
     let wake_cpu = unsafe { crate::arch::x86_64::percpu::current_cpu_id() } as usize;
@@ -574,8 +708,8 @@ pub fn policy_check(
 // expire_pending_queries — called from timer ISR
 // ============================================================================
 
-/// Expire stale pending policy queries and wake their blocked tasks with
-/// a fail-open Allow decision.
+/// Expire stale pending policy queries and wake their blocked tasks; the
+/// woken task finds no decision and denies (fail closed, uncached).
 ///
 /// Called from the BSP timer ISR (100 Hz). Uses `try_lock` to avoid blocking
 /// the ISR if the PolicyRouter lock is contended.
@@ -586,22 +720,44 @@ pub fn expire_pending_queries() {
 
     let current_tick = Timer::get_ticks();
 
-    // Step 1: collect expired task_ids under PolicyRouter lock
+    // Step 1: list expired queries under the PolicyRouter lock, leaving
+    // them in the table.
     let (expired, count) = {
-        let mut guard = match crate::POLICY_ROUTER.try_lock() {
+        let guard = match crate::POLICY_ROUTER.try_lock() {
             Some(g) => g,
             None => return, // Lock contended — skip this tick
         };
-        guard.expire_stale(current_tick, POLICY_TIMEOUT_TICKS)
+        guard.expired_queries(current_tick, POLICY_TIMEOUT_TICKS)
     };
     // PolicyRouter lock dropped here
 
-    // Step 2: wake expired tasks (no locks from step 1 held)
+    // Step 2: wake each waiter with a try_lock on its CPU's scheduler.
+    // Selective: only a task actually Blocked on THIS query is woken,
+    // its decision slot marked expired first under the same lock. A task
+    // that submitted the query but has not blocked yet is left for the
+    // next tick (it checks the slot atomically with its block, so the
+    // slot must not be written out from under a later query).
+    // This runs in the timer ISR: a blocking cross-CPU scheduler lock
+    // here deadlocked against a CPU that held its own scheduler lock
+    // while waiting for a lock this CPU's interrupted syscall held
+    // (QEMU, six CPUs, 2026-10-27 — the shape became reachable once
+    // spawn-time placement spread tasks across CPUs). A task whose CPU
+    // is busy stays in the table and is retried next tick; a task
+    // already Ready is a harmless no-op wake.
     for entry in expired.iter().take(count) {
-        if let Some(tid) = *entry {
-            // No decision stored → DECISION_NONE (0) → fail-open Allow
-            POLICY_DECISIONS[tid.slot() as usize].store(DECISION_NONE, Ordering::Release);
-            crate::wake_task_on_cpu(tid);
+        if let Some((qid, tid)) = *entry {
+            let woke = crate::try_wake_policy_waiter(tid, qid, || {
+                POLICY_DECISIONS[tid.slot() as usize].store(DECISION_EXPIRED, Ordering::Release);
+            });
+            if woke {
+                POLICY_QUERIES_EXPIRED.fetch_add(1, Ordering::Relaxed);
+                if let Some(mut guard) = crate::POLICY_ROUTER.try_lock() {
+                    guard.remove_query(qid);
+                }
+                // A contended router lock leaves the entry for next tick:
+                // the extra wake it will produce finds a Ready task and
+                // does nothing.
+            }
         }
     }
 }

@@ -39,4 +39,5 @@ dependencies = [
  "cambios-libipc",
  "cambios-libsys",
  "cambios-libsys-rt",
+ "cambios-manifest",
 ]

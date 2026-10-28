@@ -10,6 +10,16 @@
 //!
 //! On SMP, `IrqSpinlock` is required for any lock that might be contended from
 //! both thread context and ISR context (e.g., SCHEDULER, TIMER).
+//!
+//! **A holder is never descheduled.** Interrupts stay on while a plain
+//! `Spinlock` is held (syscall handlers are preemptible), but the timer
+//! and reschedule handlers switch tasks only while this CPU's
+//! `PREEMPT_DEPTH` is zero. `Spinlock::lock` / `try_lock` raise the
+//! count before the acquire attempt (a waiter is not preemptible either,
+//! which closes the acquire-then-count window) and the guard lowers it
+//! after the release. An `IrqSpinlock` holder has interrupts masked, so
+//! it needs no count. See `crate::PREEMPT_DEPTH` for the deadlock this
+//! closes (ADR-001 § Divergence 2026-10-28).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::cell::UnsafeCell;
@@ -30,8 +40,10 @@ impl<T> Spinlock<T> {
         }
     }
     
-    /// Acquire the lock (spins until available)
+    /// Acquire the lock (spins until available). The calling CPU is
+    /// non-preemptible from here until the guard drops.
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
+        crate::preempt_disable();
         // Spin until we can acquire the lock
         loop {
             match self.locked.compare_exchange(
@@ -51,6 +63,7 @@ impl<T> Spinlock<T> {
     
     /// Try to acquire the lock without spinning
     pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
+        crate::preempt_disable();
         match self.locked.compare_exchange(
             false,
             true,
@@ -58,7 +71,10 @@ impl<T> Spinlock<T> {
             Ordering::Relaxed,
         ) {
             Ok(_) => Some(SpinlockGuard { lock: self }),
-            Err(_) => None,
+            Err(_) => {
+                crate::preempt_enable();
+                None
+            }
         }
     }
 }
@@ -96,8 +112,13 @@ impl<'a, T> DerefMut for SpinlockGuard<'a, T> {
 
 impl<'a, T> Drop for SpinlockGuard<'a, T> {
     fn drop(&mut self) {
-        // Release the lock
+        // Release the lock, then allow preemption again. This order
+        // matters: lowering the count first would reopen a window in
+        // which the timer could switch us out while the lock is still
+        // held. A tick landing between the two sees a released lock and
+        // a non-zero count and simply waits for the next tick.
         self.lock.locked.store(false, Ordering::Release);
+        crate::preempt_enable();
     }
 }
 

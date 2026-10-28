@@ -254,7 +254,7 @@ src/io/mod.rs:269:NS16550_PHYS_BASE
 src/io/mod.rs:430:UARTFR_RXFE
 src/ipc/channel.rs:46:MAX_CHANNELS
 src/ipc/channel.rs:62:MAX_CHANNEL_PAGES
-src/lib.rs:762:BALANCE_INTERVAL_TICKS
+src/lib.rs:897:BALANCE_INTERVAL_TICKS
 src/loader/elf.rs:15:ELF_CLASS_64BIT
 src/loader/elf.rs:16:ELF_DATA_LITTLE_ENDIAN
 src/loader/elf.rs:17:ELF_TYPE_EXECUTABLE
@@ -298,9 +298,10 @@ src/memory/mod.rs:675:BOOTLOADER_BASE
 src/memory/mod.rs:678:KERNEL_LOAD_ADDR
 src/memory/mod.rs:681:EXTENDED_MEMORY_BASE
 src/pci/mod.rs:36:MAX_PCI_DEVICES
-src/policy/mod.rs:75:DECISION_NONE
-src/policy/mod.rs:76:DECISION_ALLOW
-src/policy/mod.rs:77:DECISION_DENY
+src/policy/mod.rs:94:DECISION_NONE
+src/policy/mod.rs:95:DECISION_ALLOW
+src/policy/mod.rs:96:DECISION_DENY
+src/policy/mod.rs:99:DECISION_EXPIRED
 src/process.rs:35:MAX_VMAS
 src/process.rs:39:VMA_ALLOC_BASE
 src/process.rs:386:HEAP_SIZE

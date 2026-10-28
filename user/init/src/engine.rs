@@ -366,10 +366,11 @@ mod tests {
                 grants: &[],
                 lifetime,
                 depends_on: deps,
+                syscalls: [0x3FF, 0],
             })
             .collect();
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         let mut order = vec![0u16; entries.len()];
         let n = topo_order(&m, &mut order).unwrap();
@@ -602,7 +603,7 @@ mod tests {
     #[test]
     fn empty_manifest_is_immediately_done() {
         let mut buf = vec![0u8; emitted_size(&[]).unwrap()];
-        emit_manifest(aid(0xEE), 1, &[], &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &[], &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap();
         let eng = SupervisorEngine::new(&m, &[]).unwrap();
         assert_eq!(eng.next_action(), Action::Done);

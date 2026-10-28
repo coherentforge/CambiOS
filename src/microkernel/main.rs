@@ -486,6 +486,9 @@ unsafe extern "C" fn kmain() -> ! {
             core::arch::asm!("mrs {}, mpidr_el1", out(reg) bsp_mpidr, options(nostack, nomem));
             // Initialize per-CPU data (TPIDR_EL1) for BSP
             cambios_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
+            // The boot CPU can name itself from here on: spinlocks start
+            // counting their holders (PREEMPT_DEPTH).
+            cambios_core::preempt_depth_go_live();
             println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
 
             // Enable FP/NEON for EL0 and EL1 (CPACR_EL1.FPEN = 0b11).
@@ -790,6 +793,9 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // code has run.
     unsafe {
         cambios_core::arch::riscv64::percpu::init_bsp(hart_id);
+        // The boot CPU can name itself from here on: spinlocks start
+        // counting their holders (PREEMPT_DEPTH).
+        cambios_core::preempt_depth_go_live();
     }
 
     // Trap vector + SBI timer.
@@ -1645,11 +1651,12 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
     let verifier = SignedBinaryVerifier::with_key(*bootstrap.current_key_bytes());
 
     // The manifest arm below stashes the transcribed blob's module
-    // bytes (init needs them mapped at MANIFEST_USER_VADDR — a
-    // DIFFERENT buffer from init's own ELF); the init arm stashes
-    // init's ELF bytes. Conflating the two was the first-boot bug of
-    // step 7; the pair of named slots keeps it unrepresentable.
-    let mut manifest_module: Option<(*const u8, usize)> = None;
+    // bytes to `manifest::retain_blob` (init and the policy service
+    // need them mapped at MANIFEST_USER_VADDR — a DIFFERENT buffer
+    // from init's own ELF); the init arm stashes init's ELF bytes.
+    // Conflating the two was the first-boot bug of step 7; retaining
+    // the blob inside the manifest module keeps it unrepresentable here.
+    let mut manifest_transcribed = false;
     let mut init_module: Option<(*const u8, usize)> = None;
 
     // Pass 1: the manifest + init modules, before any service module.
@@ -1679,7 +1686,14 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
                 "  ✓ Boot manifest transcribed: {} spawn row(s), {} reserved endpoint(s)",
                 spawn_rows, reservations
             );
-            manifest_module = Some((addr, size as usize));
+            // Retain (and realign once if the boot adapter packed it
+            // mid-page) so init and the policy service can be handed
+            // the same signed bytes at MANIFEST_USER_VADDR.
+            {
+                let mut fa_guard = cambios_core::FRAME_ALLOCATOR.lock();
+                cambios_core::manifest::retain_blob(binary, &mut fa_guard)?;
+            }
+            manifest_transcribed = true;
         } else if short_name == cambios_manifest::INIT_MODULE_NAME.as_bytes() {
             BOOT_MODULE_REGISTRY
                 .lock()
@@ -1740,19 +1754,19 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
     // borrows the BSP scheduler, so init cannot be scheduled before its
     // blob mapping, grants, and identity are installed. Policy
     // identification + enforcement enablement happen in handle_spawn
-    // when init spawns policy-service (the fail-open window covers the
-    // gap, exactly as it covered the old chain's pre-first-query
-    // window).
-    match (manifest_module, init_module) {
-        (Some(manifest), Some(init)) => {
-            create_init_process(init, manifest, &verifier, scheduler)?;
+    // when init spawns policy-service (the pre-enforcement window
+    // covers the gap: until the policy service exists, init is the
+    // only user task and there is no one to ask).
+    match (manifest_transcribed, init_module) {
+        (true, Some(init)) => {
+            create_init_process(init, &verifier, scheduler)?;
         }
-        (Some(_), None) => {
+        (true, None) => {
             println!("✗ Boot manifest transcribed but no '{}' boot module",
                 cambios_manifest::INIT_MODULE_NAME);
             return Err(BootError::InitModuleMissing);
         }
-        (None, _) => {
+        (false, _) => {
             println!("✗ No '{}' boot module — nothing describes what to run",
                 cambios_manifest::MANIFEST_MODULE_NAME);
             return Err(BootError::ManifestModuleMissing);
@@ -1776,19 +1790,17 @@ fn load_boot_modules(scheduler: &mut Scheduler) -> Result<(), cambios_core::boot
 /// run until boot releases the scheduler, so every step below lands
 /// before init's first instruction.
 ///
-/// `init_elf` is init's own signed ELF (loaded as the process image);
-/// `manifest_blob` is the transcribed manifest module (mapped into
-/// init at `MANIFEST_USER_VADDR`). Two different module buffers —
-/// conflating them is exactly the first-boot bug this signature
-/// prevents recurring.
+/// `init_elf` is init's own signed ELF (loaded as the process image).
+/// The manifest blob mapped into init is the one `retain_blob`
+/// recorded in the module loop — a different module buffer;
+/// conflating the two was the first-boot bug, and keeping the blob
+/// out of this signature is what prevents it recurring.
 fn create_init_process(
     init_elf: (*const u8, usize),
-    manifest_blob: (*const u8, usize),
     verifier: &cambios_core::loader::SignedBinaryVerifier,
     scheduler: &mut Scheduler,
 ) -> Result<(), cambios_core::boot::error::BootError> {
     let (init_addr, init_size) = init_elf;
-    let (blob_addr, blob_size) = manifest_blob;
     use cambios_core::boot::error::BootError;
     use cambios_core::ipc::capability::CapabilityKind;
     use cambios_core::ipc::{CapabilityRights, EndpointId, Principal};
@@ -1803,20 +1815,6 @@ fn create_init_process(
             return Err(BootError::InitCreationFailed);
         }
     };
-
-    // The signed blob (payload + ARCSIG trailer) must fit the mapping
-    // budget both sides of the boot contract agree on. The trailer
-    // rides along — init's parser sizes itself from the header and
-    // ignores trailing bytes.
-    //
-    // ARCHITECTURAL: one page of slack over `MANIFEST_MAX_BYTES`
-    // covers the ARCSIG trailer (72 B today) without coupling this
-    // bound to the trailer's exact layout. Derived, not tuned.
-    const MANIFEST_MAPPING_BUDGET: usize = cambios_manifest::MANIFEST_MAX_BYTES + 4096;
-    if blob_size == 0 || blob_size > MANIFEST_MAPPING_BUDGET {
-        println!("✗ manifest module size {} outside mapping budget", blob_size);
-        return Err(BootError::InitCreationFailed);
-    }
 
     // SAFETY: init_addr/init_size come from the boot-module loop,
     // which received them from the boot protocol; the module memory is
@@ -1854,72 +1852,19 @@ fn create_init_process(
     };
 
     // Map the manifest blob read-only at the fixed contract address.
-    // The pages are boot-module physical memory (outside the frame
-    // allocator's usable range) shared with the registry entry — the
-    // mapping is deliberately NOT VMA-tracked: `destroy_process`
-    // reclaims VMA-tracked regions, and these pages are not init's to
-    // free. The fixed address sits below `VMA_ALLOC_BASE`, so dynamic
-    // regions can never collide with it (same convention as the ELF
-    // segments at 0x400000 and the stack at 0x800000).
+    // `retain_blob` (module loop) already realigned it if the boot
+    // adapter packed it mid-page; the policy service receives the
+    // same mapping at every spawn, from the same retained pages.
     {
         let mut fa_guard = FRAME_ALLOCATOR.lock();
-        // Module addresses are HHDM virtual pointers on every arch
-        // (Limine populates them that way; the riscv64 initrd adapter
-        // normalizes to match); the page tables need the physical
-        // address back out.
-        let blob_phys_base = (blob_addr as u64) - cambios_core::hhdm_offset();
-        let num_pages = blob_size.div_ceil(4096);
-        // Limine hands each module its own page-aligned allocation, but
-        // the riscv64 initrd packs modules 8-byte-aligned inside one
-        // archive — the blob may start mid-page, and page tables map
-        // whole pages only. Mapping the containing page would hand init
-        // a view offset from the real blob (init read garbage at
-        // MANIFEST_USER_VADDR — the ADR-018 all-arch staging bug).
-        // Unaligned ⇒ copy the blob into fresh page-aligned frames and
-        // map those instead. Like the zero-copy mapping, the copy is
-        // deliberately not VMA-tracked and never freed: init is PID 1
-        // for the system's lifetime.
-        let map_phys_base = if blob_phys_base % 4096 == 0 {
-            blob_phys_base
-        } else {
-            let frames = match fa_guard.allocate_contiguous(num_pages) {
-                Ok(f) => f,
-                Err(e) => {
-                    println!("✗ manifest blob realignment alloc failed: {:?}", e);
-                    return Err(BootError::InitCreationFailed);
-                }
-            };
-            let dst = (frames.addr + cambios_core::hhdm_offset()) as *mut u8;
-            // SAFETY: `dst` is `num_pages` freshly allocated frames
-            // (≥ blob_size bytes) accessed via the HHDM; `blob_addr`
-            // is the module's readable HHDM pointer for `blob_size`
-            // bytes (the transcription pass already read the whole
-            // blob through it). The regions cannot overlap: one is
-            // allocator-owned RAM, the other boot-module memory
-            // outside the allocator's range.
-            unsafe { core::ptr::copy_nonoverlapping(blob_addr, dst, blob_size) };
-            frames.addr
-        };
-        for i in 0..num_pages as u64 {
-            // SAFETY: result.cr3 is the fresh page-table root
-            // load_elf_process just created, and no other reference to
-            // it exists (init cannot run while the boot path holds the
-            // scheduler). map_phys_base is page-aligned by
-            // construction (bootloader module allocation, or the
-            // realignment copy above); the frames are module memory or
-            // the never-freed copy, so mapping them read-only aliases
-            // nothing.
-            let mut pt = unsafe { cambios_core::memory::paging::page_table_from_cr3(result.cr3) };
-            if let Err(e) = cambios_core::memory::paging::map_page(
-                &mut pt,
-                cambios_manifest::MANIFEST_USER_VADDR + i * 4096,
-                map_phys_base + i * 4096,
-                cambios_core::memory::paging::flags::user_ro(),
-                &mut fa_guard,
-            ) {
-                println!("✗ manifest blob mapping failed at page {}: {:?}", i, e);
-                return Err(BootError::InitCreationFailed);
-            }
+        // SAFETY: result.cr3 is the fresh page-table root
+        // load_elf_process just created, and no other reference to it
+        // exists (init cannot run while the boot path holds the
+        // scheduler); `fa_guard` is the held FRAME_ALLOCATOR.
+        let mapped = unsafe { cambios_core::manifest::map_blob_into(result.cr3, &mut fa_guard) };
+        if let Err(e) = mapped {
+            println!("✗ manifest blob mapping failed: {:?}", e);
+            return Err(BootError::InitCreationFailed);
         }
     }
 

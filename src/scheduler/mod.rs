@@ -90,12 +90,37 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
                 let mut per_cpu = [0u16; 16];
                 crate::tasks_per_cpu(&mut per_cpu);
                 let online = crate::online_cpu_count().min(per_cpu.len());
+                // What each CPU is doing right now: current task slot
+                // (0 = idle) and its Ready count. try_lock: a CPU whose
+                // scheduler is busy shows as (65535, 65535).
+                let mut current = [65535u16; 16];
+                let mut ready = [65535u16; 16];
+                for cpu in 0..online {
+                    if cpu == cpu_id as usize {
+                        // Our own scheduler lock may be held by the
+                        // interrupted context; report the known answer.
+                        current[cpu] = 65534;
+                        ready[cpu] = 65534;
+                        continue;
+                    }
+                    if let Some(g) = crate::PER_CPU_SCHEDULER[cpu].try_lock() {
+                        if let Some(sc) = g.as_ref() {
+                            current[cpu] = sc.current_task().map(|t| t.slot() as u16).unwrap_or(0);
+                            ready[cpu] = sc.active_runnable_count() as u16;
+                        }
+                    }
+                }
                 let accepted = crate::io::try_print(format_args!(
-                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
+                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; current {:?}; runnable {:?}; policy queries submitted {} answered {} expired {}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
                     crate::RESCHED_KICKS_SENT.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_HANDLED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_SWITCHED.load(core::sync::atomic::Ordering::Relaxed),
                     &per_cpu[..online],
+                    &current[..online],
+                    &ready[..online],
+                    crate::policy::POLICY_QUERIES_SUBMITTED.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::policy::POLICY_QUERIES_ANSWERED.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::policy::POLICY_QUERIES_EXPIRED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::BOOT_STAMP_MCYCLES[0].load(core::sync::atomic::Ordering::Relaxed),
                     crate::BOOT_STAMP_MCYCLES[1].load(core::sync::atomic::Ordering::Relaxed),
                     crate::BOOT_STAMP_MCYCLES[2].load(core::sync::atomic::Ordering::Relaxed),
@@ -130,6 +155,14 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
         if let Some(sched) = sched_guard.as_mut() {
             // Wake any tasks blocked on the timer IRQ (IoWait(0))
             sched.wake_irq_waiters(0);
+
+            // A plain-spinlock holder is never descheduled: account the
+            // tick but keep the interrupted task on the CPU. Its slice,
+            // if expired, is collected at the first tick after release.
+            if crate::preemption_held() {
+                sched.isr_tick_only(current_rsp);
+                return (current_rsp, None);
+            }
 
             let new_rsp = sched.isr_tick_and_schedule(current_rsp);
             crate::set_local_cpu_idle(sched.current_is_idle());
@@ -185,6 +218,10 @@ static RESCHED_DIAG_PRINTED: core::sync::atomic::AtomicBool =
 /// lock means the wake is picked up at the next tick instead. No timer
 /// tick, no time-slice accounting, no EOI here (the arch half does EOI).
 pub fn on_resched_ipi(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
+    // Same rule as the timer: never switch away from a spinlock holder.
+    if crate::preemption_held() {
+        return (current_rsp, None);
+    }
     if let Some(mut sched_guard) = crate::local_scheduler().try_lock() {
         if let Some(sched) = sched_guard.as_mut() {
             let new_rsp = sched.isr_kick(current_rsp);
@@ -209,6 +246,11 @@ pub fn on_resched_ipi(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
 /// disabled. The caller built a synthetic SavedContext on the kernel stack;
 /// current_rsp points to it.
 pub fn on_voluntary_yield(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
+    // Yielding while holding a plain spinlock would park the lock with a
+    // task that is not running — the deadlock PREEMPT_DEPTH exists to
+    // rule out. Every caller drops its locks first (CLAUDE.md Blocking
+    // pattern); this names the invariant where it is relied upon.
+    debug_assert!(!crate::preemption_held(), "voluntary yield with a plain spinlock held");
     let mut sched_guard = crate::local_scheduler().lock();
     if let Some(sched) = sched_guard.as_mut() {
         let new_rsp = sched.voluntary_yield(current_rsp);
@@ -568,6 +610,29 @@ impl Scheduler {
         self.current_task.and_then(|id| self.get_task(id))
     }
 
+    /// The accounting half of a timer tick: count it, record the Running
+    /// task's context pointer, and charge its time slice. No scheduling
+    /// decision. `on_timer_isr` uses this alone while the interrupted
+    /// context holds a plain spinlock (`PREEMPT_DEPTH` non-zero): the
+    /// holder keeps the CPU, and an expired slice is collected at the
+    /// first tick after it releases.
+    pub fn isr_tick_only(&mut self, current_rsp: u64) {
+        self.total_ticks += 1;
+
+        // Save current task's context RSP and tick its time slice.
+        // Only save RSP for Running tasks — Blocked/Terminated tasks have a
+        // synthetic SavedContext on their kernel stack that must be preserved
+        // so they resume correctly when woken/re-scheduled.
+        if let Some(task_id) = self.current_task {
+            if let Some(task) = self.get_task_mut(task_id) {
+                if task.state == TaskState::Running {
+                    task.saved_rsp = current_rsp;
+                }
+                task.tick();
+            }
+        }
+    }
+
     /// ISR-driven tick and schedule: called from the timer ISR inner handler.
     ///
     /// Saves the interrupted task's RSP, decrements its time slice, and if
@@ -586,20 +651,7 @@ impl Scheduler {
     /// the timer ISR stub), since it mutates task state without additional
     /// locking beyond the Spinlock already held by the caller.
     pub fn isr_tick_and_schedule(&mut self, current_rsp: u64) -> u64 {
-        self.total_ticks += 1;
-
-        // Save current task's context RSP and tick its time slice.
-        // Only save RSP for Running tasks — Blocked/Terminated tasks have a
-        // synthetic SavedContext on their kernel stack that must be preserved
-        // so they resume correctly when woken/re-scheduled.
-        if let Some(task_id) = self.current_task {
-            if let Some(task) = self.get_task_mut(task_id) {
-                if task.state == TaskState::Running {
-                    task.saved_rsp = current_rsp;
-                }
-                task.tick();
-            }
-        }
+        self.isr_tick_only(current_rsp);
 
         // ADR-027 Phase 1 quiesce hook: if the current task has a pending
         // channel-quiesce hint, park it into Blocked(ChannelQuiesceWait)
@@ -1046,6 +1098,21 @@ impl Scheduler {
                 && matches!(t.block_reason, Some(BlockReason::ChildWait(s)) if s == child_slot)
         );
         is_waiting && self.wake_task(parent_id).is_ok()
+    }
+
+    /// Is `task_id` Blocked on `PolicyWait(query_id)` right now?
+    ///
+    /// The policy query-expiry sweep wakes only a task that is actually
+    /// parked on the expired query: one that submitted it but has not
+    /// blocked yet is left for the next tick (it re-checks its decision
+    /// slot atomically with its block), and one that already moved on is
+    /// not disturbed. `task_id` is generation-validated by `get_task`.
+    pub fn is_policy_waiter(&self, task_id: TaskId, query_id: u64) -> bool {
+        matches!(
+            self.get_task(task_id),
+            Some(t) if t.state == TaskState::Blocked
+                && matches!(t.block_reason, Some(BlockReason::PolicyWait(q)) if q == query_id)
+        )
     }
 
     /// Wake all tasks blocked on a specific hardware IRQ.

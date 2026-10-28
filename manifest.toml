@@ -67,28 +67,37 @@
 
 [init]
 endpoint = 1
+# Canonical syscall names (cambios-abi `SyscallNumber::NAMES`). The policy
+# service enforces exactly this set per entry; a syscall not listed is
+# denied and audited. Lists were seeded from each crate's actual calls.
+syscalls = ["spawn", "recv-msg", "try-recv-msg", "write", "print", "exit", "get-time", "wait-task", "yield", "get-pid", "register-endpoint", "get-principal"]
 
 # --- storage + identity chain ------------------------------------------------
 
 [[service]]
 name = "policy-service"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [22, 23]
 
 [[service]]
 name = "key-store-service"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 endpoints = [17]
 
 [[service]]
 name = "fs-service"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "obj-delete", "obj-get", "obj-list", "obj-put", "print", "recv-msg", "register-endpoint", "write", "yield"]
 endpoints = [16]
 depends_on = ["key-store-service"]
 
 [[service]]
 name = "virtio-blk"
+syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "port-io", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [24, 25, 26]
 
 [[service]]
 name = "fde-mount"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "install-master-key", "print", "read-volume-header", "recv-msg", "register-endpoint", "verify-volume-header", "write", "yield"]
 endpoints = [32]
 # unlock-volume gates SYS_READ_VOLUME_HEADER + SYS_INSTALL_MASTER_KEY
 # (replaces the bootstrap-equality check those handlers used pre-cutover).
@@ -100,10 +109,12 @@ depends_on = ["virtio-blk", "key-store-service"]
 
 [[service]]
 name = "virtio-net"
+syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "virtio-modern-caps", "write", "yield"]
 endpoints = [20]
 
 [[service]]
 name = "udp-stack"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "set-wallclock", "write", "yield"]
 endpoints = [21]
 system = ["set-wallclock"]
 depends_on = ["virtio-net"]
@@ -115,6 +126,7 @@ depends_on = ["virtio-net"]
 # scanout-limine (below) under `framebuffer-fallback`.
 [[service]]
 name = "scanout-virtio-gpu"
+syscalls = ["alloc-dma", "channel-create", "cluster-join", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "virtio-modern-caps", "write", "yield"]
 endpoints = [27]
 system = ["create-channel"]
 # GUI stack ships on x86_64 + aarch64 only — riscv64 has no scanout
@@ -126,6 +138,7 @@ profile = ["default"]
 
 [[service]]
 name = "compositor"
+syscalls = ["audit-emit-input-focus", "channel-attach", "channel-begin-teardown", "channel-close", "channel-complete-teardown", "channel-create", "channel-info", "cluster-create", "cluster-join", "exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [28, 30]
 system = ["create-channel", "emit-input-audit"]
 # Depends on whoever serves endpoint 27 (RegisterCompositor goes
@@ -136,12 +149,14 @@ profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "virtio-input"
+syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "virtio-modern-caps", "write", "yield"]
 depends_on = ["compositor"]
 arch = ["x86_64", "aarch64"]
 profile = ["default"]
 
 [[service]]
 name = "terminal-window"
+syscalls = ["channel-attach", "channel-close", "console-read", "exit", "get-pid", "get-principal", "get-time", "get-wallclock", "print", "recv-msg", "register-endpoint", "set-wallclock", "spawn", "try-recv-msg", "wait-task", "write", "yield"]
 endpoints = [14, 15]
 system = ["create-process", "set-wallclock"]
 depends_on = ["compositor"]
@@ -158,6 +173,7 @@ profile = ["default", "framebuffer-fallback"]
 # `manifest-gop` / image target that stages scanout-limine.elf).
 [[service]]
 name = "scanout-limine"
+syscalls = ["channel-create", "cluster-join", "exit", "get-pid", "get-principal", "get-time", "map-framebuffer", "print", "recv-msg", "register-endpoint", "write", "yield"]
 endpoints = [27]
 system = ["create-channel", "map-framebuffer"]
 profile = ["framebuffer-fallback"]
@@ -167,6 +183,7 @@ arch = ["x86_64", "aarch64"]
 
 [[service]]
 name = "tree"
+syscalls = ["channel-attach", "channel-close", "exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [61]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
@@ -174,6 +191,7 @@ profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "worm"
+syscalls = ["channel-attach", "channel-close", "exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [62]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
@@ -181,6 +199,7 @@ profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "sprouty"
+syscalls = ["allocate", "channel-attach", "channel-close", "exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [63]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
@@ -188,6 +207,7 @@ profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "ping"
+syscalls = ["channel-attach", "channel-close", "exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [19]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
@@ -196,6 +216,7 @@ profile = ["default", "framebuffer-fallback"]
 # hello-window — the canonical libgui client / regression canary.
 [[service]]
 name = "hello-window"
+syscalls = ["channel-attach", "channel-close", "exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [29]
 lifetime = "on-demand"
 arch = ["x86_64", "aarch64"]
@@ -206,16 +227,19 @@ profile = ["default", "framebuffer-fallback"]
 # No endpoints; send-only grants (the readiness ping).
 [[service]]
 name = "faultme"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 lifetime = "on-demand"
 
 # --- USB / PIV chain -------------------------------------------------------------
 
 [[service]]
 name = "usb-host"
+syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [31]
 
 [[service]]
 name = "ccid"
+syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 endpoints = [33]
 depends_on = ["usb-host"]
 
@@ -223,6 +247,7 @@ depends_on = ["usb-host"]
 
 [[service]]
 name = "audit-tail"
+syscalls = ["audit-attach", "exit", "get-pid", "get-principal", "get-process-principal", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 system = ["audit-consumer"]
 # Not in the headless (bare-metal bring-up) profile: with no scrollback
 # and no keyboard yet, its event stream pushes the driver bring-up lines
@@ -231,6 +256,7 @@ profile = ["default", "framebuffer-fallback"]
 
 [[service]]
 name = "shell"
+syscalls = ["console-read", "exit", "get-pid", "get-principal", "get-time", "get-wallclock", "print", "recv-msg", "register-endpoint", "spawn", "verify-volume-header", "wait-task", "write", "yield"]
 endpoints = [18]
 system = ["create-process"]
 depends_on = ["fs-service"]

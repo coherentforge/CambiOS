@@ -137,6 +137,36 @@ pub fn init_tombstone() -> bool {
 /// Dispatcher that routes syscalls to handlers
 pub struct SyscallDispatcher;
 
+/// Endpoints whose messages the kernel itself enqueues, on the sharded
+/// manager (`SHARDED_IPC`), rather than a user process sending through
+/// `handle_write` into `IPC_MANAGER`: the virtio-blk kernel-command slot
+/// (26) and the policy-query slot (22). A receive on these consults
+/// both managers; everywhere else only `IPC_MANAGER` carries traffic.
+/// The policy slot was missing here for as long as the upcall has
+/// existed — queries sat unread, every gated syscall fell open after
+/// the full timeout, and nothing failed loudly (found 2026-10-27).
+/// Byte buffer rendered one Latin-1 code point per byte — the user print
+/// syscall's text, written to the console in a single `fmt` pass so the
+/// sink lock is held once for the whole buffer.
+struct Latin1<'a>(&'a [u8]);
+
+impl core::fmt::Display for Latin1<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write;
+        for &b in self.0 {
+            f.write_char(b as char)?;
+        }
+        Ok(())
+    }
+}
+
+fn kernel_origin_endpoint(endpoint_id: u32) -> bool {
+    /// ARCHITECTURAL: endpoint 26 is the virtio-blk kernel-command slot
+    /// in the CambiOS IPC number-space.
+    const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
+    endpoint_id == BLK_KERNEL_CMD_ENDPOINT || endpoint_id == crate::policy::POLICY_QUERY_ENDPOINT
+}
+
 impl SyscallDispatcher {
     /// Dispatch a syscall to its handler
     ///
@@ -181,8 +211,8 @@ impl SyscallDispatcher {
         // Policy service pre-dispatch check (ADR-006).
         // Replaces the old IPC_MANAGER → interceptor → on_syscall path.
         // May block the calling task on a cache miss (upcall to user-space
-        // policy service). Falls back to Allow if the policy service is
-        // unavailable.
+        // policy service). Denies when no decision can be obtained —
+        // fail closed; see `policy::policy_check`.
         {
             use crate::ipc::interceptor::InterceptDecision;
             let decision = crate::policy::policy_check(
@@ -440,6 +470,8 @@ impl SyscallDispatcher {
                     };
                     crate::policy::POLICY_DECISIONS[tid.slot() as usize]
                         .store(val, core::sync::atomic::Ordering::Release);
+                    crate::policy::POLICY_QUERIES_ANSWERED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     crate::wake_task_on_cpu(tid);
                 }
                 return Ok(len as u64);
@@ -624,28 +656,36 @@ impl SyscallDispatcher {
         let reserved_owner =
             crate::ipc::endpoint_reservation::ENDPOINT_RESERVATIONS.owner(endpoint_id);
 
-        // Lock ordering: CAPABILITY_MANAGER(4)
-        let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
-        let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+        // Lock ordering: CAPABILITY_MANAGER(4) alone, released at the end
+        // of this block — the IPC_MANAGER(3) acquisition below is lower
+        // in the hierarchy and must not nest inside it. It did until
+        // 2026-10-28: a process registering here (holding 4, waiting on
+        // 3) against a receiver in handle_try_recv_msg (holding 3,
+        // waiting on 4) froze both CPUs the first time two services hit
+        // the pair concurrently (udp-stack vs virtio-blk, QEMU, 2 CPUs).
+        {
+            let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
+            let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
 
-        if let Some(owner_aid) = reserved_owner {
-            let caller_matches = cap_mgr
-                .get_principal(ctx.process_id)
-                .map(|p| p.aid() == &owner_aid)
-                .unwrap_or(false);
-            if !caller_matches {
-                // Squat attempt on a reserved endpoint — a security
-                // event, recorded like any other capability denial.
-                crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
-                    ctx.process_id, endpoint, crate::audit::now(), 0,
-                ));
-                return Err(SyscallError::PermissionDenied);
+            if let Some(owner_aid) = reserved_owner {
+                let caller_matches = cap_mgr
+                    .get_principal(ctx.process_id)
+                    .map(|p| p.aid() == &owner_aid)
+                    .unwrap_or(false);
+                if !caller_matches {
+                    // Squat attempt on a reserved endpoint — a security
+                    // event, recorded like any other capability denial.
+                    crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+                        ctx.process_id, endpoint, crate::audit::now(), 0,
+                    ));
+                    return Err(SyscallError::PermissionDenied);
+                }
             }
-        }
 
-        cap_mgr
-            .grant_capability(ctx.process_id, endpoint, crate::ipc::CapabilityRights::FULL)
-            .map_err(|_| SyscallError::PermissionDenied)?;
+            cap_mgr
+                .grant_capability(ctx.process_id, endpoint, crate::ipc::CapabilityRights::FULL)
+                .map_err(|_| SyscallError::PermissionDenied)?;
+        }
 
         crate::audit::emit(crate::audit::RawAuditEvent::capability_granted(
             ctx.process_id, ctx.process_id, endpoint, 0x0F, crate::audit::now(), 0,
@@ -991,9 +1031,13 @@ impl SyscallDispatcher {
         let mut buf = [0u8; 256];
         slice.read_into(&mut buf[..len])?;
 
-        for &byte in &buf[..len] {
-            crate::io::print(format_args!("{}", byte as char));
-        }
+        // One console-lock hold per syscall, not per byte: with services
+        // on different CPUs, per-byte prints interleaved character by
+        // character inside a single line (the shell banner the CI runner
+        // keys on arrived shredded by audit-tail's output, 2026-10-28).
+        // Bytes are rendered as Latin-1 code points, as before, so
+        // non-UTF-8 payloads still print rather than fail.
+        crate::io::print(format_args!("{}", Latin1(&buf[..len])));
 
         Ok(len as u64)
     }
@@ -1078,7 +1122,7 @@ impl SyscallDispatcher {
             /// slot in the CambiOS IPC number-space; see
             /// `BLK_KERNEL_RESP_ENDPOINT` above for the ABI-break caveat.
             const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
-            let msg = if endpoint_id == BLK_KERNEL_CMD_ENDPOINT {
+            let msg = if kernel_origin_endpoint(endpoint_id) {
                 msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
             } else {
                 msg
@@ -1160,7 +1204,7 @@ impl SyscallDispatcher {
                     .as_ref()
                     .map(|m| m.has_message(endpoint))
                     .unwrap_or(false)
-                    || (endpoint_id == BLK_KERNEL_CMD_ENDPOINT
+                    || (kernel_origin_endpoint(endpoint_id)
                         && crate::SHARDED_IPC.has_message(endpoint));
                 if queued {
                     false
@@ -1233,12 +1277,8 @@ impl SyscallDispatcher {
                 .map_err(|_| SyscallError::PermissionDenied)?
         };
 
-        // Virtio-blk kernel-command endpoint (same special case as handle_recv_msg)
-        /// ARCHITECTURAL: endpoint 26 — see handle_recv_msg for the ABI
-        /// caveat. Declared twice because both recv paths need the
-        /// literal for the `if endpoint_id == …` guard.
-        const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
-        let msg = if endpoint_id == BLK_KERNEL_CMD_ENDPOINT {
+        // Kernel-origin endpoints (same special case as handle_recv_msg).
+        let msg = if kernel_origin_endpoint(endpoint_id) {
             msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
         } else {
             msg
@@ -2230,8 +2270,32 @@ impl SyscallDispatcher {
         let verifier = SignedBinaryVerifier::with_key(*bootstrap.current_key_bytes());
 
 
+        // Spawn-time placement: the new task is created directly on the
+        // scheduler of the online CPU with the fewest homed tasks. The
+        // push balancer counts only Ready tasks and services are Blocked
+        // most of the time, so without this every task init spawns
+        // stays on CPU 0 for good (QEMU: tasks/cpu [17, 0]; Dell 3630:
+        // one reschedule kick in 20 s on twelve threads, 2026-10-27).
+        // Creating it there — one scheduler lock, taken first — keeps
+        // the hierarchy intact; the earlier shape (migrate under a
+        // second scheduler lock while PROCESS_TABLE and FRAME_ALLOCATOR
+        // were held) deadlocked against a concurrent exit on QEMU with
+        // six CPUs and on the Dell.
+        let home_cpu: usize = {
+            let online = crate::online_cpu_count().min(crate::MAX_CPUS);
+            let mut counts = [0u16; crate::MAX_CPUS];
+            crate::tasks_per_cpu(&mut counts[..online]);
+            let mut best = 0usize;
+            for (cpu, &n) in counts.iter().enumerate().take(online) {
+                if n < counts[best] {
+                    best = cpu;
+                }
+            }
+            best
+        };
+
         // Lock ordering: SCHEDULER(1) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
-        let mut sched_guard = crate::local_scheduler().lock();
+        let mut sched_guard = crate::PER_CPU_SCHEDULER[home_cpu].lock();
         let mut pt_guard = crate::PROCESS_TABLE.lock();
         let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
 
@@ -2258,52 +2322,25 @@ impl SyscallDispatcher {
         }
 
         // Register task in CPU map
-        let cpu_id = {
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: GS base is valid after percpu_init; pure read from per-CPU data.
-            { unsafe { crate::arch::x86_64::percpu::current_percpu().cpu_id() } }
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: TPIDR_EL1 base is valid after percpu_init; pure read from per-CPU data.
-            { unsafe { crate::arch::aarch64::percpu::current_percpu().cpu_id() } }
-            #[cfg(target_arch = "riscv64")]
-            // SAFETY: tp is valid after percpu_init; pure read from per-CPU data.
-            { unsafe { crate::arch::riscv64::percpu::current_percpu().cpu_id() } }
-        };
-        crate::set_task_cpu(new_task_id.slot(), cpu_id as u16);
+        crate::set_task_cpu(new_task_id.slot(), home_cpu as u16);
 
-        // Spawn-time placement: home the new task on the online CPU with
-        // the fewest tasks. The push balancer counts only Ready tasks and
-        // services are Blocked most of the time, so without this every
-        // task init spawns stays on CPU 0 for good (QEMU: tasks/cpu
-        // [17, 0]; Dell 3630: one reschedule kick in 20 s on twelve
-        // threads, 2026-10-27). A never-run Ready task is the safest
-        // thing to move. Lock ordering: scheduler locks are taken in
-        // ascending CPU index, so a higher target is locked now, under
-        // our own; a lower target is handled after our lock drops via
-        // `migrate_task` (which may find the task already Running and
-        // decline — then it simply stays here).
-        let target_cpu = {
-            let online = crate::online_cpu_count().min(crate::MAX_CPUS);
-            let mut counts = [0u16; crate::MAX_CPUS];
-            crate::tasks_per_cpu(&mut counts[..online]);
-            let mut best = cpu_id as usize;
-            for (cpu, &n) in counts.iter().enumerate().take(online) {
-                if n < counts[best] {
-                    best = cpu;
-                }
+        // The policy service interprets the manifest's per-entry
+        // syscall sets (ADR-006): hand it the same signed blob init
+        // reads, at the same contract address, before the task can
+        // run. A failure here is printed, not fatal to the spawn — the
+        // service exits on the missing header, init's restart budget
+        // surfaces it, and every query meanwhile times out to Deny.
+        // Fail closed, loudly.
+        if name == b"policy-service" {
+            // SAFETY: result.cr3 is the fresh root load_elf_process
+            // just created; the task cannot be scheduled while
+            // `sched_guard` (its home CPU's scheduler) is held, and
+            // `fa_guard` is the held FRAME_ALLOCATOR the contract asks
+            // for.
+            let mapped = unsafe { crate::manifest::map_blob_into(result.cr3, &mut fa_guard) };
+            if let Err(e) = mapped {
+                crate::println!("  [Spawn] manifest mapping for policy-service FAILED: {:?}", e);
             }
-            best
-        };
-        let mut migrate_after_unlock: Option<usize> = None;
-        if target_cpu > cpu_id as usize {
-            let mut dst_guard = crate::PER_CPU_SCHEDULER[target_cpu].lock();
-            if let Some(dst) = dst_guard.as_mut() {
-                let _ = crate::scheduler::migrate_task_between(
-                    sched, dst, new_task_id, target_cpu as u16,
-                );
-            }
-        } else if target_cpu < cpu_id as usize {
-            migrate_after_unlock = Some(target_cpu);
         }
 
         // Drop all locks before acquiring CAPABILITY_MANAGER(4)
@@ -2314,15 +2351,9 @@ impl SyscallDispatcher {
         drop(fa_guard);
         drop(pt_guard);
 
-        #[cfg(not(test))]
-        if let Some(target) = migrate_after_unlock {
-            let _ = crate::scheduler::migrate_task(new_task_id, cpu_id as usize, target);
-        }
-        #[cfg(test)]
-        let _ = migrate_after_unlock;
         // The task is Ready on a core that may be halted: kick it.
-        if target_cpu != cpu_id as usize && crate::cpu_is_idle(target_cpu) {
-            crate::arch::kick_cpu(target_cpu);
+        if crate::cpu_is_idle(home_cpu) {
+            crate::arch::kick_cpu(home_cpu);
         }
 
         // Register capabilities for the new process (CAPABILITY_MANAGER lock = level 4)
@@ -2353,7 +2384,7 @@ impl SyscallDispatcher {
         // The policy service arrives via init's manifest-driven spawn,
         // so its identification (POLICY_SERVICE_PID for the
         // response-endpoint write gate + interceptor reentrancy bypass,
-        // POLICY_SERVICE_READY to end the fail-open window) happens
+        // POLICY_SERVICE_READY to end the pre-enforcement window) happens
         // here, keyed off the same manifest name that keyed the grants.
         // Its row is init-only, so nothing shell-spawned can claim the
         // identity.
@@ -2371,9 +2402,9 @@ impl SyscallDispatcher {
         ));
 
         crate::println!(
-            "  [Spawn] '{}' → task {} process {} (parent=task {})",
+            "  [Spawn] '{}' → task {} process {} (parent=task {}, cpu {})",
             core::str::from_utf8(name).unwrap_or("?"),
-            new_task_id.slot(), process_id.slot(), ctx.task_id.slot()
+            new_task_id.slot(), process_id.slot(), ctx.task_id.slot(), home_cpu
         );
 
         // ADR-034 Phase B.4: return the full (slot, generation) handle. The

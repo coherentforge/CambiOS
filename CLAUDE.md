@@ -353,6 +353,8 @@ POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)
 
 Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.rs` comment.
 
+**A plain `Spinlock` holder is never descheduled.** Syscall handlers run with interrupts on, so without help the timer could switch away from a task mid-critical-section and leave a plain lock held by a task that is not running; a CPU then spinning on that lock with interrupts masked (an `IrqSpinlock` holder — `handle_spawn` with the target scheduler lock, `wake_message_waiters_all_cpus`) can never run the holder (the 2026-10-27 spawn deadlock: init on `FRAME_ALLOCATOR`, virtio-net on `PER_CPU_SCHEDULER[0]`, the allocator's holder preempted). `Spinlock::lock`/`try_lock` raise the per-CPU `PREEMPT_DEPTH` before the acquire attempt and the guard lowers it after the release; `on_timer_isr` and `on_resched_ipi` switch tasks only when it is zero (the tick is still accounted; an expired slice is collected at the first tick after release). Interrupts stay live — this is not IrqSpinlock-everywhere. Consequence for the hierarchy's deadlock-freedom argument: every lock holder is running and makes progress. `on_voluntary_yield` debug-asserts the count is zero: never block or yield with a plain lock held (the Blocking pattern already requires dropping it first).
+
 **Additional lock domains (independent of hierarchy above):**
 - `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR. Cache lock released before acquiring global allocator on refill/drain.
 - `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint. Released before acquiring scheduler for task wake.

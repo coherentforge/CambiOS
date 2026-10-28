@@ -673,6 +673,156 @@ pub fn transcribe_manifest_module(
     Ok((spawn_rows, reservations))
 }
 
+// ============================================================================
+// Manifest blob retention + mapping into its interpreters
+// ============================================================================
+
+/// Where the verified manifest blob (payload + ARCSIG trailer) lives in
+/// physical memory, page-aligned, so it can be mapped read-only at
+/// [`cambios_manifest::MANIFEST_USER_VADDR`] into every process that
+/// interprets it: init at creation (ADR-018 § 6 step 4) and the policy
+/// service at each spawn (ADR-006 — the per-entry syscall sets it
+/// enforces come from the same signed blob the kernel transcribed, so
+/// there is one authority and no second copy to drift).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestBlob {
+    /// Page-aligned physical base: the boot module itself, or the
+    /// never-freed realignment copy made by [`retain_blob`].
+    pub phys_base: u64,
+    /// Byte length including the trailer. Interpreters size their parse
+    /// from the self-describing header and ignore trailing bytes.
+    pub size: usize,
+}
+
+/// `BOOTSTRAP_PRINCIPAL` lifecycle: written once by [`retain_blob`]
+/// during single-threaded boot, read-only thereafter, outside the lock
+/// hierarchy (every accessor is lock-copy-unlock; [`map_blob_into`]
+/// copies the value out before it touches a page table).
+static MANIFEST_BLOB: crate::arch::spinlock::Spinlock<Option<ManifestBlob>> =
+    crate::arch::spinlock::Spinlock::new(None);
+
+/// ARCHITECTURAL: one page of slack over `MANIFEST_MAX_BYTES` covers
+/// the ARCSIG trailer (72 B today) without coupling this bound to the
+/// trailer's exact layout. Derived, not tuned.
+pub const MANIFEST_MAPPING_BUDGET: usize = cambios_manifest::MANIFEST_MAX_BYTES + 4096;
+
+/// Why [`map_blob_into`] could not hand a process the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestMapError {
+    /// No blob was retained this boot — the caller's bookkeeping
+    /// diverged from `load_boot_modules` (a kernel bug, not a
+    /// configuration one).
+    NotRetained,
+    /// `map_page` rejected page `page` of the blob (page-table frame
+    /// exhaustion, or an already-present mapping in a fresh root).
+    MapFailed { page: usize },
+}
+
+/// Record where the manifest blob lives so it can be mapped into its
+/// interpreters. Called once from `load_boot_modules`, right after
+/// [`transcribe_manifest_module`] verified the same bytes.
+///
+/// `blob` is the module's bytes through its HHDM pointer (every boot
+/// adapter normalizes to that). Limine hands each module its own page-aligned allocation,
+/// but the riscv64 initrd packs modules 8-byte-aligned inside one
+/// archive — the blob may start mid-page, and page tables map whole
+/// pages only. Mapping the containing page would hand the interpreter
+/// a view offset from the real blob (init read garbage at
+/// `MANIFEST_USER_VADDR` — the ADR-018 all-arch staging bug).
+/// Unaligned ⇒ copy the blob into fresh page-aligned frames once, here,
+/// and retain those. Like the module memory itself, the copy is never
+/// freed: the manifest is read for the system's lifetime.
+pub fn retain_blob(
+    blob: &[u8],
+    fa: &mut crate::memory::frame_allocator::FrameAllocator,
+) -> Result<ManifestBlob, BootError> {
+    let addr = blob.as_ptr();
+    let size = blob.len();
+    if size == 0 || size > MANIFEST_MAPPING_BUDGET {
+        crate::println!("    ✗ manifest module size {} outside mapping budget", size);
+        return Err(BootError::ManifestRetainFailed);
+    }
+    let blob_phys = (addr as u64) - crate::hhdm_offset();
+    let num_pages = size.div_ceil(4096);
+    let phys_base = if blob_phys.is_multiple_of(4096) {
+        blob_phys
+    } else {
+        let frames = match fa.allocate_contiguous(num_pages) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::println!("    ✗ manifest blob realignment alloc failed: {:?}", e);
+                return Err(BootError::ManifestRetainFailed);
+            }
+        };
+        let dst = (frames.addr + crate::hhdm_offset()) as *mut u8;
+        // SAFETY: `dst` is `num_pages` freshly allocated frames (≥ `size`
+        // bytes) accessed via the HHDM; `addr`/`size` are the bounds of
+        // the `blob` slice, readable by construction. The regions cannot
+        // overlap: one is allocator-owned RAM, the other boot-module
+        // memory outside the allocator's range.
+        unsafe { core::ptr::copy_nonoverlapping(addr, dst, size) };
+        frames.addr
+    };
+    let blob = ManifestBlob { phys_base, size };
+    let mut slot = MANIFEST_BLOB.lock();
+    if slot.is_some() {
+        crate::println!("    ✗ manifest blob retained twice");
+        return Err(BootError::ManifestRetainFailed);
+    }
+    *slot = Some(blob);
+    Ok(blob)
+}
+
+/// The retained blob, if a manifest was transcribed this boot.
+pub fn retained_blob() -> Option<ManifestBlob> {
+    *MANIFEST_BLOB.lock()
+}
+
+/// Map the retained manifest blob read-only at `MANIFEST_USER_VADDR`
+/// in the address space rooted at `root_phys`.
+///
+/// The mapping is deliberately NOT VMA-tracked: `destroy_process`
+/// reclaims VMA-tracked regions and frees their frames, and these
+/// pages are shared module memory no process owns — init restarts the
+/// policy service, and each incarnation maps the same pages. The
+/// fixed address sits below `VMA_ALLOC_BASE`, so dynamic regions never
+/// collide with it (same convention as the ELF segments at 0x400000
+/// and the stack at 0x800000).
+///
+/// # Safety
+///
+/// `root_phys` must be the page-table root of a process that cannot
+/// run yet and that nothing else holds a page-table reference to: the
+/// caller is the boot path (init, before the scheduler is released)
+/// or `handle_spawn` while it still holds the home CPU's scheduler
+/// lock (the new task cannot be picked until that lock drops). `fa`
+/// is the held `FRAME_ALLOCATOR`, so intermediate table frames come
+/// from the same allocator that will reap them.
+pub unsafe fn map_blob_into(
+    root_phys: u64,
+    fa: &mut crate::memory::frame_allocator::FrameAllocator,
+) -> Result<(), ManifestMapError> {
+    let blob = retained_blob().ok_or(ManifestMapError::NotRetained)?;
+    let num_pages = blob.size.div_ceil(4096);
+    for page in 0..num_pages {
+        // SAFETY: the caller's contract (above) makes `root_phys` an
+        // exclusively referenced root of a not-yet-running process;
+        // `blob.phys_base` is page-aligned by construction in
+        // `retain_blob`, and the frames are module memory or the
+        // never-freed copy, so mapping them read-only aliases nothing.
+        let mut pt = unsafe { crate::memory::paging::page_table_from_cr3(root_phys) };
+        crate::memory::paging::map_page(
+            &mut pt,
+            cambios_manifest::MANIFEST_USER_VADDR + (page as u64) * 4096,
+            blob.phys_base + (page as u64) * 4096,
+            crate::memory::paging::flags::user_ro(),
+            fa,
+        )
+        .map_err(|_| ManifestMapError::MapFailed { page })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,9 +846,10 @@ mod tests {
             grants: &FS_GRANTS,
             lifetime: ServiceLifetime::OneShot,
             depends_on: &[],
+            syscalls: [0x3FF, 0],
         }];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         buf
     }
 
@@ -913,9 +1064,10 @@ mod tests {
             grants: &[],
             lifetime: ServiceLifetime::OneShot,
             depends_on: &[],
+            syscalls: [0x3FF, 0],
         }];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         assert_eq!(validate_payload(&buf).unwrap_err(), BootError::ManifestInconsistent);
 
         // Zero init AID.
@@ -926,9 +1078,10 @@ mod tests {
             grants: &[],
             lifetime: ServiceLifetime::OneShot,
             depends_on: &[],
+            syscalls: [0x3FF, 0],
         }];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest([0u8; 32], 1, &defs, &mut buf).unwrap();
+        emit_manifest([0u8; 32], 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         assert_eq!(validate_payload(&buf).unwrap_err(), BootError::ManifestInconsistent);
     }
 
@@ -970,9 +1123,10 @@ mod tests {
             grants: &[],
             lifetime: ServiceLifetime::OneShot,
             depends_on: &[],
+            syscalls: [0x3FF, 0],
         }];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = Manifest::parse(&buf).unwrap(); // structurally fine
         let mut table = EndpointReservationTable::new();
         assert_eq!(
@@ -1009,6 +1163,7 @@ mod tests {
                 grants: &[],
                 lifetime: ServiceLifetime::OneShot,
                 depends_on: &[],
+                syscalls: [0x3FF, 0],
             },
             EntryDef {
                 module_name: "tree",
@@ -1017,10 +1172,11 @@ mod tests {
                 grants: &[],
                 lifetime: ServiceLifetime::OnDemand,
                 depends_on: &[],
+                syscalls: [0x3FF, 0],
             },
         ];
         let mut buf = vec![0u8; emitted_size(&defs).unwrap()];
-        emit_manifest(aid(0xEE), 1, &defs, &mut buf).unwrap();
+        emit_manifest(aid(0xEE), 1, [0x7, 0x1], &defs, &mut buf).unwrap();
         let m = validate_payload(&buf).unwrap();
         let mut table = SpawnGrantTable::new();
         assert_eq!(populate_spawn_grants(&m, &mut table).unwrap(), 2);

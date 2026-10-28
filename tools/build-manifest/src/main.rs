@@ -55,11 +55,16 @@ struct Registry {
 struct InitSection {
     #[serde(default = "default_init_endpoint")]
     endpoint: u32,
+    /// Canonical syscall names init may use (cambios-abi
+    /// `SyscallNumber::NAMES`). Required: the policy service enforces
+    /// exactly this set, and an init that cannot spawn is a boot that
+    /// fails loudly rather than a profile that was forgotten.
+    syscalls: Vec<String>,
 }
 
 impl Default for InitSection {
     fn default() -> Self {
-        InitSection { endpoint: INIT_ENDPOINT }
+        InitSection { endpoint: INIT_ENDPOINT, syscalls: Vec::new() }
     }
 }
 
@@ -113,6 +118,33 @@ struct ServiceDef {
     /// virtio-gpu) without hiding it from the registry.
     #[serde(default)]
     profile: Vec<String>,
+    /// Canonical syscall names this entry may use. Required for every
+    /// entry — see `InitSection::syscalls`.
+    syscalls: Vec<String>,
+}
+
+/// Resolve a `syscalls = [...]` list to the wire bitmap, rejecting any
+/// name cambios-abi does not know (the list of valid names is printed).
+fn syscall_mask(owner: &str, names: &[String]) -> [u64; cambios_manifest::SYSCALL_MASK_WORDS] {
+    use cambios_abi::SyscallNumber;
+    let mut mask = [0u64; cambios_manifest::SYSCALL_MASK_WORDS];
+    if names.is_empty() {
+        eprintln!("{}: `syscalls` is empty — a process that may make no syscall cannot even exit", owner);
+        exit(1);
+    }
+    for n in names {
+        match SyscallNumber::from_name(n) {
+            Some(sc) => cambios_manifest::syscall_mask_set(&mut mask, sc as u32),
+            None => {
+                eprintln!("{}: unknown syscall name '{}'. Valid names:", owner, n);
+                for (name, _) in SyscallNumber::NAMES {
+                    eprintln!("  {}", name);
+                }
+                exit(1);
+            }
+        }
+    }
+    mask
 }
 
 fn default_lifetime() -> String {
@@ -452,6 +484,7 @@ fn main() {
             grants: &grants_store[i],
             lifetime,
             depends_on: &deps_store[i],
+            syscalls: syscall_mask(&svc.name, &svc.syscalls),
         });
     }
     // Emit, then self-check through the same parser the kernel + init
@@ -461,7 +494,8 @@ fn main() {
         exit(1);
     });
     let mut blob = vec![0u8; size];
-    let written = emit_manifest(init_aid(), registry.init.endpoint, &defs, &mut blob)
+    let init_mask = syscall_mask("[init]", &registry.init.syscalls);
+    let written = emit_manifest(init_aid(), registry.init.endpoint, init_mask, &defs, &mut blob)
         .unwrap_or_else(|e| {
             eprintln!("emit failed: {:?}", e);
             exit(1);

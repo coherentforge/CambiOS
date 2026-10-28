@@ -517,9 +517,144 @@ pub fn set_local_cpu_idle(idle: bool) {
 #[cfg(test)]
 pub fn set_local_cpu_idle(_idle: bool) {}
 
+// ============================================================================
+// Preemption depth — a spinlock holder is never descheduled
+// ============================================================================
+
+/// Per-CPU count of plain `Spinlock` guards alive on that CPU (ADR-001
+/// § Divergence 2026-10-28). Written only by the owning CPU (increment
+/// before the acquire attempt, decrement after the release), read by that
+/// CPU's timer and reschedule handlers, which switch tasks only when it
+/// is zero. Lock-free; not in the hierarchy.
+///
+/// Why: syscall handlers run with interrupts on, so the timer could
+/// switch away from a task mid-critical-section, leaving a plain lock
+/// held by a task that is not running. A CPU that then spins on that
+/// lock with interrupts masked (an `IrqSpinlock` holder — `handle_spawn`
+/// with the target scheduler lock, or `wake_message_waiters_all_cpus`)
+/// can never run the holder, and nothing moves (QEMU, 2026-10-27:
+/// init spinning on `FRAME_ALLOCATOR`, virtio-net spinning on
+/// `PER_CPU_SCHEDULER[0]`, the allocator's holder preempted). With the
+/// count, every lock holder is running and makes progress — the
+/// property the lock hierarchy's deadlock-freedom argument assumes.
+pub static PREEMPT_DEPTH: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+
+/// Set once the boot CPU's per-CPU block exists. Before that there is no
+/// CPU id to index `PREEMPT_DEPTH` with — and no timer that could
+/// preempt anything, so nothing is lost by not counting. Every AP
+/// initializes its per-CPU block as its first step, before any lock.
+static PREEMPT_DEPTH_LIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Called right after the boot CPU's `percpu::init_bsp`: from here on
+/// every CPU that takes a lock can name itself.
+pub fn preempt_depth_go_live() {
+    PREEMPT_DEPTH_LIVE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn local_cpu_index() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: only called once PREEMPT_DEPTH_LIVE is set, i.e. after
+    // this CPU's GS base was initialized (BSP in init_bsp; every AP in
+    // init_ap before its first lock).
+    let cpu = unsafe { arch::x86_64::percpu::current_percpu().cpu_id() } as usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above, with TPIDR_EL1.
+    let cpu = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: as above, with `tp`.
+    let cpu = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
+    cpu
+}
+
+/// Mark this CPU non-preemptible (one more plain spinlock about to be
+/// held). Called by `Spinlock::lock` / `try_lock` before the acquire.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn preempt_disable() {
+    if PREEMPT_DEPTH_LIVE.load(core::sync::atomic::Ordering::Acquire) {
+        let cpu = local_cpu_index();
+        if cpu < MAX_CPUS {
+            PREEMPT_DEPTH[cpu].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Undo one `preempt_disable` (a plain spinlock was released, or its
+/// `try_lock` failed). The timer may switch this task out again once the
+/// count returns to zero — at the next tick, if its slice has expired.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn preempt_enable() {
+    if PREEMPT_DEPTH_LIVE.load(core::sync::atomic::Ordering::Acquire) {
+        let cpu = local_cpu_index();
+        if cpu < MAX_CPUS {
+            PREEMPT_DEPTH[cpu].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Is the interrupted context on this CPU holding a plain spinlock? The
+/// timer and reschedule handlers do not switch tasks while it is.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn preemption_held() -> bool {
+    if !PREEMPT_DEPTH_LIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let cpu = local_cpu_index();
+    cpu < MAX_CPUS && PREEMPT_DEPTH[cpu].load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Host-test stubs: no per-CPU block, no preemption.
+#[cfg(test)]
+pub fn preempt_disable() {}
+#[cfg(test)]
+pub fn preempt_enable() {}
+#[cfg(test)]
+pub fn preemption_held() -> bool {
+    false
+}
+
 /// Whether `cpu` was last seen running its idle task.
 pub fn cpu_is_idle(cpu: usize) -> bool {
     cpu < MAX_CPUS && CPU_IDLE[cpu].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Policy query-expiry wake, for interrupt context: `try_lock`s the
+/// task's CPU scheduler and wakes the task only if it is Blocked on
+/// `PolicyWait(query_id)`, running `before_wake` (the caller's decision
+/// store) under the same lock first. Sends no reschedule kick — the
+/// target runs the woken task at its next tick, the right trade for a
+/// path that must never spin inside an ISR. Returns `false` when the
+/// lock is contended or the task is not (yet, or any more) waiting on
+/// that query; the caller keeps the query and retries next tick.
+#[cfg(not(test))]
+pub fn try_wake_policy_waiter(
+    task_id: scheduler::TaskId,
+    query_id: u64,
+    before_wake: impl FnOnce(),
+) -> bool {
+    let cpu = match get_task_cpu(task_id.slot()) {
+        Some(c) if (c as usize) < MAX_CPUS => c as usize,
+        _ => return false,
+    };
+    match PER_CPU_SCHEDULER[cpu].try_lock() {
+        Some(mut guard) => match guard.as_mut() {
+            Some(sched) => {
+                if !sched.is_policy_waiter(task_id, query_id) {
+                    return false;
+                }
+                before_wake();
+                sched.wake_task(task_id).is_ok()
+            }
+            None => false,
+        },
+        None => false,
+    }
 }
 
 /// Wake every task blocked on `MessageWait(endpoint)` on EVERY online

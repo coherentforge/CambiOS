@@ -832,6 +832,104 @@ pub enum SyscallNumber {
 }
 
 impl SyscallNumber {
+    /// Canonical kebab-case names, one per variant, in declaration order.
+    /// The manifest's `syscalls = [...]` lists use these; `from_name`
+    /// resolves them. Append-only, like the numbers they name.
+    pub const NAMES: &'static [(&'static str, SyscallNumber)] = &[
+        ("exit", Self::Exit),
+        ("write", Self::Write),
+        ("read", Self::Read),
+        ("allocate", Self::Allocate),
+        ("free", Self::Free),
+        ("wait-irq", Self::WaitIrq),
+        ("register-endpoint", Self::RegisterEndpoint),
+        ("yield", Self::Yield),
+        ("get-pid", Self::GetPid),
+        ("get-time", Self::GetTime),
+        ("print", Self::Print),
+        ("get-principal", Self::GetPrincipal),
+        ("recv-msg", Self::RecvMsg),
+        ("obj-put", Self::ObjPut),
+        ("obj-get", Self::ObjGet),
+        ("obj-delete", Self::ObjDelete),
+        ("obj-list", Self::ObjList),
+        ("obj-put-signed", Self::ObjPutSigned),
+        ("map-mmio", Self::MapMmio),
+        ("alloc-dma", Self::AllocDma),
+        ("device-info", Self::DeviceInfo),
+        ("port-io", Self::PortIo),
+        ("console-read", Self::ConsoleRead),
+        ("spawn", Self::Spawn),
+        ("wait-task", Self::WaitTask),
+        ("revoke-capability", Self::RevokeCapability),
+        ("channel-create", Self::ChannelCreate),
+        ("channel-attach", Self::ChannelAttach),
+        ("channel-close", Self::ChannelClose),
+        ("channel-info", Self::ChannelInfo),
+        ("audit-attach", Self::AuditAttach),
+        ("audit-info", Self::AuditInfo),
+        ("map-framebuffer", Self::MapFramebuffer),
+        ("try-recv-msg", Self::TryRecvMsg),
+        ("virtio-modern-caps", Self::VirtioModernCaps),
+        ("set-wallclock", Self::SetWallclock),
+        ("get-wallclock", Self::GetWallclock),
+        ("audit-emit-input-focus", Self::AuditEmitInputFocus),
+        ("get-process-principal", Self::GetProcessPrincipal),
+        ("channel-quiesce-ack", Self::ChannelQuiesceAck),
+        ("cluster-create", Self::ClusterCreate),
+        ("cluster-join", Self::ClusterJoin),
+        ("cluster-revoke", Self::ClusterRevoke),
+        ("cluster-info", Self::ClusterInfo),
+        ("channel-begin-teardown", Self::ChannelBeginTeardown),
+        ("channel-complete-teardown", Self::ChannelCompleteTeardown),
+        ("cambio", Self::Cambio),
+        ("regalo", Self::Regalo),
+        ("stream", Self::Stream),
+        ("file-open", Self::FileOpen),
+        ("file-create", Self::FileCreate),
+        ("file-close", Self::FileClose),
+        ("file-read", Self::FileRead),
+        ("file-write", Self::FileWrite),
+        ("file-seek", Self::FileSeek),
+        ("file-truncate", Self::FileTruncate),
+        ("file-rename", Self::FileRename),
+        ("file-unlink", Self::FileUnlink),
+        ("file-link", Self::FileLink),
+        ("file-symlink", Self::FileSymlink),
+        ("mkdir", Self::Mkdir),
+        ("rmdir", Self::Rmdir),
+        ("opendir", Self::Opendir),
+        ("readdir", Self::Readdir),
+        ("stat", Self::Stat),
+        ("fsync", Self::Fsync),
+        ("acl-grant", Self::AclGrant),
+        ("acl-revoke", Self::AclRevoke),
+        ("acl-list", Self::AclList),
+        ("verify-volume-header", Self::VerifyVolumeHeader),
+        ("read-volume-header", Self::ReadVolumeHeader),
+        ("install-master-key", Self::InstallMasterKey),
+    ];
+
+    /// The canonical kebab-case name of this syscall.
+    pub fn name(&self) -> &'static str {
+        for (n, v) in Self::NAMES {
+            if *v == *self {
+                return n;
+            }
+        }
+        "unknown"
+    }
+
+    /// Resolve a canonical name (see `NAMES`). `None` for anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        for (n, v) in Self::NAMES {
+            if *n == name {
+                return Some(*v);
+            }
+        }
+        None
+    }
+
     /// Returns `true` for syscalls that require the caller to have a bound,
     /// non-zero Principal. Unidentified processes may only use the exempt
     /// set: Exit, Yield, GetPid, GetTime, GetWallclock, Print, GetPrincipal.
