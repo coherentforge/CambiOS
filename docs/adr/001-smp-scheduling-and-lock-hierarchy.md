@@ -427,3 +427,13 @@ The ADR's examples (GS base, `IA32_GS_BASE`, TSS.RSP0, APIC timer, naked-ASM `ir
 **Unchanged.** Lock hierarchy, `TASK_CPU_MAP`, the all-CPU scan for endpoint waiters, and the ISR `try_lock` discipline.
 
 **Prior wording (for the record).** § "Wake and block primitives": "`wake_task_on_cpu(task_id)` — looks up the task's home CPU in the lock-free `TASK_CPU_MAP`, acquires that CPU's scheduler, and wakes the task." Nothing in the section said how the target CPU learned of the wake; the timer tick was the implicit answer.
+
+### 2026-10-27 — Spawn-time placement on the least-populated CPU (commit pending: "kernel: spawn-time placement")
+
+**What changed from the plan.** § "Task Migration" relies on the push-based balancer ("adequate at current core counts") to spread tasks after they are created on the spawning CPU. Its load metric is Ready + Running tasks; services spend their lives Blocked, so the imbalance it waits for never appeared and every task stayed on CPU 0 — measured 2026-10-27 with the new `tasks/cpu` diagnostic: QEMU `[17, 0]`, the Dell 3630 one reschedule kick in twenty seconds across twelve threads. `SYS_SPAWN` now homes the new task on the online CPU with the fewest tasks (`tasks_per_cpu` over `TASK_CPU_MAP`), using `migrate_task_between` under both scheduler locks in ascending index order when the target index is higher, or `migrate_task` after the locks drop when it is lower (it refuses a task that already started running, which then simply stays), and kicks the target if idle. The balancer is unchanged.
+
+**Unchanged.** Lock hierarchy, `TASK_CPU_MAP`, the migration primitives, the balancer's own policy and throttle.
+
+**Revisit when:** a workload shows Ready tasks piling on one CPU despite placement — then the balancer's metric (Ready-only) is the next thing to look at.
+
+**Prior wording (for the record).** Future work: "**Work stealing** — not pursued. Push-based balancer remains adequate at current core counts." That sentence described a balancer that, in practice, never moved anything, because nothing it measured was ever imbalanced.
