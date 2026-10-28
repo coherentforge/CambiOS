@@ -708,6 +708,12 @@ pub fn write_str(s: &str) {
 /// Userspace has taken the display (first successful
 /// `SYS_MAP_FRAMEBUFFER`). Irreversible for this boot.
 pub fn release() {
+    // Diagnostic builds keep mirroring (see the `fbcon-hold` feature in
+    // Cargo.toml): on a machine with no serial port this is the only way
+    // to read what happened after the scanout driver took the display.
+    if cfg!(feature = "fbcon-hold") {
+        return;
+    }
     let mut con = FBCON.lock();
     if con.state == State::Active {
         con.state = State::Released;

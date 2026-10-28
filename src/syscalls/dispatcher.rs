@@ -1942,6 +1942,11 @@ impl SyscallDispatcher {
         // graphics; the boot console is an I/O device that yields here).
         if index == 0 {
             crate::io::fbcon::release();
+            if cfg!(feature = "fbcon-hold") {
+                crate::println!(
+                    "[fbcon] HOLD: diagnostic build — text console stays over the scanout driver"
+                );
+            }
         }
 
         Ok(0)

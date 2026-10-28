@@ -213,8 +213,15 @@ endif
 
 all: iso
 
+# Optional cargo features for the x86_64 kernel build, e.g.
+# `KERNEL_FEATURES=fbcon-hold` (diagnostic: keep the framebuffer text
+# console mirrored after the scanout driver maps the display — the only
+# way to read the boot log on a machine with no serial port). Flows
+# through iso / img-x86 / img-usb / usb.
+KERNEL_FEATURES ?=
+
 kernel:
-	cargo build --target x86_64-unknown-none --release
+	cargo build --target x86_64-unknown-none --release $(if $(KERNEL_FEATURES),--features "$(KERNEL_FEATURES)",)
 
 # Kernel built with `--features dev-piv` — replaces the committed
 # bootstrap pubkey with the per-developer dev one from

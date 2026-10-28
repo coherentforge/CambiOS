@@ -40,6 +40,14 @@ default = []
 # so that the kernel's verification path agrees with `SwPivBackend`'s
 # signing key.
 dev-piv = []
+# Diagnostic build for hardware without a serial console: the kernel's
+# framebuffer text console stays mirrored onto framebuffer 0 after a
+# scanout driver maps it, instead of yielding (ADR-011 says the kernel
+# owns no graphics; this build deliberately paints over the driver so
+# the boot log — policy denials, the `[sched]` counters, service output
+# — stays readable when the GUI chain fails silently). Never ship it.
+# `make usb DEVICE=… PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-hold`.
+fbcon-hold = []
 
 [dependencies]
 cambios-abi = { path = "cambios-abi" }
