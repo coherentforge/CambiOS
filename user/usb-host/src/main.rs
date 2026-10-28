@@ -400,7 +400,15 @@ fn bring_up_device(ctl: &mut xhci::XhciController, port: ConnectedPort) {
         4 | 5 => 512,
         _ => 8,
     };
-    let actual_mps = device_desc[7] as u16;
+    // USB 3.2 § 9.6.1: for SuperSpeed devices bMaxPacketSize0 is an
+    // exponent (9 → 2^9 = 512); for USB2 devices it is the size itself.
+    // Taking 9 literally shrank EP0 to 9 bytes and the next descriptor
+    // read timed out (Realtek 0bda:0328 on the Dell 3630, 2026-10-27).
+    let actual_mps: u16 = if port_speed >= 4 {
+        1u16 << (device_desc[7] & 0x0F)
+    } else {
+        device_desc[7] as u16
+    };
     if actual_mps != speed_default_mps {
         sys::print(b"[USB-HOST] Evaluate Context: EP0 MPS ");
         log_dec(b"", speed_default_mps as u32);

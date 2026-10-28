@@ -110,6 +110,17 @@ fn mcycles_since_kmain() -> u64 {
     cambios_core::arch::x86_64::rdtsc().wrapping_sub(t0) / 1_000_000
 }
 
+/// Record a boot stamp (see `cambios_core::BOOT_STAMP_MCYCLES`) and
+/// return it for the log line.
+#[cfg(target_arch = "x86_64")]
+fn boot_stamp(index: usize) -> u64 {
+    let m = mcycles_since_kmain();
+    if index < cambios_core::BOOT_STAMP_MCYCLES.len() {
+        cambios_core::BOOT_STAMP_MCYCLES[index].store(m, core::sync::atomic::Ordering::Relaxed);
+    }
+    m
+}
+
 /// Microkernel entry point (called by Limine bootloader).
 ///
 /// Limine invokes this as a raw function pointer: `extern "C" fn() -> !`.
@@ -311,7 +322,7 @@ unsafe extern "C" fn kmain() -> ! {
     match cambios_core::io::fbcon::init() {
         Ok((cols, rows)) => println!(
             "[fbcon] console on framebuffer 0: {}x{} cells (+{} Mcycles since kmain)",
-            cols, rows, mcycles_since_kmain()
+            cols, rows, boot_stamp(0)
         ),
         Err(e) => println!("[fbcon] inactive: {:?}", e),
     }
@@ -415,7 +426,7 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     #[cfg(target_arch = "x86_64")]
-    println!("[boot] +{} Mcycles since kmain", mcycles_since_kmain());
+    println!("[boot] +{} Mcycles since kmain", boot_stamp(1));
     println!("\nStarting scheduler event loop...\n");
 
     // Initialize hardware interrupts — architecture-specific
@@ -2682,7 +2693,7 @@ unsafe fn start_application_processors() {
 
     let ready = AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire);
     #[cfg(target_arch = "x86_64")]
-    println!("[boot] APs online at +{} Mcycles since kmain", mcycles_since_kmain());
+    println!("[boot] APs online at +{} Mcycles since kmain", boot_stamp(2));
     println!(
         "  ✓ {}/{} AP(s) online (total CPUs: {})",
         ready, expected, ready as usize + 1

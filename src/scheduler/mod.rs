@@ -87,11 +87,18 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
             if Timer::get_ticks() >= RESCHED_DIAG_TICK
                 && !RESCHED_DIAG_PRINTED.load(core::sync::atomic::Ordering::Relaxed)
             {
+                let mut per_cpu = [0u16; 16];
+                crate::tasks_per_cpu(&mut per_cpu);
+                let online = crate::online_cpu_count().min(per_cpu.len());
                 let accepted = crate::io::try_print(format_args!(
-                    "[sched] reschedule kicks: sent {}, handled {}, switched {}\n",
+                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
                     crate::RESCHED_KICKS_SENT.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_HANDLED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_SWITCHED.load(core::sync::atomic::Ordering::Relaxed),
+                    &per_cpu[..online],
+                    crate::BOOT_STAMP_MCYCLES[0].load(core::sync::atomic::Ordering::Relaxed),
+                    crate::BOOT_STAMP_MCYCLES[1].load(core::sync::atomic::Ordering::Relaxed),
+                    crate::BOOT_STAMP_MCYCLES[2].load(core::sync::atomic::Ordering::Relaxed),
                 ));
                 if accepted {
                     RESCHED_DIAG_PRINTED.store(true, core::sync::atomic::Ordering::Relaxed);

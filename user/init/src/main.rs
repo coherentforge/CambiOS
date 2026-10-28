@@ -160,6 +160,11 @@ mod svc {
         // "ready after N ticks" line: the per-service breakdown of
         // the boot wave, readable off a photo of the console.
         let mut spawn_tick: u64 = 0;
+        // Same numbers again, in one compact line after the settle
+        // summary: the per-service lines scroll off a 50-row console
+        // on a long wave, the settled screen does not.
+        let mut ready_ticks: [u16; cambios_manifest::MAX_MANIFEST_ENTRIES] =
+            [u16::MAX; cambios_manifest::MAX_MANIFEST_ENTRIES];
         loop {
             match eng.next_action() {
                 Action::Spawn { idx } => {
@@ -204,10 +209,14 @@ mod svc {
                                         .entry(idx as usize)
                                         .map(|e| e.module_name())
                                         .unwrap_or("");
+                                    let took = sys::get_time().wrapping_sub(spawn_tick);
+                                    if (idx as usize) < ready_ticks.len() {
+                                        ready_ticks[idx as usize] = took.min(u16::MAX as u64 - 1) as u16;
+                                    }
                                     sys::print(b"[init]   ");
                                     sys::print(name.as_bytes());
                                     sys::print(b" ready after ");
-                                    print_num(sys::get_time().wrapping_sub(spawn_tick) as u32);
+                                    print_num(took as u32);
                                     sys::print(b" ticks\n");
                                 }
                                 Err(EngineError::UnknownSender) => {
@@ -227,7 +236,22 @@ mod svc {
                         }
                     }
                 }
-                Action::Done => return,
+                Action::Done => {
+                    // One line, `name=ticks` per spawned service.
+                    sys::print(b"[init] ready ticks:");
+                    for (i, &t) in ready_ticks.iter().enumerate() {
+                        if t == u16::MAX {
+                            continue;
+                        }
+                        let name = m.entry(i).map(|e| e.module_name()).unwrap_or("");
+                        sys::print(b" ");
+                        sys::print(name.as_bytes());
+                        sys::print(b"=");
+                        print_num(t as u32);
+                    }
+                    sys::print(b"\n");
+                    return;
+                }
             }
         }
     }

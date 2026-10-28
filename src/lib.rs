@@ -473,6 +473,29 @@ pub static RESCHED_KICKS_SENT: core::sync::atomic::AtomicU64 = core::sync::atomi
 pub static RESCHED_KICKS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static RESCHED_KICKS_SWITCHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Boot-phase cycle stamps (x86_64: `+Mcycles since kmain`) recorded by
+/// kmain at framebuffer-console init, scheduler-loop start and APs
+/// online, re-printed by the reschedule diagnostic so they survive the
+/// console scrolling past.
+pub static BOOT_STAMP_MCYCLES: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Tasks currently homed on each of the first `out.len()` CPUs, from the
+/// lock-free `TASK_CPU_MAP`. Diagnostic: says whether work is spread
+/// across cores or piled on one.
+pub fn tasks_per_cpu(out: &mut [u16]) {
+    for slot in out.iter_mut() {
+        *slot = 0;
+    }
+    for task in 0..MAX_TASKS as u32 {
+        if let Some(cpu) = get_task_cpu(task) {
+            if (cpu as usize) < out.len() {
+                out[cpu as usize] = out[cpu as usize].saturating_add(1);
+            }
+        }
+    }
+}
+
 /// Record whether the calling CPU's scheduler just settled on its idle task.
 #[cfg(not(test))]
 pub fn set_local_cpu_idle(idle: bool) {
