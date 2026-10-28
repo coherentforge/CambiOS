@@ -128,6 +128,15 @@ pub struct ManifestEntry {
     /// order. Cycles are a manifest-validation error (caught at build
     /// time by build-manifest and again by init).
     pub depends_on: BoundedVec<BoundedStr<MODULE_NAME_MAX>, DEPS_MAX>,
+
+    /// Syscalls this entry's process may make — a 128-bit set over
+    /// `SyscallNumber`, written by build-manifest from the entry's
+    /// `syscalls = [...]` names. Policy-service-interpreted (ADR-006):
+    /// the kernel transcribes nothing from it; it maps the blob into
+    /// the policy service at spawn, which keys enforcement on the
+    /// caller's AID — the same row the kernel bound. Init's own set is
+    /// the header's `init_syscalls`.
+    pub syscalls: SyscallSet,
 }
 
 pub enum ServiceLifetime {
@@ -228,13 +237,14 @@ Fs-service, key-store, and the ObjectStore do not exist yet at step 4. The manif
 ```
 ┌────────────────────────────────────────────────────────────┐
 │ magic: "CBOSMANI" (8 bytes)                                │
-│ version: u32 (= 1)                                         │
+│ version: u32 (= 2)                                         │
 │ entry_count: u32                                           │
 │ entries_offset: u32   (offset from start of blob)          │
 │ strings_offset: u32   (interned module names + dep names)  │
 │ strings_len: u32                                           │
 │ init_aid: [u8; 32]    (AID the kernel binds to PID 1)      │
 │ init_endpoint: u32    (readiness-ping endpoint; v1 = 1)    │
+│ init_syscalls: [u64; 2] (syscall set init may use; ADR-006)│
 ├────────────────────────────────────────────────────────────┤
 │ Entry 0: fixed-size ManifestEntryRaw                       │
 │   principal: [u8; 32]                                      │
@@ -246,7 +256,8 @@ Fs-service, key-store, and the ObjectStore do not exist yet at step 4. The manif
 │   lifetime: ServiceLifetimeRaw (tag + fields)              │
 │   depends_on: [StringRef; DEPS_MAX]                        │
 │   depends_on_len: u8                                       │
-│   reserved: [u8; 16]                                       │
+│   syscalls: [u64; 2]  (allowed-syscall bitmap; ADR-006)     │
+│   reserved: [u8; 4]                                        │
 ├────────────────────────────────────────────────────────────┤
 │ Entry 1 … Entry N-1                                        │
 ├────────────────────────────────────────────────────────────┤
@@ -462,3 +473,9 @@ Body edits after acceptance; the prior wording is preserved here.
 § 3 originally said, under **User-spawned processes**: "the shell spawning a game, a build system spawning `cargo`, an app spawning a worker. These are not init's concern; the spawner is the parent and owns lifecycle. They take the legacy spawn path (today's blanket-grant posture, bootstrap-bound) until a policy-mediated grant flow narrows it — that is ADR-006's territory, not this ADR's." Its **Unreserved endpoints** bullet listed "shells, apps" among the processes registering first-come from the unreserved range. § 5 described the addition as "a manifest branch in `handle_spawn`: if the requested name is in the spawn-grant table *and* the caller is init … All other callers take today's path unchanged", and "Absent manifest → empty tables, behavior identical to today." § 2's `lifetime` field was documented as "init-interpreted; the kernel ignores it", with only `OneShot` and `Persistent` variants. § 4 point 2 located the readiness signal "where `SYS_MODULE_READY` is emitted today".
 
 Deleting the legacy path at step 9 required an answer for apps. The answer chosen (decision 2026-09-15) is apps-as-manifest-entries with an `OnDemand` lifetime — declared, reserved, narrowly granted, spawnable by any `CreateProcess` holder, never by init. The kernel reads exactly that one lifetime bit, because who may spawn a row is a security fact; it is transcribed as `SpawnAuthority` in the spawn table, keeping the transcribe-don't-interpret posture for everything else. A policy-mediated grant flow was *not* adopted for apps; ADR-006 keeps *subsequent* grants. Which Principal an app acts for remains the vault's future axis (ADR-033 `bind_for_spawn`).
+
+### 2026-10-28 — wire format v2: per-entry and init syscall sets (commit 3badd89)
+
+§ 5's wire diagram and § 2's entry struct gain a `syscalls` field per entry (a 2 × u64 bitmap over `SyscallNumber`, at the end of the fixed record; the trailing `reserved` shrinks from 16 to 4 bytes) and the header gains `init_syscalls` (same shape, after `init_endpoint`; 64 → 80 bytes). `version` is 2; a v1 blob is rejected (`BadVersion`), with no compatibility path — pre-user, one producer, two same-repo consumers. The sets are **policy-service-interpreted**: the kernel transcribes nothing from them, it maps the verified blob into the policy service at spawn exactly as it does into init (`manifest::retain_blob` once at boot; `manifest::map_blob_into` for both), and the service keys each query on the caller's AID (ADR-006 § Divergence 2026-10-28). This keeps § 1's split intact — security sections the kernel transcribes, policy sections user space interprets — while adding a second interpreter of the same signed artifact. `build-manifest` requires a non-empty `syscalls = [...]` on every `[[service]]` and under `[init]`, resolving names through `cambios_abi::SyscallNumber::from_name`.
+
+**Prior wording (for the record).** Diagram: "`version: u32 (= 1)`"; entry: "`depends_on_len: u8` / `reserved: [u8; 16]`"; header ended at `init_endpoint`. The entry struct had no `syscalls` field — profiles were the policy service's own slot-keyed table, outside the manifest.

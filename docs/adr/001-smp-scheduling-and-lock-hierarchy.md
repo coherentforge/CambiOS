@@ -69,6 +69,8 @@ INTERRUPT_ROUTER(7)
 
 `*` = IrqSpinlock (saves/disables interrupts before acquiring).
 
+**Holder-progress rule:** a task holding a plain `Spinlock` is never descheduled. `Spinlock::lock`/`try_lock` raise the per-CPU `PREEMPT_DEPTH` before the acquire attempt and the guard lowers it after the release; `on_timer_isr` and `on_resched_ipi` switch tasks only when it is zero (the tick is still accounted; an expired slice is collected at the first tick after release). Interrupts stay live — `IrqSpinlock` holders already have them masked and need no count. This is what the deadlock-freedom argument below assumes when it says a lower-numbered holder "will release": the holder is running.
+
 **Cross-CPU rule:** When acquiring the same lock level on multiple CPUs, acquire in ascending CPU index order. See **Cross-CPU lock rule** below.
 
 The authoritative copy of this ordering lives in the comment block in `src/lib.rs`.
@@ -303,7 +305,7 @@ CAPABILITY_MANAGER(4) → PROCESS_TABLE(5) → FRAME_ALLOCATOR(6) →
 INTERRUPT_ROUTER(7)
 ```
 
-`*` = IrqSpinlock (saves and disables interrupts before acquiring). All others are plain Spinlock.
+`*` = IrqSpinlock (saves and disables interrupts before acquiring). All others are plain Spinlock, whose holders are never descheduled (holder-progress rule, § Lock Ordering).
 
 ### Why this order
 
@@ -437,3 +439,17 @@ The ADR's examples (GS base, `IA32_GS_BASE`, TSS.RSP0, APIC timer, naked-ASM `ir
 **Revisit when:** a workload shows Ready tasks piling on one CPU despite placement — then the balancer's metric (Ready-only) is the next thing to look at.
 
 **Prior wording (for the record).** Future work: "**Work stealing** — not pursued. Push-based balancer remains adequate at current core counts." That sentence described a balancer that, in practice, never moved anything, because nothing it measured was ever imbalanced.
+
+### 2026-10-28 — A plain-spinlock holder is never descheduled (commit 3badd89)
+
+**What changed from the plan.** The hierarchy's deadlock-freedom argument assumed every lock holder makes progress, and nothing enforced it. Syscall handlers run with interrupts on, so the timer could switch away from a task holding a plain `Spinlock`; a CPU then spinning on that lock with interrupts masked — an `IrqSpinlock` holder, which is `handle_spawn` with the target CPU's scheduler lock or any cross-CPU wake in `wake_message_waiters_all_cpus` — could never run the holder. Reachable once spawn-time placement spread tasks over CPUs and the policy upcall really blocked and woke (QEMU, 2026-10-27: init in spawn holding `PER_CPU_SCHEDULER[0]` + `PROCESS_TABLE`, spinning on `FRAME_ALLOCATOR`; virtio-net spinning interrupts-off on `PER_CPU_SCHEDULER[0]`; the allocator's holder preempted and parked Ready on a CPU that would never take a tick). Register dump and disassembly in the hand-off note.
+
+**Decision (approved 2026-10-28).** A per-CPU `PREEMPT_DEPTH`, raised by `Spinlock::lock`/`try_lock` before the acquire attempt (so a waiter is not preemptible either, closing the acquire-then-count window) and lowered by the guard after the release (release first, so a tick between the two sees a free lock and a non-zero count, and simply waits). `on_timer_isr` runs `isr_tick_only` and returns without a switch while the count is non-zero; `on_resched_ipi` declines; `on_voluntary_yield` debug-asserts zero — blocking or yielding with a plain lock held was already forbidden by the Blocking pattern, and this names the invariant where it is relied upon. Live after each arch's `percpu::init_bsp`; every AP initializes its per-CPU block before its first lock. Interrupts stay live, so this is not IrqSpinlock-everywhere (the console freeze of 2026-10-22 rules that out). The verifier's statement: a task holding a kernel spinlock is running.
+
+**Rejected.** Reordering spawn's acquisitions (breaks the hierarchy). Spinning with interrupts enabled in `IrqSpinlock` and masking only on success (closes the cross-CPU shape, not a holder preempted on the spinner's own CPU).
+
+**Found in the same boot, fixed in the same commit.** `handle_register_endpoint` held `CAPABILITY_MANAGER(4)` while taking `IPC_MANAGER(3)` — an upward acquisition against `handle_try_recv_msg` (3 then 4) that froze both CPUs as soon as two services hit the pair concurrently. The capability guard is now scoped before the IPC acquisition. An approximate per-function scan of acquisition order flagged nineteen other sequences; all were verified sequential (guard dropped between), none nested.
+
+**Unchanged.** The hierarchy order and numbering, the ISR `try_lock` discipline, the Blocking pattern, `IrqSpinlock`.
+
+**Prior wording (for the record).** § Lock Ordering carried only "`*` = IrqSpinlock (saves/disables interrupts before acquiring)" and the cross-CPU rule; the holder-progress assumption was implicit in "Why this order."
