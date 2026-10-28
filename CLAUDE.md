@@ -12,6 +12,7 @@ Every design decision in kernel code must keep future formal verification achiev
 - **No trait objects in kernel hot paths.** Monomorphized generics are statically analyzable; dynamic dispatch is not.
 - **Invariants encoded in types, not comments.** Page-aligned → newtype. Non-empty region → empty case unrepresentable.
 - **Separation of specification from implementation.** Identify preconditions, postconditions, invariants as type constraints where possible, documented contracts otherwise. These are the verification targets.
+- **Enforcement fails closed.** Any path that cannot obtain an authorization decision denies, audits, and does not cache the non-answer. Feature availability may degrade (a service retries, or exits and is restarted by init); permission may not. The one structural exception is a window in which there is provably no one to ask (init before the policy service exists). Why this is non-negotiable: the policy upcall ran fail-open for months with every query undelivered, and every boot "worked" because the outcome was always Allow (2026-10-27). A fail-open path hides exactly the failure it claims to survive. `make check-fail-open` flags the phrase in code and comments; ADR-006 § Divergence 2026-10-28 carries the decision.
 
 BuddyAllocator (pure bookkeeping, host-testable) is the template; new kernel components follow the pattern.
 
@@ -67,6 +68,7 @@ Before the first edit, stop and confirm when any of these apply. Questions beat 
 - **Dynamic dispatch in kernel.** About to introduce a trait object (`Box<dyn …>`, `&dyn …`) in kernel hot paths. Violates the Formal Verification rule ("no dynamic dispatch"). Propose the monomorphized design first.
 - **Panic / unwrap / expect in non-test kernel code.** Every kernel failure must be a typed `Result`. If the only forward motion seems to be a panic, stop — the error type is probably wrong.
 - **Telemetry / analytics / phone-home.** Project principle is zero telemetry. Any feature that emits data off-device (even "anonymous") is a stop.
+- **Fail-open path.** About to make an enforcement decision default to Allow when the decider is unavailable, slow, full, or returns garbage — or to describe one in a comment. Enforcement fails closed (Formal Verification list); propose the deny + audit + restart shape instead, or name the structural reason there is no one to ask.
 - **Portable module drift.** About to add `#[cfg(target_arch = …)]` to `src/scheduler/`, `src/ipc/`, `src/process.rs`, `src/loader/elf.rs`, or another portable module. Factor an `arch::` helper instead, or escalate.
 - **Identity-gate bypass.** About to add a syscall without updating `requires_identity()` + the identity tests in [src/syscalls/mod.rs](src/syscalls/mod.rs), or add an IPC receiver that uses plain `recv_msg` where `recv_verified` is the load-bearing variant.
 - **Destructive or shared-state action.** `git reset --hard`, branch deletion, force-push, `rm -rf` under the repo, or any action visible outside this machine. The top-level "Executing actions with care" rule applies; this bullet is the local reminder.
@@ -247,6 +249,7 @@ make check-audit-taxonomy    # verify the generated taxonomy doc is in sync (loc
 make check-assumptions       # Convention 8 numeric-const tags
 make check-deferrals         # Convention 9 Revisit-when triggers
 make check-boot-panics       # ADR-021 Phase C — no panic!/expect/etc in boot init; exempt via `// BOOT_PANIC_OK: <reason>`
+make check-fail-open         # Enforcement fails closed (ADR-006 § Divergence 2026-10-28) — no fail-open phrase in kernel/user code or comments; exempt via `// FAIL_OPEN_OK: <reason>`; baseline expected empty
 make check-banned-paths      # paths in tools/banned-paths.txt must not exist on disk
 make check-index-isolation   # STATUS.md diff >20 lines + any .rs staged → reject
 make check-lockfile          # T-1: lists added/removed Cargo.lock crates (advisory)
@@ -280,7 +283,7 @@ CAMBIOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
 
 # QEMU
 make run                         # x86_64 (ISO, rebuilds kernel + modules)
-make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default `cambios> `), 1 = panic/exception, 2 = hang. Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
+make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default: the `CambiOS Shell v0.1` banner) AND every `--require REGEX` matched, 1 = panic/exception, 2 = hang or a required line missing. Default require: `boot wave settled: N ready, 0 spawn-failed, 0 dep-failed` (RUN_QUIET_REQUIRES); CI adds the policy counters via EXTRA_REQUIRES="--require '…'". Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
 make run-aarch64                 # AArch64 (FAT image)
 make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only

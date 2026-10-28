@@ -10,11 +10,19 @@ reflecting what actually happened.
 
 Exit codes:
   0 — success sentinel seen (default: ``CambiOS Shell v0.1`` — banner)
+      AND every ``--require REGEX`` matched some line
   1 — kernel panic, CPU exception, or Limine bailout
-  2 — no sentinel within --timeout, or QEMU exited before one
+  2 — no sentinel, or a required line still missing, within --timeout
+      (or QEMU exited before then)
 
 Usage:
-  qemu-run-quiet.py [--timeout N] [--success STRING] -- <qemu-cmd...>
+  qemu-run-quiet.py [--timeout N] [--success STRING] [--require REGEX]... -- <qemu-cmd...>
+
+``--require`` is a liveness assertion: a line the boot must produce for
+the run to count. The banner alone passed for months while the policy
+upcall never answered a query; a required ``answered [1-9]`` line would
+have failed that boot. Requires may match before or after the sentinel;
+the runner keeps reading after the banner until all have matched.
 """
 
 import argparse
@@ -74,6 +82,8 @@ def main() -> int:
                         help="seconds before declaring a hang (default: 60)")
     parser.add_argument("--success", default="CambiOS Shell v0.1",
                         help="success sentinel substring (default: 'CambiOS Shell v0.1' — the banner the shell prints right before the first prompt; stable across the various styled-prompt shapes the prompt itself can take)")
+    parser.add_argument("--require", action="append", default=[], metavar="REGEX",
+                        help="regex that must match some output line (ANSI-stripped) for the run to succeed; repeatable")
     args = parser.parse_args(sys.argv[1:sep])
     qemu_cmd = sys.argv[sep + 1:]
     if not qemu_cmd:
@@ -92,6 +102,8 @@ def main() -> int:
         pass
 
     success_re = re.compile(re.escape(args.success))
+    pending_requires = [(r, re.compile(r)) for r in args.require]
+    sentinel_seen = False
     # Strip ANSI SGR escapes before sentinel-matching so styled output
     # (Phase B/C: `cambios@<short-did>:HH:MM>` rendered with cyan/dim/
     # yellow attributes via cambios-style) still matches plain-string
@@ -135,13 +147,34 @@ def main() -> int:
             if KMAIN_SENTINEL.search(line):
                 kmain_seen = True
 
-            if kind == "success" and not saw_failure:
+            plain = ansi_re.sub("", line)
+            matched_require = False
+            if pending_requires and not saw_failure:
+                still = []
+                for text, rx in pending_requires:
+                    if rx.search(plain):
+                        if not matched_require:
+                            print(line)
+                            matched_require = True
+                        print(f"✓ required line matched: {text}")
+                    else:
+                        still.append((text, rx))
+                pending_requires = still
+
+            if kind == "success" and not saw_failure and not sentinel_seen:
+                sentinel_seen = True
                 elapsed = time.monotonic() - start
                 print(line)
                 print(f"✓ success sentinel reached in {elapsed:.1f}s")
+                if pending_requires:
+                    print(f"  waiting for {len(pending_requires)} required line(s)…")
+
+            if sentinel_seen and not pending_requires and not saw_failure:
                 proc.kill()
                 proc.wait()
                 return 0
+            if kind == "success":
+                continue
 
             if kind == "failure" and not saw_failure:
                 saw_failure = True
@@ -160,7 +193,7 @@ def main() -> int:
             if not kmain_seen:
                 continue
 
-            if kind == "live":
+            if kind == "live" and not matched_require:
                 print(line)
     except KeyboardInterrupt:
         proc.kill()
@@ -173,7 +206,13 @@ def main() -> int:
     if saw_failure:
         return 1
 
-    print(f"✗ no success sentinel within {elapsed:.1f}s (timeout={args.timeout}s); last {len(ring)} lines:")
+    if sentinel_seen:
+        print(f"✗ sentinel seen but {len(pending_requires)} required line(s) never matched within {elapsed:.1f}s (timeout={args.timeout}s):")
+        for text, _ in pending_requires:
+            print(f"    missing: {text}")
+        print(f"  last {len(ring)} lines:")
+    else:
+        print(f"✗ no success sentinel within {elapsed:.1f}s (timeout={args.timeout}s); last {len(ring)} lines:")
     for line in ring:
         print(line)
     return 2

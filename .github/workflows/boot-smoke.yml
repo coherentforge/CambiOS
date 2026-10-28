@@ -71,4 +71,12 @@ jobs:
         with:
           key: boot-smoke-x86_64
       - name: Boot to shell under QEMU (headless, seed-signed)
-        run: make run-quiet TIMEOUT=180
+        # Beyond the shell banner, the run must show the boot wave settled
+        # with nothing failed (Makefile default) and the policy service
+        # actually answering: the `[sched]` diagnostic the BSP prints ~20 s
+        # in must report queries answered (> 0) and none expired. A boot
+        # whose enforcer never answers no longer passes (ADR-006
+        # § Divergence 2026-10-28).
+        run: >
+          make run-quiet TIMEOUT=180
+          EXTRA_REQUIRES="--require 'policy queries submitted [1-9][0-9]* answered [1-9][0-9]* expired 0'"

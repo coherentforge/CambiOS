@@ -3514,7 +3514,14 @@ impl SyscallDispatcher {
             let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
             let cap_mgr = cap_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
             for &(endpoint, rights) in caps_to_grant {
-                let _ = cap_mgr.grant_capability(ctx.process_id, endpoint, rights);
+                // A failed promotion leaves the member under-granted — the
+                // safe direction, but a silent one; say so.
+                if let Err(e) = cap_mgr.grant_capability(ctx.process_id, endpoint, rights) {
+                    crate::println!(
+                        "  [ClusterJoin] cap promotion FAILED for pid {} ep {}: {:?}",
+                        ctx.process_id.slot(), endpoint.0, e
+                    );
+                }
             }
         }
 
@@ -4155,7 +4162,15 @@ impl SyscallDispatcher {
                         let mut cap_guard = crate::CAPABILITY_MANAGER.lock();
                         if let Some(cap_mgr) = cap_guard.as_mut() {
                             for &(endpoint, _rights) in caps {
-                                let _ = cap_mgr.revoke_capability(*pid, endpoint);
+                                // A revoke that fails is a capability that
+                                // outlives its cluster — the unsafe
+                                // direction. It cannot be silent.
+                                if let Err(e) = cap_mgr.revoke_capability(*pid, endpoint) {
+                                    crate::println!(
+                                        "  [ClusterRevoke] cap revoke FAILED for pid {} ep {}: {:?}",
+                                        pid.slot(), endpoint.0, e
+                                    );
+                                }
                             }
                         }
                     }
@@ -4167,7 +4182,12 @@ impl SyscallDispatcher {
         {
             let mut guard = crate::CLUSTER_MANAGER.lock();
             if let Some(mgr) = guard.as_mut() {
-                let _ = mgr.complete_revoke(cluster_id);
+                if let Err(e) = mgr.complete_revoke(cluster_id) {
+                    crate::println!(
+                        "  [ClusterRevoke] complete_revoke FAILED for cluster {}: {:?}",
+                        cluster_id.as_raw(), e
+                    );
+                }
             }
         }
 

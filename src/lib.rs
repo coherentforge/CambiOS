@@ -1149,7 +1149,12 @@ pub static REPLY_ENDPOINT: [core::sync::atomic::AtomicU32; 256] =
 // ============================================================================
 
 /// Whether the policy service has been identified and the upcall path is active.
-/// Before this is set, `policy_check()` falls back to Allow (current behavior).
+/// Set by `handle_spawn` when init spawns the manifest row named
+/// `policy-service`; never cleared — a policy service that dies leaves
+/// enforcement on (queries time out to Deny) until init restarts it.
+/// Before it is set the only user task is init, and `policy_check()`
+/// allows because there is no one to ask (the structural window ADR-006
+/// § Divergence 2026-10-28 names).
 pub static POLICY_SERVICE_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

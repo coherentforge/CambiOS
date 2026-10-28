@@ -128,17 +128,22 @@ mod svc {
         let wave_ticks = sys::get_time().wrapping_sub(wave_start);
 
         let s = eng.summary();
-        sys::print(b"[init] boot wave settled: ");
-        print_num(s.ready as u32);
-        sys::print(b" ready, ");
-        print_num(s.spawn_failed as u32);
-        sys::print(b" spawn-failed, ");
-        print_num(s.dep_failed as u32);
-        sys::print(b" dep-failed, ");
-        print_num(s.on_demand as u32);
-        sys::print(b" on-demand; ");
-        print_num(wave_ticks as u32);
-        sys::print(b" ticks since init started\n");
+        // One syscall for the whole line: the CI runner keys on it, and
+        // with services on other CPUs anything printed in pieces gets
+        // other services' output spliced between the pieces.
+        let mut line = Line::new();
+        line.push(b"[init] boot wave settled: ");
+        line.push_num(s.ready as u32);
+        line.push(b" ready, ");
+        line.push_num(s.spawn_failed as u32);
+        line.push(b" spawn-failed, ");
+        line.push_num(s.dep_failed as u32);
+        line.push(b" dep-failed, ");
+        line.push_num(s.on_demand as u32);
+        line.push(b" on-demand; ");
+        line.push_num(wave_ticks as u32);
+        line.push(b" ticks since init started\n");
+        line.flush();
 
         // Idle: block on our endpoint and discard. Post-boot traffic
         // (ready pings from on-demand apps, which call ready() like
@@ -213,11 +218,13 @@ mod svc {
                                     if (idx as usize) < ready_ticks.len() {
                                         ready_ticks[idx as usize] = took.min(u16::MAX as u64 - 1) as u16;
                                     }
-                                    sys::print(b"[init]   ");
-                                    sys::print(name.as_bytes());
-                                    sys::print(b" ready after ");
-                                    print_num(took as u32);
-                                    sys::print(b" ticks\n");
+                                    let mut line = Line::new();
+                                    line.push(b"[init]   ");
+                                    line.push(name.as_bytes());
+                                    line.push(b" ready after ");
+                                    line.push_num(took as u32);
+                                    line.push(b" ticks\n");
+                                    line.flush();
                                 }
                                 Err(EngineError::UnknownSender) => {
                                     // Something outside the manifest
@@ -237,37 +244,79 @@ mod svc {
                     }
                 }
                 Action::Done => {
-                    // One line, `name=ticks` per spawned service.
-                    sys::print(b"[init] ready ticks:");
+                    // One line, `name=ticks` per spawned service. Longer
+                    // than one print syscall allows, so it flushes in
+                    // whole `name=ticks` units — never mid-token.
+                    let mut line = Line::new();
+                    line.push(b"[init] ready ticks:");
                     for (i, &t) in ready_ticks.iter().enumerate() {
                         if t == u16::MAX {
                             continue;
                         }
                         let name = m.entry(i).map(|e| e.module_name()).unwrap_or("");
-                        sys::print(b" ");
-                        sys::print(name.as_bytes());
-                        sys::print(b"=");
-                        print_num(t as u32);
+                        line.reserve(1 + name.len() + 1 + 10);
+                        line.push(b" ");
+                        line.push(name.as_bytes());
+                        line.push(b"=");
+                        line.push_num(t as u32);
                     }
-                    sys::print(b"\n");
+                    line.push(b"\n");
+                    line.flush();
                     return;
                 }
             }
         }
     }
 
-    /// Decimal print without an allocator (u32 max is 10 digits).
-    fn print_num(mut n: u32) {
-        let mut buf = [0u8; 10];
-        let mut i = buf.len();
-        loop {
-            i -= 1;
-            buf[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            if n == 0 {
-                break;
+    /// Line builder sized to one `SYS_PRINT` (256 bytes): text assembled
+    /// here reaches the console in a single syscall, so lines from
+    /// services on other CPUs cannot be spliced into the middle of it.
+    /// `reserve` flushes early when the next token would not fit, so a
+    /// long line breaks only between tokens the caller chose.
+    struct Line {
+        buf: [u8; 256],
+        len: usize,
+    }
+
+    impl Line {
+        fn new() -> Self {
+            Line { buf: [0; 256], len: 0 }
+        }
+
+        /// Flush now if fewer than `n` bytes remain.
+        fn reserve(&mut self, n: usize) {
+            if self.buf.len() - self.len < n {
+                self.flush();
             }
         }
-        sys::print(&buf[i..]);
+
+        fn push(&mut self, s: &[u8]) {
+            self.reserve(s.len());
+            let n = s.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
+            self.len += n;
+        }
+
+        /// Decimal without an allocator (u32 max is 10 digits).
+        fn push_num(&mut self, mut n: u32) {
+            let mut tmp = [0u8; 10];
+            let mut i = tmp.len();
+            loop {
+                i -= 1;
+                tmp[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            self.push(&tmp[i..]);
+        }
+
+        fn flush(&mut self) {
+            if self.len > 0 {
+                sys::print(&self.buf[..self.len]);
+                self.len = 0;
+            }
+        }
     }
 }

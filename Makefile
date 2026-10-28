@@ -209,7 +209,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -1010,10 +1010,21 @@ run: iso disk-img
 # 2 = hang). Default success sentinel is `cambios> ` (full boot to shell);
 # override for pre-shell testing:  make run-quiet SUCCESS="virtio-net ready"
 # Keep this QEMU command in sync with `run:` above.
+# Liveness assertions for run-quiet: the shell banner alone proved too
+# little for months (the policy upcall never answered and every boot
+# still "passed"). Every `--require REGEX` must match a serial line
+# before the run counts as success; the runner keeps reading after the
+# banner until they all do, or the timeout. Default: the wave settled
+# with nothing failed. CI adds the enforcement counters via
+# EXTRA_REQUIRES (see .github/workflows/boot-smoke.yml).
+RUN_QUIET_REQUIRES ?= --require 'boot wave settled: [0-9]+ ready, 0 spawn-failed, 0 dep-failed'
+EXTRA_REQUIRES ?=
+
 run-quiet: iso disk-img
 	python3 tools/qemu-run-quiet.py \
 		$(if $(TIMEOUT),--timeout $(TIMEOUT),) \
 		$(if $(SUCCESS),--success "$(SUCCESS)",) \
+		$(RUN_QUIET_REQUIRES) $(EXTRA_REQUIRES) \
 		-- qemu-system-x86_64 \
 			-cdrom $(ISO) \
 			-serial mon:stdio \
@@ -1507,6 +1518,17 @@ update-assumptions-baseline:
 # 021.B.1-B.3 migrations. Exits nonzero on any new site.
 check-boot-panics:
 	python3 tools/check-boot-panics.py
+
+# Enforcement fails closed (CLAUDE.md § Formal Verification; ADR-006
+# § Divergence 2026-10-28): no new fail-open path, in code or in the
+# comment describing it, without a reviewed argument. Scans kernel +
+# user-space Rust; exempt a structural case with `// FAIL_OPEN_OK:`.
+# Baseline at tools/check-fail-open-baseline.txt (expected empty).
+check-fail-open:
+	python3 tools/check-fail-open.py
+
+update-fail-open-baseline:
+	python3 tools/check-fail-open.py --update-baseline
 
 # Regenerate the boot-panics baseline. Use only to acknowledge a
 # regression you're intentionally accepting — review the diff and
