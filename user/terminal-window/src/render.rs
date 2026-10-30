@@ -56,8 +56,9 @@ const CARET: Color = Color(0xFF_FF_FF_FF);
 
 // ─── Watermark layer ─────────────────────────────────────────────
 //
-// Handled by the compositor's z-stack now. The splash module opens a
-// back layer (z=0, opaque) and stamps the wordmark + watermark there;
+// Handled by the compositor's z-stack now. The terminal is a single
+// alpha-blended layer over the compositor's backdrop (the splash's
+// back layer was removed 2026-10-30);
 // terminal-window opens a front layer (z=1, alpha-blend) and renders
 // the live grid here with transparent BG so the back layer's
 // watermark shows through wherever cells have no glyph.
@@ -202,7 +203,7 @@ pub fn render(surf: &mut Surface, grid: &mut Grid, state: &mut RenderState) {
 /// full cell band, then blit each cell's glyph through the AA font
 /// using a color resolved from the cell's `(fg, attrs)` pair. BG is
 /// fully transparent under the alpha-blend compositor path, so any
-/// back layer (e.g. the splash watermark) shows through cells without
+/// compositor backdrop shows through cells without
 /// glyphs.
 fn draw_row(surf: &mut Surface, grid: &Grid, row: usize) {
     let cell_y = (row as u16) * CELL_H;

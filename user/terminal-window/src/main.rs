@@ -39,12 +39,6 @@ const HEAP_SIZE: usize = 64 * 1024;
 // Configuration
 // ============================================================================
 
-/// Reply endpoint for the back layer (splash + steady-state watermark).
-/// Holds the WelcomeClient handshake reply and stays registered for
-/// the life of the process; never polled afterward (the back layer
-/// is render-only and the compositor routes input to the front).
-const BACK_LAYER_ENDPOINT: u32 = 14;
-
 /// Reply endpoint for the front layer (live terminal grid). Receives
 /// input events forwarded by the compositor — the front layer wins
 /// the focus tie since it's the highest-z window in this client.
@@ -133,29 +127,11 @@ fn report_client_error(stage: &[u8], e: &cambios_libgui::client::ClientError) {
 fn run() -> ! {
     sys::print(b"[terminal-window] starting\n");
 
-    // Open the back layer first and run the splash on it. After the
-    // splash returns, the back surface holds the steady-state
-    // watermark; we keep `_back_client` in scope for the rest of the
-    // process so the compositor's window table keeps the layer alive.
-    // The splash layer is decoration: if it cannot be opened, say
-    // exactly which handshake step failed and carry on with the front
-    // layer alone. Exiting here took the whole GUI down on the Dell 3630
-    // (2026-10-29) over a layer nobody needs to type into.
-    let _back_client =
-        match cambios_terminal_window::splash::run(WINDOW_WIDTH, WINDOW_HEIGHT, BACK_LAYER_ENDPOINT)
-        {
-            Ok(c) => Some(c),
-            Err(e) => {
-                report_client_error(b"back layer (splash)", &e);
-                sys::print(b"[terminal-window] continuing without the splash layer\n");
-                None
-            }
-        };
-
-    // Open the front layer (z=1, alpha-blend). The terminal grid
-    // renders here; cells with no glyph leave alpha=0 so the back
-    // layer's watermark shows through; cells with glyphs are opaque
-    // and the compositor alpha-blends them on top.
+    // Open the terminal layer (z=1, alpha-blend). Cells with no glyph
+    // leave alpha=0 and show the compositor's backdrop; cells with
+    // glyphs are opaque. The boot splash that used to sit on a second
+    // layer behind this one was removed 2026-10-30: polish before the
+    // foundation is done, and it cost ~8 s of the Dell 3630's boot.
     let backend = match GuiBackend::open_layer(
         WINDOW_WIDTH,
         WINDOW_HEIGHT,
@@ -170,7 +146,7 @@ fn run() -> ! {
         }
     };
 
-    sys::print(b"[terminal-window] both layers open\n");
+    sys::print(b"[terminal-window] terminal layer open\n");
     cambios_libsys_rt::ready();
 
     let mut terminal = Terminal::new(backend);
