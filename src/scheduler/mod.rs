@@ -111,7 +111,7 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
                     }
                 }
                 let accepted = crate::io::try_print(format_args!(
-                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; current {:?}; runnable {:?}; policy queries submitted {} answered {} expired {}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
+                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; current {:?}; runnable {:?}; policy queries submitted {} answered {} expired {} retried {}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
                     crate::RESCHED_KICKS_SENT.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_HANDLED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_SWITCHED.load(core::sync::atomic::Ordering::Relaxed),
@@ -121,6 +121,7 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
                     crate::policy::POLICY_QUERIES_SUBMITTED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::policy::POLICY_QUERIES_ANSWERED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::policy::POLICY_QUERIES_EXPIRED.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::policy::POLICY_QUERIES_RETRIED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::BOOT_STAMP_MCYCLES[0].load(core::sync::atomic::Ordering::Relaxed),
                     crate::BOOT_STAMP_MCYCLES[1].load(core::sync::atomic::Ordering::Relaxed),
                     crate::BOOT_STAMP_MCYCLES[2].load(core::sync::atomic::Ordering::Relaxed),

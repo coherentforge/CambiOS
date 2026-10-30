@@ -51,6 +51,20 @@ pub const POLICY_RESP_ENDPOINT: u32 = 23;
 pub static POLICY_QUERIES_SUBMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static POLICY_QUERIES_ANSWERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static POLICY_QUERIES_EXPIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Upcalls re-submitted after an expiry (see `POLICY_UPCALL_ATTEMPTS`).
+/// Non-zero on a healthy system means answers are arriving late or a
+/// wake was lost — look before it becomes denials.
+pub static POLICY_QUERIES_RETRIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// TUNING: how many times `policy_check` re-submits a query whose answer
+/// did not arrive within `POLICY_TIMEOUT_TICKS` before it denies. Fail
+/// closed still means a Deny after the bound (3 s at 100 Hz); the retry
+/// is the "a service retries" half of degrade-loudly, done where the
+/// caller cannot tell a late answer from a real one — on the Dell 3630 a
+/// single expiry killed terminal-window (its first `recv-msg` denied, it
+/// exited, the GUI went black; 2026-10-29). One query is in flight per
+/// task at any time, so the bound multiplies latency, not table load.
+pub const POLICY_UPCALL_ATTEMPTS: u32 = 3;
 
 /// TUNING: ticks before a pending policy query expires and the blocked
 /// caller is woken with a Deny. At 100 Hz timer, 100 ticks = 1 second.
@@ -464,9 +478,11 @@ unsafe impl Sync for PolicyCacheCell {}
 ///
 /// # Fail closed
 ///
-/// Pending table full, query queue full, and response timeout all
-/// return `Deny(SyscallNotPermitted)`; the dispatcher audits it. None
-/// of these is cached — the next call asks again.
+/// Pending table full and query queue full return
+/// `Deny(SyscallNotPermitted)` at once. A response timeout re-submits
+/// the query up to `POLICY_UPCALL_ATTEMPTS` times, then denies. The
+/// dispatcher audits every Deny. None of these is cached — the next
+/// call asks again.
 ///
 /// # Cache path (per-CPU, interrupts disabled)
 ///
@@ -554,120 +570,132 @@ pub fn policy_check(
     };
     // CAPABILITY_MANAGER lock dropped
 
-    // Allocate a pending-query slot
-    let query_id = {
-        let mut router = crate::POLICY_ROUTER.lock();
-        match router.submit_query(task_id, current_tick) {
-            Some(qid) => qid,
-            None => {
-                // Pending table full — no way to ask, so no permission.
-                return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
+    // Upcall, with a bounded retry on expiry. Each attempt submits a
+    // fresh query; a late answer to an earlier one finds its entry gone
+    // (`complete_query` → None) and is dropped, never misattributed.
+    let mut attempt: u32 = 0;
+    let allowed = loop {
+        // Allocate a pending-query slot
+        let query_id = {
+            let mut router = crate::POLICY_ROUTER.lock();
+            match router.submit_query(task_id, Timer::get_ticks()) {
+                Some(qid) => qid,
+                None => {
+                    // Pending table full — no way to ask, so no permission.
+                    return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
+                }
             }
-        }
-    };
-    POLICY_QUERIES_SUBMITTED.fetch_add(1, Ordering::Relaxed);
-    // POLICY_ROUTER lock dropped
+        };
+        POLICY_QUERIES_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+        // POLICY_ROUTER lock dropped
 
-    // Build and send query message
-    let msg = build_query_message(query_id, process_id, syscall_num, &principal_bytes);
-    if crate::SHARDED_IPC
-        .send_message(EndpointId(POLICY_QUERY_ENDPOINT), msg)
-        .is_err()
-    {
-        // Queue full — withdraw the pending query; no decision, no permission.
-        let mut router = crate::POLICY_ROUTER.lock();
-        router.complete_query(query_id);
-        return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
-    }
-
-    // Wake the policy service if it's blocked waiting for queries.
-    // Plain-lock all-CPU wake: the prior try_lock loop could silently
-    // skip a contended scheduler, losing the wake (see
-    // wake_message_waiters_all_cpus). Syscall context — no lock held.
-    crate::wake_message_waiters_all_cpus(POLICY_QUERY_ENDPOINT);
-
-    // Block and yield — unless the answer has already landed.
-    //
-    // The decision check and the block are ONE critical section under
-    // this CPU's scheduler lock (CLAUDE.md Blocking pattern: a condition
-    // another CPU signals must be re-checked atomically with
-    // block_task). The responder stores the decision and then takes this
-    // same lock to wake us; if it ran between our send and our block,
-    // its wake found us Running and did nothing — and complete_query had
-    // already removed the query, so the expiry sweep could never rescue
-    // us. Init slept forever in PolicyWait on the first boot that
-    // delivered an answer (QEMU, two CPUs, 2026-10-27).
-    //
-    // CRITICAL: interrupts off BEFORE block_task, or the timer ISR can
-    // see Blocked state before yield saves the correct context (see
-    // handle_recv_msg). The IrqSpinlock restores the flags it saved, so
-    // taking it after the disable keeps them off through the yield.
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: Disabling interrupts is safe at kernel privilege level.
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
-    }
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: Masking IRQs is safe at EL1.
-    unsafe {
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-    }
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: `csrci sstatus, 2` clears SIE at S-mode; same contract as
-    // the dispatcher's blocking sites.
-    unsafe {
-        core::arch::asm!("csrci sstatus, 2", options(nomem, nostack));
-    }
-    let blocked = {
-        let mut guard = crate::local_scheduler().lock();
-        if POLICY_DECISIONS[task_id.slot() as usize].load(Ordering::Acquire) == DECISION_NONE {
-            match guard.as_mut() {
-                Some(sched) => sched.block_task(task_id, BlockReason::PolicyWait(query_id)).is_ok(),
-                None => false,
-            }
-        } else {
-            false
-        }
-    };
-    if blocked {
-        // SAFETY: We are on the kernel stack, no locks held.
-        unsafe {
-            crate::arch::yield_save_and_switch();
-        }
-    } else {
-        // The decision beat us to the block: no yield, so restore the
-        // interrupt state the syscall path runs with.
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: Re-enabling interrupts is safe at kernel privilege level.
-        unsafe {
-            core::arch::asm!("sti", options(nomem, nostack));
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: Unmasking IRQs is safe at EL1.
-        unsafe {
-            core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
-        }
-        #[cfg(target_arch = "riscv64")]
-        // SAFETY: `csrsi sstatus, 2` sets SIE at S-mode.
-        unsafe {
-            core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack));
-        }
-    }
-
-    // --- Woken: read decision from POLICY_DECISIONS ---
-
-    let decision_val = POLICY_DECISIONS[task_id.slot() as usize].swap(DECISION_NONE, Ordering::Acquire);
-    let allowed = match decision_val {
-        DECISION_ALLOW => true,
-        DECISION_DENY => false,
-        _ => {
-            // Expired (or no decision at all): the policy service never
-            // answered. Deny without caching — the next attempt asks
-            // again, so a recovered or restarted policy service is
-            // consulted, and a dead one keeps denying instead of being
-            // promoted to permission.
+        // Build and send query message
+        let msg = build_query_message(query_id, process_id, syscall_num, &principal_bytes);
+        if crate::SHARDED_IPC
+            .send_message(EndpointId(POLICY_QUERY_ENDPOINT), msg)
+            .is_err()
+        {
+            // Queue full — withdraw the pending query; no decision, no permission.
+            let mut router = crate::POLICY_ROUTER.lock();
+            router.complete_query(query_id);
             return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
         }
+
+        // Wake the policy service if it's blocked waiting for queries.
+        // Plain-lock all-CPU wake: the prior try_lock loop could silently
+        // skip a contended scheduler, losing the wake (see
+        // wake_message_waiters_all_cpus). Syscall context — no lock held.
+        crate::wake_message_waiters_all_cpus(POLICY_QUERY_ENDPOINT);
+
+        // Block and yield — unless the answer has already landed.
+        //
+        // The decision check and the block are ONE critical section under
+        // this CPU's scheduler lock (CLAUDE.md Blocking pattern: a condition
+        // another CPU signals must be re-checked atomically with
+        // block_task). The responder stores the decision and then takes this
+        // same lock to wake us; if it ran between our send and our block,
+        // its wake found us Running and did nothing — and complete_query had
+        // already removed the query, so the expiry sweep could never rescue
+        // us. Init slept forever in PolicyWait on the first boot that
+        // delivered an answer (QEMU, two CPUs, 2026-10-27).
+        //
+        // CRITICAL: interrupts off BEFORE block_task, or the timer ISR can
+        // see Blocked state before yield saves the correct context (see
+        // handle_recv_msg). The IrqSpinlock restores the flags it saved, so
+        // taking it after the disable keeps them off through the yield.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: Disabling interrupts is safe at kernel privilege level.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack));
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: Masking IRQs is safe at EL1.
+        unsafe {
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        }
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: `csrci sstatus, 2` clears SIE at S-mode; same contract as
+        // the dispatcher's blocking sites.
+        unsafe {
+            core::arch::asm!("csrci sstatus, 2", options(nomem, nostack));
+        }
+        let blocked = {
+            let mut guard = crate::local_scheduler().lock();
+            if POLICY_DECISIONS[task_id.slot() as usize].load(Ordering::Acquire) == DECISION_NONE {
+                match guard.as_mut() {
+                    Some(sched) => sched.block_task(task_id, BlockReason::PolicyWait(query_id)).is_ok(),
+                    None => false,
+                }
+            } else {
+                false
+            }
+        };
+        if blocked {
+            // SAFETY: We are on the kernel stack, no locks held.
+            unsafe {
+                crate::arch::yield_save_and_switch();
+            }
+        } else {
+            // The decision beat us to the block: no yield, so restore the
+            // interrupt state the syscall path runs with.
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: Re-enabling interrupts is safe at kernel privilege level.
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack));
+            }
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: Unmasking IRQs is safe at EL1.
+            unsafe {
+                core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+            }
+            #[cfg(target_arch = "riscv64")]
+            // SAFETY: `csrsi sstatus, 2` sets SIE at S-mode.
+            unsafe {
+                core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack));
+            }
+        }
+
+        // --- Woken: read decision from POLICY_DECISIONS ---
+
+        let decision_val = POLICY_DECISIONS[task_id.slot() as usize].swap(DECISION_NONE, Ordering::Acquire);
+        let allowed = match decision_val {
+            DECISION_ALLOW => true,
+            DECISION_DENY => false,
+            _ => {
+                // Expired (or no decision at all): the policy service did
+                // not answer in time. Re-submit up to the bound; then deny
+                // without caching, so a recovered or restarted policy
+                // service is consulted next time and a dead one keeps
+                // denying instead of being promoted to permission.
+                attempt += 1;
+                if attempt < POLICY_UPCALL_ATTEMPTS {
+                    POLICY_QUERIES_RETRIED.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                return InterceptDecision::Deny(DenyReason::SyscallNotPermitted);
+            }
+        };
+        break allowed;
     };
 
     // Cache the answered result

@@ -83,6 +83,53 @@ cambios_libsys_rt::service_main! {
     main: run,
 }
 
+/// One line naming the compositor-handshake step that failed and the
+/// kernel's return code, so a photo of the panel says what to fix.
+fn report_client_error(stage: &[u8], e: &cambios_libgui::client::ClientError) {
+    use cambios_libgui::client::ClientError;
+    let (step, rc): (&[u8], Option<i64>) = match e {
+        ClientError::RegisterEndpointFailed(rc) => (b"register_endpoint", Some(*rc)),
+        ClientError::EncodeCreateWindow => (b"encode CreateWindow", None),
+        ClientError::CreateWindowWriteFailed(rc) => (b"write CreateWindow", Some(*rc)),
+        ClientError::RecvVerifiedFailed => (b"recv WelcomeClient (recv_msg denied or empty)", None),
+        ClientError::DecodeWelcome => (b"decode WelcomeClient", None),
+        ClientError::ChannelAttachFailed(rc) => (b"channel_attach", Some(*rc)),
+        _ => (b"a later client step", None),
+    };
+    let mut line = [0u8; 160];
+    let mut n = 0;
+    let mut push = |bytes: &[u8]| {
+        let take = core::cmp::min(line.len() - n, bytes.len());
+        line[n..n + take].copy_from_slice(&bytes[..take]);
+        n += take;
+    };
+    push(b"[terminal-window] ");
+    push(stage);
+    push(b" failed at ");
+    push(step);
+    if let Some(rc) = rc {
+        push(b" rc=");
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        let neg = rc < 0;
+        let mut v = rc.unsigned_abs();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        if neg {
+            push(b"-");
+        }
+        push(&tmp[i..]);
+    }
+    push(b"\n");
+    sys::print(&line[..n]);
+}
+
 fn run() -> ! {
     sys::print(b"[terminal-window] starting\n");
 
@@ -90,13 +137,18 @@ fn run() -> ! {
     // splash returns, the back surface holds the steady-state
     // watermark; we keep `_back_client` in scope for the rest of the
     // process so the compositor's window table keeps the layer alive.
+    // The splash layer is decoration: if it cannot be opened, say
+    // exactly which handshake step failed and carry on with the front
+    // layer alone. Exiting here took the whole GUI down on the Dell 3630
+    // (2026-10-29) over a layer nobody needs to type into.
     let _back_client =
         match cambios_terminal_window::splash::run(WINDOW_WIDTH, WINDOW_HEIGHT, BACK_LAYER_ENDPOINT)
         {
-            Ok(c) => c,
-            Err(_) => {
-                sys::print(b"[terminal-window] failed to open back layer for splash\n");
-                sys::exit(1);
+            Ok(c) => Some(c),
+            Err(e) => {
+                report_client_error(b"back layer (splash)", &e);
+                sys::print(b"[terminal-window] continuing without the splash layer\n");
+                None
             }
         };
 
@@ -112,8 +164,8 @@ fn run() -> ! {
         true,
     ) {
         Ok(b) => b,
-        Err(_) => {
-            sys::print(b"[terminal-window] failed to open front layer\n");
+        Err(e) => {
+            report_client_error(b"front layer", &e);
             sys::exit(1);
         }
     };

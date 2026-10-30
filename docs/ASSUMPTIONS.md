@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: project-wide numeric bound catalog
 auto_refresh: required
-last_synced_to_code: 2026-10-27 (manifest wire v2 `SYSCALL_MASK_WORDS` + `MANIFEST_MAPPING_BUDGET` rows; 2026-07-12 ADR-018 step 6 — MANIFEST_MAX_BYTES derived ceiling added; 2026-07-09 step 4 — MAX_MODULES/MAX_BOOT_MODULES 32→128 lockstep with MAX_MANIFEST_ENTRIES; spawn-grant table cost recorded; 2026-07-06: step-1 manifest wire-format bounds added)
+last_synced_to_code: 2026-10-29 (POLICY_TIMEOUT_TICKS + POLICY_UPCALL_ATTEMPTS TUNING rows; 2026-10-27 manifest wire v2 `SYSCALL_MASK_WORDS` + `MANIFEST_MAPPING_BUDGET` rows; 2026-07-12 ADR-018 step 6 — MANIFEST_MAX_BYTES derived ceiling added; 2026-07-09 step 4 — MAX_MODULES/MAX_BOOT_MODULES 32→128 lockstep with MAX_MANIFEST_ENTRIES; spawn-grant table cost recorded; 2026-07-06: step-1 manifest wire-format bounds added)
 authoritative_for: every fixed numeric bound, fixed-size array, hard limit in kernel code — what kind of bound it is, why this number, and what triggers re-evaluation
 -->
 
@@ -210,6 +210,8 @@ These are performance knobs. Picking a number without measurements is guessing. 
 | `MAX_INDIVIDUAL_PAGES` (TLB shootdown) | 32 | [src/arch/x86_64/tlb.rs:31](../src/arch/x86_64/tlb.rs#L31) | Threshold for `invlpg` per-page vs. full CR3 reload. Above 32, full reload is cheaper. Verified empirically by other kernels; not measured for CambiOS. |
 | `MAX_OVERRIDES` (ACPI MADT) | 16 | [src/acpi/mod.rs:187](../src/acpi/mod.rs#L187) | Realistic firmware override count. |
 | `DRAIN_BATCH_SIZE` (audit) | 64 | [src/audit/drain.rs:59](../src/audit/drain.rs#L59) | Max events drained from all per-CPU staging buffers per timer tick. Bounds ISR time: 64 events × 64 bytes = 4 KiB of copies. |
+| `POLICY_TIMEOUT_TICKS` (policy upcall) | 100 (1 s at 100 Hz) | [src/policy/mod.rs](../src/policy/mod.rs) | How long a task blocks waiting for the policy service before the query expires. Short enough that a hung policy service surfaces as denials quickly; long enough that a loaded service answers in time. Expiry is a Deny, never an Allow (ADR-006 § Divergence 2026-10-28). |
+| `POLICY_UPCALL_ATTEMPTS` (policy upcall) | 3 | [src/policy/mod.rs](../src/policy/mod.rs) | Re-submissions of an expired query before `policy_check` denies — latency bound (3 s worst case) vs. tolerance of a late or lost answer. One query per task is in flight at a time, so the bound multiplies wait, not table load. Set after a single expiry killed terminal-window on the Dell 3630 (2026-10-29). `retried` in the `[sched]` line is the measurement; non-zero on a healthy system means answers arrive late. |
 | `AUDIT_IPC_SAMPLE_RATE` | 100 | [src/audit/mod.rs:393](../src/audit/mod.rs) | IPC send/recv sampling: emit 1 audit event per 100 operations. At ~1000 IPC/sec, produces ~10 events/sec — informative for pattern detection without flooding. |
 | `SCALE` (fbcon) | 2 | [src/io/fbcon.rs](../src/io/fbcon.rs) | Integer scale of the 8×8 face: 2 → 16×16 cells, ~80 columns on 1280 px / ~120 on 1920 px. Legibility at a desk vs. columns per line; 1 is unreadable on 4K, 3 wastes a 1024 px panel. |
 | `SCROLL_DIVISOR` (fbcon) | 4 | [src/io/fbcon.rs](../src/io/fbcon.rs) | Rows scrolled per scroll event = visible rows / 4. The console never reads the framebuffer (uncached memory reads are slow), so a scroll re-renders the whole grid; a quarter-screen block amortizes one full redraw over ~12–16 lines instead of one per line. |
