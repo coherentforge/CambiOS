@@ -12,7 +12,7 @@
 #
 # Endpoint map (kernel MAX_ENDPOINTS = 64; 0 = REPLY_ENDPOINT sentinel,
 # unusable; 1 = init):
-#   14/15 terminal-window back/front   24/25/26 virtio-blk client/
+#   15 terminal-window   24/25/26 block driver (virtio-blk | nvme) client/
 #   16 fs-service                               kernel-reply/kernel-cmd
 #   17 key-store-service               27 scanout driver
 #   18 shell                           28 compositor
@@ -94,6 +94,21 @@ depends_on = ["key-store-service"]
 name = "virtio-blk"
 syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "port-io", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
 endpoints = [24, 25, 26]
+# One block driver serves the seam (endpoints 24/25/26) per image; the
+# profile picks it. virtio-blk is QEMU's; the bare-metal profiles spawn
+# nvme. Everything above the seam depends on endpoint 26, not a name.
+profile = ["default"]
+
+# NVMe block driver — the same IPC seam as virtio-blk (`cambios-blk-proto`),
+# for the Dell 3630 and any machine whose disk is NVMe. x86_64 only until
+# an aarch64/riscv64 board with NVMe is a target (then add the arch and
+# the Makefile staging for it).
+[[service]]
+name = "nvme"
+syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
+endpoints = [24, 25, 26]
+profile = ["headless", "framebuffer-fallback"]
+arch = ["x86_64"]
 
 [[service]]
 name = "fde-mount"
@@ -103,7 +118,10 @@ endpoints = [32]
 # (replaces the bootstrap-equality check those handlers used pre-cutover).
 system = ["unlock-volume"]
 lifetime = "one-shot"
-depends_on = ["virtio-blk", "key-store-service"]
+# Depends on whichever block driver the profile spawns (endpoint 26),
+# not on virtio-blk by name — nvme serves the same seam on bare metal.
+depends_on = ["key-store-service"]
+depends_on_endpoints = [26]
 
 # --- network -------------------------------------------------------------------
 
@@ -157,7 +175,7 @@ profile = ["default"]
 [[service]]
 name = "terminal-window"
 syscalls = ["channel-attach", "channel-close", "console-read", "exit", "get-pid", "get-principal", "get-time", "get-wallclock", "print", "recv-msg", "register-endpoint", "set-wallclock", "spawn", "try-recv-msg", "wait-task", "write", "yield"]
-endpoints = [14, 15]
+endpoints = [15]
 system = ["create-process", "set-wallclock"]
 depends_on = ["compositor"]
 arch = ["x86_64", "aarch64"]

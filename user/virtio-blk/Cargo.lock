@@ -7,6 +7,10 @@ name = "cambios-abi"
 version = "0.1.0"
 
 [[package]]
+name = "cambios-blk-proto"
+version = "0.1.0"
+
+[[package]]
 name = "cambios-libipc"
 version = "0.1.0"
 dependencies = [
@@ -36,6 +40,7 @@ version = "0.1.0"
 name = "cambios-virtio-blk"
 version = "0.1.0"
 dependencies = [
+ "cambios-blk-proto",
  "cambios-libipc",
  "cambios-libsys",
  "cambios-libsys-rt",

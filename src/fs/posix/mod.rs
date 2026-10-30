@@ -8,7 +8,7 @@
 //! to [`crate::fs::disk`] (the CambiObject backend); both are generic
 //! over the [`crate::fs::block::BlockDevice`] trait so the format is
 //! exercisable against `MemBlockDevice` in unit tests and against
-//! `VirtioBlkDevice` at runtime.
+//! `BlockDriverClient` at runtime.
 //!
 //! ## Structure
 //!
@@ -35,7 +35,6 @@
 extern crate alloc;
 
 use alloc::collections::BTreeSet;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use cambios_abi::{
@@ -772,7 +771,7 @@ fn apply_bitmap_mutations(
 
 /// POSIX file storage backend. Generic over `B: BlockDevice` so the
 /// format is exercisable against `MemBlockDevice` in tests and against
-/// `VirtioBlkDevice` at runtime.
+/// `BlockDriverClient` at runtime.
 ///
 /// Commit 4B added the inode-region scan to `mount()`; commit 4C added
 /// `get_inode()`. Commit 5C-ii (this commit) adds the in-memory
@@ -975,27 +974,24 @@ impl<B: BlockDevice> PosixFsBackend<B> {
         }
 
         // -- Journal replay ---------------------------------------
-        // Load the entire journal region into memory. 16 MiB; the
-        // kernel-singleton wire-up (step 6+) will replace this with
-        // a `FrameAllocator::allocate_contiguous` allocation
-        // HHDM-mapped from the boot frame pool. Tests use Vec.
-        let mut journal_buf = vec![0u8; JOURNAL_BYTES as usize];
-        let mut block_buf = [0u8; BLOCK_SIZE];
-        for i in 0..JOURNAL_BLOCKS {
-            device.read_block(sb.journal_region_lba + i, &mut block_buf)?;
-            let start = (i as usize) * BLOCK_SIZE;
-            journal_buf[start..start + BLOCK_SIZE].copy_from_slice(&block_buf);
-        }
-
+        // Replay the journal two blocks at a time; the 16 MiB region is
+        // never loaded whole (same streaming cursor the DiskObjectStore
+        // mount uses — a kernel heap of 4 MiB cannot hold it).
         let mut journal = Journal::from_disk_state(
             JOURNAL_BYTES,
             sb.last_checkpoint_offset,
             0, // head reconstructed by replay
         )?;
         let mut bitmap = BlockBitmap::new_all_free(sb.capacity_blocks);
-        journal.replay_from_checkpoint(&journal_buf, |rec| {
-            apply_bitmap_mutations(&mut bitmap, rec)
-        })?;
+        let journal_region_lba = sb.journal_region_lba;
+        journal.replay_from_checkpoint_blocks(
+            |idx, buf| {
+                device
+                    .read_block(journal_region_lba + idx, buf)
+                    .map_err(|_| JournalError::DeviceError)
+            },
+            |rec| apply_bitmap_mutations(&mut bitmap, rec),
+        )?;
 
         // -- Defense-in-depth bitmap cross-check ------------------
         // Compare the journal-reconstructed bitmap against the

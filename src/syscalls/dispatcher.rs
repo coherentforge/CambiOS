@@ -161,10 +161,8 @@ impl core::fmt::Display for Latin1<'_> {
 }
 
 fn kernel_origin_endpoint(endpoint_id: u32) -> bool {
-    /// ARCHITECTURAL: endpoint 26 is the virtio-blk kernel-command slot
-    /// in the CambiOS IPC number-space.
-    const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
-    endpoint_id == BLK_KERNEL_CMD_ENDPOINT || endpoint_id == crate::policy::POLICY_QUERY_ENDPOINT
+    endpoint_id == cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT
+        || endpoint_id == crate::policy::POLICY_QUERY_ENDPOINT
 }
 
 impl SyscallDispatcher {
@@ -422,7 +420,7 @@ impl SyscallDispatcher {
         // skip the capability check and land in SHARDED_IPC. The kernel is
         // the only consumer; trust is by endpoint choice (mirror of the
         // POLICY_RESP_ENDPOINT pattern below). Note: NO scheduler wake —
-        // `VirtioBlkDevice::call` polls for the reply on the same endpoint
+        // `BlockDriverClient::call` polls for the reply on the same endpoint
         // after its wake-driver send, so an extra wake here is redundant
         // and (empirically) provokes a subtle interaction that stalls the
         // driver's own virtqueue self-test. The blocked kernel task on
@@ -3801,13 +3799,13 @@ impl SyscallDispatcher {
     /// before any volume layer has authenticated them, so it must
     /// be tightly scoped.
     ///
-    /// Lock ordering: none directly. `VirtioBlkDevice::call`
+    /// Lock ordering: none directly. `BlockDriverClient::call`
     /// yields the calling task via `yield_save_and_switch` while
     /// waiting for the virtio-blk driver's reply — no kernel locks
     /// are held across the yield.
     ///
     /// Gated `#[cfg(not(test))]` because the kernel-side
-    /// `crate::fs::virtio_blk_device` module is itself gated out of
+    /// `crate::fs::block_driver_client` module is itself gated out of
     /// host test builds (see `src/fs/mod.rs`). The matching
     /// `#[cfg(test)]` stub below returns `Enosys`, so host syscall
     /// tests that route to dispatcher don't break.
@@ -3817,7 +3815,7 @@ impl SyscallDispatcher {
         ctx: &SyscallContext,
     ) -> SyscallResult {
         use crate::fs::block::{BLOCK_SIZE, Block, BlockDevice};
-        use crate::fs::virtio_blk_device::VirtioBlkDevice;
+        use crate::fs::block_driver_client::BlockDriverClient;
 
         /// HARDWARE: ADR-032 § 4 reserves LBA 0..=3 (4 × 4 KiB = 16 KiB)
         /// for the volume header, even when the header_length field
@@ -3861,7 +3859,7 @@ impl SyscallDispatcher {
         // Open the virtio-blk kernel-cmd channel. Per the
         // `lazy_disk` precedent, we do this without holding any
         // kernel locks (the IPC dance yields).
-        let mut device = VirtioBlkDevice::new();
+        let mut device = BlockDriverClient::new();
         if device.ensure_handshake().is_err() {
             return Err(SyscallError::Enosys);
         }
@@ -3890,7 +3888,7 @@ impl SyscallDispatcher {
 
     /// Test-mode stub for `handle_read_volume_header`.
     ///
-    /// The kernel-side `crate::fs::virtio_blk_device` module is gated
+    /// The kernel-side `crate::fs::block_driver_client` module is gated
     /// out of host test builds (`#[cfg(not(test))]` on its declaration
     /// in `src/fs/mod.rs`) because the real adapter speaks IPC to the
     /// user-space virtio-blk driver — a runtime that doesn't exist
@@ -3906,7 +3904,7 @@ impl SyscallDispatcher {
 
     /// SYS_INSTALL_MASTER_KEY (75): receive the 64-byte XTS-AES-256
     /// FDE master key from `fde-mount` and install the
-    /// `DiskObjectStore<EncryptedBlockDevice<VirtioBlkDevice>>` as
+    /// `DiskObjectStore<EncryptedBlockDevice<BlockDriverClient>>` as
     /// the kernel's persistent ObjectStore backend. Stream A
     /// substage A-v.d per ADR-032 § Architecture.
     ///
@@ -3924,7 +3922,7 @@ impl SyscallDispatcher {
     /// after a successful install also fail.
     ///
     /// Lock ordering: acquires `OBJECT_STORE(10)` at the end to
-    /// install; `VirtioBlkDevice::ensure_handshake` and
+    /// install; `BlockDriverClient::ensure_handshake` and
     /// `DiskObjectStore::open_or_format` both yield (IPC + page-
     /// walk), so the lock is *not* held across either. Same
     /// pattern as `lazy_disk::ensure_disk_store` had.
@@ -3945,7 +3943,7 @@ impl SyscallDispatcher {
             EncryptedBlockDevice, XTS_MASTER_KEY_LEN,
         };
         use crate::fs::disk::DiskObjectStore;
-        use crate::fs::virtio_blk_device::VirtioBlkDevice;
+        use crate::fs::block_driver_client::BlockDriverClient;
 
         /// HARDWARE: ADR-032 § 4 reserves LBA 0..=3 (16 KiB) on the
         /// raw disk for the unencrypted, signed volume header. The
@@ -3996,7 +3994,7 @@ impl SyscallDispatcher {
 
         // Construct the inner virtio-blk device + handshake. No
         // kernel locks held; the IPC dance yields.
-        let mut device = VirtioBlkDevice::new();
+        let mut device = BlockDriverClient::new();
         if device.ensure_handshake().is_err() {
             Self::zeroize_master(&mut master_key);
             return Err(SyscallError::Enosys);
@@ -4081,7 +4079,7 @@ impl SyscallDispatcher {
     }
 
     /// Test-mode stub for `handle_install_master_key`. The kernel-
-    /// side `crate::fs::virtio_blk_device` module is gated out of
+    /// side `crate::fs::block_driver_client` module is gated out of
     /// host test builds (`#[cfg(not(test))]` on its declaration in
     /// `src/fs/mod.rs`); returning `Enosys` matches the no-virtio-blk
     /// behavior real callers see.

@@ -20,7 +20,7 @@
 //!      (stream A A-v.a).
 //!   2. `SYS_INSTALL_MASTER_KEY` (A-v.d) hands the 64-byte master
 //!      to the kernel; the kernel constructs
-//!      `EncryptedBlockDevice<VirtioBlkDevice>` and installs it as
+//!      `EncryptedBlockDevice<BlockDriverClient>` and installs it as
 //!      STORAGE's data device.
 //!   3. All substrate I/O flows through the wrapper from that point
 //!      forward. The header region (LBA 0..=3) is read raw via

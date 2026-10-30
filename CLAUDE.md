@@ -288,7 +288,8 @@ make run-aarch64                 # AArch64 (FAT image)
 make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only
 make img-aarch64                 # AArch64 FAT image only
-make disk-img                    # 64 MiB raw backing for virtio-blk (idempotent; `make run` depends on it)
+make disk-img                    # 64 MiB raw backing for the block driver (idempotent; `make run` depends on it)
+make run-quiet DISK_BUS=nvme     # same disk image behind a QEMU NVMe controller instead of virtio-blk-pci (also `run-img-usb DISK_BUS=nvme PROFILE=headless`, the bare-metal rehearsal: the headless/framebuffer-fallback profiles spawn `user/nvme`, `default` spawns virtio-blk; both serve the block seam in `cambios-blk-proto`)
 make img-usb [PROFILE=headless]  # bare-metal USB image: iso_root + the signed manifest for PROFILE (headless = text shell on the framebuffer console; framebuffer-fallback = scanout-limine + compositor + terminal-window, keyboard via usb-host HID). `make usb DEVICE=/dev/diskN PROFILE=…` writes it.
 make usb DEVICE=/dev/diskN PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-hold   # diagnostic stick for a machine with no serial: the kernel text console keeps mirroring over the scanout driver after the handoff, so the boot log (policy denials, `[sched]` counters, service lines) stays readable on the panel when the GUI chain fails silently. Garbled by design; never ship it.
 
@@ -473,7 +474,7 @@ Run `tree -L 2 src/ user/ tools/` for the current layout; file names and purpose
 
 - **`build.rs`** reads `CAMBIOS_TIER` (default `tier3`) and emits `--cfg tierN` for `src/config/tier.rs`. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) / [ADR-009](docs/adr/009-purpose-tiers-scope.md).
 - **Arch split:** portable modules (`scheduler/`, `ipc/`, `process.rs`, `loader/elf.rs`, `memory/buddy_allocator.rs` + `frame_allocator.rs`, `syscalls/mod.rs`) contain no arch-specific code. All arch backends live under `src/arch/<target>/`. `src/arch/mod.rs` is the cfg-gated shim.
-- **Service endpoints (load-bearing numbers):** init=1 (ADR-018 readiness pings; the manifest reserves every listed entry's endpoints to its derived AID — services AND on-demand apps: tree=61, worm=62, sprouty=63, ping=19, hello-window=29 — and init spawns the service set; the kernel auto-starts nothing), fs-service=16, key-store-service=17, virtio-net=20, udp-stack=21, virtio-blk=24 (user clients, `recv_verified`) + 26 (kernel-only commands, `recv_msg`, no cap check) + 25 (kernel's reply endpoint, `handle_write` intercept), scanout-virtio-gpu=27, compositor=28, compositor-input=30. Endpoint 0 is the REPLY_ENDPOINT "unset" sentinel — structurally unusable.
+- **Service endpoints (load-bearing numbers):** init=1 (ADR-018 readiness pings; the manifest reserves every listed entry's endpoints to its derived AID — services AND on-demand apps: tree=61, worm=62, sprouty=63, ping=19, hello-window=29 — and init spawns the service set; the kernel auto-starts nothing), fs-service=16, key-store-service=17, virtio-net=20, udp-stack=21, block driver (virtio-blk in the `default` profile, nvme in the bare-metal profiles; the seam is `cambios-blk-proto`)=24 (user clients, `recv_verified`) + 26 (kernel-only commands, `recv_msg`, no cap check) + 25 (kernel's reply endpoint, `handle_write` intercept), scanout-virtio-gpu=27, compositor=28, compositor-input=30. Endpoint 0 is the REPLY_ENDPOINT "unset" sentinel — structurally unusable.
 - **`tools/sign-elf/`** — host-side Ed25519 ELF signer (YubiKey or seed), produces the ARCSIG trailer. Own `.cargo/config.toml` targeting `aarch64-apple-darwin`.
 
 ## Key Technical Details

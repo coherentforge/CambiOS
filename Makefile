@@ -43,6 +43,8 @@ NET_DRIVER_DIR := user/virtio-net
 NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-net
 BLK_DRIVER_DIR := user/virtio-blk
 BLK_DRIVER_ELF := $(BLK_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-blk
+NVME_DIR := user/nvme
+NVME_ELF := $(NVME_DIR)/target/x86_64-unknown-none/release/cambios-nvme
 USB_HOST_DIR := user/usb-host
 USB_HOST_ELF := $(USB_HOST_DIR)/target/x86_64-unknown-none/release/cambios-usb-host
 CCID_DIR := user/ccid
@@ -209,7 +211,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk nvme virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -271,6 +273,14 @@ virtio-net:
 virtio-blk:
 	@echo "=== Building Virtio-Blk driver ==="
 	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build --release
+
+# NVMe block driver — same IPC seam as virtio-blk; spawned by the
+# bare-metal manifest profiles (headless / framebuffer-fallback).
+nvme:
+	@echo "=== Building NVMe driver ==="
+	cd $(NVME_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== Virtio-Blk driver ready ==="
@@ -882,7 +892,7 @@ iso-dev-piv: kernel-dev-piv key-store-service-dev-piv gen-dev-piv-keys format-vo
 	@echo "=== Re-assembling ISO with --features dev-piv binaries ==="
 	$(MAKE) --assume-old=kernel --assume-old=key-store-service SIGN_MODE=dev-piv iso
 
-iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-input usb-host ccid shell policy-service init manifest compositor scanout-virtio-gpu scanout-limine hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount sign-tool limine
+iso: kernel fs-service key-store-service virtio-blk nvme virtio-net udp-stack virtio-input usb-host ccid shell policy-service init manifest compositor scanout-virtio-gpu scanout-limine hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -902,6 +912,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
 	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
 	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
+	cp $(NVME_ELF) iso_root/boot/nvme.elf
 	cp $(USB_HOST_ELF) iso_root/boot/usb-host.elf
 	cp $(CCID_ELF) iso_root/boot/ccid.elf
 	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
@@ -932,6 +943,7 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
+	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/nvme.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/usb-host.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/ccid.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
@@ -977,6 +989,18 @@ iso: kernel fs-service key-store-service virtio-blk virtio-net udp-stack virtio-
 # room to grow. The image file persists across `make run` invocations, which
 # is the whole point — reboot-cycle testing needs the bytes to survive.
 DISK_IMG := cambios-disk.img
+
+# Which QEMU bus carries the disk: `virtio` (virtio-blk-pci, served by the
+# virtio-blk driver in the `default` manifest profile) or `nvme` (an NVMe
+# controller, served by the nvme driver in the bare-metal profiles —
+# `make run-img-usb DISK_BUS=nvme PROFILE=headless` is the QEMU rehearsal
+# for the Dell 3630's drive).
+DISK_BUS ?= virtio
+ifeq ($(DISK_BUS),nvme)
+DISK_DEVICE_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 -device nvme,serial=cambios0,drive=cambios-disk0
+else
+DISK_DEVICE_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 -device virtio-blk-pci,drive=cambios-disk0
+endif
 DISK_SIZE_MB := 64
 
 disk-img:
@@ -1039,8 +1063,7 @@ run-quiet: iso disk-img
 			-m 4G \
 			-netdev user,id=net0 \
 			-device virtio-net-pci,netdev=net0 \
-			-drive file=$(DISK_IMG),if=none,format=raw,id=cambios-disk0 \
-			-device virtio-blk-pci,drive=cambios-disk0 \
+			$(DISK_DEVICE_ARGS) \
 			-device qemu-xhci,id=xhci0 \
 			-device usb-ccid,bus=xhci0.0 \
 			-vga virtio \
@@ -1212,7 +1235,7 @@ img-usb: img-x86
 	@echo "Write to USB:    make usb DEVICE=/dev/diskN"
 
 # Test the GPT image in QEMU UEFI (validates before writing to USB)
-run-img-usb: img-usb
+run-img-usb: img-usb disk-img
 	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
 		-drive file=$(IMG_USB),format=raw \
@@ -1223,6 +1246,7 @@ run-img-usb: img-usb
 		-m 4G \
 		-netdev user,id=net0 \
 		-device virtio-net-pci,netdev=net0 \
+		$(DISK_DEVICE_ARGS) \
 		-no-reboot
 
 # Write the GPT image to a USB stick (with safety prompt).

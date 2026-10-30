@@ -94,6 +94,9 @@ pub enum JournalError {
     /// expected internal structure (wrong size, bad enum discriminant,
     /// non-zero reserved bytes).
     MalformedPayload,
+    /// The block reader handed to a streaming replay failed; the
+    /// device error is reported by the caller's own layer.
+    DeviceError,
 }
 
 impl From<BitmapError> for JournalError {
@@ -1052,6 +1055,84 @@ mod tests {
         disk
     }
 
+    /// Replay through the block cursor over the same in-memory region,
+    /// so the two cursors can be compared record for record.
+    fn replay_blocks(j: &mut super::Journal, disk: &[u8]) -> alloc::vec::Vec<JournalRecord> {
+        let mut seen = alloc::vec::Vec::new();
+        j.replay_from_checkpoint_blocks(
+            |idx, buf| {
+                let start = idx as usize * super::REPLAY_BLOCK_BYTES;
+                let end = core::cmp::min(start + super::REPLAY_BLOCK_BYTES, disk.len());
+                buf.fill(0);
+                buf[..end - start].copy_from_slice(&disk[start..end]);
+                Ok(())
+            },
+            |r| {
+                seen.push(r.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        seen
+    }
+
+    #[test]
+    fn block_replay_matches_slice_replay_no_wrap() {
+        let records = alloc::vec![
+            JournalRecord::InodeAllocate { inode: InodeId::new(1) },
+            JournalRecord::Checkpoint { tick: 3 },
+            JournalRecord::InodeFree { inode: InodeId::new(1) },
+        ];
+        let mut writer = small_journal();
+        let disk = simulate_writes(&mut writer, &records);
+        let mut a = small_journal();
+        let mut seen_slice = alloc::vec::Vec::new();
+        a.replay_from_checkpoint(&disk, |r| {
+            seen_slice.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        let mut b = small_journal();
+        let seen_blocks = replay_blocks(&mut b, &disk);
+        assert_eq!(seen_slice, seen_blocks);
+        assert_eq!(a.head_offset(), b.head_offset());
+    }
+
+    #[test]
+    fn block_replay_matches_slice_replay_across_wrap_and_block_edges() {
+        // Enough records to cross several 4 KiB block boundaries and
+        // wrap the region, so records straddle window edges.
+        let mut records = alloc::vec::Vec::new();
+        for i in 0..600u64 {
+            records.push(JournalRecord::InodeAllocate { inode: InodeId::new(i) });
+        }
+        let mut writer = super::Journal::new(3 * super::REPLAY_BLOCK_BYTES as u64).unwrap();
+        let disk = simulate_writes(&mut writer, &records);
+        let mut a = super::Journal::new(3 * super::REPLAY_BLOCK_BYTES as u64).unwrap();
+        let mut seen_slice = alloc::vec::Vec::new();
+        a.replay_from_checkpoint(&disk, |r| {
+            seen_slice.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        let mut b = super::Journal::new(3 * super::REPLAY_BLOCK_BYTES as u64).unwrap();
+        let seen_blocks = replay_blocks(&mut b, &disk);
+        assert_eq!(seen_slice, seen_blocks);
+        assert_eq!(a.head_offset(), b.head_offset());
+        assert!(!seen_slice.is_empty());
+    }
+
+    #[test]
+    fn records_larger_than_a_block_are_refused() {
+        let mut forged = alloc::vec![0u8; super::MAX_RECORD_BYTES + 64];
+        forged[0] = super::KIND_CHECKPOINT;
+        forged[1] = super::RECORD_FORMAT_VERSION;
+        let too_big = (super::MAX_RECORD_BYTES as u16).to_le_bytes();
+        forged[2] = too_big[0];
+        forged[3] = too_big[1];
+        assert_eq!(super::decode_record(&forged).unwrap_err(), JournalError::MalformedPayload);
+    }
+
     #[test]
     fn replay_from_checkpoint_no_wrap() {
         let records = alloc::vec![
@@ -1265,6 +1346,20 @@ pub const RECORD_CHECKSUM_BYTES: usize = 8;
 /// changes.
 pub const RECORD_FORMAT_VERSION: u8 = 1;
 
+/// ARCHITECTURAL: an encoded record (header + payload + checksum) fits in
+/// one 4 KiB block. The encoder refuses larger records and the decoder
+/// rejects them, so a streaming replay that holds two consecutive blocks
+/// always sees a whole record wherever it starts — the journal region
+/// (16 MiB) is never loaded into kernel memory at mount (the 4 MiB kernel
+/// heap could not hold it; 2026-10-30).
+pub const MAX_RECORD_BYTES: usize = 4096;
+
+/// The block size a streaming replay reads the region in. Pinned to the
+/// store's block so the journal-region LBA arithmetic is one-to-one.
+pub const REPLAY_BLOCK_BYTES: usize = 4096;
+const _: () = assert!(REPLAY_BLOCK_BYTES == super::block::BLOCK_SIZE);
+const _: () = assert!(MAX_RECORD_BYTES <= REPLAY_BLOCK_BYTES);
+
 // Kind discriminants. Non-zero so a blank journal region (all 0x00)
 // never accidentally decodes as a valid record. Values match the
 // JournalRecord variant order; `Checkpoint` and `Pad` use distinct
@@ -1308,6 +1403,9 @@ pub fn encode_record(rec: &JournalRecord) -> Result<Vec<u8>, JournalError> {
         .try_into()
         .map_err(|_| JournalError::PayloadTooLarge)?;
 
+    if RECORD_HEADER_BYTES + payload.len() + RECORD_CHECKSUM_BYTES > MAX_RECORD_BYTES {
+        return Err(JournalError::PayloadTooLarge);
+    }
     let mut record = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len() + RECORD_CHECKSUM_BYTES);
     record.push(kind);
     record.push(RECORD_FORMAT_VERSION);
@@ -1501,6 +1599,9 @@ pub fn decode_record(buf: &[u8]) -> Result<(JournalRecord, usize), JournalError>
     }
     let payload_size = u16::from_le_bytes([buf[2], buf[3]]) as usize;
     let total = RECORD_HEADER_BYTES + payload_size + RECORD_CHECKSUM_BYTES;
+    if total > MAX_RECORD_BYTES {
+        return Err(JournalError::MalformedPayload);
+    }
     if buf.len() < total {
         return Err(JournalError::BufferTooShort);
     }
@@ -1814,6 +1915,128 @@ impl Iterator for JournalRecordCursor<'_> {
     }
 }
 
+/// What `Journal::replay_with` needs from a record stream: the next
+/// record, the current offset, and a restart at the region start after
+/// a wrap pad. Implemented by the slice cursor (tests, in-memory
+/// regions) and the block cursor (mount, reading the device two blocks
+/// at a time).
+trait RecordSource {
+    fn next_record(&mut self) -> Option<Result<JournalRecord, JournalError>>;
+    fn offset(&self) -> usize;
+    fn restart(&mut self);
+}
+
+impl RecordSource for JournalRecordCursor<'_> {
+    fn next_record(&mut self) -> Option<Result<JournalRecord, JournalError>> {
+        self.next()
+    }
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn restart(&mut self) {
+        self.offset = 0;
+        self.stopped = false;
+    }
+}
+
+/// Record cursor over a journal region read block by block through
+/// `read_block(region_block_index, buf)`. Holds a two-block window
+/// (8 KiB) so a record starting anywhere in a block is fully visible
+/// (`MAX_RECORD_BYTES` ≤ one block); the region itself is never loaded
+/// whole. Blocks are read on demand and re-read only when the window
+/// moves, so a replay costs one device read per block touched.
+pub struct BlockRecordCursor<R> {
+    read_block: R,
+    region_bytes: usize,
+    offset: usize,
+    stopped: bool,
+    window: Vec<u8>,
+    /// Region block index of `window[0..REPLAY_BLOCK_BYTES]`, once loaded.
+    window_first: Option<usize>,
+}
+
+impl<R> BlockRecordCursor<R>
+where
+    R: FnMut(u64, &mut [u8; REPLAY_BLOCK_BYTES]) -> Result<(), JournalError>,
+{
+    pub fn new(read_block: R, region_bytes: usize, start_offset: usize) -> Self {
+        Self {
+            read_block,
+            region_bytes,
+            offset: start_offset,
+            stopped: false,
+            window: alloc::vec![0u8; 2 * REPLAY_BLOCK_BYTES],
+            window_first: None,
+        }
+    }
+
+    /// Make the window start at the block containing `offset`; the
+    /// second block is loaded too when it exists, else left zero (blank).
+    fn ensure_window(&mut self, offset: usize) -> Result<(), JournalError> {
+        let first = offset / REPLAY_BLOCK_BYTES;
+        if self.window_first == Some(first) {
+            return Ok(());
+        }
+        let total_blocks = self.region_bytes.div_ceil(REPLAY_BLOCK_BYTES);
+        for k in 0..2 {
+            let idx = first + k;
+            let dst_start = k * REPLAY_BLOCK_BYTES;
+            let dst: &mut [u8; REPLAY_BLOCK_BYTES] = (&mut self.window[dst_start..dst_start + REPLAY_BLOCK_BYTES])
+                .try_into()
+                .map_err(|_| JournalError::MalformedPayload)?;
+            if idx < total_blocks {
+                (self.read_block)(idx as u64, dst)?;
+            } else {
+                dst.fill(0);
+            }
+        }
+        self.window_first = Some(first);
+        Ok(())
+    }
+}
+
+impl<R> RecordSource for BlockRecordCursor<R>
+where
+    R: FnMut(u64, &mut [u8; REPLAY_BLOCK_BYTES]) -> Result<(), JournalError>,
+{
+    fn next_record(&mut self) -> Option<Result<JournalRecord, JournalError>> {
+        if self.stopped || self.offset >= self.region_bytes {
+            return None;
+        }
+        if let Err(e) = self.ensure_window(self.offset) {
+            self.stopped = true;
+            return Some(Err(e));
+        }
+        let first = self.window_first.unwrap_or(0);
+        let rel = self.offset - first * REPLAY_BLOCK_BYTES;
+        let avail = core::cmp::min(2 * REPLAY_BLOCK_BYTES - rel, self.region_bytes - self.offset);
+        let remaining = &self.window[rel..rel + avail];
+        // Same contract as the slice cursor: a zero kind byte is blank
+        // space — stop without error.
+        if remaining[0] == 0 {
+            self.stopped = true;
+            return None;
+        }
+        match decode_record(remaining) {
+            Ok((rec, consumed)) => {
+                self.offset += consumed;
+                Some(Ok(rec))
+            }
+            Err(e) => {
+                self.stopped = true;
+                Some(Err(e))
+            }
+        }
+    }
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn restart(&mut self) {
+        self.offset = 0;
+        self.stopped = false;
+    }
+}
+
 /// Replay all records starting at `start_offset` in `bytes`, calling
 /// `callback` for each. Returns the byte offset where iteration
 /// stopped — i.e., the offset of the first un-applied byte (either
@@ -2080,7 +2303,7 @@ impl Journal {
     pub fn replay_from_checkpoint<F>(
         &mut self,
         region_bytes: &[u8],
-        mut callback: F,
+        callback: F,
     ) -> Result<(), JournalError>
     where
         F: FnMut(&JournalRecord) -> Result<(), JournalError>,
@@ -2090,6 +2313,31 @@ impl Journal {
         }
         let start = self.last_checkpoint_offset as usize;
         let mut cursor = JournalRecordCursor::new(region_bytes, start);
+        self.replay_with(&mut cursor, callback)
+    }
+
+    /// `replay_from_checkpoint` over a region read from the device two
+    /// blocks at a time (`read_block(region_block_index, buf)`), for
+    /// mount paths that must not hold the whole region in memory.
+    pub fn replay_from_checkpoint_blocks<R, F>(
+        &mut self,
+        read_block: R,
+        callback: F,
+    ) -> Result<(), JournalError>
+    where
+        R: FnMut(u64, &mut [u8; REPLAY_BLOCK_BYTES]) -> Result<(), JournalError>,
+        F: FnMut(&JournalRecord) -> Result<(), JournalError>,
+    {
+        let start = self.last_checkpoint_offset as usize;
+        let mut cursor = BlockRecordCursor::new(read_block, self.region_bytes as usize, start);
+        self.replay_with(&mut cursor, callback)
+    }
+
+    fn replay_with<S, F>(&mut self, cursor: &mut S, mut callback: F) -> Result<(), JournalError>
+    where
+        S: RecordSource,
+        F: FnMut(&JournalRecord) -> Result<(), JournalError>,
+    {
         let mut wrapped = false;
 
         loop {
@@ -2102,7 +2350,7 @@ impl Journal {
             {
                 break;
             }
-            match cursor.next() {
+            match cursor.next_record() {
                 None => break,
                 Some(Err(e)) => return Err(e),
                 Some(Ok(JournalRecord::Pad { .. })) => {
@@ -2112,7 +2360,7 @@ impl Journal {
                         break;
                     }
                     wrapped = true;
-                    cursor = JournalRecordCursor::new(region_bytes, 0);
+                    cursor.restart();
                 }
                 Some(Ok(rec)) => {
                     callback(&rec)?;

@@ -53,6 +53,7 @@ dependencies = [
  "bitflags 2.11.0",
  "blake3",
  "cambios-abi",
+ "cambios-blk-proto",
  "cambios-fde-proto",
  "cambios-manifest",
  "ed25519-compact",
@@ -63,6 +64,10 @@ dependencies = [
 
 [[package]]
 name = "cambios-abi"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-blk-proto"
 version = "0.1.0"
 
 [[package]]

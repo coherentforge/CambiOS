@@ -2144,7 +2144,7 @@ const fn parse_bootstrap_aid_prefix_v1(raw: &[u8]) -> [u8; 2] {
 /// first write will trigger the init.
 ///
 /// Lock ordering position: 9 (OBJECT_STORE). No hierarchy violation when
-/// calling into `VirtioBlkDevice::call` under this lock — the device uses
+/// calling into `BlockDriverClient::call` under this lock — the device uses
 /// `SHARDED_IPC` (per-endpoint shard locks, outside the main hierarchy)
 /// and `PER_CPU_SCHEDULER` (per-CPU, no cycle with OBJECT_STORE since
 /// scheduler / ISR code never acquires OBJECT_STORE).

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Kernel-side virtio-blk adapter — implements `BlockDevice` by speaking to
-//! the user-space `user/virtio-blk` driver over IPC.
+//! Kernel-side client of the block-driver IPC seam — implements
+//! `BlockDevice` by speaking to whichever user-space block driver the
+//! manifest profile spawned (virtio-blk under QEMU, nvme on the Dell,
+//! ahci on SATA machines). The seam's bytes are `cambios-blk-proto`.
 //!
-//! ## Protocol (mirrors `user/virtio-blk/src/main.rs`)
+//! ## Protocol
 //!
-//! The driver owns the virtio-blk PCI device and the DMA bounce buffers.
+//! The driver owns the PCI device and the DMA bounce buffers.
 //! The kernel delegates every disk I/O by sending a small command message
 //! on endpoint 26 (`BLK_KERNEL_CMD_ENDPOINT`). Bulk data flows through a
 //! single 4-KiB DMA page that the driver allocates once (at HANDSHAKE) and
@@ -26,44 +28,40 @@
 //!
 //! ## Lock ordering
 //!
-//! `VirtioBlkDevice` itself uses no internal lock. It is held behind the
-//! global `VIRTIO_BLK_DEVICE` spinlock (position 10, below `OBJECT_STORE`).
+//! `BlockDriverClient` itself uses no internal lock. It is held behind the
+//! global `BLOCK_DRIVER_CLIENT` spinlock (position 10, below `OBJECT_STORE`).
 //! Callers MUST NOT hold `OBJECT_STORE` across a call into this module —
 //! the plan/execute decomposition in `DiskObjectStore` is the enforcement
 //! point.
 
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
 use crate::ipc::{EndpointId, Message};
+use cambios_blk_proto::{
+    BLK_KERNEL_CMD_ENDPOINT, BLK_KERNEL_RESP_ENDPOINT, KCMD_CAPACITY, KCMD_FLUSH,
+    KCMD_HANDSHAKE, KCMD_READ_BLOCK, KCMD_WRITE_BLOCK, STATUS_OK,
+};
 
-/// Endpoint IDs — MUST match `user/virtio-blk/src/main.rs`.
-const BLK_KERNEL_RESP_ENDPOINT: u32 = 25;
-const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
+/// Sector size on the wire (always 512; `cambios_blk_proto::SECTOR_SIZE`).
+const VIRTIO_BLK_SECTOR_SIZE: u64 = cambios_blk_proto::SECTOR_SIZE as u64;
 
-/// Kernel-only commands on endpoint 26.
-const KCMD_HANDSHAKE: u8 = 1;
-const KCMD_READ_BLOCK: u8 = 2;
-const KCMD_WRITE_BLOCK: u8 = 3;
-const KCMD_FLUSH: u8 = 4;
-const KCMD_CAPACITY: u8 = 5;
+/// TUNING: wall-clock budget for one block request (command sent, reply
+/// read) — 5 s at 100 Hz. A healthy device answers in microseconds to
+/// milliseconds; QEMU's NVMe model completes asynchronously and under TCG
+/// a round trip can take tens of ms. The wait is measured in ticks, not
+/// yields: a `yield_save_and_switch` on an idle CPU returns in
+/// microseconds, so the old "10 000 yields" budget (meant as ~100 s) was
+/// ~10 ms in practice and expired under the first NVMe round trip that
+/// did not complete synchronously (QEMU, 2026-10-30 — the same lesson
+/// usb-host learned on the Dell).
+const BLOCK_IO_TIMEOUT_TICKS: u64 = 500;
 
-/// Response status values (match the driver's).
-const STATUS_OK: u8 = 0;
-
-/// Sector size in the virtio-blk wire protocol (always 512).
-const VIRTIO_BLK_SECTOR_SIZE: u64 = 512;
-
-/// SCAFFOLDING: upper bound on yield iterations spent waiting for a single
-/// disk I/O completion before giving up.
-/// Why: real NVMe/AHCI completes a single I/O in microseconds; 10 000
-///      scheduler-quantum yields (≈100 s at 100 Hz) is far more headroom
-///      than any healthy request could need, and short enough to fail
-///      loudly rather than hang forever if the driver is dead.
-/// Replace when: we move to interrupt-driven virtio-blk completion (would
-///      remove the polling path entirely).
-const MAX_WAIT_ITERATIONS: u32 = 10_000;
+/// ARCHITECTURAL: the poll loop is finite even with a stuck clock; the
+/// tick budget is what normally ends a wait. 10^7 polls is minutes on
+/// any hardware.
+const MAX_WAIT_ITERATIONS: u32 = 10_000_000;
 
 /// Kernel-side view of the user-space virtio-blk driver.
-pub struct VirtioBlkDevice {
+pub struct BlockDriverClient {
     driver_cmd_endpoint: u32,
     response_endpoint: u32,
     /// Physical address of the driver's shared DMA region. 0 until the
@@ -76,7 +74,7 @@ pub struct VirtioBlkDevice {
     initialized: bool,
 }
 
-impl VirtioBlkDevice {
+impl BlockDriverClient {
     /// Construct an uninitialized device. Handshake is deferred until the
     /// first `BlockDevice` call happens from a real task context.
     pub fn new() -> Self {
@@ -147,12 +145,15 @@ impl VirtioBlkDevice {
         //    wake_message_waiters_all_cpus). Syscall context, no lock held.
         crate::wake_message_waiters_all_cpus(self.driver_cmd_endpoint);
 
-        // 4. Poll the response endpoint with cooperative yields. Each yield
-        //    hands the CPU back to the scheduler; virtio-blk (polling both
-        //    ep24 and ep26 via SYS_TRY_RECV_MSG) picks up the command, sends
-        //    the reply to ep25 via handle_write's intercept, and our next
-        //    recv_message call finds it.
-        for _ in 0..MAX_WAIT_ITERATIONS {
+        // 4. Poll the response endpoint with cooperative yields, bounded by
+        //    wall clock (`BLOCK_IO_TIMEOUT_TICKS`) with an iteration
+        //    backstop. Each yield hands the CPU back to the scheduler; the
+        //    driver (polling both ep24 and ep26 via SYS_TRY_RECV_MSG) picks
+        //    up the command, sends the reply to ep25 via handle_write's
+        //    intercept, and our next recv_message call finds it.
+        let start_tick = crate::scheduler::Timer::get_ticks();
+        let mut polls: u32 = 0;
+        loop {
             if let Some(reply) = crate::SHARDED_IPC.recv_message(EndpointId(self.response_endpoint))
             {
                 let mut out = [0u8; 256];
@@ -163,12 +164,17 @@ impl VirtioBlkDevice {
                 out[..n].copy_from_slice(&reply.payload[..n]);
                 return Ok((out, n));
             }
+            polls += 1;
+            if polls >= MAX_WAIT_ITERATIONS
+                || crate::scheduler::Timer::get_ticks().wrapping_sub(start_tick) >= BLOCK_IO_TIMEOUT_TICKS
+            {
+                return Err(BlockError::NotReady);
+            }
             // SAFETY: on kernel stack, no locks held.
             unsafe {
                 crate::arch::yield_save_and_switch();
             }
         }
-        Err(BlockError::NotReady)
     }
 
     pub fn ensure_handshake(&mut self) -> Result<(), BlockError> {
@@ -228,13 +234,13 @@ impl VirtioBlkDevice {
     }
 }
 
-impl Default for VirtioBlkDevice {
+impl Default for BlockDriverClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BlockDevice for VirtioBlkDevice {
+impl BlockDevice for BlockDriverClient {
     fn capacity_blocks(&self) -> u64 {
         self.capacity_blocks_cached()
     }

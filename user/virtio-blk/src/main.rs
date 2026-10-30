@@ -46,6 +46,8 @@
 //!     4 = GET_CAPACITY [cmd:1]          → [status:1][sectors_512:8]
 //!     5 = GET_STATUS   [cmd:1]          → [status:1][alive:1]
 //!
+//! The seam itself (endpoints, bytes, units) is `cambios-blk-proto`.
+//!
 //! **Endpoint 26 — kernel-only (raw `recv_msg`; replies to endpoint 25).**
 //!   Kernel-origin messages carry `sender_principal = None`, which
 //!   `recv_verified` rejects. Trust is conferred by endpoint choice: only
@@ -74,37 +76,16 @@ use virtqueue::{BounceBuffer, ChainSegment, VirtQueue};
 // IPC protocol
 // ============================================================================
 
-// Endpoint 22 is already claimed by the policy service (POLICY_QUERY_ENDPOINT);
-// endpoint 23 is its response channel. Virtio-blk takes 24.
-const BLK_ENDPOINT: u32 = 24;
-
-// Kernel-only endpoints (Phase 4a.iii). The driver polls 26 in addition to 24;
-// responses to kernel commands are sent to endpoint 25 which only the kernel
-// receives on. Kernel-origin messages use raw `recv_msg` (not `recv_verified`)
-// because the kernel itself does not stamp a sender Principal; the trust
-// anchor here is endpoint choice, same pattern the policy service uses.
-const BLK_KERNEL_RESP_ENDPOINT: u32 = 25;
-const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
-
-// User-facing commands on endpoint 24.
-const CMD_READ_BLOCK: u8 = 1;
-const CMD_WRITE_BLOCK: u8 = 2;
-const CMD_FLUSH: u8 = 3;
-const CMD_GET_CAPACITY: u8 = 4;
-const CMD_GET_STATUS: u8 = 5;
-
-// Kernel-only commands on endpoint 26 (Phase 4a.iii).
-const KCMD_HANDSHAKE: u8 = 1;
-const KCMD_READ_BLOCK: u8 = 2;
-const KCMD_WRITE_BLOCK: u8 = 3;
-const KCMD_FLUSH: u8 = 4;
-const KCMD_CAPACITY: u8 = 5;
-
-const STATUS_OK: u8 = 0;
-const STATUS_ERROR: u8 = 1;
-const STATUS_NO_DEVICE: u8 = 2;
-const STATUS_DEVICE_DEAD: u8 = 3;
-const STATUS_UNIMPLEMENTED: u8 = 4;
+// The IPC seam — endpoints, command and status bytes, units — is the
+// shared `cambios-blk-proto` crate, so this driver, nvme, ahci and the
+// kernel's BlockDriverClient cannot drift from one another.
+use cambios_blk_proto::{
+    BLK_ENDPOINT, BLK_KERNEL_CMD_ENDPOINT, BLK_KERNEL_RESP_ENDPOINT, CMD_FLUSH,
+    CMD_GET_CAPACITY, CMD_GET_STATUS, CMD_READ_BLOCK, CMD_WRITE_BLOCK, KCMD_CAPACITY,
+    KCMD_FLUSH, KCMD_HANDSHAKE, KCMD_READ_BLOCK, KCMD_WRITE_BLOCK, LOGICAL_BLOCK_SIZE,
+    SECTORS_PER_LOGICAL_BLOCK, STATUS_DEVICE_DEAD, STATUS_ERROR,
+    STATUS_NO_DEVICE, STATUS_OK, STATUS_UNIMPLEMENTED,
+};
 
 // ============================================================================
 // Virtio-blk constants (virtio spec §5.2)
@@ -131,15 +112,6 @@ const VIRTIO_BLK_S_IOERR: u8 = 1;
 #[allow(dead_code)]
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
-/// Virtio-blk legacy sector size — always 512 regardless of the underlying
-/// device's native block size. `capacity` in the device config is expressed
-/// in 512-byte units.
-const SECTOR_SIZE: usize = 512;
-
-/// We always do 4 KiB-sized logical block I/O. Matches the on-disk format's
-/// `BLOCK_SIZE` (ADR-010) and is a clean multiple of 512.
-const LOGICAL_BLOCK_SIZE: usize = 4096;
-const SECTORS_PER_LOGICAL_BLOCK: u64 = (LOGICAL_BLOCK_SIZE / SECTOR_SIZE) as u64;
 
 // ============================================================================
 // Driver state

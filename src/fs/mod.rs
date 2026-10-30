@@ -22,7 +22,7 @@ pub mod lazy_disk;
 pub mod posix;
 pub mod ram;
 #[cfg(not(test))]
-pub mod virtio_blk_device;
+pub mod block_driver_client;
 
 /// Test-mode stub for lazy_disk. The real module performs IPC handshake
 /// with the user-space virtio-blk driver; in host tests neither IPC nor
@@ -416,7 +416,7 @@ pub trait ObjectStore {
 // per delegated method — closed-world, exhaustive, monomorphized.
 //
 // Test mode (`cfg(test)`) excludes the LazyDisk variant because
-// `VirtioBlkDevice` is not available in host tests; tests construct
+// `BlockDriverClient` is not available in host tests; tests construct
 // only `Ram`.
 
 /// Enum-dispatch shim for `ObjectStore` backends installed at the kernel-side
@@ -441,7 +441,7 @@ pub enum ObjectStoreBackend {
         alloc::boxed::Box<
             disk::DiskObjectStore<
                 crate::fs::crypto::encrypted_device::EncryptedBlockDevice<
-                    block::OffsetBlockDevice<virtio_blk_device::VirtioBlkDevice>,
+                    block::OffsetBlockDevice<block_driver_client::BlockDriverClient>,
                 >,
             >,
         >,

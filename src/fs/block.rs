@@ -9,7 +9,7 @@
 //!
 //! - `MemBlockDevice` — in-kernel RAM buffer, for testing and for bring-up
 //!   before a real driver exists.
-//! - `VirtioBlkDevice` — IPC client to the user-space virtio-blk
+//! - `BlockDriverClient` — IPC client to the user-space virtio-blk
 //!   driver.
 //!
 //! Separating the trait from the backend keeps the `DiskObjectStore` logic
@@ -110,7 +110,7 @@ pub trait BlockDevice: Send {
 /// device can address from logical LBA 0 onward.
 ///
 /// Used by the FDE path: the substrate sits on top of
-/// `EncryptedBlockDevice<OffsetBlockDevice<VirtioBlkDevice>>` with
+/// `EncryptedBlockDevice<OffsetBlockDevice<BlockDriverClient>>` with
 /// `offset = 4`, hiding LBA 0..=3 (the volume header per ADR-032 § 4)
 /// from substrate reads/writes. Without this shim, the substrate's
 /// `SUPERBLOCK_LBA = 0` would alias the volume header.

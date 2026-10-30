@@ -6,7 +6,7 @@
 //! The on-disk format is specified in ADR-010. This module is the reference
 //! reader/writer of that format. It is generic over any `BlockDevice` — the
 //! same code path is exercised by unit tests against `MemBlockDevice` and
-//! at runtime against `VirtioBlkDevice`.
+//! at runtime against `BlockDriverClient`.
 //!
 //! ## Structure
 //!
@@ -28,9 +28,9 @@ use alloc::vec::Vec;
 
 use cambios_abi::Extent;
 
-use crate::fs::bitmap::{decode_from_blocks, encode_to_blocks, BlockBitmap};
+use crate::fs::bitmap::{encode_to_blocks, BlockBitmap};
 use crate::fs::block::{Block, BlockDevice, BlockError, BLOCK_SIZE};
-use crate::fs::journal::{Journal, JournalRecord};
+use crate::fs::journal::{Journal, JournalError, JournalRecord};
 use crate::fs::{
     content_hash, CambiObject, ObjectCapSet, ObjectMeta, ObjectRights, ObjectStore,
     SignatureAlgo, SignatureBytes, StoreError, MAX_OBJECT_CAPS,
@@ -101,6 +101,16 @@ pub const MAX_CONTENT_BYTES_ON_DISK: usize = BLOCK_SIZE;
 /// Replace when: a v1+ deployment wants >4 TiB CambiObject region;
 /// tiered/sparse bitmap representations land first.
 pub const MAX_DATA_BLOCKS_ON_DISK: u64 = 1_073_741_824;
+
+/// SCAFFOLDING: data blocks a freshly formatted v1 store claims — 2^20
+/// (4 GiB of content). The free-block bitmap lives on the 4 MiB kernel
+/// heap (128 KiB here; a whole 1 TB drive would need 32 MiB). Mount still
+/// accepts any declared capacity up to `MAX_DATA_BLOCKS_ON_DISK`; the
+/// rest of the device is left for ADR-031's other backends.
+/// Why: the v1 store holds `MAX_OBJECTS_ON_DISK` small objects.
+/// Replace when: the bitmap leaves the kernel heap, or a consumer needs
+///      more than 4 GiB of object content.
+pub const MAX_V1_STORE_DATA_BLOCKS: u64 = 1 << 20;
 
 // Superblock field offsets (LBA 0). v2 superblock per
 // ADR-010 § Divergence 3: the fixed-field region grows to declare
@@ -600,7 +610,9 @@ fn pick_format_geometry(
     // reserving `ceil(remaining / 32769)` for the bitmap and the
     // rest for data, then verify the total fits.
     let remaining = dev_blocks - used_by_slots;
-    let mut data_blocks = remaining - 1; // reserve at least 1 bitmap block
+    // Reserve at least 1 bitmap block, and never claim more data than the
+    // in-kernel bitmap can represent on the kernel heap.
+    let mut data_blocks = (remaining - 1).min(MAX_V1_STORE_DATA_BLOCKS);
     let bitmap_blocks = bitmap_region_blocks_for(data_blocks);
     if used_by_slots + bitmap_blocks + data_blocks > dev_blocks {
         // Shrink data_blocks by the bitmap overhead and re-check.
@@ -1211,15 +1223,11 @@ impl<B: BlockDevice> DiskObjectStore<B> {
         }
 
         // -- Journal replay -----------------------------------------
-        let mut journal_buf = vec![0u8; JOURNAL_BYTES as usize];
-        let mut block_buf = [0u8; BLOCK_SIZE];
-        for i in 0..JOURNAL_BLOCKS {
-            device
-                .read_block(sb.journal_region_lba + i, &mut block_buf)
-                .map_err(block_err_to_store)?;
-            let start = (i as usize) * BLOCK_SIZE;
-            journal_buf[start..start + BLOCK_SIZE].copy_from_slice(&block_buf);
-        }
+        // Streamed two blocks at a time: the 16 MiB region never sits in
+        // kernel memory (the second boot of a formatted disk used to
+        // panic on `vec![0; JOURNAL_BYTES]` against the 4 MiB kernel
+        // heap, 2026-10-30 — the single-boot dev-piv smoke never
+        // replayed a journal, so it never saw it).
         let mut journal = Journal::from_disk_state(
             JOURNAL_BYTES,
             sb.last_checkpoint_offset,
@@ -1227,26 +1235,35 @@ impl<B: BlockDevice> DiskObjectStore<B> {
         )
         .map_err(|_| StoreError::InvalidObject)?;
         let mut bitmap = BlockBitmap::new_all_free(sb.capacity_data_blocks);
+        let journal_region_lba = sb.journal_region_lba;
         journal
-            .replay_from_checkpoint(&journal_buf, |rec| {
-                apply_bitmap_mutations(&mut bitmap, rec)
-            })
+            .replay_from_checkpoint_blocks(
+                |idx, buf| {
+                    device
+                        .read_block(journal_region_lba + idx, buf)
+                        .map_err(|_| JournalError::DeviceError)
+                },
+                |rec| apply_bitmap_mutations(&mut bitmap, rec),
+            )
             .map_err(|_| StoreError::InvalidObject)?;
 
         // -- Defense-in-depth bitmap cross-check --------------------
+        // Block by block against the journal-reconstructed bitmap's
+        // encoding (bounded by `MAX_V1_STORE_DATA_BLOCKS` → ≤ 32 blocks
+        // of expectation held at once).
         let bitmap_blocks = bitmap_region_blocks_for(sb.capacity_data_blocks);
-        let mut disk_bitmap_blocks: Vec<Block> = Vec::with_capacity(bitmap_blocks as usize);
-        for i in 0..bitmap_blocks {
-            let mut block = [0u8; BLOCK_SIZE];
-            device
-                .read_block(sb.bitmap_region_lba + i, &mut block)
-                .map_err(block_err_to_store)?;
-            disk_bitmap_blocks.push(block);
-        }
-        let disk_bitmap = decode_from_blocks(&disk_bitmap_blocks, sb.capacity_data_blocks)
-            .map_err(|_| StoreError::InvalidObject)?;
-        if bitmap != disk_bitmap {
+        let expected = encode_to_blocks(&bitmap).map_err(|_| StoreError::InvalidObject)?;
+        if expected.len() as u64 != bitmap_blocks {
             return Err(StoreError::InvalidObject);
+        }
+        let mut block = [0u8; BLOCK_SIZE];
+        for (i, want) in expected.iter().enumerate() {
+            device
+                .read_block(sb.bitmap_region_lba + i as u64, &mut block)
+                .map_err(block_err_to_store)?;
+            if &block != want {
+                return Err(StoreError::InvalidObject);
+            }
         }
 
         // -- Slot-table scan ----------------------------------------

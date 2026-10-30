@@ -302,6 +302,44 @@ pub fn register_endpoint(endpoint_id: u32) -> i64 {
     syscall_raw3(SyscallNumber::RegisterEndpoint as u64, endpoint_id as u64, 0, 0)
 }
 
+/// A bounded wait measured on the wall clock, with an iteration backstop.
+///
+/// `tick()` returns `true` while the budget remains; call it once per
+/// poll iteration, before the condition check. Drivers that wait on
+/// hardware must wait by ticks, never by yield counts: a `yield_now` on
+/// an idle CPU returns in microseconds, so a "1000 yields" wait that
+/// meant 10 s under QEMU expired after ~1 ms on the Dell 3630 and made
+/// every USB port reset time out (2026-10-22). The iteration backstop
+/// (`MAX_POLL_ITERATIONS`) keeps the loop finite even if the clock
+/// never advances.
+pub struct Deadline {
+    start_tick: u64,
+    budget_ticks: u64,
+    checks: u32,
+}
+
+impl Deadline {
+    /// ARCHITECTURAL: a poll loop is finite even with a stuck clock.
+    /// 10^7 checks is minutes of spinning on any hardware — far past
+    /// any tick budget a caller would pass — so the clock, not this
+    /// backstop, is what normally ends a wait.
+    pub const MAX_POLL_ITERATIONS: u32 = 10_000_000;
+
+    /// Start a wait of `budget_ticks` scheduler ticks (100 Hz: 100 = 1 s).
+    pub fn for_ticks(budget_ticks: u64) -> Self {
+        Deadline { start_tick: get_time(), budget_ticks, checks: 0 }
+    }
+
+    /// One poll step. `true` while time (and the backstop) remain.
+    pub fn tick(&mut self) -> bool {
+        if self.checks >= Self::MAX_POLL_ITERATIONS {
+            return false;
+        }
+        self.checks += 1;
+        get_time().wrapping_sub(self.start_tick) < self.budget_ticks
+    }
+}
+
 pub fn yield_now() {
     syscall_raw3(SyscallNumber::Yield as u64, 0, 0, 0);
 }
