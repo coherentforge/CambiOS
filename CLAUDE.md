@@ -361,7 +361,7 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 
 **Additional lock domains (independent of hierarchy above):**
 - `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR. Cache lock released before acquiring global allocator on refill/drain.
-- `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint. Released before acquiring scheduler for task wake.
+- `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint. Released before acquiring scheduler for task wake. A blocking receiver on a kernel-origin endpoint (policy queries on 22, virtio-blk commands on 26) holds `SCHEDULER → IPC_MANAGER → shard` across its block decision — the shard is the lock the kernel-side sender publishes under, so it is the lock the Blocking pattern's atomic re-check must hold (a `has_message()` that took and dropped it left the policy service sleeping through queries on the Dell 3630: `expired 11`, 2026-10-28). No path holds a shard while taking a scheduler lock.
 - `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter. Not part of the lock hierarchy.
 - `ENDPOINT_RESERVATIONS`, `SPAWN_GRANTS`, `INIT_PROCESS` (ADR-018) — BOOTSTRAP_PRINCIPAL lifecycle: written once during single-threaded boot (manifest transcription; init creation for `INIT_PROCESS`), read-only thereafter. Not in the hierarchy; every accessor is a self-contained lock-copy-unlock, never called with another lock held.
 - `AUDIT_RING` — acquired by `drain_tick()` (try_lock from BSP ISR, holds no other lock) and by `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO` handlers (two-phase protocol: never held while PROCESS_TABLE or FRAME_ALLOCATOR is held). `audit::emit()` never touches it.

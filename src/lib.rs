@@ -100,7 +100,10 @@ use memory::frame_allocator::FrameAllocator;
 //
 // Additional lock domains (independent of hierarchy above):
 // - PER_CPU_FRAME_CACHE[cpu] — per-CPU, never held with FRAME_ALLOCATOR
-// - SHARDED_IPC.shards[endpoint] — per-endpoint, never held cross-endpoint
+// - SHARDED_IPC.shards[endpoint] — per-endpoint, never held cross-endpoint;
+//   a blocking receiver on a kernel-origin endpoint (22, 26) holds
+//   SCHEDULER → IPC_MANAGER → shard across its block decision, and no
+//   path holds a shard while taking a scheduler lock
 // - BOOTSTRAP_PRINCIPAL — written once at boot, read-only thereafter
 //
 // Large structs (IpcManager ~1.3MB, CapabilityManager ~100KB, ProcessTable ~132KB,

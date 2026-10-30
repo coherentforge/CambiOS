@@ -1200,12 +1200,34 @@ impl SyscallDispatcher {
             let blocked = {
                 let mut sched_guard = crate::local_scheduler().lock();
                 let ipc_guard = crate::IPC_MANAGER.lock();
+                // Kernel-origin endpoints (policy queries on 22, virtio-blk
+                // commands on 26) are fed through SHARDED_IPC under the
+                // endpoint's own shard lock, not IPC_MANAGER — so THAT is
+                // the lock this check must hold across block_task. A
+                // has_message() that took and dropped the shard lock left
+                // the same gap the IPC lock closes for ordinary endpoints:
+                // the kernel enqueued a query and woke a still-Running
+                // policy service, which then blocked on a non-empty queue
+                // until the next query woke it. On the Dell 3630 (twelve
+                // real cores) that was `expired 11` and a one-second Deny
+                // for each — the glacial splash of 2026-10-28; QEMU never
+                // hit the window. Lock order: SCHEDULER(1) → IPC_MANAGER(3)
+                // → shard; no path holds a shard while taking a scheduler
+                // lock (the wake helpers drop it first), so this nests
+                // without inversion.
+                let shard_guard = if kernel_origin_endpoint(endpoint_id) {
+                    Some(crate::SHARDED_IPC.shards[endpoint_id as usize].lock())
+                } else {
+                    None
+                };
                 let queued = ipc_guard
                     .as_ref()
                     .map(|m| m.has_message(endpoint))
                     .unwrap_or(false)
-                    || (kernel_origin_endpoint(endpoint_id)
-                        && crate::SHARDED_IPC.has_message(endpoint));
+                    || shard_guard
+                        .as_ref()
+                        .map(|shard| !shard.queue.is_empty())
+                        .unwrap_or(false);
                 if queued {
                     false
                 } else if let Some(sched) = sched_guard.as_mut() {
