@@ -2420,6 +2420,10 @@ impl SyscallDispatcher {
                 process_id.as_raw(),
                 core::sync::atomic::Ordering::Release,
             );
+            crate::POLICY_SERVICE_TASK.store(
+                new_task_id.as_raw(),
+                core::sync::atomic::Ordering::Release,
+            );
             crate::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
             crate::println!("  [Spawn] policy service identified; enforcement enabled");
         }

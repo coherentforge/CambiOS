@@ -66,6 +66,13 @@ pub static POLICY_QUERIES_RETRIED: core::sync::atomic::AtomicU64 = core::sync::a
 /// task at any time, so the bound multiplies latency, not table load.
 pub const POLICY_UPCALL_ATTEMPTS: u32 = 3;
 
+/// TUNING: how many query expiries print a forensic line (what the
+/// policy service was doing at that moment) before going quiet. Enough
+/// to see a pattern off a photo of the panel; bounded so a dead policy
+/// service cannot flood the console from the timer tick.
+const EXPIRY_FORENSICS_MAX: u64 = 8;
+static EXPIRY_FORENSICS_PRINTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// TUNING: ticks before a pending policy query expires and the blocked
 /// caller is woken with a Deny. At 100 Hz timer, 100 ticks = 1 second.
 /// Long enough for the policy service to respond under normal conditions,
@@ -778,6 +785,36 @@ pub fn expire_pending_queries() {
                 POLICY_DECISIONS[tid.slot() as usize].store(DECISION_EXPIRED, Ordering::Release);
             });
             if woke {
+                // Forensics for the first few expiries: an expiry means the
+                // policy service did not answer within the timeout, and the
+                // useful question is what it was doing — Blocked (on what?),
+                // Ready but not running (its CPU busy with whom?), or
+                // Running (slow). Read under try_lock from the ISR; a
+                // contended scheduler prints "?" rather than waiting.
+                let n = EXPIRY_FORENSICS_PRINTED.fetch_add(1, Ordering::Relaxed);
+                if n < EXPIRY_FORENSICS_MAX {
+                    let raw = crate::POLICY_SERVICE_TASK.load(Ordering::Acquire);
+                    let snap = if raw == u64::MAX {
+                        None
+                    } else {
+                        crate::try_task_snapshot(TaskId::from_raw(raw))
+                    };
+                    match snap {
+                        Some(sn) => {
+                            crate::io::try_print(format_args!(
+                                "[policy] expiry #{}: query {} from task {}; policy service {:?} reason {:?} on cpu {} (running there: {:?})\n",
+                                n + 1, qid, tid.slot(), sn.state, sn.block_reason, sn.cpu,
+                                sn.current_on_cpu.map(|t| t.slot()),
+                            ));
+                        }
+                        None => {
+                            crate::io::try_print(format_args!(
+                                "[policy] expiry #{}: query {} from task {}; policy service state unavailable (lock held or task unknown)\n",
+                                n + 1, qid, tid.slot(),
+                            ));
+                        }
+                    }
+                }
                 POLICY_QUERIES_EXPIRED.fetch_add(1, Ordering::Relaxed);
                 if let Some(mut guard) = crate::POLICY_ROUTER.try_lock() {
                     guard.remove_query(qid);

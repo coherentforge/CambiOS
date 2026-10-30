@@ -76,7 +76,8 @@ The task array and ready queues are heap-allocated (`Vec<Option<Task>>` and `[Ve
 pub const MAX_TASKS: usize = 256;            // Per-CPU task pool size
 const NUM_PRIORITY_BANDS: usize = 4;         // Ready queue bands
 const MAX_CPUS: usize = 256;                 // Per-CPU scheduler array size
-const DEFAULT_TIME_SLICE: u32 = 10;          // Ticks per quantum (10ms at 100Hz)
+const DEFAULT_TIME_SLICE_TICKS: u32 = 10;    // Ticks per quantum (100 ms at 100 Hz)
+const IDLE_TIME_SLICE_TICKS: u32 = 1;        // The idle task re-evaluates every tick
 ```
 
 The 256-task limit is per-CPU, not global. With `MAX_CPUS = 256`, the system supports up to 65,536 tasks total across all CPUs in principle.
@@ -102,7 +103,7 @@ Each band has its own `VecDeque<TaskId>` ready queue. The scheduler picks the ne
 
 ## Time Slicing
 
-The default time slice is **10 ticks (100ms at 100 Hz)** per task. Each timer tick decrements `time_remaining` on the running task. When it reaches zero, `time_slice_expired()` returns true and the next call to `schedule()` rotates to a new task.
+The default time slice is **10 ticks (100ms at 100 Hz)** per task. Each timer tick decrements `time_remaining` on the running task. When it reaches zero, `time_slice_expired()` returns true and the next call to `schedule()` rotates to a new task. The idle task's slice is **1 tick**: idle is the absence of work, so a Ready task that reaches an idle CPU without a successful reschedule kick (the kick is declined while the idle loop holds a plain spinlock) is picked up at the next tick rather than after a full quantum.
 
 The current time slice is reset to `time_slice` whenever a task is scheduled to run, including after a yield or wake.
 

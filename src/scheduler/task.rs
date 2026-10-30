@@ -149,6 +149,28 @@ impl TaskExitRing {
 }
 
 /// Task state machine
+/// TUNING: ticks a task runs before the timer rotates it — 10 ticks is
+/// 100 ms at the 100 Hz timer. Trades context-switch overhead against
+/// latency for a Ready task behind a CPU-bound one.
+pub const DEFAULT_TIME_SLICE_TICKS: u32 = 10;
+
+/// ARCHITECTURAL: the idle task gets one tick. Idle is the absence of
+/// work, not a competitor for the CPU: a Ready task that lands on an
+/// idle CPU without a reschedule kick (the kick is declined while the
+/// idle loop holds a plain spinlock) must be picked up at the very next
+/// tick, not after a full quantum. With the default slice that wait was
+/// up to 100 ms per lost kick (Dell 3630, 2026-10-29).
+pub const IDLE_TIME_SLICE_TICKS: u32 = 1;
+
+/// The quantum a freshly created task starts with, by priority.
+const fn slice_for(priority: Priority) -> u32 {
+    if priority.0 == Priority::IDLE.0 {
+        IDLE_TIME_SLICE_TICKS
+    } else {
+        DEFAULT_TIME_SLICE_TICKS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     /// Task is ready to run
@@ -614,8 +636,8 @@ impl Task {
             state: TaskState::Ready,
             context: CpuContext::new(entry_point, stack_pointer),
             priority,
-            time_slice: 10, // Default 10ms time slice (at 100Hz timer = 1 tick)
-            time_remaining: 10,
+            time_slice: slice_for(priority),
+            time_remaining: slice_for(priority),
             schedule_count: 0,
             block_reason: None,
             saved_rsp: 0,
@@ -644,8 +666,8 @@ impl Task {
             state: TaskState::Ready,
             context: CpuContext::new(entry_point, kernel_stack_top),
             priority,
-            time_slice: 10,
-            time_remaining: 10,
+            time_slice: slice_for(priority),
+            time_remaining: slice_for(priority),
             schedule_count: 0,
             block_reason: None,
             saved_rsp,

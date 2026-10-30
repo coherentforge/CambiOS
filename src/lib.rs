@@ -1166,6 +1166,49 @@ pub static POLICY_SERVICE_READY: core::sync::atomic::AtomicBool =
 /// (reentrancy prevention) and to verify response senders.
 pub static POLICY_SERVICE_PID: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Raw `TaskId` of the policy service's task (`u64::MAX` = not yet
+/// identified). Written once alongside `POLICY_SERVICE_PID`; read by the
+/// query-expiry sweep to say what the policy service was doing when a
+/// query timed out (Blocked and on what, Ready but not running, Running).
+pub static POLICY_SERVICE_TASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// What one task was doing at a glance, read under a `try_lock` of its
+/// CPU's scheduler. Diagnostic only.
+#[derive(Debug, Clone, Copy)]
+pub struct TaskSnapshot {
+    pub cpu: u16,
+    pub state: scheduler::TaskState,
+    pub block_reason: Option<scheduler::BlockReason>,
+    /// The task that CPU was running at the moment of the snapshot
+    /// (`None` = idle or unknown).
+    pub current_on_cpu: Option<scheduler::TaskId>,
+}
+
+/// Snapshot `task_id` without blocking: `None` if its CPU is unknown or
+/// its scheduler lock is held. Interrupt-context safe.
+#[cfg(not(test))]
+pub fn try_task_snapshot(task_id: scheduler::TaskId) -> Option<TaskSnapshot> {
+    let cpu = get_task_cpu(task_id.slot())?;
+    if (cpu as usize) >= MAX_CPUS {
+        return None;
+    }
+    let guard = PER_CPU_SCHEDULER[cpu as usize].try_lock()?;
+    let sched = guard.as_ref()?;
+    let task = sched.get_task_pub(task_id)?;
+    Some(TaskSnapshot {
+        cpu,
+        state: task.state,
+        block_reason: task.block_reason,
+        current_on_cpu: sched.current_task().filter(|t| !t.is_idle()),
+    })
+}
+
+/// Host-test stub: no per-CPU schedulers.
+#[cfg(test)]
+pub fn try_task_snapshot(_task_id: scheduler::TaskId) -> Option<TaskSnapshot> {
+    None
+}
+
 /// Pending policy query table. Independent lock domain — never held while
 /// acquiring PER_CPU_SCHEDULER. Two-phase pattern: `complete_query` returns
 /// TaskId, caller drops lock, then wakes.
