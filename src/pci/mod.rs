@@ -15,7 +15,9 @@
 //!   per PCIe r5.0 § 7.2.2. The caller installs the kernel VA of the
 //!   ECAM window by calling [`init_ecam`] during boot.
 //!
-//! [`scan`] walks bus 0 devices 0..32 × functions 0..8 through the
+//! [`scan`] walks every reachable bus — bus 0, then each bus a PCI-to-PCI
+//! bridge names as its secondary, breadth-first — devices 0..32 ×
+//! functions 0..8 through the
 //! shim, so the same scan code drives every architecture. riscv64 also
 //! has a parallel [`register_virtio_mmio`] path (see ADR-013 / R-6) that
 //! synthesizes PCI-shaped entries for virtio-mmio carriers — those
@@ -32,8 +34,78 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Maximum number of PCI devices we can track.
-pub const MAX_PCI_DEVICES: usize = 32;
+/// SCAFFOLDING: PCI function table capacity.
+/// Why: the Dell Precision 3630 exposes 29 functions on bus 0 alone, and
+///      multi-bus enumeration adds every device behind its PCIe root
+///      ports (NVMe, discrete GPU, Wi-Fi); a laptop-class v1 target lands
+///      near 40. 128 keeps the ≤25 % utilization rule with ~20 KiB of
+///      .bss (`PciDevice` ≈ 160 B).
+/// Replace when: a target's boot print reports the table-full line.
+pub const MAX_PCI_DEVICES: usize = 128;
+
+/// HARDWARE: PCI bus numbers are 8 bits (PCI Local Bus Spec r3.0 § 3.2.2.3.2).
+pub const MAX_PCI_BUSES: usize = 256;
+
+/// HARDWARE: config header type 1 = PCI-to-PCI bridge (PCI-to-PCI Bridge
+/// Architecture Spec r1.2 § 3.2); bit 7 of the header-type byte flags a
+/// multi-function device and is masked off.
+const HEADER_TYPE_BRIDGE: u8 = 0x01;
+
+/// Header type byte, from the dword at config offset 0x0C (bits 23:16),
+/// multi-function bit masked.
+const fn header_type(reg_0c: u32) -> u8 {
+    ((reg_0c >> 16) & 0x7F) as u8
+}
+
+/// Secondary bus number of a type-1 header, from the dword at config
+/// offset 0x18 (bits 15:8).
+const fn secondary_bus(reg_18: u32) -> u8 {
+    ((reg_18 >> 8) & 0xFF) as u8
+}
+
+/// Bounded breadth-first queue of buses to scan. Each bus is admitted
+/// once (visited bitmap), so a mis-programmed bridge naming an already
+/// seen bus — or a loop — cannot make the scan unbounded: at most
+/// `MAX_PCI_BUSES` pops ever happen.
+struct BusQueue {
+    visited: [u64; MAX_PCI_BUSES / 64],
+    order: [u8; MAX_PCI_BUSES],
+    head: usize,
+    tail: usize,
+}
+
+impl BusQueue {
+    const fn new() -> Self {
+        BusQueue { visited: [0; MAX_PCI_BUSES / 64], order: [0; MAX_PCI_BUSES], head: 0, tail: 0 }
+    }
+
+    /// Admit `bus` if it has not been seen. Returns whether it was added.
+    fn push(&mut self, bus: u8) -> bool {
+        let (word, bit) = ((bus as usize) / 64, (bus as usize) % 64);
+        if self.visited[word] & (1u64 << bit) != 0 {
+            return false;
+        }
+        self.visited[word] |= 1u64 << bit;
+        // tail < MAX_PCI_BUSES is implied: each bus is admitted at most once.
+        if self.tail < MAX_PCI_BUSES {
+            self.order[self.tail] = bus;
+            self.tail += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.head < self.tail {
+            let b = self.order[self.head];
+            self.head += 1;
+            Some(b)
+        } else {
+            None
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Virtio-modern PCI capability descriptors (virtio spec §4.1.4)
@@ -99,7 +171,8 @@ pub struct VirtioModernCaps {
 /// A discovered PCI device.
 #[derive(Clone, Copy)]
 pub struct PciDevice {
-    /// PCI bus number (always 0 in this implementation).
+    /// PCI bus number: 0 for the root bus, or the secondary bus of the
+    /// bridge the device sits behind.
     pub bus: u8,
     /// Device number (0-31).
     pub device: u8,
@@ -351,6 +424,23 @@ mod ecam {
 /// Arch-agnostic config-space shim used by the scan, BAR-decode, and
 /// capability-walk code below. Each arch plugs in via a private module.
 mod config {
+    /// Highest bus number the active backend can address without
+    /// faulting: every bus on x86_64 (mechanism 1 encodes the bus in the
+    /// address port); on the ECAM arches only the buses whose 1 MiB
+    /// slots `init_ecam` mapped (`ECAM_MAP_BYTES`, bus 0 today — a
+    /// read past the mapping would be a kernel page fault, not a
+    /// 0xFFFF_FFFF).
+    pub(super) fn max_bus() -> u8 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            255
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            ((super::ECAM_MAP_BYTES >> 20).saturating_sub(1)).min(255) as u8
+        }
+    }
+
     /// # Safety: caller must satisfy the active backend's preconditions
     /// (interrupts-quiet on x86_64; ECAM mapped on everything else) and
     /// pass a dword-aligned `offset`.
@@ -841,13 +931,23 @@ unsafe fn walk_virtio_modern_caps(bus: u8, device: u8, function: u8) -> VirtioMo
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Scan PCI bus 0, devices 0-31, functions 0-7.
+/// Scan every reachable PCI bus: bus 0, then each secondary bus a
+/// PCI-to-PCI bridge names, breadth-first (so bus-0 indices are the same
+/// as a single-bus scan would give), devices 0-31 × functions 0-7.
 ///
 /// Discovered devices are stored in the global `DEVICES` table. This must be
 /// called exactly once during BSP boot, before any PCI driver initialization.
 ///
+/// Bridges (header type 1) are recorded like any other function but are
+/// not BAR-sized and their command register is left as firmware set it:
+/// their "BARs" 2–5 are bus-number and window registers, and all-ones
+/// writes there reprogram the bridge. On the Dell 3630 the NVMe drive sits
+/// behind a PCIe root port on a bus a bus-0-only scan never reached
+/// (2026-10-30).
+///
 /// On aarch64 / riscv64, [`init_ecam`] must run first so the MMIO window
-/// that backs `config::read32` / `config::write32` is live. A `scan()`
+/// that backs `config::read32` / `config::write32` is live; only buses
+/// inside the mapped window are visited (`config::max_bus`). A `scan()`
 /// call before ECAM init is safe but finds nothing (ECAM reads return
 /// 0xFFFF_FFFF, which `vendor_id == 0xFFFF` filters out).
 ///
@@ -860,90 +960,123 @@ unsafe fn walk_virtio_modern_caps(bus: u8, device: u8, function: u8) -> VirtioMo
 /// - Not reentrant and not thread-safe (single-writer at boot).
 pub unsafe fn scan() {
     let mut count = DEVICE_COUNT.load(Ordering::Acquire);
+    let max_bus = config::max_bus();
+    let mut buses = BusQueue::new();
+    buses.push(0);
 
-    for dev in 0u8..32 {
-        for func in 0u8..8 {
-            // SAFETY: Standard PCI config read to probe vendor ID.
-            let id_reg = unsafe { config::read32(0, dev, func, 0x00) };
-            let vendor_id = (id_reg & 0xFFFF) as u16;
+    while let Some(bus) = buses.pop() {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                // SAFETY: Standard PCI config read to probe vendor ID.
+                let id_reg = unsafe { config::read32(bus, dev, func, 0x00) };
+                let vendor_id = (id_reg & 0xFFFF) as u16;
 
-            if vendor_id == 0xFFFF {
-                // No device present on this function
-                continue;
+                if vendor_id == 0xFFFF {
+                    // No device present on this function
+                    continue;
+                }
+
+                if count >= MAX_PCI_DEVICES {
+                    crate::println!(
+                        "  [PCI] device table full ({} entries); scan truncated at {:02x}:{:02x}.{}",
+                        MAX_PCI_DEVICES, bus, dev, func
+                    );
+                    DEVICE_COUNT.store(count, Ordering::Release);
+                    return;
+                }
+
+                let device_id = ((id_reg >> 16) & 0xFFFF) as u16;
+
+                // Class / subclass at offset 0x08 (bits 31:16 = class:subclass)
+                // SAFETY: Device confirmed present by vendor ID check.
+                let class_reg = unsafe { config::read32(bus, dev, func, 0x08) };
+                let class = ((class_reg >> 24) & 0xFF) as u8;
+                let subclass = ((class_reg >> 16) & 0xFF) as u8;
+                let prog_if = ((class_reg >> 8) & 0xFF) as u8;
+
+                // Header type at offset 0x0C bits 23:16. Type 1 is a
+                // PCI-to-PCI bridge: queue its secondary bus and skip the
+                // type-0 BAR protocol.
+                // SAFETY: Device confirmed present; offset 0x0C is the
+                // standard header-type dword.
+                let hdr_reg = unsafe { config::read32(bus, dev, func, 0x0C) };
+                let is_bridge = header_type(hdr_reg) == HEADER_TYPE_BRIDGE;
+
+                let mut bars = [0u64; 6];
+                let mut bar_sizes = [0u32; 6];
+                let mut bar_is_io = [false; 6];
+                let mut virtio_modern = VirtioModernCaps::default();
+
+                if is_bridge {
+                    // SAFETY: Device confirmed present and a type-1 header;
+                    // offset 0x18 holds primary/secondary/subordinate bus.
+                    let bus_reg = unsafe { config::read32(bus, dev, func, 0x18) };
+                    let secondary = secondary_bus(bus_reg);
+                    // A secondary at or below this bus is a mis-programmed
+                    // bridge (firmware assigns ascending numbers); do not
+                    // follow it. Beyond the backend's addressable range it
+                    // cannot be read without faulting.
+                    if secondary > bus && secondary <= max_bus {
+                        buses.push(secondary);
+                    }
+                } else {
+                    // SAFETY: Device confirmed present; BAR sizing protocol is safe
+                    // at boot before drivers claim devices.
+                    unsafe {
+                        decode_bars(bus, dev, func, &mut bars, &mut bar_sizes, &mut bar_is_io);
+                    }
+
+                    // Parse virtio-modern capability structures, if any. Returns
+                    // a `present: 0` result for non-virtio devices.
+                    // SAFETY: Device confirmed present; cap walk is side-effect-free.
+                    virtio_modern = unsafe { walk_virtio_modern_caps(bus, dev, func) };
+
+                    // Enable device. PCI Command Register at config offset 0x04
+                    // (16-bit value in low half of the dword at 0x04):
+                    //   bit 0: I/O Space Enable
+                    //   bit 1: Memory Space Enable
+                    //   bit 2: Bus Master Enable (required for the device to DMA)
+                    // SeaBIOS initializes these for devices it recognizes, but
+                    // the set isn't guaranteed across firmwares — making the
+                    // kernel do it post-scan keeps the boot semantics uniform
+                    // (xHCI controllers in particular HCE on first command when
+                    // BME is unset, because their command-ring fetch is a DMA
+                    // read). Status is the high 16 bits of the same dword and
+                    // is RW1C; reading the dword and writing it back unchanged
+                    // preserves status bits (writes of 0 are no-ops on RW1C).
+                    // Bridges are left as firmware programmed them.
+                    // SAFETY: device confirmed present; offset 0x04 is the standard PCI
+                    // command/status register; read the current command/status dword.
+                    let cmd_status = unsafe { config::read32(bus, dev, func, 0x04) };
+                    let want = cmd_status | 0x7; // I/O + Memory + Bus Master
+                    if want != cmd_status {
+                        // SAFETY: same register; write back with I/O+Memory+BusMaster set.
+                        // Status is the high 16 bits and is RW1C, so writing the read-back
+                        // value unchanged (0s) preserves it.
+                        unsafe { config::write32(bus, dev, func, 0x04, want) };
+                    }
+                }
+
+                // SAFETY: `count < MAX_PCI_DEVICES` guaranteed by the check above.
+                // This is the only writer (called once at boot).
+                unsafe {
+                    DEVICES[count] = PciDevice {
+                        bus,
+                        device: dev,
+                        function: func,
+                        vendor_id,
+                        device_id,
+                        class,
+                        subclass,
+                        prog_if,
+                        bars,
+                        bar_sizes,
+                        bar_is_io,
+                        virtio_modern,
+                    };
+                }
+                count += 1;
             }
-
-            if count >= MAX_PCI_DEVICES {
-                // Table full — stop scanning
-                DEVICE_COUNT.store(count, Ordering::Release);
-                return;
-            }
-
-            let device_id = ((id_reg >> 16) & 0xFFFF) as u16;
-
-            // Class / subclass at offset 0x08 (bits 31:16 = class:subclass)
-            // SAFETY: Device confirmed present by vendor ID check.
-            let class_reg = unsafe { config::read32(0, dev, func, 0x08) };
-            let class = ((class_reg >> 24) & 0xFF) as u8;
-            let subclass = ((class_reg >> 16) & 0xFF) as u8;
-            let prog_if = ((class_reg >> 8) & 0xFF) as u8;
-
-            let mut bars = [0u64; 6];
-            let mut bar_sizes = [0u32; 6];
-            let mut bar_is_io = [false; 6];
-            // SAFETY: Device confirmed present; BAR sizing protocol is safe
-            // at boot before drivers claim devices.
-            unsafe {
-                decode_bars(0, dev, func, &mut bars, &mut bar_sizes, &mut bar_is_io);
-            }
-
-            // Parse virtio-modern capability structures, if any. Returns
-            // a `present: 0` result for non-virtio devices.
-            // SAFETY: Device confirmed present; cap walk is side-effect-free.
-            let virtio_modern = unsafe { walk_virtio_modern_caps(0, dev, func) };
-
-            // Enable device. PCI Command Register at config offset 0x04
-            // (16-bit value in low half of the dword at 0x04):
-            //   bit 0: I/O Space Enable
-            //   bit 1: Memory Space Enable
-            //   bit 2: Bus Master Enable (required for the device to DMA)
-            // SeaBIOS initializes these for devices it recognizes, but
-            // the set isn't guaranteed across firmwares — making the
-            // kernel do it post-scan keeps the boot semantics uniform
-            // (xHCI controllers in particular HCE on first command when
-            // BME is unset, because their command-ring fetch is a DMA
-            // read). Status is the high 16 bits of the same dword and
-            // is RW1C; reading the dword and writing it back unchanged
-            // preserves status bits (writes of 0 are no-ops on RW1C).
-            // SAFETY: device confirmed present; offset 0x04 is the standard PCI
-            // command/status register; read the current command/status dword.
-            let cmd_status = unsafe { config::read32(0, dev, func, 0x04) };
-            let want = cmd_status | 0x7; // I/O + Memory + Bus Master
-            if want != cmd_status {
-                // SAFETY: same register; write back with I/O+Memory+BusMaster set.
-                // Status is the high 16 bits and is RW1C, so writing the read-back
-                // value unchanged (0s) preserves it.
-                unsafe { config::write32(0, dev, func, 0x04, want) };
-            }
-
-            // SAFETY: `count < MAX_PCI_DEVICES` guaranteed by the check above.
-            // This is the only writer (called once at boot).
-            unsafe {
-                DEVICES[count] = PciDevice {
-                    bus: 0,
-                    device: dev,
-                    function: func,
-                    vendor_id,
-                    device_id,
-                    class,
-                    subclass,
-                    prog_if,
-                    bars,
-                    bar_sizes,
-                    bar_is_io,
-                    virtio_modern,
-                };
-            }
-            count += 1;
         }
     }
 
@@ -1277,6 +1410,53 @@ mod tests {
         assert_eq!(caps.device_cfg.bar, 4);
         assert_eq!(caps.device_cfg.offset, 0x2000);
         assert_eq!(caps.device_cfg.length, 0x400);
+    }
+
+    #[test]
+    fn header_type_masks_multifunction_bit() {
+        // Offset 0x0C dword: [BIST:8][header:8][latency:8][cacheline:8].
+        assert_eq!(header_type(0x0001_0000), HEADER_TYPE_BRIDGE);
+        assert_eq!(header_type(0x0081_0000), HEADER_TYPE_BRIDGE); // multi-function bridge
+        assert_eq!(header_type(0x0080_0000), 0); // multi-function type 0
+        assert_eq!(header_type(0x00FF_0000), 0x7F);
+    }
+
+    #[test]
+    fn secondary_bus_is_bits_15_8() {
+        // [sec latency:8][subordinate:8][secondary:8][primary:8]
+        assert_eq!(secondary_bus(0x0003_0200), 0x02);
+        assert_eq!(secondary_bus(0x0000_0000), 0);
+        assert_eq!(secondary_bus(0xFFFF_FFFF), 0xFF);
+    }
+
+    #[test]
+    fn bus_queue_admits_each_bus_once_and_is_bounded() {
+        let mut q = BusQueue::new();
+        assert!(q.push(0));
+        assert!(!q.push(0)); // dedupe
+        assert!(q.push(1));
+        assert!(q.push(255));
+        assert_eq!(q.pop(), Some(0));
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(255));
+        assert_eq!(q.pop(), None);
+        // Every bus number admitted exactly once, then nothing more.
+        let mut q = BusQueue::new();
+        let mut admitted = 0;
+        for round in 0..3 {
+            for b in 0..=255u8 {
+                if q.push(b) {
+                    admitted += 1;
+                    assert_eq!(round, 0);
+                }
+            }
+        }
+        assert_eq!(admitted, MAX_PCI_BUSES);
+        let mut pops = 0;
+        while q.pop().is_some() {
+            pops += 1;
+        }
+        assert_eq!(pops, MAX_PCI_BUSES);
     }
 
     #[test]
