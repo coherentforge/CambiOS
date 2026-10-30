@@ -705,6 +705,19 @@ impl SyscallDispatcher {
         }
         crate::SHARDED_IPC.clear_endpoint(endpoint);
 
+        // The policy service listening on its query endpoint is the moment
+        // enforcement can start: from here every query lands on a queue
+        // this registration will not clear, and a sleeping service is
+        // woken by the sender. Before this, the only user task was init
+        // spawning it — no one to ask (ADR-006, structural window).
+        if endpoint_id == crate::policy::POLICY_QUERY_ENDPOINT
+            && ctx.process_id.as_raw()
+                == crate::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire)
+        {
+            crate::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
+            crate::println!("  [Policy] policy service listening on endpoint {}; enforcement enabled", endpoint_id);
+        }
+
         // Remember the registration so `reap_process` can clear this
         // endpoint's queue when the process exits. Lock ordering:
         // PROCESS_TABLE(7) alone; nothing else held here.
@@ -2422,8 +2435,13 @@ impl SyscallDispatcher {
                 new_task_id.as_raw(),
                 core::sync::atomic::Ordering::Release,
             );
-            crate::POLICY_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
-            crate::println!("  [Spawn] policy service identified; enforcement enabled");
+            // Enforcement is NOT switched on here. It starts when this
+            // process registers the query endpoint (handle_register_endpoint):
+            // a query sent before that landed on a queue the registration
+            // then cleared, the policy service slept on an empty queue, and
+            // the query expired — the nightly boot-smoke's first query from
+            // init, 2026-10-30 (`[policy] expiry #1 … Blocked MessageWait(22)`).
+            crate::println!("  [Spawn] policy service identified; enforcement starts at its registration");
         }
 
         crate::audit::emit(crate::audit::RawAuditEvent::process_created(

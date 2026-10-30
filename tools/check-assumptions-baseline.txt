@@ -291,10 +291,10 @@ src/memory/mod.rs:77:ENTRIES_PER_TABLE
 src/memory/mod.rs:675:BOOTLOADER_BASE
 src/memory/mod.rs:678:KERNEL_LOAD_ADDR
 src/memory/mod.rs:681:EXTENDED_MEMORY_BASE
-src/policy/mod.rs:115:DECISION_NONE
-src/policy/mod.rs:116:DECISION_ALLOW
-src/policy/mod.rs:117:DECISION_DENY
-src/policy/mod.rs:120:DECISION_EXPIRED
+src/policy/mod.rs:116:DECISION_NONE
+src/policy/mod.rs:117:DECISION_ALLOW
+src/policy/mod.rs:118:DECISION_DENY
+src/policy/mod.rs:121:DECISION_EXPIRED
 src/process.rs:35:MAX_VMAS
 src/process.rs:39:VMA_ALLOC_BASE
 src/process.rs:386:HEAP_SIZE

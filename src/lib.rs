@@ -1151,9 +1151,11 @@ pub static REPLY_ENDPOINT: [core::sync::atomic::AtomicU32; 256] =
 // Policy service infrastructure (ADR-006)
 // ============================================================================
 
-/// Whether the policy service has been identified and the upcall path is active.
-/// Set by `handle_spawn` when init spawns the manifest row named
-/// `policy-service`; never cleared — a policy service that dies leaves
+/// Whether the policy service is listening and the upcall path is active.
+/// Set by `handle_register_endpoint` when the process `handle_spawn`
+/// identified as the manifest row `policy-service` registers the query
+/// endpoint (a query sent before that registration would be cleared by
+/// it); never cleared — a policy service that dies leaves
 /// enforcement on (queries time out to Deny) until init restarts it.
 /// Before it is set the only user task is init, and `policy_check()`
 /// allows because there is no one to ask (the structural window ADR-006

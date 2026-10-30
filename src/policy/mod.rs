@@ -22,8 +22,9 @@
 //! audited as `SyscallDenied`, and never cached (the next attempt asks
 //! again). Enforcement availability may degrade a service into retrying;
 //! it may not degrade into permission. The one structural bypass is the
-//! window before the policy service exists, in which the only user task
-//! is init spawning it (ADR-018 boot wave): there is no one to ask.
+//! window before the policy service is listening on its query endpoint,
+//! in which the only user task that has run is init spawning it (ADR-018
+//! boot wave): there is no one to ask.
 
 use crate::ipc::interceptor::InterceptDecision;
 use crate::ipc::{EndpointId, Message, ProcessId};
@@ -475,11 +476,13 @@ unsafe impl Sync for PolicyCacheCell {}
 ///
 /// # Fast-path bypasses (no locks)
 ///
-/// - `POLICY_SERVICE_READY` is false → Allow. Structural: before the
-///   policy service is spawned the only user task is init, and nothing
-///   else can be asked. The flag is never cleared, so a policy service
-///   that later dies leaves enforcement on (queries time out → Deny)
-///   until init restarts it.
+/// - `POLICY_SERVICE_READY` is false → Allow. Structural: until the
+///   policy service has registered its query endpoint the only user task
+///   that has run is init, spawning it, and nothing can be asked (a query
+///   sent earlier would be cleared by that registration — the nightly
+///   boot-smoke's expired first query, 2026-10-30). The flag is never
+///   cleared, so a policy service that later dies leaves enforcement on
+///   (queries time out → Deny) until init restarts it.
 /// - Caller is the policy service → Allow (reentrancy prevention)
 /// - Caller is a kernel task (cr3 == 0) → Allow
 ///
