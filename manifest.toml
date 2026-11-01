@@ -42,7 +42,10 @@
 # depends_on = hard startup dependencies only (init spawns in DAG
 # order and gates on readiness pings). Soft orderings the retired
 # boot chain encoded (e.g. "policy first so enforcement is warm") are
-# NOT dependencies; the kernel's fail-open policy window covers them.
+# NOT dependencies: enforcement starts when the policy service registers
+# its query endpoint, and until then the only task that has run is init
+# spawning it (the one structural "no one to ask" window; the kernel
+# fails closed everywhere else).
 #
 # `arch` tags select per-deployment manifests (`--arch`); `profile`
 # tags select between entries that fill the same role (`--profile`,
