@@ -15,6 +15,10 @@ name = "cambios-fde-proto"
 version = "0.1.0"
 
 [[package]]
+name = "cambios-libinput-proto"
+version = "0.1.0"
+
+[[package]]
 name = "cambios-libsys"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "cambios-blk-proto",
  "cambios-fde-proto",
+ "cambios-libinput-proto",
  "cambios-libsys",
  "cambios-libsys-rt",
  "cambios-style",

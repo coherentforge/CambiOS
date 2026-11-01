@@ -313,11 +313,15 @@ udp-stack:
 		'-Crelocation-model=static') cargo build --release
 	@echo "=== UDP stack ready ==="
 
+# SHELL_FEATURES: cargo features for the shell. The headless image sets
+# `headless-input` (the shell owns the input endpoint; see manifest.toml's
+# second `shell` entry). Empty for the ISO and the GUI profiles.
+SHELL_FEATURES ?=
 shell:
-	@echo "=== Building Shell ==="
+	@echo "=== Building Shell$(if $(SHELL_FEATURES), (features: $(SHELL_FEATURES)),) ==="
 	cd $(SHELL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
+		'-Crelocation-model=static') cargo build --release $(if $(SHELL_FEATURES),--features $(SHELL_FEATURES),)
 	@echo "=== Shell ready ==="
 
 policy-service:
@@ -1163,6 +1167,15 @@ img-x86: iso manifest-profile
 	mformat -i $(IMG_X86) -F ::
 	mcopy -s -i $(IMG_X86) iso_root/EFI iso_root/boot iso_root/limine.conf ::/
 	mcopy -o -i $(IMG_X86) $(MANIFEST_PROFILE_BIN) ::/boot/manifest.bin
+	# Second swap, headless only: the shell built as the input consumer
+	# (`headless-input`), signed, replacing the ISO's plain shell in the
+	# image. iso_root keeps the plain one so the ISO never carries it.
+	if [ "$(PROFILE)" = "headless" ]; then \
+		$(MAKE) shell SHELL_FEATURES=headless-input && \
+		cp $(SHELL_ELF) /tmp/shell-headless-signed.elf && \
+		$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-headless-signed.elf && \
+		mcopy -o -i $(IMG_X86) /tmp/shell-headless-signed.elf ::/boot/shell.elf; \
+	fi
 	@echo "=== $(IMG_X86) ready ($(PROFILE) manifest) ==="
 	@echo "To write to USB: make usb DEVICE=/dev/diskN  (or: sudo dd if=$(IMG_X86) of=/dev/diskN bs=1M)"
 

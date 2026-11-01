@@ -13,6 +13,15 @@ cambios-libsys-rt = { path = "../libsys-rt" }
 cambios-style = { path = "../cambios-style" }
 cambios-fde-proto = { path = "../../cambios-fde-proto" }
 cambios-blk-proto = { path = "../../cambios-blk-proto" }
+cambios-libinput-proto = { path = "../libinput-proto" }
+
+[features]
+# The headless profile has no compositor, so the shell is the image's
+# input consumer: it owns the input endpoint and reads USB keyboard
+# events from it alongside the kernel console (manifest `shell`
+# entry tagged `headless`). GUI profiles leave it off; probing the
+# endpoint there would be a reserved-endpoint squat and is audited.
+headless-input = []
 
 [profile.release]
 opt-level = "s"        # Size-optimized (small ELF)

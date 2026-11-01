@@ -30,9 +30,23 @@ const SHELL_ENDPOINT: u32 = 18;
 /// future segment without revisiting the type.
 const PROMPT_BUF_SIZE: usize = 128;
 
+/// Input events arrive here from usb-host in the headless profile
+/// (the compositor's input endpoint in the GUI profiles; the manifest
+/// reserves it to whichever consumer the profile ships).
+#[cfg(feature = "headless-input")]
+const INPUT_ENDPOINT: u32 = 30;
+
+#[cfg(not(feature = "headless-input"))]
 cambios_libsys_rt::service_main! {
     name: "Shell",
     endpoint: SHELL_ENDPOINT,
+    main: run,
+}
+
+#[cfg(feature = "headless-input")]
+cambios_libsys_rt::service_main! {
+    name: "Shell",
+    endpoints: [SHELL_ENDPOINT, INPUT_ENDPOINT],
     main: run,
 }
 
@@ -127,18 +141,61 @@ impl<'a> core::fmt::Write for StackWriter<'a> {
 // Line reader (polling serial input)
 // ============================================================================
 
+/// One keystroke from the kernel console (serial / PS/2), or `None`.
+fn console_byte() -> Option<u8> {
+    let mut byte_buf = [0u8; 1];
+    if sys::console_read(&mut byte_buf) > 0 {
+        Some(byte_buf[0])
+    } else {
+        None
+    }
+}
+
+/// One keystroke from the input endpoint (USB keyboard via usb-host),
+/// or `None`. Key-down and auto-repeat events become bytes the line
+/// reader already understands; everything else (key-up, pointer,
+/// unmapped keys) is consumed and dropped. The wire format's ASCII
+/// field covers printable keys only, so Enter and Backspace are mapped
+/// from the HID usage code here.
+#[cfg(feature = "headless-input")]
+fn input_endpoint_byte() -> Option<u8> {
+    use cambios_libinput_proto::{decode_event, EventType, EVENT_SIZE};
+    const HID_ENTER: u32 = 0x28;
+    const HID_BACKSPACE: u32 = 0x2A;
+    const HID_KEYPAD_ENTER: u32 = 0x58;
+
+    let mut recv_buf = [0u8; 36 + EVENT_SIZE];
+    let msg = sys::try_recv_verified(INPUT_ENDPOINT, &mut recv_buf)?;
+    let event = decode_event(msg.payload())?;
+    match event.event_type {
+        EventType::KeyDown | EventType::KeyRepeat => {}
+        _ => return None,
+    }
+    let key = event.keyboard();
+    match key.keycode {
+        HID_ENTER | HID_KEYPAD_ENTER => Some(b'\r'),
+        HID_BACKSPACE => Some(0x08),
+        _ if (0x20..0x7F).contains(&key.unicode) => Some(key.unicode as u8),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "headless-input"))]
+fn input_endpoint_byte() -> Option<u8> {
+    None
+}
+
 fn read_line(buf: &mut [u8]) -> usize {
     let mut pos = 0;
-    let mut byte_buf = [0u8; 1];
 
     loop {
-        let n = sys::console_read(&mut byte_buf);
-        if n <= 0 {
-            sys::yield_now();
-            continue;
-        }
-
-        let ch = byte_buf[0];
+        let ch = match console_byte().or_else(input_endpoint_byte) {
+            Some(ch) => ch,
+            None => {
+                sys::yield_now();
+                continue;
+            }
+        };
 
         match ch {
             // Enter (CR or LF) — submit line

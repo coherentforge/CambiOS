@@ -232,13 +232,15 @@ fn filter_registry(
     target: &str,
     tags: impl Fn(&ServiceDef) -> &Vec<String>,
 ) {
-    let kept: Vec<String> = registry
+    // Filter each entry on its OWN tags, then derive the kept-name set
+    // from the survivors. Filtering by name let a same-named entry with
+    // non-matching tags survive because its sibling matched; same-named
+    // entries with disjoint tags are how one binary ships a different
+    // posture per profile (the headless shell owns the input endpoint).
+    registry
         .services
-        .iter()
-        .filter(|s| tags(s).is_empty() || tags(s).iter().any(|t| t == target))
-        .map(|s| s.name.clone())
-        .collect();
-    registry.services.retain(|s| kept.contains(&s.name));
+        .retain(|s| tags(s).is_empty() || tags(s).iter().any(|t| t == target));
+    let kept: Vec<String> = registry.services.iter().map(|s| s.name.clone()).collect();
     for svc in &registry.services {
         for dep in &svc.depends_on {
             if !kept.contains(dep) {
@@ -252,6 +254,25 @@ fn filter_registry(
         }
     }
     eprintln!("{} filter '{}': {} service(s) kept", dimension, target, registry.services.len());
+}
+
+/// After every filter has run, each name must survive exactly once.
+/// Same-named entries are legal in the registry only with tag lists that
+/// never both match one build; the emitted blob's `validate_unique`
+/// would also catch this, but by index, not by name.
+fn reject_duplicate_names(registry: &Registry, arch: Option<&str>, profile: &str) {
+    for (i, svc) in registry.services.iter().enumerate() {
+        if registry.services[..i].iter().any(|s| s.name == svc.name) {
+            eprintln!(
+                "two entries named '{}' both ship for arch '{}' / profile '{}' — their \
+                 `arch` / `profile` tag lists must be disjoint so exactly one is kept",
+                svc.name,
+                arch.unwrap_or("any"),
+                profile
+            );
+            exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -312,6 +333,7 @@ fn main() {
         filter_registry(&mut registry, "arch", target, |s| &s.arch);
     }
     filter_registry(&mut registry, "profile", &profile, |s| &s.profile);
+    reject_duplicate_names(&registry, arch.as_deref(), &profile);
 
     // Resolve endpoint dependencies against the KEPT set: exactly one
     // kept entry owns each endpoint (validate_unique enforces this on
@@ -554,4 +576,52 @@ fn main() {
         }
     }
     println!("  sign with: sign-elf [--seed <hex>] {}", output);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry(toml_text: &str) -> Registry {
+        toml::from_str(toml_text).expect("test registry parses")
+    }
+
+    const TWO_SHELLS: &str = r#"
+[init]
+endpoint = 1
+syscalls = ["spawn"]
+
+[[service]]
+name = "shell"
+syscalls = ["print"]
+endpoints = [18]
+profile = ["default", "framebuffer-fallback"]
+
+[[service]]
+name = "shell"
+syscalls = ["print", "try-recv-msg"]
+endpoints = [18, 30]
+profile = ["headless"]
+
+[[service]]
+name = "everywhere"
+syscalls = ["print"]
+endpoints = [40]
+"#;
+
+    #[test]
+    fn same_name_disjoint_profiles_keeps_exactly_the_matching_entry() {
+        let mut r = registry(TWO_SHELLS);
+        filter_registry(&mut r, "profile", "headless", |s| &s.profile);
+        let shells: Vec<&ServiceDef> = r.services.iter().filter(|s| s.name == "shell").collect();
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].endpoints, vec![18, 30]);
+        assert!(r.services.iter().any(|s| s.name == "everywhere"));
+
+        let mut r = registry(TWO_SHELLS);
+        filter_registry(&mut r, "profile", "default", |s| &s.profile);
+        let shells: Vec<&ServiceDef> = r.services.iter().filter(|s| s.name == "shell").collect();
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].endpoints, vec![18]);
+    }
 }

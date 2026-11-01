@@ -281,3 +281,19 @@ syscalls = ["console-read", "exit", "get-pid", "get-principal", "get-time", "get
 endpoints = [18]
 system = ["create-process"]
 depends_on = ["fs-service"]
+profile = ["default", "framebuffer-fallback"]
+
+# Headless posture of the same binary (built with the `headless-input`
+# feature; `make img-x86 PROFILE=headless` stages it). No compositor in
+# this profile, so the shell is the image's input consumer: it owns
+# endpoint 30, where usb-host delivers keyboard events, and reads it
+# alongside the kernel console. The kernel console alone is serial /
+# PS/2, which a USB-keyboard machine with no serial port never feeds
+# (the Dell 3630, 2026-10-31: prompt drawn, every keystroke dropped).
+[[service]]
+name = "shell"
+syscalls = ["console-read", "exit", "get-pid", "get-principal", "get-time", "get-wallclock", "print", "recv-msg", "register-endpoint", "spawn", "try-recv-msg", "verify-volume-header", "wait-task", "write", "yield"]
+endpoints = [18, 30]
+system = ["create-process"]
+depends_on = ["fs-service"]
+profile = ["headless"]
