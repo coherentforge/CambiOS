@@ -198,6 +198,7 @@ fn dispatch_command(line: &[u8]) {
         b"did-key" | b"didkey" => cmd_did_key(args),
         b"play" => cmd_play(args),
         b"fde-test" => cmd_fde_test(),
+        b"disk" => cmd_disk(),
         b"exit" => sys::exit(0),
         _ => cmd_spawn(cmd),
     }
@@ -222,6 +223,7 @@ fn cmd_help() {
     print_help_row("did-key", "render Principal as did:key, or encode/decode one");
     print_help_row("play", "launch a game; `play` alone lists available games");
     print_help_row("fde-test", "FDE volume header sign+verify round-trip (Stream A A-iv)");
+    print_help_row("disk", "ask the block driver what it found (capacity, health)");
     print_help_row("exit", "exit shell");
     sys::print(b"\r\n");
     print_help_section("External commands (boot modules):");
@@ -567,6 +569,84 @@ fn print_i64(n: i64) {
     let mut w = StackWriter::new(&mut buf);
     let _ = write!(w, "{}", n);
     sys::print(w.into_slice());
+}
+
+// ============================================================================
+// disk — query the block driver on its user endpoint
+// ============================================================================
+
+/// One request to the block driver (endpoint 24), reply polled on the
+/// shell's own endpoint. The driver answers `msg.from_endpoint()`, which
+/// is the shell's first registered endpoint. `None` on transport failure
+/// or timeout.
+fn blk_call(req: &[u8], out: &mut [u8; 16]) -> Option<usize> {
+    if sys::write(cambios_blk_proto::BLK_ENDPOINT, req) < 0 {
+        return None;
+    }
+    let mut recv_buf = [0u8; 292];
+    for _ in 0..400 {
+        if let Some(msg) = sys::recv_verified(SHELL_ENDPOINT, &mut recv_buf) {
+            let payload = msg.payload();
+            let n = core::cmp::min(payload.len(), out.len());
+            out[..n].copy_from_slice(&payload[..n]);
+            return Some(n);
+        }
+        sys::yield_now();
+    }
+    None
+}
+
+fn print_blk_status(status: u8) {
+    use cambios_blk_proto::*;
+    match status {
+        STATUS_NO_DEVICE => sys::print(b"disk: the driver found no block device on this machine\r\n"),
+        STATUS_DEVICE_DEAD => sys::print(b"disk: the device is marked dead (a command timed out)\r\n"),
+        STATUS_UNIMPLEMENTED => sys::print(b"disk: command not implemented by this driver\r\n"),
+        STATUS_ERROR => sys::print(b"disk: driver reported an error\r\n"),
+        _ => print_unknown_status("disk", status),
+    }
+}
+
+/// `disk` — the operator's view of the block seam: is a driver answering,
+/// did it find a device, how big is it, is it still alive. Reads nothing
+/// from the disk itself (block reads on the user endpoint are kernel-only).
+fn cmd_disk() {
+    use cambios_blk_proto::*;
+    let mut buf = [0u8; 16];
+
+    let n = match blk_call(&[CMD_GET_CAPACITY], &mut buf) {
+        Some(n) => n,
+        None => {
+            sys::print(b"disk: no block driver answered on endpoint 24\r\n");
+            return;
+        }
+    };
+    if n == 0 || buf[0] != STATUS_OK {
+        print_blk_status(if n == 0 { STATUS_ERROR } else { buf[0] });
+        return;
+    }
+    let sectors = match decode_u64_reply(&buf[..n]) {
+        Some((_, v)) => v,
+        None => {
+            sys::print(b"disk: short capacity reply\r\n");
+            return;
+        }
+    };
+    sys::print(b"disk: ");
+    print_i64(sectors as i64);
+    sys::print(b" sectors of 512 B = ");
+    print_i64((sectors / 2048) as i64);
+    sys::print(b" MiB, ");
+    print_i64((sectors / SECTORS_PER_LOGICAL_BLOCK) as i64);
+    sys::print(b" logical blocks of 4 KiB\r\n");
+
+    match blk_call(&[CMD_GET_STATUS], &mut buf) {
+        Some(n) if n >= 2 && buf[0] == STATUS_OK => {
+            sys::print(if buf[1] != 0 { b"disk: device alive\r\n" as &[u8] } else { b"disk: device DEAD\r\n" });
+        }
+        Some(n) if n >= 1 => print_blk_status(buf[0]),
+        _ => sys::print(b"disk: no reply to the status query\r\n"),
+    }
 }
 
 // ============================================================================
