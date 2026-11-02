@@ -1,0 +1,45 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-080",
+      "input": {
+        "limit": "MAX_TCP_CONNECTIONS_PER_PRINCIPAL",
+        "capacity": 128,
+        "requests": 129,
+        "principals": [
+          "P1",
+          "P2"
+        ]
+      },
+      "expect": {
+        "P1_active_connections": 128,
+        "P1_extra_result": "ResourceLimit",
+        "P2_state_changed": false
+      },
+      "covers": [
+        "AT-net-010",
+        "INV-net-011",
+        "INV-net-012"
+      ],
+      "source": "CambiOS per-principal quota"
+    },
+    {
+      "id": "NET-V-081",
+      "input": {
+        "rejected_payload_hex": "5345435245542d5041594c4f4144",
+        "diagnostics_enabled": true
+      },
+      "expect": {
+        "drop_counter_incremented": true,
+        "payload_hex_present_in_diagnostics": false
+      },
+      "covers": [
+        "AT-net-015",
+        "INV-net-017"
+      ],
+      "source": "CambiOS diagnostic privacy boundary"
+    }
+  ]
+}

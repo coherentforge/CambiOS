@@ -1,0 +1,24 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-001",
+      "input": {
+        "frame_hex": "000102030405",
+        "interface_mtu": 1500
+      },
+      "expect": {
+        "result": "Malformed",
+        "socket_events": 0,
+        "tx_frames": 0
+      },
+      "covers": [
+        "AT-net-001",
+        "INV-net-001",
+        "INV-net-013"
+      ],
+      "source": "Ethernet II minimum header length"
+    }
+  ]
+}

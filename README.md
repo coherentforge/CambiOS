@@ -217,7 +217,7 @@ Narrative walkthroughs that follow a concrete thing through the system, useful i
 
 ### Draft specifications
 
-- [TCP/IP Stack Specification](docs/tcp-ip-stack-spec.md): review draft for a portable, verifiable user-space network stack
+- [CambiOS network stack](spec/crates/net.md): 1986-format review draft and clean-room conformance contract
 
 ---
 

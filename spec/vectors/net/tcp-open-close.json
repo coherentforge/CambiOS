@@ -1,0 +1,110 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-050",
+      "input": {
+        "trace": [
+          {
+            "direction": "in",
+            "flags": [
+              "SYN"
+            ],
+            "seq": 100,
+            "ack": 0
+          },
+          {
+            "direction": "out",
+            "flags": [
+              "SYN",
+              "ACK"
+            ],
+            "seq": 500,
+            "ack": 101
+          },
+          {
+            "direction": "in",
+            "flags": [
+              "ACK"
+            ],
+            "seq": 101,
+            "ack": 501
+          }
+        ]
+      },
+      "expect": {
+        "state_after_event": [
+          "SynReceived",
+          "SynReceived",
+          "Established"
+        ],
+        "delivered_stream_hex": "",
+        "duplicate_bytes": 0
+      },
+      "covers": [
+        "AT-net-006",
+        "INV-net-007"
+      ],
+      "source": "RFC 9293 §§3.4, 3.5"
+    },
+    {
+      "id": "NET-V-051",
+      "input": {
+        "trace": [
+          {
+            "direction": "in",
+            "flags": [
+              "FIN",
+              "ACK"
+            ],
+            "seq": 101,
+            "ack": 501
+          },
+          {
+            "direction": "local",
+            "event": "close"
+          },
+          {
+            "direction": "in",
+            "flags": [
+              "ACK"
+            ],
+            "seq": 102,
+            "ack": 502
+          }
+        ]
+      },
+      "expect": {
+        "state_after_event": [
+          "CloseWait",
+          "LastAck",
+          "Closed"
+        ]
+      },
+      "covers": [
+        "AT-net-006",
+        "INV-net-007"
+      ],
+      "source": "RFC 9293 §3.6"
+    },
+    {
+      "id": "NET-V-052",
+      "input": {
+        "state": "Established",
+        "peer_receive_window_bytes": 1000,
+        "congestion_window_bytes": 800,
+        "unsent_data_bytes": 1200
+      },
+      "expect": {
+        "new_data_bytes_sent": 800,
+        "bytes_outside_minimum_window": 0
+      },
+      "covers": [
+        "AT-net-007",
+        "INV-net-008"
+      ],
+      "source": "RFC 9293 §3.8.6; RFC 5681 §3.1"
+    }
+  ]
+}
