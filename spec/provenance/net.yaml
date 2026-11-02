@@ -36,7 +36,11 @@ pathway:
     The authoring actions for this draft were not executed through the pathway
     runner before the attribution method was located. No retrospective run or
     script hash is fabricated.
-  commit_binding_status: pending_commit
+  commit_binding_status: not_bound
+  commit_binding_status_reason: >-
+    The required PathwayRun was not recorded for the authoring work, so this
+    commit cannot yet be honestly bound to a run. A later review commit must be
+    generated through the canonical pathway and carry its verified run binding.
   required_binding:
     commit_trailer: Pathway-Run
     git_note_ref: refs/notes/pathways
