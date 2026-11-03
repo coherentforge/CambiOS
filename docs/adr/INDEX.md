@@ -48,3 +48,4 @@ Canonical list of architecture decision records. Auto-generated from each ADR's 
 | 036 | [Typed MMIO Register Blocks for Device Drivers](036-typed-mmio-register-blocks.md) | Accepted | 2026-06-07 |
 | 037 | [Native App Framework: runtime, IPC stdlib, toolkit, service scaffolding](037-native-app-framework.md) | Accepted | 2026-06-10 |
 | 038 | [Sandboxed Guest Processes - Unsigned Code Under a Derived Principal](038-sandboxed-guest-processes.md) | Proposed | 2026-10-27 |
+| 039 | [Network Stack Architecture: the NIC seam, a clean-room verifiable engine, and the socket boundary](039-network-stack-architecture.md) | Proposed | 2026-11-02 |
