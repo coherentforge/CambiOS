@@ -164,13 +164,14 @@ Each of these is named here so none is forgotten and none blocks the first netwo
 
 | id | property | discharges |
 |---|---|---|
-| P1 | For all `(seg.seq, seg.len, rcv.nxt, rcv.wnd)`, `acceptable()` agrees with the RFC 9293 § 3.10.7.4 table under wrapping arithmetic | INV-net-006 |
-| P2 | For all `(state, flags)`, `next_state()` returns a state in `TRANSITIONS[state]`; no transition leaves the RFC 4022 graph | INV-net-006..008 |
+| P1 | For all `(seg.seq, seg.len, rcv.nxt, rcv.wnd)`, `acceptable()` agrees with the RFC 9293 § 3.10.7.4 table under wrapping arithmetic | INV-net-007 |
+| P2 | For all `(state, flags)`, `next_state()` returns a state in `TRANSITIONS[state]`; no transition leaves the RFC 4022 graph | INV-net-007 |
 | P3 | An RST with `seg.seq != rcv.nxt` never changes state and yields exactly one challenge ACK or nothing (rate limit) | INV-net-009, RFC 5961 § 3.2 |
 | P4 | A SYN in any synchronised state never resets; it yields a challenge ACK | INV-net-009, RFC 5961 § 4 |
-| P5 | The delivered byte sequence is a gap-free, duplicate-free prefix of the sender's sequence space for any arrival order of ≤ `MAX_OOO_SEGMENTS` | INV-net-010 |
+| P5 | The delivered byte sequence is a gap-free, duplicate-free prefix of the sender's sequence space for any arrival order of ≤ `MAX_OOO_SEGMENTS` | B-12 |
 | P6 | `step(arbitrary bytes ≤ 1514)` returns without panic and without out-of-bounds access, in every state | INV-net-013, B-6, B-9 |
-| P7 | Socket, listener, half-open, out-of-order and ARP tables never exceed their bound | INV-net-012 |
+| P7 | Socket, listener, half-open, out-of-order and ARP tables never exceed their bound | INV-net-011, INV-net-012 |
+| P8 | The send path never emits sequence-space data beyond `min(snd_wnd, cwnd)` | INV-net-008 |
 
 Harnesses are bounded (unwind limits named per harness). Full functional correctness of the stream (P5 unbounded) is the Verus target once that pivot lands (CLAIMS C-11 / C-12); until then it is a differential property plus the bounded harness. Performance properties (RTO convergence, cwnd growth) are measured, not proved. A harness is never weakened (bound lowered, assertion removed) without a dated line in the decision log saying why.
 
@@ -190,7 +191,7 @@ Adopted now, with where each binds:
 
 | id | requirement | binds to |
 |---|---|---|
-| INV-net-012 | a Principal cannot exhaust the socket table | `MAX_SOCKETS_PER_PRINCIPAL`; `FULL` to that client, others unaffected; P7 |
+| INV-net-011 / 012 | every table stays within its named capacity; exhausting one returns `ResourceLimit` or drops only the protected packet, without altering another Principal's state | `MAX_SOCKETS_PER_PRINCIPAL` and the other § 8 bounds; `FULL` to the exhausted client only; P7 |
 | INV-net-013 | no panic, out-of-bounds, unchecked wrap or unbounded work on any input | `step` totality (P6); `libchan` single-fetch rule; parsers over length-asserted slices |
 | INV-net-017 | no packet payload bytes in any default diagnostic output | the stack and both drivers |
 | INV-net-009 / B-13 | reset and SYN defence per RFC 5961 with a rate limit | P3, P4, `CHALLENGE_ACK_PER_SEC` |
@@ -265,7 +266,7 @@ Crates: `cambios-net-proto` (wire format), `user/libchan` (rings; the one `unsaf
 
 ## Verification Stance
 
-The pure core is the verification target and the whole design exists to make it one: no I/O, no allocation, no unsafe, fixed tables, exhaustive matches, wrapping arithmetic made explicit, a transition table the proofs read directly. P1 to P7 are bounded Kani harnesses in CI from the first engine commit; the unbounded stream property is the Verus target. The ring library is fuzzed (`fuzz_chan_ring`) and its one `unsafe` module has four stated obligations; the engine has its own fuzz target (`fuzz_engine_step`). The shell is thin enough that its correctness argument is "it copies bytes between things the proofs cover". The wire contract is host-tested round-trip. Every acceptance condition in this area is executable: a test suite, a fuzz run, a proof harness, the build gate, or a QEMU run with required serial lines and a scripted host peer, each judged by exit code and never by a person reading output. What is not verified: the drivers' DMA paths (unchanged by this work), timing behaviour (measured), and interoperability with implementations that disagree with the RFC (recorded case by case in the oracle's allow list).
+The pure core is the verification target and the whole design exists to make it one: no I/O, no allocation, no unsafe, fixed tables, exhaustive matches, wrapping arithmetic made explicit, a transition table the proofs read directly. P1 to P8 are bounded Kani harnesses in CI from the first engine commit; the unbounded stream property is the Verus target. The ring library is fuzzed (`fuzz_chan_ring`) and its one `unsafe` module has four stated obligations; the engine has its own fuzz target (`fuzz_engine_step`). The shell is thin enough that its correctness argument is "it copies bytes between things the proofs cover". The wire contract is host-tested round-trip. Every acceptance condition in this area is executable: a test suite, a fuzz run, a proof harness, the build gate, or a QEMU run with required serial lines and a scripted host peer, each judged by exit code and never by a person reading output. What is not verified: the drivers' DMA paths (unchanged by this work), timing behaviour (measured), and interoperability with implementations that disagree with the RFC (recorded case by case in the oracle's allow list).
 
 ## Why Not Other Options
 
@@ -285,7 +286,7 @@ In order, each tri-arch green before the next; the kernel step is on main, the r
 2. **Ring library** (`libchan` + fuzz target): landed, including one-shot accessors and the violation limit.
 3. **Kernel: scratch frame + `chan.peer_violation`** (ADR-007 § Divergence 8): on main, full review protocol; blocks the stack shell, not the engine.
 4. **Drivers** gain the seam, lose `SEND_PACKET` / `RECV_PACKET`.
-5. **Engine** (`cambios-netcore`): host tests, back-to-back, differential harness, P1 to P7, CLAIMS rows, ASSUMPTIONS rows. May land before step 3.
+5. **Engine** (`cambios-netcore`): host tests, back-to-back, differential harness, P1 to P8, CLAIMS rows, ASSUMPTIONS rows. May land before step 3.
 6. **Stack shell** + manifest (udp-stack removed); waits on step 3.
 7. **Clients** (`libnet`, `tcp-echo`).
 8. **Tooling**: runner flags, Makefile targets, the published packet, STATUS.
