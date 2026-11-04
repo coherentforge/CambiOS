@@ -622,6 +622,51 @@ pub fn preemption_held() -> bool {
     false
 }
 
+// ============================================================================
+// Boot hand-off: the boot context keeps the CPU until it enters its idle loop
+// ============================================================================
+
+/// True from power-on until the boot CPU's `kmain` calls [`boot_handoff`]
+/// at the door of its idle loop. While set, `on_timer_isr` and
+/// `on_resched_ipi` on every CPU account the tick but never switch tasks.
+///
+/// The boot context *is* the idle task (slot 0): lowest band, one-tick
+/// slice, picked only when nothing else is Ready. On x86_64 interrupts
+/// come on inside `init_hardware_interrupts`, and the PCI scan, AP
+/// bring-up, task distribution and the `kernel_rsp0` pre-set all run
+/// after that — work no task may overtake. Without this gate the first
+/// tick on a slow machine handed the CPU to init in the middle of the
+/// PCI scan; every driver probed an empty device table, and a
+/// yield-spinning fallback kept a task Ready forever, so the idle task
+/// never ran again: no PCI table, no APs, the boot wave never settled
+/// (boot-smoke CI 2026-10-31 → 11-02; reproduced on the Mac by
+/// duty-cycling QEMU with SIGSTOP). Same rule as `PREEMPT_DEPTH` above,
+/// one level up: the boot context holds the whole system, and a holder
+/// is always running.
+static BOOT_CONTEXT_HOLDS_CPU: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Called once, by the boot CPU's `kmain` on every architecture,
+/// immediately before it enters its idle loop. From here the timer may
+/// schedule tasks on every CPU; a Ready task waits at most one tick.
+pub fn boot_handoff() {
+    BOOT_CONTEXT_HOLDS_CPU.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Is the boot context still holding the CPU? The timer and reschedule
+/// handlers do not switch tasks while it is.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn boot_context_holds_cpu() -> bool {
+    BOOT_CONTEXT_HOLDS_CPU.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Host-test stub: no boot context, scheduling is always allowed.
+#[cfg(test)]
+pub fn boot_context_holds_cpu() -> bool {
+    false
+}
+
 /// Whether `cpu` was last seen running its idle task.
 pub fn cpu_is_idle(cpu: usize) -> bool {
     cpu < MAX_CPUS && CPU_IDLE[cpu].load(core::sync::atomic::Ordering::Acquire)

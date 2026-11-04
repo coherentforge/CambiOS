@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:385:eventually
-CLAUDE.md:402:deferred
+CLAUDE.md:386:eventually
+CLAUDE.md:403:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -90,16 +90,16 @@ src/fs/block_driver_client.rs:78:deferred
 src/ipc/capability.rs:744:deferred
 src/ipc/capability.rs:803:TODO
 src/lib.rs:110:TBD
-src/lib.rs:1276:deferred
-src/lib.rs:1284:deferred
-src/lib.rs:1292:deferred
+src/lib.rs:1321:deferred
+src/lib.rs:1329:deferred
+src/lib.rs:1337:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
-src/microkernel/main.rs:1014:for-now
-src/microkernel/main.rs:1106:for-now
-src/microkernel/main.rs:2143:deferred
-src/microkernel/main.rs:2172:deferred
-src/microkernel/main.rs:2479:for-now
+src/microkernel/main.rs:1029:for-now
+src/microkernel/main.rs:1121:for-now
+src/microkernel/main.rs:2158:deferred
+src/microkernel/main.rs:2187:deferred
+src/microkernel/main.rs:2494:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:1003:deferred
 src/process.rs:1004:deferred
@@ -107,8 +107,8 @@ src/reaper.rs:4:deferred
 src/reaper.rs:9:deferred
 src/reaper.rs:43:deferred
 src/reaper.rs:65:deferred
-src/scheduler/mod.rs:392:placeholder
-src/scheduler/mod.rs:393:placeholder
+src/scheduler/mod.rs:395:placeholder
+src/scheduler/mod.rs:396:placeholder
 src/syscalls/dispatcher.rs:4357:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO

@@ -2,7 +2,7 @@
 doc_type: implementation_reference
 owns: src/scheduler/
 auto_refresh: required
-last_synced_to_code: 2026-06-04
+last_synced_to_code: 2026-11-04
 authoritative_for: scheduler internals, task lifecycle, time slicing, priority bands, blocking primitives, IPC integration with the scheduler
 -->
 
@@ -140,6 +140,8 @@ arch-specific ASM stub:
 `try_lock()` (rather than `lock()`) on both the timer and scheduler is essential: the ISR may preempt code that already holds those locks, and a blocking `lock()` would deadlock the CPU. If a `try_lock` fails the ISR skips that tick — the next one is 10 ms away.
 
 **Preemption and plain spinlocks.** Before `isr_tick_and_schedule`, the ISR asks `crate::preemption_held()`: whether the interrupted context on this CPU holds a plain `Spinlock` (`PREEMPT_DEPTH[cpu]` non-zero; `Spinlock::lock`/`try_lock` raise it before acquiring, the guard lowers it after releasing). If so the ISR calls `isr_tick_only` — count the tick, record the context pointer, charge the slice — and returns without a switch; `on_resched_ipi` likewise declines to kick. The holder keeps the CPU until it releases, and an expired slice is collected at the first tick after that. This is what makes the lock hierarchy's deadlock-freedom argument hold: a holder is always running. Without it (2026-10-27) a task preempted while holding `FRAME_ALLOCATOR` sat Ready on a CPU whose current task was spinning with interrupts masked on another CPU's scheduler lock, while that CPU's spawn path spun on the allocator — three parties, none able to move. `IrqSpinlock` holders need no count: their interrupts are off. `on_voluntary_yield` debug-asserts the count is zero.
+
+**Boot hand-off.** The same check also asks `crate::boot_context_holds_cpu()`, a global flag that is true from power-on until the boot CPU's `kmain` calls `boot_handoff()` at the door of its idle loop (x86_64/aarch64 `microkernel_loop`, the riscv64 `wfi` loop). The boot context *is* the idle task — slot 0, band 0, one-tick slice — and on x86_64 interrupts come on inside `init_hardware_interrupts`, before AP bring-up, task distribution and the `kernel_rsp0` pre-set. Until hand-off every CPU's timer and reschedule ISR account the tick and switch nothing. Without it (boot-smoke CI 2026-10-31 → 11-02, a slow TCG runner) the first tick handed the CPU to init while kmain was still scanning PCI; the drivers probed an empty device table, scanout-virtio-gpu's no-device fallback yield-spun, so a task was always Ready and the idle task never ran again — no PCI table, no APs, wave never settled. The 1-tick idle slice made the window 10 ms instead of 100 ms, and the policy-service registration fix removed the accidental 1 s gap that had been letting kmain finish. Reproduced locally by duty-cycling QEMU with SIGSTOP/SIGCONT.
 
 ## Voluntary Context Switch
 

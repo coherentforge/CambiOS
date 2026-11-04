@@ -442,19 +442,14 @@ unsafe extern "C" fn kmain() -> ! {
         // Map ACPI physical memory into the HHDM before parsing.
         map_acpi_regions(rsdp_phys);
 
-        // SAFETY: All subsystems initialized. HHDM offset is set.
-        // ADR-021: typed BootError propagation from the interrupts
-        // subsystem (APIC init, IST stack alloc, APIC calibration).
-        // kmain returns `!` so no `?`; dispatch to boot_failed for
-        // the single typed halt path.
-        unsafe {
-            cambios_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
-                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
-        }
-        println!("✓ APIC-driven scheduling active");
-
-        // PCI bus scan — discover devices for user-space drivers
-        // SAFETY: Single-threaded boot, interrupts just enabled but no PCI drivers yet.
+        // PCI bus scan — discover devices for user-space drivers. Runs
+        // before interrupts come on: mechanism-1 config access
+        // (0xCF8/0xCFC) is a two-port sequence that `pci::config::read32`
+        // requires interrupts-quiet for, and the device table must be
+        // published before any task can ask for it (`DEVICE_COUNT` is
+        // stored only when the scan completes; a scan overtaken by init
+        // handed every driver an empty table — boot-smoke CI 2026-10-31).
+        // SAFETY: Single-threaded boot, interrupts masked, no PCI drivers yet.
         unsafe { cambios_core::pci::scan() };
         let pci_count = cambios_core::pci::device_count();
         println!("✓ PCI: {} device(s) discovered", pci_count);
@@ -474,6 +469,17 @@ unsafe extern "C" fn kmain() -> ! {
             }
         }
         println!();
+
+        // SAFETY: All subsystems initialized. HHDM offset is set.
+        // ADR-021: typed BootError propagation from the interrupts
+        // subsystem (APIC init, IST stack alloc, APIC calibration).
+        // kmain returns `!` so no `?`; dispatch to boot_failed for
+        // the single typed halt path.
+        unsafe {
+            cambios_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
+                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
+        }
+        println!("✓ APIC-driven scheduling active");
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -647,6 +653,11 @@ unsafe extern "C" fn kmain() -> ! {
             }
         }
     }
+
+    // Boot work is complete; from here the timer may switch tasks. Until
+    // this call the ISRs only account ticks (the boot context is the idle
+    // task and must not be overtaken mid PCI scan / AP bring-up).
+    cambios_core::boot_handoff();
 
     // Enter idle loop — all scheduling is now interrupt-driven
     microkernel_loop();
@@ -966,6 +977,10 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     println!("segments + user stack, each unmap_page broadcasts the SBI IPI.");
     println!("Console RX still routed: press a key → '[R-3 RX] 0xNN'.");
     println!();
+
+    // Boot work is complete; from here the timer may switch tasks (the
+    // ISRs only account ticks until this call — see `boot_handoff`).
+    cambios_core::boot_handoff();
 
     // Idle loop: wfi parks the hart until the next interrupt. This
     // is the body of Task 0 (idle). When the scheduler preempts to

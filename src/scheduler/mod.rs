@@ -157,10 +157,12 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
             // Wake any tasks blocked on the timer IRQ (IoWait(0))
             sched.wake_irq_waiters(0);
 
-            // A plain-spinlock holder is never descheduled: account the
-            // tick but keep the interrupted task on the CPU. Its slice,
-            // if expired, is collected at the first tick after release.
-            if crate::preemption_held() {
+            // A plain-spinlock holder is never descheduled, and neither is
+            // the boot context before `crate::boot_handoff` (the idle task
+            // still finishing PCI scan / AP bring-up): account the tick but
+            // keep the interrupted context on the CPU. Its slice, if
+            // expired, is collected at the first tick after release.
+            if crate::preemption_held() || crate::boot_context_holds_cpu() {
                 sched.isr_tick_only(current_rsp);
                 return (current_rsp, None);
             }
@@ -219,8 +221,9 @@ static RESCHED_DIAG_PRINTED: core::sync::atomic::AtomicBool =
 /// lock means the wake is picked up at the next tick instead. No timer
 /// tick, no time-slice accounting, no EOI here (the arch half does EOI).
 pub fn on_resched_ipi(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
-    // Same rule as the timer: never switch away from a spinlock holder.
-    if crate::preemption_held() {
+    // Same rule as the timer: never switch away from a spinlock holder,
+    // nor from the boot context before hand-off.
+    if crate::preemption_held() || crate::boot_context_holds_cpu() {
         return (current_rsp, None);
     }
     if let Some(mut sched_guard) = crate::local_scheduler().try_lock() {

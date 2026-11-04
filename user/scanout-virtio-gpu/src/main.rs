@@ -608,9 +608,22 @@ fn bar_phys_size(device_index: u32, bar_index: u8) -> Option<(u64, u64)> {
     Some((addr, size as u64))
 }
 
+/// No-device / no-endpoint fallback: stay alive without consuming a CPU.
+///
+/// Blocks on the scanout endpoint and discards whatever arrives (the
+/// compositor's RegisterCompositor; its handshake timeout governs). A
+/// `yield_now` spin here kept a task Ready at all times, which starved
+/// the kernel's idle task — the boot context still scanning PCI on a
+/// slow machine — and the whole boot wave with it (boot-smoke CI,
+/// 2026-10-31). If the endpoint could not be registered, `recv_msg`
+/// fails immediately; only then fall back to yielding so the service
+/// stays observably up without a tight syscall loop.
 fn idle_loop() -> ! {
+    let mut buf = [0u8; RECV_BUF_SIZE];
     loop {
-        sys::yield_now();
+        if sys::recv_msg(SCANOUT_DRIVER_ENDPOINT, &mut buf) < 0 {
+            sys::yield_now();
+        }
     }
 }
 
