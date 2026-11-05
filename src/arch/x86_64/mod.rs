@@ -435,6 +435,7 @@ core::arch::global_asm!(
     "iretq",
 );
 
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     ".global resched_isr_stub",
     "resched_isr_stub:",
