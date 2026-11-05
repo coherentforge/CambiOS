@@ -28,155 +28,191 @@ SHELL := /bin/bash
 KERNEL := target/x86_64-unknown-none/release/cambios_microkernel
 ISO := cambios.iso
 LIMINE_DIR := $(HOME)/.cache/cambios/limine
+# The upstream branch moves with every binary release; the commit is the
+# release this tree is built and booted against (v8.7.0). A fresh clone
+# fetches exactly that commit. An existing cache is left alone:
+# `make check-env` reports a cache that sits at a different commit.
 LIMINE_BRANCH := v8.x-binary
+LIMINE_COMMIT := aad3edd370955449717a334f0289dee10e2c5f01
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 
-# User-space ELF binaries (x86_64)
+# =============================================================================
+# Build lists
+#
+# Every per-architecture rule, image recipe and gate below is generated from
+# these lists. Nothing else in this file spells out the set of architectures,
+# of user crates, or of proof crates. `make print-<VAR>` prints any variable
+# (the lints read the lists that way).
+# =============================================================================
+
+# The architectures are the backend directories under src/arch/.
+ARCHES := $(sort $(patsubst src/arch/%/mod.rs,%,$(wildcard src/arch/*/mod.rs)))
+
+# Per architecture: Rust target triple, make-target suffix, the user crates'
+# linker script, and the `--target` argument user crates are built with.
+# x86_64 user crates pass no `--target`; the repository's .cargo/config.toml
+# default applies.
+TRIPLE_x86_64  := x86_64-unknown-none
+TRIPLE_aarch64 := aarch64-unknown-none
+TRIPLE_riscv64 := riscv64gc-unknown-none-elf
+SUFFIX_x86_64  :=
+SUFFIX_aarch64 := -aarch64
+SUFFIX_riscv64 := -riscv64
+USER_LINK_x86_64  := link.ld
+USER_LINK_aarch64 := link-aarch64.ld
+USER_LINK_riscv64 := link-riscv64.ld
+USER_TARGET_ARG_x86_64  :=
+USER_TARGET_ARG_aarch64 := --target $(TRIPLE_aarch64)
+USER_TARGET_ARG_riscv64 := --target $(TRIPLE_riscv64)
+
+# A backend directory with no entries above stops the build here, instead of
+# generating rules with an empty triple.
+$(foreach a,$(ARCHES),$(if $(TRIPLE_$(a)),,$(error src/arch/$(a)/ exists but this Makefile has no TRIPLE_$(a): add the per-architecture entries above)))
+
+# User crates staged into each architecture's boot image, in the order the
+# image recipe copies them (for riscv64 that is the initrd's module order).
+# `init` is staged by its own lines in each recipe and is not listed.
+STAGE_x86_64 := policy-service key-store-service fs-service virtio-blk nvme \
+	usb-host ccid virtio-net udp-stack shell compositor scanout-virtio-gpu \
+	scanout-limine virtio-input terminal-window ping sprouty tree worm \
+	hello-window faultme audit-tail fde-mount
+STAGE_aarch64 := policy-service key-store-service fs-service virtio-blk \
+	fde-mount usb-host ccid virtio-net udp-stack scanout-virtio-gpu \
+	virtio-input compositor terminal-window tree hello-window faultme worm \
+	ping sprouty shell audit-tail
+STAGE_riscv64 := policy-service key-store-service fs-service virtio-blk \
+	fde-mount usb-host ccid virtio-net udp-stack audit-tail shell faultme
+
+# User crates that build for the architecture but are not in its image.
+#
+# i219-net (x86_64, aarch64): the Intel I219-LM driver. No manifest.toml
+# entry names it, so no image carries it.
+# Revisit when: a manifest.toml entry names i219-net.
+#
+# scanout-limine (aarch64): omitted on purpose; limine-aarch64.conf gives
+# the reason and its own trigger.
+#
+# The riscv64 display stack and the apps that need it: they build, but the
+# riscv64 initrd ships no display stack.
+# Revisit when: compositor + scanout-virtio-gpu + virtio-input ship in the
+# riscv64 initrd.
+UNSTAGED_x86_64  := i219-net
+UNSTAGED_aarch64 := i219-net scanout-limine
+UNSTAGED_riscv64 := scanout-virtio-gpu virtio-input compositor hello-window \
+	tree worm ping sprouty terminal-window
+
+# Every user crate with a build rule for the architecture.
+$(foreach a,$(ARCHES),$(eval CRATES_$(a) := init $$(STAGE_$(a)) $$(UNSTAGED_$(a))))
+
+# Image profiles: the values a manifest.toml `profile` tag may take.
+# `default` is the QEMU image (`make iso`); `PROFILE=` picks one of the
+# bare-metal ones for img-usb.
+PROFILES := default headless framebuffer-fallback
+
+# The proof crates are the *-proofs directories under verification/.
+PROOF_CRATES := $(sort $(patsubst verification/%/Cargo.toml,%,$(wildcard verification/*-proofs/Cargo.toml)))
+
+# Host tests outside the kernel library. Every package under user/,
+# cambios-*/ and tools/ whose source holds a `#[test]` is in exactly one
+# of these two lists; check-lists fails when one is in neither (tests
+# that nothing runs) or in both. `make test-user` runs the first list.
+HOST_TEST_CRATES := cambios-abi cambios-blk-proto cambios-ccid-proto \
+	cambios-fde-proto cambios-manifest tools/build-manifest \
+	user/cambios-style user/init user/key-store-service user/libflag \
+	user/libfs user/libgui user/libgui-proto user/libinput-proto \
+	user/libipc user/libscanout user/libsys user/libterm user/ping \
+	user/sprouty user/terminal-window user/worm
+
+# Binary-only crates: `#![no_std] #![no_main]` with their own panic
+# handler, so the test harness cannot link them (duplicate lang item
+# `panic_impl`). Their tests (usb-host: descriptor and HID keyboard
+# parsing; virtio-input: evdev mapping) run nowhere.
+# Deferred: moving each crate's pure modules into a lib target, the
+# split ping, sprouty and worm already use.
+# Why: a source restructure of two drivers, separate from the build
+# lists this section holds.
+# Revisit when: either crate is next edited, or a third binary-only
+# crate with tests appears here.
+HOST_TEST_EXEMPT := user/usb-host user/virtio-input
+
+# Extra cargo arguments for every user-crate build and host test. CI
+# passes `CARGO_LOCKED=--locked`, so a Cargo.lock that no longer matches
+# its Cargo.toml fails the build; locally cargo rewrites it, and the
+# rewritten file shows up in `git status`.
+CARGO_LOCKED ?=
+
+# A newline, for recipes that expand a list into one command per line.
+define NL
+
+
+endef
+
+# `make print-ARCHES`, `make print-CRATES_aarch64`, ...
+print-%:
+	@echo '$($*)'
+
+# Hand-assembled test binary (x86_64). The Rust user crates are listed in
+# "Build lists" below.
 USER_ELF := user/hello.elf
 USER_SRC := user/hello.S
 USER_LD  := user/user.ld
-FS_SERVICE_DIR := user/fs-service
-FS_SERVICE_ELF := $(FS_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-fs-service
-KS_SERVICE_DIR := user/key-store-service
-KS_SERVICE_ELF := $(KS_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-key-store-service
-NET_DRIVER_DIR := user/virtio-net
-NET_DRIVER_ELF := $(NET_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-net
-BLK_DRIVER_DIR := user/virtio-blk
-BLK_DRIVER_ELF := $(BLK_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-virtio-blk
-NVME_DIR := user/nvme
-NVME_ELF := $(NVME_DIR)/target/x86_64-unknown-none/release/cambios-nvme
-USB_HOST_DIR := user/usb-host
-USB_HOST_ELF := $(USB_HOST_DIR)/target/x86_64-unknown-none/release/cambios-usb-host
-CCID_DIR := user/ccid
-CCID_ELF := $(CCID_DIR)/target/x86_64-unknown-none/release/cambios-ccid
-I219_DRIVER_DIR := user/i219-net
-I219_DRIVER_ELF := $(I219_DRIVER_DIR)/target/x86_64-unknown-none/release/cambios-i219-net
-UDP_STACK_DIR := user/udp-stack
-UDP_STACK_ELF := $(UDP_STACK_DIR)/target/x86_64-unknown-none/release/cambios-udp-stack
-SHELL_DIR := user/shell
-SHELL_ELF := $(SHELL_DIR)/target/x86_64-unknown-none/release/cambios-shell
-POLICY_SERVICE_DIR := user/policy-service
-POLICY_SERVICE_ELF := $(POLICY_SERVICE_DIR)/target/x86_64-unknown-none/release/cambios-policy-service
-INIT_DIR := user/init
-INIT_ELF := $(INIT_DIR)/target/x86_64-unknown-none/release/cambios-init
-INIT_ELF_AARCH64 := $(INIT_DIR)/target/aarch64-unknown-none/release/cambios-init
-INIT_ELF_RISCV64 := $(INIT_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-init
-COMPOSITOR_DIR := user/compositor
-COMPOSITOR_ELF := $(COMPOSITOR_DIR)/target/x86_64-unknown-none/release/cambios-compositor
-SCANOUT_LIMINE_DIR := user/scanout-limine
-SCANOUT_LIMINE_ELF := $(SCANOUT_LIMINE_DIR)/target/x86_64-unknown-none/release/cambios-scanout-limine
-SCANOUT_VGPU_DIR := user/scanout-virtio-gpu
-SCANOUT_VGPU_ELF := $(SCANOUT_VGPU_DIR)/target/x86_64-unknown-none/release/cambios-scanout-virtio-gpu
-VIRTIO_INPUT_DIR := user/virtio-input
-VIRTIO_INPUT_ELF := $(VIRTIO_INPUT_DIR)/target/x86_64-unknown-none/release/cambios-virtio-input
-HELLO_WINDOW_DIR := user/hello-window
-HELLO_WINDOW_ELF := $(HELLO_WINDOW_DIR)/target/x86_64-unknown-none/release/cambios-hello-window
-FAULTME_DIR := user/faultme
-FAULTME_ELF := $(FAULTME_DIR)/target/x86_64-unknown-none/release/cambios-faultme
-TREE_DIR := user/tree
-TREE_ELF := $(TREE_DIR)/target/x86_64-unknown-none/release/cambios-tree
-WORM_DIR := user/worm
-WORM_ELF := $(WORM_DIR)/target/x86_64-unknown-none/release/cambios-worm
-PING_DIR := user/ping
-PING_ELF := $(PING_DIR)/target/x86_64-unknown-none/release/cambios-ping
-SPROUTY_DIR := user/sprouty
-SPROUTY_ELF := $(SPROUTY_DIR)/target/x86_64-unknown-none/release/cambios-sprouty
-TERMINAL_WINDOW_DIR := user/terminal-window
-TERMINAL_WINDOW_ELF := $(TERMINAL_WINDOW_DIR)/target/x86_64-unknown-none/release/cambios-terminal-window
-AUDIT_TAIL_DIR := user/audit-tail
-AUDIT_TAIL_ELF := $(AUDIT_TAIL_DIR)/target/x86_64-unknown-none/release/cambios-audit-tail
-FDE_MOUNT_DIR := user/fde-mount
-FDE_MOUNT_ELF := $(FDE_MOUNT_DIR)/target/x86_64-unknown-none/release/cambios-fde-mount
 
-# User-space ELF binaries (RISC-V)
-FS_SERVICE_ELF_RISCV64 := $(FS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-fs-service
-KS_SERVICE_ELF_RISCV64 := $(KS_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-key-store-service
-BLK_DRIVER_ELF_RISCV64 := $(BLK_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-blk
-USB_HOST_ELF_RISCV64 := $(USB_HOST_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-usb-host
-CCID_ELF_RISCV64 := $(CCID_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-ccid
-NET_DRIVER_ELF_RISCV64 := $(NET_DRIVER_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-net
-UDP_STACK_ELF_RISCV64 := $(UDP_STACK_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-udp-stack
-SHELL_ELF_RISCV64 := $(SHELL_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-shell
-POLICY_SERVICE_ELF_RISCV64 := $(POLICY_SERVICE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-policy-service
-
-# Host-tool build target + headless QEMU display (CI overrides). HOST_TARGET:
-# the host-side tools (sign-elf, mkinitrd, ...) are native binaries, not
-# bare-metal; each overrides the parent .cargo/config.toml bare-metal default.
-# Defaults to the macOS dev host; CI on Linux overrides with
-# `HOST_TARGET=x86_64-unknown-linux-gnu`. Consumed by the host-tool output-path
-# vars and their build rules below. QEMU_DISPLAY: empty by default (interactive
-# `run-quiet` keeps its window); headless CI sets `QEMU_DISPLAY=-display none`.
-HOST_TARGET ?= aarch64-apple-darwin
+# Host triples: detected, not assumed.
+#
+# HOST_TARGET: the triple the host tools (sign-elf, build-manifest,
+# mkinitrd, gen-dev-piv-keys, format-volume, bake-font) are built for.
+# They are native binaries. Each tool crate's .cargo/config.toml replaces
+# the parent's bare-metal default with `host-tuple`, and the rules below
+# pass the triple explicitly so the output path is known. It is read from
+# the pinned toolchain (`rustc -vV`) the first time a rule needs it, not
+# when the Makefile is parsed: `make print-<VAR>` and the python lints
+# must not start a toolchain download. Set it in the environment only to
+# cross-build the tools.
+#
+# TEST_TARGET: the triple the kernel's unit tests and the fuzz targets
+# build for. Always an x86_64 triple of the host's operating system: the
+# kernel library picks its architecture backend by `cfg(target_arch)`,
+# and x86_64 is the only backend with host stand-ins for the symbols its
+# assembly defines on bare metal. On Apple Silicon the binaries run under
+# Rosetta 2. On a Linux host that is not x86_64 they need a cross linker
+# and an emulator; `make check-env` reports which case this machine is.
+#
+# QEMU_DISPLAY: empty by default (interactive `run-quiet` keeps its
+# window); headless CI sets `QEMU_DISPLAY=-display none`.
+# QEMU_GUI_DISPLAY: the window backend of the *-gui run targets.
+ifeq ($(origin HOST_TARGET),undefined)
+HOST_TARGET = $(eval HOST_TARGET := $(or $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p'),unknown-host))$(HOST_TARGET)
+endif
+HOST_OS = $(subst $(firstword $(subst -, ,$(HOST_TARGET)))-,,$(HOST_TARGET))
+TEST_TARGET ?= x86_64-$(HOST_OS)
 QEMU_DISPLAY ?=
+QEMU_GUI_DISPLAY ?= $(if $(findstring apple-darwin,$(HOST_TARGET)),cocoa,gtk)
 
 # RISC-V initrd artifacts
 INITRD_RISCV64 := initrd-riscv64.img
 MKINITRD_DIR := tools/mkinitrd
-MKINITRD := $(MKINITRD_DIR)/target/$(HOST_TARGET)/release/mkinitrd
+MKINITRD = $(MKINITRD_DIR)/target/$(HOST_TARGET)/release/mkinitrd
 
-# User-space ELF binaries (AArch64)
+# Hand-assembled test binary (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
 USER_SRC_AARCH64 := user/hello-aarch64.S
 USER_LD_AARCH64  := user/user-aarch64.ld
-FS_SERVICE_ELF_AARCH64 := $(FS_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-fs-service
-KS_SERVICE_ELF_AARCH64 := $(KS_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-key-store-service
-NET_DRIVER_ELF_AARCH64 := $(NET_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-virtio-net
-BLK_DRIVER_ELF_AARCH64 := $(BLK_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-virtio-blk
-USB_HOST_ELF_AARCH64 := $(USB_HOST_DIR)/target/aarch64-unknown-none/release/cambios-usb-host
-CCID_ELF_AARCH64 := $(CCID_DIR)/target/aarch64-unknown-none/release/cambios-ccid
-I219_DRIVER_ELF_AARCH64 := $(I219_DRIVER_DIR)/target/aarch64-unknown-none/release/cambios-i219-net
-UDP_STACK_ELF_AARCH64 := $(UDP_STACK_DIR)/target/aarch64-unknown-none/release/cambios-udp-stack
-SHELL_ELF_AARCH64 := $(SHELL_DIR)/target/aarch64-unknown-none/release/cambios-shell
-POLICY_SERVICE_ELF_AARCH64 := $(POLICY_SERVICE_DIR)/target/aarch64-unknown-none/release/cambios-policy-service
-COMPOSITOR_ELF_AARCH64 := $(COMPOSITOR_DIR)/target/aarch64-unknown-none/release/cambios-compositor
-SCANOUT_LIMINE_ELF_AARCH64 := $(SCANOUT_LIMINE_DIR)/target/aarch64-unknown-none/release/cambios-scanout-limine
-SCANOUT_VGPU_ELF_AARCH64 := $(SCANOUT_VGPU_DIR)/target/aarch64-unknown-none/release/cambios-scanout-virtio-gpu
-VIRTIO_INPUT_ELF_AARCH64 := $(VIRTIO_INPUT_DIR)/target/aarch64-unknown-none/release/cambios-virtio-input
-HELLO_WINDOW_ELF_AARCH64 := $(HELLO_WINDOW_DIR)/target/aarch64-unknown-none/release/cambios-hello-window
-FAULTME_ELF_AARCH64 := $(FAULTME_DIR)/target/aarch64-unknown-none/release/cambios-faultme
-TREE_ELF_AARCH64 := $(TREE_DIR)/target/aarch64-unknown-none/release/cambios-tree
-WORM_ELF_AARCH64 := $(WORM_DIR)/target/aarch64-unknown-none/release/cambios-worm
-PING_ELF_AARCH64 := $(PING_DIR)/target/aarch64-unknown-none/release/cambios-ping
-SPROUTY_ELF_AARCH64 := $(SPROUTY_DIR)/target/aarch64-unknown-none/release/cambios-sprouty
-TERMINAL_WINDOW_ELF_AARCH64 := $(TERMINAL_WINDOW_DIR)/target/aarch64-unknown-none/release/cambios-terminal-window
-AUDIT_TAIL_ELF_AARCH64 := $(AUDIT_TAIL_DIR)/target/aarch64-unknown-none/release/cambios-audit-tail
-FDE_MOUNT_ELF_AARCH64 := $(FDE_MOUNT_DIR)/target/aarch64-unknown-none/release/cambios-fde-mount
-
-# User-space ELF binaries (RISC-V) — scanout + input extension for Scanout-4.c
-SCANOUT_VGPU_ELF_RISCV64 := $(SCANOUT_VGPU_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-scanout-virtio-gpu
-VIRTIO_INPUT_ELF_RISCV64 := $(VIRTIO_INPUT_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-virtio-input
-
-# User-space ELF binaries (RISC-V) — GUI stack (ADR-011). libgui is
-# arch-agnostic; each app ships a link-riscv64.ld matching the
-# virtio-net riscv64 shape. Runtime requires kernel ECAM PCI + a
-# virtio-gpu-pci QEMU device; build infra lands first so the cross-
-# arch port is unblocked.
-COMPOSITOR_ELF_RISCV64 := $(COMPOSITOR_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-compositor
-HELLO_WINDOW_ELF_RISCV64 := $(HELLO_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-hello-window
-FAULTME_ELF_RISCV64 := $(FAULTME_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-faultme
-TREE_ELF_RISCV64 := $(TREE_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-tree
-WORM_ELF_RISCV64 := $(WORM_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-worm
-PING_ELF_RISCV64 := $(PING_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-ping
-SPROUTY_ELF_RISCV64 := $(SPROUTY_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-sprouty
-TERMINAL_WINDOW_ELF_RISCV64 := $(TERMINAL_WINDOW_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-terminal-window
-AUDIT_TAIL_ELF_RISCV64 := $(AUDIT_TAIL_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-audit-tail
-FDE_MOUNT_ELF_RISCV64 := $(FDE_MOUNT_DIR)/target/riscv64gc-unknown-none-elf/release/cambios-fde-mount
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
-SIGN_ELF := $(SIGN_ELF_DIR)/target/$(HOST_TARGET)/release/sign-elf
+SIGN_ELF = $(SIGN_ELF_DIR)/target/$(HOST_TARGET)/release/sign-elf
 
 # Boot-manifest builder (ADR-018 step 2; input = manifest.toml, the
 # ADR-037 Phase-2 endpoint-registry artifact)
 BUILD_MANIFEST_DIR := tools/build-manifest
-BUILD_MANIFEST := $(BUILD_MANIFEST_DIR)/target/$(HOST_TARGET)/release/build-manifest
+BUILD_MANIFEST = $(BUILD_MANIFEST_DIR)/target/$(HOST_TARGET)/release/build-manifest
 
 # Dev-PIV keypair generator (host-side). Derives Ed25519+X25519 keys from a
 # persistent per-developer seed; writes dev_bootstrap_pubkey.bin (consumed by
 # the kernel under --features dev-piv) and user/key-store-service/
 # dev_piv_secret.bin (consumed by SwPivBackend under --features dev-piv).
 GEN_DEV_PIV_DIR := tools/gen-dev-piv-keys
-GEN_DEV_PIV := $(GEN_DEV_PIV_DIR)/target/aarch64-apple-darwin/release/gen-dev-piv-keys
+GEN_DEV_PIV = $(GEN_DEV_PIV_DIR)/target/$(HOST_TARGET)/release/gen-dev-piv-keys
 DEV_BOOTSTRAP_PUBKEY := dev_bootstrap_pubkey.bin
 DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 
@@ -184,7 +220,7 @@ DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 # ADR-032 § 4 volume header to a raw disk image file using the
 # DPIV bundle gen-dev-piv-keys produced. Sibling to sign-elf.
 FORMAT_VOLUME_DIR := tools/format-volume
-FORMAT_VOLUME := $(FORMAT_VOLUME_DIR)/target/aarch64-apple-darwin/release/format-volume
+FORMAT_VOLUME = $(FORMAT_VOLUME_DIR)/target/$(HOST_TARGET)/release/format-volume
 
 # Signing mode: "yubikey" (default) or "seed" (for CI/testing without hardware key)
 SIGN_MODE ?= seed
@@ -211,7 +247,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-aarch64 check-riscv64 check-clippy check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf fs-service key-store-service virtio-net virtio-blk nvme virtio-input usb-host ccid i219-net udp-stack shell policy-service init compositor scanout-limine scanout-virtio-gpu hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount user-elf-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-net-aarch64 virtio-blk-aarch64 usb-host-aarch64 ccid-aarch64 i219-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 init-aarch64 compositor-aarch64 scanout-limine-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 fde-mount-aarch64 fs-service-riscv64 key-store-service-riscv64 virtio-blk-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 policy-service-riscv64 init-riscv64 scanout-virtio-gpu-riscv64 virtio-input-riscv64 compositor-riscv64 hello-window-riscv64 faultme-riscv64 tree-riscv64 worm-riscv64 ping-riscv64 sprouty-riscv64 terminal-window-riscv64 audit-tail-riscv64 fde-mount-riscv64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists check-env check-elf-link check-dco install-hooks audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -238,7 +274,7 @@ kernel-dev-piv:
 # IPC clients can talk to a virtual YubiKey without real hardware.
 key-store-service-dev-piv:
 	@echo "=== Building Key Store service (--features dev-piv) ==="
-	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+	cd user/key-store-service && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
 		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
 		'-Crelocation-model=static') cargo build --release --features dev-piv
 	@echo "=== Key Store service ready (dev-piv) ==="
@@ -249,519 +285,72 @@ user-elf:
 	ld.lld -T $(USER_LD) -nostdlib --no-dynamic-linker -static user/hello.o -o $(USER_ELF)
 	@echo "=== $(USER_ELF) ready ==="
 
-fs-service:
-	@echo "=== Building FS service ==="
-	cd $(FS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== FS service ready ==="
-
-key-store-service:
-	@echo "=== Building Key Store service ==="
-	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== Key Store service ready ==="
-
-virtio-net:
-	@echo "=== Building Virtio-Net driver ==="
-	cd $(NET_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== Virtio-Net driver ready ==="
-
-virtio-blk:
-	@echo "=== Building Virtio-Blk driver ==="
-	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-
-# NVMe block driver — same IPC seam as virtio-blk; spawned by the
-# bare-metal manifest profiles (headless / framebuffer-fallback).
-nvme:
-	@echo "=== Building NVMe driver ==="
-	cd $(NVME_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== Virtio-Blk driver ready ==="
-
-usb-host:
-	@echo "=== Building USB-Host driver ==="
-	cd $(USB_HOST_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== USB-Host driver ready ==="
-
-ccid:
-	@echo "=== Building CCID class driver ==="
-	cd $(CCID_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== CCID class driver ready ==="
-
-i219-net:
-	@echo "=== Building Intel I219-LM driver ==="
-	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== I219-LM driver ready ==="
-
-udp-stack:
-	@echo "=== Building UDP stack ==="
-	cd $(UDP_STACK_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== UDP stack ready ==="
-
-# SHELL_FEATURES: cargo features for the shell. The headless image sets
-# `headless-input` (the shell owns the input endpoint; see manifest.toml's
-# second `shell` entry). Empty for the ISO and the GUI profiles.
-SHELL_FEATURES ?=
-shell:
-	@echo "=== Building Shell$(if $(SHELL_FEATURES), (features: $(SHELL_FEATURES)),) ==="
-	cd $(SHELL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release $(if $(SHELL_FEATURES),--features $(SHELL_FEATURES),)
-	@echo "=== Shell ready ==="
-
-policy-service:
-	@echo "=== Building Policy service ==="
-	cd $(POLICY_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== Policy service ready ==="
-
-# ADR-018 init (PID 1). Built like any service; enters the ISO/boot
-# chain at migration step 7.
-init:
-	@echo "=== Building init ==="
-	cd $(INIT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== init ready ==="
-
-audit-tail:
-	@echo "=== Building audit-tail (ADR-023) ==="
-	cd $(AUDIT_TAIL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== audit-tail ready ==="
-
-fde-mount:
-	@echo "=== Building fde-mount (ADR-032 § Architecture, stream A A-v.a) ==="
-	cd $(FDE_MOUNT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== fde-mount ready ==="
-
-compositor:
-	@echo "=== Building compositor (Phase Scanout-1, ADR-014) ==="
-	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== compositor ready ==="
-
-scanout-limine:
-	@echo "=== Building scanout-limine (Phase Scanout-2, ADR-014) ==="
-	cd $(SCANOUT_LIMINE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== scanout-limine ready ==="
-
-scanout-virtio-gpu:
-	@echo "=== Building scanout-virtio-gpu (Phase Scanout-4.a, ADR-014) ==="
-	cd $(SCANOUT_VGPU_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== scanout-virtio-gpu ready ==="
-
-virtio-input:
-	@echo "=== Building virtio-input (ADR-012 Input-1) ==="
-	cd $(VIRTIO_INPUT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== virtio-input ready ==="
-
-hello-window:
-	@echo "=== Building hello-window (Phase Scanout-3, ADR-011) ==="
-	cd $(HELLO_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== hello-window ready ==="
-
-faultme:
-	@echo "=== Building faultme (ADR-019 fault-reap fixture) ==="
-	cd $(FAULTME_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== faultme ready ==="
-
-tree:
-	@echo "=== Building tree (first-party app, ADR-011 / ADR-012) ==="
-	cd $(TREE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== tree ready ==="
-
-worm:
-	@echo "=== Building worm (first-party app, ADR-011 / ADR-012) ==="
-	cd $(WORM_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== worm ready ==="
-
-ping:
-	@echo "=== Building ping (first-party app, ADR-011 / ADR-012) ==="
-	cd $(PING_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== ping ready ==="
-
-sprouty:
-	@echo "=== Building sprouty (first-party app, ADR-011 / ADR-012) ==="
-	cd $(SPROUTY_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== sprouty ready ==="
-
-terminal-window:
-	@echo "=== Building terminal-window (GUI shell host) ==="
-	cd $(TERMINAL_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --release
-	@echo "=== terminal-window ready ==="
-
-# AArch64 user-space build targets
 user-elf-aarch64:
 	@echo "=== Building user-space ELF (AArch64) ==="
 	clang -target aarch64-unknown-none -nostdlib -ffreestanding -c $(USER_SRC_AARCH64) -o user/hello-aarch64.o
 	ld.lld -T $(USER_LD_AARCH64) -nostdlib --no-dynamic-linker -static user/hello-aarch64.o -o $(USER_ELF_AARCH64)
 	@echo "=== $(USER_ELF_AARCH64) ready ==="
 
-fs-service-aarch64:
-	@echo "=== Building FS service (AArch64) ==="
-	cd $(FS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== FS service (AArch64) ready ==="
+# -----------------------------------------------------------------------------
+# User crates: one rule per (crate, architecture), generated from the lists.
+#
+# The recipe is the same for every crate. CARGO_ENCODED_RUSTFLAGS replaces the
+# rustflags the repository's .cargo/config.toml sets for the kernel (kernel
+# linker script, kernel code model) with the crate's own linker script.
+#
+# Targets are named <crate><suffix>: fs-service, fs-service-aarch64,
+# fs-service-riscv64. Each rule also defines ELF_<crate>_<arch>, the path of
+# the binary it produces.
+#
+# nvme serves the same block seam as virtio-blk; the bare-metal manifest
+# profiles (headless / framebuffer-fallback) spawn it.
+# -----------------------------------------------------------------------------
 
-key-store-service-aarch64:
-	@echo "=== Building Key Store service (AArch64) ==="
-	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== Key Store service (AArch64) ready ==="
+# Cargo features for one (crate, architecture). The headless image rebuilds
+# the x86_64 shell with `headless-input` (the shell owns the input endpoint;
+# see manifest.toml's second `shell` entry). Empty for the ISO and the GUI
+# profiles.
+SHELL_FEATURES ?=
+FEATURES_shell_x86_64 = $(if $(SHELL_FEATURES),--features $(SHELL_FEATURES),)
 
-virtio-net-aarch64:
-	@echo "=== Building Virtio-Net driver (AArch64) ==="
-	cd $(NET_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== Virtio-Net driver (AArch64) ready ==="
+# $(1) = crate directory under user/, $(2) = architecture
+define USER_CRATE_RULE
+ELF_$(1)_$(2) := user/$(1)/target/$$(TRIPLE_$(2))/release/cambios-$(1)
+.PHONY: $(1)$$(SUFFIX_$(2))
+$(1)$$(SUFFIX_$(2)):
+	@echo "=== Building $(1) ($(2)) ==="
+	cd user/$(1) && CARGO_ENCODED_RUSTFLAGS=$$$$(printf '%s\x1f%s\x1f%s\x1f%s' \
+		'-Clink-arg=--script=$$(USER_LINK_$(2))' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
+		'-Crelocation-model=static') cargo build $$(strip $$(CARGO_LOCKED) $$(USER_TARGET_ARG_$(2)) --release $$(FEATURES_$(1)_$(2)))
+	@echo "=== $(1) ($(2)) ready ==="
+endef
+$(foreach a,$(ARCHES),$(foreach c,$(CRATES_$(a)),$(eval $(call USER_CRATE_RULE,$(c),$(a)))))
 
-virtio-blk-aarch64:
-	@echo "=== Building Virtio-Blk driver (AArch64) ==="
-	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== Virtio-Blk driver (AArch64) ready ==="
+# Every user crate, for every architecture that has a rule for it:
+# the staged crates the images build anyway, and the UNSTAGED ones no
+# image builds.
+.PHONY: check-user
+check-user: $(foreach a,$(ARCHES),$(addsuffix $(SUFFIX_$(a)),$(CRATES_$(a))))
+	@echo "=== every user crate builds for every architecture that lists it ==="
 
-usb-host-aarch64:
-	@echo "=== Building USB-Host driver (AArch64) ==="
-	cd $(USB_HOST_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== USB-Host driver (AArch64) ready ==="
+# Host tests of the packages in HOST_TEST_CRATES, one goal each
+# (`make host-test-user-libsys`). They build for TEST_TARGET, not
+# HOST_TARGET: libsys's aarch64 syscall stubs name x18, a register
+# Apple's ABI reserves, so the x86_64 host triple is the one every
+# crate builds for on every host. A crate with a lib target runs its
+# lib tests only; its bin target is `no_main` and cannot link a test
+# harness.
+define HOST_TEST_RULE
+.PHONY: host-test-$(subst /,-,$(1))
+host-test-$(subst /,-,$(1)):
+	@echo "=== host tests: $(1) ==="
+	cd $(1) && cargo test $$(strip $$(CARGO_LOCKED) $(if $(wildcard $(1)/src/lib.rs),--lib) --target $$(TEST_TARGET))
+endef
+$(foreach c,$(HOST_TEST_CRATES),$(eval $(call HOST_TEST_RULE,$(c))))
 
-ccid-aarch64:
-	@echo "=== Building CCID class driver (AArch64) ==="
-	cd $(CCID_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== CCID class driver (AArch64) ready ==="
-
-i219-net-aarch64:
-	@echo "=== Building Intel I219-LM driver (AArch64) ==="
-	cd $(I219_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== I219-LM driver (AArch64) ready ==="
-
-udp-stack-aarch64:
-	@echo "=== Building UDP stack (AArch64) ==="
-	cd $(UDP_STACK_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== UDP stack (AArch64) ready ==="
-
-shell-aarch64:
-	@echo "=== Building Shell (AArch64) ==="
-	cd $(SHELL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== Shell (AArch64) ready ==="
-
-policy-service-aarch64:
-	@echo "=== Building Policy service (AArch64) ==="
-	cd $(POLICY_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== Policy service (AArch64) ready ==="
-
-init-aarch64:
-	@echo "=== Building init (AArch64) ==="
-	cd $(INIT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== init (AArch64) ready ==="
-
-audit-tail-aarch64:
-	@echo "=== Building audit-tail (AArch64) ==="
-	cd $(AUDIT_TAIL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== audit-tail (AArch64) ready ==="
-
-fde-mount-aarch64:
-	@echo "=== Building fde-mount (AArch64) ==="
-	cd $(FDE_MOUNT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== fde-mount (AArch64) ready ==="
-
-compositor-aarch64:
-	@echo "=== Building compositor (AArch64) ==="
-	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== compositor (AArch64) ready ==="
-
-scanout-limine-aarch64:
-	@echo "=== Building scanout-limine (AArch64) ==="
-	cd $(SCANOUT_LIMINE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== scanout-limine (AArch64) ready ==="
-
-scanout-virtio-gpu-aarch64:
-	@echo "=== Building scanout-virtio-gpu (AArch64, Scanout-4.c ADR-014) ==="
-	cd $(SCANOUT_VGPU_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== scanout-virtio-gpu (AArch64) ready ==="
-
-virtio-input-aarch64:
-	@echo "=== Building virtio-input (AArch64, ADR-012 Input-1) ==="
-	cd $(VIRTIO_INPUT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== virtio-input (AArch64) ready ==="
-
-hello-window-aarch64:
-	@echo "=== Building hello-window (AArch64) ==="
-	cd $(HELLO_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== hello-window (AArch64) ready ==="
-
-faultme-aarch64:
-	@echo "=== Building faultme (AArch64) ==="
-	cd $(FAULTME_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== faultme (AArch64) ready ==="
-
-tree-aarch64:
-	@echo "=== Building tree (AArch64) ==="
-	cd $(TREE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== tree (AArch64) ready ==="
-
-worm-aarch64:
-	@echo "=== Building worm (AArch64) ==="
-	cd $(WORM_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== worm (AArch64) ready ==="
-
-ping-aarch64:
-	@echo "=== Building ping (AArch64) ==="
-	cd $(PING_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== ping (AArch64) ready ==="
-
-sprouty-aarch64:
-	@echo "=== Building sprouty (AArch64) ==="
-	cd $(SPROUTY_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== sprouty (AArch64) ready ==="
-
-terminal-window-aarch64:
-	@echo "=== Building terminal-window (AArch64) ==="
-	cd $(TERMINAL_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-aarch64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target aarch64-unknown-none --release
-	@echo "=== terminal-window (AArch64) ready ==="
-
-# RISC-V user-space build targets (R-6 / ADR-013)
-# Services build with the same CARGO_ENCODED_RUSTFLAGS shape as x86_64/aarch64;
-# only the linker script and target triple differ.
-fs-service-riscv64:
-	@echo "=== Building FS service (RISC-V) ==="
-	cd $(FS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== FS service (RISC-V) ready ==="
-
-key-store-service-riscv64:
-	@echo "=== Building Key Store service (RISC-V) ==="
-	cd $(KS_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== Key Store service (RISC-V) ready ==="
-
-virtio-blk-riscv64:
-	@echo "=== Building Virtio-Blk driver (RISC-V) ==="
-	cd $(BLK_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== Virtio-Blk driver (RISC-V) ready ==="
-
-usb-host-riscv64:
-	@echo "=== Building USB-Host driver (RISC-V) ==="
-	cd $(USB_HOST_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== USB-Host driver (RISC-V) ready ==="
-
-ccid-riscv64:
-	@echo "=== Building CCID class driver (RISC-V) ==="
-	cd $(CCID_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== CCID class driver (RISC-V) ready ==="
-
-virtio-net-riscv64:
-	@echo "=== Building Virtio-Net driver (RISC-V) ==="
-	cd $(NET_DRIVER_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== Virtio-Net driver (RISC-V) ready ==="
-
-udp-stack-riscv64:
-	@echo "=== Building UDP stack (RISC-V) ==="
-	cd $(UDP_STACK_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== UDP stack (RISC-V) ready ==="
-
-shell-riscv64:
-	@echo "=== Building Shell (RISC-V) ==="
-	cd $(SHELL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== Shell (RISC-V) ready ==="
-
-policy-service-riscv64:
-	@echo "=== Building Policy service (RISC-V) ==="
-	cd $(POLICY_SERVICE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== Policy service (RISC-V) ready ==="
-
-init-riscv64:
-	@echo "=== Building init (RISC-V) ==="
-	cd $(INIT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== init (RISC-V) ready ==="
-
-audit-tail-riscv64:
-	@echo "=== Building audit-tail (RISC-V) ==="
-	cd $(AUDIT_TAIL_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== audit-tail (RISC-V) ready ==="
-
-fde-mount-riscv64:
-	@echo "=== Building fde-mount (RISC-V) ==="
-	cd $(FDE_MOUNT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== fde-mount (RISC-V) ready ==="
-
-scanout-virtio-gpu-riscv64:
-	@echo "=== Building scanout-virtio-gpu (RISC-V, Scanout-4.c ADR-014) ==="
-	cd $(SCANOUT_VGPU_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== scanout-virtio-gpu (RISC-V) ready ==="
-
-virtio-input-riscv64:
-	@echo "=== Building virtio-input (RISC-V, ADR-012 Input-1) ==="
-	cd $(VIRTIO_INPUT_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== virtio-input (RISC-V) ready ==="
-
-compositor-riscv64:
-	@echo "=== Building compositor (RISC-V, ADR-014) ==="
-	cd $(COMPOSITOR_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== compositor (RISC-V) ready ==="
-
-hello-window-riscv64:
-	@echo "=== Building hello-window (RISC-V, ADR-011) ==="
-	cd $(HELLO_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== hello-window (RISC-V) ready ==="
-
-tree-riscv64:
-	@echo "=== Building tree (RISC-V, ADR-011/012) ==="
-	cd $(TREE_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== tree (RISC-V) ready ==="
-
-worm-riscv64:
-	@echo "=== Building worm (RISC-V, ADR-011/012) ==="
-	cd $(WORM_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== worm (RISC-V) ready ==="
-
-faultme-riscv64:
-	@echo "=== Building faultme (RISC-V) ==="
-	cd $(FAULTME_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== faultme (RISC-V) ready ==="
-
-ping-riscv64:
-	@echo "=== Building ping (RISC-V, ADR-011/012) ==="
-	cd $(PING_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== ping (RISC-V) ready ==="
-
-sprouty-riscv64:
-	@echo "=== Building sprouty (RISC-V, ADR-011/012) ==="
-	cd $(SPROUTY_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== sprouty (RISC-V) ready ==="
-
-terminal-window-riscv64:
-	@echo "=== Building terminal-window (RISC-V) ==="
-	cd $(TERMINAL_WINDOW_DIR) && CARGO_ENCODED_RUSTFLAGS=$$(printf '%s\x1f%s\x1f%s\x1f%s' \
-		'-Clink-arg=--script=link-riscv64.ld' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build --target riscv64gc-unknown-none-elf --release
-	@echo "=== terminal-window (RISC-V) ready ==="
+.PHONY: test-user
+test-user: $(foreach c,$(HOST_TEST_CRATES),host-test-$(subst /,-,$(c)))
+	@echo "=== host tests pass in $(words $(HOST_TEST_CRATES)) packages ==="
 
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
@@ -827,7 +416,7 @@ mkinitrd:
 # Required before any build with `--features dev-piv` enabled.
 gen-dev-piv-keys:
 	@echo "=== Building dev-PIV keypair generator ==="
-	cd $(GEN_DEV_PIV_DIR) && cargo build --release
+	cd $(GEN_DEV_PIV_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Generating dev-PIV keypair files ==="
 	$(GEN_DEV_PIV)
 	@echo "=== dev-PIV keypair files ready ==="
@@ -838,7 +427,7 @@ gen-dev-piv-keys:
 # run at least once (consumes user/key-store-service/dev_piv_secret.bin).
 format-volume:
 	@echo "=== Building format-volume host tool ==="
-	cd $(FORMAT_VOLUME_DIR) && cargo build --release
+	cd $(FORMAT_VOLUME_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== format-volume ready: $(FORMAT_VOLUME) ==="
 
 # Re-bake the JetBrains Mono Regular TTF in assets/fonts/ into the
@@ -850,9 +439,9 @@ JBM_PX_HEIGHT := 24
 JBM_CELL := 16x32
 bake-font:
 	@echo "=== Building bake-font host tool ==="
-	cd tools/bake-font && cargo build --release
+	cd tools/bake-font && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Re-baking JetBrains Mono into user/libgui/src/font_jbmono_data.rs ==="
-	./tools/bake-font/target/aarch64-apple-darwin/release/bake-font \
+	./tools/bake-font/target/$(HOST_TARGET)/release/bake-font \
 	    assets/fonts/JetBrainsMono-Regular.ttf \
 	    user/libgui/src/font_jbmono_data.rs \
 	    --px $(JBM_PX_HEIGHT) --cell $(JBM_CELL) --const-prefix JBM
@@ -871,10 +460,12 @@ export-pubkey: sign-tool
 # the dir present but missing key files (e.g., BOOTX64.EFI gone while
 # BOOTAA64.EFI survives), and `git clone` refuses a non-empty target.
 $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
-	@echo "=== Cloning Limine $(LIMINE_BRANCH) ==="
+	@echo "=== Fetching Limine $(LIMINE_BRANCH) at $(LIMINE_COMMIT) ==="
 	rm -rf $(LIMINE_DIR)
-	mkdir -p $(dir $(LIMINE_DIR))
-	git clone $(LIMINE_REPO) --branch=$(LIMINE_BRANCH) --depth=1 $(LIMINE_DIR)
+	mkdir -p $(LIMINE_DIR)
+	git -C $(LIMINE_DIR) init -q
+	git -C $(LIMINE_DIR) fetch -q --depth=1 $(LIMINE_REPO) $(LIMINE_COMMIT)
+	git -C $(LIMINE_DIR) checkout -q FETCH_HEAD
 
 # Upstream's `limine-binary` branch ships the pre-built EFI stages but
 # NOT the compiled macOS host tool `limine` (the `xxx bios-install $(ISO)`
@@ -896,7 +487,7 @@ iso-dev-piv: kernel-dev-piv key-store-service-dev-piv gen-dev-piv-keys format-vo
 	@echo "=== Re-assembling ISO with --features dev-piv binaries ==="
 	$(MAKE) --assume-old=kernel --assume-old=key-store-service SIGN_MODE=dev-piv iso
 
-iso: kernel fs-service key-store-service virtio-blk nvme virtio-net udp-stack virtio-input usb-host ccid shell policy-service init manifest compositor scanout-virtio-gpu scanout-limine hello-window faultme tree worm ping sprouty terminal-window audit-tail fde-mount sign-tool limine
+iso: kernel $(STAGE_x86_64) init manifest sign-tool limine
 	@echo "=== Building ISO (signing mode: $(SIGN_MODE)) ==="
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -912,60 +503,16 @@ iso: kernel fs-service key-store-service virtio-blk nvme virtio-net udp-stack vi
 	# `make img-usb PROFILE=framebuffer-fallback`) spawns scanout-limine.
 	# A staged module the manifest does not declare is loaded but
 	# unspawnable, so carrying both costs nothing but bytes.
-	cp $(POLICY_SERVICE_ELF) iso_root/boot/policy-service.elf
-	cp $(KS_SERVICE_ELF) iso_root/boot/key-store-service.elf
-	cp $(FS_SERVICE_ELF) iso_root/boot/fs-service.elf
-	cp $(BLK_DRIVER_ELF) iso_root/boot/virtio-blk.elf
-	cp $(NVME_ELF) iso_root/boot/nvme.elf
-	cp $(USB_HOST_ELF) iso_root/boot/usb-host.elf
-	cp $(CCID_ELF) iso_root/boot/ccid.elf
-	cp $(NET_DRIVER_ELF) iso_root/boot/virtio-net.elf
-	cp $(UDP_STACK_ELF) iso_root/boot/udp-stack.elf
-	cp $(SHELL_ELF) iso_root/boot/shell.elf
-	cp $(COMPOSITOR_ELF) iso_root/boot/compositor.elf
-	cp $(SCANOUT_VGPU_ELF) iso_root/boot/scanout-virtio-gpu.elf
-	cp $(SCANOUT_LIMINE_ELF) iso_root/boot/scanout-limine.elf
-	cp $(VIRTIO_INPUT_ELF) iso_root/boot/virtio-input.elf
-	cp $(TERMINAL_WINDOW_ELF) iso_root/boot/terminal-window.elf
-	cp $(PING_ELF) iso_root/boot/ping.elf
-	cp $(SPROUTY_ELF) iso_root/boot/sprouty.elf
-	cp $(TREE_ELF) iso_root/boot/tree.elf
-	cp $(WORM_ELF) iso_root/boot/worm.elf
-	cp $(HELLO_WINDOW_ELF) iso_root/boot/hello-window.elf
-	cp $(FAULTME_ELF) iso_root/boot/faultme.elf
-	cp $(AUDIT_TAIL_ELF) iso_root/boot/audit-tail.elf
-	cp $(FDE_MOUNT_ELF) iso_root/boot/fde-mount.elf
+	$(foreach c,$(STAGE_x86_64),cp $(ELF_$(c)_x86_64) iso_root/boot/$(c).elf$(NL))
 	# ADR-018: init + the signed manifest blob (full reservation set —
 	# the step-8 cutover shape). manifest.bin arrives already signed by
 	# the `manifest` prerequisite — do NOT re-sign it here (sign-elf
 	# appends a trailer; a second pass would stack trailers and break
 	# verification).
-	cp $(INIT_ELF) iso_root/boot/init.elf
+	cp $(ELF_init_x86_64) iso_root/boot/init.elf
 	cp manifest.bin iso_root/boot/manifest.bin
 	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/init.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/policy-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/key-store-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fs-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-blk.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/nvme.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/usb-host.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/ccid.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-net.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/udp-stack.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/shell.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/compositor.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-virtio-gpu.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/scanout-limine.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/virtio-input.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/terminal-window.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/ping.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/sprouty.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/tree.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/worm.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/hello-window.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/faultme.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/audit-tail.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/fde-mount.elf
+	$(foreach c,$(STAGE_x86_64),$(SIGN_ELF) $(SIGN_FLAGS) iso_root/boot/$(c).elf$(NL))
 	# Copy Limine config (root + standard location)
 	cp limine.conf iso_root/limine.conf
 	cp limine.conf iso_root/boot/limine/limine.conf
@@ -1114,11 +661,11 @@ run-quiet-dev-piv: iso-dev-piv disk-img
 			-vga virtio \
 			-no-reboot
 
-# Same as `run`, plus a graphical QEMU window (macOS Cocoa backend) so
-# compositor / scanout output is visible. Use for Scanout-3+ visual
-# verification; `run` stays headless (serial-only) for CI / text-mode
-# workflows. For Linux change `cocoa` to `gtk`; for remote sessions
-# swap to `-vnc :0` and connect via Screen Sharing.
+# Same as `run`, plus a graphical QEMU window so compositor / scanout
+# output is visible; `run` stays headless (serial-only) for CI and
+# text-mode work. The window backend is QEMU_GUI_DISPLAY (cocoa on a
+# macOS host, gtk elsewhere); for a remote session pass
+# `QEMU_GUI_DISPLAY="vnc=:0"` and connect with a VNC viewer.
 run-gui: iso disk-img
 	qemu-system-x86_64 \
 		-cdrom $(ISO) \
@@ -1135,7 +682,7 @@ run-gui: iso disk-img
 		-device usb-ccid,bus=xhci0.0 \
 		-vga virtio \
 		-no-reboot \
-		-display cocoa
+		-display $(QEMU_GUI_DISPLAY)
 
 run-uefi: iso
 	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
@@ -1172,17 +719,30 @@ img-x86: iso manifest-profile
 	# image. iso_root keeps the plain one so the ISO never carries it.
 	if [ "$(PROFILE)" = "headless" ]; then \
 		$(MAKE) shell SHELL_FEATURES=headless-input && \
-		cp $(SHELL_ELF) /tmp/shell-headless-signed.elf && \
+		cp $(ELF_shell_x86_64) /tmp/shell-headless-signed.elf && \
 		$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-headless-signed.elf && \
 		mcopy -o -i $(IMG_X86) /tmp/shell-headless-signed.elf ::/boot/shell.elf; \
 	fi
 	@echo "=== $(IMG_X86) ready ($(PROFILE) manifest) ==="
 	@echo "To write to USB: make usb DEVICE=/dev/diskN  (or: sudo dd if=$(IMG_X86) of=/dev/diskN bs=1M)"
 
-# UEFI firmware paths (resolved via Homebrew Cellar for QEMU 10.x)
-# QEMU 10.x requires pflash loading (not -bios) per firmware/*.json descriptors.
-EFI_FW_X86 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-x86_64-code.fd' 2>/dev/null | head -1)
-EFI_VARS_X86 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-i386-vars.fd' 2>/dev/null | head -1)
+# UEFI firmware: the edk2 images QEMU itself ships, looked up where
+# Homebrew (Apple Silicon, then Intel) and a QEMU installed under /usr or
+# /usr/local put them. QEMU 10.x requires pflash loading (not -bios) per
+# its firmware/*.json descriptors. A distribution that packages the
+# firmware separately (ovmf, AAVMF) needs EFI_FW_X86 + EFI_VARS_X86 (a
+# matching code/vars pair) or EFI_FW_AARCH64 set by hand; `make check-env`
+# prints what this lookup finds.
+#
+# Deferred: a lookup for distribution firmware packages.
+# Why: their file names and code/vars pairings differ per distribution,
+# and none has booted this tree, so a list here would be a guess.
+# Revisit when: a Linux host boots `make run-aarch64` or `make run-uefi`
+# with firmware from a distribution package.
+EFI_FW_DIRS := /opt/homebrew/Cellar/qemu /usr/local/Cellar/qemu /usr/local/share/qemu /usr/share/qemu
+efi_fw = $(shell find $(EFI_FW_DIRS) -name '$(1)' 2>/dev/null | head -1)
+EFI_FW_X86 ?= $(call efi_fw,edk2-x86_64-code.fd)
+EFI_VARS_X86 ?= $(call efi_fw,edk2-i386-vars.fd)
 
 # Test x86_64 FAT image in QEMU UEFI (validates the image before writing to USB)
 run-img-x86: img-x86
@@ -1342,8 +902,30 @@ verify-usb:
 		exit 1; \
 	fi
 
+# Kernel unit tests on the host (TEST_TARGET, see the host-triples block).
+#
+# A macOS host links the test binary as Mach-O; CI links it as ELF. The
+# two formats disagree about symbol names: a `#[no_mangle]` Rust symbol is
+# `_name` in Mach-O and `name` in ELF, where an assembly label is `name`
+# in both. A duplicate or missing symbol can therefore link here and fail
+# in CI (`resched_isr_stub`, repaired in 6f3c914). So on a macOS host `make test`
+# also links the test binary as ELF without running it (`check-elf-link`:
+# the toolchain's own lld and static musl, no system linker or libraries).
 test:
-	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+	RUST_MIN_STACK=8388608 cargo test --lib --target $(TEST_TARGET)
+	$(if $(findstring apple-darwin,$(HOST_TARGET)),$(MAKE) --no-print-directory check-elf-link,@true)
+
+ELF_LINK_TARGET := x86_64-unknown-linux-musl
+check-elf-link:
+	@echo "=== Linking the unit tests as ELF ($(ELF_LINK_TARGET), not run) ==="
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld -C link-self-contained=yes" \
+		cargo test --lib --no-run --target $(ELF_LINK_TARGET)
+
+# What this machine has and lacks for building, testing and booting
+# CambiOS: toolchain, targets, host tools, emulator, firmware, hooks.
+# Exit 0 when everything `make check-all` + `make test` need is present.
+check-env:
+	@python3 tools/check-env.py
 
 # =============================================================================
 # make verify — run Kani formal-verification proofs.
@@ -1373,12 +955,11 @@ verify: verify-all
 # test binaries).
 # =============================================================================
 .PHONY: stats
-# Host triple used to enumerate --lib tests in `make stats`. Defaults to the
-# maintainer's macOS host; override in CI / on Linux
-# (STATS_TEST_TARGET=x86_64-unknown-linux-gnu). The --lib tests are pure logic,
-# so the count is host-independent — the target only overrides the .cargo
-# bare-metal default so a host binary can be built.
-STATS_TEST_TARGET ?= x86_64-apple-darwin
+# Host triple used to enumerate --lib tests in `make stats`: the one
+# `make test` builds for. The --lib tests are pure logic, so the count is
+# host-independent; the target only overrides the .cargo bare-metal
+# default so a host binary can be built.
+STATS_TEST_TARGET ?= $(TEST_TARGET)
 
 stats:
 	@echo "=== CambiOS stats (derived from source) ==="
@@ -1422,6 +1003,13 @@ check-doc-refs:
 
 update-doc-refs-baseline:
 	python3 tools/check-doc-refs.py --update-baseline
+
+# Every file that has to repeat part of a build list (the toolchain file,
+# the cargo config, the CI workflows, the Limine configs, workspace.exclude,
+# the manifest's tags) agrees with the "Build lists" section at the top of
+# this file. No baseline: a disagreement is fixed. See tools/check-lists.py.
+check-lists:
+	python3 tools/check-lists.py
 
 # Regenerate docs/generated/audit-taxonomy.md from the canonical audit event
 # taxonomy in cambios-abi (the `audit_taxonomy!` macro). The doc is rendered
@@ -1517,9 +1105,22 @@ claude-preflight:
 # Install the tracked pre-commit hook by pointing core.hooksPath at
 # .githooks/. Run once per clone. Future hook changes propagate via
 # `git pull` — no re-install needed. See .githooks/pre-commit.
+#
+# The target checks its own work: the setting reads back as .githooks and
+# every tracked hook is executable. A clone whose hooksPath pointed at a
+# stale copy ran one lint for months while the tracked hooks ran none.
 install-hooks:
 	@git config core.hooksPath .githooks
-	@echo "=== core.hooksPath -> .githooks (pre-commit + commit-msg hooks active) ==="
+	@test "$$(git config --get core.hooksPath)" = ".githooks" || { echo "install-hooks: core.hooksPath did not take" >&2; exit 1; }
+	@for h in .githooks/*; do test -x "$$h" || { echo "install-hooks: $$h is not executable (chmod +x $$h)" >&2; exit 1; }; done
+	@echo "=== core.hooksPath -> .githooks; active hooks: $$(ls .githooks | tr '\n' ' ')==="
+
+# Developer Certificate of Origin sign-off on every commit in a range
+# (the commit-msg hook checks one commit at a time; CI checks the range
+# a pull request adds). Usage: make check-dco RANGE=origin/main..HEAD
+check-dco:
+	@test -n "$(RANGE)" || { echo 'usage: make check-dco RANGE=<base>..<head>' >&2; exit 1; }
+	python3 tools/check-dco.py --range "$(RANGE)"
 
 # Enforce CLAUDE.md Development Convention 9 (every deferral is a
 # conscious deferral). Scans kernel source + design docs for deferral
@@ -1565,8 +1166,8 @@ check-boot-panics:
 
 # Enforcement fails closed (CLAUDE.md § Formal Verification; ADR-006
 # § Divergence 2026-10-28): no new fail-open path, in code or in the
-# comment describing it, without a reviewed argument. Scans kernel +
-# user-space Rust; exempt a structural case with `// FAIL_OPEN_OK:`.
+# comment describing it, without a reviewed argument. Scans every Rust
+# file in the repository; exempt a structural case with `// FAIL_OPEN_OK:`.
 # Baseline at tools/check-fail-open-baseline.txt (expected empty).
 check-fail-open:
 	python3 tools/check-fail-open.py
@@ -1582,10 +1183,11 @@ update-boot-panics-baseline:
 
 # Enforce CLAUDE.md Development Convention 1: every `unsafe { ... }`
 # block must carry a `// SAFETY:` comment in its preceding comment
-# block. Comment-block-aware scanner; cluster + assignment-continuation
+# block, in every Rust file in the repository except verification/.
+# Comment-block-aware scanner; cluster + assignment-continuation
 # + attribute-line aware. Baseline at
-# tools/check-unsafe-coverage-baseline.txt; expected empty after E1
-# (prancy-manatee Tier 1 E1 + E3). Exits nonzero on any new site.
+# tools/check-unsafe-coverage-baseline.txt: empty for the kernel, 19
+# sites in five user crates. Exits nonzero on any new site.
 check-unsafe-coverage:
 	python3 tools/check-unsafe-coverage.py
 
@@ -1598,12 +1200,12 @@ update-unsafe-coverage-baseline:
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
 IMG_AARCH64 := cambios-aarch64.img
-EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-code.fd' 2>/dev/null | head -1)
+EFI_FW_AARCH64 ?= $(call efi_fw,edk2-aarch64-code.fd)
 
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
 
-img-aarch64: kernel-aarch64 init-aarch64 manifest-aarch64 fs-service-aarch64 key-store-service-aarch64 virtio-blk-aarch64 fde-mount-aarch64 usb-host-aarch64 ccid-aarch64 virtio-net-aarch64 udp-stack-aarch64 shell-aarch64 policy-service-aarch64 scanout-virtio-gpu-aarch64 virtio-input-aarch64 compositor-aarch64 hello-window-aarch64 faultme-aarch64 tree-aarch64 worm-aarch64 ping-aarch64 sprouty-aarch64 terminal-window-aarch64 audit-tail-aarch64 sign-tool limine
+img-aarch64: kernel-aarch64 init-aarch64 manifest-aarch64 $(addsuffix $(SUFFIX_aarch64),$(STAGE_aarch64)) sign-tool limine
 	@echo "=== Building AArch64 FAT boot image (signing mode: $(SIGN_MODE)) ==="
 	rm -f $(IMG_AARCH64)
 	dd if=/dev/zero of=$(IMG_AARCH64) bs=1M count=64
@@ -1615,79 +1217,19 @@ img-aarch64: kernel-aarch64 init-aarch64 manifest-aarch64 fs-service-aarch64 key
 	mcopy -i $(IMG_AARCH64) $(LIMINE_DIR)/BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
 	mcopy -i $(IMG_AARCH64) $(KERNEL_AARCH64) ::/boot/cambios_microkernel
 	# Copy + sign AArch64 boot modules (must match limine.conf module order)
-	cp $(POLICY_SERVICE_ELF_AARCH64) /tmp/policy-service-signed.elf
-	cp $(KS_SERVICE_ELF_AARCH64) /tmp/key-store-service-signed.elf
-	cp $(FS_SERVICE_ELF_AARCH64) /tmp/fs-service-signed.elf
-	cp $(BLK_DRIVER_ELF_AARCH64) /tmp/virtio-blk-signed.elf
-	cp $(FDE_MOUNT_ELF_AARCH64) /tmp/fde-mount-signed.elf
-	cp $(USB_HOST_ELF_AARCH64) /tmp/usb-host-signed.elf
-	cp $(CCID_ELF_AARCH64) /tmp/ccid-signed.elf
-	cp $(NET_DRIVER_ELF_AARCH64) /tmp/virtio-net-signed.elf
-	cp $(UDP_STACK_ELF_AARCH64) /tmp/udp-stack-signed.elf
-	cp $(SCANOUT_VGPU_ELF_AARCH64) /tmp/scanout-virtio-gpu-signed.elf
-	cp $(VIRTIO_INPUT_ELF_AARCH64) /tmp/virtio-input-signed.elf
-	cp $(COMPOSITOR_ELF_AARCH64) /tmp/compositor-signed.elf
-	cp $(TERMINAL_WINDOW_ELF_AARCH64) /tmp/terminal-window-signed.elf
-	cp $(TREE_ELF_AARCH64) /tmp/tree-signed.elf
-	cp $(HELLO_WINDOW_ELF_AARCH64) /tmp/hello-window-signed.elf
-	cp $(FAULTME_ELF_AARCH64) /tmp/faultme-signed.elf
-	cp $(WORM_ELF_AARCH64) /tmp/worm-signed.elf
-	cp $(PING_ELF_AARCH64) /tmp/ping-signed.elf
-	cp $(SPROUTY_ELF_AARCH64) /tmp/sprouty-signed.elf
-	cp $(SHELL_ELF_AARCH64) /tmp/shell-signed.elf
-	cp $(AUDIT_TAIL_ELF_AARCH64) /tmp/audit-tail-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/policy-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/key-store-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fs-service-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-blk-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/fde-mount-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/usb-host-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/ccid-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-net-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/udp-stack-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/scanout-virtio-gpu-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/virtio-input-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/compositor-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/terminal-window-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/tree-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/hello-window-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/faultme-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/worm-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/ping-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/sprouty-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/shell-signed.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/audit-tail-signed.elf
-	mcopy -i $(IMG_AARCH64) /tmp/policy-service-signed.elf ::/boot/policy-service.elf
-	mcopy -i $(IMG_AARCH64) /tmp/key-store-service-signed.elf ::/boot/key-store-service.elf
-	mcopy -i $(IMG_AARCH64) /tmp/fs-service-signed.elf ::/boot/fs-service.elf
-	mcopy -i $(IMG_AARCH64) /tmp/virtio-blk-signed.elf ::/boot/virtio-blk.elf
-	mcopy -i $(IMG_AARCH64) /tmp/fde-mount-signed.elf ::/boot/fde-mount.elf
-	mcopy -i $(IMG_AARCH64) /tmp/usb-host-signed.elf ::/boot/usb-host.elf
-	mcopy -i $(IMG_AARCH64) /tmp/ccid-signed.elf ::/boot/ccid.elf
-	mcopy -i $(IMG_AARCH64) /tmp/virtio-net-signed.elf ::/boot/virtio-net.elf
-	mcopy -i $(IMG_AARCH64) /tmp/udp-stack-signed.elf ::/boot/udp-stack.elf
-	mcopy -i $(IMG_AARCH64) /tmp/scanout-virtio-gpu-signed.elf ::/boot/scanout-virtio-gpu.elf
-	mcopy -i $(IMG_AARCH64) /tmp/virtio-input-signed.elf ::/boot/virtio-input.elf
-	mcopy -i $(IMG_AARCH64) /tmp/compositor-signed.elf ::/boot/compositor.elf
-	mcopy -i $(IMG_AARCH64) /tmp/terminal-window-signed.elf ::/boot/terminal-window.elf
-	mcopy -i $(IMG_AARCH64) /tmp/tree-signed.elf ::/boot/tree.elf
-	mcopy -i $(IMG_AARCH64) /tmp/hello-window-signed.elf ::/boot/hello-window.elf
-	mcopy -i $(IMG_AARCH64) /tmp/faultme-signed.elf ::/boot/faultme.elf
-	mcopy -i $(IMG_AARCH64) /tmp/worm-signed.elf ::/boot/worm.elf
-	mcopy -i $(IMG_AARCH64) /tmp/ping-signed.elf ::/boot/ping.elf
-	mcopy -i $(IMG_AARCH64) /tmp/sprouty-signed.elf ::/boot/sprouty.elf
-	mcopy -i $(IMG_AARCH64) /tmp/shell-signed.elf ::/boot/shell.elf
-	mcopy -i $(IMG_AARCH64) /tmp/audit-tail-signed.elf ::/boot/audit-tail.elf
+	$(foreach c,$(STAGE_aarch64),cp $(ELF_$(c)_aarch64) /tmp/$(c)-signed.elf$(NL))
+	$(foreach c,$(STAGE_aarch64),$(SIGN_ELF) $(SIGN_FLAGS) /tmp/$(c)-signed.elf$(NL))
+	$(foreach c,$(STAGE_aarch64),mcopy -i $(IMG_AARCH64) /tmp/$(c)-signed.elf ::/boot/$(c).elf$(NL))
 	# ADR-018 step 8 (commit D): init + the signed manifest blob.
 	# manifest-aarch64.bin arrives signed by its prerequisite — do NOT
 	# re-sign (stacked ARCSIG trailers break verification). Staged as
 	# /boot/manifest.bin so the module name matches MANIFEST_MODULE_NAME.
-	cp $(INIT_ELF_AARCH64) /tmp/init-signed.elf
+	cp $(ELF_init_aarch64) /tmp/init-signed.elf
 	$(SIGN_ELF) $(SIGN_FLAGS) /tmp/init-signed.elf
 	mcopy -i $(IMG_AARCH64) /tmp/init-signed.elf ::/boot/init.elf
 	rm -f /tmp/init-signed.elf
 	mcopy -i $(IMG_AARCH64) manifest-aarch64.bin ::/boot/manifest.bin
-	rm -f /tmp/policy-service-signed.elf /tmp/key-store-service-signed.elf /tmp/fs-service-signed.elf /tmp/virtio-blk-signed.elf /tmp/fde-mount-signed.elf /tmp/usb-host-signed.elf /tmp/ccid-signed.elf /tmp/virtio-net-signed.elf /tmp/udp-stack-signed.elf /tmp/scanout-virtio-gpu-signed.elf /tmp/virtio-input-signed.elf /tmp/compositor-signed.elf /tmp/terminal-window-signed.elf /tmp/tree-signed.elf /tmp/hello-window-signed.elf /tmp/faultme-signed.elf /tmp/worm-signed.elf /tmp/ping-signed.elf /tmp/sprouty-signed.elf /tmp/shell-signed.elf /tmp/audit-tail-signed.elf
+	rm -f $(foreach c,$(STAGE_aarch64),/tmp/$(c)-signed.elf)
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/limine.conf
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
@@ -1713,8 +1255,8 @@ run-aarch64: img-aarch64
 # GUI-on-aarch64 run: attaches virtio-gpu-pci as the scanout carrier and
 # virtio-keyboard-pci as an input carrier. The kernel's ECAM enumerator
 # (src/pci/mod.rs `mod ecam`) discovers both; scanout-virtio-gpu +
-# virtio-input + compositor + worm bind through them. `-display cocoa`
-# opens a macOS window; on Linux swap for `-display gtk` or `sdl`.
+# virtio-input + compositor + worm bind through them. The window
+# backend is QEMU_GUI_DISPLAY (see the host-triples block at the top).
 run-aarch64-gui: img-aarch64
 	qemu-system-aarch64 \
 		-machine virt,gic-version=3 \
@@ -1722,7 +1264,7 @@ run-aarch64-gui: img-aarch64
 		-smp 2 \
 		-m 4G \
 		-serial mon:stdio \
-		-display cocoa \
+		-display $(QEMU_GUI_DISPLAY) \
 		-device virtio-gpu-pci \
 		-device virtio-keyboard-pci \
 		-device qemu-xhci,id=xhci0 \
@@ -1769,7 +1311,7 @@ kernel-riscv64:
 # img-riscv64 deps, copy + sign + --module here, and pick the right
 # slot in BOOT_MODULE_ORDER (between compositor's last GUI dep and
 # shell, mirroring x86_64).
-img-riscv64: init-riscv64 manifest-riscv64 policy-service-riscv64 key-store-service-riscv64 fs-service-riscv64 virtio-blk-riscv64 fde-mount-riscv64 usb-host-riscv64 ccid-riscv64 virtio-net-riscv64 udp-stack-riscv64 shell-riscv64 faultme-riscv64 audit-tail-riscv64 sign-tool mkinitrd
+img-riscv64: init-riscv64 manifest-riscv64 $(addsuffix $(SUFFIX_riscv64),$(STAGE_riscv64)) sign-tool mkinitrd
 	@echo "=== Building RISC-V initrd (signing mode: $(SIGN_MODE)) ==="
 	rm -rf initrd_root_riscv64
 	mkdir -p initrd_root_riscv64
@@ -1777,32 +1319,10 @@ img-riscv64: init-riscv64 manifest-riscv64 policy-service-riscv64 key-store-serv
 	# manifest-riscv64.bin arrives signed by its prerequisite (no
 	# re-sign — stacked trailers break verification) and enters the
 	# archive under the name MANIFEST_MODULE_NAME expects. Both first.
-	cp $(INIT_ELF_RISCV64)           initrd_root_riscv64/init.elf
-	cp $(POLICY_SERVICE_ELF_RISCV64) initrd_root_riscv64/policy-service.elf
-	cp $(KS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/key-store-service.elf
-	cp $(FS_SERVICE_ELF_RISCV64)     initrd_root_riscv64/fs-service.elf
-	cp $(BLK_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-blk.elf
-	cp $(FDE_MOUNT_ELF_RISCV64)      initrd_root_riscv64/fde-mount.elf
-	cp $(USB_HOST_ELF_RISCV64)       initrd_root_riscv64/usb-host.elf
-	cp $(CCID_ELF_RISCV64)           initrd_root_riscv64/ccid.elf
-	cp $(NET_DRIVER_ELF_RISCV64)     initrd_root_riscv64/virtio-net.elf
-	cp $(UDP_STACK_ELF_RISCV64)      initrd_root_riscv64/udp-stack.elf
-	cp $(SHELL_ELF_RISCV64)          initrd_root_riscv64/shell.elf
-	cp $(FAULTME_ELF_RISCV64)        initrd_root_riscv64/faultme.elf
-	cp $(AUDIT_TAIL_ELF_RISCV64)     initrd_root_riscv64/audit-tail.elf
+	cp $(ELF_init_riscv64) initrd_root_riscv64/init.elf
+	$(foreach c,$(STAGE_riscv64),cp $(ELF_$(c)_riscv64) initrd_root_riscv64/$(c).elf$(NL))
 	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/init.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/policy-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/key-store-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fs-service.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-blk.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/fde-mount.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/usb-host.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/ccid.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/virtio-net.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/udp-stack.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/shell.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/faultme.elf
-	$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/audit-tail.elf
+	$(foreach c,$(STAGE_riscv64),$(SIGN_ELF) $(SIGN_FLAGS) initrd_root_riscv64/$(c).elf$(NL))
 	# Module order matches limine.conf on x86_64/aarch64 — the kernel's
 	# BOOT_MODULE_ORDER release chain is positional, so the service
 	# roster must be identical across arches (future ADR-018 manifest
@@ -1810,18 +1330,7 @@ img-riscv64: init-riscv64 manifest-riscv64 policy-service-riscv64 key-store-serv
 	$(MKINITRD) --out $(INITRD_RISCV64) \
 		--module manifest.bin=manifest-riscv64.bin \
 		--module init=initrd_root_riscv64/init.elf \
-		--module policy-service=initrd_root_riscv64/policy-service.elf \
-		--module key-store-service=initrd_root_riscv64/key-store-service.elf \
-		--module fs-service=initrd_root_riscv64/fs-service.elf \
-		--module virtio-blk=initrd_root_riscv64/virtio-blk.elf \
-		--module fde-mount=initrd_root_riscv64/fde-mount.elf \
-		--module usb-host=initrd_root_riscv64/usb-host.elf \
-		--module ccid=initrd_root_riscv64/ccid.elf \
-		--module virtio-net=initrd_root_riscv64/virtio-net.elf \
-		--module udp-stack=initrd_root_riscv64/udp-stack.elf \
-		--module audit-tail=initrd_root_riscv64/audit-tail.elf \
-		--module shell=initrd_root_riscv64/shell.elf \
-		--module faultme=initrd_root_riscv64/faultme.elf
+		$(foreach c,$(STAGE_riscv64),--module $(c)=initrd_root_riscv64/$(c).elf)
 	rm -rf initrd_root_riscv64
 	@echo "=== $(INITRD_RISCV64) ready ==="
 
@@ -1861,20 +1370,24 @@ run-riscv64: kernel-riscv64 img-riscv64
 # The discipline is the same either way — no commits that regress any
 # *currently buildable* architecture.
 # ---------------------------------------------------------------------------
-check-all: check-x86 check-aarch64 check-riscv64
+check-all: $(addprefix check-,$(ARCHES))
 	@echo "=== All three architectures build cleanly ==="
 
-check-stable: check-x86 check-aarch64
+check-stable: check-x86_64 check-aarch64
 	@echo "=== x86_64 + aarch64 build cleanly (RISC-V intentionally excluded — see Makefile comment) ==="
 
-check-x86:
-	cargo build --target x86_64-unknown-none --release
+# One build rule and one clippy rule per architecture. check-x86 and
+# check-clippy-x86 are the historical names for the x86_64 pair.
+define ARCH_GATE_RULES
+.PHONY: check-$(1) check-clippy-$(1)
+check-$(1):
+	cargo build --target $$(TRIPLE_$(1)) --release
+check-clippy-$(1):
+	cargo clippy --target $$(TRIPLE_$(1)) --release --lib
+endef
+$(foreach a,$(ARCHES),$(eval $(call ARCH_GATE_RULES,$(a))))
 
-check-aarch64:
-	cargo build --target aarch64-unknown-none --release
-
-check-riscv64:
-	cargo build --target riscv64gc-unknown-none-elf --release
+check-x86: check-x86_64
 
 # ---------------------------------------------------------------------------
 # Tri-arch clippy gate — runs clippy on all three backends so the #![deny]
@@ -1885,17 +1398,10 @@ check-riscv64:
 # (Cargo.toml [lints.clippy]) hard-fails here as well. CI runs this per-push;
 # a genuinely-irreducible unsafe block takes a local `#[allow(...)]` + rationale.
 # ---------------------------------------------------------------------------
-check-clippy: check-clippy-x86 check-clippy-aarch64 check-clippy-riscv64
+check-clippy: $(addprefix check-clippy-,$(ARCHES))
 	@echo "=== clippy clean on all three architectures ==="
 
-check-clippy-x86:
-	cargo clippy --target x86_64-unknown-none --release --lib
-
-check-clippy-aarch64:
-	cargo clippy --target aarch64-unknown-none --release --lib
-
-check-clippy-riscv64:
-	cargo clippy --target riscv64gc-unknown-none-elf --release --lib
+check-clippy-x86: check-clippy-x86_64
 
 # ---------------------------------------------------------------------------
 # Fuzzing
@@ -1905,8 +1411,8 @@ check-clippy-riscv64:
 # (`fuzz_asm_stubs`) for the symbols its `global_asm!` blocks define on
 # bare metal. A new assembly symbol the kernel references needs a
 # stand-in there, or every fuzz target fails to link (`make fuzz-build`
-# is what notices). On Apple Silicon the binaries run under Rosetta 2;
-# on Linux pass FUZZ_TARGET=x86_64-unknown-linux-gnu.
+# is what notices). FUZZ_TARGET defaults to TEST_TARGET, the x86_64
+# triple of this host's operating system.
 #
 # cargo-fuzz runs under the nightly pinned in rust-toolchain.toml, the
 # same compiler that builds the kernel.
@@ -1917,7 +1423,7 @@ check-clippy-riscv64:
 # for a 24 h run.
 .PHONY: fuzz-build fuzz-syscall-dispatcher
 FUZZ_ARGS ?= -max_total_time=60 -print_final_stats=1
-FUZZ_TARGET ?= x86_64-apple-darwin
+FUZZ_TARGET ?= $(TEST_TARGET)
 fuzz-build:
 	cargo fuzz build --fuzz-dir fuzz --target $(FUZZ_TARGET)
 
@@ -1930,26 +1436,13 @@ fuzz-syscall-dispatcher:
 # proof crates. Each proof crate is workspace-excluded; cargo-kani uses its
 # own pinned nightly toolchain. Run individual proof crates from this
 # wrapper rather than `cd`-ing into each one.
-.PHONY: verify-userslice verify-capability verify-elf verify-frame verify-buddy verify-dtb verify-all
-verify-userslice:
-	cd verification/userslice-proofs && cargo kani
+# verify-<name> runs verification/<name>-proofs; the set is PROOF_CRATES.
+VERIFY_TARGETS := $(patsubst %-proofs,verify-%,$(PROOF_CRATES))
+.PHONY: verify-all $(VERIFY_TARGETS)
+$(VERIFY_TARGETS): verify-%:
+	cd verification/$*-proofs && cargo kani
 
-verify-capability:
-	cd verification/capability-proofs && cargo kani
-
-verify-elf:
-	cd verification/elf-proofs && cargo kani
-
-verify-frame:
-	cd verification/frame-proofs && cargo kani
-
-verify-buddy:
-	cd verification/buddy-proofs && cargo kani
-
-verify-dtb:
-	cd verification/dtb-proofs && cargo kani
-
-verify-all: verify-buddy verify-elf verify-frame verify-capability verify-userslice verify-dtb
+verify-all: $(VERIFY_TARGETS)
 	@echo "=== All proof crates verified ==="
 
 clean:

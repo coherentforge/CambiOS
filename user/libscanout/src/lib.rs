@@ -517,12 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn register_compositor_roundtrip_tag_only() {
+    fn register_compositor_roundtrip() {
         let mut buf = [0u8; 16];
-        let n = encode_register_compositor(&mut buf).unwrap();
-        assert_eq!(n, 4);
+        let cluster_id = 0x0123_4567_89AB_CDEF;
+        let n = encode_register_compositor(&mut buf, cluster_id).unwrap();
+        assert_eq!(n, 12);
         assert_eq!(MsgTag::from_u32(u32::from_le_bytes(buf[0..4].try_into().unwrap())),
                    Some(MsgTag::RegisterCompositor));
+        assert_eq!(decode_register_compositor(&buf[..n]), Some(cluster_id));
     }
 
     #[test]

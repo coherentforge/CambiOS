@@ -7,3 +7,22 @@
 # baseline is the work of CLAUDE.md prompt-shaping changelog
 # entry 'E1' (Tier 1 step E1, prancy-manatee plan).
 
+user/compositor/src/main.rs:899
+user/libgui/src/client.rs:409
+user/libgui/src/surface.rs:201
+user/usb-host/src/xhci.rs:1271
+user/virtio-blk/src/virtqueue.rs:355
+user/virtio-net/src/main.rs:275
+user/virtio-net/src/main.rs:337
+user/virtio-net/src/virtqueue.rs:135
+user/virtio-net/src/virtqueue.rs:144
+user/virtio-net/src/virtqueue.rs:151
+user/virtio-net/src/virtqueue.rs:216
+user/virtio-net/src/virtqueue.rs:236
+user/virtio-net/src/virtqueue.rs:243
+user/virtio-net/src/virtqueue.rs:262
+user/virtio-net/src/virtqueue.rs:273
+user/virtio-net/src/virtqueue.rs:300
+user/virtio-net/src/virtqueue.rs:342
+user/virtio-net/src/virtqueue.rs:352
+user/virtio-net/src/virtqueue.rs:360

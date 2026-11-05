@@ -1,34 +1,59 @@
 # CambiOS code ownership.
 #
-# Paths listed here REQUIRE a code-owner review before a PR can merge (paired with
-# branch protection: require_code_owner_reviews=true). The cambios-agent bot is
-# intentionally NOT an owner, so it cannot self-merge changes to these paths — an
-# owner (a human, or a review agent acting as one) must approve first.
+# Everything is owned unless a line below says otherwise. An owned path
+# needs a code-owner review before a pull request that touches it can
+# merge (branch protection: require_code_owner_reviews). The project's
+# agent identity (cambios-agent) is not an owner, so it cannot merge a
+# change to an owned path on its own.
 #
-# Unlisted paths the bot MAY auto-merge on green CI, hands-off:
-#   - docs/ (except docs/adr/) — STATUS.md, ASSUMPTIONS.md, design docs
-#   - verification/ — test/proof additions  (see note below)
-#   - user/ — the hands-off USERSPACE-BUILD lane (looser rules than kernel)
+# The earlier form of this file listed the owned paths and left the rest
+# open. A directory created after the list was written was therefore
+# unowned: the proof crates, the boot manifest, the trusted public key,
+# every Cargo.lock, the hooks, and any new top-level crate. Ownership by
+# default means a new path is reviewed until someone decides it need
+# not be.
+#
+# In this file the last matching pattern wins, and a pattern with no
+# owner makes the path unowned.
 
-# Verified kernel core
-/src/                 @riccajason
+*                                 @riccajason
 
-# Syscall ABI surface (the kernel/userspace contract)
-/cambios-abi/         @riccajason
+# ---------------------------------------------------------------------------
+# Hands-off lanes: unowned on purpose. A pull request touching only
+# these merges on green checks, without an owner's review.
+#
+# The trade for each is stated, so it can be revisited.
+# ---------------------------------------------------------------------------
 
-# Architecture decision records (authoritative history)
-/docs/adr/            @riccajason
+# User-space crates. Looser rules than the kernel, and the place most
+# outside work lands. `make check-user` and `make test-user` are what
+# make a green check on this lane mean something.
+/user/
 
-# Project operating contract
-/CLAUDE.md            @riccajason
+# The status index and the bounds catalogue: updated with almost every
+# change, by whoever made it. STATUS.md is at the repository root.
+/STATUS.md
+/docs/ASSUMPTIONS.md
 
-# The gates themselves: build, lint, hooks, CI
-/Makefile             @riccajason
-/tools/               @riccajason
-/.github/             @riccajason
+# Generated documents (a lint fails when one is out of step with its
+# source) and working notes.
+/docs/generated/
+/docs/dev-notes/
 
-# Conscious exceptions (NOT owned, so the bot auto-merges them on green CI):
-#   user/        — Jason's hands-off USERSPACE-BUILD lane. Add here to require review.
-#   verification/— hands-off test/proof drains. NOTE: a bot could in principle make
-#                  a proof vacuous and keep CI green; add `/verification/ @riccajason`
-#                  if that risk outweighs hands-off proof draining.
+# Narrative and reference documents that carry no decision.
+/docs/manuals/
+/docs/developer-experience.md
+/docs/storage-planning.md
+/docs/identity-synthesis.md
+/docs/INTERRUPT_ROUTING.md
+/docs/SYSCALLS.md
+
+# ---------------------------------------------------------------------------
+# Owned inside a hands-off lane.
+# ---------------------------------------------------------------------------
+
+# The system library is the user-space half of the syscall ABI.
+/user/libsys/                     @riccajason
+
+# A lockfile change is a dependency change, wherever the lockfile is.
+Cargo.lock                        @riccajason

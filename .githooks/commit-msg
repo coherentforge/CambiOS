@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2024-2026 Jason Ricca
 #
-# Commit-msg hook: enforce Claude-authored commit hygiene.
+# Commit-msg hook: the sign-off every commit carries, and the hygiene
+# rules for agent-authored commits.
 #
-# Runs two Python checks in order; either one's failure rejects:
+# Runs three Python checks in order; any one's failure rejects:
+#   0. tools/check-dco.py
+#      Rejects a commit with no `Signed-off-by:` line (`git commit -s`).
+#      Applies to every commit, by a person or an agent: the line
+#      certifies the Developer Certificate of Origin (CONTRIBUTING.md).
 #   1. tools/check-claude-staged-files.py (H1, 2026-04-23)
-#      Rejects commits that bear a "Co-Authored-By: Claude" trailer
-#      without a matching "Staged files:" section. Catches file-list
-#      sweeps where the body drifted from `git diff --cached`.
+#      Rejects commits that bear a "Co-Authored-By:" trailer naming an
+#      agent (tools/_agent.py) without a matching "Staged files:"
+#      section. Catches file-list sweeps where the body drifted from
+#      `git diff --cached`.
 #   2. tools/check-preflight-discipline.py (sticky preflight, 2026-04-25)
 #      Rejects commits that stage a file which was already dirty at the
 #      start of the current Claude session AND was never preflighted
@@ -16,8 +22,9 @@
 #      because H1 only checks file-list correspondence, not per-hunk
 #      authorship — the 6th-recurrence shape (commit 4d4a4ab).
 #
-# Jason's manual commits (no Claude trailer) pass through both checks
-# untouched. Sticky-preflight gate is also bypassed when
+# A person's manual commits (no agent trailer) pass through checks 1
+# and 2 untouched. Check 2 reads Claude Code's session state and stays
+# Claude-only. Sticky-preflight gate is also bypassed when
 # CLAUDE_PREFLIGHT_SESSION is unset (gradual rollout).
 #
 # Bypass: `git commit --no-verify` (discouraged).
@@ -26,5 +33,6 @@ set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
+python3 tools/check-dco.py "$1"
 python3 tools/check-claude-staged-files.py "$1"
 python3 tools/check-preflight-discipline.py "$1"

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2024-2026 Jason Ricca
 #
-# Reject Claude-authored commits whose "Staged files:" section does not
+# Reject agent-authored commits whose "Staged files:" section does not
 # match the actual staged files.
 #
 # Rationale: parallel Claude sessions have repeatedly swept each other's
@@ -17,9 +17,12 @@
 #   4. c9e8e86 — 5th recurrence, auto-attribution swept foreign file
 #   5. this lint                        (2026-04-23)
 #
-# Claude-authored is detected by the presence of "Co-Authored-By: Claude"
-# anywhere in the commit message. Non-Claude commits pass through
-# untouched; Jason's manual commits do not need a Staged files block.
+# Agent-authored is detected by a "Co-Authored-By:" trailer naming an
+# agent (tools/_agent.py holds the names: Claude, Codex, Copilot, ...).
+# The rule began as a Claude rule and the file keeps its name; the
+# failure it prevents does not depend on which agent staged the files.
+# Commits without such a trailer pass through untouched; a person's
+# manual commits do not need a Staged files block.
 #
 # Parse rule: the first line matching /^\s*-?\s*Staged files\s*:\s*$/
 # (case-insensitive) begins the block. The trailing `:\s*$` means a
@@ -46,6 +49,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _agent import is_agent_authored  # noqa: E402
 
 
 HEADER_RE = re.compile(r'^(?P<indent>\s*)-?\s*Staged files\s*:\s*$', re.IGNORECASE)
@@ -99,15 +105,15 @@ def main():
         line for line in msg.splitlines() if not line.lstrip().startswith("#")
     )
 
-    if "Co-Authored-By: Claude" not in msg:
+    if not is_agent_authored(msg):
         return 0
 
     claimed, found_header = extract_claimed_paths(msg)
     if not found_header:
-        print("ERROR: Claude-authored commit missing 'Staged files:' section.",
+        print("ERROR: agent-authored commit missing 'Staged files:' section.",
               file=sys.stderr)
         print("", file=sys.stderr)
-        print("  Every Claude commit body must list its staged files in a",
+        print("  Every agent-authored commit body must list its staged files in a",
               file=sys.stderr)
         print("  block like:", file=sys.stderr)
         print("", file=sys.stderr)

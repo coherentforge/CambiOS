@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:401:eventually
-CLAUDE.md:419:deferred
+CLAUDE.md:422:eventually
+CLAUDE.md:440:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -128,7 +128,7 @@ src/syscalls/userspace.rs:211:TODO
 src/syscalls/userspace.rs:228:TODO
 src/syscalls/userspace.rs:249:TODO
 tools/check-lockfile-additions.py:19:for-now
-tools/check-unsafe-coverage.py:82:for-now
+tools/check-unsafe-coverage.py:92:for-now
 user/compositor/src/main.rs:514:for-now
 user/key-store-service/src/vault/mod.rs:396:for-now
 user/libgui-proto/src/lib.rs:27:deferred

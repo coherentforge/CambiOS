@@ -10,5 +10,13 @@ targets = [
     "x86_64-unknown-none",
     "aarch64-unknown-none",
     "riscv64gc-unknown-none-elf",
+    # Host triples. The unit tests and fuzz targets build for an x86_64
+    # triple of the host's operating system (TEST_TARGET in the Makefile);
+    # on x86_64 Linux that is the host triple, which rustup always installs.
     "x86_64-apple-darwin",
+    # `make check-elf-link`: a macOS host links the unit tests as ELF, the
+    # format CI links, without running them.
+    "x86_64-unknown-linux-musl",
 ]
+# `make check-clippy` is a gate, so the lint tool comes with the toolchain.
+components = ["clippy"]

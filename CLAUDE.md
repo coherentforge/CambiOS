@@ -40,9 +40,9 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 
 ## Development Environment
 
-- **Host:** macOS (Apple Silicon)
-- **Kernel targets:** `x86_64-unknown-none`, `aarch64-unknown-none`, and `riscv64gc-unknown-none-elf` (ELF, bare metal). RISC-V backend is in progress (Phase R-0 done) — see [ADR-013](docs/adr/013-riscv64-architecture-support.md) and [STATUS.md](STATUS.md) RISC-V port phases.
-- **Unit tests:** `cargo test --lib` (runs natively on macOS)
+- **Host:** macOS on Apple Silicon or x86_64 Linux (the host CI runs on). The Makefile detects the host triple; no command in this file needs one typed by hand. `make check-env` reports what a machine has and lacks.
+- **Kernel targets:** `x86_64-unknown-none`, `aarch64-unknown-none`, and `riscv64gc-unknown-none-elf` (ELF, bare metal). All three build at every commit (`make check-all`). What each one boots, and how far, is in [STATUS.md](STATUS.md); the RISC-V design is [ADR-013](docs/adr/013-riscv64-architecture-support.md).
+- **Unit tests:** `make test` (the kernel library, on the host) and `make test-user` (the user, protocol and tool crates that have host tests). A bare `cargo test` fails: the default cargo target is bare metal.
 - **AArch64 boot media:** FAT disk image via `mtools` (ISO/cdrom doesn't work for AArch64 UEFI on QEMU)
 - **RISC-V boot:** OpenSBI (M-mode firmware, ships with QEMU as `-bios default`) hands a DTB pointer to a custom S-mode boot stub at `src/boot/riscv.rs`. No Limine on RISC-V.
 
@@ -53,7 +53,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **AArch64 QEMU MUST use** `-machine virt,gic-version=3` (GICv3 required for ICC system registers).
 - **RISC-V QEMU MUST use** `-machine virt -bios default` (loads OpenSBI as M-mode firmware; the kernel is the S-mode payload). No vendor-specific machine types — generic-first per [ADR-013](docs/adr/013-riscv64-architecture-support.md).
 - **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Use `make check-all` (x86_64 + aarch64 + riscv64) as the permanent gate — R-6 landed 2026-04-19 so all three arches are now buildable at every commit boundary. `make check-stable` (x86_64 + aarch64 only) remains available as an escape hatch for future temporary backend breakage; the discipline is identical either way — no commits regress any *currently buildable* arch.
-- **ALWAYS** all new files get an SPDX license header + copyright at the top. Default: `// SPDX-License-Identifier: AGPL-3.0-or-later` then `// Copyright (C) 2024-2026 Jason Ricca` on the next line. Files under `user/libsys/` use `// SPDX-License-Identifier: MPL-2.0` instead. Adapt the comment syntax to file type (`#` for .toml/.py/.sh/Makefile; `/* ... */` for .ld/.S linker scripts and assembly). Do NOT use "All rights reserved" — a license grant supersedes reserved rights, and the SPDX header is the load-bearing declaration.
+- **ALWAYS** all new files get an SPDX license header + copyright at the top. Default: `// SPDX-License-Identifier: AGPL-3.0-or-later` then `// Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors` on the next line. A file that already carries the earlier `Copyright (C) 2024-2026 Jason Ricca` line keeps it; headers are not rewritten in passing. Files under `user/libsys/` use `// SPDX-License-Identifier: MPL-2.0` instead. Adapt the comment syntax to file type (`#` for .toml/.py/.sh/Makefile; `/* ... */` for .ld/.S linker scripts and assembly). Do NOT use "All rights reserved" — a license grant supersedes reserved rights, and the SPDX header is the load-bearing declaration.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
 
 ## Stop-and-Ask Gate
@@ -70,7 +70,7 @@ Before the first edit, stop and confirm when any of these apply. Questions beat 
 - **Telemetry / analytics / phone-home.** Project principle is zero telemetry. Any feature that emits data off-device (even "anonymous") is a stop.
 - **Fail-open path.** About to make an enforcement decision default to Allow when the decider is unavailable, slow, full, or returns garbage — or to describe one in a comment. Enforcement fails closed (Formal Verification list); propose the deny + audit + restart shape instead, or name the structural reason there is no one to ask.
 - **Portable module drift.** About to add `#[cfg(target_arch = …)]` to `src/scheduler/`, `src/ipc/`, `src/process.rs`, `src/loader/elf.rs`, or another portable module. Factor an `arch::` helper instead, or escalate.
-- **Identity-gate bypass.** About to add a syscall without updating `requires_identity()` + the identity tests in [src/syscalls/mod.rs](src/syscalls/mod.rs), or add an IPC receiver that uses plain `recv_msg` where `recv_verified` is the load-bearing variant.
+- **Identity-gate bypass.** About to add a syscall without updating `requires_identity()` and the identity tests beside it in [cambios-abi/src/lib.rs](cambios-abi/src/lib.rs), or add an IPC receiver that uses plain `recv_msg` where `recv_verified` is the load-bearing variant.
 - **Destructive or shared-state action.** `git reset --hard`, branch deletion, force-push, `rm -rf` under the repo, or any action visible outside this machine. The top-level "Executing actions with care" rule applies; this bullet is the local reminder.
 - **Pre-edit audit.** Before the first Edit/Write on any file per session (especially under parallel-thread development), run `make claude-preflight FILE=<path>` or `git diff <path>`. If the diff is non-empty and the changes aren't this session's, STOP — ask the user to commit them before proceeding, or pick a different file. File-scoped `git add <file>` does not protect against *within-file* multi-authorship, so the gate has to fire before the edit, not before the commit.
 
@@ -86,7 +86,8 @@ Commit at topic boundaries within a session, not at session end. Bisectable hist
 - **Split by logical boundary, not by file.** A small multi-file change is one commit; a large single-file change spanning multiple topics should be multiple commits if the edits are cleanly separable.
 - **Never `git add .` or `git commit -a` without naming files.** Working-tree sweeps conflate unrelated work — if a parallel session has uncommitted edits, those will get swept into the commit message of whatever is landing. Stage by explicit filename.
 - **Draft the commit body from `git diff --cached`, not from memory.** Every claim ("removes X", "renames Y") must match a line in the staged diff. Verification bullets ("grep returns nothing", "make check-all clean") must be run against the staged tree at drafting time, not recalled. Bodies written from memory drift ahead of what got staged.
-- **Claude drafts; user executes.** Claude prepares `git add <files>` + commit message; user runs the commit to enter their PGP passphrase. Never bypass signing (`--no-gpg-sign`, `--no-verify`).
+- **Sign off every commit** (`git commit -s`). The `Signed-off-by:` line certifies the Developer Certificate of Origin; the commit-msg hook rejects a commit without it. An agent-authored commit carries the sign-off of the person the agent works for. Process details for contributors are in [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Who runs the commit.** On the maintainer's clone the agent drafts and the maintainer executes: the agent prepares `git add <files>` and the commit message, and the maintainer runs the commit to enter their PGP (Pretty Good Privacy) passphrase. On a contributor's clone or fork, the contributor, or their agent under the contributor's own identity, commits to a branch and opens a pull request; a contributor's change reaches `main` only through a pull request that passes the required checks. The project's own agent identity (the `cambios-agent` GitHub App) takes the same pull-request path. In every case: never bypass signing or hooks (`--no-gpg-sign`, `--no-verify`).
 
 ## Acronyms in Chat and Docs
 
@@ -240,6 +241,10 @@ Observed symptom → likely root cause. The symptom rarely names the invariant i
 
 Seven coordinated places must change atomically (variant declaration, identity gate, `from_u64` wire-up, test coverage, dispatcher arm, handler, libsys wrapper) — full walkthrough with each step's failure mode in [docs/dev-notes/syscall-workflow.md](docs/dev-notes/syscall-workflow.md). Canonical reference: `TryRecvMsg = 37`. **Flow-specific stop-and-ask:** syscall in exempt set? new capability-check kind? new arch backend helper?
 
+### Adding a user crate
+
+Six things have to agree: the crate itself, the Makefile's build lists, `workspace.exclude`, the Limine configs, the `manifest.toml` entry, and the host-test lists. `make check-lists` names the one that is missing. Walkthrough: [docs/dev-notes/adding-a-user-crate.md](docs/dev-notes/adding-a-user-crate.md).
+
 ## Quick Reference
 
 ```bash
@@ -252,16 +257,32 @@ cargo build --target riscv64gc-unknown-none-elf --release
 make check-all        # x86_64 + aarch64 + riscv64 (permanent gate)
 make check-stable     # x86_64 + aarch64 only (escape hatch for temporary backend breakage)
 
-# Unit tests (host). `--lib` mandatory (microkernel binary can't link on macOS). RUST_MIN_STACK needed for buddy-allocator tests.
-RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+# Unit tests (host). They build for TEST_TARGET, the x86_64 triple of this machine's OS (the kernel
+# library picks its backend by target_arch). On a macOS host `make test` also links the test binary
+# as ELF, the format CI links, without running it.
+make test             # kernel library
+make test-user        # every package in the Makefile's HOST_TEST_CRATES (`make host-test-user-libsys` for one)
+make check-user       # every user crate builds for every architecture that lists it
+
+# What this machine has and lacks: toolchain, targets, emulator, firmware, hooks
+make check-env
+
+# Proofs (Kani 0.67.0, its own bundled toolchain). CI compiles every proof crate on every push and
+# solves the crates whose inputs changed; verification/CLAIMS.md maps claims to harnesses.
+make verify-all       # every crate under verification/ (`make verify-<crate>` for one)
+
+# Fuzz targets (cargo-fuzz, the pinned nightly). Building them is the check; runs are manual.
+make fuzz-build
 
 # Derived counts (syscalls, tests, LOC)
 make stats
 
-# Lints (all don't-grow-the-baseline gates; baselines in tools/check-*-baseline.txt)
+# Lints. Most are don't-grow-the-baseline gates (baselines in tools/check-*-baseline.txt); check-lists has no baseline.
+make check-lists             # every copy of a build list (architectures, user crates, host-tested packages, proof crates) agrees with the Makefile's "Build lists" section
+make check-doc-refs          # docs/ASSUMPTIONS.md source references resolve; repair with `python3 tools/check-doc-refs.py --fix`
 make check-adrs              # ADR cross-refs + regenerate docs/adr/INDEX.md
 make audit-taxonomy          # regenerate docs/generated/audit-taxonomy.md from cambios-abi (audit_taxonomy! macro)
-make check-audit-taxonomy    # verify the generated taxonomy doc is in sync (local make-target lint, like check-adrs; not ubuntu-CI-gated)
+make check-audit-taxonomy    # verify the generated taxonomy doc is in sync (local only: neither CI nor the hooks run it)
 make check-assumptions       # Convention 8 numeric-const tags
 make check-deferrals         # Convention 9 Revisit-when triggers
 make check-boot-panics       # ADR-021 Phase C — no panic!/expect/etc in boot init; exempt via `// BOOT_PANIC_OK: <reason>`
@@ -270,7 +291,7 @@ make check-banned-paths      # paths in tools/banned-paths.txt must not exist on
 make check-index-isolation   # STATUS.md diff >20 lines + any .rs staged → reject
 make check-lockfile          # T-1: lists added/removed Cargo.lock crates (advisory)
 make check-unsafe-coverage   # Convention 1 (blocks): every `unsafe { }` has `// SAFETY:` (cluster + cfg-attr + assignment-continuation aware)
-make check-status-freshness  # STATUS.md `last_synced_to_code:` within 7 days of today (advisory; warn-but-pass)
+make check-status-freshness  # STATUS.md `last_synced_to_code:` within 7 days of today (advisory; warn-but-pass). CI runs it with `--strict`, which fails when STATUS.md's Kani harness total disagrees with the source
 make check-clippy            # Convention 1 (tri-arch deny gate, CI per-push): missing_safety_doc (every `pub unsafe fn` has `# Safety`) + multiple_unsafe_ops_per_block + undocumented_unsafe_blocks; runs clippy on x86_64+aarch64+riscv64 because arch-cfg'd unsafe only lints on its own target
 # Commit-msg hooks (Claude-authored commits only):
 # 1. H1 (2026-04-23): `Staged files:` block must match `git diff --cached
@@ -314,11 +335,11 @@ make symbols
 
 # Standalone builds
 make fs-service                  # user/fs-service — separate crate, uses CARGO_ENCODED_RUSTFLAGS to override parent .cargo/config.toml
-make sign-tool                   # tools/sign-elf — host-side, own .cargo/config.toml targeting aarch64-apple-darwin
+make sign-tool                   # tools/sign-elf — host-side tool, built for the detected host triple
 make manifest                    # ADR-018: emit manifest.bin from manifest.toml via tools/build-manifest (`--arch x86_64 --profile default`; manifest-aarch64 / manifest-riscv64 for the other arches), sign with sign-elf. The manifest is the ONLY spawn authority since step 9: services, on-demand apps (`lifetime = "on-demand"`), grants, reservations all live in manifest.toml. A dependant can name a role by endpoint (`depends_on_endpoints = [27]`); build-manifest resolves it to the one kept owner per arch/profile, so the wire blob is always plain name deps.
-make init                        # user/init — PID 1 supervisor (init-aarch64 / init-riscv64 for other arches); host tests: cd user/init && cargo test --target aarch64-apple-darwin
+make init                        # user/init — PID 1 supervisor (init-aarch64 / init-riscv64 for other arches); host tests: `make host-test-user-init`
 make gen-dev-piv-keys            # tools/gen-dev-piv-keys — derives dev Ed25519+X25519 keys from a persistent per-developer seed at tools/gen-dev-piv-keys/.dev-seed.bin (gitignored); writes dev_bootstrap_pubkey.bin (workspace root) + dev_slot_9c_seed.bin (workspace root, for sign-elf via SIGN_MODE=dev-piv) + user/key-store-service/dev_piv_secret.bin. Idempotent; required before any `--features dev-piv` build (kernel + key-store-service must both be built with this feature for SwPivBackend's pubkey to match the kernel-baked bootstrap pubkey).
-make format-volume               # tools/format-volume — host tool that writes a fresh signed ADR-032 volume header to a raw disk image. Run as `tools/format-volume/target/aarch64-apple-darwin/release/format-volume <disk-image>`. Requires gen-dev-piv-keys to have run first. The header pairs with the dev_bootstrap_pubkey.bin baked into the kernel under `--features dev-piv`; fde-mount reads + verifies + unwraps the master key at boot. Stream A A-v.e.
+make format-volume               # tools/format-volume — host tool that writes a fresh signed ADR-032 volume header to a raw disk image. Run as `$(make -s print-FORMAT_VOLUME) <disk-image>`. Requires gen-dev-piv-keys to have run first. The header pairs with the dev_bootstrap_pubkey.bin baked into the kernel under `--features dev-piv`; fde-mount reads + verifies + unwraps the master key at boot. Stream A A-v.e.
 
 # Dev-PIV feature builds (Stream A; ADR-032 Migration Path step 2)
 make kernel-dev-piv              # kernel built with --features dev-piv (replaces baked bootstrap pubkey with the dev one)
@@ -327,11 +348,11 @@ make iso-dev-piv                 # Re-assembles the ISO with dev-piv kernel + ke
 make run-quiet-dev-piv           # Formats cambios-disk.img with a fresh signed FDE header + boots under iso-dev-piv. Stream A A-v.d end-to-end smoke test.
 # Manual: cargo build --target x86_64-unknown-none --release --features dev-piv (kernel) + CARGO_ENCODED_RUSTFLAGS=... cargo build --release --features dev-piv inside user/key-store-service/
 
-# ELF signing (produces ARCSIG trailer)
-./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf <elf-file>                                    # YubiKey (default)
-./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --seed <hex> <elf-file>                       # seed (CI/test)
-./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --export-pubkey bootstrap_pubkey.bin          # one-time setup
-./tools/sign-elf/target/aarch64-apple-darwin/release/sign-elf --print-pubkey
+# ELF signing (produces ARCSIG trailer). The tool is built under its host triple; `make -s print-SIGN_ELF` prints the path.
+$(make -s print-SIGN_ELF) <elf-file>                                    # YubiKey (default)
+$(make -s print-SIGN_ELF) --seed <hex> <elf-file>                       # seed (CI/test)
+$(make -s print-SIGN_ELF) --export-pubkey bootstrap_pubkey.bin          # one-time setup
+$(make -s print-SIGN_ELF) --print-pubkey
 ```
 
 ## Code Navigation — rust-analyzer MCP Tools
@@ -389,7 +410,7 @@ Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.
 
 ## Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 
-x86_64 + AArch64 shipping; riscv64gc in progress per [ADR-013](docs/adr/013-riscv64-architecture-support.md). Per-module parity status lives in [STATUS.md](STATUS.md).
+x86_64, AArch64 and riscv64gc build at every commit ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Per-module parity status lives in [STATUS.md](STATUS.md).
 
 ### Portability Boundary (portable modules — no arch code)
 `src/scheduler/`, `src/ipc/`, `src/syscalls/mod.rs`, `src/process.rs`, `src/memory/buddy_allocator.rs` + `frame_allocator.rs`, `src/arch/spinlock.rs`. All arch code lives under `src/arch/<target>/`; `src/arch/mod.rs` is the cfg-gated shim.
@@ -441,7 +462,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
 | **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
 | **Init / boot manifest / service lifecycle** | [ADR-018](docs/adr/018-init-process-and-boot-manifest.md) (kernel transcribes security sections, init interprets policy sections; migration-step ordering), [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md) (restart substrate — gates step 10) | `cambios-manifest/src/lib.rs` (wire format, shared parser, boot-protocol consts), `user/init/src/engine.rs` (supervisor state machine), `src/manifest.rs` (kernel transcription), `manifest.toml` + `tools/build-manifest` (registry artifact) |
-| **Architecture port (RISC-V — in progress, future archs)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), this file's "Multi-Platform Strategy" section, plan file at `/Users/jasonricca/.claude/plans/melodic-tumbling-muffin.md` | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
+| **Architecture port (a new backend)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), this file's "Multi-Platform Strategy" section; `make check-lists` names each file a new architecture has to be added to | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
 | **Graphics / compositor / GUI / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) (+ § Divergence 2026-04-20 for 4.a/4.b scanout transport: `SYS_VIRTIO_MODERN_CAPS = 38`, double-copy frame path, `-vga virtio` QEMU; + § Divergence 2026-05-08 for the client↔compositor protocol — 10 wire messages 0x3xxx/0x4xxx, libgui-proto authoritative) | `user/compositor` (ep 28), `user/scanout-virtio-gpu` (ep 27 — default x86_64 driver, 5 2D ops: CREATE_2D / ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH), `user/scanout-limine` (fallback). Intel + aarch64/riscv64 virtio-gpu deferred to 4.c+. [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) for channel transport. |
 | **GUI client library (user/libgui v0)** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) (libgui = in-process widget layer; v0 drawing primitives only, widgets deferred), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) § Divergence 2026-05-08 (client↔compositor wire protocol — full message table + authority model) | `user/libgui-proto/src/lib.rs` (wire format), `user/hello-window/` (canonical client), `user/libgui/src/{surface,font,tile_grid,client,bitmap}.rs`. No new kernel syscalls — drawing is CPU writes into attached surface channel. `Client::open` does CreateWindow/WelcomeClient/channel_attach handshake. `TileGrid::hit_test` deferred — don't add without consumer. |
 | **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) (+ § Divergence: virtio-input-first, `COMPOSITOR_INPUT_ENDPOINT = 30`, first-live-window focus) | `user/libinput-proto/src/lib.rs` (96-byte wire + class payloads + modifier/button bitfields), `user/virtio-input/` (main.rs + transport.rs + virtqueue.rs + evdev.rs), `user/compositor/src/main.rs::pump_input_once` (→ focused window via `MsgTag::InputEvent = 0x4030`), `user/libgui/src/client.rs::poll_event`. Hub deferred until second consumer or signed-carrier hardware. `signature_block` reserved from day one so ADR-012 Input-5 lands without format revision. |
@@ -492,7 +513,7 @@ Run `tree -L 2 src/ user/ tools/` for the current layout; file names and purpose
 - **`build.rs`** reads `CAMBIOS_TIER` (default `tier3`) and emits `--cfg tierN` for `src/config/tier.rs`. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) / [ADR-009](docs/adr/009-purpose-tiers-scope.md).
 - **Arch split:** portable modules (`scheduler/`, `ipc/`, `process.rs`, `loader/elf.rs`, `memory/buddy_allocator.rs` + `frame_allocator.rs`, `syscalls/mod.rs`) contain no arch-specific code. All arch backends live under `src/arch/<target>/`. `src/arch/mod.rs` is the cfg-gated shim.
 - **Service endpoints (load-bearing numbers):** init=1 (ADR-018 readiness pings; the manifest reserves every listed entry's endpoints to its derived AID — services AND on-demand apps: tree=61, worm=62, sprouty=63, ping=19, hello-window=29 — and init spawns the service set; the kernel auto-starts nothing), fs-service=16, key-store-service=17, virtio-net=20, udp-stack=21, block driver (virtio-blk in the `default` profile, nvme in the bare-metal profiles; the seam is `cambios-blk-proto`)=24 (user clients, `recv_verified`) + 26 (kernel-only commands, `recv_msg`, no cap check) + 25 (kernel's reply endpoint, `handle_write` intercept), scanout-virtio-gpu=27, compositor=28, input consumer=30 (the compositor in the GUI profiles, the shell in `headless` — usb-host always delivers keyboard events there; the manifest's two `shell` entries with disjoint `profile` tags pick the owner). Endpoint 0 is the REPLY_ENDPOINT "unset" sentinel — structurally unusable.
-- **`tools/sign-elf/`** — host-side Ed25519 ELF signer (YubiKey or seed), produces the ARCSIG trailer. Own `.cargo/config.toml` targeting `aarch64-apple-darwin`.
+- **`tools/sign-elf/`** — host-side Ed25519 ELF signer (YubiKey or seed), produces the ARCSIG trailer. Built for the host (`host-tuple` in its `.cargo/config.toml`).
 
 ## Key Technical Details
 
@@ -551,7 +572,7 @@ User data before user code is **required** by SYSRET selector computation.
 
 ### Syscall Numbers
 
-The canonical list is the `SyscallNumber` enum in [src/syscalls/mod.rs](src/syscalls/mod.rs) — that is the ABI. Run `make stats` for the current count. The per-syscall summaries below describe *behavior*, not *existence*; if you need the authoritative list of numbers, read the enum.
+The canonical list is the `SyscallNumber` enum in [cambios-abi/src/lib.rs](cambios-abi/src/lib.rs) ([ADR-024](docs/adr/024-syscall-abi-crate.md)); [src/syscalls/mod.rs](src/syscalls/mod.rs) re-exports it. That enum is the ABI. Run `make stats` for the current count. The per-syscall summaries below describe *behavior*, not *existence*; if you need the authoritative list of numbers, read the enum.
 
 Handlers live in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs). All IPC syscalls go through capability + interceptor checks and stamp `sender_principal`. Only the non-obvious gotchas / ABIs / restrictions are listed below:
 

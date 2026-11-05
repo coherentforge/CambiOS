@@ -23,3 +23,18 @@ user/user-riscv64.ld
 # by the 2026-06-03 correctness review; deleted here. Banned so a stray
 # copy can't resurface untracked and get swept into a future commit.
 src/microkernel/main.rs.bak
+
+# user/dhcp-client: a Cargo.toml and two linker scripts with no source and
+# no build rule (STATUS.md records the DHCP client as paused, with its
+# pre-work in user/udp-stack). It was not in workspace.exclude either.
+# check-lists rejects a directory under user/
+# that has a manifest and no source; deleted in the commit that adds the
+# lint. Banned so an untracked copy cannot come back.
+user/dhcp-client
+
+# tools/check-demo-readiness.sh: a macOS-only readiness script from April
+# 2026 with its own copies of the architecture and target lists and
+# Homebrew-only advice; nothing referenced it. Replaced by
+# tools/check-env.py (`make check-env`), which reads the lists from the
+# Makefile and reports for macOS and Linux hosts.
+tools/check-demo-readiness.sh
