@@ -14,11 +14,11 @@ src/arch/aarch64/mod.rs:160:USER_CS
 src/arch/aarch64/mod.rs:162:USER_SS
 src/arch/aarch64/mod.rs:164:KERNEL_CS
 src/arch/aarch64/mod.rs:166:KERNEL_SS
-src/arch/aarch64/mod.rs:882:SAVED_CTX_ELR_INDEX
-src/arch/aarch64/mod.rs:884:SAVED_CTX_SPSR_INDEX
-src/arch/aarch64/mod.rs:886:SAVED_CTX_SP_EL0_INDEX
-src/arch/aarch64/mod.rs:889:PL011_PHYS
-src/arch/aarch64/mod.rs:899:MAX_DEBUG_SWITCHES
+src/arch/aarch64/mod.rs:893:SAVED_CTX_ELR_INDEX
+src/arch/aarch64/mod.rs:895:SAVED_CTX_SPSR_INDEX
+src/arch/aarch64/mod.rs:897:SAVED_CTX_SP_EL0_INDEX
+src/arch/aarch64/mod.rs:900:PL011_PHYS
+src/arch/aarch64/mod.rs:910:MAX_DEBUG_SWITCHES
 src/arch/aarch64/paging.rs:49:DESC_VALID
 src/arch/aarch64/paging.rs:51:DESC_TABLE
 src/arch/aarch64/paging.rs:53:DESC_AF

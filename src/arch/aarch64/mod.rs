@@ -692,6 +692,15 @@ core::arch::global_asm!(
     "str x0, [sp, #0]",
     // Restore and eret (shared path)
     "sync_el0_restore:",
+    // Mask IRQs for the whole restore. Exception entry masked them, but a
+    // handler that yielded comes back through .Lyield_resume with them
+    // unmasked. An IRQ taken after `msr elr_el1` below overwrites ELR_EL1
+    // and SPSR_EL1 with the interrupted kernel PC and PSTATE; the timer
+    // stub returns here, nothing reloads the user values, and the eret
+    // enters EL0 at a kernel address (the virtio-blk reap at this stub's
+    // own PC, 2026-11-04). The same reason x86_64's return path does
+    // `cli` before `sysretq`. The eret restores the user's DAIF from SPSR.
+    "msr daifset, #2",
     "ldr x2, [sp, #248]",
     "ldr x3, [sp, #256]",
     "ldr x4, [sp, #264]",
@@ -825,7 +834,9 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
     // FAR_EL1 / ELR_EL1 were read above, before any nested exception can
     // clobber them.
     // SAFETY: clearing DAIF.I at EL1 on a valid kernel stack with the
-    // trap frame fully saved — the same posture the SVC path takes.
+    // trap frame fully saved — the posture a syscall handler has once it
+    // has yielded (.Lyield_resume unmasks). This path never reaches
+    // sync_el0_restore, which masks again for the handlers that do.
     unsafe {
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
     }
