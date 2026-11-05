@@ -115,6 +115,41 @@ pub fn irq_save_disable() -> usize {
 #[inline]
 pub fn irq_restore(_token: usize) {}
 
+/// Enable FP/Advanced-SIMD at EL0 and EL1 on the calling CPU
+/// (CPACR_EL1.FPEN = 0b11, ARM DDI 0487 D17.2.30).
+///
+/// CPACR_EL1 is a per-CPU register, so the BSP and every AP must each call
+/// this before any user task runs on them. Rust-compiled user code reaches
+/// NEON through `compiler_builtins::memset` (`dup v0.4h`); with FPEN
+/// unset that instruction traps as EC=0x07 and the task is reaped. The
+/// first task placed on an AP by spawn-time placement — the policy
+/// service — hit exactly that from 2026-10-27 until the AP path gained
+/// this call (2026-11-04). Idempotent; no FP/SIMD state is saved or
+/// restored across context switches on either architecture yet (tracked
+/// in STATUS.md Known issues).
+#[cfg(target_os = "none")]
+#[inline]
+pub fn enable_fpsimd() {
+    // SAFETY: CPACR_EL1 is always writable at EL1; setting FPEN only
+    // removes a trap and touches no memory. `isb` makes the new setting
+    // visible to the next instruction.
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, cpacr_el1",
+            "orr {tmp}, {tmp}, #(3 << 20)",
+            "msr cpacr_el1, {tmp}",
+            "isb",
+            tmp = out(reg) _,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Host-test stub: no CPACR_EL1 under `cargo test --lib`.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn enable_fpsimd() {}
+
 /// GDT compatibility shim.
 ///
 /// AArch64 has no segment selectors — privilege is managed via exception
@@ -741,6 +776,7 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
     let elr = unsafe { core::ptr::read_volatile(frame.wrapping_add(31)) };
 
     let ec_name = match ec {
+        0x07 => "Trapped FP/SIMD access (EL0)",
         0x20 => "Instruction Abort (EL0)",
         0x21 => "Instruction Abort (EL1)",
         0x24 => "Data Abort (EL0)",
@@ -761,10 +797,22 @@ extern "C" fn fault_el0_inner(saved_sp: u64, esr: u64) {
         _ => "other fault",
     };
 
-    crate::println!(
-        "  [Fault] EL0 {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
-        ec_name, fault_type, access, far, elr, dfsc
-    );
+    if ec == 0x07 {
+        // FAR_EL1 is not written for this class; the "address" would be a
+        // stale value from an earlier abort and has misled a diagnosis
+        // already (aarch64 policy service, 2026-11-04: `memset`'s `dup`
+        // on an AP whose CPACR_EL1.FPEN was still 0 read as a bad pointer
+        // into the boot modules). Name the real cause.
+        crate::println!(
+            "  [Fault] EL0 {} at PC={:#x} — CPACR_EL1.FPEN not enabled on this CPU (see arch::aarch64::enable_fpsimd)",
+            ec_name, elr
+        );
+    } else {
+        crate::println!(
+            "  [Fault] EL0 {} {} {} at {:#x} (PC={:#x}, DFSC={:#x})",
+            ec_name, fault_type, access, far, elr, dfsc
+        );
+    }
     let kind = match ec {
         0x20 | 0x24 => crate::reap::FaultKind::PageFault,
         other => crate::reap::FaultKind::ArchSpecific(other as u8),
@@ -811,6 +859,7 @@ extern "C" fn fault_el1_inner(esr: u64, far: u64, elr: u64) {
         0x24 => "Data Abort (EL0→EL1)",
         0x25 => "Data Abort (EL1)",
         0x00 => "Unknown",
+        0x07 => "Trapped FP/SIMD access (EL1; CPACR_EL1.FPEN)",
         0x15 => "SVC (unexpected in EL1 sync)",
         0x2F => "SError",
         _ => "Other Synchronous Exception",

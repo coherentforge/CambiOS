@@ -497,16 +497,10 @@ unsafe extern "C" fn kmain() -> ! {
             cambios_core::preempt_depth_go_live();
             println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
 
-            // Enable FP/NEON for EL0 and EL1 (CPACR_EL1.FPEN = 0b11).
-            // Without this, FP/NEON instructions from EL0 trap with EC=0x0.
-            // Rust-compiled user-space code uses NEON for zeroing (movi v0.2d).
-            core::arch::asm!(
-                "mrs {tmp}, cpacr_el1",
-                "orr {tmp}, {tmp}, #(3 << 20)",   // FPEN = 0b11
-                "msr cpacr_el1, {tmp}",
-                "isb",
-                tmp = out(reg) _,
-            );
+            // Enable FP/NEON for EL0 and EL1 on this CPU (CPACR_EL1.FPEN
+            // = 0b11). CPACR_EL1 is per-CPU: every AP does the same in
+            // `ap_entry`. Rust-compiled user code uses NEON in `memset`.
+            cambios_core::arch::aarch64::enable_fpsimd();
 
             // Initialize GIC CPU interface (ICC system registers)
             cambios_core::arch::aarch64::gic::init();
@@ -2333,6 +2327,13 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
         // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
         cambios_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
+
+        // Step 2b: Enable FP/NEON for EL0 and EL1 on this CPU. CPACR_EL1
+        // is per-CPU; the BSP's setting does not reach the APs. Without
+        // it the first user task placed here that runs a NEON `memset`
+        // traps with EC=0x07 and is reaped — the policy service, homed on
+        // CPU 1 by spawn-time placement, from 2026-10-27 until 2026-11-04.
+        cambios_core::arch::aarch64::enable_fpsimd();
 
         // Step 3: Install exception vector table (per-CPU VBAR_EL1)
         cambios_core::arch::syscall::init();

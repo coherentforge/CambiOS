@@ -4,7 +4,7 @@
 
 CLAUDE.md:11:eventually
 CLAUDE.md:386:eventually
-CLAUDE.md:403:deferred
+CLAUDE.md:404:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -69,12 +69,12 @@ docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:77:deferred
 docs/storage-planning.md:42:deferred
 src/arch/aarch64/gic.rs:130:deferred
-src/arch/aarch64/mod.rs:124:placeholder
-src/arch/aarch64/mod.rs:126:placeholder
-src/arch/aarch64/mod.rs:128:placeholder
-src/arch/aarch64/mod.rs:130:placeholder
-src/arch/aarch64/mod.rs:482:placeholder
-src/arch/aarch64/mod.rs:1104:eventually
+src/arch/aarch64/mod.rs:159:placeholder
+src/arch/aarch64/mod.rs:161:placeholder
+src/arch/aarch64/mod.rs:163:placeholder
+src/arch/aarch64/mod.rs:165:placeholder
+src/arch/aarch64/mod.rs:517:placeholder
+src/arch/aarch64/mod.rs:1153:eventually
 src/arch/riscv64/mod.rs:119:placeholder
 src/arch/riscv64/mod.rs:121:placeholder
 src/arch/riscv64/mod.rs:123:placeholder
@@ -95,11 +95,11 @@ src/lib.rs:1329:deferred
 src/lib.rs:1337:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
-src/microkernel/main.rs:1029:for-now
-src/microkernel/main.rs:1121:for-now
-src/microkernel/main.rs:2158:deferred
-src/microkernel/main.rs:2187:deferred
-src/microkernel/main.rs:2494:for-now
+src/microkernel/main.rs:1023:for-now
+src/microkernel/main.rs:1115:for-now
+src/microkernel/main.rs:2152:deferred
+src/microkernel/main.rs:2181:deferred
+src/microkernel/main.rs:2495:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:1003:deferred
 src/process.rs:1004:deferred
