@@ -99,7 +99,7 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Status       | Proven |
 | Backing      | `verification/capability-proofs::{proof_delegate_cannot_escalate_rights, proof_delegate_without_delegate_right_denied}` |
 | Bound        | symbolic grantor rights ⊆ `CapabilityRights::all()`, symbolic delegated rights, exhaustive over the rights bitmask space |
-| Gap          | The full `CapabilityManager` lifecycle (grant + revoke + delegate + lookup against a generation-counter `ProcessId`) is covered by 12 harnesses, but cross-process composition (sender's caps × receiver's caps × interceptor decision) is per-function — not yet a single end-to-end claim. Identity-binding is C-9 / C-10 below. |
+| Gap          | The full `CapabilityManager` lifecycle (grant + revoke + delegate + lookup against a generation-counter `ProcessId`) is covered by 14 harnesses, but cross-process composition (sender's caps × receiver's caps × interceptor decision) is per-function — not yet a single end-to-end claim. Identity-binding is C-9 / C-10 below. |
 | Cited where  | [ADR-000](../docs/adr/000-zta-and-cap.md), [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md), `src/ipc/capability.rs` |
 
 ## C-6: User-pointer slice validators reject every kernel pointer with non-zero length
@@ -142,7 +142,7 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 
 | Layer        | 2 |
 | Status       | Tested |
-| Backing      | `src/ipc/capability.rs::tests::test_revoke_all_for_process` + handle_exit integration covered by capability-proofs grant/revoke harnesses |
+| Backing      | `src/ipc/capability.rs::tests::{test_revoke_all_for_process_returns_count, test_revoke_all_clears_every_system_capability, test_revoke_all_for_process_preserves_other_processes}`; the table-level half is also proven by `verification/capability-proofs::proof_revoke_all_clears_endpoints_and_system_caps` |
 | Bound        | N/A — tests pick representative cap states, not symbolic ones |
 | Gap          | Cross-module property (ProcessTable + CapabilityManager) — Kani's per-function model can't state the claim because the postcondition mentions invariants from two different modules. Targeted for the planned Kani→Verus pivot once contracts compose. The deliberate-fail-in-Kani artifact is row C-11's planned scaffold. |
 | Cited where  | [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md), `src/syscalls/dispatcher.rs::handle_exit` |
@@ -217,19 +217,28 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Cited where  | `src/arch/riscv64/tlb.rs`, WI-2 (`3cb182b`), `notes/audit-concurrency-cfg-parity.md` finding B |
 | Revisit when | Real riscv64 SMP hardware is in the test loop, OR a herd7/litmus or Kani RVWMO model of the shootdown handshake is added to CI - then Status can move toward Tested/Proven. |
 
+## C-18: Revoking another process's capability requires the `revoke` right on that endpoint, and a process cannot revoke its own capability through this path
+
+| Layer        | 2 |
+| Status       | Proven |
+| Backing      | `verification/capability-proofs::{proof_revoke_without_revoke_right_rejected, proof_revoke_self_rejected, proof_revoke_with_revoke_right_removes_capability}` |
+| Bound        | 3-slot `CapabilityManager`, one endpoint, holder with `SEND_ONLY`. The revoker's standing is symbolic: no capability on the endpoint, or any combination of send / receive / delegate with `revoke` clear (denied); `revoke` set with the other three rights symbolic (allowed). |
+| Gap          | Authority paths 1 and 3 of ADR-007 § "Who can revoke" (original grantor, policy service) are not implemented, so nothing is proven about them. The proof is per-function on the capability table: it does not cover `handle_revoke_capability`'s argument handling, the audit emit (compiled out of the proof crate), or channel-role unmap (stubbed in the kernel). History worth keeping: these three harnesses replace one for the retired bootstrap-only rule, which stopped compiling on 2026-09-15 (`e40096e`). From that commit until this row landed the capability crate did not build, and its required CI check reported success without running, because the workflow skips Kani when no proof input changes. Rows C-5 and C-10 were not backed during that window. |
+| Cited where  | [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md) § "Who can revoke", `src/ipc/capability.rs::CapabilityManager::revoke` |
+
 ---
 
 # Status summary
 
-As of this draft (2026-06-11):
+As of 2026-11-04:
 
 | Status | Layer 1 | Layer 2 | Layer 3 | Total |
 | --- | --- | --- | --- | --- |
-| Proven | 0 | 7 | 0 | 7 |
+| Proven | 0 | 8 | 0 | 8 |
 | Tested | 1 | 2 | 0 | 3 |
 | Asserted | 1 | 0 | 0 | 1 |
 | Aspirational | 0 | 4 | 2 | 6 |
-| **Total** | **2** | **13** | **2** | **17** |
+| **Total** | **2** | **14** | **2** | **18** |
 
 The shape is what it should be at this stage: most of the load-bearing safety properties (parsers, allocator, capability manager, user-slice validators) have proof backing; the cross-module identity / authorization properties are honestly Aspirational with a concrete pivot plan; the meaning-claims are Aspirational by their nature and the doc explicitly says so. The two weak-memory TLB-shootdown ordering invariants (C-16, C-17) are a third honest-Aspirational kind: the barrier/fence is provably emitted (disassembly) but the only witness QEMU can give is no-regression, so real weakly-ordered SMP hardware or a litmus/Kani model is the path to a stronger status.
 

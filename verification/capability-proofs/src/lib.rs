@@ -176,7 +176,7 @@ pub mod _capability_src;
 #[cfg(kani)]
 mod proofs {
     use super::ipc::capability::*;
-    use super::ipc::{CapabilityRights, EndpointId, Principal, ProcessId};
+    use super::ipc::{CapabilityRights, EndpointId, ProcessId};
     extern crate alloc;
     use alloc::boxed::Box;
 
@@ -512,32 +512,97 @@ mod proofs {
         );
     }
 
-    /// P3.12 — `revoke(holder, endpoint, revoker, bootstrap)` with
-    /// `revoker != bootstrap` returns `Err(AccessDenied)` and leaves the
-    /// holder's capability intact. The Phase 3.1 authority model
-    /// (bootstrap-only) is enforced before any table mutation.
+    /// P3.12 — `revoke(holder, endpoint, revoker)` is denied unless the
+    /// revoker holds the `revoke` right on `endpoint`, and a denied call
+    /// leaves the holder's capability intact. Authority is the `revoke`
+    /// right (ADR-007 § "Who can revoke", path 2); the check runs before
+    /// any table mutation.
+    ///
+    /// The revoker's standing is symbolic: either no capability on the
+    /// endpoint at all, or one with any combination of send / receive /
+    /// delegate and `revoke` clear. No such combination confers revocation
+    /// authority.
+    ///
+    /// Unwind covers: `make_manager` init loop (3 iterations) and the
+    /// capability scans in `verify_access` (at most 1 entry per process).
     #[kani::proof]
     #[kani::unwind(5)]
-    fn proof_revoke_non_bootstrap_rejected() {
+    fn proof_revoke_without_revoke_right_rejected() {
         let mut mgr = make_manager(3);
         let holder = ProcessId::new(1, 0);
+        let revoker = ProcessId::new(2, 0);
         let endpoint = EndpointId(7);
         mgr.register_process(holder).unwrap();
+        mgr.register_process(revoker).unwrap();
         mgr.grant_capability(holder, endpoint, CapabilityRights::SEND_ONLY).unwrap();
 
-        let bootstrap = Principal::from_public_key([0xAA; 32]);
-        // Symbolic attacker principal, constrained to differ from bootstrap.
-        let attacker_byte: u8 = kani::any();
-        kani::assume(attacker_byte != 0xAA);
-        let attacker = Principal::from_public_key([attacker_byte; 32]);
+        let revoker_has_capability: bool = kani::any();
+        if revoker_has_capability {
+            let mut rights = any_rights();
+            rights.revoke = false;
+            mgr.grant_capability(revoker, endpoint, rights).unwrap();
+        }
 
-        let result = mgr.revoke(holder, endpoint, attacker, bootstrap);
+        let result = mgr.revoke(holder, endpoint, revoker);
         assert!(matches!(result, Err(CapabilityError::AccessDenied)));
 
         // Holder's capability is still present.
         assert!(mgr
             .verify_access(holder, endpoint, CapabilityRights::SEND_ONLY)
             .is_ok());
+    }
+
+    /// P3.13 — a process cannot revoke its own capability through this
+    /// path, even when it holds the `revoke` right on the endpoint:
+    /// `revoke(p, endpoint, p)` returns `Err(AccessDenied)` and the
+    /// capability survives. (Self-revocation is process exit's job, via
+    /// `revoke_all_for_process`.)
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn proof_revoke_self_rejected() {
+        let mut mgr = make_manager(3);
+        let holder = ProcessId::new(1, 0);
+        let endpoint = EndpointId(7);
+        mgr.register_process(holder).unwrap();
+        mgr.grant_capability(holder, endpoint, CapabilityRights::FULL).unwrap();
+
+        let result = mgr.revoke(holder, endpoint, holder);
+        assert!(matches!(result, Err(CapabilityError::AccessDenied)));
+
+        assert!(mgr
+            .verify_access(holder, endpoint, CapabilityRights::FULL)
+            .is_ok());
+    }
+
+    /// P3.14 — a revoker that holds the `revoke` right on `endpoint`
+    /// (its other rights symbolic) removes a different holder's
+    /// capability: the call returns `Ok`, the holder's next
+    /// `verify_access` is denied, and the revoker's own capability is
+    /// untouched. Together with P3.12 this pins the authority rule from
+    /// both sides: the `revoke` right is necessary and sufficient.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn proof_revoke_with_revoke_right_removes_capability() {
+        let mut mgr = make_manager(3);
+        let holder = ProcessId::new(1, 0);
+        let revoker = ProcessId::new(2, 0);
+        let endpoint = EndpointId(7);
+        mgr.register_process(holder).unwrap();
+        mgr.register_process(revoker).unwrap();
+        mgr.grant_capability(holder, endpoint, CapabilityRights::SEND_ONLY).unwrap();
+
+        let mut revoker_rights = any_rights();
+        revoker_rights.revoke = true;
+        mgr.grant_capability(revoker, endpoint, revoker_rights).unwrap();
+
+        assert!(mgr.revoke(holder, endpoint, revoker).is_ok());
+
+        // The holder's capability is gone; the revoker's is not.
+        assert!(matches!(
+            mgr.verify_access(holder, endpoint, CapabilityRights::SEND_ONLY),
+            Err(CapabilityError::AccessDenied)
+        ));
+        assert!(mgr.verify_access(revoker, endpoint, revoker_rights).is_ok());
     }
 
     // ------------------------------------------------------------------------
