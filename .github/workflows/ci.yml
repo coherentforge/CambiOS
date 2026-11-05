@@ -16,11 +16,10 @@
 # *-unknown-none targets are tier-2 with prebuilt core/alloc, so every build
 # here is a pure Rust cross-compile — no C toolchain, no build-std.
 #
-# NOT in scope (deliberately):
-#   * Tier B — Kani proofs (`make verify-all`). Heavier setup (CBMC + a
-#     bundled toolchain, worth caching); lands as a separate workflow.
-#   * Tier C — QEMU boot smoke (`make run-quiet`). Needs qemu-system-* plus
-#     ISO/FAT-image tooling and seed signing; deferred.
+# NOT in this workflow (deliberately):
+#   * Tier B — Kani proofs. Separate workflow: .github/workflows/proofs.yml.
+#   * Tier C — QEMU boot smoke (`make run-quiet`). Separate workflow, nightly:
+#     .github/workflows/boot-smoke.yml.
 #   * The commit-msg / pre-commit / pre-push provenance hooks. They enforce
 #     Claude-authored-commit provenance (CLAUDE_PREFLIGHT_SESSION, edit logs)
 #     and are inherently local — meaningless in CI. This workflow is additive;
@@ -124,6 +123,10 @@ jobs:
   # Commit-boundary / provenance gates are excluded on purpose: they read the
   # staged diff or session state and are no-ops or meaningless in CI —
   # check-index-isolation, check-lockfile (advisory), claude-preflight.
+  # check-audit-taxonomy is the one content lint not run here: it builds a
+  # host tool (tools/gen-audit-taxonomy) and so needs a Rust toolchain; it
+  # stays a local `make` target.
+  # Revisit when: the userspace CI job exists (it installs the toolchain).
   # check-status-freshness runs here too (Kani-harness drift, --strict): it is
   # compile-free now that STATUS.md no longer pins a unit-test total, so it
   # belongs with the other pure-python gates. Its date heuristic stays
@@ -146,6 +149,10 @@ jobs:
         run: make check-deferrals
       - name: check-boot-panics (ADR-021 boot-init panics)
         run: make check-boot-panics
+      - name: check-fail-open (enforcement fails closed, ADR-006)
+        run: make check-fail-open
+      - name: check-doc-refs (ASSUMPTIONS.md source line refs)
+        run: make check-doc-refs
       - name: check-banned-paths (deleted-stays-deleted)
         run: make check-banned-paths
       - name: check-unsafe-coverage (Convention 1 SAFETY comments)

@@ -29,6 +29,18 @@
 #                              comment block (CLAUDE.md Development
 #                              Convention 1). Don't-grow-the-baseline
 #                              gate. Tier 1 E3 (prancy-manatee plan).
+#   check-fail-open:           Enforcement fails closed: no fail-open
+#                              path in kernel or user code, or in the
+#                              comment describing one, without a
+#                              `// FAIL_OPEN_OK:` argument (ADR-006
+#                              § Divergence 2026-10-28). Baseline is
+#                              expected empty.
+#   check-doc-refs:            Every `path#LNN` reference in
+#                              docs/ASSUMPTIONS.md still points at the
+#                              constant its row names. A change that
+#                              moves a cited constant fails here; repair
+#                              with `python3 tools/check-doc-refs.py --fix`
+#                              and stage docs/ASSUMPTIONS.md with it.
 #   check-status-freshness:    STATUS.md `last_synced_to_code:` must be
 #                              within 7 days of today. Advisory only
 #                              (exit 0; warn-but-pass first iteration).
@@ -47,4 +59,6 @@ python3 tools/check-banned-paths.py
 python3 tools/check-index-isolation.py
 python3 tools/check-lockfile-additions.py
 python3 tools/check-unsafe-coverage.py
+python3 tools/check-fail-open.py
+python3 tools/check-doc-refs.py
 python3 tools/check-status-freshness.py

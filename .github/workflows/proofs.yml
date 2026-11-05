@@ -8,7 +8,19 @@
 # source verbatim via #[path], so the proofs cover the live code; the job is
 # just `cd verification/<crate> && cargo kani`, exactly as the Makefile does.
 #
-# Path-gated. A proof's only inputs are the single kernel file it #[path]-
+# Two things run no matter what changed, because a green check must mean the
+# proofs were at least compiled:
+#   * `kani-codegen` compiles every crate under verification/ on every push
+#     and pull request (`cargo kani --only-codegen`: harnesses included, no
+#     solver). A harness that no longer matches the kernel's signatures
+#     fails here even when the path filter below says nothing relevant
+#     changed. That is what happened on 2026-09-15: `revoke` lost a
+#     parameter, capability-proofs stopped compiling, and the six solver
+#     checks reported success on every later run because they skipped.
+#   * A weekly scheduled run (and any manual dispatch) executes the full
+#     solve for all six crates, path filter ignored.
+#
+# The solver jobs are path-gated. A proof's only inputs are the single kernel file it #[path]-
 # includes plus the proof crate's own harnesses/stubs under verification/, so
 # nothing else needs to re-verify. The `changes` job detects whether any
 # proof-relevant path changed; the `kani` matrix jobs ALWAYS run (they are
@@ -42,6 +54,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC: full solve, path filter ignored
 
 permissions:
   contents: read
@@ -64,11 +78,15 @@ jobs:
     name: detect proof-relevant changes
     runs-on: ubuntu-latest
     outputs:
-      proofs: ${{ steps.filter.outputs.proofs }}
+      proofs: ${{ steps.decide.outputs.proofs }}
     steps:
       - uses: actions/checkout@v4
+      # Only push and pull_request have a base to diff against; on a
+      # scheduled or dispatched run the filter is skipped and `decide`
+      # below answers for it.
       - uses: dorny/paths-filter@v3
         id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         with:
           filters: |
             proofs:
@@ -80,6 +98,15 @@ jobs:
               - 'src/syscalls/user_slice.rs'
               - 'src/boot/riscv.rs'
               - '.github/workflows/proofs.yml'
+      # A scheduled or manually dispatched run solves everything; only push
+      # and pull_request runs consult the path filter.
+      - name: Decide whether the solver runs
+        id: decide
+        run: |
+          case "${{ github.event_name }}" in
+            push|pull_request) echo "proofs=${{ steps.filter.outputs.proofs }}" >> "$GITHUB_OUTPUT" ;;
+            *)                 echo "proofs=true" >> "$GITHUB_OUTPUT" ;;
+          esac
 
   # ---------------------------------------------------------------------------
   # Prime the Kani install (verifier binaries + bundled toolchain/CBMC) into a
@@ -107,6 +134,46 @@ jobs:
             cargo install --locked kani-verifier@${KANI_VERSION}
           fi
           cargo kani setup
+
+  # ---------------------------------------------------------------------------
+  # Compile every proof crate, every run, whatever changed. The crate list is
+  # the directory listing, not a copy of it, so a new crate under
+  # verification/ is compiled here without touching this file. No path gate
+  # and no dependency on `changes` or `setup`: this job is the floor under
+  # the path-gated solver jobs below. When the Kani cache is cold (the
+  # `setup` job was skipped) the install step pays for it once.
+  #
+  # Not yet a required status check: adding its name to branch protection is
+  # a repository setting, changed by the maintainer after it has run green.
+  # ---------------------------------------------------------------------------
+  kani-codegen:
+    name: kani-codegen (every proof crate compiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Kani toolchain + verifier binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+          key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+      - name: Ensure Kani present (no-op on cache hit)
+        run: |
+          if ! command -v cargo-kani >/dev/null; then
+            ( cd "$HOME" && cargo install --locked kani-verifier@${KANI_VERSION} )
+          fi
+          cargo kani setup
+      - name: cargo kani --only-codegen (every crate under verification/)
+        run: |
+          set -e
+          for crate in verification/*-proofs; do
+            echo "::group::$crate"
+            ( cd "$crate" && cargo kani --only-codegen )
+            echo "::endgroup::"
+          done
 
   # ---------------------------------------------------------------------------
   # One job per proof crate. ALWAYS runs (these are required status checks, so
