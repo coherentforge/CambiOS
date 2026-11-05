@@ -247,7 +247,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists check-env check-elf-link audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists check-env check-elf-link check-dco install-hooks audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -1105,9 +1105,22 @@ claude-preflight:
 # Install the tracked pre-commit hook by pointing core.hooksPath at
 # .githooks/. Run once per clone. Future hook changes propagate via
 # `git pull` — no re-install needed. See .githooks/pre-commit.
+#
+# The target checks its own work: the setting reads back as .githooks and
+# every tracked hook is executable. A clone whose hooksPath pointed at a
+# stale copy ran one lint for months while the tracked hooks ran none.
 install-hooks:
 	@git config core.hooksPath .githooks
-	@echo "=== core.hooksPath -> .githooks (pre-commit + commit-msg hooks active) ==="
+	@test "$$(git config --get core.hooksPath)" = ".githooks" || { echo "install-hooks: core.hooksPath did not take" >&2; exit 1; }
+	@for h in .githooks/*; do test -x "$$h" || { echo "install-hooks: $$h is not executable (chmod +x $$h)" >&2; exit 1; }; done
+	@echo "=== core.hooksPath -> .githooks; active hooks: $$(ls .githooks | tr '\n' ' ')==="
+
+# Developer Certificate of Origin sign-off on every commit in a range
+# (the commit-msg hook checks one commit at a time; CI checks the range
+# a pull request adds). Usage: make check-dco RANGE=origin/main..HEAD
+check-dco:
+	@test -n "$(RANGE)" || { echo 'usage: make check-dco RANGE=<base>..<head>' >&2; exit 1; }
+	python3 tools/check-dco.py --range "$(RANGE)"
 
 # Enforce CLAUDE.md Development Convention 9 (every deferral is a
 # conscious deferral). Scans kernel source + design docs for deferral

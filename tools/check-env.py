@@ -229,6 +229,8 @@ def main():
         ok("cargo-fuzz")
     else:
         missing("extra", "cargo-fuzz", "`make fuzz-build`", "cargo install cargo-fuzz")
+    tool("extra", "c++", "`make fuzz-build` (libfuzzer-sys compiles libFuzzer from C++ source)",
+         "xcode-select --install" if IS_MAC else "install the `g++` package (Debian/Ubuntu name)")
 
     print()
     if missing_needed:
