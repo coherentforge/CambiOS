@@ -88,6 +88,19 @@ Commit at topic boundaries within a session, not at session end. Bisectable hist
 - **Draft the commit body from `git diff --cached`, not from memory.** Every claim ("removes X", "renames Y") must match a line in the staged diff. Verification bullets ("grep returns nothing", "make check-all clean") must be run against the staged tree at drafting time, not recalled. Bodies written from memory drift ahead of what got staged.
 - **Claude drafts; user executes.** Claude prepares `git add <files>` + commit message; user runs the commit to enter their PGP passphrase. Never bypass signing (`--no-gpg-sign`, `--no-verify`).
 
+## Acronyms in Chat and Docs
+
+**Every acronym or initialism gets a parenthetical on first use per message (chat) or per document (docs): the expansion, plus a reference to where the term is defined when one exists.** Project terms point at their ADR or doc section; hardware and spec terms point at the spec; general terms get the expansion alone.
+
+- `FPEN (Floating-Point Enable, the CPACR_EL1 field; Arm Architecture Reference Manual, CPACR_EL1)`
+- `HHDM (Higher Half Direct Map, Limine's identity map of physical memory; Platform Gotchas below)`
+- `AID (Autonomic Identifier, the 32-byte Principal; ADR-025, identity.md § AID)`
+- `EC (Exception Class, ESR_EL1 bits 31:26)`
+
+Why: the fault lines, ADRs, and spec names in this project are dense with abbreviations, and a reader entering a message cold should not have to hunt for what one stands for before they can follow the decision it supports. The parenthetical is also where the definition's home gets named, so the reference becomes clickable context rather than a word to remember.
+
+Exempt: the handful that read as plain English (CPU, RAM, OS, API, ID, URL, PC in the program-counter sense once the register name is near). Repo-wide abbreviations with a canonical table (`ADR`, `SPDX`, `QEMU`, `ELF`) need the expansion only, no reference.
+
 ## Prompt-Shaping Changelog
 
 Open mechanism decisions awaiting Revisit-when triggers — see [docs/dev-notes/prompt-shaping-changelog.md](docs/dev-notes/prompt-shaping-changelog.md). Codified rules and shipped tooling are out of scope; their history lives in `git log -- CLAUDE.md` and `git log -- tools/`.
