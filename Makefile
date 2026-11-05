@@ -192,7 +192,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -886,6 +886,13 @@ check-doc-refs:
 
 update-doc-refs-baseline:
 	python3 tools/check-doc-refs.py --update-baseline
+
+# Every file that has to repeat part of a build list (the toolchain file,
+# the cargo config, the CI workflows, the Limine configs, workspace.exclude,
+# the manifest's tags) agrees with the "Build lists" section at the top of
+# this file. No baseline: a disagreement is fixed. See tools/check-lists.py.
+check-lists:
+	python3 tools/check-lists.py
 
 # Regenerate docs/generated/audit-taxonomy.md from the canonical audit event
 # taxonomy in cambios-abi (the `audit_taxonomy!` macro). The doc is rendered
