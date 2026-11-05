@@ -1153,8 +1153,8 @@ check-boot-panics:
 
 # Enforcement fails closed (CLAUDE.md § Formal Verification; ADR-006
 # § Divergence 2026-10-28): no new fail-open path, in code or in the
-# comment describing it, without a reviewed argument. Scans kernel +
-# user-space Rust; exempt a structural case with `// FAIL_OPEN_OK:`.
+# comment describing it, without a reviewed argument. Scans every Rust
+# file in the repository; exempt a structural case with `// FAIL_OPEN_OK:`.
 # Baseline at tools/check-fail-open-baseline.txt (expected empty).
 check-fail-open:
 	python3 tools/check-fail-open.py
@@ -1170,10 +1170,11 @@ update-boot-panics-baseline:
 
 # Enforce CLAUDE.md Development Convention 1: every `unsafe { ... }`
 # block must carry a `// SAFETY:` comment in its preceding comment
-# block. Comment-block-aware scanner; cluster + assignment-continuation
+# block, in every Rust file in the repository except verification/.
+# Comment-block-aware scanner; cluster + assignment-continuation
 # + attribute-line aware. Baseline at
-# tools/check-unsafe-coverage-baseline.txt; expected empty after E1
-# (prancy-manatee Tier 1 E1 + E3). Exits nonzero on any new site.
+# tools/check-unsafe-coverage-baseline.txt: empty for the kernel, 19
+# sites in five user crates. Exits nonzero on any new site.
 check-unsafe-coverage:
 	python3 tools/check-unsafe-coverage.py
 
