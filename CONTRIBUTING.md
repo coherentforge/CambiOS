@@ -55,7 +55,7 @@ A pull request is judged by the checks as they stand on `main` when it is opened
 
 ### Review
 
-[.github/CODEOWNERS](.github/CODEOWNERS) lists the paths that need the maintainer's review before a merge: the kernel (`src/`), the syscall ABI (application binary interface) crate, the ADRs, CLAUDE.md, and the gates themselves (`Makefile`, `tools/`, `.github/`). A change that touches those paths waits for that review however green its checks are.
+Every path needs the maintainer's review before a merge unless [.github/CODEOWNERS](.github/CODEOWNERS) names it a hands-off lane. The hands-off lanes are the user crates under `user/`, the status index, the bounds catalogue, generated documents and working notes. Inside `user/`, two things are still reviewed: the system library `user/libsys/`, which is the user-space half of the syscall ABI (application binary interface), and any `Cargo.lock`, because a lockfile change is a dependency change. A change that touches a reviewed path waits for that review however green its checks are.
 
 ## Commits
 
