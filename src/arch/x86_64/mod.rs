@@ -805,6 +805,9 @@ mod fuzz_asm_stubs {
     pub extern "C" fn timer_isr_stub() {}
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn resched_isr_stub() {}
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn yield_save_and_switch() {}
 
     #[unsafe(no_mangle)]

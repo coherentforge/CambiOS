@@ -85,7 +85,7 @@ impl KernelFixture {
 
         Self {
             process_id: pid,
-            task_id: TaskId(FIXTURE_TASK),
+            task_id: TaskId::new(FIXTURE_TASK, 0),
         }
     }
 

@@ -11,7 +11,7 @@
 //! - No panic on any operation sequence
 //! - verify_access succeeds only if a matching grant exists with sufficient rights
 //! - revoke of a non-existent endpoint returns EndpointNotFound
-//! - grant count never exceeds 32 (the hard cap)
+//! - grant count never exceeds `MAX_CAPS_PER_PROCESS` (the per-process table bound)
 //! - capability escalation is impossible: delegated rights <= source rights
 
 #![no_main]
@@ -19,7 +19,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use cambios_core::ipc::capability::{CapabilityError, ProcessCapabilities};
+use cambios_core::ipc::capability::{CapabilityError, ProcessCapabilities, MAX_CAPS_PER_PROCESS};
 use cambios_core::ipc::{CapabilityRights, EndpointId, ProcessId};
 
 /// Capability operations the fuzzer can invoke.
@@ -86,7 +86,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     // Update existing — should always succeed
                     assert!(result.is_ok(), "Grant update failed unexpectedly");
                     shadow[idx].1 = rights;
-                } else if granted_count >= 32 {
+                } else if granted_count >= MAX_CAPS_PER_PROCESS {
                     // Table full
                     assert_eq!(result, Err(CapabilityError::CapabilityFull));
                 } else {

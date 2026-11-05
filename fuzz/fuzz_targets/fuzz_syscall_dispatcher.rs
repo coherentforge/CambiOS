@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Jason Ricca
 
-//! Fuzz target: `SyscallDispatcher::dispatch` (Tier 1 step B,
-//! ~/.claude/plans/scope-tier-2-also-prancy-manatee.md).
+//! Fuzz target: `SyscallDispatcher::dispatch`.
 //!
 //! Drives random `(syscall_num, 6 × u64 args)` tuples through the
 //! kernel's syscall dispatch front-end. Catches panics, OOB reads,
@@ -21,9 +20,24 @@
 //!
 //! Pointer-shaped args reach handler-side validation before any
 //! deref. The fixture uses `cr3 = 0`, so any user-pointer page-walk
-//! early-rejects via `UserReadSlice` / `UserWriteSlice`. Handlers
+//! early-rejects via `UserReadSlice` / `UserWriteSlice`. Most handlers
 //! that need IPC / scheduler / frame-allocator state return typed
 //! errors when those subsystems are uninitialized.
+//!
+//! What this target cannot exercise. A handler that executes a
+//! privileged instruction before it can fail (the blocking pattern's
+//! interrupt disable: `WaitIrq` reaches `cli` on any in-range IRQ
+//! number) faults in a host process, and libFuzzer reports that as a
+//! crash within seconds. `Exit` never returns at all and is skipped
+//! below. So today the target covers the argument validation of the
+//! handlers that return before either point, and stops at the first
+//! one that does not.
+//!
+//! Deferred: full dispatcher coverage on a host.
+//! Why: the interrupt disable is inline `asm!` in the handlers, with no
+//! host stand-in the way the context-switch stubs have one.
+//! Revisit when: the blocking pattern's interrupt disable sits behind an
+//! `arch::` helper that has a `cfg(any(test, fuzzing))` stand-in.
 
 #![no_main]
 
@@ -31,7 +45,7 @@ use libfuzzer_sys::fuzz_target;
 
 use cambios_core::syscalls::dispatcher::SyscallDispatcher;
 use cambios_core::syscalls::fuzz_fixture::KernelFixture;
-use cambios_core::syscalls::SyscallArgs;
+use cambios_core::syscalls::{SyscallArgs, SyscallNumber};
 
 const INPUT_LEN: usize = 56;
 
@@ -44,6 +58,15 @@ fuzz_target!(|data: &[u8]| {
     buf.copy_from_slice(&data[..INPUT_LEN]);
 
     let syscall_num = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+
+    // `Exit` never returns: its handler ends in `loop { yield_save_and_switch() }`
+    // and the task is never scheduled again. The fuzz build's stand-in for
+    // the context switch returns immediately, so dispatching `Exit` here
+    // spins forever. It takes one `u64` exit code and validates nothing,
+    // so there is no argument handling to fuzz.
+    if syscall_num == SyscallNumber::Exit as u64 {
+        return;
+    }
     let arg1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let arg2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
     let arg3 = u64::from_le_bytes(buf[24..32].try_into().unwrap());

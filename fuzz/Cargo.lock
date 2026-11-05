@@ -12,27 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cambios"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.0",
- "blake3",
- "ed25519-compact",
- "limine",
- "uart_16550",
- "x86_64",
-]
-
-[[package]]
-name = "cambios-fuzz"
-version = "0.0.0"
-dependencies = [
- "arbitrary",
- "cambios",
- "libfuzzer-sys",
-]
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -75,6 +54,47 @@ dependencies = [
  "constant_time_eq",
  "cpufeatures",
 ]
+
+[[package]]
+name = "cambios"
+version = "0.3.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "blake3",
+ "cambios-abi",
+ "cambios-blk-proto",
+ "cambios-fde-proto",
+ "cambios-manifest",
+ "ed25519-compact",
+ "limine",
+ "uart_16550",
+ "x86_64",
+]
+
+[[package]]
+name = "cambios-abi"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-blk-proto"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-fde-proto"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-fuzz"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "cambios",
+ "libfuzzer-sys",
+]
+
+[[package]]
+name = "cambios-manifest"
+version = "0.1.0"
 
 [[package]]
 name = "cc"

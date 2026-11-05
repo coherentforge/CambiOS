@@ -1898,13 +1898,18 @@ check-clippy-riscv64:
 	cargo clippy --target riscv64gc-unknown-none-elf --release --lib
 
 # ---------------------------------------------------------------------------
-# Fuzzing — Tier 1 step B (~/.claude/plans/scope-tier-2-also-prancy-manatee.md)
+# Fuzzing
 #
-# x86_64-apple-darwin matches `cargo test --lib`'s host triple and avoids
-# the aarch64 backend's inline asm that references labels in
-# `cfg(not(any(test, fuzzing)))` global_asm blocks. Switching to an
-# aarch64 host (default on Apple Silicon) requires `fuzz_asm_stubs` for
-# the aarch64 backend — currently only the x86_64 backend has those.
+# The fuzz targets build for an x86_64 host triple: the fuzz build
+# exercises the x86_64 backend, which is the only one with host stand-ins
+# (`fuzz_asm_stubs`) for the symbols its `global_asm!` blocks define on
+# bare metal. A new assembly symbol the kernel references needs a
+# stand-in there, or every fuzz target fails to link (`make fuzz-build`
+# is what notices). On Apple Silicon the binaries run under Rosetta 2;
+# on Linux pass FUZZ_TARGET=x86_64-unknown-linux-gnu.
+#
+# cargo-fuzz runs under the nightly pinned in rust-toolchain.toml, the
+# same compiler that builds the kernel.
 #
 # `make fuzz-syscall-dispatcher` smoke-runs for 60 s; pass extra
 # libfuzzer args via FUZZ_ARGS, e.g.
@@ -1912,11 +1917,12 @@ check-clippy-riscv64:
 # for a 24 h run.
 .PHONY: fuzz-build fuzz-syscall-dispatcher
 FUZZ_ARGS ?= -max_total_time=60 -print_final_stats=1
+FUZZ_TARGET ?= x86_64-apple-darwin
 fuzz-build:
-	cargo +nightly fuzz build --fuzz-dir fuzz --target x86_64-apple-darwin
+	cargo fuzz build --fuzz-dir fuzz --target $(FUZZ_TARGET)
 
 fuzz-syscall-dispatcher:
-	cargo +nightly fuzz run --fuzz-dir fuzz --target x86_64-apple-darwin \
+	cargo fuzz run --fuzz-dir fuzz --target $(FUZZ_TARGET) \
 		fuzz_syscall_dispatcher -- $(FUZZ_ARGS)
 
 # ---------------------------------------------------------------------------
