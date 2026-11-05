@@ -7,4 +7,4 @@
 # the crate is `no_std` and architecture-agnostic, so the native host
 # triple avoids cross-compile overhead and links the test runner.
 [build]
-target = "aarch64-apple-darwin"
+target = "host-tuple"

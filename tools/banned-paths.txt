@@ -31,3 +31,10 @@ src/microkernel/main.rs.bak
 # that has a manifest and no source; deleted in the commit that adds the
 # lint. Banned so an untracked copy cannot come back.
 user/dhcp-client
+
+# tools/check-demo-readiness.sh: a macOS-only readiness script from April
+# 2026 with its own copies of the architecture and target lists and
+# Homebrew-only advice; nothing referenced it. Replaced by
+# tools/check-env.py (`make check-env`), which reads the lists from the
+# Makefile and reports for macOS and Linux hosts.
+tools/check-demo-readiness.sh

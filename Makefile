@@ -28,7 +28,12 @@ SHELL := /bin/bash
 KERNEL := target/x86_64-unknown-none/release/cambios_microkernel
 ISO := cambios.iso
 LIMINE_DIR := $(HOME)/.cache/cambios/limine
+# The upstream branch moves with every binary release; the commit is the
+# release this tree is built and booted against (v8.7.0). A fresh clone
+# fetches exactly that commit. An existing cache is left alone:
+# `make check-env` reports a cache that sits at a different commit.
 LIMINE_BRANCH := v8.x-binary
+LIMINE_COMMIT := aad3edd370955449717a334f0289dee10e2c5f01
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 
 # =============================================================================
@@ -123,20 +128,41 @@ USER_ELF := user/hello.elf
 USER_SRC := user/hello.S
 USER_LD  := user/user.ld
 
-# Host-tool build target + headless QEMU display (CI overrides). HOST_TARGET:
-# the host-side tools (sign-elf, mkinitrd, ...) are native binaries, not
-# bare-metal; each overrides the parent .cargo/config.toml bare-metal default.
-# Defaults to the macOS dev host; CI on Linux overrides with
-# `HOST_TARGET=x86_64-unknown-linux-gnu`. Consumed by the host-tool output-path
-# vars and their build rules below. QEMU_DISPLAY: empty by default (interactive
-# `run-quiet` keeps its window); headless CI sets `QEMU_DISPLAY=-display none`.
-HOST_TARGET ?= aarch64-apple-darwin
+# Host triples: detected, not assumed.
+#
+# HOST_TARGET: the triple the host tools (sign-elf, build-manifest,
+# mkinitrd, gen-dev-piv-keys, format-volume, bake-font) are built for.
+# They are native binaries. Each tool crate's .cargo/config.toml replaces
+# the parent's bare-metal default with `host-tuple`, and the rules below
+# pass the triple explicitly so the output path is known. It is read from
+# the pinned toolchain (`rustc -vV`) the first time a rule needs it, not
+# when the Makefile is parsed: `make print-<VAR>` and the python lints
+# must not start a toolchain download. Set it in the environment only to
+# cross-build the tools.
+#
+# TEST_TARGET: the triple the kernel's unit tests and the fuzz targets
+# build for. Always an x86_64 triple of the host's operating system: the
+# kernel library picks its architecture backend by `cfg(target_arch)`,
+# and x86_64 is the only backend with host stand-ins for the symbols its
+# assembly defines on bare metal. On Apple Silicon the binaries run under
+# Rosetta 2. On a Linux host that is not x86_64 they need a cross linker
+# and an emulator; `make check-env` reports which case this machine is.
+#
+# QEMU_DISPLAY: empty by default (interactive `run-quiet` keeps its
+# window); headless CI sets `QEMU_DISPLAY=-display none`.
+# QEMU_GUI_DISPLAY: the window backend of the *-gui run targets.
+ifeq ($(origin HOST_TARGET),undefined)
+HOST_TARGET = $(eval HOST_TARGET := $(or $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p'),unknown-host))$(HOST_TARGET)
+endif
+HOST_OS = $(subst $(firstword $(subst -, ,$(HOST_TARGET)))-,,$(HOST_TARGET))
+TEST_TARGET ?= x86_64-$(HOST_OS)
 QEMU_DISPLAY ?=
+QEMU_GUI_DISPLAY ?= $(if $(findstring apple-darwin,$(HOST_TARGET)),cocoa,gtk)
 
 # RISC-V initrd artifacts
 INITRD_RISCV64 := initrd-riscv64.img
 MKINITRD_DIR := tools/mkinitrd
-MKINITRD := $(MKINITRD_DIR)/target/$(HOST_TARGET)/release/mkinitrd
+MKINITRD = $(MKINITRD_DIR)/target/$(HOST_TARGET)/release/mkinitrd
 
 # Hand-assembled test binary (AArch64)
 USER_ELF_AARCH64 := user/hello-aarch64.elf
@@ -145,19 +171,19 @@ USER_LD_AARCH64  := user/user-aarch64.ld
 
 # ELF signing tool
 SIGN_ELF_DIR := tools/sign-elf
-SIGN_ELF := $(SIGN_ELF_DIR)/target/$(HOST_TARGET)/release/sign-elf
+SIGN_ELF = $(SIGN_ELF_DIR)/target/$(HOST_TARGET)/release/sign-elf
 
 # Boot-manifest builder (ADR-018 step 2; input = manifest.toml, the
 # ADR-037 Phase-2 endpoint-registry artifact)
 BUILD_MANIFEST_DIR := tools/build-manifest
-BUILD_MANIFEST := $(BUILD_MANIFEST_DIR)/target/$(HOST_TARGET)/release/build-manifest
+BUILD_MANIFEST = $(BUILD_MANIFEST_DIR)/target/$(HOST_TARGET)/release/build-manifest
 
 # Dev-PIV keypair generator (host-side). Derives Ed25519+X25519 keys from a
 # persistent per-developer seed; writes dev_bootstrap_pubkey.bin (consumed by
 # the kernel under --features dev-piv) and user/key-store-service/
 # dev_piv_secret.bin (consumed by SwPivBackend under --features dev-piv).
 GEN_DEV_PIV_DIR := tools/gen-dev-piv-keys
-GEN_DEV_PIV := $(GEN_DEV_PIV_DIR)/target/aarch64-apple-darwin/release/gen-dev-piv-keys
+GEN_DEV_PIV = $(GEN_DEV_PIV_DIR)/target/$(HOST_TARGET)/release/gen-dev-piv-keys
 DEV_BOOTSTRAP_PUBKEY := dev_bootstrap_pubkey.bin
 DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 
@@ -165,7 +191,7 @@ DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 # ADR-032 § 4 volume header to a raw disk image file using the
 # DPIV bundle gen-dev-piv-keys produced. Sibling to sign-elf.
 FORMAT_VOLUME_DIR := tools/format-volume
-FORMAT_VOLUME := $(FORMAT_VOLUME_DIR)/target/aarch64-apple-darwin/release/format-volume
+FORMAT_VOLUME = $(FORMAT_VOLUME_DIR)/target/$(HOST_TARGET)/release/format-volume
 
 # Signing mode: "yubikey" (default) or "seed" (for CI/testing without hardware key)
 SIGN_MODE ?= seed
@@ -192,7 +218,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists check-env check-elf-link audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
 
 all: iso
 
@@ -335,7 +361,7 @@ mkinitrd:
 # Required before any build with `--features dev-piv` enabled.
 gen-dev-piv-keys:
 	@echo "=== Building dev-PIV keypair generator ==="
-	cd $(GEN_DEV_PIV_DIR) && cargo build --release
+	cd $(GEN_DEV_PIV_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Generating dev-PIV keypair files ==="
 	$(GEN_DEV_PIV)
 	@echo "=== dev-PIV keypair files ready ==="
@@ -346,7 +372,7 @@ gen-dev-piv-keys:
 # run at least once (consumes user/key-store-service/dev_piv_secret.bin).
 format-volume:
 	@echo "=== Building format-volume host tool ==="
-	cd $(FORMAT_VOLUME_DIR) && cargo build --release
+	cd $(FORMAT_VOLUME_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== format-volume ready: $(FORMAT_VOLUME) ==="
 
 # Re-bake the JetBrains Mono Regular TTF in assets/fonts/ into the
@@ -358,9 +384,9 @@ JBM_PX_HEIGHT := 24
 JBM_CELL := 16x32
 bake-font:
 	@echo "=== Building bake-font host tool ==="
-	cd tools/bake-font && cargo build --release
+	cd tools/bake-font && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Re-baking JetBrains Mono into user/libgui/src/font_jbmono_data.rs ==="
-	./tools/bake-font/target/aarch64-apple-darwin/release/bake-font \
+	./tools/bake-font/target/$(HOST_TARGET)/release/bake-font \
 	    assets/fonts/JetBrainsMono-Regular.ttf \
 	    user/libgui/src/font_jbmono_data.rs \
 	    --px $(JBM_PX_HEIGHT) --cell $(JBM_CELL) --const-prefix JBM
@@ -379,10 +405,12 @@ export-pubkey: sign-tool
 # the dir present but missing key files (e.g., BOOTX64.EFI gone while
 # BOOTAA64.EFI survives), and `git clone` refuses a non-empty target.
 $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTAA64.EFI:
-	@echo "=== Cloning Limine $(LIMINE_BRANCH) ==="
+	@echo "=== Fetching Limine $(LIMINE_BRANCH) at $(LIMINE_COMMIT) ==="
 	rm -rf $(LIMINE_DIR)
-	mkdir -p $(dir $(LIMINE_DIR))
-	git clone $(LIMINE_REPO) --branch=$(LIMINE_BRANCH) --depth=1 $(LIMINE_DIR)
+	mkdir -p $(LIMINE_DIR)
+	git -C $(LIMINE_DIR) init -q
+	git -C $(LIMINE_DIR) fetch -q --depth=1 $(LIMINE_REPO) $(LIMINE_COMMIT)
+	git -C $(LIMINE_DIR) checkout -q FETCH_HEAD
 
 # Upstream's `limine-binary` branch ships the pre-built EFI stages but
 # NOT the compiled macOS host tool `limine` (the `xxx bios-install $(ISO)`
@@ -578,11 +606,11 @@ run-quiet-dev-piv: iso-dev-piv disk-img
 			-vga virtio \
 			-no-reboot
 
-# Same as `run`, plus a graphical QEMU window (macOS Cocoa backend) so
-# compositor / scanout output is visible. Use for Scanout-3+ visual
-# verification; `run` stays headless (serial-only) for CI / text-mode
-# workflows. For Linux change `cocoa` to `gtk`; for remote sessions
-# swap to `-vnc :0` and connect via Screen Sharing.
+# Same as `run`, plus a graphical QEMU window so compositor / scanout
+# output is visible; `run` stays headless (serial-only) for CI and
+# text-mode work. The window backend is QEMU_GUI_DISPLAY (cocoa on a
+# macOS host, gtk elsewhere); for a remote session pass
+# `QEMU_GUI_DISPLAY="vnc=:0"` and connect with a VNC viewer.
 run-gui: iso disk-img
 	qemu-system-x86_64 \
 		-cdrom $(ISO) \
@@ -599,7 +627,7 @@ run-gui: iso disk-img
 		-device usb-ccid,bus=xhci0.0 \
 		-vga virtio \
 		-no-reboot \
-		-display cocoa
+		-display $(QEMU_GUI_DISPLAY)
 
 run-uefi: iso
 	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
@@ -643,10 +671,23 @@ img-x86: iso manifest-profile
 	@echo "=== $(IMG_X86) ready ($(PROFILE) manifest) ==="
 	@echo "To write to USB: make usb DEVICE=/dev/diskN  (or: sudo dd if=$(IMG_X86) of=/dev/diskN bs=1M)"
 
-# UEFI firmware paths (resolved via Homebrew Cellar for QEMU 10.x)
-# QEMU 10.x requires pflash loading (not -bios) per firmware/*.json descriptors.
-EFI_FW_X86 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-x86_64-code.fd' 2>/dev/null | head -1)
-EFI_VARS_X86 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-i386-vars.fd' 2>/dev/null | head -1)
+# UEFI firmware: the edk2 images QEMU itself ships, looked up where
+# Homebrew (Apple Silicon, then Intel) and a QEMU installed under /usr or
+# /usr/local put them. QEMU 10.x requires pflash loading (not -bios) per
+# its firmware/*.json descriptors. A distribution that packages the
+# firmware separately (ovmf, AAVMF) needs EFI_FW_X86 + EFI_VARS_X86 (a
+# matching code/vars pair) or EFI_FW_AARCH64 set by hand; `make check-env`
+# prints what this lookup finds.
+#
+# Deferred: a lookup for distribution firmware packages.
+# Why: their file names and code/vars pairings differ per distribution,
+# and none has booted this tree, so a list here would be a guess.
+# Revisit when: a Linux host boots `make run-aarch64` or `make run-uefi`
+# with firmware from a distribution package.
+EFI_FW_DIRS := /opt/homebrew/Cellar/qemu /usr/local/Cellar/qemu /usr/local/share/qemu /usr/share/qemu
+efi_fw = $(shell find $(EFI_FW_DIRS) -name '$(1)' 2>/dev/null | head -1)
+EFI_FW_X86 ?= $(call efi_fw,edk2-x86_64-code.fd)
+EFI_VARS_X86 ?= $(call efi_fw,edk2-i386-vars.fd)
 
 # Test x86_64 FAT image in QEMU UEFI (validates the image before writing to USB)
 run-img-x86: img-x86
@@ -806,8 +847,30 @@ verify-usb:
 		exit 1; \
 	fi
 
+# Kernel unit tests on the host (TEST_TARGET, see the host-triples block).
+#
+# A macOS host links the test binary as Mach-O; CI links it as ELF. The
+# two formats disagree about symbol names: a `#[no_mangle]` Rust symbol is
+# `_name` in Mach-O and `name` in ELF, where an assembly label is `name`
+# in both. A duplicate or missing symbol can therefore link here and fail
+# in CI (`resched_isr_stub`, repaired in 6f3c914). So on a macOS host `make test`
+# also links the test binary as ELF without running it (`check-elf-link`:
+# the toolchain's own lld and static musl, no system linker or libraries).
 test:
-	RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+	RUST_MIN_STACK=8388608 cargo test --lib --target $(TEST_TARGET)
+	$(if $(findstring apple-darwin,$(HOST_TARGET)),$(MAKE) --no-print-directory check-elf-link,@true)
+
+ELF_LINK_TARGET := x86_64-unknown-linux-musl
+check-elf-link:
+	@echo "=== Linking the unit tests as ELF ($(ELF_LINK_TARGET), not run) ==="
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker-flavor=ld.lld -C linker=rust-lld -C link-self-contained=yes" \
+		cargo test --lib --no-run --target $(ELF_LINK_TARGET)
+
+# What this machine has and lacks for building, testing and booting
+# CambiOS: toolchain, targets, host tools, emulator, firmware, hooks.
+# Exit 0 when everything `make check-all` + `make test` need is present.
+check-env:
+	@python3 tools/check-env.py
 
 # =============================================================================
 # make verify — run Kani formal-verification proofs.
@@ -837,12 +900,11 @@ verify: verify-all
 # test binaries).
 # =============================================================================
 .PHONY: stats
-# Host triple used to enumerate --lib tests in `make stats`. Defaults to the
-# maintainer's macOS host; override in CI / on Linux
-# (STATS_TEST_TARGET=x86_64-unknown-linux-gnu). The --lib tests are pure logic,
-# so the count is host-independent — the target only overrides the .cargo
-# bare-metal default so a host binary can be built.
-STATS_TEST_TARGET ?= x86_64-apple-darwin
+# Host triple used to enumerate --lib tests in `make stats`: the one
+# `make test` builds for. The --lib tests are pure logic, so the count is
+# host-independent; the target only overrides the .cargo bare-metal
+# default so a host binary can be built.
+STATS_TEST_TARGET ?= $(TEST_TARGET)
 
 stats:
 	@echo "=== CambiOS stats (derived from source) ==="
@@ -1069,7 +1131,7 @@ update-unsafe-coverage-baseline:
 # AArch64 targets
 KERNEL_AARCH64 := target/aarch64-unknown-none/release/cambios_microkernel
 IMG_AARCH64 := cambios-aarch64.img
-EFI_FW_AARCH64 := $(shell find /opt/homebrew/Cellar/qemu -name 'edk2-aarch64-code.fd' 2>/dev/null | head -1)
+EFI_FW_AARCH64 ?= $(call efi_fw,edk2-aarch64-code.fd)
 
 kernel-aarch64:
 	cargo build --target aarch64-unknown-none --release
@@ -1124,8 +1186,8 @@ run-aarch64: img-aarch64
 # GUI-on-aarch64 run: attaches virtio-gpu-pci as the scanout carrier and
 # virtio-keyboard-pci as an input carrier. The kernel's ECAM enumerator
 # (src/pci/mod.rs `mod ecam`) discovers both; scanout-virtio-gpu +
-# virtio-input + compositor + worm bind through them. `-display cocoa`
-# opens a macOS window; on Linux swap for `-display gtk` or `sdl`.
+# virtio-input + compositor + worm bind through them. The window
+# backend is QEMU_GUI_DISPLAY (see the host-triples block at the top).
 run-aarch64-gui: img-aarch64
 	qemu-system-aarch64 \
 		-machine virt,gic-version=3 \
@@ -1133,7 +1195,7 @@ run-aarch64-gui: img-aarch64
 		-smp 2 \
 		-m 4G \
 		-serial mon:stdio \
-		-display cocoa \
+		-display $(QEMU_GUI_DISPLAY) \
 		-device virtio-gpu-pci \
 		-device virtio-keyboard-pci \
 		-device qemu-xhci,id=xhci0 \
@@ -1280,8 +1342,8 @@ check-clippy-x86: check-clippy-x86_64
 # (`fuzz_asm_stubs`) for the symbols its `global_asm!` blocks define on
 # bare metal. A new assembly symbol the kernel references needs a
 # stand-in there, or every fuzz target fails to link (`make fuzz-build`
-# is what notices). On Apple Silicon the binaries run under Rosetta 2;
-# on Linux pass FUZZ_TARGET=x86_64-unknown-linux-gnu.
+# is what notices). FUZZ_TARGET defaults to TEST_TARGET, the x86_64
+# triple of this host's operating system.
 #
 # cargo-fuzz runs under the nightly pinned in rust-toolchain.toml, the
 # same compiler that builds the kernel.
@@ -1292,7 +1354,7 @@ check-clippy-x86: check-clippy-x86_64
 # for a 24 h run.
 .PHONY: fuzz-build fuzz-syscall-dispatcher
 FUZZ_ARGS ?= -max_total_time=60 -print_final_stats=1
-FUZZ_TARGET ?= x86_64-apple-darwin
+FUZZ_TARGET ?= $(TEST_TARGET)
 fuzz-build:
 	cargo fuzz build --fuzz-dir fuzz --target $(FUZZ_TARGET)
 
