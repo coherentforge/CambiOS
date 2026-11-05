@@ -112,6 +112,35 @@ PROFILES := default headless framebuffer-fallback
 # The proof crates are the *-proofs directories under verification/.
 PROOF_CRATES := $(sort $(patsubst verification/%/Cargo.toml,%,$(wildcard verification/*-proofs/Cargo.toml)))
 
+# Host tests outside the kernel library. Every package under user/,
+# cambios-*/ and tools/ whose source holds a `#[test]` is in exactly one
+# of these two lists; check-lists fails when one is in neither (tests
+# that nothing runs) or in both. `make test-user` runs the first list.
+HOST_TEST_CRATES := cambios-abi cambios-blk-proto cambios-ccid-proto \
+	cambios-fde-proto cambios-manifest tools/build-manifest \
+	user/cambios-style user/init user/key-store-service user/libflag \
+	user/libfs user/libgui user/libgui-proto user/libinput-proto \
+	user/libipc user/libscanout user/libsys user/libterm user/ping \
+	user/sprouty user/terminal-window user/worm
+
+# Binary-only crates: `#![no_std] #![no_main]` with their own panic
+# handler, so the test harness cannot link them (duplicate lang item
+# `panic_impl`). Their tests (usb-host: descriptor and HID keyboard
+# parsing; virtio-input: evdev mapping) run nowhere.
+# Deferred: moving each crate's pure modules into a lib target, the
+# split ping, sprouty and worm already use.
+# Why: a source restructure of two drivers, separate from the build
+# lists this section holds.
+# Revisit when: either crate is next edited, or a third binary-only
+# crate with tests appears here.
+HOST_TEST_EXEMPT := user/usb-host user/virtio-input
+
+# Extra cargo arguments for every user-crate build and host test. CI
+# passes `CARGO_LOCKED=--locked`, so a Cargo.lock that no longer matches
+# its Cargo.toml fails the build; locally cargo rewrites it, and the
+# rewritten file shows up in `git status`.
+CARGO_LOCKED ?=
+
 # A newline, for recipes that expand a list into one command per line.
 define NL
 
@@ -292,10 +321,36 @@ $(1)$$(SUFFIX_$(2)):
 	@echo "=== Building $(1) ($(2)) ==="
 	cd user/$(1) && CARGO_ENCODED_RUSTFLAGS=$$$$(printf '%s\x1f%s\x1f%s\x1f%s' \
 		'-Clink-arg=--script=$$(USER_LINK_$(2))' '-Clink-arg=-z' '-Clink-arg=noexecstack' \
-		'-Crelocation-model=static') cargo build $$(strip $$(USER_TARGET_ARG_$(2)) --release $$(FEATURES_$(1)_$(2)))
+		'-Crelocation-model=static') cargo build $$(strip $$(CARGO_LOCKED) $$(USER_TARGET_ARG_$(2)) --release $$(FEATURES_$(1)_$(2)))
 	@echo "=== $(1) ($(2)) ready ==="
 endef
 $(foreach a,$(ARCHES),$(foreach c,$(CRATES_$(a)),$(eval $(call USER_CRATE_RULE,$(c),$(a)))))
+
+# Every user crate, for every architecture that has a rule for it:
+# the staged crates the images build anyway, and the UNSTAGED ones no
+# image builds.
+.PHONY: check-user
+check-user: $(foreach a,$(ARCHES),$(addsuffix $(SUFFIX_$(a)),$(CRATES_$(a))))
+	@echo "=== every user crate builds for every architecture that lists it ==="
+
+# Host tests of the packages in HOST_TEST_CRATES, one goal each
+# (`make host-test-user-libsys`). They build for TEST_TARGET, not
+# HOST_TARGET: libsys's aarch64 syscall stubs name x18, a register
+# Apple's ABI reserves, so the x86_64 host triple is the one every
+# crate builds for on every host. A crate with a lib target runs its
+# lib tests only; its bin target is `no_main` and cannot link a test
+# harness.
+define HOST_TEST_RULE
+.PHONY: host-test-$(subst /,-,$(1))
+host-test-$(subst /,-,$(1)):
+	@echo "=== host tests: $(1) ==="
+	cd $(1) && cargo test $$(strip $$(CARGO_LOCKED) $(if $(wildcard $(1)/src/lib.rs),--lib) --target $$(TEST_TARGET))
+endef
+$(foreach c,$(HOST_TEST_CRATES),$(eval $(call HOST_TEST_RULE,$(c))))
+
+.PHONY: test-user
+test-user: $(foreach c,$(HOST_TEST_CRATES),host-test-$(subst /,-,$(c)))
+	@echo "=== host tests pass in $(words $(HOST_TEST_CRATES)) packages ==="
 
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
