@@ -1,0 +1,83 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-130",
+      "input": {
+        "family": "ipv4",
+        "fragments": [
+          {
+            "offset": 0,
+            "bytes_hex": "01020304"
+          },
+          {
+            "offset": 2,
+            "bytes_hex": "05060708"
+          }
+        ]
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "overlapping_fragments",
+        "transport_events": 0
+      },
+      "covers": [
+        "AT-net-016",
+        "INV-net-018"
+      ],
+      "source": "RFC 791; CambiOS B-10 overlap policy"
+    },
+    {
+      "id": "NET-V-131",
+      "input": {
+        "family": "ipv6",
+        "fragments": [
+          {
+            "offset": 0,
+            "more": true,
+            "bytes_hex": "01020304"
+          }
+        ]
+      },
+      "expect": {
+        "result": "Expired",
+        "transport_events": 0,
+        "retained_bytes": 0
+      },
+      "covers": [
+        "AT-net-016",
+        "INV-net-018"
+      ],
+      "source": "RFC 8200; RFC 6980; bounded reassembly lifetime"
+    },
+    {
+      "id": "NET-V-132",
+      "input": {
+        "family": "ipv4",
+        "fragments": [
+          {
+            "offset": 0,
+            "more": true,
+            "bytes_hex": "01020304"
+          },
+          {
+            "offset": 4,
+            "more": false,
+            "bytes_hex": "05060708"
+          }
+        ]
+      },
+      "expect": {
+        "result": "Delivered",
+        "payload_hex": "0102030405060708",
+        "transport_events": 1
+      },
+      "covers": [
+        "AT-net-016",
+        "INV-net-018"
+      ],
+      "source": "RFC 791"
+    }
+  ]
+}

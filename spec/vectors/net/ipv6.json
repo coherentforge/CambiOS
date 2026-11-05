@@ -1,0 +1,46 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-020",
+      "input": {
+        "family": "ipv6",
+        "extension_header_count": 9,
+        "extension_bytes": 72,
+        "next_header": 59
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "extension_header_count_limit",
+        "transport_events": 0
+      },
+      "covers": [
+        "AT-net-003",
+        "INV-net-003",
+        "INV-net-004"
+      ],
+      "source": "RFC 8200; CambiOS MAX_IPV6_EXTENSION_HEADERS"
+    },
+    {
+      "id": "NET-V-021",
+      "input": {
+        "family": "ipv6",
+        "extension_header_count": 1,
+        "extension_bytes": 2056,
+        "next_header": 59
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "extension_header_bytes_limit",
+        "transport_events": 0
+      },
+      "covers": [
+        "AT-net-003",
+        "INV-net-003",
+        "INV-net-004"
+      ],
+      "source": "RFC 8200; CambiOS MAX_IPV6_EXTENSION_BYTES"
+    }
+  ]
+}

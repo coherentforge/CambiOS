@@ -1,0 +1,107 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-110",
+      "input": {
+        "query_id": 7,
+        "question": {
+          "name": "cambios.example",
+          "type": "AAAA",
+          "class": "IN"
+        },
+        "response_id": 8,
+        "response_question": {
+          "name": "cambios.example",
+          "type": "AAAA",
+          "class": "IN"
+        }
+      },
+      "expect": {
+        "result": "Ignored",
+        "request_completed": false
+      },
+      "covers": [
+        "AT-net-013",
+        "INV-net-015"
+      ],
+      "source": "RFC 1035 §4.1"
+    },
+    {
+      "id": "NET-V-111",
+      "input": {
+        "name_pointer_offsets": [
+          12,
+          12
+        ],
+        "packet_length": 32
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "compression_pointer_loop"
+      },
+      "covers": [
+        "AT-net-013",
+        "INV-net-013",
+        "INV-net-015"
+      ],
+      "source": "RFC 1035 §4.1.4"
+    },
+    {
+      "id": "NET-V-112",
+      "input": {
+        "query_id": 9,
+        "question": {
+          "name": "cambios.example",
+          "type": "A",
+          "class": "IN"
+        },
+        "response_id": 9,
+        "response_question": {
+          "name": "cambios.example",
+          "type": "A",
+          "class": "IN"
+        },
+        "answer_ttl_seconds": 60,
+        "clock_advance_seconds": 61
+      },
+      "expect": {
+        "first_result": "Completed",
+        "cache_entry_after_advance": false
+      },
+      "covers": [
+        "AT-net-013",
+        "INV-net-015"
+      ],
+      "source": "RFC 1035 TTL"
+    },
+    {
+      "id": "NET-V-113",
+      "input": {
+        "query_id": 10,
+        "question": {
+          "name": "cambios.example",
+          "type": "A",
+          "class": "IN"
+        },
+        "response_id": 10,
+        "response_question": {
+          "name": "other.example",
+          "type": "A",
+          "class": "IN"
+        }
+      },
+      "expect": {
+        "result": "Ignored",
+        "request_completed": false,
+        "cache_changed": false
+      },
+      "covers": [
+        "AT-net-013",
+        "INV-net-015"
+      ],
+      "source": "RFC 1035 §4.1; transaction question must match"
+    }
+  ]
+}
