@@ -86,6 +86,7 @@ Commit at topic boundaries within a session, not at session end. Bisectable hist
 - **Split by logical boundary, not by file.** A small multi-file change is one commit; a large single-file change spanning multiple topics should be multiple commits if the edits are cleanly separable.
 - **Never `git add .` or `git commit -a` without naming files.** Working-tree sweeps conflate unrelated work — if a parallel session has uncommitted edits, those will get swept into the commit message of whatever is landing. Stage by explicit filename.
 - **Draft the commit body from `git diff --cached`, not from memory.** Every claim ("removes X", "renames Y") must match a line in the staged diff. Verification bullets ("grep returns nothing", "make check-all clean") must be run against the staged tree at drafting time, not recalled. Bodies written from memory drift ahead of what got staged.
+- **Sign off every commit** (`git commit -s`). The `Signed-off-by:` line certifies the Developer Certificate of Origin; the commit-msg hook rejects a commit without it. An agent-authored commit carries the sign-off of the person the agent works for. Process details for contributors are in [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Who runs the commit.** On the maintainer's clone the agent drafts and the maintainer executes: the agent prepares `git add <files>` and the commit message, and the maintainer runs the commit to enter their PGP (Pretty Good Privacy) passphrase. On a contributor's clone or fork, the contributor, or their agent under the contributor's own identity, commits to a branch and opens a pull request; a contributor's change reaches `main` only through a pull request that passes the required checks. The project's own agent identity (the `cambios-agent` GitHub App) takes the same pull-request path. In every case: never bypass signing or hooks (`--no-gpg-sign`, `--no-verify`).
 
 ## Acronyms in Chat and Docs
@@ -239,6 +240,10 @@ Observed symptom → likely root cause. The symptom rarely names the invariant i
 ### Adding a new syscall
 
 Seven coordinated places must change atomically (variant declaration, identity gate, `from_u64` wire-up, test coverage, dispatcher arm, handler, libsys wrapper) — full walkthrough with each step's failure mode in [docs/dev-notes/syscall-workflow.md](docs/dev-notes/syscall-workflow.md). Canonical reference: `TryRecvMsg = 37`. **Flow-specific stop-and-ask:** syscall in exempt set? new capability-check kind? new arch backend helper?
+
+### Adding a user crate
+
+Six things have to agree: the crate itself, the Makefile's build lists, `workspace.exclude`, the Limine configs, the `manifest.toml` entry, and the host-test lists. `make check-lists` names the one that is missing. Walkthrough: [docs/dev-notes/adding-a-user-crate.md](docs/dev-notes/adding-a-user-crate.md).
 
 ## Quick Reference
 
