@@ -25,14 +25,22 @@ one record per line in "path:line:token" form. The goal is to not
 Exit status:
   0 — no new deferrals without triggers
   1 — new violations found (or baseline is stale)
-  2 — repo root not found or baseline unreadable
+  2 — repo root not found, baseline unreadable, or git cannot list
+      the repository's files
 
 Scope: scans docs/**/*.md, CLAUDE.md, STATUS.md, src/**/*.rs,
-user/**/*.rs. Skips target/, fuzz/target/, .git/, /tmp vendored
-deps, and this script's own baseline file.
+user/**/*.rs, tools/**/*.py. Only files that belong to the repository
+are scanned: tracked files plus untracked files git does not ignore
+(so a new file is linted before its first `git add`). A gitignored
+file is not part of the repository and never enters the baseline: a
+local virtualenv under tools/ once put 340 site-packages lines into
+the committed baseline, entries CI could never see and another
+developer's checkout would not match. Also skips target/, fuzz/,
+.git/, and this script's own baseline file.
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -98,17 +106,32 @@ def should_skip(path: Path) -> bool:
     return False
 
 
-def iter_scan_paths():
+def repo_files():
+    """Absolute paths of every file that belongs to the repository:
+    tracked, or untracked and not ignored. Returns None when git cannot
+    say; the caller stops instead of walking the filesystem, because a
+    filesystem walk is what let gitignored files into the baseline."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=ROOT, check=True, capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {ROOT / rel for rel in out.decode("utf-8").split("\0") if rel}
+
+
+def iter_scan_paths(files):
     for top, pattern in SCAN_GLOBS:
         base = ROOT / top
         if not base.is_dir():
             continue
         for p in base.glob(pattern):
-            if not should_skip(p):
+            if p in files and not should_skip(p):
                 yield p
     for name in SCAN_TOPLEVEL:
         p = ROOT / name
-        if p.is_file() and not should_skip(p):
+        if p in files and p.is_file() and not should_skip(p):
             yield p
 
 
@@ -176,11 +199,18 @@ def main():
 
     update_mode = "--update-baseline" in sys.argv
 
+    files = repo_files()
+    if files is None:
+        print("check-deferrals: `git ls-files` failed; cannot tell which "
+              "files belong to the repository, so nothing was scanned",
+              file=sys.stderr)
+        return 2
+
     baseline = load_baseline()
     new_violations = []
     all_hits = []
 
-    for path in sorted(iter_scan_paths()):
+    for path in sorted(iter_scan_paths(files)):
         rel = path.relative_to(ROOT).as_posix()
         for lineno, token, line in find_deferrals(path):
             key = (rel, str(lineno), token)
