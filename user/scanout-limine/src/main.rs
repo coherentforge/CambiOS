@@ -20,6 +20,14 @@
 //! per-rect copy if it ever matters; today's full-FB memcpy is fast
 //! enough at 4 MiB and trivially correct.
 //!
+//! No framebuffer: a machine where Limine handed over none (or one
+//! this driver cannot use) is a driver with zero displays, not a dead
+//! service. It registers and pairs with the compositor all the same,
+//! answers `RegisterCompositor` with `WelcomeCompositor`, announces
+//! nothing, and the compositor runs headless (ADR-014 § Fallback
+//! rules). Exiting before the ready ping instead leaves init waiting
+//! on this row forever, and the shell with it.
+//!
 //! Trust model: today the driver accepts the first `RegisterCompositor`
 //! it receives and binds that sender's Principal as "the compositor".
 //! Stricter trust gating (compositor Principal in a compiled-in trust
@@ -45,7 +53,9 @@ use cambios_libscanout::{
 
 /// Per-driver state. Single-display, single-compositor.
 struct DriverState {
-    fb: FramebufferDescriptor,
+    /// The mapped Limine framebuffer; `None` when there is none to
+    /// drive (see the module docs). No framebuffer, no display.
+    fb: Option<FramebufferDescriptor>,
     /// Compositor's Principal, captured from the first `RegisterCompositor`.
     /// Used as the peer principal for `channel_create` and to verify
     /// subsequent `FrameReady` messages came from the same compositor.
@@ -74,20 +84,11 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[SCANOUT-LIMINE] starting\r\n");
 
-    // Map the Limine framebuffer. The kernel grants the
-    // `MapFramebuffer` capability to scanout-limine by name at
-    // boot — see register_process_capabilities in src/microkernel/main.rs.
-    let mut fb = FramebufferDescriptor::default();
-    if let Err(rc) = sys::map_framebuffer(0, &mut fb) {
-        print_int(b"[SCANOUT-LIMINE] map_framebuffer rc=", rc);
-        sys::exit(1);
-    }
-    print_fb(&fb);
-
-    if fb.bpp != 32 {
-        // Limine FB is virtually always 32bpp on QEMU/UEFI; if not, refuse.
-        print_int(b"[SCANOUT-LIMINE] unsupported bpp=", fb.bpp as i64);
-        sys::exit(2);
+    // No usable framebuffer means zero displays, not a dead driver:
+    // the control loop below runs either way (see the module docs).
+    let fb = map_usable_framebuffer();
+    if fb.is_none() {
+        sys::print(b"[SCANOUT-LIMINE] no usable framebuffer; serving with zero displays\r\n");
     }
 
     if sys::register_endpoint(SCANOUT_DRIVER_ENDPOINT) < 0 {
@@ -116,6 +117,29 @@ fn run() -> ! {
         // recv_verified blocks; if we get None it's a malformed/anonymous
         // message and we just spin to wait for the next.
     }
+}
+
+/// Map framebuffer 0 and check this driver can drive it. `None` when
+/// there is no framebuffer, the mapping is refused, or its format is
+/// one the full-frame copy below does not handle; the reason is
+/// logged.
+///
+/// The kernel grants the `MapFramebuffer` capability to scanout-limine
+/// from its manifest row.
+fn map_usable_framebuffer() -> Option<FramebufferDescriptor> {
+    let mut fb = FramebufferDescriptor::default();
+    if let Err(rc) = sys::map_framebuffer(0, &mut fb) {
+        print_int(b"[SCANOUT-LIMINE] map_framebuffer rc=", rc);
+        return None;
+    }
+    print_fb(&fb);
+
+    if fb.bpp != 32 {
+        // Limine FB is virtually always 32bpp on QEMU/UEFI; if not, refuse.
+        print_int(b"[SCANOUT-LIMINE] unsupported bpp=", fb.bpp as i64);
+        return None;
+    }
+    Some(fb)
 }
 
 fn handle_message(state: &mut DriverState, msg: &VerifiedMessage) {
@@ -165,8 +189,23 @@ fn handle_register_compositor(state: &mut DriverState, msg: &VerifiedMessage) {
         }
     }
 
+    // Pairing first. The compositor blocks for this and nothing else:
+    // it runs headless until a DisplayConnected arrives (ADR-014
+    // § Fallback rules). So with no framebuffer, or if the channel
+    // below cannot be created, it keeps serving clients and the boot
+    // wave keeps moving.
+    let mut reply = [0u8; 16];
+    if let Some(n) = encode_welcome_compositor(&mut reply, 0) {
+        sys::write(state.compositor_endpoint, &reply[..n]);
+    }
+
+    let Some(fb) = state.fb else {
+        sys::print(b"[SCANOUT-LIMINE] compositor paired; no display to announce\r\n");
+        return;
+    };
+
     // Allocate the scanout channel sized for the framebuffer.
-    let size_bytes = (state.fb.pitch as u64) * (state.fb.height as u64);
+    let size_bytes = (fb.pitch as u64) * (fb.height as u64);
     let pages = size_bytes.div_ceil(4096) as u32;
     print_int(b"[SCANOUT-LIMINE] channel_create pages=", pages as i64);
     print_hex(b"[SCANOUT-LIMINE] peer_principal first u64=",
@@ -186,21 +225,15 @@ fn handle_register_compositor(state: &mut DriverState, msg: &VerifiedMessage) {
     });
     print_hex(b"[SCANOUT-LIMINE] scanout channel id=", channel_id);
 
-    // Send WelcomeCompositor (capabilities = 0, no flags defined in v0).
-    let mut reply = [0u8; 16];
-    if let Some(n) = encode_welcome_compositor(&mut reply, 0) {
-        sys::write(state.compositor_endpoint, &reply[..n]);
-    }
-
     // Send DisplayConnected with the scanout channel id + DisplayInfo.
     let info = DisplayInfo {
         display_id: 0,
         state: DisplayState::Connected,
         geometry: Geometry {
-            width: state.fb.width,
-            height: state.fb.height,
-            pitch: state.fb.pitch,
-            bpp: state.fb.bpp,
+            width: fb.width,
+            height: fb.height,
+            pitch: fb.pitch,
+            bpp: fb.bpp,
         },
         backing_scale: 100,
         refresh_hz: 60, // Limine doesn't expose refresh; assume 60 Hz.
@@ -226,12 +259,12 @@ fn handle_frame_ready(state: &mut DriverState, msg: &VerifiedMessage) {
         return;
     }
 
-    let scanout = match state.scanout {
-        Some(s) => s,
-        None => {
-            sys::print(b"[SCANOUT-LIMINE] FrameReady but no scanout channel; dropping\r\n");
-            return;
-        }
+    // A frame for a display that was never announced (no framebuffer,
+    // or its channel could not be created). A compositor that followed
+    // the protocol is headless and sends none.
+    let (Some(fb), Some(scanout)) = (state.fb, state.scanout) else {
+        sys::print(b"[SCANOUT-LIMINE] FrameReady with no display announced; dropping\r\n");
+        return;
     };
 
     let Some((display_id, seq, _damage_count)) = decode_frame_ready_header(msg.payload()) else {
@@ -253,7 +286,7 @@ fn handle_frame_ready(state: &mut DriverState, msg: &VerifiedMessage) {
     //   returned by sys::channel_create with role=Consumer. Valid for
     //   `scanout.size_bytes` bytes (pitch × height) of read access until
     //   the channel is closed (which we never do in this loop).
-    // - state.fb.vaddr is the driver's framebuffer mapping, returned by
+    // - fb.vaddr is the driver's framebuffer mapping, returned by
     //   sys::map_framebuffer. Valid for `pitch × height` bytes of write
     //   access (write-combining) for the kernel's lifetime.
     // - Both regions are exactly `scanout.size_bytes` bytes (we sized
@@ -265,7 +298,7 @@ fn handle_frame_ready(state: &mut DriverState, msg: &VerifiedMessage) {
     unsafe {
         core::ptr::copy_nonoverlapping(
             scanout.vaddr as *const u8,
-            state.fb.vaddr as *mut u8,
+            fb.vaddr as *mut u8,
             scanout.size_bytes,
         );
     }

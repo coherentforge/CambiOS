@@ -1050,9 +1050,16 @@ run: iso disk-img
 # still "passed"). Every `--require REGEX` must match a serial line
 # before the run counts as success; the runner keeps reading after the
 # banner until they all do, or the timeout. Default: the wave settled
-# with nothing failed. CI adds the enforcement counters via
-# EXTRA_REQUIRES (see .github/workflows/boot-smoke.yml).
-RUN_QUIET_REQUIRES ?= --require 'boot wave settled: [0-9]+ ready, 0 spawn-failed, 0 dep-failed'
+# with nothing failed, and the compositor bound a display. The second
+# one is there because a machine with no display now boots to the
+# shell with a headless compositor (ADR-014 § Fallback rules) — right
+# for the machine, but this recipe attaches `-vga virtio`, so a boot
+# that finds no display here is a regression (the 2026-10-31
+# "every driver reports no device" shape) and must not pass. CI adds
+# the enforcement counters via EXTRA_REQUIRES (see
+# .github/workflows/boot-smoke.yml).
+RUN_QUIET_REQUIRES ?= --require 'boot wave settled: [0-9]+ ready, 0 spawn-failed, 0 dep-failed' \
+	--require 'COMPOSITOR\] display connected: [0-9]+x[0-9]+'
 EXTRA_REQUIRES ?=
 
 run-quiet: iso disk-img
@@ -1692,10 +1699,12 @@ img-aarch64: kernel-aarch64 init-aarch64 manifest-aarch64 fs-service-aarch64 key
 	mcopy -i $(IMG_AARCH64) limine-aarch64.conf ::/boot/limine/limine.conf
 	@echo "=== $(IMG_AARCH64) ready ==="
 
-# Serial-only run (no virtio-gpu device attached). Matches the pre-GUI
-# aarch64 flow; the kernel + shell still boot, just with no scanout
-# device for the compositor to bind to — compositor's handshake blocks
-# indefinitely, which is expected in this mode.
+# Serial-only run (no virtio-gpu device attached). The scanout driver
+# finds no device and serves with zero displays; the compositor pairs
+# with it and runs headless (ADR-014 § Fallback rules); the boot wave
+# settles and the shell comes up on the serial console. This is the
+# no-display machine, kept deliberately — `run-aarch64-gui` attaches
+# the GPU.
 run-aarch64: img-aarch64
 	qemu-system-aarch64 \
 		-machine virt,gic-version=3 \

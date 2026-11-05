@@ -34,6 +34,17 @@
 //! syscall. Both are nontrivial; the two-copy path lets 4.b ship
 //! without that design work.
 //!
+//! # No device
+//!
+//! A machine without a virtio-gpu (or with one this driver cannot
+//! initialise) is not a failure of this service. The driver registers
+//! its endpoint and pairs with the compositor all the same, as a
+//! driver with zero displays: it answers `RegisterCompositor` with
+//! `WelcomeCompositor` and announces nothing, and the compositor runs
+//! headless (ADR-014 § Fallback rules). Exiting or going silent
+//! instead would take the shell down with the display, since init
+//! and the compositor would both be left waiting.
+//!
 //! # Deliberately NOT in 4.b
 //!
 //! - Damage-rect-aware partial transfer (compositor still sends
@@ -119,6 +130,15 @@ struct CompositorBinding {
     principal: [u8; 32],
     /// Compositor's reply endpoint (where we send async events).
     reply_endpoint: u32,
+    /// The display announced to this compositor. `None` when there is
+    /// no device, or its scanout could not be set up: the pairing
+    /// stands, with zero displays.
+    display: Option<DisplayBinding>,
+}
+
+/// One announced display: the host resource's backing store and the
+/// scanout channel shared with the compositor.
+struct DisplayBinding {
     /// Backing store for the virtio-gpu resource — DMA-contiguous,
     /// physically addressable by the device, mapped into this
     /// process's address space.
@@ -145,17 +165,12 @@ cambios_libsys_rt::service_main! {
 fn run() -> ! {
     sys::print(b"[SCANOUT-VGPU] starting (Phase Scanout-4.b)\r\n");
 
-    let mut setup = match initialize_device() {
-        Some(s) => s,
-        None => {
-            sys::print(b"[SCANOUT-VGPU] device init failed; entering passive idle\r\n");
-            // Register the endpoint anyway so the compositor's
-            // handshake timeout (not our own) governs the behavior.
-            let _ = sys::register_endpoint(SCANOUT_DRIVER_ENDPOINT);
-            cambios_libsys_rt::ready();
-            idle_loop();
-        }
-    };
+    // No usable device means zero displays, not a dead driver: the
+    // control loop below runs either way (see the module docs).
+    let mut setup = initialize_device();
+    if setup.is_none() {
+        sys::print(b"[SCANOUT-VGPU] no usable device; serving with zero displays\r\n");
+    }
 
     // Register our endpoint. Ping init ready so the compositor (which
     // depends on us in the manifest) is spawned and sends
@@ -338,7 +353,7 @@ fn pick_first_enabled_scanout(info: &[u8]) -> Option<(u32, u32)> {
 // ============================================================================
 
 fn handle_message(
-    setup: &mut Setup,
+    setup: &mut Option<Setup>,
     binding: &mut Option<CompositorBinding>,
     msg: &VerifiedMessage,
 ) {
@@ -360,7 +375,7 @@ fn handle_message(
 }
 
 fn handle_register_compositor(
-    setup: &mut Setup,
+    setup: &mut Option<Setup>,
     binding: &mut Option<CompositorBinding>,
     msg: &VerifiedMessage,
 ) {
@@ -390,6 +405,35 @@ fn handle_register_compositor(
         }
     }
 
+    // Pairing first. The compositor blocks for this and nothing else:
+    // it runs headless until a DisplayConnected arrives (ADR-014
+    // § Fallback rules). So whatever happens below — no device, a DMA
+    // allocation that fails, a command the device rejects — it keeps
+    // serving clients and the boot wave keeps moving.
+    let mut reply = [0u8; 16];
+    if let Some(n) = encode_welcome_compositor(&mut reply, 0) {
+        sys::write(reply_endpoint, &reply[..n]);
+    }
+
+    let display = match setup.as_mut() {
+        Some(setup) => connect_display(setup, &principal, reply_endpoint),
+        None => None,
+    };
+    if display.is_none() {
+        sys::print(b"[SCANOUT-VGPU] compositor paired; no display to announce\r\n");
+    }
+    *binding = Some(CompositorBinding { principal, reply_endpoint, display });
+}
+
+/// Bring up scanout 0 for the compositor `principal` and announce it:
+/// DMA backing, the host resource bound to the scanout, the shared
+/// channel, then `DisplayConnected`. `None` if any step fails; the
+/// failed step has been logged and nothing was announced.
+fn connect_display(
+    setup: &mut Setup,
+    principal: &[u8; 32],
+    reply_endpoint: u32,
+) -> Option<DisplayBinding> {
     // Compute scanout size. XRGB8888 = 4 bytes per pixel, pitch = width * 4.
     let pitch: u32 = setup.width * 4;
     let frame_bytes = (pitch as usize) * (setup.height as usize);
@@ -400,7 +444,7 @@ fn handle_register_compositor(
         Some(b) => b,
         None => {
             sys::print(b"[SCANOUT-VGPU] backing DMA alloc failed\r\n");
-            return;
+            return None;
         }
     };
     print_kv(b"[SCANOUT-VGPU] backing pages=", pages as u64);
@@ -414,7 +458,7 @@ fn handle_register_compositor(
         &setup.cmd_buf, cmd_len, &setup.resp_buf)
     {
         print_gpu_err(b"RESOURCE_CREATE_2D", e);
-        return;
+        return None;
     }
 
     // 3. RESOURCE_ATTACH_BACKING.
@@ -426,7 +470,7 @@ fn handle_register_compositor(
         &setup.cmd_buf, cmd_len, &setup.resp_buf)
     {
         print_gpu_err(b"RESOURCE_ATTACH_BACKING", e);
-        return;
+        return None;
     }
 
     // 4. SET_SCANOUT — bind the resource to scanout 0.
@@ -438,36 +482,22 @@ fn handle_register_compositor(
         &setup.cmd_buf, cmd_len, &setup.resp_buf)
     {
         print_gpu_err(b"SET_SCANOUT", e);
-        return;
+        return None;
     }
     sys::print(b"[SCANOUT-VGPU] virtio-gpu resource bound to scanout 0\r\n");
 
     // 5. Create the shared-memory channel. role = 1 = Consumer
     // (driver reads, compositor writes) — matches scanout-limine.
     let mut channel_vaddr: u64 = 0;
-    let rc = sys::channel_create(pages, &principal, 1, &mut channel_vaddr);
+    let rc = sys::channel_create(pages, principal, 1, &mut channel_vaddr);
     if rc < 0 {
         print_int(b"[SCANOUT-VGPU] channel_create rc=", rc);
-        return;
+        return None;
     }
     let channel_id = rc as u64;
-
-    *binding = Some(CompositorBinding {
-        principal,
-        reply_endpoint,
-        backing,
-        channel_id,
-        channel_vaddr,
-        frame_bytes,
-    });
     print_hex(b"[SCANOUT-VGPU] scanout channel id=", channel_id);
 
-    // 6. Send WelcomeCompositor + DisplayConnected.
-    let mut reply = [0u8; 16];
-    if let Some(n) = encode_welcome_compositor(&mut reply, 0) {
-        sys::write(reply_endpoint, &reply[..n]);
-    }
-
+    // 6. Announce the display.
     let info = DisplayInfo {
         display_id: 0,
         state: DisplayState::Connected,
@@ -484,14 +514,20 @@ fn handle_register_compositor(
         edid_hash: [0; 32],
     };
     let mut reply = [0u8; 128];
-    if let Some(n) = encode_display_connected(&mut reply, &info, channel_id) {
-        sys::write(reply_endpoint, &reply[..n]);
-        sys::print(b"[SCANOUT-VGPU] DisplayConnected sent\r\n");
-    }
+    let n = encode_display_connected(&mut reply, &info, channel_id)?;
+    sys::write(reply_endpoint, &reply[..n]);
+    sys::print(b"[SCANOUT-VGPU] DisplayConnected sent\r\n");
+
+    Some(DisplayBinding {
+        backing,
+        channel_id,
+        channel_vaddr,
+        frame_bytes,
+    })
 }
 
 fn handle_frame_ready(
-    setup: &mut Setup,
+    setup: &mut Option<Setup>,
     binding: &mut Option<CompositorBinding>,
     msg: &VerifiedMessage,
 ) {
@@ -506,6 +542,12 @@ fn handle_frame_ready(
         sys::print(b"[SCANOUT-VGPU] FrameReady from wrong sender; dropping\r\n");
         return;
     }
+    // A frame for a display that was never announced. A compositor
+    // that followed the protocol is headless and sends none.
+    let (Some(setup), Some(d)) = (setup.as_mut(), b.display.as_ref()) else {
+        sys::print(b"[SCANOUT-VGPU] FrameReady with no display announced; dropping\r\n");
+        return;
+    };
 
     let Some((display_id, seq, _damage_count)) = decode_frame_ready_header(msg.payload()) else {
         sys::print(b"[SCANOUT-VGPU] malformed FrameReady; dropping\r\n");
@@ -527,9 +569,9 @@ fn handle_frame_ready(
     #[allow(unsafe_code)]
     unsafe {
         core::ptr::copy_nonoverlapping(
-            b.channel_vaddr as *const u8,
-            b.backing.vaddr as *mut u8,
-            b.frame_bytes,
+            d.channel_vaddr as *const u8,
+            d.backing.vaddr as *mut u8,
+            d.frame_bytes,
         );
     }
 
@@ -608,16 +650,17 @@ fn bar_phys_size(device_index: u32, bar_index: u8) -> Option<(u64, u64)> {
     Some((addr, size as u64))
 }
 
-/// No-device / no-endpoint fallback: stay alive without consuming a CPU.
+/// No-endpoint fallback: the scanout endpoint could not be registered,
+/// so there is nothing to serve and no way to be reached. Stay alive.
 ///
-/// Blocks on the scanout endpoint and discards whatever arrives (the
-/// compositor's RegisterCompositor; its handshake timeout governs). A
-/// `yield_now` spin here kept a task Ready at all times, which starved
-/// the kernel's idle task — the boot context still scanning PCI on a
-/// slow machine — and the whole boot wave with it (boot-smoke CI,
-/// 2026-10-31). If the endpoint could not be registered, `recv_msg`
-/// fails immediately; only then fall back to yielding so the service
-/// stays observably up without a tight syscall loop.
+/// (A missing device does not come here — that is the ordinary
+/// control loop with zero displays.) `recv_msg` on an endpoint this
+/// process does not hold fails immediately, hence the yield. A bare
+/// `yield_now` spin as the *no-device* path once kept a task Ready at
+/// all times, which starved the kernel's idle task — the boot context
+/// still scanning PCI on a slow machine — and the whole boot wave
+/// with it (boot-smoke CI, 2026-10-31); the boot hand-off gate now
+/// holds the CPU for the boot context regardless.
 fn idle_loop() -> ! {
     let mut buf = [0u8; RECV_BUF_SIZE];
     loop {

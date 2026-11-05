@@ -11,8 +11,9 @@
 //!   abstraction over whichever scanout-driver is bound.
 //! - `ScanoutBuffer` — process-local handle to a mapped scanout region
 //!   (carries the compositor's vaddr; not on the wire).
-//! - `HeadlessBackend` — the no-display fallback used when no
-//!   scanout-driver registers within the handshake timeout.
+//! - `HeadlessBackend` — the no-display state: what the compositor
+//!   runs on before a display connects, and for good when none ever
+//!   does (no driver paired, or a driver with nothing to drive).
 //!
 //! Per ADR-014, future implementors (`VirtioGpuBackend`, `IntelGpuBackend`,
 //! `LimineFbBackend`) live alongside but each is a thin IPC client over
@@ -114,10 +115,13 @@ pub trait ScanoutBackend {
 // HeadlessBackend — the no-display fallback
 // ============================================================================
 
-/// The fallback backend when no scanout-driver registers within
-/// `SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS`. Compositor remains alive,
-/// silently swallows all display operations. Useful for headless
-/// servers, CI, and pre-driver bring-up.
+/// The backend the compositor starts on, and stays on while no display
+/// is connected: no driver paired, a driver with no device, or a
+/// display that has not been announced yet. Compositor remains alive,
+/// accepts clients, and swallows all display operations. It leaves
+/// this state when the paired driver sends `DisplayConnected` — at
+/// boot or any time after (ADR-014 § Fallback rules: "same
+/// `DisplayConnected` flow as a hotplug").
 pub struct HeadlessBackend;
 
 impl HeadlessBackend {
@@ -143,8 +147,11 @@ impl ScanoutBackend for HeadlessBackend {
         Err(ScanoutError::Headless)
     }
 
-    fn handle_scanout_payload(&mut self, _payload: &[u8]) -> Option<ScanoutEvent> {
-        None
+    fn handle_scanout_payload(&mut self, payload: &[u8]) -> Option<ScanoutEvent> {
+        // The one driver message that means something with no display
+        // bound: a display arriving. The compositor binds it and
+        // replaces this backend. Anything else is noise here.
+        decode_display_connected_event(payload)
     }
 
     fn request_mode(&mut self, _display_id: u32, _mode: Mode) -> Result<(), ScanoutError> {
@@ -152,23 +159,32 @@ impl ScanoutBackend for HeadlessBackend {
     }
 }
 
+/// Decode a `DisplayConnected` payload into the compositor-side event.
+/// Shared by every backend: a display can arrive while Headless (the
+/// first one) or while one is already bound. `None` for any other tag
+/// or a malformed payload.
+fn decode_display_connected_event(payload: &[u8]) -> Option<ScanoutEvent> {
+    let (info, scanout_channel_id) = decode_display_connected(payload)?;
+    Some(ScanoutEvent::DisplayConnected { info, scanout_channel_id })
+}
+
 // ============================================================================
 // LimineFbBackend — Phase Scanout-2 fallback (talks to user/scanout-limine)
 // ============================================================================
 
 use cambios_libscanout::{
-    decode_frame_displayed, encode_frame_ready,
+    decode_display_connected, decode_frame_displayed, encode_frame_ready,
 };
 use cambios_libsys as sys;
 
 /// IPC client for `user/scanout-limine`.
 ///
-/// Holds the displays advertised at handshake time and the scanout buffer
-/// the compositor writes pixels into. `submit_frame` encodes a
-/// `FrameReady` and sends it to `SCANOUT_DRIVER_ENDPOINT`; `poll_event`
-/// non-blocking-recvs from `COMPOSITOR_ENDPOINT` and decodes any
-/// driver-side events (today: `FrameDisplayed` only — full hotplug
-/// path lands once dynamic display add/remove is exercised).
+/// Holds the display the driver announced and the scanout buffer the
+/// compositor writes pixels into. `submit_frame` encodes a
+/// `FrameReady` and sends it to `SCANOUT_DRIVER_ENDPOINT`;
+/// `handle_scanout_payload` decodes the driver-side events the
+/// compositor's dispatch loop hands down (`FrameDisplayed`, and
+/// `DisplayConnected` for a further display).
 pub struct LimineFbBackend {
     /// The single scanout buffer this backend owns. Limine fallback is
     /// single-display by construction; multi-display lands with
@@ -183,10 +199,9 @@ pub struct LimineFbBackend {
 }
 
 impl LimineFbBackend {
-    /// Build from the handshake reply: the `DisplayConnected`
-    /// `DisplayInfo` and the channel ID, which the compositor has
-    /// already attached (`SYS_CHANNEL_ATTACH`) to obtain the scanout
-    /// vaddr.
+    /// Build from a `DisplayConnected` event: its `DisplayInfo` and
+    /// the scanout channel, which the compositor has already attached
+    /// (`SYS_CHANNEL_ATTACH`) to obtain the scanout vaddr.
     pub fn from_handshake(info: DisplayInfo, scanout: ScanoutBuffer) -> Self {
         Self {
             scanout,
@@ -248,9 +263,12 @@ impl ScanoutBackend for LimineFbBackend {
                 self.last_present_time = present_time;
                 Some(ScanoutEvent::FrameDisplayed { display_id, seq, present_time_ticks: present_time })
             }
-            // Other event types (DisplayConnected/Disconnected/etc.)
-            // not handled in v0 — single-display, no hotplug. Drop
-            // silently rather than fail loudly.
+            // Surfaced so the compositor can say what it did with it;
+            // it composes one scanout today and ignores a second.
+            MsgTag::DisplayConnected => decode_display_connected_event(payload),
+            // DisplayDisconnected / DisplayModeChanged / FrameDropped:
+            // no driver sends them yet. Drop silently rather than
+            // fail loudly.
             _ => None,
         }
     }

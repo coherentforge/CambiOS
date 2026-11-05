@@ -299,8 +299,8 @@ CAMBIOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
 
 # QEMU
 make run                         # x86_64 (ISO, rebuilds kernel + modules)
-make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default: the `CambiOS Shell v0.1` banner) AND every `--require REGEX` matched, 1 = panic/exception, 2 = hang or a required line missing. Default require: `boot wave settled: N ready, 0 spawn-failed, 0 dep-failed` (RUN_QUIET_REQUIRES); CI adds the policy counters via EXTRA_REQUIRES="--require '…'". Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
-make run-aarch64                 # AArch64 (FAT image)
+make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default: the `CambiOS Shell v0.1` banner) AND every `--require REGEX` matched, 1 = panic/exception, 2 = hang or a required line missing. Default requires (RUN_QUIET_REQUIRES): `boot wave settled: N ready, 0 spawn-failed, 0 dep-failed` and `[COMPOSITOR] display connected: WxH` (this recipe attaches a GPU; a boot with no display reaches the shell headless, so the display is required where it is known to exist); CI adds the policy counters via EXTRA_REQUIRES="--require '…'". Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
+make run-aarch64                 # AArch64 (FAT image); serial-only, no GPU: the compositor runs headless (run-aarch64-gui attaches one)
 make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only
 make img-aarch64                 # AArch64 FAT image only

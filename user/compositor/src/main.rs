@@ -8,11 +8,14 @@
 //! - Registers `COMPOSITOR_ENDPOINT = 28` — single endpoint shared by
 //!   the scanout-driver (tag prefix 0x20xx) and clients (tag prefix
 //!   0x30xx). Incoming messages are dispatched by tag high nibble.
-//! - Performs the protocol handshake with the active scanout-driver:
+//! - Pairs with the active scanout-driver before reporting ready:
 //!   sends `RegisterCompositor` to `SCANOUT_DRIVER_ENDPOINT`, awaits
-//!   `WelcomeCompositor` + `DisplayConnected`, attaches to the scanout
-//!   channel, builds a `LimineFbBackend` (or falls back to
-//!   `HeadlessBackend`).
+//!   `WelcomeCompositor`, and pins the Principal that answered.
+//! - Starts on `HeadlessBackend`. A display is an event, at boot or
+//!   later (ADR-014 § Fallback rules): when the paired driver sends
+//!   `DisplayConnected`, the dispatch loop attaches the scanout
+//!   channel and switches to `LimineFbBackend`. A driver with no
+//!   display sends none, and the compositor stays headless.
 //! - Paints a single throwaway "first-pixels" test frame: fills the
 //!   scanout buffer with a known color, submits a `FrameReady`,
 //!   awaits the `FrameDisplayed` ack. End-to-end validation of the
@@ -53,14 +56,14 @@ use cambios_libgui_proto::{
 use cambios_libinput_proto::{button, decode_event, DeviceClass, EventType};
 use cambios_libsys as sys;
 use cambios_libscanout::{
-    decode_display_connected, encode_register_compositor, MsgTag,
-    COMPOSITOR_ENDPOINT, SCANOUT_DRIVER_ENDPOINT,
+    encode_register_compositor, MsgTag, COMPOSITOR_ENDPOINT, SCANOUT_DRIVER_ENDPOINT,
 };
 
 mod scanout;
 mod windows;
 use scanout::{
-    Backend, HeadlessBackend, LimineFbBackend, ScanoutBackend, ScanoutBuffer, ScanoutEvent,
+    Backend, DisplayInfo, HeadlessBackend, LimineFbBackend, ScanoutBackend, ScanoutBuffer,
+    ScanoutEvent,
 };
 use windows::{commit_window_resize, handle_client_payload, ResizeEdge, Window, WindowTable, WindowView};
 
@@ -124,25 +127,28 @@ fn run() -> ! {
         }
     };
 
-    // Readiness ordering: do the scanout handshake BEFORE calling
-    // `ready()`. Later spawns include hello-window
-    // (Scanout-3), which immediately sends `CreateWindow` to ep28 —
-    // if it arrives while we're blocked in `recv_verified` for
-    // `WelcomeCompositor`, the handshake reads the client message
-    // instead of the scanout-driver's reply and fails with
-    // "expected WelcomeCompositor, got other tag". Serialising the
-    // gate resolves the race; shell is a leaf that doesn't touch the
-    // compositor so the ~1 handshake RTT delay is harmless.
-    let mut backend = match handshake_with_scanout_driver(cluster_id) {
-        Some(b) => {
-            sys::print(b"[COMPOSITOR] backend bound: scanout-limine\r\n");
-            b
-        }
-        None => {
-            sys::print(b"[COMPOSITOR] handshake failed; falling back to headless\r\n");
-            Backend::Headless(HeadlessBackend::new())
-        }
-    };
+    // Readiness ordering: pair with the scanout-driver BEFORE calling
+    // `ready()`. Two reasons. Clients are spawned only after our ready
+    // ping and send `CreateWindow` to ep28 at once; a client message
+    // arriving while we are blocked in `recv_verified` for
+    // `WelcomeCompositor` would be read as the driver's reply and fail
+    // the pairing. And the Principal that answers here is the one we
+    // trust for every later driver-direction message (see
+    // `pump_dispatch_once`): before our ready ping the only processes
+    // alive are the boot-wave services ahead of us in the manifest.
+    //
+    // Only the pairing is synchronous. Displays are events: we start
+    // headless and bind one when the driver announces it, which a
+    // driver with nothing to drive never does (ADR-014 § Fallback
+    // rules). Blocking here for a `DisplayConnected` is what used to
+    // stall the whole boot wave on a machine with no display.
+    let driver = pair_with_scanout_driver(cluster_id);
+    if driver.is_some() {
+        sys::print(b"[COMPOSITOR] paired with scanout-driver; headless until a display connects\r\n");
+    } else {
+        sys::print(b"[COMPOSITOR] no scanout-driver paired; headless\r\n");
+    }
+    let mut backend = Backend::Headless(HeadlessBackend::new());
 
     // Note: the throwaway first-pixels cyan test that originally lived
     // here has been retired. terminal-window now claims the full
@@ -206,8 +212,21 @@ fn run() -> ! {
         // even at the v1 endgame ~30-window target.
         let _ = window_table.reap_dead_channels();
 
-        let outcome = pump_dispatch_once(&mut backend, &mut window_table);
+        let outcome = pump_dispatch_once(&mut backend, &mut window_table, driver.as_ref());
         let mut needs_composite = matches!(outcome, DispatchOutcome::ClientFrame(_));
+        // A display arriving — the boot-time one or a later one — is
+        // the same event (ADR-014: "one event-handling code path for
+        // all of them").
+        if let DispatchOutcome::ScanoutEvent(ScanoutEvent::DisplayConnected {
+            info,
+            scanout_channel_id,
+        }) = outcome
+        {
+            if bind_display(&mut backend, info, scanout_channel_id) {
+                // Windows created while headless have never been shown.
+                needs_composite = window_table.iter().next().is_some();
+            }
+        }
         if needs_composite {
             // Z-stack composition: any window's FrameReady triggers a
             // full back-to-front recomposition because a higher-layer
@@ -715,9 +734,16 @@ enum DispatchOutcome {
 
 /// Core dispatch tick: try to pull one message from `COMPOSITOR_ENDPOINT`
 /// and route it by tag direction. Non-blocking.
+///
+/// `driver` is the Principal that answered the pairing handshake.
+/// Driver-direction messages (tag 0x2xxx) are honoured only from it:
+/// ep28 is also where every client sends, and a `DisplayConnected`
+/// from anyone else would have the compositor attach a channel of the
+/// sender's choosing and compose every window into it.
 fn pump_dispatch_once<B: ScanoutBackend>(
     backend: &mut B,
     window_table: &mut WindowTable,
+    driver: Option<&[u8; 32]>,
 ) -> DispatchOutcome {
     let mut buf = [0u8; DISPATCH_BUFFER_BYTES];
     let n = sys::try_recv_msg(COMPOSITOR_ENDPOINT, &mut buf);
@@ -743,10 +769,27 @@ fn pump_dispatch_once<B: ScanoutBackend>(
     // High nibble of the tag. Symmetric with libscanout's 0x10xx/0x20xx
     // and libgui-proto's 0x30xx/0x40xx.
     match tag_raw >> 12 {
-        0x2 => match backend.handle_scanout_payload(payload) {
-            Some(evt) => DispatchOutcome::ScanoutEvent(evt),
-            None => DispatchOutcome::Idle,
-        },
+        0x2 => {
+            if driver != Some(&sender_principal) {
+                // Not the paired driver (or nothing paired). Say so a
+                // few times, then stay quiet: a hostile sender must
+                // not be able to flood the console.
+                static FORGED_LOG_BUDGET: AtomicU8 = AtomicU8::new(3);
+                let logged = FORGED_LOG_BUDGET.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| if v > 0 { Some(v - 1) } else { None },
+                );
+                if logged.is_ok() {
+                    sys::print(b"[COMPOSITOR] scanout-direction message from a sender that is not the paired driver; dropped\r\n");
+                }
+                return DispatchOutcome::Idle;
+            }
+            match backend.handle_scanout_payload(payload) {
+                Some(evt) => DispatchOutcome::ScanoutEvent(evt),
+                None => DispatchOutcome::Idle,
+            }
+        }
         0x3 => match handle_client_payload(payload, &sender_principal, from_endpoint, window_table) {
             Some(view) => DispatchOutcome::ClientFrame(view),
             None => DispatchOutcome::Idle,
@@ -770,8 +813,8 @@ fn pump_dispatch_once<B: ScanoutBackend>(
 ///   and scanout). Format-mismatch swizzling lands once virtio-gpu /
 ///   Intel backends advertise alternate formats.
 ///
-/// Only meaningful against a `Backend::Limine` backend today; headless
-/// has no scanout buffer to blit to.
+/// A no-op while headless: there is no scanout buffer to blit to. The
+/// windows keep their state and are shown when a display binds.
 fn composite_and_present(
     backend: &mut Backend,
     window_table: &WindowTable,
@@ -1276,7 +1319,14 @@ fn register_rendering_limb_cluster() -> Option<u64> {
     Some(cluster_id)
 }
 
-fn handshake_with_scanout_driver(cluster_id: u64) -> Option<Backend> {
+/// Pair with the scanout-driver (ADR-014 § Connection topology:
+/// "pairing is at startup ... from then on the pair is fixed for the
+/// boot"). Returns the kernel-stamped Principal of the process that
+/// answered, or `None` if nothing usable did.
+///
+/// Says nothing about displays. A driver with a display follows the
+/// welcome with `DisplayConnected`; a driver without one does not.
+fn pair_with_scanout_driver(cluster_id: u64) -> Option<[u8; 32]> {
     // 1. Send RegisterCompositor (with cluster_id) to the driver's
     //    endpoint. The driver decodes the cluster_id and calls
     //    SYS_CLUSTER_JOIN itself — the cap-token-passing role of the
@@ -1293,11 +1343,18 @@ fn handshake_with_scanout_driver(cluster_id: u64) -> Option<Backend> {
     }
     sys::print(b"[COMPOSITOR] sent RegisterCompositor\r\n");
 
-    // 2. Block-recv WelcomeCompositor. Boot-gate ordering guarantees
-    //    the driver registered SCANOUT_DRIVER_ENDPOINT before we sent,
-    //    so blocking is fine. Future runtime hotplug will need a
-    //    timed handshake (SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS) —
-    //    out of scope for v0.
+    // 2. Block-recv WelcomeCompositor. The manifest orders us after
+    //    whoever owns SCANOUT_DRIVER_ENDPOINT, so a driver process has
+    //    reported ready before we sent, and every driver answers this
+    //    whether or not it has a display.
+    //
+    // Deferred: ADR-014's handshake timeout
+    //      (SCANOUT_DRIVER_HANDSHAKE_TIMEOUT_TICKS). A driver that is
+    //      up but never answers still blocks us here, and the boot
+    //      wave behind us.
+    // Why: there is no timed receive to build it on.
+    // Revisit when: the endpoint-set wait syscall lands (it carries
+    //      the timeout).
     let mut welcome_buf = [0u8; 320];
     let welcome = sys::recv_verified(COMPOSITOR_ENDPOINT, &mut welcome_buf)?;
     if !is_tagged(welcome.payload(), MsgTag::WelcomeCompositor) {
@@ -1305,20 +1362,31 @@ fn handshake_with_scanout_driver(cluster_id: u64) -> Option<Backend> {
         return None;
     }
     sys::print(b"[COMPOSITOR] received WelcomeCompositor\r\n");
+    Some(*welcome.sender().as_bytes())
+}
 
-    // 3. Block-recv DisplayConnected (driver sends it immediately
-    //    after Welcome in the v0 protocol).
-    let mut display_buf = [0u8; 320];
-    let display_msg = sys::recv_verified(COMPOSITOR_ENDPOINT, &mut display_buf)?;
-    let (info, channel_id) = decode_display_connected(display_msg.payload())?;
-    sys::print(b"[COMPOSITOR] received DisplayConnected\r\n");
+/// Bind a display the paired driver announced: attach its scanout
+/// channel and leave headless. Returns `true` if the backend changed.
+///
+/// The caller has already established that the message came from the
+/// paired driver (`pump_dispatch_once`).
+fn bind_display(backend: &mut Backend, info: DisplayInfo, channel_id: u64) -> bool {
+    if matches!(backend, Backend::Limine(_)) {
+        // Deferred: a second display, or a re-announce of the first.
+        // Why: the compositor composes one scanout today; no driver
+        //      announces more than one.
+        // Revisit when: a scanout-driver announces a second display
+        //      (ADR-014 Scanout-4.c, multi-display + hotplug).
+        sys::print(b"[COMPOSITOR] DisplayConnected while a display is bound; ignored\r\n");
+        return false;
+    }
 
-    // 4. Attach to the scanout channel. Driver created it with role =
-    //    Consumer (creator reads); compositor as peer gets RW.
+    // Driver created the channel with role = Consumer (creator
+    // reads); compositor as peer gets RW.
     let vaddr_or_err = sys::channel_attach(channel_id);
     if vaddr_or_err < 0 {
-        sys::print(b"[COMPOSITOR] channel_attach failed\r\n");
-        return None;
+        sys::print(b"[COMPOSITOR] channel_attach failed; staying headless\r\n");
+        return false;
     }
     let vaddr = vaddr_or_err as u64;
 
@@ -1329,8 +1397,43 @@ fn handshake_with_scanout_driver(cluster_id: u64) -> Option<Backend> {
         vaddr,
         channel_id,
     };
+    *backend = Backend::Limine(LimineFbBackend::from_handshake(info, scanout));
 
-    Some(Backend::Limine(LimineFbBackend::from_handshake(info, scanout)))
+    // One print call. `make run-quiet` requires this line, and
+    // separate prints interleave with other services' output when
+    // two CPUs are printing. Longest form is 70 bytes.
+    let mut line = [0u8; 80];
+    let mut n = append(&mut line, 0, b"[COMPOSITOR] display connected: ");
+    n = append_u32_dec(&mut line, n, info.geometry.width);
+    n = append(&mut line, n, b"x");
+    n = append_u32_dec(&mut line, n, info.geometry.height);
+    n = append(&mut line, n, b"; scanout bound\r\n");
+    sys::print(&line[..n]);
+    true
+}
+
+/// Append `bytes` to `buf` starting at `at`, truncating at the end of
+/// `buf`. Returns the new length.
+fn append(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
+    let take = bytes.len().min(buf.len().saturating_sub(at));
+    buf[at..at + take].copy_from_slice(&bytes[..take]);
+    at + take
+}
+
+/// Append `n` in decimal (no_std, no alloc, no `format!`).
+fn append_u32_dec(buf: &mut [u8], at: usize, mut n: u32) -> usize {
+    // u32::MAX has 10 decimal digits.
+    let mut digits = [0u8; 10];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    append(buf, at, &digits[i..])
 }
 
 fn is_tagged(payload: &[u8], expected: MsgTag) -> bool {
@@ -1355,7 +1458,7 @@ fn is_tagged(payload: &[u8], expected: MsgTag) -> bool {
 /// VNC); the default `-display none` configuration validates the
 /// memcpy + ack but doesn't show pixels.
 #[allow(dead_code)] // diagnostic helper; no boot-path caller after the cyan-test retirement.
-fn run_first_pixels_test(backend: &mut LimineFbBackend) {
+fn run_first_pixels_test(backend: &mut LimineFbBackend, driver: &[u8; 32]) {
     sys::print(b"[COMPOSITOR] painting test frame (cyan)\r\n");
 
     let scanout = backend.scanout;
@@ -1404,7 +1507,7 @@ fn run_first_pixels_test(backend: &mut LimineFbBackend) {
     let mut scratch_table = WindowTable::new();
     for _ in 0..1000 {
         if let DispatchOutcome::ScanoutEvent(ScanoutEvent::FrameDisplayed { .. }) =
-            pump_dispatch_once(backend, &mut scratch_table)
+            pump_dispatch_once(backend, &mut scratch_table, Some(driver))
         {
             sys::print(b"[COMPOSITOR] FrameDisplayed received -- first-pixels test PASSED\r\n");
             return;

@@ -129,7 +129,7 @@ src/syscalls/userspace.rs:228:TODO
 src/syscalls/userspace.rs:249:TODO
 tools/check-lockfile-additions.py:19:for-now
 tools/check-unsafe-coverage.py:82:for-now
-user/compositor/src/main.rs:514:for-now
+user/compositor/src/main.rs:533:for-now
 user/key-store-service/src/vault/mod.rs:396:for-now
 user/libgui-proto/src/lib.rs:27:deferred
 user/libgui/src/font.rs:13:placeholder
