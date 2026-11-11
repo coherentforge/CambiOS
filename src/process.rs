@@ -78,12 +78,59 @@ impl Default for VmaTracker {
 
 impl VmaTracker {
     /// Create a new empty VMA tracker.
+    ///
+    /// By-value constructor for host tests and `const` contexts. The
+    /// kernel initializes trackers inside their object-table slot with
+    /// [`Self::init_empty_at`] / [`Self::reset`]; a 6 KiB return value
+    /// is a kernel-stack transient (Convention 4).
     pub const fn new() -> Self {
         VmaTracker {
             entries: [None; MAX_VMAS],
             count: 0,
             next_vaddr: VMA_ALLOC_BASE,
         }
+    }
+
+    /// Initialize an empty tracker in place at `dst`, field by field.
+    /// Equal to [`Self::new`] afterwards; `Option` entries are written
+    /// element-wise (Convention 7: zeroed memory is not `None`).
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `size_of::<VmaTracker>()`
+    /// bytes, properly aligned, and exclusively owned by the caller for
+    /// the duration of the call. After it returns, `*dst` is fully
+    /// initialized.
+    pub unsafe fn init_empty_at(dst: *mut VmaTracker) {
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let entries = unsafe { core::ptr::addr_of_mut!((*dst).entries) } as *mut Option<VmaEntry>;
+        for i in 0..MAX_VMAS {
+            // SAFETY: i < MAX_VMAS keeps the element in bounds.
+            let el = unsafe { entries.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(None) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).next_vaddr) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(VMA_ALLOC_BASE) };
+    }
+
+    /// Return an initialized tracker to the empty state in place, entry
+    /// by entry. Equal to [`Self::new`] afterwards. Used when a process
+    /// slot goes `Live` and when it returns to `Empty`.
+    pub fn reset(&mut self) {
+        for e in self.entries.iter_mut() {
+            *e = None;
+        }
+        self.count = 0;
+        self.next_vaddr = VMA_ALLOC_BASE;
     }
 
     /// Register a pre-determined virtual address region in the tracker.
@@ -256,12 +303,60 @@ impl Default for FdTable {
 
 impl FdTable {
     /// Create an empty FdTable.
+    ///
+    /// By-value constructor for host tests and `const` contexts; the
+    /// kernel uses [`Self::init_empty_at`] / [`Self::reset`] inside the
+    /// object-table slot (Convention 4, as for `VmaTracker::new`).
     pub const fn new() -> Self {
         FdTable {
             entries: [None; MAX_FDS_PER_PROCESS],
             count: 0,
             next_generation: 0,
         }
+    }
+
+    /// Initialize an empty table in place at `dst`, field by field.
+    /// Equal to [`Self::new`] afterwards; `Option` entries are written
+    /// element-wise (Convention 7: zeroed memory is not `None`).
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `size_of::<FdTable>()` bytes,
+    /// properly aligned, and exclusively owned by the caller for the
+    /// duration of the call. After it returns, `*dst` is fully
+    /// initialized.
+    pub unsafe fn init_empty_at(dst: *mut FdTable) {
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the array without forming a reference.
+        let entries = unsafe { core::ptr::addr_of_mut!((*dst).entries) } as *mut Option<OpenFile>;
+        for i in 0..MAX_FDS_PER_PROCESS {
+            // SAFETY: i < MAX_FDS_PER_PROCESS keeps the element in bounds.
+            let el = unsafe { entries.add(i) };
+            // SAFETY: el is a valid, aligned, exclusively owned element.
+            unsafe { el.write(None) };
+        }
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).count) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).next_generation) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+    }
+
+    /// Return an initialized table to the empty state in place, entry
+    /// by entry. Equal to [`Self::new`] afterwards. The fd generation
+    /// counter restarts: it distinguishes opens within one process
+    /// lifetime, and the slot's `ProcessId` generation distinguishes
+    /// lifetimes.
+    pub fn reset(&mut self) {
+        for e in self.entries.iter_mut() {
+            *e = None;
+        }
+        self.count = 0;
+        self.next_generation = 0;
     }
 
     /// Allocate a new fd, returning `(slot_index, generation)` on
@@ -388,23 +483,55 @@ pub const HEAP_SIZE: u64 = 0x400000;
 /// Number of 4 KiB frames in a process heap (4 MiB / 4 KiB = 1024).
 pub const HEAP_PAGES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
 
-/// Errors from `ProcessDescriptor::new` — today, only heap allocation
-/// can fail.
+/// Errors from [`ProcessDescriptor::init_live`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessCreateError {
     /// The frame allocator could not provide a contiguous heap region.
     /// Wraps the underlying frame allocator error for diagnostics.
     HeapAllocFailure(FrameAllocError),
+    /// The slot was not `Empty`. `ProcessTable::create_process` only
+    /// offers free slots, so this names a caller bug, typed rather than
+    /// panicked.
+    SlotOccupied,
+}
+
+/// Whether an object-table slot currently describes a process.
+///
+/// Every slot of the process table holds a `ProcessDescriptor` for the
+/// kernel's lifetime; this field, not an `Option` wrapper, says which
+/// slots are in use. An explicit discriminant is the state machine the
+/// verification rules ask for, it is what `init_empty_at` writes (so an
+/// all-zero slot is never mistaken for a value; Convention 7), and it is
+/// what lets a descriptor be brought up and torn down *in its slot*
+/// instead of travelling through the kernel stack (Convention 4; the
+/// 2026-11-09 spawn-path overflow was a 12 KiB descriptor built by
+/// value on a 32 KiB task stack).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SlotState {
+    /// No process. Every other field holds the canonical empty value
+    /// (`clear` / `init_empty_at`); the heap and page table it may once
+    /// have named are already released.
+    Empty,
+    /// A process. The struct invariants below hold.
+    Live,
 }
 
 /// Process descriptor with VMA tracking. The per-process buddy
-/// allocator no longer lives inline — it's constructed in place at
-/// the start of each process's heap by [`ProcessDescriptor::new`] and
+/// allocator does not live inline — it is constructed in place at the
+/// start of each process's heap by [`ProcessDescriptor::init_live`] and
 /// accessed via [`ProcessDescriptor::allocator_mut`]. See the module
 /// doc and ADR-008 for the rationale.
 ///
+/// Descriptors are slot-resident: the object table holds `num_slots` of
+/// them from boot, each written in place once by [`Self::init_empty_at`],
+/// brought to `Live` through `&mut` by [`Self::init_live`], and returned
+/// to `Empty` in place by [`Self::clear`]. There is no by-value
+/// constructor on the kernel path.
+///
 /// # Invariants (for formal verification)
 ///
+/// - `state == Empty` ⇒ every field equals [`Self::empty_literal`]'s.
+/// - The remaining invariants hold for `state == Live`:
 /// - `cr3 == 0` means the process uses the kernel page table (kernel tasks).
 /// - `cr3 != 0` is a valid physical address of a PML4/L0 page table with
 ///   kernel-half entries (256..511 on x86_64) cloned from the kernel PML4.
@@ -418,12 +545,14 @@ pub enum ProcessCreateError {
 ///   once when the process exits.
 /// - **The first `size_of::<BuddyAllocator>()` bytes of the managed heap
 ///   contain a valid `BuddyAllocator` struct**, constructed in place by
-///   `ProcessDescriptor::new` via `core::ptr::write` and initialized with
-///   `new_with_reserved_prefix` so user allocations never overlap.
+///   `ProcessDescriptor::init_live` via `BuddyAllocator::init_at` with a
+///   reserved prefix so user allocations never overlap it.
 /// - All VMA entries in `vma` reference user-space addresses in the lower
 ///   canonical half (< `USER_SPACE_END`).
 /// - BuddyAllocator offsets are relative to `virt_base`, not absolute.
 pub struct ProcessDescriptor {
+    /// Whether this slot describes a process. See [`SlotState`].
+    pub state: SlotState,
     /// Physical base address of this process's heap (for page tables).
     /// The first `size_of::<BuddyAllocator>()` bytes at this address hold
     /// the process's buddy allocator state.
@@ -455,37 +584,149 @@ pub struct ProcessDescriptor {
 const _: () = assert!(crate::ipc::MAX_ENDPOINTS <= 64);
 
 impl ProcessDescriptor {
-    /// Create a new process descriptor, dynamically allocating its
-    /// heap region from the frame allocator and placing a fresh
-    /// `BuddyAllocator` in the first few KB of that heap.
+    /// Reference field initializer, kept as a compile-time-checked
+    /// exhaustive struct literal so a new field cannot be forgotten by
+    /// [`Self::init_empty_at`] or [`Self::clear`] without this (or
+    /// `clear`'s destructuring) failing to compile. Never called on the
+    /// kernel path: it is a ~12 KiB value.
+    #[allow(dead_code)]
+    const fn empty_literal() -> Self {
+        Self {
+            state: SlotState::Empty,
+            phys_base: 0,
+            virt_base: 0,
+            heap_size: 0,
+            cr3: 0,
+            vma: VmaTracker::new(),
+            fds: FdTable::new(),
+            registered_endpoints: 0,
+        }
+    }
+
+    /// Host-test constructor. Builds through [`Self::init_empty_at`] so
+    /// the in-place initializer is what tests exercise; the kernel must
+    /// not use this (it is a ~12 KiB stack local).
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        let mut slot = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: slot is a valid, aligned, exclusively owned uninit Self.
+        unsafe { Self::init_empty_at(slot.as_mut_ptr()) };
+        // SAFETY: init_empty_at fully initialized every field.
+        unsafe { slot.assume_init() }
+    }
+
+    /// Initialize an `Empty` descriptor in place at `dst`, field by
+    /// field. The only way a descriptor comes into existence on the
+    /// kernel path (`object_table::init` runs it once per slot at boot).
+    /// Equal to [`Self::empty_literal`] afterwards.
     ///
-    /// Heap is not at a deterministic PID-derived physical address —
+    /// # Safety
+    /// `dst` must be valid for writes of `size_of::<ProcessDescriptor>()`
+    /// bytes, properly aligned, and exclusively owned by the caller for
+    /// the duration of the call. After it returns, `*dst` is fully
+    /// initialized.
+    pub unsafe fn init_empty_at(dst: *mut ProcessDescriptor) {
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).state) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(SlotState::Empty) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).phys_base) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).virt_base) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).heap_size) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).cr3) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let vma = unsafe { core::ptr::addr_of_mut!((*dst).vma) };
+        // SAFETY: vma is a valid, aligned, exclusively owned VmaTracker slot.
+        unsafe { VmaTracker::init_empty_at(vma) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let fds = unsafe { core::ptr::addr_of_mut!((*dst).fds) };
+        // SAFETY: fds is a valid, aligned, exclusively owned FdTable slot.
+        unsafe { FdTable::init_empty_at(fds) };
+        // SAFETY: `dst` is valid, aligned and exclusively owned (fn contract);
+        // addr_of_mut! projects the field without forming a reference.
+        let f = unsafe { core::ptr::addr_of_mut!((*dst).registered_endpoints) };
+        // SAFETY: f is a valid, aligned, exclusively owned field slot, written once.
+        unsafe { f.write(0) };
+    }
+
+    /// Return the descriptor to `Empty` in place: every field to its
+    /// [`Self::empty_literal`] value, tables entry by entry. Releases
+    /// nothing; the caller has already reclaimed the heap and handed
+    /// the page-table root to the reaper. The destructuring is the
+    /// exhaustiveness check: a new field fails to compile here.
+    pub fn clear(&mut self) {
+        let Self {
+            state,
+            phys_base,
+            virt_base,
+            heap_size,
+            cr3,
+            vma,
+            fds,
+            registered_endpoints,
+        } = self;
+        *state = SlotState::Empty;
+        *phys_base = 0;
+        *virt_base = 0;
+        *heap_size = 0;
+        *cr3 = 0;
+        vma.reset();
+        fds.reset();
+        *registered_endpoints = 0;
+    }
+
+    /// Bring an `Empty` slot to `Live`: allocate the process heap from
+    /// the frame allocator, place a fresh `BuddyAllocator` at the start
+    /// of that heap, and write every field in place. `cr3` is left at 0
+    /// (kernel page table); `ProcessTable::create_process` sets a
+    /// per-process root afterwards when asked to.
+    ///
+    /// The heap is not at a deterministic PID-derived physical address:
     /// each process gets a fresh contiguous region from the frame
-    /// allocator, which means process exit MUST free it via
+    /// allocator, so process exit MUST free it via
     /// [`ProcessDescriptor::reclaim_heap`] to avoid a leak.
     ///
     /// The per-process `BuddyAllocator` lives in the heap itself at
-    /// `virt_base..virt_base + size_of::<BuddyAllocator>()`,
-    /// constructed via `core::ptr::write` with
-    /// `new_with_reserved_prefix` so user allocations skip the
-    /// allocator's own state. This shrinks `SLOT_OVERHEAD` (the per-
-    /// process object-table cost) from ~22 KB to ~a few hundred bytes
-    /// — see ADR-008 § "Current binding observation" for the effect
-    /// on tier policies.
+    /// `virt_base..virt_base + size_of::<BuddyAllocator>()`, placed with
+    /// a reserved prefix so user allocations skip the allocator's own
+    /// state. This keeps `SLOT_OVERHEAD` (the per-process object-table
+    /// cost) to the descriptor alone — see ADR-008 § "Current binding
+    /// observation" for the effect on tier policies.
     ///
     /// `hhdm_offset`: the higher-half direct map offset from Limine,
     /// so the kernel can access process heap memory via
     /// `virt_base = phys_base + hhdm_offset`.
     ///
-    /// Returns `Err(ProcessCreateError::HeapAllocFailure(_))` if the
-    /// frame allocator cannot provide `HEAP_PAGES` contiguous frames.
-    /// The caller's responsibility is to propagate the error to its
-    /// own caller (usually `ProcessTable::create_process`).
-    pub fn new(
-        _process_id: ProcessId,
+    /// Errors: `SlotOccupied` if `self.state != Empty` (nothing is
+    /// touched); `HeapAllocFailure` if the frame allocator cannot
+    /// provide `HEAP_PAGES` contiguous frames (the slot stays `Empty`).
+    pub fn init_live(
+        &mut self,
         hhdm_offset: u64,
         frame_alloc: &mut FrameAllocator,
-    ) -> Result<Self, ProcessCreateError> {
+    ) -> Result<(), ProcessCreateError> {
+        if self.state != SlotState::Empty {
+            return Err(ProcessCreateError::SlotOccupied);
+        }
         let frame = frame_alloc
             .allocate_contiguous(HEAP_PAGES)
             .map_err(ProcessCreateError::HeapAllocFailure)?;
@@ -529,15 +770,21 @@ impl ProcessDescriptor {
             );
         }
 
-        Ok(ProcessDescriptor {
-            phys_base,
-            virt_base,
-            heap_size: HEAP_SIZE,
-            cr3: 0, // 0 = uses kernel page table (no per-process table yet)
-            vma: VmaTracker::new(),
-            fds: FdTable::new(),
-            registered_endpoints: 0,
-        })
+        // Every field written in place; the tables entry by entry (an
+        // `Empty` slot already holds empty tables by the struct
+        // invariant, and writing them again costs nothing that
+        // depending on it would not). `state` goes last so a reader
+        // that sees `Live` sees a complete descriptor. The field list
+        // is pinned by `empty_literal` and `clear`.
+        self.phys_base = phys_base;
+        self.virt_base = virt_base;
+        self.heap_size = HEAP_SIZE;
+        self.cr3 = 0; // 0 = uses kernel page table until create_process sets one
+        self.vma.reset();
+        self.fds.reset();
+        self.registered_endpoints = 0;
+        self.state = SlotState::Live;
+        Ok(())
     }
 
     /// Return a mutable reference to the in-place `BuddyAllocator` at
@@ -545,11 +792,11 @@ impl ProcessDescriptor {
     ///
     /// # Safety / invariant
     ///
-    /// This helper only produces a valid reference as long as
-    /// `ProcessDescriptor::new` successfully constructed the
-    /// descriptor — that's where the allocator is placement-new'd.
-    /// All constructors go through `new`, so the invariant holds
-    /// for every live descriptor. The returned reference is tied to
+    /// This helper only produces a valid reference for a `Live`
+    /// descriptor: `init_live` is the only transition to `Live`, and it
+    /// placement-news the allocator before setting the state. Every
+    /// caller reaches a descriptor through `ProcessTable::resolve`,
+    /// which admits only `Live` slots. The returned reference is tied to
     /// `self`'s borrow, so the borrow checker enforces unique access
     /// despite the raw pointer cast inside.
     #[inline]
@@ -703,9 +950,9 @@ impl ProcessDescriptor {
 /// Process table — slice-backed storage from the kernel object table
 /// region.
 ///
-/// Storage is a `&'static mut [Option<ProcessDescriptor>]`
-/// slice handed in from `memory::object_table::init()`. The slice
-/// length equals `config::num_slots()`, computed at boot from the
+/// Storage is a `&'static mut [ProcessDescriptor]` slice handed in
+/// from `memory::object_table::init()`, every element `Empty`. The
+/// slice length equals `config::num_slots()`, computed at boot from the
 /// SCAFFOLDING: number of recent process exits to remember for
 /// principal-after-exit lookup.
 /// Why: an audit consumer reading buffered events may encounter a
@@ -785,7 +1032,9 @@ impl RecentExitsRing {
 /// `ProcessId` returned by `create_process`. Lookups compare the
 /// caller's `ProcessId.generation()` against the stored generation.
 pub struct ProcessTable {
-    processes: &'static mut [Option<ProcessDescriptor>],
+    /// One slot-resident descriptor per slot; `state` says which are in
+    /// use. Descriptors never leave this slice (Convention 4).
+    processes: &'static mut [ProcessDescriptor],
     /// Cached HHDM offset for creating new processes
     hhdm_offset: u64,
     /// Per-slot generation counter (ADR-008 § Open Problem 9).
@@ -805,16 +1054,16 @@ impl ProcessTable {
     /// Construct a process table backed by an already-initialized
     /// slice from the kernel object table region.
     ///
-    /// The slice must have every slot pre-initialized to `None`
-    /// (which `object_table::init` guarantees). The returned
-    /// `Box<Self>` lives on the kernel heap; only its small header
-    /// (slice pointer, length, hhdm_offset, generations) lands there —
-    /// the actual slot storage lives in the object table region.
+    /// The slice must have every slot initialized `Empty` (which
+    /// `object_table::init` guarantees via `init_empty_at`). The
+    /// returned `Box<Self>` lives on the kernel heap; only its small
+    /// header (slice pointer, length, hhdm_offset, generations) lands
+    /// there — the actual slot storage lives in the object table region.
     ///
     /// Also allocates a heap-backed generation counter array, one
     /// `u32` per slot, all starting at 0.
     pub fn from_object_slice(
-        processes: &'static mut [Option<ProcessDescriptor>],
+        processes: &'static mut [ProcessDescriptor],
         hhdm_offset: u64,
     ) -> Option<Box<Self>> {
         let num_slots = processes.len();
@@ -848,7 +1097,7 @@ impl ProcessTable {
     /// O(n) in `num_slots` but bounded and verification-friendly (no
     /// free-list state to reason about).
     fn find_free_slot(&self) -> Option<usize> {
-        self.processes.iter().position(|slot| slot.is_none())
+        self.processes.iter().position(|slot| slot.state == SlotState::Empty)
     }
 
     /// Number of slots in the table (equal to `config::num_slots()`).
@@ -865,12 +1114,19 @@ impl ProcessTable {
     /// receives one. This closes the ambient-authority gap where any
     /// caller could pick an arbitrary slot index.
     ///
+    /// The descriptor is brought to `Live` *in its slot* through `&mut`
+    /// (`init_live`); nothing descriptor-sized is on this frame. The
+    /// by-value shape this replaced measured 32,856 B on a 32 KiB task
+    /// stack (2026-11-09).
+    ///
     /// Failure modes:
     /// - `"No free process slots"` — all slots occupied
     /// - `"Failed to allocate process heap"` — frame allocator
     ///   exhausted (heaps are allocated on demand)
     /// - `"Failed to allocate page table"` — per-process PML4
-    ///   allocation failed
+    ///   allocation failed (the slot is returned to `Empty`)
+    /// - `"Process slot already live"` — `find_free_slot` and the slot
+    ///   disagree; cannot happen under the table lock, typed anyway
     pub fn create_process(
         &mut self,
         frame_alloc: &mut FrameAllocator,
@@ -879,13 +1135,18 @@ impl ProcessTable {
         let idx = self.find_free_slot().ok_or("No free process slots")?;
         let generation = self.generations[idx];
         let process_id = ProcessId::new(idx as u32, generation);
+        let hhdm_offset = self.hhdm_offset;
 
-        let mut desc = match ProcessDescriptor::new(process_id, self.hhdm_offset, frame_alloc) {
-            Ok(d) => d,
+        let desc = &mut self.processes[idx];
+        match desc.init_live(hhdm_offset, frame_alloc) {
+            Ok(()) => {}
             Err(ProcessCreateError::HeapAllocFailure(_)) => {
                 return Err("Failed to allocate process heap");
             }
-        };
+            Err(ProcessCreateError::SlotOccupied) => {
+                return Err("Process slot already live");
+            }
+        }
 
         // Optionally create a per-process page table
         if create_page_table {
@@ -897,17 +1158,18 @@ impl ProcessTable {
                     // User-space mappings at low addresses are set up separately.
                 }
                 Err(_) => {
-                    // Unwind the heap allocation so we don't leak frames.
-                    // If free_contiguous itself fails we still bubble up the
-                    // original error to the caller — at that point the frame
-                    // allocator is inconsistent regardless.
+                    // Unwind the heap allocation so we don't leak frames,
+                    // and return the slot to `Empty`. If free_contiguous
+                    // itself fails we still bubble up the original error
+                    // to the caller — at that point the frame allocator
+                    // is inconsistent regardless.
                     let _ = desc.reclaim_heap(frame_alloc);
+                    desc.clear();
                     return Err("Failed to allocate page table");
                 }
             }
         }
 
-        self.processes[idx] = Some(desc);
         Ok(process_id)
     }
 
@@ -936,8 +1198,10 @@ impl ProcessTable {
             return None;
         }
         // Generation match implies the same incarnation; confirm occupancy
-        // (a freed-but-not-yet-reused slot carries no descriptor).
-        self.processes[idx].as_ref()?;
+        // (a freed-but-not-yet-reused slot is `Empty`).
+        if self.processes[idx].state != SlotState::Live {
+            return None;
+        }
         Some(idx)
     }
 
@@ -945,10 +1209,7 @@ impl ProcessTable {
     /// Returns 0 on failure (including a stale / unknown `process_id`).
     pub fn allocate_for(&mut self, process_id: ProcessId, size: usize) -> usize {
         match self.resolve(process_id) {
-            Some(idx) => self.processes[idx]
-                .as_mut()
-                .map(|desc| desc.allocate(size))
-                .unwrap_or(0),
+            Some(idx) => self.processes[idx].allocate(size),
             None => 0,
         }
     }
@@ -957,10 +1218,7 @@ impl ProcessTable {
     /// Returns `false` for a stale / unknown `process_id`.
     pub fn free_for(&mut self, process_id: ProcessId, virt_addr: usize) -> bool {
         match self.resolve(process_id) {
-            Some(idx) => self.processes[idx]
-                .as_mut()
-                .map(|desc| desc.free(virt_addr))
-                .unwrap_or(false),
+            Some(idx) => self.processes[idx].free(virt_addr),
             None => false,
         }
     }
@@ -973,7 +1231,7 @@ impl ProcessTable {
     /// getter reads the stored `phys_base` field.
     pub fn get_heap_base(&self, process_id: ProcessId) -> u64 {
         match self.resolve(process_id) {
-            Some(idx) => self.processes[idx].as_ref().map(|p| p.phys_base).unwrap_or(0),
+            Some(idx) => self.processes[idx].phys_base,
             None => 0,
         }
     }
@@ -981,7 +1239,7 @@ impl ProcessTable {
     /// Get process heap size. Returns 0 for a stale / unknown `process_id`.
     pub fn get_heap_size(&self, process_id: ProcessId) -> u64 {
         match self.resolve(process_id) {
-            Some(idx) => self.processes[idx].as_ref().map(|p| p.heap_size).unwrap_or(0),
+            Some(idx) => self.processes[idx].heap_size,
             None => 0,
         }
     }
@@ -1033,38 +1291,44 @@ impl ProcessTable {
         if self.generations[idx] != process_id.generation() {
             return None;
         }
-        if let Some(mut desc) = self.processes[idx].take() {
-            // Step 1: Reclaim VMA-tracked user-space regions.
-            // Unmaps pages from the process page table and frees
-            // physical frames. Must precede page table reclaim, and runs
-            // while the page table is still intact (and still the dying
-            // task's active root).
-            let _vma_count = desc.reclaim_user_vmas(frame_alloc);
-
-            // Step 2: Page-table frames (root + intermediates) are NOT freed
-            // here — see the doc comment. Capture the root for the reaper.
-            // `None` when cr3 == 0 (kernel task, no per-process table).
-            let deferred_root = if desc.cr3 != 0 { Some(desc.cr3) } else { None };
-
-            // Step 3: Reclaim the heap region.
-            let _ = desc.reclaim_heap(frame_alloc);
-
-            // Step 4: Increment generation so the next occupant of this
-            // slot gets a distinct ProcessId. Wrapping is intentional —
-            // u32 gives ~4 billion reuses per slot before wrap.
-            self.generations[idx] = self.generations[idx].wrapping_add(1);
-
-            deferred_root
-        } else {
-            None
+        // The descriptor is torn down in its slot through `&mut`; the
+        // `take()` this replaced moved 12 KiB onto the task stack.
+        let desc = &mut self.processes[idx];
+        if desc.state != SlotState::Live {
+            return None;
         }
+
+        // Step 1: Reclaim VMA-tracked user-space regions.
+        // Unmaps pages from the process page table and frees
+        // physical frames. Must precede page table reclaim, and runs
+        // while the page table is still intact (and still the dying
+        // task's active root).
+        let _vma_count = desc.reclaim_user_vmas(frame_alloc);
+
+        // Step 2: Page-table frames (root + intermediates) are NOT freed
+        // here — see the doc comment. Capture the root for the reaper.
+        // `None` when cr3 == 0 (kernel task, no per-process table).
+        let deferred_root = if desc.cr3 != 0 { Some(desc.cr3) } else { None };
+
+        // Step 3: Reclaim the heap region.
+        let _ = desc.reclaim_heap(frame_alloc);
+
+        // Step 4: Return the slot to `Empty` in place.
+        desc.clear();
+
+        // Step 5: Increment generation so the next occupant of this
+        // slot gets a distinct ProcessId. Wrapping is intentional —
+        // u32 gives ~4 billion reuses per slot before wrap.
+        self.generations[idx] = self.generations[idx].wrapping_add(1);
+
+        deferred_root
     }
 
     /// Get a process's CR3 (PML4 physical address). Returns 0 if no
     /// per-process page table, or for a stale / unknown `process_id`.
     pub fn get_cr3(&self, process_id: ProcessId) -> u64 {
         match self.resolve(process_id) {
-            Some(idx) => self.processes[idx].as_ref().map(|p| p.cr3).unwrap_or(0),
+            Some(idx) => self.processes[idx].cr3,
             None => 0,
         }
     }
@@ -1080,14 +1344,14 @@ impl ProcessTable {
     /// unknown `process_id`.
     pub fn vma_mut(&mut self, process_id: ProcessId) -> Option<&mut VmaTracker> {
         let idx = self.resolve(process_id)?;
-        self.processes[idx].as_mut().map(|p| &mut p.vma)
+        Some(&mut self.processes[idx].vma)
     }
 
     /// Get read-only access to a process's VMA tracker. `None` for a stale
     /// / unknown `process_id`.
     pub fn vma(&self, process_id: ProcessId) -> Option<&VmaTracker> {
         let idx = self.resolve(process_id)?;
-        self.processes[idx].as_ref().map(|p| &p.vma)
+        Some(&self.processes[idx].vma)
     }
 
     /// Record that `process_id` registered `endpoint`. `false` for a
@@ -1097,23 +1361,15 @@ impl ProcessTable {
             return false;
         }
         let Some(idx) = self.resolve(process_id) else { return false };
-        match self.processes[idx].as_mut() {
-            Some(p) => {
-                p.registered_endpoints |= 1u64 << endpoint;
-                true
-            }
-            None => false,
-        }
+        self.processes[idx].registered_endpoints |= 1u64 << endpoint;
+        true
     }
 
     /// The endpoints `process_id` registered, one bit per id; 0 for a
     /// stale / unknown `process_id`.
     pub fn registered_endpoints(&self, process_id: ProcessId) -> u64 {
         let Some(idx) = self.resolve(process_id) else { return 0 };
-        self.processes[idx]
-            .as_ref()
-            .map(|p| p.registered_endpoints)
-            .unwrap_or(0)
+        self.processes[idx].registered_endpoints
     }
 }
 
@@ -1276,6 +1532,7 @@ mod tests {
     /// (no real frame allocation in test mode).
     fn test_descriptor() -> ProcessDescriptor {
         ProcessDescriptor {
+            state: SlotState::Live,
             phys_base: 0x1000_0000,
             virt_base: 0xFFFF_8001_0000_0000,
             heap_size: HEAP_SIZE,
@@ -1517,15 +1774,21 @@ mod tests {
     // every read path routes through `ProcessTable::resolve`.
     // ========================================================================
 
-    /// Build a `ProcessTable` over a leaked, all-`None` slot array — no boot
-    /// object-table region or frame allocation required.
-    fn empty_table(num_slots: usize) -> Box<ProcessTable> {
-        let mut v: alloc::vec::Vec<Option<ProcessDescriptor>> = alloc::vec::Vec::new();
+    /// Build a `ProcessTable` over a leaked, all-`Empty` slot array — no
+    /// boot object-table region or frame allocation required. The slots
+    /// come from `ProcessDescriptor::empty()`, i.e. `init_empty_at`, the
+    /// same initializer `object_table::init` runs.
+    fn empty_table_with_hhdm(num_slots: usize, hhdm_offset: u64) -> Box<ProcessTable> {
+        let mut v: alloc::vec::Vec<ProcessDescriptor> = alloc::vec::Vec::new();
         for _ in 0..num_slots {
-            v.push(None);
+            v.push(ProcessDescriptor::empty());
         }
-        let leaked: &'static mut [Option<ProcessDescriptor>] = Box::leak(v.into_boxed_slice());
-        ProcessTable::from_object_slice(leaked, 0).expect("table construction")
+        let leaked: &'static mut [ProcessDescriptor] = Box::leak(v.into_boxed_slice());
+        ProcessTable::from_object_slice(leaked, hhdm_offset).expect("table construction")
+    }
+
+    fn empty_table(num_slots: usize) -> Box<ProcessTable> {
+        empty_table_with_hhdm(num_slots, 0)
     }
 
     #[test]
@@ -1536,7 +1799,7 @@ mod tests {
         let mut occupant = test_descriptor();
         occupant.cr3 = 0xAAAA_0000;
         occupant.phys_base = 0xBBBB_0000;
-        table.processes[0] = Some(occupant);
+        table.processes[0] = occupant;
         let current = ProcessId::new(0, 0);
 
         // The current id resolves to its own resources.
@@ -1552,7 +1815,7 @@ mod tests {
         let mut new_occupant = test_descriptor();
         new_occupant.cr3 = 0xCCCC_0000;
         new_occupant.phys_base = 0xDDDD_0000;
-        table.processes[0] = Some(new_occupant);
+        table.processes[0] = new_occupant;
         table.generations[0] = 1;
 
         let stale = ProcessId::new(0, 0); // old generation
@@ -1575,7 +1838,7 @@ mod tests {
     #[test]
     fn process_table_stale_id_cannot_destroy_current_occupant() {
         let mut table = empty_table(1);
-        table.processes[0] = Some(test_descriptor());
+        table.processes[0] = test_descriptor();
         table.generations[0] = 5;
         let mut fa = FrameAllocator::new();
 
@@ -1587,8 +1850,9 @@ mod tests {
             None,
             "stale id must defer nothing"
         );
-        assert!(
-            table.processes[0].is_some(),
+        assert_eq!(
+            table.processes[0].state,
+            SlotState::Live,
             "stale id reaped the live occupant"
         );
         assert_eq!(table.generations[0], 5, "stale destroy must not bump gen");
@@ -1601,7 +1865,147 @@ mod tests {
             Some(0x2000_0000),
             "destroy must defer the descriptor's cr3 root"
         );
-        assert!(table.processes[0].is_none());
+        assert_eq!(table.processes[0].state, SlotState::Empty);
         assert_eq!(table.generations[0], 6);
+    }
+
+    // ========================================================================
+    // Slot-resident descriptor lifecycle. The descriptor never exists by
+    // value on the kernel path: `init_empty_at` writes it into its slot at
+    // boot, `init_live` fills it through `&mut`, `clear` empties it in
+    // place. These pin the three transitions and the "Empty ⇒ canonical"
+    // invariant.
+    // ========================================================================
+
+    /// Field-for-field comparison against the exhaustive literal.
+    fn assert_is_empty_literal(d: &ProcessDescriptor) {
+        let lit = ProcessDescriptor::empty_literal();
+        assert_eq!(d.state, lit.state);
+        assert_eq!(d.phys_base, lit.phys_base);
+        assert_eq!(d.virt_base, lit.virt_base);
+        assert_eq!(d.heap_size, lit.heap_size);
+        assert_eq!(d.cr3, lit.cr3);
+        assert_eq!(d.registered_endpoints, lit.registered_endpoints);
+        assert_eq!(d.vma.count(), 0);
+        assert!(d.vma.entries.iter().all(|e| e.is_none()));
+        assert_eq!(d.vma.next_vaddr, VMA_ALLOC_BASE);
+        assert_eq!(d.fds.count(), 0);
+        assert!(d.fds.entries.iter().all(|e| e.is_none()));
+        assert_eq!(d.fds.next_generation, 0);
+    }
+
+    #[test]
+    fn process_descriptor_init_empty_at_matches_literal() {
+        // `empty()` routes through `init_empty_at`.
+        let d = ProcessDescriptor::empty();
+        assert_is_empty_literal(&d);
+    }
+
+    #[test]
+    fn process_descriptor_clear_returns_to_empty_literal() {
+        let mut d = test_descriptor();
+        d.vma.allocate_region(2).unwrap();
+        d.vma.register_region(0x400000, 1);
+        let (id, rights, backing) = dummy_open_args();
+        d.fds.allocate(id, rights, backing).unwrap();
+        d.registered_endpoints = 0b1010;
+        assert_eq!(d.state, SlotState::Live);
+
+        d.clear();
+        assert_is_empty_literal(&d);
+    }
+
+    #[test]
+    fn process_descriptor_init_live_rejects_live_slot() {
+        let mut d = test_descriptor();
+        let mut fa = FrameAllocator::new();
+        assert_eq!(
+            d.init_live(0, &mut fa),
+            Err(ProcessCreateError::SlotOccupied),
+            "a Live slot must not be re-initialized"
+        );
+        // Nothing was touched.
+        assert_eq!(d.phys_base, 0x1000_0000);
+        assert_eq!(d.state, SlotState::Live);
+    }
+
+    #[test]
+    fn process_descriptor_init_live_heap_failure_leaves_slot_empty() {
+        let mut d = ProcessDescriptor::empty();
+        let mut fa = FrameAllocator::new(); // no regions: every allocation fails
+        assert!(matches!(
+            d.init_live(0, &mut fa),
+            Err(ProcessCreateError::HeapAllocFailure(_))
+        ));
+        assert_is_empty_literal(&d);
+    }
+
+    /// `create_process` / `destroy_process` round trip against a real
+    /// `FrameAllocator`, with the heap landing in a host buffer.
+    ///
+    /// Host trick (as in `object_table::tests::init_produces_valid_slices`):
+    /// the allocator hands out fake physical frames from `0x100000`;
+    /// `hhdm_offset` is chosen so `phys + hhdm_offset` lands inside a real
+    /// buffer, which is what `init_live` writes the `BuddyAllocator` into.
+    #[test]
+    fn process_table_create_and_destroy_in_place() {
+        let fake_phys_base = 0x100000u64;
+        // Three heaps' worth of frames so three processes can coexist.
+        let region_bytes = 3 * HEAP_SIZE as usize;
+        let mut fa = FrameAllocator::new();
+        fa.add_region(fake_phys_base, region_bytes as u64);
+        fa.finalize();
+        let free_at_start = fa.free_count();
+
+        let page = PAGE_SIZE as usize;
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; region_bytes + page];
+        let raw = buf.as_mut_ptr() as usize;
+        let aligned_virt = (raw + page - 1) & !(page - 1);
+        let hhdm_offset = aligned_virt as u64 - fake_phys_base;
+
+        let mut table = empty_table_with_hhdm(2, hhdm_offset);
+
+        // Spawn A into slot 0.
+        let a = table.create_process(&mut fa, false).expect("create A");
+        assert_eq!((a.slot(), a.generation()), (0, 0));
+        assert_eq!(table.processes[0].state, SlotState::Live);
+        assert_eq!(table.get_heap_base(a), fake_phys_base);
+        assert_eq!(table.get_heap_size(a), HEAP_SIZE);
+        assert_eq!(table.get_cr3(a), 0);
+        assert_eq!(fa.free_count(), free_at_start - HEAP_PAGES);
+
+        // The in-heap allocator was placed: an allocation succeeds and
+        // lands inside this process's heap.
+        let p = table.allocate_for(a, 64);
+        assert!(p >= aligned_virt && p < aligned_virt + HEAP_SIZE as usize);
+
+        // Spawn B skips the Live slot.
+        let b = table.create_process(&mut fa, false).expect("create B");
+        assert_eq!(b.slot(), 1);
+        assert_eq!(fa.free_count(), free_at_start - 2 * HEAP_PAGES);
+
+        // Destroy A: slot returns to the canonical Empty value in place,
+        // the heap frames come back, the generation moves on.
+        assert_eq!(table.destroy_process(a, &mut fa), None, "cr3 == 0 defers no root");
+        assert_is_empty_literal(&table.processes[0]);
+        assert_eq!(table.generations[0], 1);
+        assert_eq!(fa.free_count(), free_at_start - HEAP_PAGES);
+        assert!(!table.slot_occupied(a), "the old id is stale");
+
+        // The free slot is reused with the next generation.
+        let c = table.create_process(&mut fa, false).expect("create C");
+        assert_eq!((c.slot(), c.generation()), (0, 1));
+        assert!(table.slot_occupied(c));
+        assert!(!table.slot_occupied(a));
+
+        // Full table: the typed failure, nothing allocated.
+        assert_eq!(
+            table.create_process(&mut fa, false),
+            Err("No free process slots")
+        );
+        assert_eq!(fa.free_count(), free_at_start - 2 * HEAP_PAGES);
+
+        drop(table);
+        drop(buf);
     }
 }

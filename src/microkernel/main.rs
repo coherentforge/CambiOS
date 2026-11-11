@@ -1421,7 +1421,7 @@ fn init_kernel_object_tables() {
         "✓ Kernel object tables: {} slots × ({} + {}) bytes = {} KiB, \
          tier={}, binding={}, phys={:#x}",
         table.num_slots,
-        core::mem::size_of::<Option<cambios_core::process::ProcessDescriptor>>(),
+        core::mem::size_of::<cambios_core::process::ProcessDescriptor>(),
         core::mem::size_of::<Option<cambios_core::ipc::capability::ProcessCapabilities>>(),
         table.region_bytes / 1024,
         config::ACTIVE_TIER_NAME,

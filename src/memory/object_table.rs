@@ -6,7 +6,10 @@
 //! The "kernel object table region" is a single contiguous physical
 //! allocation that backs two disjoint, page-aligned slices:
 //!
-//! - **Process slots:** `[Option<ProcessDescriptor>; num_slots]`
+//! - **Process slots:** `[ProcessDescriptor; num_slots]`, every one
+//!   `SlotState::Empty` at init. The descriptor is slot-resident for the
+//!   kernel's lifetime; its `state` field, not an `Option`, says whether
+//!   a process lives there (see `process::SlotState`).
 //! - **Capability slots:** `[Option<ProcessCapabilities>; num_slots]`
 //!
 //! Both are sized at boot from `config::num_slots()`, which is itself
@@ -35,15 +38,17 @@
 //! 2. The underlying physical region is allocated exclusively by the
 //!    frame allocator, is never returned, and does not overlap with
 //!    any other kernel data structure.
-//! 3. The region is fully initialized (every slot explicitly written
-//!    to `None`) before the slices are handed out.
+//! 3. The region is fully initialized (every process slot written in
+//!    place to the `Empty` descriptor, every capability slot explicitly
+//!    written to `None`) before the slices are handed out.
 //!
 //! All three are enforced in `init()`: the frame allocator gives back
-//! a disjoint region, every slot is explicitly written via
-//! `core::ptr::write(None)` (we cannot rely on zeroed memory being
-//! `None` for `Option<T>` with niche-optimized contents — see
-//! `ProcessTable::new_boxed` for the same gotcha), and the caller
-//! (kernel boot path) is responsible for the "exactly once" part.
+//! a disjoint region; every process slot is initialized field by field
+//! with `ProcessDescriptor::init_empty_at` (a 12 KiB descriptor must
+//! never exist by value on a kernel stack, Convention 4) and every
+//! capability slot via `core::ptr::write(None)` (zeroed memory is not
+//! `None`, Convention 7); and the caller (kernel boot path) is
+//! responsible for the "exactly once" part.
 //!
 //! [ADR-008]: ../../../docs/adr/008-boot-time-sized-object-tables.md
 
@@ -78,8 +83,8 @@ pub enum ObjectTableError {
 /// per slice.
 pub struct ObjectTable {
     /// Slice of process slots, length == `num_slots`. Every element
-    /// starts as `None`.
-    pub process_slots: &'static mut [Option<ProcessDescriptor>],
+    /// starts `SlotState::Empty`.
+    pub process_slots: &'static mut [ProcessDescriptor],
 
     /// Slice of capability slots, length == `num_slots`. Every element
     /// starts as `None`.
@@ -106,7 +111,7 @@ pub struct ObjectTable {
 /// Exposed for tests and for the boot log to print the region size
 /// without calling `init()`.
 pub const fn region_bytes_for(num_slots: usize) -> u64 {
-    let process_bytes = num_slots * core::mem::size_of::<Option<ProcessDescriptor>>();
+    let process_bytes = num_slots * core::mem::size_of::<ProcessDescriptor>();
     let capability_bytes = num_slots * core::mem::size_of::<Option<ProcessCapabilities>>();
 
     let process_aligned = align_up_const(process_bytes, PAGE_SIZE as usize);
@@ -124,8 +129,9 @@ const fn align_up_const(value: usize, align: usize) -> usize {
 /// Initialize the kernel object table region.
 ///
 /// Allocates a contiguous physical region from `frame_alloc`, carves
-/// it into two page-aligned subregions, initializes every slot in
-/// both subregions to `None`, and returns the populated `ObjectTable`.
+/// it into two page-aligned subregions, initializes every process slot
+/// to the `Empty` descriptor and every capability slot to `None`, and
+/// returns the populated `ObjectTable`.
 ///
 /// Must be called exactly once per kernel lifetime.
 ///
@@ -152,7 +158,7 @@ pub fn init(
 
     // Compute the two page-aligned subregion sizes and the total
     // allocation size (in pages, for the frame allocator).
-    let process_bytes = num_slots * core::mem::size_of::<Option<ProcessDescriptor>>();
+    let process_bytes = num_slots * core::mem::size_of::<ProcessDescriptor>();
     let capability_bytes = num_slots * core::mem::size_of::<Option<ProcessCapabilities>>();
 
     let process_bytes_aligned = align_up_const(process_bytes, PAGE_SIZE as usize);
@@ -172,15 +178,15 @@ pub fn init(
     // The two subregion pointers. Process subregion starts at the
     // region base (page-aligned by frame allocation); capability
     // subregion starts after the page-aligned process subregion.
-    let process_ptr = region_base_virt as *mut Option<ProcessDescriptor>;
+    let process_ptr = region_base_virt as *mut ProcessDescriptor;
     let capability_ptr =
         (region_base_virt + process_bytes_aligned as u64) as *mut Option<ProcessCapabilities>;
 
-    // Initialize every slot to `None` via explicit writes. We cannot
-    // rely on zeroed memory being `None` because niche optimization
-    // may place the discriminant in a way that makes all-zeros a
-    // `Some(...)` variant — see `ProcessTable::new_boxed` for the
-    // same gotcha audited earlier.
+    // Initialize every slot by explicit writes. Process slots are built
+    // in place, field by field (`init_empty_at`): a descriptor is ~12 KiB
+    // and must never be staged on the boot stack (Convention 4).
+    // Capability slots are `Option`s written `None`: zeroed memory is
+    // not `None` (Convention 7), so the discriminant has to be written.
     //
     // SAFETY: process_ptr and capability_ptr are page-aligned (frame
     // allocator returned a page-aligned base, subregion boundary is
@@ -191,8 +197,9 @@ pub fn init(
     for i in 0..num_slots {
         // SAFETY: process_ptr + i is within the allocated region (num_slots slots).
         let slot = unsafe { process_ptr.add(i) };
-        // SAFETY: slot is a valid, aligned pointer within the region.
-        unsafe { slot.write(None) };
+        // SAFETY: slot is a valid, aligned, exclusively owned descriptor slot;
+        // init_empty_at writes every field.
+        unsafe { ProcessDescriptor::init_empty_at(slot) };
     }
     for i in 0..num_slots {
         // SAFETY: capability_ptr + i is within the allocated region (num_slots slots).
@@ -201,11 +208,10 @@ pub fn init(
         unsafe { slot.write(None) };
     }
 
-    // SAFETY: All slots initialized above; pointers are valid and
-    // SAFETY: process_ptr is non-null, page-aligned, initialized to None via
-    // write_bytes(0) + ptr::write(None), and owned exclusively by this call.
-    // Lifetime is 'static because the region is never freed.
-    let process_slots: &'static mut [Option<ProcessDescriptor>] =
+    // SAFETY: process_ptr is non-null, page-aligned, every element
+    // initialized above via init_empty_at, and owned exclusively by this
+    // call. Lifetime is 'static because the region is never freed.
+    let process_slots: &'static mut [ProcessDescriptor] =
         unsafe { core::slice::from_raw_parts_mut(process_ptr, num_slots) };
     // SAFETY: Same as above — capability_ptr is the next page-aligned sub-region,
     // properly initialized and exclusively owned.
@@ -256,7 +262,7 @@ mod tests {
         // For large num_slots, the total must be at least the sum of
         // the unpadded subregion sizes.
         let n = 1024usize;
-        let min_required = n * core::mem::size_of::<Option<ProcessDescriptor>>()
+        let min_required = n * core::mem::size_of::<ProcessDescriptor>()
             + n * core::mem::size_of::<Option<ProcessCapabilities>>();
         assert!(region_bytes_for(n) >= min_required as u64);
     }
@@ -319,9 +325,12 @@ mod tests {
         assert_eq!(table.capability_slots.len(), num_slots);
         assert_eq!(table.region_base_phys, fake_phys_base);
 
-        // Every slot must be None after init (explicit write in init).
+        // Every process slot must be the Empty descriptor and every
+        // capability slot None after init (explicit writes in init).
         for slot in table.process_slots.iter() {
-            assert!(slot.is_none());
+            assert_eq!(slot.state, crate::process::SlotState::Empty);
+            assert_eq!(slot.vma.count(), 0);
+            assert_eq!(slot.fds.count(), 0);
         }
         for slot in table.capability_slots.iter() {
             assert!(slot.is_none());
@@ -336,7 +345,7 @@ mod tests {
         let process_start = table.process_slots.as_ptr() as usize;
         let capability_start = table.capability_slots.as_ptr() as usize;
         let process_end =
-            process_start + num_slots * core::mem::size_of::<Option<ProcessDescriptor>>();
+            process_start + num_slots * core::mem::size_of::<ProcessDescriptor>();
         assert!(
             capability_start >= process_end,
             "capability subregion ({:#x}) must start at or after process \

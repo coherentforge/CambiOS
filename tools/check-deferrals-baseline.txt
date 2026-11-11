@@ -101,8 +101,8 @@ src/microkernel/main.rs:2152:deferred
 src/microkernel/main.rs:2181:deferred
 src/microkernel/main.rs:2495:for-now
 src/platform/mod.rs:353:for-now
-src/process.rs:1003:deferred
-src/process.rs:1004:deferred
+src/process.rs:1261:deferred
+src/process.rs:1262:deferred
 src/reaper.rs:4:deferred
 src/reaper.rs:9:deferred
 src/reaper.rs:43:deferred

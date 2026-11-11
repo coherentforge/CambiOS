@@ -297,9 +297,9 @@ src/policy/mod.rs:118:DECISION_DENY
 src/policy/mod.rs:121:DECISION_EXPIRED
 src/process.rs:35:MAX_VMAS
 src/process.rs:39:VMA_ALLOC_BASE
-src/process.rs:386:HEAP_SIZE
-src/process.rs:389:HEAP_PAGES
-src/process.rs:722:RECENT_EXITS_RING_SIZE
+src/process.rs:481:HEAP_SIZE
+src/process.rs:484:HEAP_PAGES
+src/process.rs:969:RECENT_EXITS_RING_SIZE
 src/syscalls/fuzz_fixture.rs:38:FIXTURE_SLOT
 src/syscalls/fuzz_fixture.rs:41:FIXTURE_GENERATION
 src/syscalls/fuzz_fixture.rs:45:FIXTURE_TASK
