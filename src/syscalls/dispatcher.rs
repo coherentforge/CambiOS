@@ -416,23 +416,54 @@ impl SyscallDispatcher {
         let mut kbuf = [0u8; 256];
         slice.read_into(&mut kbuf[..len])?;
 
-        // Virtio-blk kernel response endpoint: writes here
-        // skip the capability check and land in SHARDED_IPC. The kernel is
-        // the only consumer; trust is by endpoint choice (mirror of the
-        // POLICY_RESP_ENDPOINT pattern below). Note: NO scheduler wake —
-        // `BlockDriverClient::call` polls for the reply on the same endpoint
-        // after its wake-driver send, so an extra wake here is redundant
-        // and (empirically) provokes a subtle interaction that stalls the
-        // driver's own virtqueue self-test. The blocked kernel task on
-        // MessageWait(25) will still resume when its timer slice runs.
-        /// ARCHITECTURAL: endpoint 25 is the virtio-blk kernel→driver
-        /// response slot in the CambiOS IPC number-space. The userspace
-        /// driver recognizes it by number, so changing it is an ABI
-        /// break coordinated across `user/virtio-blk` and every kernel
-        /// callsite that sends to it.
-        const BLK_KERNEL_RESP_ENDPOINT: u32 = 25;
-        if endpoint_id == BLK_KERNEL_RESP_ENDPOINT {
+        // Block-driver kernel reply endpoint. The kernel is the only
+        // consumer (`BlockDriverClient` polls it), so this write never
+        // reaches a user receiver and bypasses the send-side capability
+        // pipeline; what replaces the pipeline is an identity gate. The
+        // manifest reserves this endpoint to the block-driver row
+        // (ADR-018), and only a process bound to that row's Principal may
+        // write here: the kernel acts on these replies (it copies disk
+        // blocks through the page the handshake reply names), so a reply
+        // from anyone else is a forged instruction to the kernel. Every
+        // process holds `AllEndpoints { send }`, which is why the ordinary
+        // capability check would not have stopped one. No reservation ⇒
+        // nobody may write here (fail closed). The accepted message is
+        // stamped with the sender's Principal like every other control
+        // message (ADR-005 § 1); `from` carries the sender's process slot
+        // so the client can resolve the sender for the handshake's
+        // DMA-ownership check.
+        //
+        // Lock ordering: CAPABILITY_MANAGER(4) alone, released before the
+        // shard enqueue. Note: NO scheduler wake — `BlockDriverClient::
+        // call` polls for the reply on the same endpoint after its
+        // wake-driver send, so an extra wake here is redundant and
+        // (empirically) provokes a subtle interaction that stalls the
+        // driver's own virtqueue self-test (ADR-010 § Divergence 2).
+        if endpoint_id == cambios_blk_proto::BLK_KERNEL_RESP_ENDPOINT {
             let ep = crate::ipc::EndpointId(endpoint_id);
+            let Some(owner_aid) =
+                crate::ipc::endpoint_reservation::ENDPOINT_RESERVATIONS.owner(endpoint_id)
+            else {
+                crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+                    ctx.process_id, ep, crate::audit::now(), 0,
+                ));
+                return Err(SyscallError::PermissionDenied);
+            };
+            let sender = {
+                let cap_guard = crate::CAPABILITY_MANAGER.lock();
+                cap_guard
+                    .as_ref()
+                    .and_then(|cap_mgr| cap_mgr.get_principal(ctx.process_id).ok())
+            };
+            let sender = match sender {
+                Some(p) if p.aid() == &owner_aid => p,
+                _ => {
+                    crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+                        ctx.process_id, ep, crate::audit::now(), 0,
+                    ));
+                    return Err(SyscallError::PermissionDenied);
+                }
+            };
             let mut msg = crate::ipc::Message::new(
                 crate::ipc::EndpointId(ctx.process_id.slot()),
                 ep,
@@ -440,6 +471,7 @@ impl SyscallDispatcher {
             if msg.set_payload(&kbuf[..len]).is_err() {
                 return Err(SyscallError::InvalidArg);
             }
+            msg.sender_principal = Some(sender);
             if crate::SHARDED_IPC.send_message(ep, msg).is_err() {
                 return Err(SyscallError::OutOfMemory);
             }
@@ -1798,8 +1830,18 @@ impl SyscallDispatcher {
             .and_then(|pt| pt.vma_mut(ctx.process_id))
             .ok_or(SyscallError::InvalidArg)?;
 
+        // Recorded as a DMA grant: the process will learn this physical
+        // address and may later name it to the kernel (the block driver
+        // reports its shared page this way). `ProcessTable::owns_dma_range`
+        // is where such a claim is checked against this record.
         let region_vaddr = vma
-            .allocate_region(total_pages)
+            .allocate_region_with(
+                total_pages,
+                crate::process::VmaBacking::DmaGrant {
+                    phys_base: base_phys,
+                    phys_pages: num_pages,
+                },
+            )
             .ok_or(SyscallError::OutOfMemory)?;
 
         // The actual DMA mapping starts after the first guard page
@@ -3874,13 +3916,12 @@ impl SyscallDispatcher {
             }
         }
 
-        // Open the virtio-blk kernel-cmd channel. Per the
-        // `lazy_disk` precedent, we do this without holding any
-        // kernel locks (the IPC dance yields).
-        let mut device = BlockDriverClient::new();
-        if device.ensure_handshake().is_err() {
+        // Connect to the block driver. No kernel lock is held here:
+        // `connect` takes PROCESS_TABLE and CAPABILITY_MANAGER for its
+        // shared-page ownership check, and the IPC wait yields.
+        let Ok(mut device) = BlockDriverClient::connect() else {
             return Err(SyscallError::Enosys);
-        }
+        };
 
         // Read 16 KiB into a kernel-local stack buffer. 16 KiB is
         // well within the 256 KiB boot stack budget; per the
@@ -4010,13 +4051,14 @@ impl SyscallDispatcher {
         let slice = UserReadSlice::validate(ctx, master_ptr, XTS_MASTER_KEY_LEN)?;
         slice.read_into(&mut master_key)?;
 
-        // Construct the inner virtio-blk device + handshake. No
-        // kernel locks held; the IPC dance yields.
-        let mut device = BlockDriverClient::new();
-        if device.ensure_handshake().is_err() {
+        // Connect to the block driver, before anything is installed
+        // under OBJECT_STORE: `connect` takes PROCESS_TABLE and
+        // CAPABILITY_MANAGER for its shared-page ownership check, and
+        // the IPC wait yields. No kernel lock is held here.
+        let Ok(mut device) = BlockDriverClient::connect() else {
             Self::zeroize_master(&mut master_key);
             return Err(SyscallError::Enosys);
-        }
+        };
 
         // Peek raw bytes at the substrate's data offset *before*
         // wrapping with the encrypted layer. ADR-032 § Architecture

@@ -123,7 +123,7 @@ src/boot/initrd.rs:58:ARCHIVE_HEADER_SIZE
 src/boot/initrd.rs:61:ENTRY_HEADER_SIZE
 src/boot/mod.rs:84:MAX_BOOT_MODULES
 src/config/tier.rs:117:SLOT_OVERHEAD
-src/fs/block_driver_client.rs:45:VIRTIO_BLK_SECTOR_SIZE
+src/fs/block_driver_client.rs:68:VIRTIO_BLK_SECTOR_SIZE
 src/fs/disk.rs:119:SB_OFF_MAGIC
 src/fs/disk.rs:120:SB_OFF_VERSION
 src/fs/disk.rs:121:SB_OFF_CAPACITY_SLOTS
@@ -297,9 +297,9 @@ src/policy/mod.rs:118:DECISION_DENY
 src/policy/mod.rs:121:DECISION_EXPIRED
 src/process.rs:35:MAX_VMAS
 src/process.rs:39:VMA_ALLOC_BASE
-src/process.rs:481:HEAP_SIZE
-src/process.rs:484:HEAP_PAGES
-src/process.rs:969:RECENT_EXITS_RING_SIZE
+src/process.rs:547:HEAP_SIZE
+src/process.rs:550:HEAP_PAGES
+src/process.rs:1035:RECENT_EXITS_RING_SIZE
 src/syscalls/fuzz_fixture.rs:38:FIXTURE_SLOT
 src/syscalls/fuzz_fixture.rs:41:FIXTURE_GENERATION
 src/syscalls/fuzz_fixture.rs:45:FIXTURE_TASK

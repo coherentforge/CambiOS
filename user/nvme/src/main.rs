@@ -21,11 +21,11 @@ mod nvme;
 mod pci;
 
 use cambios_blk_proto::{
-    decode_lba_request, encode_u64_reply, BLK_ENDPOINT, BLK_KERNEL_CMD_ENDPOINT,
-    BLK_KERNEL_RESP_ENDPOINT, CMD_FLUSH, CMD_GET_CAPACITY, CMD_GET_STATUS, CMD_READ_BLOCK,
-    CMD_WRITE_BLOCK, KCMD_CAPACITY, KCMD_FLUSH, KCMD_HANDSHAKE, KCMD_READ_BLOCK,
-    KCMD_WRITE_BLOCK, STATUS_DEVICE_DEAD, STATUS_ERROR, STATUS_NO_DEVICE, STATUS_OK,
-    STATUS_UNIMPLEMENTED,
+    decode_kernel_request, decode_lba_args, encode_kstatus_reply, encode_ku64_reply,
+    encode_u64_reply, BLK_ENDPOINT, BLK_KERNEL_CMD_ENDPOINT, BLK_KERNEL_RESP_ENDPOINT,
+    CMD_FLUSH, CMD_GET_CAPACITY, CMD_GET_STATUS, CMD_READ_BLOCK, CMD_WRITE_BLOCK,
+    KCMD_CAPACITY, KCMD_FLUSH, KCMD_HANDSHAKE, KCMD_READ_BLOCK, KCMD_WRITE_BLOCK,
+    STATUS_DEVICE_DEAD, STATUS_ERROR, STATUS_NO_DEVICE, STATUS_OK, STATUS_UNIMPLEMENTED,
 };
 use cambios_libipc as ipc;
 use cambios_libsys as sys;
@@ -152,57 +152,55 @@ fn log_err(stage: &[u8], e: NvmeError) {
 // IPC handlers
 // ---------------------------------------------------------------------------
 
+/// Kernel commands (endpoint 26). Every reply echoes the request's tag,
+/// errors included: the kernel accepts only the reply that answers the
+/// request it is waiting on, and an untagged reply answers nothing.
 fn handle_kernel_cmd(driver: &mut Driver, payload: &[u8], response: &mut [u8]) -> usize {
-    if payload.is_empty() {
-        response[0] = STATUS_ERROR;
-        return 1;
-    }
-    match payload[0] {
+    let Some(req) = decode_kernel_request(payload) else {
+        // No tag to echo: nothing the kernel would accept.
+        return 0;
+    };
+    match req.kcmd {
         KCMD_HANDSHAKE => match driver.ensure_shared() {
-            Some(paddr) => encode_u64_reply(STATUS_OK, paddr, response),
-            None => {
-                response[0] = STATUS_ERROR;
-                1
-            }
+            Some(paddr) => encode_ku64_reply(STATUS_OK, req.tag, paddr, response),
+            None => encode_kstatus_reply(STATUS_ERROR, req.tag, response),
         },
         KCMD_READ_BLOCK | KCMD_WRITE_BLOCK => {
-            let Some(lba) = decode_lba_request(payload) else {
-                response[0] = STATUS_ERROR;
-                return 1;
+            let Some(lba) = decode_lba_args(req.args) else {
+                return encode_kstatus_reply(STATUS_ERROR, req.tag, response);
             };
             let Some(page) = driver.shared else {
-                response[0] = STATUS_ERROR; // no handshake yet
-                return 1;
+                // No handshake yet.
+                return encode_kstatus_reply(STATUS_ERROR, req.tag, response);
             };
-            let result = if payload[0] == KCMD_READ_BLOCK {
+            let result = if req.kcmd == KCMD_READ_BLOCK {
                 driver.ctl.read_block(lba, &page)
             } else {
                 driver.ctl.write_block(lba, &page)
             };
-            response[0] = match result {
+            let status = match result {
                 Ok(()) => STATUS_OK,
                 Err(e) => {
-                    log_err(if payload[0] == KCMD_READ_BLOCK { b"read" } else { b"write" }, e);
+                    log_err(if req.kcmd == KCMD_READ_BLOCK { b"read" } else { b"write" }, e);
                     driver.status_for(e)
                 }
             };
-            1
+            encode_kstatus_reply(status, req.tag, response)
         }
         KCMD_FLUSH => {
-            response[0] = match driver.ctl.flush() {
+            let status = match driver.ctl.flush() {
                 Ok(()) => STATUS_OK,
                 Err(e) => {
                     log_err(b"flush", e);
                     driver.status_for(e)
                 }
             };
-            1
+            encode_kstatus_reply(status, req.tag, response)
         }
-        KCMD_CAPACITY => encode_u64_reply(STATUS_OK, driver.ctl.capacity_sectors(), response),
-        _ => {
-            response[0] = STATUS_ERROR;
-            1
+        KCMD_CAPACITY => {
+            encode_ku64_reply(STATUS_OK, req.tag, driver.ctl.capacity_sectors(), response)
         }
+        _ => encode_kstatus_reply(STATUS_ERROR, req.tag, response),
     }
 }
 
@@ -337,13 +335,19 @@ fn no_device_loop() -> ! {
     let mut recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let mut kern_recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let resp = [STATUS_NO_DEVICE; 1];
+    let mut kern_resp = [0u8; 16];
     loop {
         let mut did_work = false;
         did_work |= ipc::poll_raw(BLK_ENDPOINT, &mut recv_buf, |msg| {
             sys::write(msg.from_endpoint(), &resp);
         });
-        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |_msg| {
-            sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp);
+        // The kernel accepts only a reply that echoes its tag, so the
+        // fast failure has to carry it.
+        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+            if let Some(req) = decode_kernel_request(msg.payload()) {
+                let n = encode_kstatus_reply(STATUS_NO_DEVICE, req.tag, &mut kern_resp);
+                sys::write(BLK_KERNEL_RESP_ENDPOINT, &kern_resp[..n]);
+            }
         });
         if !did_work {
             sys::yield_now();

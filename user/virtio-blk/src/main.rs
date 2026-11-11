@@ -80,6 +80,7 @@ use virtqueue::{BounceBuffer, ChainSegment, VirtQueue};
 // shared `cambios-blk-proto` crate, so this driver, nvme, ahci and the
 // kernel's BlockDriverClient cannot drift from one another.
 use cambios_blk_proto::{
+    decode_kernel_request, decode_lba_args, encode_kstatus_reply, encode_ku64_reply,
     BLK_ENDPOINT, BLK_KERNEL_CMD_ENDPOINT, BLK_KERNEL_RESP_ENDPOINT, CMD_FLUSH,
     CMD_GET_CAPACITY, CMD_GET_STATUS, CMD_READ_BLOCK, CMD_WRITE_BLOCK, KCMD_CAPACITY,
     KCMD_FLUSH, KCMD_HANDSHAKE, KCMD_READ_BLOCK, KCMD_WRITE_BLOCK, LOGICAL_BLOCK_SIZE,
@@ -521,68 +522,45 @@ fn handle_unimplemented(response: &mut [u8]) -> usize {
 }
 
 // ============================================================================
-// Kernel command handler (endpoint 26, Phase 4a.iii)
+// Kernel command handler (endpoint 26)
 //
-// Payload layouts:
-//   HANDSHAKE:   [cmd:1]                         response: [status:1][paddr:8]
-//   READ_BLOCK:  [cmd:1][lba:8]                  response: [status:1]
-//   WRITE_BLOCK: [cmd:1][lba:8]                  response: [status:1]
-//   FLUSH:       [cmd:1]                         response: [status:1]
-//   CAPACITY:    [cmd:1]                         response: [status:1][sectors:8]
+// Wire layouts are `cambios-blk-proto`'s: every request is
+// `[kcmd][tag:4][args]`, every reply `[status][tag:4][data]`. The tag is
+// echoed on every path, errors included — a reply without the kernel's
+// tag answers nothing, and the kernel waits out its budget instead of
+// failing fast.
 // ============================================================================
 
 fn handle_kernel_cmd(driver: &mut BlkDriver, payload: &[u8], response: &mut [u8]) -> usize {
-    if payload.is_empty() {
-        response[0] = STATUS_ERROR;
-        return 1;
-    }
-    match payload[0] {
+    let Some(req) = decode_kernel_request(payload) else {
+        // No tag to echo: nothing to say that the kernel would accept.
+        return 0;
+    };
+    match req.kcmd {
         KCMD_HANDSHAKE => match driver.ensure_shared_region() {
-            Some(paddr) => {
-                response[0] = STATUS_OK;
-                response[1..9].copy_from_slice(&paddr.to_le_bytes());
-                9
-            }
-            None => {
-                response[0] = STATUS_ERROR;
-                1
-            }
+            Some(paddr) => encode_ku64_reply(STATUS_OK, req.tag, paddr, response),
+            None => encode_kstatus_reply(STATUS_ERROR, req.tag, response),
         },
-        KCMD_READ_BLOCK => {
-            if payload.len() < 9 {
-                response[0] = STATUS_ERROR;
-                return 1;
-            }
-            let mut lba_bytes = [0u8; 8];
-            lba_bytes.copy_from_slice(&payload[1..9]);
-            let lba = u64::from_le_bytes(lba_bytes);
-            response[0] = if driver.read_block_shared(lba) { STATUS_OK } else { STATUS_ERROR };
-            1
+        KCMD_READ_BLOCK | KCMD_WRITE_BLOCK => {
+            let Some(lba) = decode_lba_args(req.args) else {
+                return encode_kstatus_reply(STATUS_ERROR, req.tag, response);
+            };
+            let ok = if req.kcmd == KCMD_READ_BLOCK {
+                driver.read_block_shared(lba)
+            } else {
+                driver.write_block_shared(lba)
+            };
+            encode_kstatus_reply(if ok { STATUS_OK } else { STATUS_ERROR }, req.tag, response)
         }
-        KCMD_WRITE_BLOCK => {
-            if payload.len() < 9 {
-                response[0] = STATUS_ERROR;
-                return 1;
-            }
-            let mut lba_bytes = [0u8; 8];
-            lba_bytes.copy_from_slice(&payload[1..9]);
-            let lba = u64::from_le_bytes(lba_bytes);
-            response[0] = if driver.write_block_shared(lba) { STATUS_OK } else { STATUS_ERROR };
-            1
-        }
-        KCMD_FLUSH => {
-            response[0] = if driver.flush() { STATUS_OK } else { STATUS_ERROR };
-            1
-        }
+        KCMD_FLUSH => encode_kstatus_reply(
+            if driver.flush() { STATUS_OK } else { STATUS_ERROR },
+            req.tag,
+            response,
+        ),
         KCMD_CAPACITY => {
-            response[0] = STATUS_OK;
-            response[1..9].copy_from_slice(&driver.capacity_sectors.to_le_bytes());
-            9
+            encode_ku64_reply(STATUS_OK, req.tag, driver.capacity_sectors, response)
         }
-        _ => {
-            response[0] = STATUS_ERROR;
-            1
-        }
+        _ => encode_kstatus_reply(STATUS_ERROR, req.tag, response),
     }
 }
 
@@ -732,6 +710,7 @@ fn no_device_loop() -> ! {
     let mut recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let mut kern_recv_buf = [0u8; ipc::RECV_BUF_SIZE];
     let resp_buf = [STATUS_NO_DEVICE; 1];
+    let mut kern_resp_buf = [0u8; 16];
 
     loop {
         let mut did_work = false;
@@ -743,8 +722,13 @@ fn no_device_loop() -> ! {
             sys::write(msg.from_endpoint(), &resp_buf);
         });
 
-        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |_msg| {
-            sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf);
+        // The kernel accepts only a reply that echoes its tag, so the
+        // fast failure has to carry it.
+        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+            if let Some(req) = decode_kernel_request(msg.payload()) {
+                let n = encode_kstatus_reply(STATUS_NO_DEVICE, req.tag, &mut kern_resp_buf);
+                sys::write(BLK_KERNEL_RESP_ENDPOINT, &kern_resp_buf[..n]);
+            }
         });
 
         if !did_work {

@@ -38,6 +38,29 @@ const MAX_VMAS: usize = 256;
 /// Placed above code (0x400000) and stack (0x800000) regions.
 pub const VMA_ALLOC_BASE: u64 = 0x1000_0000;
 
+/// What stands behind a tracked region: the kernel's record of which
+/// physical memory it handed the process there, where that record is
+/// load-bearing.
+///
+/// Only one kind is load-bearing today. `SYS_ALLOC_DMA` hands a process a
+/// physically contiguous run whose address the process learns and may
+/// later report back to the kernel (the block driver names its shared
+/// page this way). The kernel accepts such a report only if the record
+/// says the run is the process's: a physical address a process asserts is
+/// a claim, and this is the evidence it is checked against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VmaBacking {
+    /// Pages mapped one at a time or by a device mapping; reclaimed by
+    /// walking the page table. The kernel keeps no physical record and
+    /// accepts no physical-address claim about them.
+    Mapped,
+    /// A contiguous run of `phys_pages` frames from `phys_base`, granted
+    /// by `SYS_ALLOC_DMA`. The region's virtual span may be wider than the
+    /// run (guard pages on either side); the run is what the process may
+    /// name to the kernel.
+    DmaGrant { phys_base: u64, phys_pages: u32 },
+}
+
 /// A tracked virtual memory region in a process's address space.
 #[derive(Clone, Copy)]
 pub struct VmaEntry {
@@ -45,6 +68,8 @@ pub struct VmaEntry {
     pub base_vaddr: u64,
     /// Number of 4 KB pages in this region
     pub num_pages: u32,
+    /// The kernel's physical record for the region, if it keeps one.
+    pub backing: VmaBacking,
 }
 
 /// Per-process virtual memory area tracker.
@@ -170,16 +195,29 @@ impl VmaTracker {
         self.entries[slot] = Some(VmaEntry {
             base_vaddr,
             num_pages,
+            backing: VmaBacking::Mapped,
         });
         self.count += 1;
         true
     }
 
-    /// Allocate a virtual address region of `num_pages` pages.
+    /// Allocate a virtual address region of `num_pages` pages with no
+    /// physical record ([`VmaBacking::Mapped`]).
     ///
     /// Returns the base virtual address, or `None` if no slots remain.
     /// Does NOT map pages — the caller must do frame alloc + map_page.
     pub fn allocate_region(&mut self, num_pages: u32) -> Option<u64> {
+        self.allocate_region_with(num_pages, VmaBacking::Mapped)
+    }
+
+    /// Allocate a virtual address region of `num_pages` pages and record
+    /// `backing` for it. `SYS_ALLOC_DMA` is the caller that records a
+    /// [`VmaBacking::DmaGrant`]; everything else goes through
+    /// [`allocate_region`].
+    ///
+    /// Returns the base virtual address, or `None` if no slots remain.
+    /// Does NOT map pages — the caller must do frame alloc + map_page.
+    pub fn allocate_region_with(&mut self, num_pages: u32, backing: VmaBacking) -> Option<u64> {
         if num_pages == 0 {
             return None;
         }
@@ -198,11 +236,39 @@ impl VmaTracker {
         self.entries[slot] = Some(VmaEntry {
             base_vaddr: vaddr,
             num_pages,
+            backing,
         });
         self.count += 1;
         self.next_vaddr = vaddr + size;
 
         Some(vaddr)
+    }
+
+    /// Whether `[paddr, paddr + len)` lies inside one DMA grant recorded
+    /// for this process. This is the check behind every physical address
+    /// a process reports to the kernel: `false` for a range that touches
+    /// no grant, straddles a grant's edge, is empty, or overflows.
+    ///
+    /// Bounded by `MAX_VMAS`; pure bookkeeping, no page-table access.
+    pub fn owns_dma_range(&self, paddr: u64, len: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let Some(end) = paddr.checked_add(len) else {
+            return false;
+        };
+        self.entries.iter().flatten().any(|e| match e.backing {
+            VmaBacking::DmaGrant { phys_base, phys_pages } => {
+                let Some(grant_end) = (phys_pages as u64)
+                    .checked_mul(4096)
+                    .and_then(|size| phys_base.checked_add(size))
+                else {
+                    return false;
+                };
+                phys_base <= paddr && end <= grant_end
+            }
+            VmaBacking::Mapped => false,
+        })
     }
 
     /// Look up a VMA by its base virtual address.
@@ -1354,6 +1420,34 @@ impl ProcessTable {
         Some(&self.processes[idx].vma)
     }
 
+    /// The full `ProcessId` (slot + current generation) of the process
+    /// occupying `slot`, or `None` for an empty or out-of-range slot.
+    ///
+    /// This is how a bare slot number — the `from` of a kernel-consumed
+    /// IPC reply, for one — becomes an id that every later lookup checks
+    /// for staleness: if the occupant exits between this call and the
+    /// next, the next `resolve` sees the bumped generation and fails.
+    pub fn occupant(&self, slot: u32) -> Option<ProcessId> {
+        let idx = slot as usize;
+        if idx >= self.processes.len() {
+            return None;
+        }
+        if self.processes[idx].state != SlotState::Live {
+            return None;
+        }
+        Some(ProcessId::new(slot, self.generations[idx]))
+    }
+
+    /// Whether `[paddr, paddr + len)` lies inside a DMA grant the kernel
+    /// recorded for `process_id` (`VmaTracker::owns_dma_range`). `false`
+    /// for a stale / unknown `process_id`: a process that is gone owns
+    /// nothing.
+    pub fn owns_dma_range(&self, process_id: ProcessId, paddr: u64, len: u64) -> bool {
+        self.vma(process_id)
+            .map(|vma| vma.owns_dma_range(paddr, len))
+            .unwrap_or(false)
+    }
+
     /// Record that `process_id` registered `endpoint`. `false` for a
     /// stale / unknown `process_id` or an endpoint id past the bitmask.
     pub fn note_registered_endpoint(&mut self, process_id: ProcessId, endpoint: u32) -> bool {
@@ -1519,6 +1613,119 @@ mod tests {
         // Next allocation after MAX_VMAS fills the tracker → no free slots
         assert!(vma.allocate_region(1).is_none());
         assert_eq!(vma.count(), MAX_VMAS);
+    }
+
+    // ========================================================================
+    // DMA grant record — the evidence a process's physical-address claim
+    // is checked against.
+    // ========================================================================
+
+    #[test]
+    fn test_vma_dma_grant_contains_its_run_and_nothing_else() {
+        let mut vma = VmaTracker::new();
+        // SYS_ALLOC_DMA shape: 2 DMA pages, virtual span 4 (guards).
+        let grant_base = 0x4000_0000u64;
+        assert!(vma
+            .allocate_region_with(4, VmaBacking::DmaGrant { phys_base: grant_base, phys_pages: 2 })
+            .is_some());
+
+        // Whole run, first page, second page, an interior sub-range.
+        assert!(vma.owns_dma_range(grant_base, 8192));
+        assert!(vma.owns_dma_range(grant_base, 4096));
+        assert!(vma.owns_dma_range(grant_base + 4096, 4096));
+        assert!(vma.owns_dma_range(grant_base + 100, 16));
+
+        // One byte past either edge, a range straddling the end, a range
+        // ending exactly at the start, an empty range.
+        assert!(!vma.owns_dma_range(grant_base - 1, 4096));
+        assert!(!vma.owns_dma_range(grant_base + 4096, 4097));
+        assert!(!vma.owns_dma_range(grant_base, 8193));
+        assert!(!vma.owns_dma_range(grant_base - 4096, 4096));
+        assert!(!vma.owns_dma_range(grant_base, 0));
+
+        // The guard pages are virtual; they vouch for no physical memory.
+        assert!(!vma.owns_dma_range(grant_base - 4096, 1));
+        assert!(!vma.owns_dma_range(grant_base + 8192, 1));
+    }
+
+    #[test]
+    fn test_vma_mapped_regions_vouch_for_no_physical_address() {
+        let mut vma = VmaTracker::new();
+        let base = vma.allocate_region(4).unwrap();
+        assert!(vma.register_region(0x400000, 4));
+        // Neither the virtual addresses nor any physical address match: a
+        // Mapped region is not evidence of anything.
+        assert!(!vma.owns_dma_range(base, 4096));
+        assert!(!vma.owns_dma_range(0x400000, 4096));
+        assert!(!vma.owns_dma_range(0, 4096));
+        assert!(vma.count() == 2);
+    }
+
+    #[test]
+    fn test_vma_dma_grant_arithmetic_cannot_overflow() {
+        let mut vma = VmaTracker::new();
+        assert!(vma
+            .allocate_region_with(
+                3,
+                VmaBacking::DmaGrant { phys_base: u64::MAX - 4095, phys_pages: 1 }
+            )
+            .is_some());
+        // The grant's own end overflows: it vouches for nothing.
+        assert!(!vma.owns_dma_range(u64::MAX - 4095, 4096));
+        // A claim whose end overflows is rejected before any comparison.
+        let mut vma = VmaTracker::new();
+        assert!(vma
+            .allocate_region_with(3, VmaBacking::DmaGrant { phys_base: 0x1000, phys_pages: 1 })
+            .is_some());
+        assert!(!vma.owns_dma_range(u64::MAX, 2));
+    }
+
+    #[test]
+    fn test_vma_dma_grant_freed_is_forgotten() {
+        let mut vma = VmaTracker::new();
+        let vbase = vma
+            .allocate_region_with(3, VmaBacking::DmaGrant { phys_base: 0x8000_0000, phys_pages: 1 })
+            .unwrap();
+        assert!(vma.owns_dma_range(0x8000_0000, 4096));
+        assert!(vma.free_region(vbase).is_some());
+        assert!(!vma.owns_dma_range(0x8000_0000, 4096));
+    }
+
+    #[test]
+    fn test_occupant_carries_the_live_generation() {
+        let mut table = empty_table(2);
+        assert_eq!(table.occupant(0), None);
+        assert_eq!(table.occupant(1), None);
+        assert_eq!(table.occupant(2), None);
+        assert_eq!(table.occupant(u32::MAX), None);
+
+        let occupant_gen = 7u32;
+        table.generations[0] = occupant_gen;
+        table.processes[0] = test_descriptor();
+        let pid = table.occupant(0).unwrap();
+        assert_eq!((pid.slot(), pid.generation()), (0, occupant_gen));
+        // The id this returns resolves; a hand-built stale one does not.
+        assert!(table.slot_occupied(pid));
+        assert!(!table.slot_occupied(ProcessId::new(0, occupant_gen - 1)));
+    }
+
+    #[test]
+    fn test_owns_dma_range_is_false_for_a_stale_or_absent_process() {
+        let mut table = empty_table(2);
+        let mut desc = test_descriptor();
+        assert!(desc
+            .vma
+            .allocate_region_with(3, VmaBacking::DmaGrant { phys_base: 0x9000_0000, phys_pages: 1 })
+            .is_some());
+        table.generations[0] = 3;
+        table.processes[0] = desc;
+        let live = ProcessId::new(0, 3);
+        assert!(table.owns_dma_range(live, 0x9000_0000, 4096));
+        assert!(!table.owns_dma_range(live, 0x9000_1000, 4096));
+        // Same slot, previous incarnation: owns nothing.
+        assert!(!table.owns_dma_range(ProcessId::new(0, 2), 0x9000_0000, 4096));
+        // Empty slot: owns nothing.
+        assert!(!table.owns_dma_range(ProcessId::new(1, 0), 0x9000_0000, 4096));
     }
 
     // ========================================================================
