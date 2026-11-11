@@ -266,6 +266,7 @@ make check-assumptions       # Convention 8 numeric-const tags
 make check-deferrals         # Convention 9 Revisit-when triggers
 make check-boot-panics       # ADR-021 Phase C — no panic!/expect/etc in boot init; exempt via `// BOOT_PANIC_OK: <reason>`
 make check-fail-open         # Enforcement fails closed (ADR-006 § Divergence 2026-10-28) — no fail-open phrase in kernel/user code or comments; exempt via `// FAIL_OPEN_OK: <reason>`; baseline expected empty
+make check-doc-refs          # ASSUMPTIONS.md `file.rs#Lnnn` source refs name the symbol within ±1 line (CI-gated since b194a8b; any edit that moves a const in a cited file trips it — run it with the other line-keyed gates, `python3 tools/check-doc-refs.py --fix` re-anchors drifted refs)
 make check-banned-paths      # paths in tools/banned-paths.txt must not exist on disk
 make check-index-isolation   # STATUS.md diff >20 lines + any .rs staged → reject
 make check-lockfile          # T-1: lists added/removed Cargo.lock crates (advisory)
