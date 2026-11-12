@@ -1,0 +1,44 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-160",
+      "input": {
+        "prefix": "2001:db8:1::/64",
+        "autonomous_flag": true,
+        "valid_lifetime_seconds": 3600,
+        "preferred_lifetime_seconds": 1800,
+        "dad_traces": [
+          {
+            "conflict": false,
+            "elapsed_ms": 1000
+          },
+          {
+            "conflict": true,
+            "elapsed_ms": 500
+          }
+        ]
+      },
+      "expect": {
+        "addresses": [
+          "2001:db8:1::1",
+          "2001:db8:1::2"
+        ],
+        "states": [
+          "Preferred",
+          "Duplicate"
+        ],
+        "source_address_usable": [
+          true,
+          false
+        ]
+      },
+      "covers": [
+        "AT-net-020",
+        "INV-net-022"
+      ],
+      "source": "RFC 4861 §7.2; RFC 4862 §§5.4, 5.5"
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-040",
+      "input": {
+        "family": "ipv4",
+        "udp_length": 12,
+        "available_transport_bytes": 12,
+        "checksum": 0,
+        "endpoint_permitted": true
+      },
+      "expect": {
+        "result": "Delivered",
+        "payload_hex": "74657374"
+      },
+      "covers": [
+        "AT-net-005",
+        "INV-net-006"
+      ],
+      "source": "RFC 768: IPv4 checksum omission is permitted"
+    },
+    {
+      "id": "NET-V-041",
+      "input": {
+        "family": "ipv4",
+        "udp_length": 13,
+        "available_transport_bytes": 12,
+        "checksum": 0,
+        "endpoint_permitted": true
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "udp_length_exceeds_packet",
+        "socket_events": 0
+      },
+      "covers": [
+        "AT-net-005",
+        "INV-net-006"
+      ],
+      "source": "RFC 768"
+    },
+    {
+      "id": "NET-V-042",
+      "input": {
+        "family": "ipv6",
+        "udp_length": 12,
+        "available_transport_bytes": 12,
+        "checksum": 0,
+        "endpoint_permitted": true
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "ipv6_zero_checksum",
+        "socket_events": 0
+      },
+      "covers": [
+        "AT-net-005",
+        "INV-net-020"
+      ],
+      "source": "RFC 8200 §8.1"
+    },
+    {
+      "id": "NET-V-043",
+      "input": {
+        "family": "ipv4",
+        "udp_length": 12,
+        "available_transport_bytes": 12,
+        "source": "192.0.2.1",
+        "destination": "192.0.2.2",
+        "source_port": 40000,
+        "destination_port": 7,
+        "checksum": "nonzero-invalid",
+        "endpoint_permitted": true
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "udp_checksum",
+        "socket_events": 0
+      },
+      "covers": [
+        "AT-net-005",
+        "INV-net-006"
+      ],
+      "source": "RFC 768 checksum over IPv4 pseudo-header and UDP payload"
+    },
+    {
+      "id": "NET-V-044",
+      "input": {
+        "family": "ipv4",
+        "udp_length": 12,
+        "available_transport_bytes": 12,
+        "source": "192.0.2.1",
+        "destination": "192.0.2.2",
+        "source_port": 40000,
+        "destination_port": 7,
+        "checksum": "valid",
+        "endpoint_permitted": true,
+        "payload_hex": "74657374"
+      },
+      "expect": {
+        "result": "Delivered",
+        "payload_hex": "74657374"
+      },
+      "covers": [
+        "AT-net-005",
+        "INV-net-006"
+      ],
+      "source": "RFC 768 known-answer pseudo-header checksum case"
+    }
+  ]
+}

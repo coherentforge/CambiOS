@@ -1,0 +1,41 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-010",
+      "input": {
+        "ipv4_header_hex": "450000140001000040110000c0000201c6336401",
+        "transport": "udp"
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "header_checksum",
+        "transport_events": 0
+      },
+      "covers": [
+        "AT-net-002",
+        "INV-net-002",
+        "INV-net-013"
+      ],
+      "source": "RFC 791 §3.1; checksum field intentionally zero"
+    },
+    {
+      "id": "NET-V-011",
+      "input": {
+        "ipv4_header_hex": "450000130001000040110000c0000201c6336401",
+        "available_bytes": 20
+      },
+      "expect": {
+        "result": "Malformed",
+        "reason": "total_length_less_than_header",
+        "transport_events": 0
+      },
+      "covers": [
+        "AT-net-002",
+        "INV-net-002"
+      ],
+      "source": "RFC 791 §3.1"
+    }
+  ]
+}

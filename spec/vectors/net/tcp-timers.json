@@ -1,0 +1,49 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-070",
+      "input": {
+        "initial_rto_ms": 1000,
+        "retransmission_timeouts": 4,
+        "ack_rtt_sample_ms": null
+      },
+      "expect": {
+        "rto_ms_after_each_timeout": [
+          2000,
+          4000,
+          8000,
+          16000
+        ],
+        "rto_never_exceeds_ms": 60000
+      },
+      "covers": [
+        "AT-net-009",
+        "INV-net-010"
+      ],
+      "source": "RFC 6298 §§2.1, 5.5; 60,000 ms is the proposed CambiOS cap"
+    },
+    {
+      "id": "NET-V-071",
+      "input": {
+        "algorithm": "CUBIC",
+        "C": 0.4,
+        "beta": 0.7,
+        "W_max_mss": 100,
+        "loss_event": true,
+        "sample_time_s": 4.217163326508746
+      },
+      "expect": {
+        "W_after_loss_mss": 70,
+        "K_s": 4.217163326508746,
+        "W_cubic_at_K_mss": 100
+      },
+      "covers": [
+        "AT-net-009",
+        "INV-net-010"
+      ],
+      "source": "RFC 9438 §4.1; K = cube_root(W_max × (1 − beta) / C), W_cubic(K) = W_max"
+    }
+  ]
+}

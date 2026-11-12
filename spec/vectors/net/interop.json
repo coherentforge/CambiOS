@@ -1,0 +1,75 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-140",
+      "input": {
+        "peer": "Linux",
+        "family": "ipv4",
+        "protocol": "tcp",
+        "trace": [
+          "active_open",
+          "peer_syn_ack",
+          "ack",
+          "send_hex:74657374",
+          "peer_ack",
+          "peer_fin",
+          "local_close"
+        ]
+      },
+      "expect": {
+        "connected_once": true,
+        "received_stream_hex": "74657374",
+        "duplicate_stream_bytes": 0,
+        "invalid_checksum_drops": 0,
+        "close_completes": true
+      },
+      "covers": [
+        "AT-net-018",
+        "INV-net-002",
+        "INV-net-006",
+        "INV-net-007",
+        "INV-net-008"
+      ],
+      "source": "RFC 9293 §§3.4–3.6; RFC 791; trace is an executable conformance scenario, peer implementation is comparison only"
+    },
+    {
+      "id": "NET-V-141",
+      "input": {
+        "peer": "BSD-derived",
+        "family": "ipv6",
+        "protocols": [
+          "tcp",
+          "udp",
+          "icmpv6"
+        ],
+        "trace": [
+          "neighbor_solicitation",
+          "neighbor_advertisement",
+          "tcp_active_open",
+          "send_hex:74657374",
+          "udp_send_hex:74657374",
+          "peer_fin",
+          "local_close"
+        ]
+      },
+      "expect": {
+        "neighbor_resolution_completes": true,
+        "received_tcp_stream_hex": "74657374",
+        "udp_datagram_hex": "74657374",
+        "tcp_duplicate_stream_bytes": 0,
+        "ipv6_udp_checksum_failures": 0,
+        "close_completes": true
+      },
+      "covers": [
+        "AT-net-018",
+        "INV-net-003",
+        "INV-net-006",
+        "INV-net-007",
+        "INV-net-008"
+      ],
+      "source": "RFC 8200; RFC 4861; RFC 4443; RFC 9293; Linux/BSD peers are comparison evidence only"
+    }
+  ]
+}
