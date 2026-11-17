@@ -215,6 +215,10 @@ Narrative walkthroughs that follow a concrete thing through the system, useful i
 - [04 — Why a Buggy Driver Can't Kill You](docs/manuals/04-driver-isolation.md): microkernel isolation told through consequences
 - [05 — From NTP Query to UTC Clock](docs/manuals/05-ntp-query.md): a UDP packet end-to-end through the network stack
 
+### Draft specifications
+
+- [CambiOS network stack](spec/crates/net.md): 1986-format review draft and clean-room conformance contract
+
 ---
 
 ## Design Documents

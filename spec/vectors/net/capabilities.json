@@ -1,0 +1,64 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-100",
+      "input": {
+        "principal": "P1",
+        "operation": "tcp_listen",
+        "endpoint": "0.0.0.0:443",
+        "permitted": false
+      },
+      "expect": {
+        "result": "Denied",
+        "frames_emitted": 0,
+        "listener_created": false
+      },
+      "covers": [
+        "AT-net-012",
+        "INV-net-014",
+        "INV-net-019"
+      ],
+      "source": "CambiOS capability boundary"
+    },
+    {
+      "id": "NET-V-101",
+      "input": {
+        "principal": "P1",
+        "operation": "tcp_listen",
+        "endpoint": "0.0.0.0:443",
+        "permitted": true
+      },
+      "expect": {
+        "result": "Ok",
+        "listener_created": true
+      },
+      "covers": [
+        "AT-net-012",
+        "INV-net-014",
+        "INV-net-019"
+      ],
+      "source": "CambiOS capability boundary"
+    },
+    {
+      "id": "NET-V-102",
+      "input": {
+        "remote_probe": "unauthenticated",
+        "endpoints": [
+          "absent-listener",
+          "policy-denied-listener"
+        ]
+      },
+      "expect": {
+        "protected_state_disclosed": false,
+        "response_class": "common-rfc-required-class"
+      },
+      "covers": [
+        "AT-net-017",
+        "INV-net-019"
+      ],
+      "source": "RFC 9293; B-17"
+    }
+  ]
+}

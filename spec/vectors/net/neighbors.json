@@ -1,0 +1,33 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-030",
+      "input": {
+        "operator_pinned": {
+          "interface": 1,
+          "ip": "192.0.2.1",
+          "mac": "02:00:00:00:00:01"
+        },
+        "arp_reply": {
+          "interface": 1,
+          "sender_ip": "192.0.2.1",
+          "sender_mac": "02:00:00:00:00:99"
+        }
+      },
+      "expect": {
+        "pinned_mapping": {
+          "ip": "192.0.2.1",
+          "mac": "02:00:00:00:00:01"
+        },
+        "principal_policy_changed": false
+      },
+      "covers": [
+        "AT-net-004",
+        "INV-net-005"
+      ],
+      "source": "RFC 826; operator-pinned address rule"
+    }
+  ]
+}

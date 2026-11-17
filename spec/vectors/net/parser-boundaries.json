@@ -1,0 +1,54 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-090",
+      "input": {
+        "case": "every-length-field-at-0-1-header-minus-1-header-equal-packet-equal-packet-plus-1",
+        "protocols": [
+          "ethernet",
+          "arp",
+          "ipv4",
+          "ipv6",
+          "udp",
+          "tcp",
+          "dns",
+          "dhcp"
+        ]
+      },
+      "expect": {
+        "outcome": "valid_packet_or_closed_error",
+        "panic": false,
+        "out_of_bounds": false,
+        "unbounded_work": false
+      },
+      "covers": [
+        "AT-net-011",
+        "INV-net-013"
+      ],
+      "source": "all length fields listed in §4; exhaustive finite boundary partition"
+    },
+    {
+      "id": "NET-V-091",
+      "input": {
+        "tcp_seq": 4294967295,
+        "tcp_len": 2,
+        "peer_window": 16,
+        "crosses_u32_wrap": true
+      },
+      "expect": {
+        "comparison": "RFC_serial_arithmetic",
+        "panic": false,
+        "unchecked_wrap": false
+      },
+      "covers": [
+        "AT-net-011",
+        "INV-net-007",
+        "INV-net-008",
+        "INV-net-013"
+      ],
+      "source": "RFC 9293 §3.4.2"
+    }
+  ]
+}

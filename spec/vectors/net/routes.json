@@ -1,0 +1,58 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-150",
+      "input": {
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "next_hop": "192.0.2.1",
+            "interface": 3,
+            "metric": 1
+          },
+          {
+            "prefix": "192.0.2.0/24",
+            "next_hop": null,
+            "interface": 2,
+            "metric": 10
+          },
+          {
+            "prefix": "192.0.2.0/24",
+            "next_hop": null,
+            "interface": 1,
+            "metric": 10
+          },
+          {
+            "prefix": "192.0.2.0/24",
+            "next_hop": null,
+            "interface": 4,
+            "metric": 5
+          }
+        ],
+        "destinations": [
+          "192.0.2.8",
+          "198.51.100.2"
+        ]
+      },
+      "expect": {
+        "egress_interfaces": [
+          4,
+          3
+        ],
+        "selection_order": [
+          "longest_prefix",
+          "lowest_metric",
+          "lowest_interface_id"
+        ],
+        "forwarding_for_nonlocal_destination": false
+      },
+      "covers": [
+        "AT-net-019",
+        "INV-net-021"
+      ],
+      "source": "CambiOS host-route policy; longest-prefix route selection profile"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 CambiOS contributors
+schema: cambios-spec-provenance-draft-v1
+artifact:
+  title: CambiOS network stack specification
+  paths:
+    - README.md
+    - spec/crates/net.md
+    - spec/claims/net.md
+    - spec/vectors/net/index.json
+    - spec/vectors/net/schema.json
+    - spec/vectors/net/frames.json
+    - spec/vectors/net/ipv4.json
+    - spec/vectors/net/ipv6.json
+    - spec/vectors/net/neighbors.json
+    - spec/vectors/net/udp.json
+    - spec/vectors/net/tcp-open-close.json
+    - spec/vectors/net/tcp-reset-defense.json
+    - spec/vectors/net/tcp-timers.json
+    - spec/vectors/net/resource-limits.json
+    - spec/vectors/net/parser-boundaries.json
+    - spec/vectors/net/capabilities.json
+    - spec/vectors/net/dns.json
+    - spec/vectors/net/dhcp.json
+    - spec/vectors/net/reassembly.json
+    - spec/vectors/net/interop.json
+    - spec/vectors/net/routes.json
+    - spec/vectors/net/slaac.json
+pathway:
+  technique_provenance_template: Collaboration.Meta.EmbedTechniqueProvenance@v1
+  run_template: Collaboration.Attestation.RecordPathwayRun@v1
+  commit_binding_template: Pathways.Provenance.BindCommitToPathwayRun@v1
+  co_originator_attribution_status: unconfirmed
+  run_status: not_recorded
+  run_status_reason: >-
+    The authoring actions for this draft were not executed through the pathway
+    runner before the attribution method was located. No retrospective run or
+    script hash is fabricated.
+  commit_binding_status: not_bound
+  commit_binding_status_reason: >-
+    The required PathwayRun was not recorded for the authoring work, so this
+    commit cannot yet be honestly bound to a run. A later review commit must be
+    generated through the canonical pathway and carry its verified run binding.
+  required_binding:
+    commit_trailer: Pathway-Run
+    git_note_ref: refs/notes/pathways
+    verification: Re-derive commit tree hash and canonical run content hash;
+      both bindings must agree.
+aqua:
+  attestation_status: not_created
+  reason: >-
+    No CambiOS Aqua signing identity was invoked for this review draft. The
+    source-to-claim evidence mapping in the spec is ordinary review metadata,
+    not a cryptographic Aqua attestation.
+  required_before_claiming_attested:
+    - Signed Aqua sidecar over the finalized artifact hash
+    - Signer identity and authorship/lineage fields verified against the chain
+    - Sidecar hash recorded with the commit-bound PathwayRun
+human_attribution:
+  preparing_agent: OpenAI Codex
+  requested_reviewer:
+    name: Jason Ricca
+    github: riccajason
+  project_authority: CambiOS maintainers
+  note: Reviewer attribution is not co-authorship or an Aqua signature.
