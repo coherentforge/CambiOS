@@ -41,6 +41,10 @@
 #                              moves a cited constant fails here; repair
 #                              with `python3 tools/check-doc-refs.py --fix`
 #                              and stage docs/ASSUMPTIONS.md with it.
+#   check-lists:               Every file that repeats part of a build
+#                              list (architectures, user crates, proof
+#                              crates) agrees with the Makefile's "Build
+#                              lists" section. No baseline.
 #   check-status-freshness:    STATUS.md `last_synced_to_code:` must be
 #                              within 7 days of today. Advisory only
 #                              (exit 0; warn-but-pass first iteration).
@@ -61,4 +65,5 @@ python3 tools/check-lockfile-additions.py
 python3 tools/check-unsafe-coverage.py
 python3 tools/check-fail-open.py
 python3 tools/check-doc-refs.py
+python3 tools/check-lists.py
 python3 tools/check-status-freshness.py
