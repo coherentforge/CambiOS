@@ -2040,11 +2040,17 @@ sandbox-pull:
 # Default model is the one the sandbox exists for. Claude Code's local model
 # table may not list it (the /model picker omits it and `--model` prints an
 # "unrecognized model" warning), but the API serves it; `modelUsage` in the
-# JSON output is the authoritative record of what answered.
+# JSON output is the authoritative record of what answered. The run is
+# detached inside the guest; `sandbox-fetch RUN=<stamp>` collects one whose
+# wait was interrupted (host slept, Ctrl-C).
 SANDBOX_MODEL ?= claude-mythos-5-2
 sandbox-run:
 	@test -n "$(PROMPT)" || { echo "usage: make sandbox-run PROMPT=<file> [MODEL=<id>] [JSON=1]" >&2; exit 2; }
 	@$(SANDBOX_SESSION_ENV) SANDBOX_MODEL=$(or $(MODEL),$(SANDBOX_MODEL)) $(SANDBOX_SESSION) run $(if $(JSON),--json,) $(PROMPT)
+
+sandbox-fetch:
+	@test -n "$(RUN)" || { echo "usage: make sandbox-fetch RUN=<stamp>   (stamps: ls ~/sandbox/runs)" >&2; exit 2; }
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) fetch $(RUN)
 
 sandbox-status:
 	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) status

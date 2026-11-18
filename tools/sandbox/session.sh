@@ -16,6 +16,7 @@
 #   session.sh ssh [CMD]   shell into the current session as `agent`
 #   session.sh run [--model M] [--json] [FILE]
 #                          hand one task (FILE or stdin) to the agent inside
+#   session.sh fetch STAMP wait for / collect a run whose `run` was interrupted
 #   session.sh pull        fetch refs/heads/sandbox/* from the exchange
 #   session.sh status      VMs, current session, proxy, last decisions
 #
@@ -36,7 +37,10 @@ REPO="${REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 EXCHANGE="$SANDBOX_HOME/exchange.git"
 KEY="$SANDBOX_HOME/id_sandbox"
 CURRENT="$SANDBOX_HOME/session.current"
-SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+# ServerAlive: a dead peer is noticed in about a minute. Without it the first
+# detached-run wait sat on macOS's two-hour TCP keepalive (task 001).
+SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+          -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 # Mirrors SANDBOX_SOFTNET_POLICY in the Makefile: stateless default deny,
 # SSH in from the host, one TCP port out to the host (the proxy).
 POLICY=(--net-softnet-block=0.0.0.0/0 "--net-softnet-allow=in proto tcp @host port 22,out proto tcp @host port $PROXY_PORT")
@@ -45,6 +49,10 @@ POLICY=(--net-softnet-block=0.0.0.0/0 "--net-softnet-allow=in proto tcp @host po
 BOOT_WAIT_S=120
 # TUNING: how long an in-guest poweroff may take before `down` gives up.
 STOP_WAIT_S=90
+# TUNING: how often `run`/`fetch` ask the guest whether a detached run has
+# finished. Each poll is one SSH connection; a review run takes minutes to
+# hours, so 15 s costs nothing and keeps the answer prompt.
+RUN_POLL_S=15
 
 die() { echo "session.sh: $*" >&2; exit 1; }
 log() { printf '=== %s\n' "$*"; }
@@ -100,7 +108,10 @@ cmd_up() {
 
   log "mount exchange share, fast-forward guest checkout"
   ssh_as admin "$ip" 'mountpoint -q /mnt/tart || { sudo mkdir -p /mnt/tart && sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/tart; }'
-  ssh_as agent "$ip" 'cd ~/cambios && git fetch --quiet /mnt/tart/exchange main && git checkout --quiet -B main FETCH_HEAD && git log --oneline -1'
+  # `checkout -- .` after the branch switch: the golden's `cargo fetch`
+  # rewrote several Cargo.lock files, and the agent's first `git status`
+  # should show a clean tree, not provisioning residue (task 001).
+  ssh_as agent "$ip" 'cd ~/cambios && git fetch --quiet /mnt/tart/exchange main && git checkout --quiet -B main FETCH_HEAD && git checkout --quiet -- . && git log --oneline -1'
 
   if [ -r "$CREDENTIAL" ]; then
     log "credential -> agent (~/.cambios-sandbox-env, 600)"
@@ -163,11 +174,22 @@ cmd_status() {
 }
 
 # run [--model M] [--json] [PROMPT_FILE]: hand one task to the agent inside
-# the current session and print its answer. The prompt comes from the file or
-# from stdin; it reaches `claude -p` on stdin, so no quoting crosses the SSH
-# hop. The VM is the containment, so the agent runs with permission prompts
-# bypassed; everything it does stays on the clone, and code comes back only
-# as refs/heads/sandbox/*. Each run is kept under $SANDBOX_HOME/runs/.
+# the current session and print its answer. The prompt (file or stdin) is
+# copied to the guest as ~/runs/STAMP.prompt and `claude -p` runs DETACHED
+# there (setsid, stdin/stdout/stderr/exit status all under ~/runs/STAMP.*);
+# the host polls for the exit file over fresh SSH connections and copies the
+# four files to $SANDBOX_HOME/runs/ when it appears. The VM is the
+# containment, so the agent runs with permission prompts bypassed;
+# everything it does stays on the clone, and code comes back only as
+# refs/heads/sandbox/*.
+#
+# Why detached (task 001, 2026-11-18): the first design piped the prompt
+# through one SSH session and tee'd stdout. The run hit the subscription's
+# session limit six minutes in, claude went silent, macOS's two-hour TCP
+# keepalive then declared the idle connection dead, sshd hung up on the
+# process, and nothing of the run reached the host. A detached run survives
+# the host sleeping, the SSH hop dying, and a wait interrupted with Ctrl-C:
+# `fetch STAMP` collects it later.
 cmd_run() {
   local name; name=$(current)
   [ -n "$name" ] || die "no current session"
@@ -186,7 +208,44 @@ cmd_run() {
   local args="-p --output-format $fmt --permission-mode bypassPermissions"
   [ -n "$model" ] && args="$args --model $model"
   log "run $stamp (model: ${model:-default}) -> $dir/$stamp.out"
-  ssh "${SSH_OPTS[@]}" "agent@$ip" "bash -lc 'cd ~/cambios && claude $args'" < "$dir/$stamp.prompt" | tee "$dir/$stamp.out"
+  ssh_as agent "$ip" 'mkdir -p ~/runs'
+  scp "${SSH_OPTS[@]}" -q "$dir/$stamp.prompt" "agent@$ip:runs/$stamp.prompt"
+  # setsid + nohup + no inherited fds: the process must outlive this SSH
+  # session. The exit file is written last, so its presence means the
+  # output files are complete.
+  ssh_as agent "$ip" "setsid nohup bash -lc 'cd ~/cambios && claude $args < ~/runs/$stamp.prompt > ~/runs/$stamp.out 2> ~/runs/$stamp.err; echo \$? > ~/runs/$stamp.exit' >/dev/null 2>&1 </dev/null &"
+  cmd_fetch "$stamp"
+}
+
+# fetch STAMP: wait until the detached run STAMP has written its exit file,
+# copy its files to $SANDBOX_HOME/runs/, print the answer, exit with the
+# agent's status. Safe to interrupt and repeat. A poll that cannot reach the
+# guest (host asleep, bridge gone) is not a verdict; two consecutive answers
+# of "no claude process and no exit file" are.
+cmd_fetch() {
+  local stamp=${1:-}; [ -n "$stamp" ] || die "fetch: STAMP required"
+  local name; name=$(current)
+  [ -n "$name" ] || die "no current session"
+  local dir="$SANDBOX_HOME/runs"; mkdir -p "$dir"
+  local probe="if test -f ~/runs/$stamp.exit; then echo done; elif pgrep -u agent -x claude >/dev/null; then echo running; else echo dead; fi"
+  local ip state dead=0
+  log "waiting for $stamp (poll ${RUN_POLL_S}s; Ctrl-C and 'fetch $stamp' later is safe)"
+  while true; do
+    ip=$(vm_ip "$name" 2>/dev/null || true)
+    state=$([ -n "$ip" ] && ssh_as agent "$ip" "$probe" 2>/dev/null || echo unreachable)
+    case "$state" in
+      done) break ;;
+      dead) dead=$((dead + 1)); [ $dead -ge 2 ] && die "run $stamp: no claude process and no exit file on the guest" ;;
+      *) dead=0 ;;
+    esac
+    sleep "$RUN_POLL_S"
+  done
+  scp "${SSH_OPTS[@]}" -q "agent@$ip:runs/$stamp.out" "agent@$ip:runs/$stamp.err" "agent@$ip:runs/$stamp.exit" "$dir/"
+  cat "$dir/$stamp.out"
+  local rc; rc=$(tr -dc 0-9 < "$dir/$stamp.exit")
+  [ -s "$dir/$stamp.err" ] && log "stderr ($(wc -l < "$dir/$stamp.err" | tr -d ' ') lines) in $dir/$stamp.err"
+  log "run $stamp exit ${rc:-?}"
+  return "${rc:-1}"
 }
 
 case "${1:-}" in
@@ -194,6 +253,7 @@ case "${1:-}" in
   down) cmd_down ;;
   ssh) shift; cmd_ssh "$@" ;;
   run) shift; cmd_run "$@" ;;
+  fetch) shift; cmd_fetch "$@" ;;
   pull) cmd_pull ;;
   status) cmd_status ;;
   *) sed -n '5,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
