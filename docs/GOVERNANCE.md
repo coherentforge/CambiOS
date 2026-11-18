@@ -89,9 +89,9 @@ If the project's current leader becomes unable to continue (illness, death, or v
 
 ## Open-Source Status
 
-CambiOS is developed in an open repository under a permissive license (Apache 2.0, MIT, or a combination — finalized before the first canonical release). Open development is load-bearing for the project's trust model: users can audit the code, contributors can inspect the architecture, and the project's commitments are verifiable rather than merely stated.
+CambiOS is developed in an open repository under the GNU Affero General Public License, version 3 or later. The user-space system library (`user/libsys/`) is under the Mozilla Public License 2.0, so that an application linking it can choose its own license. Open development is load-bearing for the project's trust model: users can audit the code, contributors can inspect the architecture, and the project's commitments are verifiable rather than merely stated.
 
-The project's default is open source and expects to stay that way indefinitely. The license is chosen to maximize user freedom and minimize friction for adoption.
+The project's default is open source and expects to stay that way indefinitely. The licenses are chosen to keep the system, and every modification to it, open, while leaving applications free to choose their own terms.
 
 ## Cross-References
 

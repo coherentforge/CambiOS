@@ -1,12 +1,13 @@
-Copyright (C) 2024-2026 Jason Ricca. All rights reserved.
+CambiOS
 
-CambiOS Microkernel Operating System
+Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors.
 
-All source code, documentation, and associated files in this repository are
-the intellectual property of Jason Ricca unless otherwise noted.
+CambiOS is free software, licensed under the GNU Affero General Public
+License, version 3 or (at your option) any later version. The full text
+is in LICENSE. Files under user/libsys/ are licensed under the Mozilla
+Public License, version 2.0; the full text is in user/libsys/LICENSE.
 
-No license is currently granted for use, modification, or distribution of
-this software. This notice establishes authorship and ownership. A formal
-license will be selected and applied in the future.
-
-For inquiries, contact the author.
+Each source file names its license in an SPDX-License-Identifier header,
+and that header governs the file. Contributors keep the copyright in
+what they contribute, and certify their right to submit it with the
+sign-off described in CONTRIBUTING.md.
