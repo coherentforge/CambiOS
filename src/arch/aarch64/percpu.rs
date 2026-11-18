@@ -338,7 +338,8 @@ mod tests {
     #[test]
     fn test_percpu_array_size() {
         // The static array should have MAX_CPUS entries
-        // SAFETY: Read-only access to check array length at compile time
-        assert_eq!(unsafe { PER_CPU_DATA.len() }, MAX_CPUS);
+        // A raw pointer to the array carries its length; no reference to
+        // the mutable static is formed.
+        assert_eq!((&raw const PER_CPU_DATA as *const [PerCpu]).len(), MAX_CPUS);
     }
 }

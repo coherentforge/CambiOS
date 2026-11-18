@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:402:eventually
-CLAUDE.md:420:deferred
+CLAUDE.md:407:eventually
+CLAUDE.md:425:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
@@ -73,8 +73,8 @@ src/arch/aarch64/mod.rs:159:placeholder
 src/arch/aarch64/mod.rs:161:placeholder
 src/arch/aarch64/mod.rs:163:placeholder
 src/arch/aarch64/mod.rs:165:placeholder
-src/arch/aarch64/mod.rs:517:placeholder
-src/arch/aarch64/mod.rs:1164:eventually
+src/arch/aarch64/mod.rs:519:placeholder
+src/arch/aarch64/mod.rs:1167:eventually
 src/arch/riscv64/mod.rs:119:placeholder
 src/arch/riscv64/mod.rs:121:placeholder
 src/arch/riscv64/mod.rs:123:placeholder

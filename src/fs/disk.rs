@@ -2689,7 +2689,7 @@ mod tests {
         // Format then corrupt the on-disk bitmap: claim block 5 is
         // occupied on disk while the journal (still empty) reconstructs
         // an all-free bitmap. Mount must surface the divergence.
-        let mut store = fresh_store();
+        let store = fresh_store();
         let bitmap_lba = store.superblock.bitmap_region_lba;
         // Take ownership of the device through into_device.
         let mut dev = store.into_device();

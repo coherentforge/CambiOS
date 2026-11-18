@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn format_then_mount_roundtrip() {
-        let mut backend = fresh_backend();
+        let backend = fresh_backend();
         let sb_before = *backend.superblock();
         let dev = backend.into_device();
         // Re-open: should mount, bump generation, succeed.
@@ -2148,7 +2148,7 @@ mod tests {
         // fresh_backend) ... actually no, we want slot 0 to read as
         // occupied at mount but corrupt at get-time. Do the
         // corruption AFTER mount has populated the inodes set.
-        let mut backend = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
+        let backend = PosixFsBackend::open_or_format(dev, 4, 32, 0).unwrap();
         // Reach into the device through into_device → mutate → re-open
         // would re-validate; instead use the existing device through
         // a fresh write that the in-memory set doesn't know about.
@@ -2517,7 +2517,7 @@ mod tests {
     fn create_inode_skips_already_occupied_slots() {
         // Pre-populate slot 0 via direct-write, then ensure
         // create_inode picks slot 1.
-        let mut backend = fresh_backend();
+        let backend = fresh_backend();
         let mut dev = backend.into_device();
         write_inode(&mut dev, 0, &make_inode(0, 0));
         let mut backend = PosixFsBackend::open_or_format(dev, 8, 64, 0).unwrap();

@@ -250,6 +250,7 @@ extern "C" {
     pub fn context_switch(current_ctx: *mut CpuContext, next_ctx: *const CpuContext) -> !;
 }
 
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     // =================================================================
     // context_save(ctx: *mut CpuContext)
@@ -443,6 +444,7 @@ pub fn cpu_to_saved_context(cpu: &CpuContext, saved: &mut SavedContext) {
 // The timer IRQ comes through the IRQ vector from the current EL (EL1)
 // using SP_EL0 or SP_EL1 depending on SPSel.
 
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     // =================================================================
     // Exception vector table — installed at VBAR_EL1
@@ -622,6 +624,7 @@ core::arch::global_asm!(
 // Synchronous exception stubs — fault dispatching
 // ============================================================================
 
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     // =================================================================
     // sync_el0_stub: Synchronous exception from EL0 (user mode)
@@ -1217,6 +1220,7 @@ extern "C" {
     pub fn yield_save_and_switch();
 }
 
+#[cfg(not(any(fuzzing, test)))]
 core::arch::global_asm!(
     ".global yield_save_and_switch",
     "yield_save_and_switch:",
@@ -1319,6 +1323,55 @@ core::arch::global_asm!(
     "msr daifclr, #2",             // unmask IRQs
     "ret",                          // return to caller of yield_save_and_switch
 );
+
+// ============================================================================
+// Asm symbol stubs — satisfy linker for non-kernel targets (fuzz + host test)
+// ============================================================================
+//
+// Same shape as `arch::x86_64::fuzz_asm_stubs`: the `global_asm!` blocks
+// above are gated out of cargo-fuzz (`--cfg fuzzing`) and host unit tests
+// (`cfg(test)` on aarch64-apple-darwin), because the directives are
+// ELF-flavoured — the Mach-O assembler rejects `b.eq` to a non-local label
+// and the fixups the vector table needs. Nothing in a host test reaches
+// these symbols; the linker only needs them to exist.
+
+#[cfg(any(fuzzing, test))]
+mod fuzz_asm_stubs {
+    use crate::scheduler::CpuContext;
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn context_save(_ctx: *mut CpuContext) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn context_restore(_ctx: *const CpuContext) -> ! {
+        unreachable!("context_restore called outside kernel target")
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn context_switch(
+        _current_ctx: *mut CpuContext,
+        _next_ctx: *const CpuContext,
+    ) -> ! {
+        unreachable!("context_switch called outside kernel target")
+    }
+
+    /// Stands in for the 2 KiB vector table; `syscall::init` takes its
+    /// address and never runs on a host.
+    #[unsafe(no_mangle)]
+    pub static exception_vector_table: u8 = 0;
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn timer_isr_stub() {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn sync_el0_stub() {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn sync_el1_stub() {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn yield_save_and_switch() {}
+}
 
 /// Rust handler for voluntary context switch.
 ///

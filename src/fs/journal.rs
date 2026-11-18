@@ -1012,6 +1012,7 @@ mod tests {
         let encoded = super::encode_record(&rec).unwrap();
         let len = encoded.len() as u64;
         let min_pad = (super::RECORD_HEADER_BYTES + super::RECORD_CHECKSUM_BYTES) as u64;
+        assert!(5 < min_pad, "the sub-pad gap below must be smaller than min_pad");
         // After append 1, head = len. Pick region so remaining is in
         // [len, len + min_pad): region - len = len + 5, i.e.
         // region = 2*len + 5. Sub-pad gap = 5 < min_pad.
@@ -1172,7 +1173,7 @@ mod tests {
         // post_cp records. Note the checkpoint's byte offset.
         let mut writer = small_journal();
         let mut disk = alloc::vec![0u8; writer.region_bytes() as usize];
-        let mut write = |w: &mut super::Journal, d: &mut [u8], r: &JournalRecord| {
+        let write = |w: &mut super::Journal, d: &mut [u8], r: &JournalRecord| {
             let encoded = super::encode_record(r).unwrap();
             let app = w.append(&encoded).unwrap();
             if let Some((pad_at, pad_bytes)) = app.pad_at {
@@ -1238,7 +1239,7 @@ mod tests {
 
         let mut writer = super::Journal::new(region).unwrap();
         let mut disk = alloc::vec![0u8; region as usize];
-        let mut commit = |w: &mut super::Journal, d: &mut [u8], r: &JournalRecord| {
+        let commit = |w: &mut super::Journal, d: &mut [u8], r: &JournalRecord| {
             let encoded = super::encode_record(r).unwrap();
             let app = w.append(&encoded).unwrap();
             if let Some((pad_at, pad_bytes)) = app.pad_at {
