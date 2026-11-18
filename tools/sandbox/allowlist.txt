@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+#
+# Hostnames the sandbox VM may reach, one per line, exact match, port 443 only.
+# Read by tools/sandbox/allowlist-proxy.py (re-read on SIGHUP).
+# Everything else is denied and logged. Keep this list as short as the tool
+# inside the VM can live with; the deny log says what it tried.
+api.anthropic.com

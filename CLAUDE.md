@@ -310,6 +310,11 @@ make run-quiet DISK_BUS=nvme     # same disk image behind a QEMU NVMe controller
 make img-usb [PROFILE=headless]  # bare-metal USB image: iso_root + the signed manifest for PROFILE (headless = text shell on the framebuffer console, with the shell rebuilt `--features headless-input` and swapped in so it owns input endpoint 30 and reads the USB keyboard from usb-host; framebuffer-fallback = scanout-limine + compositor + terminal-window, keyboard via usb-host HID → compositor). `make usb DEVICE=/dev/diskN PROFILE=…` writes it.
 make usb DEVICE=/dev/diskN PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-hold   # diagnostic stick for a machine with no serial: the kernel text console keeps mirroring over the scanout driver after the handoff, so the boot log (policy denials, `[sched]` counters, service lines) stays readable on the panel when the GUI chain fails silently. Garbled by design; never ship it.
 
+# Sandbox VM egress (stage G, notes/stage-g-mythos-sandbox-vm.md): allow-list proxy on the Tart bridge
+make sandbox-net-up              # start tools/sandbox/allowlist-proxy.py bound to bridge100 (run after the VM is up); log + pidfile under ~/sandbox
+make sandbox-net-down            # stop it
+make sandbox-net-status          # pid, listener, last 10 decisions; $(SANDBOX_SOFTNET_POLICY) is the `tart run` flag set that pairs with it
+
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols
 

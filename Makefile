@@ -1965,3 +1965,47 @@ clean:
 	cargo clean
 	rm -f $(ISO) $(IMG_X86) $(IMG_AARCH64) $(INITRD_RISCV64)
 	rm -rf iso_root initrd_root_riscv64
+
+# Sandbox VM egress control (stage G rung 2). The Mythos tool runs inside a
+# Tart Linux VM under softnet default-deny; the only flow it may open is TCP
+# to the host's allow-list proxy, which tunnels CONNECT to the hostnames in
+# tools/sandbox/allowlist.txt (port 443 only) and logs every decision.
+# `sandbox-net-up` must run after the VM is up: the proxy binds to the Tart
+# bridge (bridge100), which only exists while a VM runs. Nothing here needs
+# sudo; softnet's one-time SUID bit is set by `tart run` itself.
+SANDBOX_HOME ?= $(HOME)/sandbox
+SANDBOX_PROXY_PORT ?= 3128
+SANDBOX_PROXY := tools/sandbox/allowlist-proxy.py
+SANDBOX_ALLOWLIST := tools/sandbox/allowlist.txt
+SANDBOX_PROXY_PID := $(SANDBOX_HOME)/proxy.pid
+SANDBOX_PROXY_LOG := $(SANDBOX_HOME)/proxy.log
+# Softnet policy for `tart run`: stateless default deny, then exactly two
+# stateful flows - SSH from the host into the VM, and the VM to the proxy.
+# `@host` is the bridge gateway, which softnet draws afresh on every run.
+SANDBOX_SOFTNET_POLICY := --net-softnet-block=0.0.0.0/0 --net-softnet-allow="in proto tcp @host port 22,out proto tcp @host port $(SANDBOX_PROXY_PORT)"
+
+.PHONY: sandbox-net-up sandbox-net-down sandbox-net-status
+sandbox-net-up:
+	@mkdir -p $(SANDBOX_HOME)
+	@if [ -f $(SANDBOX_PROXY_PID) ] && kill -0 $$(cat $(SANDBOX_PROXY_PID)) 2>/dev/null; then \
+		echo "sandbox proxy already running (pid $$(cat $(SANDBOX_PROXY_PID)))"; exit 1; fi
+	@rm -f $(SANDBOX_PROXY_PID)
+	@nohup python3 $(SANDBOX_PROXY) --iface bridge100 --wait 90 --port $(SANDBOX_PROXY_PORT) \
+		--allow $(SANDBOX_ALLOWLIST) --log $(SANDBOX_PROXY_LOG) --pidfile $(SANDBOX_PROXY_PID) \
+		> $(SANDBOX_HOME)/proxy.stdout 2>&1 &
+	@for i in $$(seq 1 200); do [ -f $(SANDBOX_PROXY_PID) ] && break; sleep 0.5; done; \
+		if [ -f $(SANDBOX_PROXY_PID) ]; then cat $(SANDBOX_HOME)/proxy.stdout; \
+		else echo "sandbox proxy did not start:"; cat $(SANDBOX_HOME)/proxy.stdout; exit 1; fi
+
+sandbox-net-down:
+	@if [ -f $(SANDBOX_PROXY_PID) ]; then \
+		kill $$(cat $(SANDBOX_PROXY_PID)) 2>/dev/null && echo "sandbox proxy stopped"; \
+		rm -f $(SANDBOX_PROXY_PID); \
+	else echo "sandbox proxy not running"; fi
+
+sandbox-net-status:
+	@if [ -f $(SANDBOX_PROXY_PID) ] && kill -0 $$(cat $(SANDBOX_PROXY_PID)) 2>/dev/null; then \
+		echo "sandbox proxy running (pid $$(cat $(SANDBOX_PROXY_PID)))"; \
+		lsof -nP -iTCP:$(SANDBOX_PROXY_PORT) -sTCP:LISTEN | tail -n +2; \
+	else echo "sandbox proxy not running"; fi
+	@echo "--- last decisions ($(SANDBOX_PROXY_LOG)) ---"; tail -n 10 $(SANDBOX_PROXY_LOG) 2>/dev/null || true
