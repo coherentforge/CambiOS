@@ -7,12 +7,15 @@
 # softnet default-deny policy with the exchange repo mounted, the allow-list
 # proxy up, the host's HEAD fast-forwarded into the guest checkout, and the
 # credential copied onto the clone's disk. `down` powers the guest off from
-# inside, deletes the clone, stops the proxy. Nothing survives a session
-# except branches the agent pushed into the exchange.
+# inside, deletes the clone, stops the proxy. Nothing of the guest survives a
+# session except branches the agent pushed into the exchange; the host keeps
+# the run transcripts under runs/ and one boot log for post-mortems.
 #
 #   session.sh up [NAME]   start a session (NAME defaults to a timestamp)
 #   session.sh down        end the current session
 #   session.sh ssh [CMD]   shell into the current session as `agent`
+#   session.sh run [--model M] [--json] [FILE]
+#                          hand one task (FILE or stdin) to the agent inside
 #   session.sh pull        fetch refs/heads/sandbox/* from the exchange
 #   session.sh status      VMs, current session, proxy, last decisions
 #
@@ -115,6 +118,9 @@ cmd_down() {
   [ -n "$name" ] || die "no current session"
   local state; state=$(vm_state "$name")
   if [ "$state" = running ]; then
+    # Poweroff from inside, then delete: `tart stop` on a live guest dropped
+    # the last seconds of writes once (rung 3), and `tart delete` wants a
+    # stopped VM. Order matters for both reasons.
     local ip; ip=$(vm_ip "$name" 2>/dev/null || true)
     if [ -n "$ip" ]; then
       log "poweroff from inside"
@@ -156,10 +162,38 @@ cmd_status() {
   make -C "$REPO" --no-print-directory sandbox-net-status || true
 }
 
+# run [--model M] [--json] [PROMPT_FILE]: hand one task to the agent inside
+# the current session and print its answer. The prompt comes from the file or
+# from stdin; it reaches `claude -p` on stdin, so no quoting crosses the SSH
+# hop. The VM is the containment, so the agent runs with permission prompts
+# bypassed; everything it does stays on the clone, and code comes back only
+# as refs/heads/sandbox/*. Each run is kept under $SANDBOX_HOME/runs/.
+cmd_run() {
+  local name; name=$(current)
+  [ -n "$name" ] || die "no current session"
+  local model="${SANDBOX_MODEL:-}" fmt=text file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) model=$2; shift 2 ;;
+      --json) fmt=json; shift ;;
+      *) file=$1; shift ;;
+    esac
+  done
+  local ip; ip=$(vm_ip "$name")
+  local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  local dir="$SANDBOX_HOME/runs"; mkdir -p "$dir"
+  if [ -n "$file" ]; then cp "$file" "$dir/$stamp.prompt"; else cat > "$dir/$stamp.prompt"; fi
+  local args="-p --output-format $fmt --permission-mode bypassPermissions"
+  [ -n "$model" ] && args="$args --model $model"
+  log "run $stamp (model: ${model:-default}) -> $dir/$stamp.out"
+  ssh "${SSH_OPTS[@]}" "agent@$ip" "bash -lc 'cd ~/cambios && claude $args'" < "$dir/$stamp.prompt" | tee "$dir/$stamp.out"
+}
+
 case "${1:-}" in
   up) shift; cmd_up "$@" ;;
   down) cmd_down ;;
   ssh) shift; cmd_ssh "$@" ;;
+  run) shift; cmd_run "$@" ;;
   pull) cmd_pull ;;
   status) cmd_status ;;
   *) sed -n '5,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;

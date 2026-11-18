@@ -2034,6 +2034,18 @@ sandbox-ssh:
 sandbox-pull:
 	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) pull
 
+# One task into the current session: `make sandbox-run PROMPT=task.md
+# [MODEL=claude-…] [JSON=1]`. The host session (or Jason) frames the task,
+# the agent inside answers on stdout and pushes code as refs/heads/sandbox/*.
+# Default model is the one the sandbox exists for. Claude Code's local model
+# table may not list it (the /model picker omits it and `--model` prints an
+# "unrecognized model" warning), but the API serves it; `modelUsage` in the
+# JSON output is the authoritative record of what answered.
+SANDBOX_MODEL ?= claude-mythos-5-2
+sandbox-run:
+	@test -n "$(PROMPT)" || { echo "usage: make sandbox-run PROMPT=<file> [MODEL=<id>] [JSON=1]" >&2; exit 2; }
+	@$(SANDBOX_SESSION_ENV) SANDBOX_MODEL=$(or $(MODEL),$(SANDBOX_MODEL)) $(SANDBOX_SESSION) run $(if $(JSON),--json,) $(PROMPT)
+
 sandbox-status:
 	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) status
 

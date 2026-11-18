@@ -317,6 +317,7 @@ make sandbox-net-status          # pid, listener, last 10 decisions; $(SANDBOX_S
 make sandbox-up [SESSION=name]   # clone the sealed golden image, boot it under the policy with ~/sandbox/exchange.git mounted, proxy up, guest checkout at this HEAD, ~/sandbox/credential.env copied onto the clone (tools/sandbox/session.sh)
 make sandbox-ssh                 # shell into the session as `agent`
 make sandbox-pull                # fetch the agent's refs/heads/sandbox/* branches from the exchange for review
+make sandbox-run PROMPT=f [MODEL=id] [JSON=1]   # hand one task file to the agent inside the session (claude -p, permissions bypassed: the VM is the containment); answer on stdout, kept under ~/sandbox/runs/. Default MODEL is claude-mythos-5-2 ($(SANDBOX_MODEL)); the guest's /model picker does not list it but the API serves it
 make sandbox-down                # poweroff from inside, delete the clone, stop the proxy; only the exchange survives
 make sandbox-status              # VMs, current session, proxy, last decisions
 make sandbox-image               # rebuild the sealed golden image from the stock base (tools/sandbox/image.sh + provision.sh); previous kept as cambios-golden-prev

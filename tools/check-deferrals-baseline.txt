@@ -3,8 +3,8 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 CLAUDE.md:11:eventually
-CLAUDE.md:415:eventually
-CLAUDE.md:433:deferred
+CLAUDE.md:416:eventually
+CLAUDE.md:434:deferred
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
