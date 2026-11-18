@@ -314,6 +314,11 @@ make usb DEVICE=/dev/diskN PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-ho
 make sandbox-net-up              # start tools/sandbox/allowlist-proxy.py bound to bridge100 (run after the VM is up); log + pidfile under ~/sandbox
 make sandbox-net-down            # stop it
 make sandbox-net-status          # pid, listener, last 10 decisions; $(SANDBOX_SOFTNET_POLICY) is the `tart run` flag set that pairs with it
+make sandbox-up [SESSION=name]   # clone the sealed golden image, boot it under the policy with ~/sandbox/exchange.git mounted, proxy up, guest checkout at this HEAD, ~/sandbox/credential.env copied onto the clone (tools/sandbox/session.sh)
+make sandbox-ssh                 # shell into the session as `agent`
+make sandbox-pull                # fetch the agent's refs/heads/sandbox/* branches from the exchange for review
+make sandbox-down                # poweroff from inside, delete the clone, stop the proxy; only the exchange survives
+make sandbox-status              # VMs, current session, proxy, last decisions
 
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols

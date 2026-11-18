@@ -2009,3 +2009,30 @@ sandbox-net-status:
 		lsof -nP -iTCP:$(SANDBOX_PROXY_PORT) -sTCP:LISTEN | tail -n +2; \
 	else echo "sandbox proxy not running"; fi
 	@echo "--- last decisions ($(SANDBOX_PROXY_LOG)) ---"; tail -n 10 $(SANDBOX_PROXY_LOG) 2>/dev/null || true
+
+# Session lifecycle (stage G rung 5). tools/sandbox/session.sh holds the
+# logic; these are wrappers that pass the shared settings. One session at a
+# time: `sandbox-up` clones the sealed golden image, boots it under
+# SANDBOX_SOFTNET_POLICY with the exchange repo mounted, starts the proxy,
+# fast-forwards the guest checkout to this HEAD and copies
+# $(SANDBOX_HOME)/credential.env onto the clone. `sandbox-down` powers the
+# guest off from inside, deletes the clone and stops the proxy. The agent's
+# work comes back as refs/heads/sandbox/* in the exchange (`sandbox-pull`).
+SANDBOX_SESSION := tools/sandbox/session.sh
+SANDBOX_SESSION_ENV := SANDBOX_HOME=$(SANDBOX_HOME) SANDBOX_PROXY_PORT=$(SANDBOX_PROXY_PORT) REPO=$(CURDIR)
+
+.PHONY: sandbox-up sandbox-down sandbox-ssh sandbox-pull sandbox-status
+sandbox-up:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) up $(SESSION)
+
+sandbox-down:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) down
+
+sandbox-ssh:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) ssh
+
+sandbox-pull:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) pull
+
+sandbox-status:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) status

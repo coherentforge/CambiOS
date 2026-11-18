@@ -99,6 +99,13 @@ if [ -e /etc/cambios-sandbox-sealed ]; then
 fi
 EOF
   sudo chmod 644 /etc/profile.d/cambios-sandbox.sh
+  # Mount the Tart directory share at boot. `make sandbox-up` passes the
+  # exchange repo as --dir=exchange:..., which then appears at
+  # /mnt/tart/exchange. nofail: a VM started without --dir still boots.
+  sudo mkdir -p /mnt/tart
+  if ! grep -q 'com.apple.virtio-fs.automount' /etc/fstab; then
+    echo 'com.apple.virtio-fs.automount /mnt/tart virtiofs defaults,nofail 0 0' | sudo tee -a /etc/fstab >/dev/null
+  fi
 }
 
 phase_rust() {
