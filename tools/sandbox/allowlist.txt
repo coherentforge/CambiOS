@@ -5,4 +5,12 @@
 # Read by tools/sandbox/allowlist-proxy.py (re-read on SIGHUP).
 # Everything else is denied and logged. Keep this list as short as the tool
 # inside the VM can live with; the deny log says what it tried.
+#
+# Claude Code (docs: code.claude.com/docs/en/network-config.md, 2026-11-17):
+#   api.anthropic.com    model API
+#   platform.claude.com  first-run connectivity probe; OAuth token exchange/refresh
+# Install-time only (claude.ai, downloads.claude.ai) happens in the open-network
+# golden-image build, never through this proxy. Telemetry hosts are switched off
+# in the guest profile and stay out of this list on purpose.
 api.anthropic.com
+platform.claude.com
