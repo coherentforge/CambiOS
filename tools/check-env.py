@@ -255,6 +255,8 @@ def main():
                     f"rustup target add {fuzz_target}")
         if fuzz_target.split("-")[0] != host.split("-")[0]:
             x86_runner("extra", fuzz_target, host, "`make fuzz-syscall-dispatcher`")
+    tool("extra", "c++", "`make fuzz-build` (libfuzzer-sys compiles libFuzzer from C++ source)",
+         "xcode-select --install" if IS_MAC else "install the `g++` package (Debian/Ubuntu name)")
 
     print()
     if missing_needed:
