@@ -6,8 +6,10 @@
 check-unsafe-coverage: enforce CLAUDE.md Development Convention 1 —
 "every unsafe block MUST have a // SAFETY: comment".
 
-Scans all kernel `.rs` files for `unsafe { ... }` blocks and flags
-each one whose preceding comment block does not contain `SAFETY:`.
+Scans every `.rs` file in the repository (kernel, user crates, protocol
+crates, host tools, fuzz targets; verification/ excepted) for
+`unsafe { ... }` blocks and flags each one whose preceding comment
+block does not contain `SAFETY:`.
 
 Comment-block-aware: walks backward from the `unsafe {` line through
 contiguous comment lines (line comments `//`, `///`, `//!`, plus
@@ -31,19 +33,27 @@ gate; new violations fail the commit.
 Exit status:
   0 — no new sites
   1 — new sites flagged
-  2 — repo root not found or baseline unreadable
+  2 — repo root not found, baseline unreadable, or git could not list
+      the repository's files
 """
 
 import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _repo  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = ROOT / "tools" / "check-unsafe-coverage-baseline.txt"
 
-# Scan all kernel `.rs` files. Verification proof crates ship stub
-# modules, not kernel code; user-space crates have their own discipline.
-SCAN_DIRS = ["src"]
+# Every `.rs` file in the repository: the kernel, the user crates, the
+# protocol crates, the host tools, the fuzz targets. Convention 1 does
+# not stop at the kernel boundary, and a crate added tomorrow is in
+# scope without an edit here. The one exclusion is verification/: the
+# proof crates' stub modules stand in for kernel code under the model
+# checker and are not shipped.
+SKIP_TOP = ("verification",)
 
 # Pattern: an `unsafe` keyword followed (after optional whitespace) by
 # `{`. Excludes `unsafe fn`, `unsafe impl`, `unsafe trait`.
@@ -212,13 +222,8 @@ def find_violations(path: Path):
         yield (idx + 1, line.rstrip())
 
 
-def iter_scan_paths():
-    for rel in SCAN_DIRS:
-        d = ROOT / rel
-        if not d.is_dir():
-            continue
-        for path in sorted(d.glob("**/*.rs")):
-            yield path
+def iter_scan_paths(files):
+    return _repo.rust_sources(files, skip_top=SKIP_TOP)
 
 
 def load_baseline():
@@ -259,11 +264,17 @@ def main():
 
     update_mode = "--update-baseline" in sys.argv
 
+    files = _repo.repo_files()
+    if files is None:
+        print("check-unsafe-coverage: `git ls-files` failed; cannot tell which "
+              "files belong to the repository", file=sys.stderr)
+        return 2
+
     baseline = load_baseline()
     new_violations = []
     all_hits = []
 
-    for path in iter_scan_paths():
+    for path in iter_scan_paths(files):
         rel = path.relative_to(ROOT).as_posix()
         for lineno, line in find_violations(path):
             key = (rel, str(lineno))

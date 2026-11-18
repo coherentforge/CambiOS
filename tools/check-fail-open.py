@@ -11,10 +11,9 @@ anyone noticing, because the outcome was always Allow (2026-10-27). This
 lint makes any new fail-open path — in code or in the comment that
 describes it — a conscious, reviewed decision rather than a reflex.
 
-Scope: kernel and user-space Rust sources (`src/`, `user/*/src/`,
-`cambios-abi/src/`, `cambios-manifest/src/`). Historical ADR prose is out
-of scope — the Divergence appendices are where superseded designs are
-remembered.
+Scope: every `.rs` file in the repository, whatever crate it is in.
+Historical ADR prose is out of scope — the Divergence appendices are
+where superseded designs are remembered.
 
 Patterns flagged (case-insensitive, comments included — the prose is the
 point):
@@ -36,12 +35,16 @@ own argument in review.
 Exit status:
   0 — no new sites
   1 — new sites flagged
-  2 — repo root not found or baseline unreadable
+  2 — repo root not found, baseline unreadable, or git could not list
+      the repository's files
 """
 
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _repo  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = ROOT / "tools" / "check-fail-open-baseline.txt"
@@ -57,18 +60,11 @@ PATTERNS = [
 EXEMPT_MARKER = re.compile(r"FAIL_OPEN_OK:")
 CONTEXT_WINDOW = 3
 
-SCAN_DIRS = ["src", "user", "cambios-abi/src", "cambios-manifest/src"]
-
-
-def iter_scan_paths():
-    for rel in SCAN_DIRS:
-        base = ROOT / rel
-        if not base.is_dir():
-            continue
-        for path in sorted(base.glob("**/*.rs")):
-            if "target" in path.parts:
-                continue
-            yield path
+def iter_scan_paths(files):
+    """Every `.rs` file in the repository. An enforcement decision can
+    be written in any crate, so no crate is outside the rule, and a
+    crate added tomorrow is in scope without an edit here."""
+    return _repo.rust_sources(files)
 
 
 def has_exemption_near(lines, idx, window=CONTEXT_WINDOW):
@@ -106,8 +102,13 @@ def load_baseline():
 
 def main(argv):
     update = "--update-baseline" in argv
+    files = _repo.repo_files()
+    if files is None:
+        print("check-fail-open: `git ls-files` failed; cannot tell which "
+              "files belong to the repository", file=sys.stderr)
+        return 2
     found = []
-    for path in iter_scan_paths():
+    for path in iter_scan_paths(files):
         rel = path.relative_to(ROOT).as_posix()
         for lineno, name, text in find_sites(path):
             found.append((rel, str(lineno), name, text))

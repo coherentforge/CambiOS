@@ -40,9 +40,11 @@ developer's checkout would not match. Also skips target/, fuzz/,
 """
 
 import re
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _repo import repo_files  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = ROOT / "tools" / "check-deferrals-baseline.txt"
@@ -104,21 +106,6 @@ def should_skip(path: Path) -> bool:
         if part in SKIP_DIR_NAMES:
             return True
     return False
-
-
-def repo_files():
-    """Absolute paths of every file that belongs to the repository:
-    tracked, or untracked and not ignored. Returns None when git cannot
-    say; the caller stops instead of walking the filesystem, because a
-    filesystem walk is what let gitignored files into the baseline."""
-    try:
-        out = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            cwd=ROOT, check=True, capture_output=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return {ROOT / rel for rel in out.decode("utf-8").split("\0") if rel}
 
 
 def iter_scan_paths(files):
