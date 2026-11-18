@@ -4,16 +4,15 @@
 # Override the parent project's bare-metal kernel target so this crate
 # can be built and tested standalone. cambios-abi is `no_std` but
 # architecture-agnostic (pure ABI types: SyscallNumber / SyscallError
-# / SyscallArgs / SyscallResult), so any host target compiles. Using
-# the native macOS-on-Apple-Silicon triple matches the tools/sign-elf
-# precedent and avoids cross-compile overhead under `cargo test`.
+# / SyscallArgs / SyscallResult), so any host target compiles.
+# `host-tuple` is cargo's name for the triple of the machine running it.
 #
 # Without this override, `cd cambios-abi && cargo test` inherits the
 # parent .cargo/config.toml's `target = "x86_64-unknown-none"`, which
 # has no std/test crates and the test runner fails to link.
 #
-# The kernel-side test path (`cargo test --lib --target
-# x86_64-apple-darwin` from the project root) re-exports cambios-abi
-# and exercises these tests through that — both paths now pass.
+# The kernel's unit tests (`make test`, from the project root) do not
+# run this crate's tests: a dependency's `#[cfg(test)]` modules are not
+# compiled into a dependent's test build. Run them from this directory.
 [build]
-target = "aarch64-apple-darwin"
+target = "host-tuple"

@@ -4,4 +4,4 @@
 # Host-side tool: override the parent project's bare-metal kernel
 # target. Same precedent as tools/sign-elf and tools/format-volume.
 [build]
-target = "aarch64-apple-darwin"
+target = "host-tuple"
