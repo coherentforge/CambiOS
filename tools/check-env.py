@@ -122,7 +122,7 @@ def main():
         return 2
     channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 
-    print("needed: make check-all, make test, make check-clippy, the commit hooks")
+    print("needed: make check-all, make test, make test-user, make check-clippy, the commit hooks")
     ok("python", platform.python_version())
     tool("needed", "make", "every target", pkg("make", "make"))
     tool("needed", "git", "the lints index repository files through git", pkg("git", "git"))
@@ -169,6 +169,17 @@ def main():
         # architecture needs a way to run it.
         if test_target.split("-")[0] != host.split("-")[0]:
             x86_runner("needed", test_target, host, "`make test`")
+
+        # The user crates' host tests build for an x86_64 triple of this
+        # OS (USER_TEST_TARGET): libsys names x18, which Apple reserves.
+        user_target = _lists.make_vars("USER_TEST_TARGET")["USER_TEST_TARGET"][0]
+        if user_target in installed:
+            ok(f"target {user_target}")
+        else:
+            missing("needed", f"target {user_target}", "`make test-user` (an x86_64 triple of this OS)",
+                    f"rustup target add {user_target}")
+        if user_target.split("-")[0] != host.split("-")[0]:
+            x86_runner("needed", user_target, host, "`make test-user`")
 
     _, hooks = run("git", "config", "--get", "core.hooksPath")
     if hooks == ".githooks":
@@ -249,7 +260,7 @@ def main():
     if missing_needed:
         print(f"check-env FAILED: {missing_needed} needed item(s) missing")
         return 1
-    print("check-env OK: everything `make check-all` and `make test` need is present")
+    print("check-env OK: everything `make check-all`, `make test` and `make test-user` need is present")
     return 0
 
 

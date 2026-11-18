@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "cambios-abi"
+version = "0.1.0"
+
+[[package]]
 name = "cambios-libfs"
 version = "0.1.0"
 dependencies = [
@@ -17,3 +21,6 @@ version = "0.1.0"
 [[package]]
 name = "cambios-libsys"
 version = "0.1.0"
+dependencies = [
+ "cambios-abi",
+]

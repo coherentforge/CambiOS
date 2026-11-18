@@ -10,10 +10,11 @@ targets = [
     "x86_64-unknown-none",
     "aarch64-unknown-none",
     "riscv64gc-unknown-none-elf",
-    # Host triples. The unit tests build for the host triple (TEST_TARGET
-    # in the Makefile), which rustup always installs. The fuzz targets
-    # build for the x86_64 triple of the host's operating system
-    # (FUZZ_TARGET); on an Apple Silicon Mac that is this one.
+    # Host triples. The kernel's unit tests build for the host triple
+    # (TEST_TARGET in the Makefile), which rustup always installs. The
+    # user crates' host tests and the fuzz targets build for the x86_64
+    # triple of the host's operating system (USER_TEST_TARGET,
+    # FUZZ_TARGET); on an Apple Silicon Mac that is this one.
     "x86_64-apple-darwin",
     # `make check-elf-link`: a macOS host links the unit tests as ELF, the
     # format CI links, without running them.

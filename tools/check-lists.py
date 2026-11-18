@@ -28,6 +28,10 @@ What it checks:
   manifest        every [[service]] names a user crate; `arch` and
                   `profile` tags use known values (an unknown tag would
                   silently drop the entry from every image).
+  host tests      every package under user/, cambios-*/ and tools/ whose
+                  source holds a #[test] is in HOST_TEST_CRATES (run by
+                  `make test-user`) or HOST_TEST_EXEMPT (with its reason),
+                  never both and never neither.
   proof crates    the Proofs workflow's matrix is the proof-crate list; its
                   path filter is exactly the kernel files the crates
                   include with #[path]; each crate is in workspace.exclude
@@ -181,6 +185,26 @@ def check_manifest(arch_list, profiles):
                 problem("manifest.toml", f"[[service]] {name}: profile tag {p!r} is not a profile ({' '.join(profiles)})")
 
 
+def check_host_tests(run, exempt):
+    """A crate with tests that no make target runs is how a test rots:
+    user/libscanout's stopped compiling when a wire message gained a
+    field, and nothing noticed."""
+    with_tests = set()
+    for cargo_toml in sorted(ROOT.glob("*/Cargo.toml")) + sorted(ROOT.glob("*/*/Cargo.toml")):
+        pkg = cargo_toml.parent
+        rel = pkg.relative_to(ROOT).as_posix()
+        if rel.split("/")[0] in ("verification", "fuzz", "target"):
+            continue
+        sources = [f for sub in ("src", "tests") for f in sorted((pkg / sub).rglob("*.rs"))]
+        if any(re.search(r"^\s*#\[test\]", f.read_text(encoding="utf-8"), flags=re.M) for f in sources):
+            with_tests.add(rel)
+    same("Makefile", "HOST_TEST_CRATES + HOST_TEST_EXEMPT vs the packages whose source holds a #[test]",
+         with_tests, set(run) | set(exempt))
+    for both in sorted(set(run) & set(exempt)):
+        problem("Makefile", f"{both} is in both HOST_TEST_CRATES and HOST_TEST_EXEMPT")
+    return len(run)
+
+
 def check_proof_crates(proofs, excluded):
     wf = read(".github/workflows/proofs.yml")
     m = re.search(r"matrix:\s*\n\s*crate:\s*\n((?:\s*- \S+\s*\n)+)", wf)
@@ -214,6 +238,7 @@ def main():
         stage = _lists.per_arch("STAGE", arch_list)
         proofs = _lists.proof_crates()
         profiles = _lists.make_vars("PROFILES")["PROFILES"]
+        host_tests = _lists.make_vars("HOST_TEST_CRATES", "HOST_TEST_EXEMPT")
     except _lists.ListError as e:
         print(f"check-lists: {e}", file=sys.stderr)
         return 2
@@ -227,11 +252,13 @@ def main():
     excluded = check_workspace_exclude()
     check_boot_configs(stage)
     check_manifest(arch_list, profiles)
+    n_tested = check_host_tests(host_tests["HOST_TEST_CRATES"], host_tests["HOST_TEST_EXEMPT"])
     check_proof_crates(proofs, excluded)
 
     n_crates = len({c for a in arch_list for c in crates[a]})
     print(f"check-lists: {len(arch_list)} architectures, {n_crates} user crates, "
-          f"{len(proofs)} proof crates; {len(PROBLEMS)} disagreement(s)")
+          f"{n_tested} host-tested packages, {len(proofs)} proof crates; "
+          f"{len(PROBLEMS)} disagreement(s)")
     if PROBLEMS:
         print("check-lists found copies that disagree with the Makefile lists:", file=sys.stderr)
         for p in PROBLEMS:
