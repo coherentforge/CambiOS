@@ -7,9 +7,18 @@
 # Regression Discipline, ADR-013) on GitHub-hosted Linux runners:
 #
 #   * tri-arch release build        — `make check-all` (x86_64 + aarch64 + riscv64)
-#   * host unit tests               — `make test`, retargeted to the Linux host
+#   * host unit tests               — `make test`
 #   * missing_safety_doc = "deny"   — `cargo clippy --lib` (Dev Convention 1)
 #   * don't-grow-the-baseline lints — the pure-Python check-* gates
+#   * user crates                   — `make check-user` + `make test-user`
+#   * fuzz targets                  — `make fuzz-build` (they build; runs are manual)
+#
+# Every cargo invocation that has a committed lockfile runs with --locked:
+# a Cargo.lock that no longer matches its Cargo.toml fails here. Locally
+# cargo rewrites it, which is how four of them went stale unseen.
+#
+# Actions are pinned by commit, with the release in a comment. A tag can
+# be moved to different code; a commit cannot.
 #
 # The pinned nightly and the three bare-metal targets come from
 # rust-toolchain.toml; rustup installs them automatically on first use. The
@@ -58,37 +67,35 @@ jobs:
           - aarch64-unknown-none
           - riscv64gc-unknown-none-elf
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned toolchain + target (rust-toolchain.toml)
         run: |
           rustup show
           rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
-      - name: cargo build --release
-        run: cargo build --target ${{ matrix.target }} --release
+      - name: cargo build --release --locked
+        run: cargo build --locked --target ${{ matrix.target }} --release
 
   # ---------------------------------------------------------------------------
-  # Host unit tests — `make test`, retargeted from x86_64-apple-darwin to the
-  # runner's native triple. The darwin target in the Makefile exists only to
-  # override .cargo/config.toml's bare-metal default; the --lib tests are pure
-  # logic. RUST_MIN_STACK matches the Makefile (buddy-allocator deep recursion).
+  # Host unit tests — `make test`. The Makefile picks the host triple
+  # (TEST_TARGET, here x86_64 Linux) and sets RUST_MIN_STACK
+  # (buddy-allocator deep recursion), so this job runs the command a
+  # contributor runs.
   # ---------------------------------------------------------------------------
   test:
     name: unit tests (--lib)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: host-test
-      - name: cargo test --lib
-        env:
-          RUST_MIN_STACK: "8388608"
-        run: cargo test --lib --target x86_64-unknown-linux-gnu
+      - name: make test
+        run: make test
 
   # ---------------------------------------------------------------------------
   # clippy — enforces the unsafe-discipline deny lints on ALL THREE backends
@@ -103,13 +110,13 @@ jobs:
     name: clippy (unsafe discipline, tri-arch)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned toolchain + clippy
         run: |
           rustup show
           rustup component add clippy
           rustup target add x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: clippy
       - name: make check-clippy (tri-arch)
@@ -124,9 +131,8 @@ jobs:
   # staged diff or session state and are no-ops or meaningless in CI —
   # check-index-isolation, check-lockfile (advisory), claude-preflight.
   # check-audit-taxonomy is the one content lint not run here: it builds a
-  # host tool (tools/gen-audit-taxonomy) and so needs a Rust toolchain; it
-  # stays a local `make` target.
-  # Revisit when: the userspace CI job exists (it installs the toolchain).
+  # host tool (tools/gen-audit-taxonomy) and so needs a Rust toolchain. It
+  # runs in the `userspace` job below, which installs one.
   # check-status-freshness runs here too (Kani-harness drift, --strict): it is
   # compile-free now that STATUS.md no longer pins a unit-test total, so it
   # belongs with the other pure-python gates. Its date heuristic stays
@@ -140,7 +146,10 @@ jobs:
     name: baseline lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Full history: check-dco walks the commits a pull request adds.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - name: check-adrs (ADR cross-references)
         run: make check-adrs
       - name: check-assumptions (Convention 8 numeric bounds)
@@ -153,9 +162,77 @@ jobs:
         run: make check-fail-open
       - name: check-doc-refs (ASSUMPTIONS.md source line refs)
         run: make check-doc-refs
+      - name: check-lists (build lists agree across files)
+        run: make check-lists
+      - name: check-dco (every commit the pull request adds is signed off)
+        if: github.event_name == 'pull_request'
+        run: make check-dco RANGE="origin/${{ github.base_ref }}..HEAD"
       - name: check-banned-paths (deleted-stays-deleted)
         run: make check-banned-paths
       - name: check-unsafe-coverage (Convention 1 SAFETY comments)
         run: make check-unsafe-coverage
       - name: check-status-freshness (Kani-harness drift, --strict)
         run: python3 tools/check-status-freshness.py --strict
+
+  # ---------------------------------------------------------------------------
+  # User crates. The kernel jobs above build and test the kernel crate only;
+  # the user crates, the protocol crates and the host tools are separate cargo
+  # packages outside its workspace. `make check-user` builds every user crate
+  # for every architecture that lists it (the UNSTAGED ones no image builds
+  # included); `make test-user` runs the host tests of every package in the
+  # Makefile's HOST_TEST_CRATES. Both lists are checked against the tree by
+  # check-lists, so a crate added without a build rule or with unlisted tests
+  # fails the lints job, not silently here.
+  #
+  # Each crate has its own target directory, so only the cargo registry is
+  # cached. About six minutes cold on an emulated runner.
+  #
+  # Not yet a required status check: adding its name to branch protection is
+  # a repository setting, changed by the maintainer after it has run green.
+  # ---------------------------------------------------------------------------
+  userspace:
+    name: userspace (build + host tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: userspace
+          cache-targets: "false"
+      - name: make check-user (every user crate, every architecture that lists it)
+        run: make check-user CARGO_LOCKED=--locked
+      - name: make test-user (host tests of the user, protocol and tool crates)
+        run: make test-user CARGO_LOCKED=--locked
+      - name: make check-audit-taxonomy (the generated taxonomy document is in sync)
+        run: make check-audit-taxonomy
+      - name: The build modified no tracked file
+        run: git diff --exit-code
+
+  # ---------------------------------------------------------------------------
+  # Fuzz targets build. The fuzz crate links the kernel library for a host
+  # triple with stand-ins for its assembly symbols; a new symbol without a
+  # stand-in breaks every target, and nothing else notices (the build was
+  # dead from June to November 2026). This job builds them; it does not run
+  # them. cargo-fuzz is pinned to the version this was proven with.
+  #
+  # Not yet a required status check, for the same reason as `userspace`.
+  # ---------------------------------------------------------------------------
+  fuzz-build:
+    name: fuzz targets build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fuzz
+          workspaces: fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: make fuzz-build
+        run: make fuzz-build

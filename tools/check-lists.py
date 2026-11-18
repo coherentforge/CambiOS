@@ -118,7 +118,7 @@ def check_arches(arch_list, triple):
     m = re.search(r"matrix:\s*\n\s*target:\s*\n((?:\s*- \S+\s*\n)+)", ci)
     matrix = re.findall(r"- (\S+)", m.group(1)) if m else []
     same(".github/workflows/ci.yml", "build matrix targets", triples, matrix)
-    m = re.search(r"rustup target add ([^\n]+)\n\s*- uses: Swatinem/rust-cache@v2\s*\n\s*with:\s*\n\s*key: clippy", ci)
+    m = re.search(r"rustup target add ([^\n]+)\n\s*- uses: Swatinem/rust-cache@[^\n]+\n\s*with:\s*\n\s*key: clippy", ci)
     clippy = m.group(1).split() if m else []
     same(".github/workflows/ci.yml", "clippy job `rustup target add`", triples, clippy)
 

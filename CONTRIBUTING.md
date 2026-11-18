@@ -47,9 +47,7 @@ Never bypass a hook or signing (`--no-verify`, `--no-gpg-sign`). If a hook is wr
 
 ### On the pull request
 
-The workflows under [.github/workflows/](.github/workflows/) run on every pull request: the kernel build for three architectures, the kernel unit tests, clippy, the lints, and the Kani proof jobs (Kani is the model checker the proofs under `verification/` use). Branch protection on `main` names the checks that must pass before a merge. A nightly job boots x86_64 under QEMU to the shell.
-
-CI does not yet build or test the user crates. Until it does, `make check-user` and `make test-user` on your machine are that check.
+The workflows under [.github/workflows/](.github/workflows/) run on every pull request: the kernel build for three architectures, the kernel unit tests, clippy, the lints (including the sign-off on every commit the pull request adds), the user-crate builds and host tests, the fuzz-target build, and the Kani proof jobs (Kani is the model checker the proofs under `verification/` use). Every cargo command runs with `--locked`, so a `Cargo.lock` that no longer matches its `Cargo.toml` fails. Branch protection on `main` names the checks that must pass before a merge. A nightly job boots x86_64 under QEMU to the shell.
 
 A pull request is judged by the checks as they stand on `main` when it is opened and updated. The history of the gates is the history of `.github/`, `.githooks/`, `tools/` and the `Makefile`.
 

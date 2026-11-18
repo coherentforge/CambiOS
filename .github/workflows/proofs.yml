@@ -80,11 +80,11 @@ jobs:
     outputs:
       proofs: ${{ steps.decide.outputs.proofs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Only push and pull_request have a base to diff against; on a
       # scheduled or dispatched run the filter is skipped and `decide`
       # below answers for it.
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         with:
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Cache Kani toolchain + verifier binaries
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.kani
@@ -151,9 +151,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Restore Kani toolchain + verifier binaries
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.kani
@@ -203,11 +203,11 @@ jobs:
       - name: No proof-relevant changes — skip (report success)
         if: needs.changes.outputs.proofs != 'true'
         run: echo "No proof-relevant paths changed; skipping Kani for ${{ matrix.crate }}."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: needs.changes.outputs.proofs == 'true'
       - name: Restore Kani toolchain + verifier binaries
         if: needs.changes.outputs.proofs == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.kani
