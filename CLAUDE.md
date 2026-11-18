@@ -319,6 +319,9 @@ make sandbox-ssh                 # shell into the session as `agent`
 make sandbox-pull                # fetch the agent's refs/heads/sandbox/* branches from the exchange for review
 make sandbox-down                # poweroff from inside, delete the clone, stop the proxy; only the exchange survives
 make sandbox-status              # VMs, current session, proxy, last decisions
+make sandbox-image               # rebuild the sealed golden image from the stock base (tools/sandbox/image.sh + provision.sh); previous kept as cambios-golden-prev
+make sandbox-check               # is the golden fresh? stamp = hash of rust-toolchain.toml, every Cargo.lock, provision.sh, Limine pin, base digest; sandbox-up refuses a stale one
+make sandbox-image-schedule      # user launchd job: weekly rebuild (Mondays 06:00); sandbox-image-unschedule removes it
 
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols

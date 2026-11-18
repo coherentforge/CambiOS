@@ -66,6 +66,11 @@ cmd_up() {
   [ -d "$EXCHANGE" ] || die "exchange repo $EXCHANGE missing"
   [ -r "$KEY" ] || die "host key $KEY missing"
   mkdir -p "$SANDBOX_HOME"
+  # Refuse a stale golden: its crate cache would not match the lockfiles and
+  # offline builds inside would fail in confusing ways.
+  if [ "${SANDBOX_ALLOW_STALE:-0}" != 1 ]; then
+    "$(dirname "$0")/image.sh" check || die "golden image stale (SANDBOX_ALLOW_STALE=1 to override)"
+  fi
 
   # The exchange's main mirrors the host's HEAD and nothing else writes it
   # (the agent pushes refs/heads/sandbox/*), so a rebased host history is a

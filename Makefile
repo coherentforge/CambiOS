@@ -2036,3 +2036,48 @@ sandbox-pull:
 
 sandbox-status:
 	@$(SANDBOX_SESSION_ENV) $(SANDBOX_SESSION) status
+
+# Golden image (stage G rung 6). tools/sandbox/image.sh builds it from the
+# stock base with provision.sh and stamps it with a hash over every input
+# that changes what the image must hold offline (toolchain pin, every
+# Cargo.lock, provision.sh, Limine pin, base image digest). `sandbox-up`
+# refuses a stale golden. `sandbox-image-schedule` installs a user launchd
+# job that rebuilds weekly (apt security updates, Claude Code stable); it
+# touches ~/Library/LaunchAgents and nothing else.
+SANDBOX_IMAGE := tools/sandbox/image.sh
+SANDBOX_LAUNCHD_LABEL := com.cambios.sandbox-image
+SANDBOX_LAUNCHD_PLIST := $(HOME)/Library/LaunchAgents/$(SANDBOX_LAUNCHD_LABEL).plist
+
+.PHONY: sandbox-image sandbox-check sandbox-stamp sandbox-image-schedule sandbox-image-unschedule
+sandbox-image:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_IMAGE) build
+
+sandbox-check:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_IMAGE) check
+
+sandbox-stamp:
+	@$(SANDBOX_SESSION_ENV) $(SANDBOX_IMAGE) stamp
+
+sandbox-image-schedule:
+	@mkdir -p $(dir $(SANDBOX_LAUNCHD_PLIST))
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0"><dict>' \
+	  '  <key>Label</key><string>$(SANDBOX_LAUNCHD_LABEL)</string>' \
+	  '  <key>ProgramArguments</key><array>' \
+	  '    <string>/usr/bin/make</string><string>-C</string><string>$(CURDIR)</string><string>sandbox-image</string>' \
+	  '  </array>' \
+	  '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(HOME)/.cargo/bin</string></dict>' \
+	  '  <key>StartCalendarInterval</key><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>' \
+	  '  <key>StandardOutPath</key><string>$(SANDBOX_HOME)/image-schedule.log</string>' \
+	  '  <key>StandardErrorPath</key><string>$(SANDBOX_HOME)/image-schedule.log</string>' \
+	  '</dict></plist>' > $(SANDBOX_LAUNCHD_PLIST)
+	@launchctl bootout gui/$$(id -u)/$(SANDBOX_LAUNCHD_LABEL) 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(SANDBOX_LAUNCHD_PLIST)
+	@echo "weekly golden rebuild scheduled (Mondays 06:00): $(SANDBOX_LAUNCHD_PLIST)"
+
+sandbox-image-unschedule:
+	@launchctl bootout gui/$$(id -u)/$(SANDBOX_LAUNCHD_LABEL) 2>/dev/null || true
+	@rm -f $(SANDBOX_LAUNCHD_PLIST)
+	@echo "weekly golden rebuild unscheduled"

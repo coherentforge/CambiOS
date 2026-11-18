@@ -1,0 +1,21 @@
+#!/usr/bin/expect -f
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+#
+# One-shot password SSH into the STOCK Tart Ubuntu image (admin/admin), used
+# by image.sh exactly once per golden build to install the host key. After
+# provision.sh's harden phase the image refuses passwords, so this never
+# works against a golden or session VM, by design.
+#
+#   stock-ssh.exp <ip> <command...>
+set timeout 60
+set ip [lindex $argv 0]
+set cmd [join [lrange $argv 1 end] " "]
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR admin@$ip $cmd
+expect {
+  -re "(?i)password:" { send "admin\r"; exp_continue }
+  "Permission denied" { exit 3 }
+  eof
+}
+catch wait result
+exit [lindex $result 3]

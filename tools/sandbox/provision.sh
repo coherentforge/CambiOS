@@ -108,8 +108,18 @@ EOF
   fi
 }
 
+ensure_share() {
+  # The Tart --dir share; fstab mounts it on sealed images, the build VM
+  # (fresh from the stock image) has no fstab entry yet.
+  if ! mountpoint -q /mnt/tart; then
+    sudo mkdir -p /mnt/tart
+    sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/tart
+  fi
+}
+
 phase_rust() {
   log rust
+  ensure_share
   if ! sudo -u "$AGENT" test -r "$EXCHANGE/HEAD"; then
     echo "agent cannot read $EXCHANGE; mirroring through admin"
     sudo rm -rf /srv/cambios-exchange.git
@@ -150,6 +160,16 @@ phase_claude() {
   # Needs claude.ai (script) and downloads.claude.ai (binary) during the build phase.
   as_agent "curl -fsSL '$CLAUDE_INSTALL_URL' | bash -s '$CLAUDE_VERSION'"
   as_agent 'command -v claude && claude --version' || echo "claude not on PATH for login shells yet"
+  # Trust the one workspace up front. Without this, `claude -p` ignores the
+  # repo's .claude/settings.json permission allow-list ("workspace has not
+  # been trusted") and a session clone would need an interactive run first.
+  as_agent "python3 - <<'PY'
+import json, os
+p = os.path.expanduser('~/.claude.json')
+d = json.load(open(p)) if os.path.exists(p) else {}
+d.setdefault('projects', {}).setdefault('$REPO_DIR', {})['hasTrustDialogAccepted'] = True
+json.dump(d, open(p, 'w'), indent=2)
+PY"
 }
 
 phase_harden() {
