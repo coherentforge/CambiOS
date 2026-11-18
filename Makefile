@@ -176,7 +176,7 @@ BUILD_MANIFEST := $(BUILD_MANIFEST_DIR)/target/$(HOST_TARGET)/release/build-mani
 # the kernel under --features dev-piv) and user/key-store-service/
 # dev_piv_secret.bin (consumed by SwPivBackend under --features dev-piv).
 GEN_DEV_PIV_DIR := tools/gen-dev-piv-keys
-GEN_DEV_PIV := $(GEN_DEV_PIV_DIR)/target/aarch64-apple-darwin/release/gen-dev-piv-keys
+GEN_DEV_PIV := $(GEN_DEV_PIV_DIR)/target/$(HOST_TARGET)/release/gen-dev-piv-keys
 DEV_BOOTSTRAP_PUBKEY := dev_bootstrap_pubkey.bin
 DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 
@@ -184,7 +184,7 @@ DEV_PIV_SECRET := user/key-store-service/dev_piv_secret.bin
 # ADR-032 § 4 volume header to a raw disk image file using the
 # DPIV bundle gen-dev-piv-keys produced. Sibling to sign-elf.
 FORMAT_VOLUME_DIR := tools/format-volume
-FORMAT_VOLUME := $(FORMAT_VOLUME_DIR)/target/aarch64-apple-darwin/release/format-volume
+FORMAT_VOLUME := $(FORMAT_VOLUME_DIR)/target/$(HOST_TARGET)/release/format-volume
 
 # Signing mode: "yubikey" (default) or "seed" (for CI/testing without hardware key)
 SIGN_MODE ?= seed
@@ -827,7 +827,7 @@ mkinitrd:
 # Required before any build with `--features dev-piv` enabled.
 gen-dev-piv-keys:
 	@echo "=== Building dev-PIV keypair generator ==="
-	cd $(GEN_DEV_PIV_DIR) && cargo build --release
+	cd $(GEN_DEV_PIV_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Generating dev-PIV keypair files ==="
 	$(GEN_DEV_PIV)
 	@echo "=== dev-PIV keypair files ready ==="
@@ -838,7 +838,7 @@ gen-dev-piv-keys:
 # run at least once (consumes user/key-store-service/dev_piv_secret.bin).
 format-volume:
 	@echo "=== Building format-volume host tool ==="
-	cd $(FORMAT_VOLUME_DIR) && cargo build --release
+	cd $(FORMAT_VOLUME_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== format-volume ready: $(FORMAT_VOLUME) ==="
 
 # Re-bake the JetBrains Mono Regular TTF in assets/fonts/ into the
@@ -850,9 +850,9 @@ JBM_PX_HEIGHT := 24
 JBM_CELL := 16x32
 bake-font:
 	@echo "=== Building bake-font host tool ==="
-	cd tools/bake-font && cargo build --release
+	cd tools/bake-font && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Re-baking JetBrains Mono into user/libgui/src/font_jbmono_data.rs ==="
-	./tools/bake-font/target/aarch64-apple-darwin/release/bake-font \
+	./tools/bake-font/target/$(HOST_TARGET)/release/bake-font \
 	    assets/fonts/JetBrainsMono-Regular.ttf \
 	    user/libgui/src/font_jbmono_data.rs \
 	    --px $(JBM_PX_HEIGHT) --cell $(JBM_CELL) --const-prefix JBM
