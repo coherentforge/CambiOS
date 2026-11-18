@@ -82,23 +82,36 @@ pub fn source_tag() -> u8 {
 mod tests {
     use super::*;
 
-    /// Reset module state between tests. Necessary because the static
-    /// atomics persist across `#[test]` runs in a single binary.
-    fn reset() {
+    /// The clock statics are process-wide and the test harness runs tests
+    /// on parallel threads, so every test here holds this lock for its
+    /// whole body. Without it one test's `set` can land between another's
+    /// reset and its `get`: `get_returns_zero_before_any_set` failed in a
+    /// third of runs on a slow x86_64 Linux host.
+    static CLOCK_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock, then reset module state. The reset is necessary
+    /// because the static atomics persist across `#[test]` runs in a
+    /// single binary. A test that failed while holding the lock leaves it
+    /// poisoned; the statics are reset here regardless, so the poison
+    /// carries no information and is discarded.
+    #[must_use]
+    fn reset() -> std::sync::MutexGuard<'static, ()> {
+        let guard = CLOCK_STATICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         WALL_BASELINE_UNIX.store(0, Ordering::Release);
         WALL_BASELINE_TICKS.store(0, Ordering::Release);
         WALL_SOURCE_TAG.store(0, Ordering::Release);
+        guard
     }
 
     #[test]
     fn get_returns_zero_before_any_set() {
-        reset();
+        let _clock = reset();
         assert_eq!(get(), 0);
     }
 
     #[test]
     fn get_returns_baseline_when_no_ticks_elapsed() {
-        reset();
+        let _clock = reset();
         // Anchor at the current tick count; `get()` should produce the
         // baseline + elapsed_ticks/100. The tick counter advances during
         // a real run; the bound is "≥ baseline, ≤ baseline + 1 second of
@@ -114,7 +127,7 @@ mod tests {
 
     #[test]
     fn source_tag_round_trips() {
-        reset();
+        let _clock = reset();
         set(1_700_000_000, 2);
         assert_eq!(source_tag(), 2);
     }
@@ -125,7 +138,7 @@ mod tests {
         // `set_wallclock(0, 0)` on NTP failure precisely so the sentinel
         // semantics survive. We don't enforce that here (caller's job),
         // but `get()` still returns 0, matching the unset case.
-        reset();
+        let _clock = reset();
         set(0, 0);
         assert_eq!(get(), 0);
     }
