@@ -2,7 +2,7 @@
 
 If you are an AI agent working in this repository, two files are your instructions:
 
-1. [CLAUDE.md](CLAUDE.md) is the technical contract: conventions, the Stop-and-Ask Gate, required reading per subsystem, the commands. It applies to every agent, whatever the file's name says.
+1. [CLAUDE.md](CLAUDE.md) is the technical contract: conventions, the Stop-and-Ask Gate, required reading per subsystem, the commands. It applies to every agent, whatever the file's name says. Its "Where things live" index names the files under `.claude/rules/` that hold the reference for each part of the tree; read the one for the paths you work on.
 2. [CONTRIBUTING.md](CONTRIBUTING.md) is the process contract: what checks a change, how commits are written and signed off, who reviews what.
 
 Three rules to carry even if you read nothing else:

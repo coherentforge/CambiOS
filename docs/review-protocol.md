@@ -39,7 +39,7 @@ All builds and clippy must pass with zero errors. Do not skip any step.
 - No raw pointer dereference without a bounds or null check nearby
 
 ## 3. Lock Ordering
-Verify no change introduces a lock ordering violation against the canonical hierarchy in CLAUDE.md's [Lock Ordering](../CLAUDE.md#lock-ordering) section. **Do not duplicate the hierarchy here** — it drifted once and will drift again. Checklist:
+Verify no change introduces a lock ordering violation against the canonical hierarchy in [.claude/rules/locks.md](../.claude/rules/locks.md). **Do not duplicate the hierarchy here** — it drifted once and will drift again. Checklist:
 - Lower-numbered locks must be acquired before higher-numbered ones
 - `try_lock()` in ISR context is acceptable (already established pattern)
 - Holding multiple locks simultaneously requires explicit justification

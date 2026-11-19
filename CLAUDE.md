@@ -55,6 +55,8 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Use `make check-all` (x86_64 + aarch64 + riscv64) as the permanent gate — R-6 landed 2026-04-19 so all three arches are now buildable at every commit boundary. `make check-stable` (x86_64 + aarch64 only) remains available as an escape hatch for future temporary backend breakage; the discipline is identical either way — no commits regress any *currently buildable* arch.
 - **ALWAYS** all new files get an SPDX license header + copyright at the top. Default: `// SPDX-License-Identifier: AGPL-3.0-or-later` then `// Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors` on the next line. A file that already carries the earlier `Copyright (C) 2024-2026 Jason Ricca` line keeps it; headers are not rewritten in passing. Files under `user/libsys/` use `// SPDX-License-Identifier: MPL-2.0` instead. Adapt the comment syntax to file type (`#` for .toml/.py/.sh/Makefile; `/* ... */` for .ld/.S linker scripts and assembly). Do NOT use "All rights reserved" — a license grant supersedes reserved rights, and the SPDX header is the load-bearing declaration.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
+- **Design documents come first.** Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with the [Design Documents](#design-documents) and the ADRs. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
+- **Path-scoped reference lives in `.claude/rules/`.** Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file that [Where things live](#where-things-live) names before working on those paths. The rules in this file outrank them when they conflict.
 
 ## Stop-and-Ask Gate
 
@@ -94,7 +96,7 @@ Commit at topic boundaries within a session, not at session end. Bisectable hist
 **Every acronym or initialism gets a parenthetical on first use per message (chat) or per document (docs): the expansion, plus a reference to where the term is defined when one exists.** Project terms point at their ADR or doc section; hardware and spec terms point at the spec; general terms get the expansion alone.
 
 - `FPEN (Floating-Point Enable, the CPACR_EL1 field; Arm Architecture Reference Manual, CPACR_EL1)`
-- `HHDM (Higher Half Direct Map, Limine's identity map of physical memory; Platform Gotchas below)`
+- `HHDM (Higher Half Direct Map, Limine's identity map of physical memory; .claude/rules/platform-gotchas.md)`
 - `AID (Autonomic Identifier, the 32-byte Principal; ADR-025, identity.md § AID)`
 - `EC (Exception Class, ESR_EL1 bits 31:26)`
 
@@ -110,17 +112,13 @@ Open mechanism decisions awaiting Revisit-when triggers — see [docs/dev-notes/
 
 1. **Every `unsafe` block MUST have a `// SAFETY:` comment, and every `pub unsafe fn` MUST have a `# Safety` rustdoc section** explaining why the operation is safe / what contract the caller must uphold. Citing alignment, bounds, aliasing, or lifetime invariants is the point — "trust me" is not a SAFETY comment. The `unsafe { ... }` rule is enforced by `make check-unsafe-coverage`; the `pub unsafe fn` rule is enforced by `clippy::missing_safety_doc = "deny"` in `[lints.clippy]`. One unsafe op per block, each with its own `// SAFETY:`, is hard-enforced by `#![deny(clippy::multiple_unsafe_ops_per_block)]` + `#![deny(clippy::undocumented_unsafe_blocks)]` in `src/lib.rs`, gated tri-arch by `make check-clippy` (a genuinely-irreducible block takes a local `#[allow(...)]` with rationale).
 
-2. **Lock ordering** (see [Lock Ordering](#lock-ordering)) must always be followed. Never acquire a lower-numbered lock while holding a higher-numbered one.
+2. **Lock ordering** (see [.claude/rules/locks.md](.claude/rules/locks.md)) must always be followed. Never acquire a lower-numbered lock while holding a higher-numbered one.
 
-3. **Architecture portability:** All x86-specific code must be behind `#[cfg(target_arch = "x86_64")]`. The `src/arch/mod.rs` shim re-exports the active backend. Portable scheduler logic lives in `scheduler/mod.rs`.
-
-4. **Large structs** (Scheduler, IpcManager, ChannelManager, ClusterManager, BuddyAllocator, BootInfo) must be constructed **in place**, never as a stack local that is then moved. `Box::new(T::new())` is NOT the pattern — it builds all of `T` on the caller's stack first and then copies it into the box. The pattern is `alloc` + field-wise `addr_of_mut!(...).write(...)` + `Box::from_raw` (`IpcManager::new_boxed`, `ClusterManager::new_boxed`, `ChannelManager::new_boxed`) or an in-place initializer into a static (`BootInfo::init_empty_at` via `boot::begin_install`). Boot stacks: 256 KiB on every arch (Limine `StackSizeRequest` on x86_64/aarch64; `BOOT_STACK_SIZE` parity on riscv64). Adjacent memory below a boot or kernel stack is *other data* — an overflow corrupts silently. The 2026-09-14 riscv64 boot rot was exactly this: a 16 KiB riscv64 boot stack, 17–75 KiB stack transients from `Box::new(X::new())` and `BootInfo::empty()`, and `.data` statics (`POLICY_ROUTER`, `AUDIT_RING`) linked just below it reading back as garbage. Scheduler uses Vec/VecDeque internally so only ~200 bytes of metadata lands on the stack.
+Conventions 3 (architecture portability) and 4 (large structs are constructed in place) apply to kernel code only and are in [.claude/rules/kernel.md](.claude/rules/kernel.md).
 
 5. **`no_std` only.** No standard library. No heap allocation before `memory::init()` completes in `main.rs`.
 
-6. **GDT must be `static mut`** (writable .data section) because the CPU writes the Accessed bit.
-
-7. **Never assume zeroed memory equals `None` for `Option<T>`.** Rust does not guarantee the Option discriminant layout — the compiler may assign discriminant 0 to `Some` (not `None`), especially for large structs on bare-metal targets. Always use explicit `core::ptr::write(None)` when initializing heap-allocated arrays of `Option<T>`.
+Conventions 6 (the GDT is `static mut`) and 7 (zeroed memory is not `None`) are kernel-only too, in the same file.
 
 8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Templates:
 
@@ -202,38 +200,14 @@ This 8-item checklist fires every change (both tiers). The category table it dra
 2. Did this change move a phase forward (e.g., "Phase 3 in progress" → "Phase 3 done")? → Update the Phase markers table.
 3. Did this change touch the scheduler? → Re-read [SCHEDULER.md](src/scheduler/SCHEDULER.md) and update if anything in it is now wrong.
 4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments. Did this change diverge from an existing ADR's plan? → Show the user the planned diff to the ADR body first; once approved, edit the body to reflect the new design and add a `## Divergence` appendix at the bottom preserving the prior wording with date + commit reference. The body is current truth; the appendix is history.
-5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference / Lock Ordering / Syscall Numbers tables.
-6. Did this change resolve a Platform Gotcha in CLAUDE.md or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
+5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference, [.claude/rules/locks.md](.claude/rules/locks.md) or [.claude/rules/syscalls.md](.claude/rules/syscalls.md).
+6. Did this change resolve a Platform Gotcha in [.claude/rules/platform-gotchas.md](.claude/rules/platform-gotchas.md) or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
 7. Did this change cite a doc that doesn't exist yet? → Either create the doc or remove the citation.
 8. Did this change add or modify a numeric `const`, fixed-size array, or `MAX_*` bound in kernel code? → Tag it with `SCAFFOLDING` / `ARCHITECTURAL` / `HARDWARE` / `TUNING` per Development Convention 8, and add or update the row in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Unconscious bounds are not allowed.
 
 ## Common Failure Signatures
 
-Observed symptom → likely root cause. The symptom rarely names the invariant it violated.
-
-- **`error[E0152]: found duplicate lang item 'panic_impl'`** → a crate in the dependency tree pulled in `std`. Kernel and userspace modules are both `no_std`; most commonly triggered when a new dependency's default features include `std`. Disable default features on the offender and pick only `no_std`-compatible flags.
-
-- **`link error: undefined reference to 'memcpy'` / `memset` / `memmove`** → new crate missing the `compiler_builtins` `mem` feature, or kernel linker flags lost `-C link-arg=--no-undefined`. Cross-check the failing module's `Cargo.toml` against a working sibling (`user/fs-service`, `user/shell`).
-
-- **QEMU reboots / triple-faults immediately after "booting kernel…"** → IDT not installed yet (any exception before `interrupts::init()` is a triple fault), or the double-fault handler faulted because IST1 isn't pointing at valid memory. Check the boot sequence in [src/microkernel/main.rs](src/microkernel/main.rs) for ordering regressions.
-
-- **AArch64 "Undefined Instruction" exception at `mrs ICC_SRE_EL1`** → QEMU running default GICv2. Must use `-machine virt,gic-version=3`. (Duplicates a Platform Gotcha intentionally — this error text should resolve to its cause from either direction.)
-
-- **Kernel panic "allocation failed" / `GlobalAlloc::alloc` returns null in early boot** → attempted `Box::new` / `Vec::new` before `memory::init()` ran. Move the allocation after init, or pre-allocate a static. The `debug_assert!` at the top of [src/memory/heap.rs](src/memory/heap.rs) will name this directly in debug builds.
-
-- **A write-once static reads back as garbage (a `None` static is `Some`, a count is astronomically large, a `TaskId` slot is out of range), and the victim changes when unrelated code or link layout changes** → a stack overflowing into the `.data`/`.bss` neighbors below it. Run `llvm-nm -n` on the kernel and look at what sits immediately below `BOOT_STACK` / `AP_BOOT_STACKS` / a kernel stack; then measure `size_of` for every struct built on that path (a host test printing `size_of::<T>()` takes a minute). `Box::new(T::new())` and `let x = T::empty()` are the usual culprits — see Convention 4. Reference case: the riscv64 boot rot of 2026-09-14 (16 KiB boot stack; `ClusterManager` 75 KiB, `ChannelManager` 58 KiB, `BootInfo` 17 KiB; victims `POLICY_ROUTER` → `TASK_CPU_MAP` → `AUDIT_RING` in link order).
-
-- **`#PF` in kernel with CR2 = user vaddr during a syscall** → the user pointer belongs to a process whose page tables aren't currently loaded in CR3 (e.g., kernel reading a peer's channel buffer while in a third process's context). Use the page-walk helpers in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs) rather than dereferencing user pointers directly. *Note: this codebase does not enable SMAP, so `stac`/`clac` is not the cause — don't go looking for it.*
-
-- **A user task is reaped with a kernel-text PC (aarch64: `[Fault] EL0 … PC=0xffffffff8…` with EC=0x00), usually a task that makes syscalls in a tight loop** → the return-to-user path took an interrupt after it had loaded the return registers. An IRQ between `msr elr_el1` and `eret` (aarch64), `csrw sepc` and `sret` (riscv64), or the user-RSP switch and `sysretq` (x86_64) overwrites the return address and status with the kernel's own; the ISR comes back to the stub, nothing reloads them, and the return instruction enters user mode at the stub's address. Every return path masks interrupts *before* it loads those registers. "Exception entry already masked them" is not an argument: a handler that yielded resumes with interrupts on. Reference case: aarch64 `sync_el0_restore`, 2026-11-04 — virtio-blk's poll-and-yield loop hit the five-instruction window within seconds of every boot; a service that blocks passes through it rarely enough that the same bug would read as a flake.
-
-- **QEMU output stops mid-run with no panic, no reboot, no further timer ticks** → a silent hang. Locate the last thing that printed and check the code path immediately after it:
-  - *Touched a lock used from an ISR?* → it must use `try_lock()`, not `lock()`. A blocking ISR lock deadlocks the CPU.
-  - *Touched lock ordering?* → re-check the [Lock Ordering](#lock-ordering) hierarchy. Acquiring a lower-numbered lock while holding a higher-numbered one freezes the CPU that hits the violation. No runtime "deadlock detected" message is printed — silence *is* the diagnostic.
-  - *Touched the timer ISR?* → missing APIC EOI (`apic::write_eoi()`) or GIC EOI means no further timer interrupts fire.
-  - *Touched yield / context switch?* → a lock held across `yield_save_and_switch` freezes the next task to try to acquire it.
-  - *Every driver reports "no device", the `✓ PCI:` table never prints, `[sched]` shows one CPU and `aps +0`, and only a slow machine (CI's TCG runner) does it?* → the boot context was overtaken before `boot_handoff()`: something runnable arrived before kmain finished PCI scan / AP bring-up (a yield-spinning service keeps the idle task — which *is* kmain — off the CPU forever). Boot work belongs before the hand-off call; a service's fallback loop must block, not yield-spin. Reproduce locally by duty-cycling QEMU with `kill -STOP`/`-CONT` (notes/boot-smoke-regression-2026-11-02.md).
-  - *One task sleeps forever while the system stays alive (timer ticks continue, other services print)?* → a lost wake-up. Either the waker scanned only its local CPU's scheduler (endpoint wakes must use `wake_message_waiters_all_cpus` — TASK_CPU_MAP can't resolve endpoint waiters), or the sleeper's condition check wasn't atomic with `block_task` (see the Blocking pattern). Probabilistic-looking stalls that depend on task placement are this, not timing luck — the ADR-018 boot-wave stall (init slept through a ready ping sent from the other CPU) is the reference case.
+Observed symptom, likely root cause: [docs/dev-notes/failure-signatures.md](docs/dev-notes/failure-signatures.md). Read it when a build error or a QEMU log does not name its cause. It covers duplicate `panic_impl` and missing `memcpy` link errors, triple faults at boot, the GICv2 undefined instruction, early allocation failures, write-once statics reading back as garbage, `#PF` on a user address in a syscall, a user task reaped at a kernel-text PC, and silent hangs.
 
 ## Worked Examples
 
@@ -293,24 +267,6 @@ make check-lockfile          # T-1: lists added/removed Cargo.lock crates (advis
 make check-unsafe-coverage   # Convention 1 (blocks): every `unsafe { }` has `// SAFETY:` (cluster + cfg-attr + assignment-continuation aware)
 make check-status-freshness  # STATUS.md `last_synced_to_code:` within 7 days of today (advisory; warn-but-pass). CI runs it with `--strict`, which fails when STATUS.md's Kani harness total disagrees with the source
 make check-clippy            # Convention 1 (tri-arch deny gate, CI per-push): missing_safety_doc (every `pub unsafe fn` has `# Safety`) + multiple_unsafe_ops_per_block + undocumented_unsafe_blocks; runs clippy on x86_64+aarch64+riscv64 because arch-cfg'd unsafe only lints on its own target
-# Commit-msg hooks (Claude-authored commits only):
-# 1. H1 (2026-04-23): `Staged files:` block must match `git diff --cached
-#    --name-only`. Script: tools/check-claude-staged-files.py.
-# 2. Sticky preflight (2026-04-25): rejects commits that stage a file
-#    which was already dirty at the start of the current Claude session
-#    AND was never preflighted. Catches the 6th-recurrence shape that H1
-#    misses (within-file sweeps). Set `CLAUDE_PREFLIGHT_SESSION=<id>`
-#    once per session to enable enforcement; warn-but-pass when unset.
-#    Script: tools/check-preflight-discipline.py.
-# Pre-push hook (Claude-authored commits only):
-# 3. Edit-window gate (2026-04-25): rejects pushes whose Claude-authored
-#    commits modify files no Claude session ever touched via Edit/Write/
-#    NotebookEdit. Defense-in-depth on top of (2); catches anything that
-#    bypassed commit-msg via `--no-verify`. Requires the PostToolUse hook
-#    in .claude/settings.local.json (calls tools/log-claude-edit.py) plus
-#    `CLAUDE_PREFLIGHT_SESSION`. Warn-but-pass without an edit log.
-#    Scripts: tools/log-claude-edit.py + tools/check-edit-window.py.
-# All run automatically when installed via `make install-hooks`.
 
 # One-time per clone — installs .githooks/ via core.hooksPath
 make install-hooks
@@ -330,44 +286,11 @@ make run-quiet DISK_BUS=nvme     # same disk image behind a QEMU NVMe controller
 make img-usb [PROFILE=headless]  # bare-metal USB image: iso_root + the signed manifest for PROFILE (headless = text shell on the framebuffer console, with the shell rebuilt `--features headless-input` and swapped in so it owns input endpoint 30 and reads the USB keyboard from usb-host; framebuffer-fallback = scanout-limine + compositor + terminal-window, keyboard via usb-host HID → compositor). `make usb DEVICE=/dev/diskN PROFILE=…` writes it.
 make usb DEVICE=/dev/diskN PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-hold   # diagnostic stick for a machine with no serial: the kernel text console keeps mirroring over the scanout driver after the handoff, so the boot log (policy denials, `[sched]` counters, service lines) stays readable on the panel when the GUI chain fails silently. Garbled by design; never ship it.
 
-# Sandbox VM egress (stage G, notes/stage-g-mythos-sandbox-vm.md): allow-list proxy on the Tart bridge
-make sandbox-net-up              # start tools/sandbox/allowlist-proxy.py bound to bridge100 (run after the VM is up); log + pidfile under ~/sandbox
-make sandbox-net-down            # stop it
-make sandbox-net-status          # pid, listener, last 10 decisions; $(SANDBOX_SOFTNET_POLICY) is the `tart run` flag set that pairs with it
-make sandbox-up [SESSION=name]   # clone the sealed golden image, boot it under the policy with ~/sandbox/exchange.git mounted, proxy up, guest checkout at this HEAD, ~/sandbox/credential.env copied onto the clone (tools/sandbox/session.sh)
-make sandbox-ssh                 # shell into the session as `agent`
-make sandbox-pull                # fetch the agent's refs/heads/sandbox/* branches from the exchange for review
-make sandbox-run PROMPT=f [MODEL=id] [JSON=1]   # hand one task file to the agent inside the session (claude -p, permissions bypassed: the VM is the containment); the run is detached in the guest, the host polls for its exit; answer on stdout, kept under ~/sandbox/runs/. Default MODEL is claude-mythos-5-2 ($(SANDBOX_MODEL)); the guest's /model picker does not list it but the API serves it
-make sandbox-fetch RUN=stamp     # collect a run whose wait was interrupted (host slept, Ctrl-C); safe to repeat
-make sandbox-down                # poweroff from inside, delete the clone, stop the proxy; only the exchange survives
-make sandbox-status              # VMs, current session, proxy, last decisions
-make sandbox-image               # rebuild the sealed golden image from the stock base (tools/sandbox/image.sh + provision.sh); previous kept as cambios-golden-prev
-make sandbox-check               # is the golden fresh? stamp = hash of rust-toolchain.toml, every Cargo.lock, provision.sh, Limine pin, base digest; sandbox-up refuses a stale one
-make sandbox-image-schedule      # user launchd job: weekly rebuild (Mondays 06:00); sandbox-image-unschedule removes it
-
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols
 
-# Standalone builds
-make fs-service                  # user/fs-service — separate crate, uses CARGO_ENCODED_RUSTFLAGS to override parent .cargo/config.toml
-make sign-tool                   # tools/sign-elf — host-side tool, built for the detected host triple
-make manifest                    # ADR-018: emit manifest.bin from manifest.toml via tools/build-manifest (`--arch x86_64 --profile default`; manifest-aarch64 / manifest-riscv64 for the other arches), sign with sign-elf. The manifest is the ONLY spawn authority since step 9: services, on-demand apps (`lifetime = "on-demand"`), grants, reservations all live in manifest.toml. A dependant can name a role by endpoint (`depends_on_endpoints = [27]`); build-manifest resolves it to the one kept owner per arch/profile, so the wire blob is always plain name deps.
-make init                        # user/init — PID 1 supervisor (init-aarch64 / init-riscv64 for other arches); host tests: `make host-test-user-init`
-make gen-dev-piv-keys            # tools/gen-dev-piv-keys — derives dev Ed25519+X25519 keys from a persistent per-developer seed at tools/gen-dev-piv-keys/.dev-seed.bin (gitignored); writes dev_bootstrap_pubkey.bin (workspace root) + dev_slot_9c_seed.bin (workspace root, for sign-elf via SIGN_MODE=dev-piv) + user/key-store-service/dev_piv_secret.bin. Idempotent; required before any `--features dev-piv` build (kernel + key-store-service must both be built with this feature for SwPivBackend's pubkey to match the kernel-baked bootstrap pubkey).
-make format-volume               # tools/format-volume — host tool that writes a fresh signed ADR-032 volume header to a raw disk image. Run as `$(make -s print-FORMAT_VOLUME) <disk-image>`. Requires gen-dev-piv-keys to have run first. The header pairs with the dev_bootstrap_pubkey.bin baked into the kernel under `--features dev-piv`; fde-mount reads + verifies + unwraps the master key at boot. Stream A A-v.e.
-
-# Dev-PIV feature builds (Stream A; ADR-032 Migration Path step 2)
-make kernel-dev-piv              # kernel built with --features dev-piv (replaces baked bootstrap pubkey with the dev one)
-make key-store-service-dev-piv   # key-store-service built with --features dev-piv (loads SwPivBackend with the DPIV's slot-9C/9D keys)
-make iso-dev-piv                 # Re-assembles the ISO with dev-piv kernel + key-store binaries (uses --assume-old + SIGN_MODE=dev-piv so sign-elf signs with the slot-9C seed the dev-piv kernel accepts)
-make run-quiet-dev-piv           # Formats cambios-disk.img with a fresh signed FDE header + boots under iso-dev-piv. Stream A A-v.d end-to-end smoke test.
-# Manual: cargo build --target x86_64-unknown-none --release --features dev-piv (kernel) + CARGO_ENCODED_RUSTFLAGS=... cargo build --release --features dev-piv inside user/key-store-service/
-
-# ELF signing (produces ARCSIG trailer). The tool is built under its host triple; `make -s print-SIGN_ELF` prints the path.
-$(make -s print-SIGN_ELF) <elf-file>                                    # YubiKey (default)
-$(make -s print-SIGN_ELF) --seed <hex> <elf-file>                       # seed (CI/test)
-$(make -s print-SIGN_ELF) --export-pubkey bootstrap_pubkey.bin          # one-time setup
-$(make -s print-SIGN_ELF) --print-pubkey
+# Git hook mechanics, standalone builds, dev-PIV builds and ELF signing: .claude/rules/tools.md.
+# Sandbox VM: .claude/rules/sandbox.md.
 ```
 
 ## Code Navigation — rust-analyzer MCP Tools
@@ -384,85 +307,13 @@ An MCP server exposing rust-analyzer is configured in `.mcp.json`. **Prefer thes
 
 These tools return semantically precise results (no false positives from comments or strings) and save significant tokens compared to grep-then-read cycles. Grep is still appropriate for searching within string literals, comments, or non-Rust files.
 
-## Lock Ordering
-
-Lock ordering MUST be followed to prevent deadlock.
-
-```
-SCHEDULER(1)* → TIMER(2)* → IPC_MANAGER(3) → CAPABILITY_MANAGER(4) →
-CLUSTER_MANAGER(5) → CHANNEL_MANAGER(6) → PROCESS_TABLE(7) →
-FRAME_ALLOCATOR(8) → INTERRUPT_ROUTER(9) → OBJECT_STORE(10) →
-POSIX_STORE(11) → BLOCK_BITMAP_LOCK(12) → JOURNAL_LOCK(13)
-```
-`*` = IrqSpinlock (saves/disables interrupts before acquiring, prevents same-CPU deadlock when timer ISR fires while lock is held). Others use plain Spinlock — including `CLUSTER_MANAGER`, `POSIX_STORE`, `BLOCK_BITMAP_LOCK`, and `JOURNAL_LOCK`, which never run in ISR context (all four are syscall-driven).
-
-`CLUSTER_MANAGER(5)` inserted per [ADR-027 § Architecture](docs/adr/027-service-clusters.md). Cluster operations acquire `CLUSTER_MANAGER` → (`CAPABILITY_MANAGER` for cap promotion / revoke) → `CHANNEL_MANAGER` (per-channel teardown during cluster revoke) → `PROCESS_TABLE` (member-PID lookup) → `FRAME_ALLOCATOR` (unmap-driven frame frees). Strictly downward — no inversion.
-
-`POSIX_STORE(11)`, `BLOCK_BITMAP_LOCK(12)`, and `JOURNAL_LOCK(13)` inserted per [ADR-029 § Decision 4](docs/adr/029-posix-file-storage-model.md) (POSIX_STORE + BLOCK_BITMAP_LOCK) and [ADR-029 § Divergence 2](docs/adr/029-posix-file-storage-model.md) (JOURNAL_LOCK promotion from POSIX-internal sub-lock to top-level position 13, to support cross-backend use forecast by [ADR-010 § Divergence 3](docs/adr/010-persistent-object-store-on-disk-format.md)). Acquisition patterns are strictly downward — no inversion:
-
-- **POSIX-only write path** (e.g., `SYS_FILE_WRITE`): `POSIX_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK`. Skips `OBJECT_STORE` (no CambiObject touched).
-- **CambiObject-only write path** (post-[ADR-010 § Divergence 3](docs/adr/010-persistent-object-store-on-disk-format.md) landing in step 5D): `OBJECT_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK`. Skips `POSIX_STORE` (no POSIX inode touched).
-- **CAMBIO cross-backend transaction**: `OBJECT_STORE → POSIX_STORE → BLOCK_BITMAP_LOCK → JOURNAL_LOCK`. Full chain.
-
-`POSIX_STORE(11)`'s concrete `Spinlock<Option<PosixFsBackend<...>>>` is reserved in the hierarchy doc but its declaration is deferred to ADR-029 migration step 6+, when the kernel singleton wire-up picks a concrete `BlockDevice`. The slot is referenced in the hierarchy now so the invariant lands with the data structures rather than as a retrofit. Unit tests use the `PosixFsBackend` instance's struct fields directly without touching the global slot.
-
-`BLOCK_BITMAP_LOCK` and `JOURNAL_LOCK` are held only briefly — lock, mutate, journal-append, unlock. No device I/O while held; the byte writes happen with locks released, then a final commit step under-lock applies the in-memory bitmap mark (per [ADR-029 § Decision 2 step 4](docs/adr/029-posix-file-storage-model.md): journal record durable before in-memory bitmap commits).
-
-Lower-numbered locks must be acquired before higher-numbered ones. See `src/lib.rs` comment.
-
-**A plain `Spinlock` holder is never descheduled.** Syscall handlers run with interrupts on, so without help the timer could switch away from a task mid-critical-section and leave a plain lock held by a task that is not running; a CPU then spinning on that lock with interrupts masked (an `IrqSpinlock` holder — `handle_spawn` with the target scheduler lock, `wake_message_waiters_all_cpus`) can never run the holder (the 2026-10-27 spawn deadlock: init on `FRAME_ALLOCATOR`, virtio-net on `PER_CPU_SCHEDULER[0]`, the allocator's holder preempted). `Spinlock::lock`/`try_lock` raise the per-CPU `PREEMPT_DEPTH` before the acquire attempt and the guard lowers it after the release; `on_timer_isr` and `on_resched_ipi` switch tasks only when it is zero (the tick is still accounted; an expired slice is collected at the first tick after release). Interrupts stay live — this is not IrqSpinlock-everywhere. Consequence for the hierarchy's deadlock-freedom argument: every lock holder is running and makes progress. `on_voluntary_yield` debug-asserts the count is zero: never block or yield with a plain lock held (the Blocking pattern already requires dropping it first). **The boot context is held the same way:** `boot_context_holds_cpu()` is true until the BSP's `kmain` calls `boot_handoff()` at the door of its idle loop, and the ISRs switch nothing before then on any CPU. The boot context is the idle task (slot 0, one-tick slice); on x86_64 interrupts come on inside `init_hardware_interrupts`, before AP bring-up, and a slow machine's first tick handed the CPU to init mid-boot (boot-smoke CI 2026-10-31). Boot work that must precede the first task goes before that call, never after.
-
-**Additional lock domains (independent of hierarchy above):**
-- `PER_CPU_FRAME_CACHE[cpu]` — per-CPU, never held with FRAME_ALLOCATOR. Cache lock released before acquiring global allocator on refill/drain.
-- `SHARDED_IPC.shards[endpoint]` — per-endpoint, never held cross-endpoint. Released before acquiring scheduler for task wake. A blocking receiver on a kernel-origin endpoint (policy queries on 22, virtio-blk commands on 26) holds `SCHEDULER → IPC_MANAGER → shard` across its block decision — the shard is the lock the kernel-side sender publishes under, so it is the lock the Blocking pattern's atomic re-check must hold (a `has_message()` that took and dropped it left the policy service sleeping through queries on the Dell 3630: `expired 11`, 2026-10-28). No path holds a shard while taking a scheduler lock.
-- `BOOTSTRAP_PRINCIPAL` — written once at boot, read-only thereafter. Not part of the lock hierarchy.
-- `ENDPOINT_RESERVATIONS`, `SPAWN_GRANTS`, `INIT_PROCESS` (ADR-018) — BOOTSTRAP_PRINCIPAL lifecycle: written once during single-threaded boot (manifest transcription; init creation for `INIT_PROCESS`), read-only thereafter. Not in the hierarchy; every accessor is a self-contained lock-copy-unlock, never called with another lock held.
-- `AUDIT_RING` — acquired by `drain_tick()` (try_lock from BSP ISR, holds no other lock) and by `SYS_AUDIT_ATTACH`/`SYS_AUDIT_INFO` handlers (two-phase protocol: never held while PROCESS_TABLE or FRAME_ALLOCATOR is held). `audit::emit()` never touches it.
-- `PER_CPU_AUDIT_BUFFER[cpu]` — lock-free SPSC; no lock at all. Written by local CPU, drained by BSP.
-- `CPU_IDLE[cpu]` — lock-free `AtomicBool` per CPU, written by that CPU's own scheduling entry points after each decision, read by the wake helpers to gate the reschedule kick. Advisory: a stale read costs one timer tick, never correctness.
-- `TASK_SLOT_BITMAP` — lock-free global task-slot allocator (`claim_task_slot`/`release_task_slot`, ADR-034 Residual Risk closure); CAS only, no lock. `claim` may be called while SCHEDULER is held (it acquires no lock); `release` runs in the reaper with SCHEDULER dropped. Arbitrates the global slot namespace so concurrent cross-CPU spawns can't collide.
-- `SERIAL1` and `io::fbcon::FBCON` — the two console sinks, each a plain `Spinlock`, never held together: `io::print` writes serial, drops that guard, then takes the framebuffer console. Neither is in the hierarchy; nothing inside them may block or take another lock. **Interrupt handlers never call `print`/`println!`; they use `io::try_print`**, which `try_lock`s both sinks and drops the output on contention — that is what makes a plain lock safe (a handler landing on the CPU mid-print cannot spin on it). An interrupt-masking `IrqSpinlock` was tried here and froze the Dell 3630's boot mid-print (2026-10-22); interrupts stay live during the slow real-hardware console writes. The framebuffer console mirrors every `println!` / `SYS_PRINT` onto framebuffer 0 as text (x86_64; init right after `boot::populate`) and goes `Released` at the first successful `SYS_MAP_FRAMEBUFFER` — the kernel never draws over a scanout driver. Consequence for hardware debugging: on a machine with no serial, the last text line a *successful* GUI boot shows is `[SCANOUT-LIMINE] starting`; everything after the handoff is invisible unless the compositor draws. The `fbcon-hold` kernel feature (`KERNEL_FEATURES=fbcon-hold`) keeps the mirror alive for diagnosis only.
-
-## Multi-Platform Strategy (x86_64, AArch64, RISC-V)
-
-x86_64, AArch64 and riscv64gc build at every commit ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Per-module parity status lives in [STATUS.md](STATUS.md).
-
-### Portability Boundary (portable modules — no arch code)
-`src/scheduler/`, `src/ipc/`, `src/syscalls/mod.rs`, `src/process.rs`, `src/memory/buddy_allocator.rs` + `frame_allocator.rs`, `src/arch/spinlock.rs`. All arch code lives under `src/arch/<target>/`; `src/arch/mod.rs` is the cfg-gated shim.
-
-### Rules for New Code
-- **Arch-specific code goes under `src/arch/<target>/`**, never in portable modules.
-- **New arch backends match the public API** in `src/arch/x86_64/mod.rs` (`SavedContext`, `context_switch()`, `timer_isr_inner()`, etc.).
-- **Targets:** aarch64 = `aarch64-unknown-none` + `linker-aarch64.ld`. riscv64 = `riscv64gc-unknown-none-elf` + `linker-riscv64.ld`; code model must be `medium` (`medlow` can't reach higher-half).
-- **Interrupt subsystem portable where possible.** `interrupts/routing.rs` is arch-independent; PIC/PIT should eventually move under `arch/x86_64/`.
-- **Bootloader:** x86_64/AArch64 = Limine 8.7.0. RISC-V = OpenSBI + custom S-mode stub; no Limine (unsupported).
-- **AArch64 MMIO must be explicitly mapped** into TTBR1 via `early_map_mmio()` — Limine's AArch64 HHDM covers RAM only.
-- **RISC-V is generic-first.** Discover MMIO via DTB; no vendor-specific paths in the core backend.
-- **Three-arch cfg discipline.** Prefer `#[cfg(not(target_arch = "x86_64"))]` when AArch64 + RISC-V share behavior; use positive 3-way cfgs only when behavior diverges; factor an `arch::` helper instead of inline 3-way cfg blocks.
-
-## Platform Gotchas
-
-These are persistent platform/bootloader quirks that any new code in the boot or hardware paths must respect. Status of *features* (what's built vs planned) lives in [STATUS.md](STATUS.md); this section is for things that won't go away.
-
-- **Boot requires BOTH manifest.bin and init.elf staged (ADR-018 step 9).** The kernel starts no service itself — it transcribes the manifest, registers every module by name, creates init as PID 1, and init spawns the boot wave. Missing manifest ⇒ typed `ManifestModuleMissing` boot failure; manifest without init ⇒ `InitModuleMissing`. There is no fallback chain any more. A module the manifest does not declare is loaded but unspawnable (`SYS_SPAWN` ⇒ `InvalidArg`); a boot-wave row spawned by anyone but init ⇒ `PermissionDenied`; on-demand rows (apps) are spawnable by any `CreateProcess` holder.
-- **Limine base revision 3 HHDM gap (x86_64):** ACPI_RECLAIMABLE, ACPI_NVS, and RESERVED regions are NOT in the HHDM. `map_acpi_regions()` in `main.rs` explicitly maps small RESERVED regions (≤1MB, **uncacheable**, read-only) and all ACPI regions (cacheable, read-only) into the HHDM before ACPI parsing. SeaBIOS puts ACPI tables in RESERVED memory (not ACPI_RECLAIMABLE), so the RESERVED mapping is essential. **Device register pages must be claimed through `paging::claim_mmio_page`**, which remaps any earlier mapping uncacheable + writable: on the Dell Precision 3630 the RESERVED sweep had already mapped the Local APIC page cacheable, the APIC driver used it because `map_page` said `AlreadyMapped`, and the first cached APIC read hung the core (2026-10-22). Intel defines APIC access through any memory type but UC as undefined.
-- **x86_64 memory types are the PAT Limine programs, plus one entry of ours.** Limine's layout is `0x0000010500070406` (index 0 WB … index 5 WC, the one its framebuffer mapping uses). Limine syncs the APs' MTRRs but not their PAT, so `percpu::init_bsp` captures the BSP's PAT and `init_ap` writes it on every AP (the Dell 3630's slow boot, 2026-10-23: eleven APs writing the console framebuffer write-through). `init_bsp` also sets index 1 (PWT only, no PAT bit) to WC, which `flags::user_framebuffer` selects for `SYS_MAP_FRAMEBUFFER` — never use the PAT bit on a 4 KiB leaf, the `x86_64` crate treats it as HUGE_PAGE and refuses to unmap. Device registers stay UC via `claim_mmio_page` / `user_mmio`.
-- **Limine AArch64 HHDM does NOT map device MMIO.** PL011 UART (0x0900_0000), GIC Distributor (0x0800_0000), and GIC Redistributor (0x080A_0000) must be explicitly mapped into TTBR1 via `early_map_mmio()` before any I/O. Uses bootstrap frames from kernel .bss (physical address found by walking TTBR1 page tables, since kernel statics are NOT in HHDM).
-- **Limine AArch64 TCR_EL1.T1SZ too narrow.** Limine sets T1SZ for ~39-bit VA, but HHDM at `0xFFFF000000000000` needs 48-bit. `kmain` widens T1SZ to 16 (48-bit) at early boot.
-- **AArch64 QEMU requires GICv3.** Must use `-machine virt,gic-version=3` because the GIC driver uses ICC system registers (GICv3). Default GICv2 causes Undefined Instruction on `mrs ICC_SRE_EL1`.
-- **AArch64 CPACR_EL1 is per-CPU: every AP must enable FP/SIMD itself.** `arch::aarch64::enable_fpsimd()` (FPEN = 0b11) runs on the BSP and in `ap_entry`. Rust user code reaches NEON through `compiler_builtins::memset`; on a CPU where FPEN is still 0 that instruction traps as EC=0x07 and the task is reaped. The fault line names it; the pre-fix line read as a bad pointer because FAR_EL1 is stale for that class. The first task spawn-time placement homed on CPU 1, the policy service, died this way from 2026-10-27 until 2026-11-04, and the boot-smoke CI job (x86_64 only) never saw it. Neither architecture saves FP/SIMD register state across a context switch yet (STATUS.md Known issues).
-- **ELF loader doesn't merge overlapping segment permissions.** If two PT_LOAD segments share a page with different permissions (e.g., .text RX and .got RW), the first segment's permissions are used. User-space linker scripts work around this with `ALIGN(4096)` before `.data`. Loader fix is tracked in [STATUS.md](STATUS.md).
-- **`SYS_WAIT_IRQ` unregistered-IRQ wake fallback.** Registered device IRQs use targeted single-CPU wake via `TASK_CPU_MAP`. Unregistered IRQs fall back to all-CPU scan with `try_lock()` — if SCHEDULER lock is contended, wake is deferred to the next timer tick. Acceptable; not a bug.
-- **Stray level-triggered IRQs are masked (x86_64).** A GSI with no entry in the routing table that wakes nobody is masked in the I/O APIC from its own handler and logged once (`[IRQ] stray GSI N … masked`); `SYS_WAIT_IRQ` unmasks the pin when a driver claims it. Real PCI devices assert level-triggered INTx lines that stay asserted after EOI; without this the handler re-enters forever and the interrupted context never resumes (the Dell 3630's xHCI after RUN, 2026-10-22 — the screen froze mid-string). QEMU never produced one.
-- **xHCI on real firmware needs the BIOS → OS hand-off before reset.** `usb-host` walks the Extended Capability list for USB Legacy Support, sets the OS-owned semaphore, waits (bounded) for the BIOS-owned bit to clear, then disables every SMI source. Resetting a BIOS-owned controller drops the CPU into SMM. The Dell's controller also demands 65 scratchpad pages (`MaxScrPads`); qemu-xhci asks for none and has no legacy capability, so neither path exists under QEMU — the Dell is the test.
-
 ## Required Reading by Subsystem
 
 When working on a subsystem, read its design and implementation docs *before* writing code. This map exists so context doesn't get forgotten between sessions. If a doc is missing from the list it means the subsystem is small enough that the code is the documentation.
 
 | Working on... | Read first | Then |
 |---|---|---|
-| **Scheduler / context switch / preemption** | [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) | This file's [Lock Ordering](#lock-ordering) and "Timer / Preemptive Scheduling" sections |
+| **Scheduler / context switch / preemption** | [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) | [.claude/rules/locks.md](.claude/rules/locks.md) and [.claude/rules/scheduling.md](.claude/rules/scheduling.md) |
 | **IPC control path (256-byte messages)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/mod.rs`, `src/ipc/interceptor.rs` |
 | **IPC bulk path (channels — Phase 3)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (channels are the audit transport) |
 | **Service clusters / cluster-shaped revoke / boot-time mesh setup** | [ADR-027](docs/adr/027-service-clusters.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channel substrate), [ADR-018](docs/adr/018-init-process-and-boot-manifest.md) (manifest-driven boot) | `src/ipc/cluster.rs` (skeleton, post-HN), `user/compositor/src/main.rs` (rendering limb is the first cluster). Per-channel quiesce protocol is the prerequisite — independent pre-HN work that closes the compositor #PF on clean client exit; clusters wrap N quiesce-revokes in a single locked transition. |
@@ -477,7 +328,7 @@ When working on a subsystem, read its design and implementation docs *before* wr
 | **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
 | **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
 | **Init / boot manifest / service lifecycle** | [ADR-018](docs/adr/018-init-process-and-boot-manifest.md) (kernel transcribes security sections, init interprets policy sections; migration-step ordering), [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md) (restart substrate — gates step 10) | `cambios-manifest/src/lib.rs` (wire format, shared parser, boot-protocol consts), `user/init/src/engine.rs` (supervisor state machine), `src/manifest.rs` (kernel transcription), `manifest.toml` + `tools/build-manifest` (registry artifact) |
-| **Architecture port (a new backend)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), this file's "Multi-Platform Strategy" section; `make check-lists` names each file a new architecture has to be added to | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
+| **Architecture port (a new backend)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), the Multi-Platform Strategy section of [.claude/rules/kernel.md](.claude/rules/kernel.md); `make check-lists` names each file a new architecture has to be added to | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
 | **Graphics / compositor / GUI / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) (+ § Divergence 2026-04-20 for 4.a/4.b scanout transport: `SYS_VIRTIO_MODERN_CAPS = 38`, double-copy frame path, `-vga virtio` QEMU; + § Divergence 2026-05-08 for the client↔compositor protocol — 10 wire messages 0x3xxx/0x4xxx, libgui-proto authoritative) | `user/compositor` (ep 28), `user/scanout-virtio-gpu` (ep 27 — default x86_64 driver, 5 2D ops: CREATE_2D / ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH), `user/scanout-limine` (fallback). Intel + aarch64/riscv64 virtio-gpu deferred to 4.c+. [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) for channel transport. |
 | **GUI client library (user/libgui v0)** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) (libgui = in-process widget layer; v0 drawing primitives only, widgets deferred), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) § Divergence 2026-05-08 (client↔compositor wire protocol — full message table + authority model) | `user/libgui-proto/src/lib.rs` (wire format), `user/hello-window/` (canonical client), `user/libgui/src/{surface,font,tile_grid,client,bitmap}.rs`. No new kernel syscalls — drawing is CPU writes into attached surface channel. `Client::open` does CreateWindow/WelcomeClient/channel_attach handshake. `TileGrid::hit_test` deferred — don't add without consumer. |
 | **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) (+ § Divergence: virtio-input-first, `COMPOSITOR_INPUT_ENDPOINT = 30`, first-live-window focus) | `user/libinput-proto/src/lib.rs` (96-byte wire + class payloads + modifier/button bitfields), `user/virtio-input/` (main.rs + transport.rs + virtqueue.rs + evdev.rs), `user/compositor/src/main.rs::pump_input_once` (→ focused window via `MsgTag::InputEvent = 0x4030`), `user/libgui/src/client.rs::poll_event`. Hub deferred until second consumer or signed-carrier hardware. `signature_block` reserved from day one so ADR-012 Input-5 lands without format revision. |
@@ -509,7 +360,7 @@ These documents capture architectural decisions that implementation must align w
 - **[GOVERNANCE.md](docs/GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
 - **[docs/adr/](docs/adr/)** — Architecture decision records. Read the ones in the Required Reading map for the subsystem you're touching. (Run `ls docs/adr/` for the current set; do not cite a range here — it drifts.)
 
-Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with these documents. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
+Work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry follows the "Design documents come first" rule under [Critical Rules](#critical-rules).
 
 ## Roadmap
 
@@ -517,90 +368,46 @@ What's built, what's in progress, what's planned (including v1 ordering, phase m
 
 ---
 
-# Deep Reference
+## Where things live
 
-Sections below describe kernel state (directory pointers, tables, per-syscall behavior). Operational rules above outrank them when they conflict. Toolchain versions live in [Cargo.toml](Cargo.toml) and [rust-toolchain.toml](rust-toolchain.toml); linker scripts are `linker.ld` (x86_64) / `linker-aarch64.ld` / `linker-riscv64.ld`. Bootloader is Limine 8.7.0 on x86_64+AArch64, OpenSBI on RISC-V.
+Reference that matters only inside one part of the tree is in `.claude/rules/`. Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file named below before working on the paths it lists. Each heading keeps the name the section had in this file, so older links and citations still resolve.
 
-## Architecture (directory layout)
+### Lock Ordering
 
-Run `tree -L 2 src/ user/ tools/` for the current layout; file names and purposes drift, so this file doesn't restate them. The non-obvious pieces that *don't* read off the tree:
+[.claude/rules/locks.md](.claude/rules/locks.md), for any file under `src/`. The hierarchy, why a plain `Spinlock` holder is never descheduled, the boot context, and the lock domains outside the hierarchy.
 
-- **`build.rs`** reads `CAMBIOS_TIER` (default `tier3`) and emits `--cfg tierN` for `src/config/tier.rs`. See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) / [ADR-009](docs/adr/009-purpose-tiers-scope.md).
-- **Arch split:** portable modules (`scheduler/`, `ipc/`, `process.rs`, `loader/elf.rs`, `memory/buddy_allocator.rs` + `frame_allocator.rs`, `syscalls/mod.rs`) contain no arch-specific code. All arch backends live under `src/arch/<target>/`. `src/arch/mod.rs` is the cfg-gated shim.
-- **Service endpoints (load-bearing numbers):** init=1 (ADR-018 readiness pings; the manifest reserves every listed entry's endpoints to its derived AID — services AND on-demand apps: tree=61, worm=62, sprouty=63, ping=19, hello-window=29 — and init spawns the service set; the kernel auto-starts nothing), fs-service=16, key-store-service=17, virtio-net=20, udp-stack=21, block driver (virtio-blk in the `default` profile, nvme in the bare-metal profiles; the seam is `cambios-blk-proto`)=24 (user clients, `recv_verified`) + 26 (kernel-only commands, `recv_msg`, no cap check; requests carry `[kcmd][tag:4]`) + 25 (kernel's reply endpoint: `handle_write` intercepts it before the IPC pipeline and accepts a write only from a process whose Principal is the manifest's reservation owner of 25, stamps it, and denies + audits anything else; `BlockDriverClient` accepts only a stamped reply echoing its request tag, and takes the handshake's shared-page address only inside a `SYS_ALLOC_DMA` grant of the replying process), scanout-virtio-gpu=27, compositor=28, input consumer=30 (the compositor in the GUI profiles, the shell in `headless` — usb-host always delivers keyboard events there; the manifest's two `shell` entries with disjoint `profile` tags pick the owner). Endpoint 0 is the REPLY_ENDPOINT "unset" sentinel — structurally unusable.
-- **`tools/sign-elf/`** — host-side Ed25519 ELF signer (YubiKey or seed), produces the ARCSIG trailer. Built for the host (`host-tuple` in its `.cargo/config.toml`).
+### Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 
-## Key Technical Details
-
-### GDT Layout (7 entries per CPU, replaces Limine's at boot)
-| Index | Offset | Description | Selector |
-|-------|--------|-------------|----------|
-| 0 | 0x00 | Null | — |
-| 1 | 0x08 | Kernel Code 64-bit DPL=0 | KERNEL_CS=0x08 |
-| 2 | 0x10 | Kernel Data 64-bit DPL=0 | KERNEL_SS=0x10 |
-| 3 | 0x18 | User Data 64-bit DPL=3 | USER_SS=0x1B |
-| 4 | 0x20 | User Code 64-bit DPL=3 | USER_CS=0x23 |
-| 5 | 0x28 | TSS low | TSS_SELECTOR=0x28 |
-| 6 | 0x30 | TSS high | — |
-
-User data before user code is **required** by SYSRET selector computation.
-
-### SYSCALL/SYSRET
-- STAR MSR: bits[47:32]=0x08 (kernel CS), bits[63:48]=0x10 (user base)
-- SFMASK=0x200 (clears IF on syscall entry)
-- Entry point in `src/arch/x86_64/syscall.rs`
-- **Kernel stack switch on entry:** `syscall_entry` saves user RSP to `gs:[32]` (PerCpu.user_rsp_scratch), loads kernel RSP from `gs:[24]` (PerCpu.kernel_rsp0), pushes user RSP onto kernel stack. Return path: `cli`, restore regs, `pop rsp`, `sysretq`.
-- **Interrupts enabled in handlers:** `sti` after kernel stack switch, `cli` before return. Syscall handlers are preemptible by the timer ISR.
-- `PerCpu.kernel_rsp0` updated by `set_kernel_stack()` on every context switch (timer ISR + yield_save_and_switch).
+[.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under `src/`. The same file holds Development Conventions 3, 4, 6 and 7, the toolchain and linker-script pointers, Architecture (directory layout) and Memory Layout.
 
 ### Memory Layout
-- **Kernel heap:** 4MB at HHDM+physical, initialized from Limine memory map
-- **Boot stack:** 256KB via Limine StackSizeRequest
-- **Kernel object table region (Phase 3.2a):** contiguous physical region allocated at boot via `FrameAllocator::allocate_contiguous`, HHDM-mapped, holds two page-aligned subregions — `[ProcessDescriptor; num_slots]` and `[Option<ProcessCapabilities>; num_slots]`. Size is determined by `config::num_slots()` × (`size_of::<ProcessDescriptor>() + size_of::<Option<ProcessCapabilities>>()`), rounded up per subregion to a page boundary. Allocated in `init_kernel_object_tables()` in `main.rs` between frame allocator init and GDT setup. **Process descriptors are slot-resident:** every slot holds a `ProcessDescriptor` for the kernel's lifetime, written in place once at boot (`ProcessDescriptor::init_empty_at`, the `BootInfo::init_empty_at` pattern) and carrying an explicit `state: SlotState { Empty, Live }` instead of an `Option` wrapper; `create_process` fills the slot through `&mut` (`init_live`) and `destroy_process` resets it in place (`clear`). A ~12 KiB descriptor never exists by value on a kernel stack (Convention 4; the by-value `create_process` measured 32,856 B on a 32 KiB task stack, 2026-11-09). See [ADR-008](docs/adr/008-boot-time-sized-object-tables.md) and `src/memory/object_table.rs`.
-- **Per-process heaps (Phase 3.2a):** each process gets a `HEAP_SIZE` (4 MiB) contiguous physical region, allocated on demand in `ProcessDescriptor::init_live` via `FrameAllocator::allocate_contiguous(HEAP_PAGES)` and freed in `handle_exit` via `free_contiguous`. No more `PROCESS_HEAP_BASE + pid * HEAP_SIZE` arithmetic — the physical base is whatever the frame allocator hands out. Kernel still accesses the heap via HHDM (`virt_base = phys_base + hhdm_offset`).
-- **User code:** mapped at 0x400000
-- **User stack:** top at 0x800000, 64KB (16 pages), grows down
-- **Per-process PML4:** kernel half cloned (entries 256..511)
-- **HHDM:** Higher Half Direct Map provided by Limine for physical memory access
-- **x86_64 HHDM:** `0xFFFF800000000000`
-- **AArch64 HHDM:** `0xFFFF000000000000` (QEMU virt RAM starts at 1 GiB)
-- **Frame allocator:** bitmap covers 0-2 GiB physical (524288 frames, 64 KB bitmap in .bss)
+
+In [.claude/rules/kernel.md](.claude/rules/kernel.md).
+
+### Platform Gotchas
+
+[.claude/rules/platform-gotchas.md](.claude/rules/platform-gotchas.md), for `src/`, `user/usb-host/`, the linker scripts, the Limine configs and `manifest.toml`.
 
 ### Timer / Preemptive Scheduling
-- **APIC timer** at 100Hz (periodic mode, PIT-calibrated), fires on vector 32
-- **I/O APIC** routes device IRQs (keyboard, serial, IDE) on vectors 33-56
-- Device ISRs: `x86-interrupt` ABI handlers, wake blocked tasks via `try_lock()` + EOI
-- 8259 PIC disabled (remapped to 0xF0-0xFF, all lines masked)
-- PIT used only for one-shot APIC timer calibration at boot
-- Timer ISR: naked asm stub (`global_asm!` in `arch/mod.rs`) → Rust `timer_isr_inner`
-- APIC EOI (`apic::write_eoi()`) replaces PIC EOI
-- IST1 allocated for double-fault handler (4KB dedicated stack)
-- Uses `try_lock()` to avoid deadlock when interrupted code holds a lock
-- Portable `on_timer_isr()` + `ContextSwitchHint` pattern in `scheduler/mod.rs`
-- **Voluntary context switch** via `yield_save_and_switch`: builds synthetic SavedContext (identical layout to timer ISR) on the kernel stack, calls `yield_inner` → `on_voluntary_yield` → `scheduler.voluntary_yield()`. No EOI (not a hardware interrupt). x86_64 (`arch/x86_64/mod.rs`): synthetic iretq frame, TSS/CR3 updates. AArch64 (`arch/aarch64/mod.rs`): synthetic eret frame, SP_EL0 via SPSel toggle, TTBR0_EL1/TLB updates. Used by handle_exit, handle_yield, handle_recv_msg (restart loop), handle_wait_irq.
-- **Blocking pattern**: disable interrupts (`cli`/`msr daifset, #2`) → `block_task(Blocked)` → `yield_save_and_switch()` → re-check on wake. The interrupt disable before `block_task` prevents the timer ISR from seeing Blocked state before yield saves correct context. **When blocking on a condition another CPU signals (e.g. `MessageWait`), the condition re-check must be atomic with `block_task`** — hold the lock the signaler publishes under (IPC_MANAGER for message queues; SCHEDULER(1) → IPC(3) is downward) across the block decision, or a signal in the check-to-block gap is lost forever. And the signaler's wake must be **all-CPU** (`wake_message_waiters_all_cpus`, plain lock) — endpoint waiters can't be resolved via TASK_CPU_MAP, and a local-only or try_lock wake silently misses waiters on other CPUs (the ADR-018 boot-wave stall, 2026-09-14).
-- **IPI primitives** in `apic.rs`: `send_ipi()`, `send_ipi_all_excluding_self()`, `send_ipi_self()` via ICR
-- **Reschedule kick** (vector 0xFD, `RESCHED_VECTOR`): `arch::kick_cpu(cpu)` after a cross-CPU wake, sent only from syscall/kernel-thread context with the target's scheduler lock already dropped and only when `CPU_IDLE[cpu]` says the target is halted. `resched_isr_stub` → `on_resched_ipi` → `Scheduler::isr_kick`: switches off the idle task (or a no-longer-Running current), never preempts a Running task. Without it a halted core saw a wake at its next timer tick — up to 10 ms per IPC hop, the Dell 3630's slow games and 16 s wave (2026-10-26). Device ISRs do not kick (ICR reentrancy); their remote wakes still ride the tick.
-- **TLB shootdown** via vector 0xFE (`tlb.rs`): `shootdown_page()`, `shootdown_range()`, `shootdown_all()` — broadcast IPI, target CPUs execute `invlpg` or CR3 reload, initiating CPU spins on atomic pending counter
-- **Cross-CPU task wake**: `TASK_CPU_MAP` (`[AtomicU16; 256]` in `lib.rs`) tracks task→CPU assignment (lock-free). `wake_task_on_cpu(TaskId)` reads the map and acquires the correct CPU's scheduler to wake. `block_local_task(TaskId, BlockReason)` uses `local_scheduler()`. All IPC helpers, ISR dispatch, and diagnostics use these instead of hardcoded `PER_CPU_SCHEDULER[0]`. `migrate_task_between()` updates the map atomically.
-- **IPC reply-endpoint registry**: `REPLY_ENDPOINT` (`[AtomicU32; 256]` in `lib.rs`) stores the first endpoint each process registered via `SYS_REGISTER_ENDPOINT`. `handle_write` uses this as the `from` field of outgoing messages, so receivers doing `sys::write(msg.from_endpoint(), reply)` route replies back to a queue the sender is actually listening on. Falls back to pid-slot when a process has never registered. Landed in Phase 4b — before this fix, `from` was the sender's pid slot, which was always a different number from the registered endpoint, and any reply sent via `msg.from_endpoint()` went into a queue nobody read.
+
+[.claude/rules/scheduling.md](.claude/rules/scheduling.md), for the scheduler, the architecture backends, interrupts, IPC, syscalls, policy, `src/microkernel/` and `src/lib.rs`. It holds the Blocking pattern, voluntary context switch, the reschedule kick and cross-CPU wake.
 
 ### Syscall Numbers
 
-The canonical list is the `SyscallNumber` enum in [cambios-abi/src/lib.rs](cambios-abi/src/lib.rs) ([ADR-024](docs/adr/024-syscall-abi-crate.md)); [src/syscalls/mod.rs](src/syscalls/mod.rs) re-exports it. That enum is the ABI. Run `make stats` for the current count. The per-syscall summaries below describe *behavior*, not *existence*; if you need the authoritative list of numbers, read the enum.
+[.claude/rules/syscalls.md](.claude/rules/syscalls.md), for `src/syscalls/`, `cambios-abi/` and `user/libsys/`.
 
-Handlers live in [src/syscalls/dispatcher.rs](src/syscalls/dispatcher.rs). All IPC syscalls go through capability + interceptor checks and stamp `sender_principal`. Only the non-obvious gotchas / ABIs / restrictions are listed below:
+### GDT Layout and SYSCALL/SYSRET
 
-- **Exit**: calls `CapabilityManager::revoke_all_for_process()` ([ADR-007](docs/adr/007-capability-revocation-and-telemetry.md)); VMA / page-table / frame reclaim is still partial.
-- **Allocate**: rolls back on OOM.
-- **No syscall is bootstrap-Principal-gated any more** (slots 11 `BindPrincipal` and 31 `ChannelRevoke` retired 2026-09-15; never reused). Principals are bound kernel-internally at spawn from the manifest row. **AuditAttach** is gated by `AuditConsumer`, the FDE pair by `UnlockVolume`, cluster create/revoke by `CreateCluster` / `ClusterRevoke` (or being the cluster's creator), and **RevokeCapability** by holding the `revoke` right on the target endpoint (ADR-007 § "Who can revoke", path 2).
-- **RecvMsg**: wire format is `[sender_principal:32][from_endpoint:4][payload:N]`. Blocks on `MessageWait(endpoint)`.
-- **TryRecvMsg** (Phase 4b): non-blocking RecvMsg. Required for services polling multiple endpoints (virtio-blk ep24+ep26). `from_endpoint` is the sender's **reply endpoint** (first registered endpoint, tracked in `REPLY_ENDPOINT`) — before Phase 4b, `from = pid_slot` sent replies into a queue nobody read.
-- **ObjPutSigned**: caller supplies an Ed25519 signature; kernel verifies against caller's Principal before storing.
-- **MapMmio**: rejects addresses within RAM range. **PortIo**: rejects ports outside discovered PCI BARs. **AllocDma**: guard pages before + after.
-- **DeviceInfo**: 108-byte descriptor. **AuditInfo**: 48-byte buffer. **MapFramebuffer**: 32-byte `FramebufferDescriptor`, capability-gated, kernel holds the phys addr; call once per display.
-- **Spawn**: requires `CapabilityKind::CreateProcess` ([ADR-008](docs/adr/008-boot-time-sized-object-tables.md)).
-- **RevokeCapability**: Phase 3.1 authority = bootstrap only; grantor / `revoke`-right-holder / policy paths land in Phase 3.4. `CapabilityHandle` refactor deferred to post-v1 handle table.
-- **ChannelCreate**: needs `CreateChannel` system cap; roles are Producer / Consumer / Bidirectional ([ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md)). **ChannelAttach**: kernel verifies caller's Principal matches `peer_principal` from create; maps pages RO/RW per role.
-- **Slot 36 (was ModuleReady)**: retired at ADR-018 step 9 with the boot-release chain; never reused (slot-18 discipline). Readiness is `cambios_libsys_rt::ready()` — an ordinary IPC write of `READY_PING_TAG` to init's endpoint 1; init matches the kernel-stamped sender AID against the manifest entry.
-- **Spawn**: manifest-only. Row lookup by name (unknown ⇒ `InvalidArg`), then the row's `SpawnAuthority` (`InitOnly` for boot-wave rows, `AnyCreateProcessHolder` for on-demand apps), then signed-ELF load, then `install_manifest_row` binds the row's derived AID + exactly its grants.
+[.claude/rules/x86_64.md](.claude/rules/x86_64.md), for `src/arch/x86_64/`.
+
+### Service endpoints
+
+[.claude/rules/userspace.md](.claude/rules/userspace.md), for `user/`, `manifest.toml`, `cambios-manifest/` and `cambios-blk-proto/`.
+
+### Git hooks, host tools and signing
+
+[.claude/rules/tools.md](.claude/rules/tools.md), for `tools/`, `.githooks/`, `user/key-store-service/`, `user/fde-mount/` and `manifest.toml`. The commit-msg and pre-push hook mechanics, standalone builds, dev-PIV builds, ELF signing and `tools/sign-elf/`.
+
+### Sandbox VM
+
+[.claude/rules/sandbox.md](.claude/rules/sandbox.md), for `tools/sandbox/`.

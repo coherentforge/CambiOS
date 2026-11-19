@@ -52,7 +52,7 @@ Helpers in `lib.rs` resolve the calling CPU's scheduler via the per-CPU data poi
 - `local_scheduler()` — returns the calling CPU's `IrqSpinlock`
 - `local_timer()` — returns the calling CPU's timer
 
-The lock hierarchy puts `PER_CPU_SCHEDULER` at position 1 (innermost), so it must be acquired before any other system lock. See `CLAUDE.md` § "Lock Ordering" for the full hierarchy.
+The lock hierarchy puts `PER_CPU_SCHEDULER` at position 1 (innermost), so it must be acquired before any other system lock. See `.claude/rules/locks.md` for the full hierarchy.
 
 ### `Scheduler` struct (`mod.rs`)
 
@@ -263,8 +263,8 @@ The `RUST_MIN_STACK` is required because some scheduler tests allocate large `Ve
 ## Cross-References
 
 - **[ADR-001](../../docs/adr/001-smp-scheduling-and-lock-hierarchy.md)** — SMP scheduling decision rationale, lock hierarchy, migration design
-- **[CLAUDE.md](../../CLAUDE.md) § "Lock Ordering"** — full lock hierarchy with the scheduler at position 1
-- **[CLAUDE.md](../../CLAUDE.md) § "Timer / Preemptive Scheduling"** — APIC and ARM timer integration details
-- **[CLAUDE.md](../../CLAUDE.md) § "Voluntary context switch"** — `yield_save_and_switch` implementation notes for both architectures
+- **[.claude/rules/locks.md](../../.claude/rules/locks.md)** — full lock hierarchy with the scheduler at position 1
+- **[.claude/rules/scheduling.md](../../.claude/rules/scheduling.md)** — APIC and ARM timer integration details
+- **[.claude/rules/scheduling.md](../../.claude/rules/scheduling.md) § "Voluntary context switch"** — `yield_save_and_switch` implementation notes for both architectures
 - **`src/arch/x86_64/mod.rs`** — x86_64 `SavedContext`, `timer_isr_inner`, `yield_save_and_switch`, `set_kernel_stack`
 - **`src/arch/aarch64/mod.rs`** — AArch64 equivalents

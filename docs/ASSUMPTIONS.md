@@ -181,7 +181,7 @@ These are *not* arbitrary. Each one encodes a design decision. They should not c
 | `MIN_ORDER` / `MAX_ORDER` (buddy) | 4 / 19 | [src/memory/buddy_allocator.rs](../src/memory/buddy_allocator.rs) | 16 B minimum, 512 KiB maximum allocation. Encodes the buddy allocator's range. |
 | `ENTRIES_PER_TABLE` (page table) | 512 | [src/memory/mod.rs:77](../src/memory/mod.rs#L77) | x86_64 / AArch64 4-level page tables have exactly 512 entries per level. Hardware-defined but expressed as a structural constant. |
 | `Principal::public_key` length | 32 bytes | [src/ipc/mod.rs:123](../src/ipc/mod.rs#L123) | Ed25519 public key length. The crypto algorithm is the design decision; 32 is its consequence. Changes only if [identity.md](identity.md) chooses a different crypto primitive (e.g., ML-DSA-65 post-quantum). |
-| Lock hierarchy depth | 10 | n/a | The ten-lock hierarchy in [CLAUDE.md § Lock Ordering](../CLAUDE.md#lock-ordering). Bumped from 9 → 10 in 2026-05-07 when ADR-027 inserted `CLUSTER_MANAGER` at position 5 (cascade renumber for everything below). Adding a lock is a deliberate architectural decision, not a number bump. |
+| Lock hierarchy depth | 10 | n/a | The ten-lock hierarchy in [.claude/rules/locks.md](../.claude/rules/locks.md). Bumped from 9 → 10 in 2026-05-07 when ADR-027 inserted `CLUSTER_MANAGER` at position 5 (cascade renumber for everything below). Adding a lock is a deliberate architectural decision, not a number bump. |
 | `MEMBER_BYTES` (SYS_CLUSTER_CREATE wire) | 36 | [src/syscalls/dispatcher.rs](../src/syscalls/dispatcher.rs) | ARCHITECTURAL: per-member spec on the SYS_CLUSTER_CREATE syscall boundary — `{ principal: [u8; 32], role: u32 }` packed = 36 bytes. ADR-027 cluster manifest wire format. Changing this is a new syscall, not a size bump. |
 | `CLUSTER_INFO_BYTES` | 28 | [src/syscalls/dispatcher.rs](../src/syscalls/dispatcher.rs) | ARCHITECTURAL: SYS_CLUSTER_INFO output descriptor — `[state:u32][policy:u32][creator_pid_slot:u32][joined_members:u32][active_channels:u32][created_at_tick:u64]` = 28 bytes. ADR-027. Changing this is a new syscall, not a size bump. |
 | `RAW_AUDIT_EVENT_SIZE` | 64 bytes | [src/audit/mod.rs:55](../src/audit/mod.rs#L55) | One x86_64 cache line. Matches ADR-007's "~64 bytes average" target. The flat wire format avoids serialization overhead and is memcpy-safe. |
@@ -262,7 +262,7 @@ When you remove a bound or remove a constant entirely, delete its row from this 
 
 ## What is not in this document
 
-- Memory addresses (HHDM bases, page table layouts, MMIO bases) — those are documented in CLAUDE.md's Memory Layout section because they're tied to the bootloader and architecture, not arbitrary numeric choices.
+- Memory addresses (HHDM bases, page table layouts, MMIO bases) — those are documented in the Memory Layout section of [.claude/rules/kernel.md](../.claude/rules/kernel.md) because they're tied to the bootloader and architecture, not arbitrary numeric choices.
 - Syscall numbers — those are an interface, not a bound.
 - Lock ordering numbers (the 1-8 hierarchy) — that's an ordering, not a bound.
 

@@ -1,6 +1,6 @@
 # Contributing to CambiOS
 
-This file is the process contract: how a change gets from your machine to `main`, and what checks it on the way. It applies to people and to AI agents working for them. The technical contract (conventions, lock ordering, required reading per subsystem) is [CLAUDE.md](CLAUDE.md), and agents should read both.
+This file is the process contract: how a change gets from your machine to `main`, and what checks it on the way. It applies to people and to AI agents working for them. The technical contract (conventions, lock ordering, required reading per subsystem) is [CLAUDE.md](CLAUDE.md) with the files under `.claude/rules/` that its "Where things live" index names, and agents should read both.
 
 Where this file and the repository disagree, the repository is right and this file has a bug. Please say so in a pull request.
 

@@ -28,8 +28,8 @@ Exit status:
   2 — repo root not found, baseline unreadable, or git cannot list
       the repository's files
 
-Scope: scans docs/**/*.md, CLAUDE.md, STATUS.md, src/**/*.rs,
-user/**/*.rs, tools/**/*.py. Only files that belong to the repository
+Scope: scans docs/**/*.md, CLAUDE.md, .claude/rules/*.md, STATUS.md,
+src/**/*.rs, user/**/*.rs, tools/**/*.py. Only files that belong to the repository
 are scanned: tracked files plus untracked files git does not ignore
 (so a new file is linted before its first `git add`). A gitignored
 file is not part of the repository and never enters the baseline: a
@@ -90,6 +90,7 @@ SKIP_PATHS = {
 # File globs in scope.
 SCAN_GLOBS = [
     ("docs", "**/*.md"),
+    (".claude/rules", "*.md"),
     ("src", "**/*.rs"),
     ("user", "**/*.rs"),
     ("tools", "**/*.py"),
