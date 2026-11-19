@@ -190,10 +190,19 @@ cmd_status() {
 # process, and nothing of the run reached the host. A detached run survives
 # the host sleeping, the SSH hop dying, and a wait interrupted with Ctrl-C:
 # `fetch STAMP` collects it later.
+#
+# Why stream-json (task 002, 2026-11-19): with text or json output the .out
+# file stays empty until the run ends, so a 20-minute run could be watched
+# only through the guest's session transcript. stream-json writes one event
+# per line as the run goes (each tool call, each message, then a final
+# `result` event carrying the answer, turns, cost and modelUsage), so
+# `tail -f ~/runs/STAMP.out` in the guest is the live view and the fetched
+# file is the full record. fetch prints the result event's text. --json
+# keeps the old single JSON object.
 cmd_run() {
   local name; name=$(current)
   [ -n "$name" ] || die "no current session"
-  local model="${SANDBOX_MODEL:-}" fmt=text file=""
+  local model="${SANDBOX_MODEL:-}" fmt=stream-json file=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --model) model=$2; shift 2 ;;
@@ -206,6 +215,8 @@ cmd_run() {
   local dir="$SANDBOX_HOME/runs"; mkdir -p "$dir"
   if [ -n "$file" ]; then cp "$file" "$dir/$stamp.prompt"; else cat > "$dir/$stamp.prompt"; fi
   local args="-p --output-format $fmt --permission-mode bypassPermissions"
+  # claude -p refuses stream-json without --verbose.
+  [ "$fmt" = stream-json ] && args="$args --verbose"
   [ -n "$model" ] && args="$args --model $model"
   log "run $stamp (model: ${model:-default}) -> $dir/$stamp.out"
   ssh_as agent "$ip" 'mkdir -p ~/runs'
@@ -215,6 +226,42 @@ cmd_run() {
   # output files are complete.
   ssh_as agent "$ip" "setsid nohup bash -lc 'cd ~/cambios && claude $args < ~/runs/$stamp.prompt > ~/runs/$stamp.out 2> ~/runs/$stamp.err; echo \$? > ~/runs/$stamp.exit' >/dev/null 2>&1 </dev/null &"
   cmd_fetch "$stamp"
+}
+
+# print_answer OUT: print a run's answer. A stream-json file (first line a
+# JSON event of type "system") prints the text of its final `result` event
+# plus a one-line summary on stderr; a stream with no result event (the run
+# died mid-way) says so instead of dumping the events. Text and json output
+# print as they are.
+print_answer() {
+  python3 -I - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8", errors="replace") as f:
+    lines = f.read().splitlines()
+def event(line):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return None
+    return e if isinstance(e, dict) else None
+first = event(lines[0]) if lines else None
+if not first or first.get("type") != "system":
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+    sys.exit(0)
+results = [e for e in map(event, lines) if e and e.get("type") == "result"]
+if not results:
+    print(f"[session] no result event: the run stopped after {len(lines)} events; "
+          f"the event log is {path}", file=sys.stderr)
+    sys.exit(0)
+r = results[-1]
+print(r.get("result", ""))
+cost = r.get("total_cost_usd")
+print(f"[session] {r.get('subtype', '?')}, {r.get('num_turns', '?')} turns, "
+      f"{(r.get('duration_ms') or 0) / 60000:.1f} min"
+      + (f", ${cost:.2f} at list" if isinstance(cost, (int, float)) else "")
+      + f"; event log {path}", file=sys.stderr)
+PY
 }
 
 # fetch STAMP: wait until the detached run STAMP has written its exit file,
@@ -241,7 +288,7 @@ cmd_fetch() {
     sleep "$RUN_POLL_S"
   done
   scp "${SSH_OPTS[@]}" -q "agent@$ip:runs/$stamp.out" "agent@$ip:runs/$stamp.err" "agent@$ip:runs/$stamp.exit" "$dir/"
-  cat "$dir/$stamp.out"
+  print_answer "$dir/$stamp.out"
   local rc; rc=$(tr -dc 0-9 < "$dir/$stamp.exit")
   [ -s "$dir/$stamp.err" ] && log "stderr ($(wc -l < "$dir/$stamp.err" | tr -d ' ') lines) in $dir/$stamp.err"
   log "run $stamp exit ${rc:-?}"
