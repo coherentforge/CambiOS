@@ -17,7 +17,8 @@ Git invokes a pre-push hook with the line(s) of "<local_ref>
 <local_oid> <remote_ref> <remote_oid>" on stdin. For each push
 range, this script:
 
-  1. Lists the commits being pushed (`git rev-list <remote>..<local>`).
+  1. Lists the commits being pushed (`git rev-list <remote>..<local>
+     --not --remotes`: commits no remote-tracking ref has yet).
   2. For each commit with a `Co-Authored-By: Claude` trailer:
      a. Pulls the modified file list (`git diff-tree --no-commit-id
         --name-only -r <commit>`).
@@ -123,16 +124,19 @@ def commit_files(commit: str) -> list[str]:
 
 def commits_in_range(local_oid: str, remote_oid: str) -> list[str]:
     """Walk commits being pushed. On branch creation (remote == zero
-    oid), inspect the entire new branch — but only commits not yet
-    reachable from any other already-pushed ref, so we don't drown
-    in unrelated history."""
+    oid), inspect the entire new branch; on an update, the commits
+    after the remote's tip. Either way, only commits not yet reachable
+    from any remote-tracking ref: a commit some remote already has was
+    published once, and checking it again only re-fires on history (a
+    push to the sandbox exchange re-checked the batch already on
+    origin/main, 2026-11-19)."""
     if remote_oid == ZERO_OID:
         rev_args = ["git", "rev-list", local_oid, "--not", "--remotes"]
     elif local_oid == ZERO_OID:
         # Branch deletion — nothing being pushed forward to inspect.
         return []
     else:
-        rev_args = ["git", "rev-list", f"{remote_oid}..{local_oid}"]
+        rev_args = ["git", "rev-list", f"{remote_oid}..{local_oid}", "--not", "--remotes"]
     out = subprocess.check_output(rev_args, text=True).strip()
     return out.splitlines() if out else []
 
