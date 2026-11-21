@@ -217,7 +217,13 @@ cmd_run() {
   local args="-p --output-format $fmt --permission-mode bypassPermissions"
   # claude -p refuses stream-json without --verbose.
   [ "$fmt" = stream-json ] && args="$args --verbose"
-  [ -n "$model" ] && args="$args --model $model"
+  # The model ID reaches the guest's inner `bash -lc` unquoted, where the
+  # `[1m]` window suffix would be a glob. Accept only an ID-shaped string,
+  # then double-quote it inside the single-quoted remote command.
+  if [ -n "$model" ]; then
+    [[ "$model" =~ ^[A-Za-z0-9._-]+(\[1m\])?$ ]] || die "run: model '$model' is not a model ID (letters, digits, . _ -, optional [1m])"
+    args="$args --model \"$model\""
+  fi
   log "run $stamp (model: ${model:-default}) -> $dir/$stamp.out"
   ssh_as agent "$ip" 'mkdir -p ~/runs'
   scp "${SSH_OPTS[@]}" -q "$dir/$stamp.prompt" "agent@$ip:runs/$stamp.prompt"

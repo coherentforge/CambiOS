@@ -1537,16 +1537,22 @@ sandbox-pull:
 # One task into the current session: `make sandbox-run PROMPT=task.md
 # [MODEL=claude-…] [JSON=1]`. The host session (or Jason) frames the task,
 # the agent inside answers on stdout and pushes code as refs/heads/sandbox/*.
-# Default model is the one the sandbox exists for. Claude Code's local model
-# table may not list it (the /model picker omits it and `--model` prints an
-# "unrecognized model" warning), but the API serves it; `modelUsage` in the
-# JSON output is the authoritative record of what answered. The run is
-# detached inside the guest; `sandbox-fetch RUN=<stamp>` collects one whose
-# wait was interrupted (host slept, Ctrl-C).
-SANDBOX_MODEL ?= claude-mythos-5-2
+# Default model is the one the sandbox exists for, with its real context
+# window declared. Mythos 5.2 has a 1M window, but a Claude Code that does not
+# recognize the ID (the guest's 2.1.311 did not) assumed 200K before v2.1.323
+# and auto-compacts there: task 002 compacted twice at a fifth of the window.
+# The `[1m]` suffix is Claude Code's documented way to declare a 1M window for
+# such an ID (code.claude.com/docs/en/model-config, "Correct the window for a
+# gateway or custom model ID"); Claude Code strips it before the request, so
+# the API sees `claude-mythos-5-2`, and it stays correct once the CLI knows
+# the model. The suffix needs quoting through every shell (session.sh does).
+# `modelUsage` in the run's result event is the record of what answered. The
+# run is detached inside the guest; `sandbox-fetch RUN=<stamp>` collects one
+# whose wait was interrupted (host slept, Ctrl-C).
+SANDBOX_MODEL ?= claude-mythos-5-2[1m]
 sandbox-run:
 	@test -n "$(PROMPT)" || { echo "usage: make sandbox-run PROMPT=<file> [MODEL=<id>] [JSON=1]" >&2; exit 2; }
-	@$(SANDBOX_SESSION_ENV) SANDBOX_MODEL=$(or $(MODEL),$(SANDBOX_MODEL)) $(SANDBOX_SESSION) run $(if $(JSON),--json,) $(PROMPT)
+	@$(SANDBOX_SESSION_ENV) SANDBOX_MODEL='$(or $(MODEL),$(SANDBOX_MODEL))' $(SANDBOX_SESSION) run $(if $(JSON),--json,) $(PROMPT)
 
 sandbox-fetch:
 	@test -n "$(RUN)" || { echo "usage: make sandbox-fetch RUN=<stamp>   (stamps: ls ~/sandbox/runs)" >&2; exit 2; }
