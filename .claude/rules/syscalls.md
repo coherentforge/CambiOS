@@ -3,6 +3,7 @@ paths:
   - "src/syscalls/**"
   - "cambios-abi/**"
   - "user/libsys/**"
+  - "user/libsys-rt/**"
 ---
 
 # Syscall Numbers
@@ -19,8 +20,7 @@ Handlers live in [src/syscalls/dispatcher.rs](../../src/syscalls/dispatcher.rs).
 - **ObjPutSigned**: caller supplies an Ed25519 signature; kernel verifies against caller's Principal before storing.
 - **MapMmio**: rejects addresses within RAM range. **PortIo**: rejects ports outside discovered PCI BARs. **AllocDma**: guard pages before + after.
 - **DeviceInfo**: 108-byte descriptor. **AuditInfo**: 48-byte buffer. **MapFramebuffer**: 32-byte `FramebufferDescriptor`, capability-gated, kernel holds the phys addr; call once per display.
-- **Spawn**: requires `CapabilityKind::CreateProcess` ([ADR-008](../../docs/adr/008-boot-time-sized-object-tables.md)).
 - **RevokeCapability**: Phase 3.1 authority = bootstrap only; grantor / `revoke`-right-holder / policy paths land in Phase 3.4. `CapabilityHandle` refactor deferred to post-v1 handle table.
 - **ChannelCreate**: needs `CreateChannel` system cap; roles are Producer / Consumer / Bidirectional ([ADR-005](../../docs/adr/005-ipc-primitives-control-and-bulk.md)). **ChannelAttach**: kernel verifies caller's Principal matches `peer_principal` from create; maps pages RO/RW per role.
 - **Slot 36 (was ModuleReady)**: retired at ADR-018 step 9 with the boot-release chain; never reused (slot-18 discipline). Readiness is `cambios_libsys_rt::ready()` — an ordinary IPC write of `READY_PING_TAG` to init's endpoint 1; init matches the kernel-stamped sender AID against the manifest entry.
-- **Spawn**: manifest-only. Row lookup by name (unknown ⇒ `InvalidArg`), then the row's `SpawnAuthority` (`InitOnly` for boot-wave rows, `AnyCreateProcessHolder` for on-demand apps), then signed-ELF load, then `install_manifest_row` binds the row's derived AID + exactly its grants.
+- **Spawn**: requires `CapabilityKind::CreateProcess` ([ADR-008](../../docs/adr/008-boot-time-sized-object-tables.md)). Manifest-only. Row lookup by name (unknown ⇒ `InvalidArg`), then the row's `SpawnAuthority` (`InitOnly` for boot-wave rows, `AnyCreateProcessHolder` for on-demand apps), then signed-ELF load, then `install_manifest_row` binds the row's derived AID + exactly its grants.

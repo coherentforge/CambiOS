@@ -1,16 +1,24 @@
 ---
 paths:
-  - "src/**"
+  - "src/**/*"
+  - "user/i219-net/**"
+  - "user/nvme/**"
+  - "user/scanout-limine/**"
+  - "user/scanout-virtio-gpu/**"
   - "user/usb-host/**"
+  - "user/virtio-blk/**"
+  - "user/virtio-input/**"
+  - "user/virtio-net/**"
   - "user/**/*.ld"
   - "*.ld"
   - "limine*.conf"
   - "manifest.toml"
+  - "Makefile"
 ---
 
 # Platform Gotchas
 
-These are persistent platform/bootloader quirks that any new code in the boot or hardware paths must respect. Status of *features* (what's built vs planned) lives in [STATUS.md](../../STATUS.md); this section is for things that won't go away.
+These are persistent platform/bootloader quirks that any new code in the boot or hardware paths must respect. Status of *features* (what's built vs planned) lives in [STATUS.md](../../STATUS.md); this file is for things that won't go away.
 
 - **Boot requires BOTH manifest.bin and init.elf staged (ADR-018 step 9).** The kernel starts no service itself — it transcribes the manifest, registers every module by name, creates init as PID 1, and init spawns the boot wave. Missing manifest ⇒ typed `ManifestModuleMissing` boot failure; manifest without init ⇒ `InitModuleMissing`. There is no fallback chain any more. A module the manifest does not declare is loaded but unspawnable (`SYS_SPAWN` ⇒ `InvalidArg`); a boot-wave row spawned by anyone but init ⇒ `PermissionDenied`; on-demand rows (apps) are spawnable by any `CreateProcess` holder.
 - **Limine base revision 3 HHDM gap (x86_64):** ACPI_RECLAIMABLE, ACPI_NVS, and RESERVED regions are NOT in the HHDM. `map_acpi_regions()` in `main.rs` explicitly maps small RESERVED regions (≤1MB, **uncacheable**, read-only) and all ACPI regions (cacheable, read-only) into the HHDM before ACPI parsing. SeaBIOS puts ACPI tables in RESERVED memory (not ACPI_RECLAIMABLE), so the RESERVED mapping is essential. **Device register pages must be claimed through `paging::claim_mmio_page`**, which remaps any earlier mapping uncacheable + writable: on the Dell Precision 3630 the RESERVED sweep had already mapped the Local APIC page cacheable, the APIC driver used it because `map_page` said `AlreadyMapped`, and the first cached APIC read hung the core (2026-10-22). Intel defines APIC access through any memory type but UC as undefined.

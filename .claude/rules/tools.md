@@ -11,26 +11,7 @@ paths:
 
 ## Git hooks
 
-```bash
-# Commit-msg hooks (Claude-authored commits only):
-# 1. H1 (2026-04-23): `Staged files:` block must match `git diff --cached
-#    --name-only`. Script: tools/check-claude-staged-files.py.
-# 2. Sticky preflight (2026-04-25): rejects commits that stage a file
-#    which was already dirty at the start of the current Claude session
-#    AND was never preflighted. Catches the 6th-recurrence shape that H1
-#    misses (within-file sweeps). Set `CLAUDE_PREFLIGHT_SESSION=<id>`
-#    once per session to enable enforcement; warn-but-pass when unset.
-#    Script: tools/check-preflight-discipline.py.
-# Pre-push hook (Claude-authored commits only):
-# 3. Edit-window gate (2026-04-25): rejects pushes whose Claude-authored
-#    commits modify files no Claude session ever touched via Edit/Write/
-#    NotebookEdit. Defense-in-depth on top of (2); catches anything that
-#    bypassed commit-msg via `--no-verify`. Requires the PostToolUse hook
-#    in .claude/settings.local.json (calls tools/log-claude-edit.py) plus
-#    `CLAUDE_PREFLIGHT_SESSION`. Warn-but-pass without an edit log.
-#    Scripts: tools/log-claude-edit.py + tools/check-edit-window.py.
-# All run automatically when installed via `make install-hooks`.
-```
+What the commit-msg and pre-push hooks require of a commit (the `Staged files:` block, `CLAUDE_PREFLIGHT_SESSION`, the edit-window gate) is in the root [CLAUDE.md](../../CLAUDE.md) Quick Reference, above `make install-hooks`: it binds every Claude-authored commit, whichever files the commit touches, so it is read before any file here is opened. The scripts are `tools/check-claude-staged-files.py`, `tools/check-preflight-discipline.py`, `tools/log-claude-edit.py` and `tools/check-edit-window.py`; the hooks themselves are in `.githooks/`.
 
 ## Standalone builds, dev-PIV builds, ELF signing
 

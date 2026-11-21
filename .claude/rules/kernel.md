@@ -1,11 +1,11 @@
 ---
 paths:
-  - "src/**"
+  - "src/**/*"
 ---
 
 # Kernel reference
 
-Sections below describe kernel state (directory pointers, tables, per-syscall behavior). Operational rules in the root [CLAUDE.md](../../CLAUDE.md) outrank them when they conflict. Toolchain versions live in [Cargo.toml](../../Cargo.toml) and [rust-toolchain.toml](../../rust-toolchain.toml); linker scripts are `linker.ld` (x86_64) / `linker-aarch64.ld` / `linker-riscv64.ld`. Bootloader is Limine 8.7.0 on x86_64+AArch64, OpenSBI on RISC-V.
+Sections below hold four of the numbered Development Conventions and describe kernel state (directory pointers, memory layout). Per-syscall behavior is in [syscalls.md](syscalls.md), the lock hierarchy in [locks.md](locks.md). Operational rules in the root [CLAUDE.md](../../CLAUDE.md) outrank them when they conflict. Toolchain versions live in [Cargo.toml](../../Cargo.toml) and [rust-toolchain.toml](../../rust-toolchain.toml); linker scripts are `linker.ld` (x86_64) / `linker-aarch64.ld` / `linker-riscv64.ld`. Bootloader is Limine 8.7.0 on x86_64+AArch64, OpenSBI on RISC-V.
 
 ## Development Conventions 3, 4, 6 and 7
 

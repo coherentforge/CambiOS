@@ -200,7 +200,7 @@ This 8-item checklist fires every change (both tiers). The category table it dra
 2. Did this change move a phase forward (e.g., "Phase 3 in progress" → "Phase 3 done")? → Update the Phase markers table.
 3. Did this change touch the scheduler? → Re-read [SCHEDULER.md](src/scheduler/SCHEDULER.md) and update if anything in it is now wrong.
 4. Did this change introduce a new architectural decision? → Draft a new ADR. Don't bury the decision in code comments. Did this change diverge from an existing ADR's plan? → Show the user the planned diff to the ADR body first; once approved, edit the body to reflect the new design and add a `## Divergence` appendix at the bottom preserving the prior wording with date + commit reference. The body is current truth; the appendix is history.
-5. Did this change add or rename a build command, lock, or syscall? → Update CLAUDE.md's Quick Reference, [.claude/rules/locks.md](.claude/rules/locks.md) or [.claude/rules/syscalls.md](.claude/rules/syscalls.md).
+5. Did this change add or rename a build command, lock, or syscall? → Update whichever file holds it: CLAUDE.md's Quick Reference, [.claude/rules/tools.md](.claude/rules/tools.md) or [.claude/rules/sandbox.md](.claude/rules/sandbox.md) for a build command, [.claude/rules/locks.md](.claude/rules/locks.md) for a lock, [.claude/rules/syscalls.md](.claude/rules/syscalls.md) for a syscall.
 6. Did this change resolve a Platform Gotcha in [.claude/rules/platform-gotchas.md](.claude/rules/platform-gotchas.md) or a Known Issue in STATUS.md? → Remove it from the gotcha list (don't leave a `~~strikethrough~~ FIXED` ghost).
 7. Did this change cite a doc that doesn't exist yet? → Either create the doc or remove the citation.
 8. Did this change add or modify a numeric `const`, fixed-size array, or `MAX_*` bound in kernel code? → Tag it with `SCAFFOLDING` / `ARCHITECTURAL` / `HARDWARE` / `TUNING` per Development Convention 8, and add or update the row in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Unconscious bounds are not allowed.
@@ -268,6 +268,25 @@ make check-unsafe-coverage   # Convention 1 (blocks): every `unsafe { }` has `//
 make check-status-freshness  # STATUS.md `last_synced_to_code:` within 7 days of today (advisory; warn-but-pass). CI runs it with `--strict`, which fails when STATUS.md's Kani harness total disagrees with the source
 make check-clippy            # Convention 1 (tri-arch deny gate, CI per-push): missing_safety_doc (every `pub unsafe fn` has `# Safety`) + multiple_unsafe_ops_per_block + undocumented_unsafe_blocks; runs clippy on x86_64+aarch64+riscv64 because arch-cfg'd unsafe only lints on its own target
 
+# Commit-msg hooks (Claude-authored commits only):
+# 1. H1 (2026-04-23): `Staged files:` block must match `git diff --cached
+#    --name-only`. Script: tools/check-claude-staged-files.py.
+# 2. Sticky preflight (2026-04-25): rejects commits that stage a file
+#    which was already dirty at the start of the current Claude session
+#    AND was never preflighted. Catches the 6th-recurrence shape that H1
+#    misses (within-file sweeps). Set `CLAUDE_PREFLIGHT_SESSION=<id>`
+#    once per session to enable enforcement; warn-but-pass when unset.
+#    Script: tools/check-preflight-discipline.py.
+# Pre-push hook (Claude-authored commits only):
+# 3. Edit-window gate (2026-04-25): rejects pushes whose Claude-authored
+#    commits modify files no Claude session ever touched via Edit/Write/
+#    NotebookEdit. Defense-in-depth on top of (2); catches anything that
+#    bypassed commit-msg via `--no-verify`. Requires the PostToolUse hook
+#    in .claude/settings.local.json (calls tools/log-claude-edit.py) plus
+#    `CLAUDE_PREFLIGHT_SESSION`. Warn-but-pass without an edit log.
+#    Scripts: tools/log-claude-edit.py + tools/check-edit-window.py.
+# All run automatically when installed via `make install-hooks`.
+
 # One-time per clone — installs .githooks/ via core.hooksPath
 make install-hooks
 
@@ -289,7 +308,7 @@ make usb DEVICE=/dev/diskN PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-ho
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols
 
-# Git hook mechanics, standalone builds, dev-PIV builds and ELF signing: .claude/rules/tools.md.
+# Standalone builds, dev-PIV builds and ELF signing: .claude/rules/tools.md.
 # Sandbox VM: .claude/rules/sandbox.md.
 ```
 
@@ -370,44 +389,44 @@ What's built, what's in progress, what's planned (including v1 ordering, phase m
 
 ## Where things live
 
-Reference that matters only inside one part of the tree is in `.claude/rules/`. Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file named below before working on the paths it lists. Each heading keeps the name the section had in this file, so older links and citations still resolve.
+Reference that matters only inside one part of the tree is in `.claude/rules/`. Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file named below before working on the paths it lists. The `paths:` list at the top of each file is the list of record; the paths named here follow it. Each heading keeps the name the section had in this file, so older links and citations still resolve.
 
 ### Lock Ordering
 
-[.claude/rules/locks.md](.claude/rules/locks.md), for any file under `src/`. The hierarchy, why a plain `Spinlock` holder is never descheduled, the boot context, and the lock domains outside the hierarchy.
+[.claude/rules/locks.md](.claude/rules/locks.md), for any file under the kernel's `src/` (the one at the repository root, not a crate's). The hierarchy, why a plain `Spinlock` holder is never descheduled, the boot context, and the lock domains outside the hierarchy.
 
 ### Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 
-[.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under `src/`. The same file holds Development Conventions 3, 4, 6 and 7, the toolchain and linker-script pointers, Architecture (directory layout) and Memory Layout.
+[.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/`. The same file holds Development Conventions 3, 4, 6 and 7, the toolchain and linker-script pointers, Architecture (directory layout) and Memory Layout.
 
 ### Memory Layout
 
-In [.claude/rules/kernel.md](.claude/rules/kernel.md).
+In [.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/`. Kernel heap, boot stack, the object-table region, per-process heaps, user code and stack addresses, and the direct-map bases.
 
 ### Platform Gotchas
 
-[.claude/rules/platform-gotchas.md](.claude/rules/platform-gotchas.md), for `src/`, `user/usb-host/`, the linker scripts, the Limine configs and `manifest.toml`.
+[.claude/rules/platform-gotchas.md](.claude/rules/platform-gotchas.md), for the kernel's `src/`, the user-space device-driver crates, the linker scripts, the Limine configs, `manifest.toml` and the `Makefile`. Bootloader, firmware and real-hardware quirks that boot and hardware-path code must respect: manifest and init staging, direct-map gaps, x86_64 memory types, GICv3, per-CPU floating-point enable, stray interrupts, the USB controller hand-off.
 
 ### Timer / Preemptive Scheduling
 
-[.claude/rules/scheduling.md](.claude/rules/scheduling.md), for the scheduler, the architecture backends, interrupts, IPC, syscalls, policy, `src/microkernel/` and `src/lib.rs`. It holds the Blocking pattern, voluntary context switch, the reschedule kick and cross-CPU wake.
+[.claude/rules/scheduling.md](.claude/rules/scheduling.md), for the scheduler, the architecture backends, interrupts, IPC, syscalls, policy, audit, `src/io/`, the loader, memory, `src/microkernel/`, `src/lib.rs` and the three other kernel files that block or wake. It holds the Blocking pattern, voluntary context switch, the reschedule kick and cross-CPU wake.
 
 ### Syscall Numbers
 
-[.claude/rules/syscalls.md](.claude/rules/syscalls.md), for `src/syscalls/`, `cambios-abi/` and `user/libsys/`.
+[.claude/rules/syscalls.md](.claude/rules/syscalls.md), for `src/syscalls/`, `cambios-abi/`, `user/libsys/` and `user/libsys-rt/`. Where the canonical list is (the `SyscallNumber` enum in `cambios-abi`) and the per-syscall behavior that does not read off it: wire formats, gating capabilities, retired slots.
 
 ### GDT Layout and SYSCALL/SYSRET
 
-[.claude/rules/x86_64.md](.claude/rules/x86_64.md), for `src/arch/x86_64/`.
+[.claude/rules/x86_64.md](.claude/rules/x86_64.md), for `src/arch/x86_64/`. The seven GDT entries and their selectors, the STAR and SFMASK register values, and the kernel stack switch on syscall entry.
 
 ### Service endpoints
 
-[.claude/rules/userspace.md](.claude/rules/userspace.md), for `user/`, `manifest.toml`, `cambios-manifest/` and `cambios-blk-proto/`.
+[.claude/rules/userspace.md](.claude/rules/userspace.md), for `user/`, `manifest.toml`, `cambios-manifest/`, `cambios-blk-proto/` and the two kernel files that handle the block driver's endpoints. The load-bearing endpoint numbers and how each is handled; the assignment of record is the header of `manifest.toml`.
 
 ### Git hooks, host tools and signing
 
-[.claude/rules/tools.md](.claude/rules/tools.md), for `tools/`, `.githooks/`, `user/key-store-service/`, `user/fde-mount/` and `manifest.toml`. The commit-msg and pre-push hook mechanics, standalone builds, dev-PIV builds, ELF signing and `tools/sign-elf/`.
+[.claude/rules/tools.md](.claude/rules/tools.md), for `tools/`, `.githooks/`, `user/key-store-service/`, `user/fde-mount/` and `manifest.toml`. Standalone builds, dev-PIV builds, ELF signing and `tools/sign-elf/`. What the hooks require of a commit is in the [Quick Reference](#quick-reference), above `make install-hooks`.
 
 ### Sandbox VM
 
-[.claude/rules/sandbox.md](.claude/rules/sandbox.md), for `tools/sandbox/`.
+[.claude/rules/sandbox.md](.claude/rules/sandbox.md), for `tools/sandbox/`. The `make sandbox-*` targets: session up and down, the egress proxy, handing a task to the agent, and the golden image.

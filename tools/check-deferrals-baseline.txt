@@ -3,7 +3,7 @@
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
 .claude/rules/kernel.md:35:eventually
-.claude/rules/platform-gotchas.md:23:deferred
+.claude/rules/platform-gotchas.md:31:deferred
 CLAUDE.md:11:eventually
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred

@@ -7,6 +7,13 @@ paths:
   - "src/syscalls/**"
   - "src/policy/**"
   - "src/microkernel/**"
+  - "src/audit/**"
+  - "src/io/**"
+  - "src/loader/**"
+  - "src/memory/**"
+  - "src/fs/block_driver_client.rs"
+  - "src/reap.rs"
+  - "src/reaper.rs"
   - "src/lib.rs"
 ---
 
