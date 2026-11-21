@@ -1,9 +1,13 @@
 ---
 paths:
-  - "tools/**"
+  - "tools/sign-elf/**"
+  - "tools/build-manifest/**"
+  - "tools/gen-dev-piv-keys/**"
+  - "tools/format-volume/**"
   - ".githooks/**"
   - "user/key-store-service/**"
   - "user/fde-mount/**"
+  - "user/libsys/src/vault.rs"
   - "manifest.toml"
 ---
 

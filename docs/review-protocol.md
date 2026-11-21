@@ -48,10 +48,10 @@ Verify no change introduces a lock ordering violation against the canonical hier
 ## 4. Architecture Portability
 - New x86-specific code is behind `#[cfg(target_arch = "x86_64")]`
 - New x86-specific code lives under `src/arch/x86_64/`, not in portable modules
-- Portable modules (`scheduler/`, `ipc/`, `process.rs`, `loader/elf.rs`) contain no arch-specific code
+- Portable modules (the Portability Boundary list in [.claude/rules/kernel.md](../.claude/rules/kernel.md)) contain no arch-specific code beyond the one cfg that list names
 
 ## 5. Memory Safety
-- Large structs (>1KB) are heap-allocated via `new_boxed()` or `Box::new()` — boot stack is 256KB
+- Large structs are constructed in place (Convention 4, `.claude/rules/kernel.md`): `new_boxed()` or an in-place initializer into a static, never `Box::new(T::new())`
 - No heap allocation before `memory::init()` completes
 - Frame allocator regions don't overlap with kernel heap or reserved memory
 

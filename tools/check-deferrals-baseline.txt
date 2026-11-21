@@ -2,7 +2,7 @@
 # Do not hand-edit unless you understand Convention 9.
 # Format: path:line:token-name (see tools/check-deferrals.py).
 
-.claude/rules/kernel.md:35:eventually
+.claude/rules/kernel.md:32:eventually
 .claude/rules/platform-gotchas.md:31:deferred
 CLAUDE.md:11:eventually
 docs/CambiOS.md:224:deferred

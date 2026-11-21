@@ -293,3 +293,16 @@ Candidates this review adds:
 - **Exact globs.** `user/libsys/**` matches the MPL-licensed crate and nothing else; `*.ld` and `limine*.conf` match the root linker scripts and Limine configs; `src/arch/x86_64/**` loads `x86_64.md` and only there.
 - **Delegation.** A subagent gets the root and loads rules from its own reads, so a brief does not need to carry rules text.
 - **SPDX (Software Package Data Exchange) header on this file.** Critical Rules asks for one on every new file. None of the 84 tracked Markdown files has one, including the two newest in this directory. This file carries it as an HTML comment; whether Markdown is meant to be in scope is a rule-versus-practice gap for the maintainer to settle.
+
+## Maintainer decisions (2026-11-21)
+
+Recorded by the host session that landed this review, not by the review run.
+
+- **Applied on the branch:** all accepted, landed byte-identical in the placement commit.
+- **Accepted and landed in the following commit:** 1.2 (read the rules file when no matching file is open), 1.3 with the rest of 3.3 (Conventions 4 and 7 stated in the root again; Convention 7 whole, Convention 4's rule sentence, with the kernel pattern and the incident kept in `kernel.md`), 2.6 (`linker*.ld` added to `kernel.md`), 2.7 (`tools.md` narrowed to the four host tools, `user/libsys/src/vault.rs` added), 3.8, 3.9 (the `sandbox.md` citation dropped; the boot-smoke reproduction harness moved into `failure-signatures.md`), 4.4 (one portable-module list, in `kernel.md`), 4.5, 4.6.
+- **3.7:** accepted as written. Each code comment is re-anchored when its file is next edited for another reason; the ADRs are left as record. Revisit when: a file listed under 3.7 is next edited.
+- **4.1:** not now. Revisit when: the Where things live index changes again, which is when a prose path list can next drift from a `paths:` list.
+- **2.8:** no glob change, as the finding proposes; §8 item 5 carries the obligation.
+- **4.3 (shrink), 4.8, 4.9 and section 6:** input to the step 2 rewording.
+- **SPDX on this file:** the HTML-comment header was removed on landing, so this file matches every other Markdown file in the repository. Whether the rule covers Markdown is still open.
+- **Glob probe for 2.6 and 2.7**, on the host, one fresh headless session per question: `linker-riscv64.ld` loads `kernel.md` and `platform-gotchas.md`; `tools/check-deferrals.py` loads nothing; `tools/sign-elf/src/main.rs` and `user/libsys/src/vault.rs` load `tools.md`. Every user-crate linker script is named `link*.ld`, so `linker*.ld` cannot reach one whether or not the pattern is anchored. A rules file is delivered once per session: a second matching read in the same session shows nothing new, so a probe that reads several files sees each rules file only at its first match.

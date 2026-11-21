@@ -56,7 +56,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **ALWAYS** all new files get an SPDX license header + copyright at the top. Default: `// SPDX-License-Identifier: AGPL-3.0-or-later` then `// Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors` on the next line. A file that already carries the earlier `Copyright (C) 2024-2026 Jason Ricca` line keeps it; headers are not rewritten in passing. Files under `user/libsys/` use `// SPDX-License-Identifier: MPL-2.0` instead. Adapt the comment syntax to file type (`#` for .toml/.py/.sh/Makefile; `/* ... */` for .ld/.S linker scripts and assembly). Do NOT use "All rights reserved" — a license grant supersedes reserved rights, and the SPDX header is the load-bearing declaration.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
 - **Design documents come first.** Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with the [Design Documents](#design-documents) and the ADRs. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
-- **Path-scoped reference lives in `.claude/rules/`.** Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file that [Where things live](#where-things-live) names before working on those paths. The rules in this file outrank them when they conflict.
+- **Path-scoped reference lives in `.claude/rules/`.** Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file that [Where things live](#where-things-live) names before working on those paths. The rules in this file outrank them when they conflict. Claude Code loads a rules file only when a matching file is read or edited. When the work concerns those paths with no such file open (a plan, an ADR draft, a review read from `git diff`, a new file written before any neighbour is read) or the block is no longer in context after a compaction, read the rules file named in Where things live first.
 
 ## Stop-and-Ask Gate
 
@@ -71,9 +71,9 @@ Before the first edit, stop and confirm when any of these apply. Questions beat 
 - **Panic / unwrap / expect in non-test kernel code.** Every kernel failure must be a typed `Result`. If the only forward motion seems to be a panic, stop — the error type is probably wrong.
 - **Telemetry / analytics / phone-home.** Project principle is zero telemetry. Any feature that emits data off-device (even "anonymous") is a stop.
 - **Fail-open path.** About to make an enforcement decision default to Allow when the decider is unavailable, slow, full, or returns garbage — or to describe one in a comment. Enforcement fails closed (Formal Verification list); propose the deny + audit + restart shape instead, or name the structural reason there is no one to ask.
-- **Portable module drift.** About to add `#[cfg(target_arch = …)]` to `src/scheduler/`, `src/ipc/`, `src/process.rs`, `src/loader/elf.rs`, or another portable module. Factor an `arch::` helper instead, or escalate.
+- **Portable module drift.** About to add `#[cfg(target_arch = …)]` to `src/scheduler/`, `src/ipc/`, `src/process.rs`, `src/loader/elf.rs`, or another module in the Portability Boundary list in [.claude/rules/kernel.md](.claude/rules/kernel.md). Factor an `arch::` helper instead, or escalate.
 - **Identity-gate bypass.** About to add a syscall without updating `requires_identity()` and the identity tests beside it in [cambios-abi/src/lib.rs](cambios-abi/src/lib.rs), or add an IPC receiver that uses plain `recv_msg` where `recv_verified` is the load-bearing variant.
-- **Destructive or shared-state action.** `git reset --hard`, branch deletion, force-push, `rm -rf` under the repo, or any action visible outside this machine. The top-level "Executing actions with care" rule applies; this bullet is the local reminder.
+- **Destructive or shared-state action.** `git reset --hard`, branch deletion, force-push, `rm -rf` under the repo, or any action visible outside this machine. Confirm with the user before any of these; this holds whatever the agent's own instructions say about destructive actions.
 - **Pre-edit audit.** Before the first Edit/Write on any file per session (especially under parallel-thread development), run `make claude-preflight FILE=<path>` or `git diff <path>`. If the diff is non-empty and the changes aren't this session's, STOP — ask the user to commit them before proceeding, or pick a different file. File-scoped `git add <file>` does not protect against *within-file* multi-authorship, so the gate has to fire before the edit, not before the commit.
 
 This list is not exhaustive. The rule: **when you are about to modify something the user would want to be consulted on before the first edit, stop before the first edit.**
@@ -114,11 +114,15 @@ Open mechanism decisions awaiting Revisit-when triggers — see [docs/dev-notes/
 
 2. **Lock ordering** (see [.claude/rules/locks.md](.claude/rules/locks.md)) must always be followed. Never acquire a lower-numbered lock while holding a higher-numbered one.
 
-Conventions 3 (architecture portability) and 4 (large structs are constructed in place) apply to kernel code only and are in [.claude/rules/kernel.md](.claude/rules/kernel.md).
+Convention 3 (architecture portability) applies to the kernel tree and is in [.claude/rules/kernel.md](.claude/rules/kernel.md).
+
+4. **Large structs are constructed in place**, never as a stack local that is then moved: kernel and boot stacks are small and so are user stacks (64 KiB). The kernel pattern and the reference failure are in [.claude/rules/kernel.md](.claude/rules/kernel.md).
 
 5. **`no_std` only.** No standard library. No heap allocation before `memory::init()` completes in `main.rs`.
 
-Conventions 6 (the GDT is `static mut`) and 7 (zeroed memory is not `None`) are kernel-only too, in the same file.
+Convention 6 (the GDT is `static mut`) is kernel-only, in [.claude/rules/kernel.md](.claude/rules/kernel.md).
+
+7. **Never assume zeroed memory equals `None` for `Option<T>`.** Rust does not guarantee the Option discriminant layout — the compiler may assign discriminant 0 to `Some` (not `None`), especially for large structs on bare-metal targets. Always use explicit `core::ptr::write(None)` when initializing heap-allocated arrays of `Option<T>`.
 
 8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Templates:
 
@@ -397,11 +401,11 @@ Reference that matters only inside one part of the tree is in `.claude/rules/`. 
 
 ### Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 
-[.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/`. The same file holds Development Conventions 3, 4, 6 and 7, the toolchain and linker-script pointers, Architecture (directory layout) and Memory Layout.
+[.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/` and the three kernel linker scripts. The same file holds Development Conventions 3 and 6, the detail of Convention 4, the portable-module list, the toolchain and linker-script pointers, Architecture (directory layout) and Memory Layout.
 
 ### Memory Layout
 
-In [.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/`. Kernel heap, boot stack, the object-table region, per-process heaps, user code and stack addresses, and the direct-map bases.
+In [.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/` and the three kernel linker scripts. Kernel heap, boot stack, the object-table region, per-process heaps, user code and stack addresses, and the direct-map bases.
 
 ### Platform Gotchas
 
@@ -425,7 +429,7 @@ In [.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the ke
 
 ### Git hooks, host tools and signing
 
-[.claude/rules/tools.md](.claude/rules/tools.md), for `tools/`, `.githooks/`, `user/key-store-service/`, `user/fde-mount/` and `manifest.toml`. Standalone builds, dev-PIV builds, ELF signing and `tools/sign-elf/`. What the hooks require of a commit is in the [Quick Reference](#quick-reference), above `make install-hooks`.
+[.claude/rules/tools.md](.claude/rules/tools.md), for the four host tools it describes (`tools/sign-elf/`, `tools/build-manifest/`, `tools/gen-dev-piv-keys/`, `tools/format-volume/`), `.githooks/`, `user/key-store-service/`, `user/fde-mount/`, `user/libsys/src/vault.rs` and `manifest.toml`. Standalone builds, dev-PIV builds, ELF signing and `tools/sign-elf/`. What the hooks require of a commit is in the [Quick Reference](#quick-reference), above `make install-hooks`.
 
 ### Sandbox VM
 

@@ -6,7 +6,7 @@ paths:
 # Sandbox VM
 
 ```bash
-# Sandbox VM egress (stage G, notes/stage-g-mythos-sandbox-vm.md): allow-list proxy on the Tart bridge
+# Sandbox VM egress: allow-list proxy on the Tart bridge
 make sandbox-net-up              # start tools/sandbox/allowlist-proxy.py bound to bridge100 (run after the VM is up); log + pidfile under ~/sandbox
 make sandbox-net-down            # stop it
 make sandbox-net-status          # pid, listener, last 10 decisions; $(SANDBOX_SOFTNET_POLICY) is the `tart run` flag set that pairs with it

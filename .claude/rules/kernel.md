@@ -1,32 +1,29 @@
 ---
 paths:
   - "src/**/*"
+  - "linker*.ld"
 ---
 
 # Kernel reference
 
-Sections below hold four of the numbered Development Conventions and describe kernel state (directory pointers, memory layout). Per-syscall behavior is in [syscalls.md](syscalls.md), the lock hierarchy in [locks.md](locks.md). Operational rules in the root [CLAUDE.md](../../CLAUDE.md) outrank them when they conflict. Toolchain versions live in [Cargo.toml](../../Cargo.toml) and [rust-toolchain.toml](../../rust-toolchain.toml); linker scripts are `linker.ld` (x86_64) / `linker-aarch64.ld` / `linker-riscv64.ld`. Bootloader is Limine 8.7.0 on x86_64+AArch64, OpenSBI on RISC-V.
+Sections below hold Development Conventions 3 and 6 and the kernel detail of Convention 4, which carry the same force as the rest of the numbered list in the root, and describe kernel state (directory pointers, memory layout). Per-syscall behavior is in [syscalls.md](syscalls.md), the lock hierarchy in [locks.md](locks.md). Operational rules in the root [CLAUDE.md](../../CLAUDE.md) outrank them when they conflict. Toolchain versions live in [Cargo.toml](../../Cargo.toml) and [rust-toolchain.toml](../../rust-toolchain.toml); linker scripts are `linker.ld` (x86_64) / `linker-aarch64.ld` / `linker-riscv64.ld`. Bootloader is Limine 8.7.0 on x86_64+AArch64, OpenSBI on RISC-V.
 
-## Development Conventions 3, 4, 6 and 7
+## Development Conventions 3, 4 and 6
 
-These apply to kernel code only. The rest of the numbered list is in the root CLAUDE.md.
+Conventions 3 and 6 apply to the kernel tree only. Convention 4 is stated in the root CLAUDE.md, where it also binds user crates; the kernel pattern and its reference failure are here. The rest of the numbered list, Conventions 5 and 7 included, is in the root.
 
 3. **Architecture portability:** All x86-specific code must be behind `#[cfg(target_arch = "x86_64")]`. The `src/arch/mod.rs` shim re-exports the active backend. Portable scheduler logic lives in `scheduler/mod.rs`.
 
 4. **Large structs** (Scheduler, IpcManager, ChannelManager, ClusterManager, BuddyAllocator, BootInfo) must be constructed **in place**, never as a stack local that is then moved. `Box::new(T::new())` is NOT the pattern — it builds all of `T` on the caller's stack first and then copies it into the box. The pattern is `alloc` + field-wise `addr_of_mut!(...).write(...)` + `Box::from_raw` (`IpcManager::new_boxed`, `ClusterManager::new_boxed`, `ChannelManager::new_boxed`) or an in-place initializer into a static (`BootInfo::init_empty_at` via `boot::begin_install`). Boot stacks: 256 KiB on every arch (Limine `StackSizeRequest` on x86_64/aarch64; `BOOT_STACK_SIZE` parity on riscv64). Adjacent memory below a boot or kernel stack is *other data* — an overflow corrupts silently. The 2026-09-14 riscv64 boot rot was exactly this: a 16 KiB riscv64 boot stack, 17–75 KiB stack transients from `Box::new(X::new())` and `BootInfo::empty()`, and `.data` statics (`POLICY_ROUTER`, `AUDIT_RING`) linked just below it reading back as garbage. Scheduler uses Vec/VecDeque internally so only ~200 bytes of metadata lands on the stack.
 
-Convention 5 (`no_std` only) is in the root CLAUDE.md.
-
 6. **GDT must be `static mut`** (writable .data section) because the CPU writes the Accessed bit.
-
-7. **Never assume zeroed memory equals `None` for `Option<T>`.** Rust does not guarantee the Option discriminant layout — the compiler may assign discriminant 0 to `Some` (not `None`), especially for large structs on bare-metal targets. Always use explicit `core::ptr::write(None)` when initializing heap-allocated arrays of `Option<T>`.
 
 ## Multi-Platform Strategy (x86_64, AArch64, RISC-V)
 
 x86_64, AArch64 and riscv64gc build at every commit ([ADR-013](../../docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Per-module parity status lives in [STATUS.md](../../STATUS.md).
 
 ### Portability Boundary (portable modules — no arch code)
-`src/scheduler/`, `src/ipc/`, `src/syscalls/mod.rs`, `src/process.rs`, `src/memory/buddy_allocator.rs` + `frame_allocator.rs`, `src/arch/spinlock.rs`. All arch code lives under `src/arch/<target>/`; `src/arch/mod.rs` is the cfg-gated shim.
+`src/scheduler/`, `src/ipc/`, `src/syscalls/mod.rs`, `src/process.rs`, `src/loader/elf.rs` (its machine-type selection, `ELF_MACHINE_EXPECTED`, is the one cfg it carries), `src/memory/buddy_allocator.rs` + `frame_allocator.rs`, `src/arch/spinlock.rs`. This is the list the root Stop-and-Ask bullet "Portable module drift" and [review-protocol.md](../../docs/review-protocol.md) § 4 are checked against. All arch code lives under `src/arch/<target>/`; `src/arch/mod.rs` is the cfg-gated shim.
 
 ### Rules for New Code
 - **Arch-specific code goes under `src/arch/<target>/`**, never in portable modules.
@@ -43,7 +40,7 @@ x86_64, AArch64 and riscv64gc build at every commit ([ADR-013](../../docs/adr/01
 Run `tree -L 2 src/ user/ tools/` for the current layout; file names and purposes drift, so this file doesn't restate them. The non-obvious pieces that *don't* read off the tree:
 
 - **`build.rs`** reads `CAMBIOS_TIER` (default `tier3`) and emits `--cfg tierN` for `src/config/tier.rs`. See [ADR-008](../../docs/adr/008-boot-time-sized-object-tables.md) / [ADR-009](../../docs/adr/009-purpose-tiers-scope.md).
-- **Arch split:** portable modules (`scheduler/`, `ipc/`, `process.rs`, `loader/elf.rs`, `memory/buddy_allocator.rs` + `frame_allocator.rs`, `syscalls/mod.rs`) contain no arch-specific code. All arch backends live under `src/arch/<target>/`. `src/arch/mod.rs` is the cfg-gated shim.
+- **Arch split:** the portable modules are the Portability Boundary list above. All arch backends live under `src/arch/<target>/`. `src/arch/mod.rs` is the cfg-gated shim.
 
 Service endpoints are in [userspace.md](userspace.md); `tools/sign-elf/` is in [tools.md](tools.md).
 
