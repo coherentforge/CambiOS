@@ -55,7 +55,7 @@ Never suggest adding telemetry, analytics, or any form of phone-home behavior.
 - **Tri-arch regression gate is mandatory before commits** ([ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline). Use `make check-all` (x86_64 + aarch64 + riscv64) as the permanent gate — R-6 landed 2026-04-19 so all three arches are now buildable at every commit boundary. `make check-stable` (x86_64 + aarch64 only) remains available as an escape hatch for future temporary backend breakage; the discipline is identical either way — no commits regress any *currently buildable* arch.
 - **ALWAYS** all new files get an SPDX license header + copyright at the top. Default: `// SPDX-License-Identifier: AGPL-3.0-or-later` then `// Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors` on the next line. A file that already carries the earlier `Copyright (C) 2024-2026 Jason Ricca` line keeps it; headers are not rewritten in passing. Files under `user/libsys/` use `// SPDX-License-Identifier: MPL-2.0` instead. Adapt the comment syntax to file type (`#` for .toml/.py/.sh/Makefile; `/* ... */` for .ld/.S linker scripts and assembly). Do NOT use "All rights reserved" — a license grant supersedes reserved rights, and the SPDX header is the load-bearing declaration.
 - **FUTURE VERIFICATION** every part of the microkernel will be formally verified at a later date.
-- **Design documents come first.** Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with the [Design Documents](#design-documents) and the ADRs. If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
+- **Design documents come first.** Any work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry must be consistent with the design documents and ADRs in [Required Reading by Subsystem](#required-reading-by-subsystem). If implementation reveals a design problem, update the design doc *first* — don't silently diverge.
 - **Path-scoped reference lives in `.claude/rules/`.** Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file that [Where things live](#where-things-live) names before working on those paths. The rules in this file outrank them when they conflict. Claude Code loads a rules file only when a matching file is read or edited. When the work concerns those paths with no such file open (a plan, an ADR draft, a review read from `git diff`, a new file written before any neighbour is read) or the block is no longer in context after a compaction, read the rules file named in Where things live first.
 
 ## Stop-and-Ask Gate
@@ -88,6 +88,7 @@ Commit at topic boundaries within a session, not at session end. Bisectable hist
 - **Split by logical boundary, not by file.** A small multi-file change is one commit; a large single-file change spanning multiple topics should be multiple commits if the edits are cleanly separable.
 - **Never `git add .` or `git commit -a` without naming files.** Working-tree sweeps conflate unrelated work — if a parallel session has uncommitted edits, those will get swept into the commit message of whatever is landing. Stage by explicit filename.
 - **Draft the commit body from `git diff --cached`, not from memory.** Every claim ("removes X", "renames Y") must match a line in the staged diff. Verification bullets ("grep returns nothing", "make check-all clean") must be run against the staged tree at drafting time, not recalled. Bodies written from memory drift ahead of what got staged.
+- **The hooks bind every Claude-authored commit.** Its message carries a `Staged files:` block equal to `git diff --cached --name-only`. Set `CLAUDE_PREFLIGHT_SESSION=<id>` once per session so the preflight and edit-window gates enforce instead of warn. The pre-push gate refuses a commit that changes a file no Claude session edited with Edit, Write or NotebookEdit. Mechanics and scripts: [.claude/rules/tools.md](.claude/rules/tools.md); `make install-hooks` installs them once per clone.
 - **Sign off every commit** (`git commit -s`). The `Signed-off-by:` line certifies the Developer Certificate of Origin; the commit-msg hook rejects a commit without it. An agent-authored commit carries the sign-off of the person the agent works for. Process details for contributors are in [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Who runs the commit.** On the maintainer's clone the agent drafts and the maintainer executes: the agent prepares `git add <files>` and the commit message, and the maintainer runs the commit to enter their PGP (Pretty Good Privacy) passphrase. On a contributor's clone or fork, the contributor, or their agent under the contributor's own identity, commits to a branch and opens a pull request; a contributor's change reaches `main` only through a pull request that passes the required checks. The project's own agent identity (the `cambios-agent` GitHub App) takes the same pull-request path. In every case: never bypass signing or hooks (`--no-gpg-sign`, `--no-verify`).
 
@@ -120,27 +121,11 @@ Convention 3 (architecture portability) applies to the kernel tree and is in [.c
 
 5. **`no_std` only.** No standard library. No heap allocation before `memory::init()` completes in `main.rs`.
 
-Convention 6 (the GDT is `static mut`) is kernel-only, in [.claude/rules/kernel.md](.claude/rules/kernel.md).
+Convention 6 (the GDT is `static mut`) is x86_64-only, in [.claude/rules/x86_64.md](.claude/rules/x86_64.md).
 
 7. **Never assume zeroed memory equals `None` for `Option<T>`.** Rust does not guarantee the Option discriminant layout — the compiler may assign discriminant 0 to `Some` (not `None`), especially for large structs on bare-metal targets. Always use explicit `core::ptr::write(None)` when initializing heap-allocated arrays of `Option<T>`.
 
-8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). Templates:
-
-```rust
-/// SCAFFOLDING: <one-line statement of the constraint>
-/// Why: <verification or early-development rationale>
-/// Replace when: <observable trigger that should make a future maintainer revisit>
-const MAX_FOO: usize = 32;
-
-/// ARCHITECTURAL: <statement of the invariant the constant encodes>
-const NUM_PRIORITY_BANDS: usize = 4;
-
-/// HARDWARE: <ABI/spec reference that fixes this number>
-const MAX_GSI_PINS: usize = 24;
-
-/// TUNING: <what workload property this number trades off>
-const CACHE_CAPACITY: usize = 32;
-```
+8. **Every numeric bound is a conscious bound.** Fixed `const` numerics, fixed-size arrays, and `MAX_*` values in kernel code must carry a doc comment naming their category: `SCAFFOLDING` (verification ergonomics, expected to grow), `ARCHITECTURAL` (real invariant, won't change), `HARDWARE` (ABI/spec fact), or `TUNING` (workload-dependent). Unconscious bounds — values picked because something fit — are how production-ready software accrues weakness while it's still cheap to fix. The full catalog with rationale and replacement criteria lives in [ASSUMPTIONS.md](docs/ASSUMPTIONS.md). The doc-comment template for each category is in [.claude/rules/kernel.md](.claude/rules/kernel.md).
 
 **SCAFFOLDING bounds must be sized for the v1 endgame.** Extrapolation procedure + 25%-utilization rule: see [ASSUMPTIONS.md § Sizing SCAFFOLDING bounds](docs/ASSUMPTIONS.md#sizing-scaffolding-bounds-for-the-v1-endgame). Update the matching row in the same change; Step 8 of the Post-Change Review lists this.
 
@@ -177,13 +162,7 @@ const CACHE_CAPACITY: usize = 32;
 
    Same anti-rot shape as the "no forward numeric ADR references" rule (changelog 2026-04-16) and Convention 9 (deferrals need observable triggers): durable artifacts must not anchor to mutable indices. Lint deferred per usual cadence (prose first; `make check-phase-refs` flagging `Phase \d` patterns lands on first recurrence).
 
-   **Exceptions in practice** (from the kernel sweep precedent — see commits f24233e through a15a743):
-
-   - **Convention 9 triggers preserve their phase numbers.** `// Replace when: R-6 lands` and `// Revisit when: identity.md Phase 1.5 lands (post-v1)` are valid per Convention 9's own examples ("Revisit when R-6 lands"). Don't strip phase numbers from `Replace when:` / `Revisit when:` blocks; they're observable triggers, not anchors.
-   - **Runtime log strings are out of scope.** Convention 10 is about code *comments*. Output strings like `[R-3 RX]` (the RISC-V trap-handler diagnostic prefix in `src/arch/riscv64/plic.rs`) are operator-visible artifacts; renaming them is a coordinated multi-file decision, not a comment cleanup.
-   - **ADR prose is out of scope.** ADR files in `docs/adr/` are historical decision records. Phase references in the reasoning are part of the record. Don't touch unless explicitly addressing an ADR's content.
-   - **Within-function step labels rename to "Step N".** Inline comments like `// Phase 1: handshake` / `// Phase 2: install` used as in-function ordering (precedents: `src/fs/lazy_disk.rs::ensure_disk_store`, `src/policy/mod.rs::expire_stale_decisions`, `src/syscalls/dispatcher.rs::handle_audit_attach`) describe code structure that needs *some* label. Rename to `// Step N:` rather than dropping — the word "Phase" trips readers into looking for a STATUS.md index that isn't there.
-   - **`Phase X (substantive-subsystem)` parentheticals where the subsystem name is adjacent get the phase dropped, name kept.** `Phase 5 (social log)` → `social log`. The substantive name is the durable anchor; the phase tag was a forecast of when growth would come from there.
+   **Convention 9 triggers keep their phase numbers.** `// Revisit when: R-6 lands` is an observable trigger, not an anchor; don't strip it. The other exceptions a comment sweep leaves alone (log strings, ADR prose, in-function step labels, subsystem parentheticals) are in [docs/dev-notes/convention-10-exceptions.md](docs/dev-notes/convention-10-exceptions.md).
 
 ## Post-Change Review Protocol
 
@@ -255,43 +234,27 @@ make fuzz-build
 # Derived counts (syscalls, tests, LOC)
 make stats
 
-# Lints. Most are don't-grow-the-baseline gates (baselines in tools/check-*-baseline.txt); check-lists has no baseline.
-make check-lists             # every copy of a build list (architectures, user crates, host-tested packages, proof crates) agrees with the Makefile's "Build lists" section
-make check-adrs              # ADR cross-refs + regenerate docs/adr/INDEX.md
-make audit-taxonomy          # regenerate docs/generated/audit-taxonomy.md from cambios-abi (audit_taxonomy! macro)
-make check-audit-taxonomy    # verify the generated taxonomy doc is in sync (local only: neither CI nor the hooks run it)
-make check-assumptions       # Convention 8 numeric-const tags
-make check-deferrals         # Convention 9 Revisit-when triggers
-make check-boot-panics       # ADR-021 Phase C — no panic!/expect/etc in boot init; exempt via `// BOOT_PANIC_OK: <reason>`
-make check-fail-open         # Enforcement fails closed (ADR-006 § Divergence 2026-10-28) — no fail-open phrase in kernel/user code or comments; exempt via `// FAIL_OPEN_OK: <reason>`; baseline expected empty
-make check-doc-refs          # ASSUMPTIONS.md `file.rs#Lnnn` source refs name the symbol within ±1 line (CI-gated since b194a8b; any edit that moves a const in a cited file trips it — run it with the other line-keyed gates, `python3 tools/check-doc-refs.py --fix` re-anchors drifted refs)
-make check-banned-paths      # paths in tools/banned-paths.txt must not exist on disk
-make check-index-isolation   # STATUS.md diff >20 lines + any .rs staged → reject
-make check-lockfile          # T-1: lists added/removed Cargo.lock crates (advisory)
-make check-unsafe-coverage   # Convention 1 (blocks): every `unsafe { }` has `// SAFETY:` (cluster + cfg-attr + assignment-continuation aware)
-make check-status-freshness  # STATUS.md `last_synced_to_code:` within 7 days of today (advisory; warn-but-pass). CI runs it with `--strict`, which fails when STATUS.md's Kani harness total disagrees with the source
-make check-clippy            # Convention 1 (tri-arch deny gate, CI per-push): missing_safety_doc (every `pub unsafe fn` has `# Safety`) + multiple_unsafe_ops_per_block + undocumented_unsafe_blocks; runs clippy on x86_64+aarch64+riscv64 because arch-cfg'd unsafe only lints on its own target
+# Lints. A failing lint prints its own remedy. Most are don't-grow-the-baseline gates (tools/check-*-baseline.txt).
+# CI = run on every push; hook = run by pre-commit.
+make check-lists             # every copy of a build list matches the Makefile's (CI, hook)
+make check-adrs              # ADR cross-refs; regenerates docs/adr/INDEX.md (CI)
+make audit-taxonomy          # regenerates docs/generated/audit-taxonomy.md from cambios-abi
+make check-audit-taxonomy    # that generated doc is in sync (CI)
+make check-assumptions       # Convention 8 tags on numeric consts (CI)
+make check-deferrals         # Convention 9 Revisit-when triggers (CI)
+make check-boot-panics       # ADR-021: no panic paths in boot init (CI)
+make check-fail-open         # enforcement fails closed: no fail-open phrase (CI, hook)
+make check-doc-refs          # ASSUMPTIONS.md file.rs#Lnnn refs still name their symbol (CI, hook)
+make check-banned-paths      # tools/banned-paths.txt entries absent (CI, hook)
+make check-index-isolation   # no STATUS.md diff >20 lines with .rs staged (hook)
+make check-lockfile          # lists Cargo.lock crate changes (hook, advisory)
+make check-unsafe-coverage   # Convention 1: every unsafe block has SAFETY (CI, hook)
+make check-status-freshness  # STATUS.md sync date within 7 days (hook, advisory); CI runs --strict for Kani-total drift
+make check-clippy            # Convention 1 clippy denies, all three arches (CI)
+# check-doc-refs is line-keyed: any edit that moves a const in a cited file trips it. Run it with the other
+# line-keyed gates after the last edit; `python3 tools/check-doc-refs.py --fix` re-anchors drifted refs.
 
-# Commit-msg hooks (Claude-authored commits only):
-# 1. H1 (2026-04-23): `Staged files:` block must match `git diff --cached
-#    --name-only`. Script: tools/check-claude-staged-files.py.
-# 2. Sticky preflight (2026-04-25): rejects commits that stage a file
-#    which was already dirty at the start of the current Claude session
-#    AND was never preflighted. Catches the 6th-recurrence shape that H1
-#    misses (within-file sweeps). Set `CLAUDE_PREFLIGHT_SESSION=<id>`
-#    once per session to enable enforcement; warn-but-pass when unset.
-#    Script: tools/check-preflight-discipline.py.
-# Pre-push hook (Claude-authored commits only):
-# 3. Edit-window gate (2026-04-25): rejects pushes whose Claude-authored
-#    commits modify files no Claude session ever touched via Edit/Write/
-#    NotebookEdit. Defense-in-depth on top of (2); catches anything that
-#    bypassed commit-msg via `--no-verify`. Requires the PostToolUse hook
-#    in .claude/settings.local.json (calls tools/log-claude-edit.py) plus
-#    `CLAUDE_PREFLIGHT_SESSION`. Warn-but-pass without an edit log.
-#    Scripts: tools/log-claude-edit.py + tools/check-edit-window.py.
-# All run automatically when installed via `make install-hooks`.
-
-# One-time per clone — installs .githooks/ via core.hooksPath
+# One-time per clone — installs .githooks/ via core.hooksPath (what the hooks require: Commit Cadence)
 make install-hooks
 
 # Tier-policy builds (ADR-008/009). CAMBIOS_TIER ∈ {tier1, tier2, tier3}; default tier3.
@@ -299,91 +262,66 @@ CAMBIOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
 
 # QEMU
 make run                         # x86_64 (ISO, rebuilds kernel + modules)
-make run-quiet                   # x86_64, filtered via tools/qemu-run-quiet.py; exit 0 = success sentinel (default: the `CambiOS Shell v0.1` banner) AND every `--require REGEX` matched, 1 = panic/exception, 2 = hang or a required line missing. Default requires (RUN_QUIET_REQUIRES): `boot wave settled: N ready, 0 spawn-failed, 0 dep-failed` and `[COMPOSITOR] display connected: WxH` (this recipe attaches a GPU; a boot with no display reaches the shell headless, so the display is required where it is known to exist); CI adds the policy counters via EXTRA_REQUIRES="--require '…'". Override with `make run-quiet SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
+make run-quiet                   # x86_64 via tools/qemu-run-quiet.py. Exit 0 = shell banner reached and every required line seen, 1 = panic or exception, 2 = hang or a required line missing. Required lines: RUN_QUIET_REQUIRES in the Makefile, plus EXTRA_REQUIRES="--require '…'"; `SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
 make run-aarch64                 # AArch64 (FAT image); serial-only, no GPU: the compositor runs headless (run-aarch64-gui attaches one)
 make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only
 make img-aarch64                 # AArch64 FAT image only
 make disk-img                    # 64 MiB raw backing for the block driver (idempotent; `make run` depends on it)
-make run-quiet DISK_BUS=nvme     # same disk image behind a QEMU NVMe controller instead of virtio-blk-pci (also `run-img-usb DISK_BUS=nvme PROFILE=headless`, the bare-metal rehearsal: the headless/framebuffer-fallback profiles spawn `user/nvme`, `default` spawns virtio-blk; both serve the block seam in `cambios-blk-proto`)
-make img-usb [PROFILE=headless]  # bare-metal USB image: iso_root + the signed manifest for PROFILE (headless = text shell on the framebuffer console, with the shell rebuilt `--features headless-input` and swapped in so it owns input endpoint 30 and reads the USB keyboard from usb-host; framebuffer-fallback = scanout-limine + compositor + terminal-window, keyboard via usb-host HID → compositor). `make usb DEVICE=/dev/diskN PROFILE=…` writes it.
-make usb DEVICE=/dev/diskN PROFILE=framebuffer-fallback KERNEL_FEATURES=fbcon-hold   # diagnostic stick for a machine with no serial: the kernel text console keeps mirroring over the scanout driver after the handoff, so the boot log (policy denials, `[sched]` counters, service lines) stays readable on the panel when the GUI chain fails silently. Garbled by design; never ship it.
+make run-quiet DISK_BUS=nvme     # same disk image behind a QEMU NVMe controller instead of virtio-blk-pci
 
 # Symbol index for AI-assisted navigation (read .symbols at session start)
 make symbols
 
+# Bare-metal USB images and the fbcon-hold diagnostic stick: .claude/rules/platform-gotchas.md.
 # Standalone builds, dev-PIV builds and ELF signing: .claude/rules/tools.md.
 # Sandbox VM: .claude/rules/sandbox.md.
 ```
 
 ## Code Navigation — rust-analyzer MCP Tools
 
-An MCP server exposing rust-analyzer is configured in `.mcp.json`. **Prefer these tools over Grep/Glob for code navigation whenever practical:**
-
-- **`mcp__rust-analyzer__symbol_references`** — find a symbol by name and get all references in one call. Use this instead of grepping for a symbol name.
-- **`mcp__rust-analyzer__hover`** — get the resolved type, struct fields, and doc comments at a position. Use this instead of reading surrounding code to understand a type.
-- **`mcp__rust-analyzer__definition`** — jump to where a symbol is defined. Use this instead of grepping for `fn name` or `struct name`.
-- **`mcp__rust-analyzer__references`** — find all references at a position (when you already have file:line:col).
-- **`mcp__rust-analyzer__implementations`** — find all trait implementations. Use this instead of grepping for `impl TraitName`.
-- **`mcp__rust-analyzer__symbols`** — fuzzy search for symbols across the workspace.
-- **`mcp__rust-analyzer__document_symbols`** — structural overview of a file (all functions, types, constants).
-
-These tools return semantically precise results (no false positives from comments or strings) and save significant tokens compared to grep-then-read cycles. Grep is still appropriate for searching within string literals, comments, or non-Rust files.
+`.mcp.json` configures an MCP (Model Context Protocol) server that exposes rust-analyzer. When it is connected, prefer its symbol, definition, reference, implementation and hover tools over Grep for navigating Rust; Grep stays right for string literals, comments and non-Rust files.
 
 ## Required Reading by Subsystem
 
-When working on a subsystem, read its design and implementation docs *before* writing code. This map exists so context doesn't get forgotten between sessions. If a doc is missing from the list it means the subsystem is small enough that the code is the documentation.
+When working on a subsystem, read its design documents and ADRs *before* writing code; the "Unread subsystem" Stop-and-Ask bullet is checked against this map. Source files are not listed: open the subsystem's directory. A subsystem with no row is small enough that the code is the documentation. Pure intent lives in the design documents and ADRs, current status in [STATUS.md](STATUS.md). The full ADR set is [docs/adr/](docs/adr/) (run `ls docs/adr/`; do not cite a range here, it drifts).
 
-| Working on... | Read first | Then |
-|---|---|---|
-| **Scheduler / context switch / preemption** | [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) | [.claude/rules/locks.md](.claude/rules/locks.md) and [.claude/rules/scheduling.md](.claude/rules/scheduling.md) |
-| **IPC control path (256-byte messages)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) | `src/ipc/mod.rs`, `src/ipc/interceptor.rs` |
-| **IPC bulk path (channels — Phase 3)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (channels are the audit transport) |
-| **Service clusters / cluster-shaped revoke / boot-time mesh setup** | [ADR-027](docs/adr/027-service-clusters.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channel substrate), [ADR-018](docs/adr/018-init-process-and-boot-manifest.md) (manifest-driven boot) | `src/ipc/cluster.rs` (skeleton, post-HN), `user/compositor/src/main.rs` (rendering limb is the first cluster). Per-channel quiesce protocol is the prerequisite — independent pre-HN work that closes the compositor #PF on clean client exit; clusters wrap N quiesce-revokes in a single locked transition. |
-| **Capabilities, grant/revoke, delegation** | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) | `src/ipc/capability.rs` |
-| **Process tables / tier configuration / boot-time object sizing** | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md), [ADR-009](docs/adr/009-purpose-tiers-scope.md) | `src/process.rs`, `src/ipc/capability.rs`, [ASSUMPTIONS.md § Tier policies](docs/ASSUMPTIONS.md) |
-| **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) ([§ Divergence](docs/adr/002-three-layer-enforcement-pipeline.md#divergence): interceptor moved from `Box<dyn IpcInterceptor>` to `IpcInterceptorBackend` enum-dispatch shim — same precedent as ADR-003 for `OBJECT_STORE`) | `src/ipc/interceptor.rs` (trait + `IpcInterceptorBackend` enum), `src/ipc/mod.rs` (`IpcManager.interceptor` and `ShardedIpcManager.interceptor` field sites) |
-| **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) | `src/audit/mod.rs`, `src/audit/buffer.rs`, `src/audit/drain.rs` |
-| **Audit consumer capability / kernelvisor prep / `audit-tail` boot module** | [ADR-023](docs/adr/023-audit-consumer-capability.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (the bootstrap-only check ADR-023 supersedes) | `user/audit-tail/src/main.rs`, `src/syscalls/dispatcher.rs` (`handle_audit_attach`, `handle_get_process_principal`), `src/process.rs` (`RecentExitsRing`) |
-| **Identity / Principal / sender_principal / vault** | [identity.md](docs/identity.md), [ADR-025](docs/adr/025-principal-as-aid.md) (Principal as 32-byte AID — supersedes the implementation contract from [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md)), [ADR-026](docs/adr/026-identity-transcription-at-the-kernel-ring.md) (kernel transcribes identity events without interpreting them), [ADR-033](docs/adr/033-multi-principal-vault.md) (`user/key-store-service` as the AID → hardware-key-slot directory; `bind_for_spawn` / `sign_with` / `decrypt_with` IPC) | [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) (intent only) |
-| **ObjectStore / CambiObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/fs/mod.rs`, `src/fs/ram.rs`, `user/fs-service/src/main.rs` |
-| **Persistent ObjectStore / on-disk format / BlockDevice** | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) (+ § Divergence 3 landed 2026-05-16: v2 record format, shared bitmap + journal via [ADR-029 § Decision 5](docs/adr/029-posix-file-storage-model.md)) | `src/fs/block.rs`, `src/fs/disk.rs`, `src/fs/bitmap.rs`, `src/fs/journal.rs`; [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) for the `CambiObject` model the format serializes |
-| **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) | `src/loader/mod.rs` (`SignedBinaryVerifier`) |
-| **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) | `user/libsys/src/lib.rs`, an existing service like `user/udp-stack/src/main.rs` as template |
-| **Init / boot manifest / service lifecycle** | [ADR-018](docs/adr/018-init-process-and-boot-manifest.md) (kernel transcribes security sections, init interprets policy sections; migration-step ordering), [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md) (restart substrate — gates step 10) | `cambios-manifest/src/lib.rs` (wire format, shared parser, boot-protocol consts), `user/init/src/engine.rs` (supervisor state machine), `src/manifest.rs` (kernel transcription), `manifest.toml` + `tools/build-manifest` (registry artifact) |
-| **Architecture port (a new backend)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), the Multi-Platform Strategy section of [.claude/rules/kernel.md](.claude/rules/kernel.md); `make check-lists` names each file a new architecture has to be added to | `src/arch/aarch64/mod.rs` as the closest structural reference (single trap vector, `scause`-style dispatch, callee-saved context_switch); `src/boot/mod.rs` for the BootInfo contract a new boot adapter must satisfy |
-| **Graphics / compositor / GUI / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) (+ § Divergence 2026-04-20 for 4.a/4.b scanout transport: `SYS_VIRTIO_MODERN_CAPS = 38`, double-copy frame path, `-vga virtio` QEMU; + § Divergence 2026-05-08 for the client↔compositor protocol — 10 wire messages 0x3xxx/0x4xxx, libgui-proto authoritative) | `user/compositor` (ep 28), `user/scanout-virtio-gpu` (ep 27 — default x86_64 driver, 5 2D ops: CREATE_2D / ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH), `user/scanout-limine` (fallback). Intel + aarch64/riscv64 virtio-gpu deferred to 4.c+. [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) for channel transport. |
-| **GUI client library (user/libgui v0)** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md) (libgui = in-process widget layer; v0 drawing primitives only, widgets deferred), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) § Divergence 2026-05-08 (client↔compositor wire protocol — full message table + authority model) | `user/libgui-proto/src/lib.rs` (wire format), `user/hello-window/` (canonical client), `user/libgui/src/{surface,font,tile_grid,client,bitmap}.rs`. No new kernel syscalls — drawing is CPU writes into attached surface channel. `Client::open` does CreateWindow/WelcomeClient/channel_attach handshake. `TileGrid::hit_test` deferred — don't add without consumer. |
-| **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) (+ § Divergence: virtio-input-first, `COMPOSITOR_INPUT_ENDPOINT = 30`, first-live-window focus) | `user/libinput-proto/src/lib.rs` (96-byte wire + class payloads + modifier/button bitfields), `user/virtio-input/` (main.rs + transport.rs + virtqueue.rs + evdev.rs), `user/compositor/src/main.rs::pump_input_once` (→ focused window via `MsgTag::InputEvent = 0x4030`), `user/libgui/src/client.rs::poll_event`. Hub deferred until second consumer or signed-carrier hardware. `signature_block` reserved from day one so ADR-012 Input-5 lands without format revision. |
-| **Security review / threat model** | [SECURITY.md](docs/SECURITY.md), [threat-model.md](docs/threat-model.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) | All ADRs |
-| **"Is X done yet?" / current state** | [STATUS.md](STATUS.md) | — |
+| Working on... | Read first |
+|---|---|
+| **Scheduler / context switch / preemption** | [SCHEDULER.md](src/scheduler/SCHEDULER.md), [ADR-001](docs/adr/001-smp-scheduling-and-lock-hierarchy.md) |
+| **IPC control path (256-byte messages)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) |
+| **IPC bulk path (channels)** | [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (channels are the audit transport) |
+| **Service clusters / cluster-shaped revoke / boot-time mesh setup** | [ADR-027](docs/adr/027-service-clusters.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channel substrate), [ADR-018](docs/adr/018-init-process-and-boot-manifest.md) (manifest-driven boot) |
+| **Capabilities, grant/revoke, delegation** | [ADR-000](docs/adr/000-zta-and-cap.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) |
+| **Process tables / tier configuration / boot-time object sizing** | [ADR-008](docs/adr/008-boot-time-sized-object-tables.md), [ADR-009](docs/adr/009-purpose-tiers-scope.md), [ASSUMPTIONS.md § Tier policies](docs/ASSUMPTIONS.md) |
+| **Policy / `on_syscall` / interceptor decisions** | [ADR-006](docs/adr/006-policy-service.md), [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) and its [§ Divergence](docs/adr/002-three-layer-enforcement-pipeline.md#divergence) (the interceptor is an enum, `IpcInterceptorBackend`, not a trait object) |
+| **Audit infrastructure / observability** | [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md) |
+| **Audit consumer capability / `audit-tail`** | [ADR-023](docs/adr/023-audit-consumer-capability.md), [ADR-007](docs/adr/007-capability-revocation-and-telemetry.md) (the bootstrap-only check ADR-023 supersedes) |
+| **Identity / Principal / sender_principal / vault** | [identity.md](docs/identity.md), [ADR-025](docs/adr/025-principal-as-aid.md) (supersedes [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md)'s implementation contract), [ADR-026](docs/adr/026-identity-transcription-at-the-kernel-ring.md), [ADR-033](docs/adr/033-multi-principal-vault.md); [FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md) (intent only) |
+| **ObjectStore / CambiObject / fs-service** | [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md), [ADR-004](docs/adr/004-cryptographic-integrity.md) |
+| **Persistent ObjectStore / on-disk format / BlockDevice** | [ADR-010](docs/adr/010-persistent-object-store-on-disk-format.md) and its § Divergence 3, [ADR-029 § Decision 5](docs/adr/029-posix-file-storage-model.md) (shared bitmap and journal), [ADR-003](docs/adr/003-content-addressed-storage-and-identity.md) (the `CambiObject` model the format serializes) |
+| **Signed ELF loading / cryptographic integrity** | [ADR-004](docs/adr/004-cryptographic-integrity.md) |
+| **User-space services (any new boot module)** | [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) |
+| **Init / boot manifest / service lifecycle** | [ADR-018](docs/adr/018-init-process-and-boot-manifest.md), [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md) (restart substrate) |
+| **Architecture port (a new backend)** | [ADR-013](docs/adr/013-riscv64-architecture-support.md), the Multi-Platform Strategy section of [.claude/rules/kernel.md](.claude/rules/kernel.md); `make check-lists` names each file a new architecture has to be added to |
+| **Graphics / compositor / GPU driver** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) and its § Divergence 2026-04-20 (scanout transport) and 2026-05-08 (client-compositor protocol), [ADR-005](docs/adr/005-ipc-primitives-control-and-bulk.md) (channel transport); [.claude/rules/gui.md](.claude/rules/gui.md) |
+| **GUI client library (`user/libgui`)** | [ADR-011](docs/adr/011-graphics-architecture-and-scaling.md), [ADR-014](docs/adr/014-compositor-scanout-driver-protocol.md) § Divergence 2026-05-08; [.claude/rules/gui.md](.claude/rules/gui.md) |
+| **Input drivers / Input Hub / event wire format / trust tiers** | [ADR-012](docs/adr/012-input-architecture-and-device-classes.md) and its § Divergence; [.claude/rules/gui.md](.claude/rules/gui.md) |
+| **Security review / threat model** | [SECURITY.md](docs/SECURITY.md), [threat-model.md](docs/threat-model.md), [ADR-000](docs/adr/000-zta-and-cap.md), [PHILOSOPHY.md](docs/PHILOSOPHY.md), then all ADRs |
+| **"Is X done yet?" / current state** | [STATUS.md](STATUS.md) |
 
-**Orphan ADRs** — not bound to any subsystem row above; consult when their topic enters scope:
-- [ADR-015](docs/adr/015-storage-tiers-and-commitment-ladder.md) — storage durability tiers / commitment ladder. Read when working on persistence, replication, or durability guarantees.
-- [ADR-016](docs/adr/016-win-compat-api-ai-boundary.md) — Win32 API surface and the AI-translation boundary. Read when working on the Windows compatibility shim.
-- [ADR-017](docs/adr/017-user-directed-cloud-inference.md) — user-directed cloud inference policy. Read when adding cloud-AI routing or consent flows.
-- [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md) — process fault reaping and peer generation. Read when working on process lifecycle, fault recovery, or service restart.
-- [ADR-020](docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md) — typed user buffer slices at the syscall boundary. Read alongside the syscall walkthrough when a new syscall takes user pointers.
-- [ADR-021](docs/adr/021-typed-boot-error-propagation.md) — typed boot error propagation; enforced by `make check-boot-panics`. Read when working on `src/microkernel/main.rs` or any boot-init path.
-- [ADR-022](docs/adr/022-wall-clock-time.md) — wall-clock time syscalls (44/45) and the SetWallclock cap (reservation only; impl deferred behind audit refactor). Read when impl resumes.
-- [ADR-024](docs/adr/024-syscall-abi-crate.md) — `cambios-abi` crate as the syscall ABI definition surface. Read when modifying the syscall ABI or generating bindings.
-- [ADR-034](docs/adr/034-deferred-task-resource-reclamation.md) — deferred reclamation of a terminating task's self-referential resources (page-table root, kernel stack, task slot) via per-CPU reapers; the N-CPU address-space occupancy invariant. Read when working on process exit/teardown, the reaper, or the scheduler slot lifecycle; pairs with [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md).
-
-## Design Documents
-
-These documents capture architectural decisions that implementation must align with. Pure intent goes in the design docs and ADRs; current implementation status goes in [STATUS.md](STATUS.md).
-
-- **[CambiOS.md](docs/CambiOS.md)** — Source-of-truth architecture document (vision, principles, what CambiOS *is*).
-- **[identity.md](docs/identity.md)** — Identity architecture: what identity means in CambiOS, Ed25519 Principals, author/owner model, biometric commitment, did:key DID method, revocation model.
-- **[FS-and-ID-design-plan.md](docs/FS-and-ID-design-plan.md)** — Phase intent for identity + storage. Content-addressed ObjectStore, CambiObject model, bootstrap identity, IPC sender_principal stamping. Flows from identity.md.
-- **[win-compat.md](docs/win-compat.md)** — Windows compatibility layer design: sandboxed PE loader, AI-translated Win32 shim tiers, virtual registry/filesystem, sandboxed Principal model, target application phases (business → CAD → instrumentation).
-- **[PHILOSOPHY.md](docs/PHILOSOPHY.md)** — Why CambiOS exists, the AI-watches-not-decides stance, the verification-first commitment.
-- **[SECURITY.md](docs/SECURITY.md)** — Security posture, enforcement table, threat model.
-- **[ASSUMPTIONS.md](docs/ASSUMPTIONS.md)** — Catalog of every numeric bound in kernel code with category (SCAFFOLDING / ARCHITECTURAL / HARDWARE / TUNING) and replacement criteria. Anti-drift mechanism for bounds chosen for verification ergonomics.
-- **[GOVERNANCE.md](docs/GOVERNANCE.md)** — Project governance, deployment tiers, and scope boundaries. Companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
-- **[docs/adr/](docs/adr/)** — Architecture decision records. Read the ones in the Required Reading map for the subsystem you're touching. (Run `ls docs/adr/` for the current set; do not cite a range here — it drifts.)
-
-Work on identity, storage, filesystem, IPC architecture, capabilities, policy, or telemetry follows the "Design documents come first" rule under [Critical Rules](#critical-rules).
+**Read when the topic enters scope** (no subsystem row):
+- [CambiOS.md](docs/CambiOS.md): what CambiOS is; the source-of-truth architecture document.
+- [GOVERNANCE.md](docs/GOVERNANCE.md): deployment tiers and scope boundaries; companion to [ADR-009](docs/adr/009-purpose-tiers-scope.md).
+- [ADR-015](docs/adr/015-storage-tiers-and-commitment-ladder.md): storage durability tiers, replication.
+- [ADR-016](docs/adr/016-win-compat-api-ai-boundary.md) and [win-compat.md](docs/win-compat.md): the Windows compatibility layer.
+- [ADR-017](docs/adr/017-user-directed-cloud-inference.md): cloud-AI routing and consent.
+- [ADR-019](docs/adr/019-process-fault-reaping-and-peer-generation.md): process lifecycle, fault recovery, service restart.
+- [ADR-020](docs/adr/020-typed-user-buffer-slices-at-syscall-boundary.md): a syscall that takes user pointers.
+- [ADR-021](docs/adr/021-typed-boot-error-propagation.md): `src/microkernel/main.rs` or any boot-init path.
+- [ADR-022](docs/adr/022-wall-clock-time.md): wall-clock time (syscalls and cap reserved, not built).
+- [ADR-024](docs/adr/024-syscall-abi-crate.md): the syscall ABI or its bindings.
+- [ADR-034](docs/adr/034-deferred-task-resource-reclamation.md): process exit and teardown, the reaper, the task-slot lifecycle; pairs with ADR-019.
 
 ## Roadmap
 
@@ -393,44 +331,24 @@ What's built, what's in progress, what's planned (including v1 ordering, phase m
 
 ## Where things live
 
-Reference that matters only inside one part of the tree is in `.claude/rules/`. Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file named below before working on the paths it lists. The `paths:` list at the top of each file is the list of record; the paths named here follow it. Each heading keeps the name the section had in this file, so older links and citations still resolve.
+Reference that matters only inside one part of the tree is in `.claude/rules/`. Claude Code loads each file there when a file matching its `paths:` list is read or edited. Other agents read the file named below before working on the paths it lists. The `paths:` list at the top of each file is the list of record; the paths named here follow it. "The kernel's `src/`" is the one at the repository root, not a crate's. A section name cited by an older comment ("CLAUDE.md § Timer / Preemptive Scheduling") is in the Holds column of the file that now has it.
+
+| File | Loads for | Holds |
+|---|---|---|
+| [kernel.md](.claude/rules/kernel.md) | the kernel's `src/`, the three kernel linker scripts | Convention 3, Convention 4's kernel pattern, Convention 8's templates, Multi-Platform Strategy and the portable-module list, directory layout, [Memory Layout](#memory-layout) |
+| [platform-gotchas.md](.claude/rules/platform-gotchas.md) | the kernel's `src/`, the device-driver crates, linker scripts, Limine configs, `manifest.toml`, the `Makefile` | Platform Gotchas: bootloader, firmware and real-hardware quirks; bare-metal USB images and the `fbcon-hold` stick |
+| [scheduling.md](.claude/rules/scheduling.md) | the scheduler, arch backends, interrupts, IPC, syscalls, policy, audit, `src/io/`, loader, memory, `src/microkernel/`, `src/lib.rs`, three other kernel files that block or wake | Timer / Preemptive Scheduling: the Blocking pattern, voluntary context switch, the reschedule kick, cross-CPU wake |
+| [syscalls.md](.claude/rules/syscalls.md) | `src/syscalls/`, `cambios-abi/`, `user/libsys/`, `user/libsys-rt/` | Syscall Numbers: where the canonical list is, and per-syscall behavior that does not read off it |
+| [x86_64.md](.claude/rules/x86_64.md) | `src/arch/x86_64/` | Convention 6, the GDT layout, SYSCALL/SYSRET register values, the kernel stack switch |
+| [userspace.md](.claude/rules/userspace.md) | `user/`, `manifest.toml`, `cambios-manifest/`, `cambios-blk-proto/`, the two kernel files that handle the block driver's endpoints | Service endpoints whose handling does not read off the `manifest.toml` header |
+| [gui.md](.claude/rules/gui.md) | the compositor, scanout, libgui, libgui-proto, hello-window, terminal-window, libinput-proto and virtio-input crates | graphics, GUI client library and input: protocol sources, the rules that bind changes there |
+| [tools.md](.claude/rules/tools.md) | `tools/sign-elf/`, `tools/build-manifest/`, `tools/gen-dev-piv-keys/`, `tools/format-volume/`, `.githooks/`, `user/key-store-service/`, `user/fde-mount/`, `user/libsys/src/vault.rs`, `manifest.toml` | hook mechanics (what they require of a commit: Commit Cadence), standalone and dev-PIV builds, ELF signing |
+| [sandbox.md](.claude/rules/sandbox.md) | `tools/sandbox/` | the `make sandbox-*` targets |
 
 ### Lock Ordering
 
-[.claude/rules/locks.md](.claude/rules/locks.md), for any file under the kernel's `src/` (the one at the repository root, not a crate's). The hierarchy, why a plain `Spinlock` holder is never descheduled, the boot context, and the lock domains outside the hierarchy.
-
-### Multi-Platform Strategy (x86_64, AArch64, RISC-V)
-
-[.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/` and the three kernel linker scripts. The same file holds Development Conventions 3 and 6, the detail of Convention 4, the portable-module list, the toolchain and linker-script pointers, Architecture (directory layout) and Memory Layout.
+[.claude/rules/locks.md](.claude/rules/locks.md), for the kernel's `src/`. The hierarchy, why a plain `Spinlock` holder is never descheduled, the boot context, and the lock domains outside the hierarchy.
 
 ### Memory Layout
 
-In [.claude/rules/kernel.md](.claude/rules/kernel.md), for any file under the kernel's `src/` and the three kernel linker scripts. Kernel heap, boot stack, the object-table region, per-process heaps, user code and stack addresses, and the direct-map bases.
-
-### Platform Gotchas
-
-[.claude/rules/platform-gotchas.md](.claude/rules/platform-gotchas.md), for the kernel's `src/`, the user-space device-driver crates, the linker scripts, the Limine configs, `manifest.toml` and the `Makefile`. Bootloader, firmware and real-hardware quirks that boot and hardware-path code must respect: manifest and init staging, direct-map gaps, x86_64 memory types, GICv3, per-CPU floating-point enable, stray interrupts, the USB controller hand-off.
-
-### Timer / Preemptive Scheduling
-
-[.claude/rules/scheduling.md](.claude/rules/scheduling.md), for the scheduler, the architecture backends, interrupts, IPC, syscalls, policy, audit, `src/io/`, the loader, memory, `src/microkernel/`, `src/lib.rs` and the three other kernel files that block or wake. It holds the Blocking pattern, voluntary context switch, the reschedule kick and cross-CPU wake.
-
-### Syscall Numbers
-
-[.claude/rules/syscalls.md](.claude/rules/syscalls.md), for `src/syscalls/`, `cambios-abi/`, `user/libsys/` and `user/libsys-rt/`. Where the canonical list is (the `SyscallNumber` enum in `cambios-abi`) and the per-syscall behavior that does not read off it: wire formats, gating capabilities, retired slots.
-
-### GDT Layout and SYSCALL/SYSRET
-
-[.claude/rules/x86_64.md](.claude/rules/x86_64.md), for `src/arch/x86_64/`. The seven GDT entries and their selectors, the STAR and SFMASK register values, and the kernel stack switch on syscall entry.
-
-### Service endpoints
-
-[.claude/rules/userspace.md](.claude/rules/userspace.md), for `user/`, `manifest.toml`, `cambios-manifest/`, `cambios-blk-proto/` and the two kernel files that handle the block driver's endpoints. The load-bearing endpoint numbers and how each is handled; the assignment of record is the header of `manifest.toml`.
-
-### Git hooks, host tools and signing
-
-[.claude/rules/tools.md](.claude/rules/tools.md), for the four host tools it describes (`tools/sign-elf/`, `tools/build-manifest/`, `tools/gen-dev-piv-keys/`, `tools/format-volume/`), `.githooks/`, `user/key-store-service/`, `user/fde-mount/`, `user/libsys/src/vault.rs` and `manifest.toml`. Standalone builds, dev-PIV builds, ELF signing and `tools/sign-elf/`. What the hooks require of a commit is in the [Quick Reference](#quick-reference), above `make install-hooks`.
-
-### Sandbox VM
-
-[.claude/rules/sandbox.md](.claude/rules/sandbox.md), for `tools/sandbox/`. The `make sandbox-*` targets: session up and down, the egress proxy, handing a task to the agent, and the golden image.
+In [.claude/rules/kernel.md](.claude/rules/kernel.md). Kernel heap, boot stack, the object-table region, per-process heaps, user code and stack addresses, and the direct-map bases.
