@@ -1398,20 +1398,24 @@ define ARCH_GATE_RULES
 check-$(1):
 	cargo build --target $$(TRIPLE_$(1)) --release
 check-clippy-$(1):
-	cargo clippy --target $$(TRIPLE_$(1)) --release --lib
+	cargo clippy --target $$(TRIPLE_$(1)) --release --lib --bins -- -D warnings
 endef
 $(foreach a,$(ARCHES),$(eval $(call ARCH_GATE_RULES,$(a))))
 
 check-x86: check-x86_64
 
 # ---------------------------------------------------------------------------
-# Tri-arch clippy gate — runs clippy on all three backends so the #![deny]
-# unsafe-discipline lints in src/lib.rs (multiple_unsafe_ops_per_block +
-# undocumented_unsafe_blocks, Dev Convention 1) are enforced on arch-specific
-# code too: x86_64 clippy alone never compiles the cfg-gated aarch64/riscv64
-# paths, so a per-op violation there would slip through. missing_safety_doc
-# (Cargo.toml [lints.clippy]) hard-fails here as well. CI runs this per-push;
-# a genuinely-irreducible unsafe block takes a local `#[allow(...)]` + rationale.
+# Tri-arch clippy gate — runs clippy on all three backends so the
+# unsafe-discipline denies in Cargo.toml [lints.clippy]
+# (multiple_unsafe_ops_per_block, undocumented_unsafe_blocks,
+# missing_safety_doc; Dev Convention 1) are enforced on arch-specific code
+# too: x86_64 clippy alone never compiles the cfg-gated aarch64/riscv64
+# paths, so a per-op violation there would slip through. It lints the kernel
+# binary as well as the library (`--bins`: src/microkernel/main.rs, the boot
+# path, went unlinted under `--lib` alone and held five multi-op unsafe
+# blocks no gate saw), and any warning fails it (`-D warnings`). CI runs
+# this per-push; a genuinely-irreducible unsafe block takes a local
+# `#[allow(...)]` + rationale.
 # ---------------------------------------------------------------------------
 check-clippy: $(addprefix check-clippy-,$(ARCHES))
 	@echo "=== clippy clean on all three architectures ==="

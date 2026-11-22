@@ -23,6 +23,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 # extends it to function signatures. The expected steady state is `deny`;
 # we run at `warn` only while a known-incomplete back-fill is in flight.
 missing_safety_doc = "deny"
+# Convention 1, per-op unsafe discipline: every `unsafe {}` holds at most
+# one unsafe op and carries its own `// SAFETY:`. Declared here rather than
+# as `#![deny]` in src/lib.rs so it binds every target of the package: the
+# kernel binary (src/microkernel/main.rs, the boot path) is its own crate
+# root, and a crate attribute in lib.rs never reached it. A genuinely
+# irreducible block takes a local `#[allow(...)]` with a written rationale.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 
 [package]
 name = "cambios"

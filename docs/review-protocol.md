@@ -8,12 +8,11 @@ Full protocol for verifying a code change before reporting it complete. [CLAUDE.
 # Unit tests (host)
 RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
 
-# Clippy lint pass (catches correctness + style issues beyond warnings)
-# Note: not yet -D warnings — 164 pre-existing style lints need a
-# dedicated cleanup pass first. Run without -D to check for NEW lints
-# introduced by the current change. Once the baseline is clean,
-# promote to -D warnings.
-cargo clippy --target x86_64-unknown-none 2>&1 | grep "^error\|^warning" | head -20
+# Clippy lint pass (catches correctness + style issues beyond warnings):
+# the library and the kernel binary, all three arches, -D warnings.
+# The baseline has been zero warnings since 2026-11-21, so any warning
+# is new and fails the gate.
+make check-clippy
 
 # Kernel build — x86_64 (debug + release)
 cargo build --target x86_64-unknown-none

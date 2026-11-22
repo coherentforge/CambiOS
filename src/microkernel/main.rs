@@ -484,51 +484,78 @@ unsafe extern "C" fn kmain() -> ! {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // AArch64: GIC + ARM Generic Timer
-        // SAFETY: Single-threaded boot, interrupts masked. GIC MMIO at QEMU virt addresses.
+        // AArch64: GIC + ARM Generic Timer. Single-threaded boot on the
+        // BSP: no AP has been started, and IRQs stay masked (DAIF.I)
+        // until `microkernel_loop` unmasks them. Each step below runs
+        // exactly once, in this order.
+
+        // Read the BSP's MPIDR_EL1 for hardware affinity identification
+        let bsp_mpidr: u64;
+        // SAFETY: MPIDR_EL1 is a read-only identification register,
+        // readable at EL1; the read touches no memory (nomem, nostack).
         unsafe {
-            // Read the BSP's MPIDR_EL1 for hardware affinity identification
-            let bsp_mpidr: u64;
             core::arch::asm!("mrs {}, mpidr_el1", out(reg) bsp_mpidr, options(nostack, nomem));
-            // Initialize per-CPU data (TPIDR_EL1) for BSP
-            cambios_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
-            // The boot CPU can name itself from here on: spinlocks start
-            // counting their holders (PREEMPT_DEPTH).
-            cambios_core::preempt_depth_go_live();
-            println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
-
-            // Enable FP/NEON for EL0 and EL1 on this CPU (CPACR_EL1.FPEN
-            // = 0b11). CPACR_EL1 is per-CPU: every AP does the same in
-            // `ap_entry`. Rust-compiled user code uses NEON in `memset`.
-            cambios_core::arch::aarch64::enable_fpsimd();
-
-            // Initialize GIC CPU interface (ICC system registers)
-            cambios_core::arch::aarch64::gic::init();
-            println!("  ✓ GIC CPU interface enabled");
-
-            // Initialize GIC Distributor (SPI routing, priorities)
-            // QEMU virt physical addresses, translated through HHDM
-            /// HARDWARE: ARM GICv3 Distributor base on QEMU `virt`.
-            /// Platform-fixed by QEMU's `virt` machine; real hardware
-            /// discovers this from the device tree or ACPI MADT.
-            const GICD_PHYS: u64 = 0x0800_0000;
-            /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`.
-            /// Platform-fixed by QEMU; see `GICD_PHYS` above.
-            const GICR_PHYS: u64 = 0x080A_0000;
-            let hhdm = cambios_core::hhdm_offset();
-            cambios_core::arch::aarch64::gic::init_distributor(GICD_PHYS + hhdm);
-            println!("  ✓ GIC Distributor initialized");
-
-            // Initialize GIC Redistributor for BSP (PPI 30 = timer)
-            cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, 0);
-            println!("  ✓ GIC Redistributor initialized (CPU 0)");
-
-            // Start ARM Generic Timer at 100 Hz
-            // ADR-021: typed BootError propagation.
-            cambios_core::arch::aarch64::timer::init(100)
-                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
-            println!("  ✓ ARM Generic Timer started (100 Hz)");
         }
+        // Initialize per-CPU data (TPIDR_EL1) for BSP
+        // SAFETY: `init_bsp` requires one call, on the BSP, during
+        // single-threaded boot. This is its only call site, and no AP
+        // runs before `start_application_processors`.
+        unsafe {
+            cambios_core::arch::aarch64::percpu::init_bsp(bsp_mpidr & 0xFF_FFFF);
+        }
+        // The boot CPU can name itself from here on: spinlocks start
+        // counting their holders (PREEMPT_DEPTH).
+        cambios_core::preempt_depth_go_live();
+        println!("  ✓ Per-CPU data initialized (BSP, MPIDR={:#x})", bsp_mpidr & 0xFF_FFFF);
+
+        // Enable FP/NEON for EL0 and EL1 on this CPU (CPACR_EL1.FPEN
+        // = 0b11). CPACR_EL1 is per-CPU: every AP does the same in
+        // `ap_entry`. Rust-compiled user code uses NEON in `memset`.
+        cambios_core::arch::aarch64::enable_fpsimd();
+
+        // Initialize GIC CPU interface (ICC system registers)
+        // SAFETY: `gic::init` requires one call per CPU during boot with
+        // interrupts masked: this is the BSP's call, and DAIF.I is set.
+        unsafe {
+            cambios_core::arch::aarch64::gic::init();
+        }
+        println!("  ✓ GIC CPU interface enabled");
+
+        // Initialize GIC Distributor (SPI routing, priorities)
+        // QEMU virt physical addresses, translated through HHDM
+        /// HARDWARE: ARM GICv3 Distributor base on QEMU `virt`.
+        /// Platform-fixed by QEMU's `virt` machine; real hardware
+        /// discovers this from the device tree or ACPI MADT.
+        const GICD_PHYS: u64 = 0x0800_0000;
+        /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`.
+        /// Platform-fixed by QEMU; see `GICD_PHYS` above.
+        const GICR_PHYS: u64 = 0x080A_0000;
+        let hhdm = cambios_core::hhdm_offset();
+        // SAFETY: `init_distributor` requires one call during
+        // single-threaded boot with the GICD region mapped. `kmain`'s
+        // early MMIO setup mapped all 16 pages from GICD_PHYS at
+        // HHDM + phys before this point; this is the only call site.
+        unsafe {
+            cambios_core::arch::aarch64::gic::init_distributor(GICD_PHYS + hhdm);
+        }
+        println!("  ✓ GIC Distributor initialized");
+
+        // Initialize GIC Redistributor for BSP (PPI 30 = timer)
+        // SAFETY: `init_redistributor` requires one call per CPU with
+        // that CPU's GICR frame mapped. CPU 0's frame is the first of the
+        // 128 pages from GICR_PHYS that `kmain`'s early MMIO setup mapped.
+        unsafe {
+            cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, 0);
+        }
+        println!("  ✓ GIC Redistributor initialized (CPU 0)");
+
+        // Start ARM Generic Timer at 100 Hz
+        // ADR-021: typed BootError propagation.
+        // SAFETY: `timer::init` requires boot with DAIF.I set and PPI 30
+        // enabled in the redistributor, which `init_redistributor` just did.
+        let timer = unsafe { cambios_core::arch::aarch64::timer::init(100) };
+        timer.unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
+        println!("  ✓ ARM Generic Timer started (100 Hz)");
         println!("✓ GIC + timer scheduling active\n");
 
         // PCIe ECAM bring-up + PCI bus scan.
@@ -761,7 +788,7 @@ unsafe extern "C" fn kmain_riscv64(hart_id: u64, dtb_phys: u64) -> ! {
     // Confirms the heap + allocator + paging are all wired correctly.
     {
         use alloc::boxed::Box;
-        let boxed: Box<u64> = Box::new(0xCA_B1_05_DEADBEEFu64);
+        let boxed: Box<u64> = Box::new(0x00CA_B105_DEAD_BEEF_u64);
         let ptr = &*boxed as *const u64 as u64;
         println!("✓ Box::new: value {:#x} at vaddr {:#x}", *boxed, ptr);
         // Drop at end of scope returns memory to the allocator.
@@ -1056,22 +1083,36 @@ fn scheduler_init_riscv64() {
 unsafe extern "C" fn kmain_riscv64_ap(cpu_index: u64, hart_id: u64) -> ! {
     let cpu_idx = cpu_index as usize;
 
-    // SAFETY: per-AP bring-up, all steps run exactly once per hart
-    // in the defined order below. BSP has already initialized shared
-    // hardware (PLIC, frame allocator, process table, heap); each
-    // unsafe call sets up only this hart's private state (tp,
-    // stvec, sie.STIE) or installs a per-hart scheduler instance.
+    // Per-AP bring-up: each step below runs exactly once per hart, in
+    // this order. The BSP has already initialized shared hardware (PLIC,
+    // frame allocator, process table, heap); each unsafe call sets up
+    // only this hart's private state (tp, stvec, sie.STIE). SBI HSM
+    // starts the hart in S-mode with sstatus.SIE = 0, so interrupts are
+    // masked throughout.
+
+    // Step 1: per-hart data (writes tp + clears sscratch).
+    // SAFETY: `init_ap` requires one call per AP, on that AP, with a
+    // unique `cpu_index` in 1..MAX_CPUS. `start_application_processors`
+    // hands each hart a distinct index counting up from 1 and stops
+    // below MAX_AP_BOOT_STACKS (8); this is the hart's entry point.
     unsafe {
-        // Step 1: per-hart data (writes tp + clears sscratch).
         cambios_core::arch::riscv64::percpu::init_ap(cpu_idx, hart_id);
-
-        // Step 2: trap vector (per-hart stvec).
-        cambios_core::arch::riscv64::trap::install();
-
-        // Step 3: SBI timer — reads BootInfo for timebase, enables
-        // sie.STIE, arms first tick.
-        let _reload = cambios_core::arch::riscv64::timer::init(100);
     }
+
+    // Step 2: trap vector (per-hart stvec).
+    // SAFETY: `trap::install` requires SIE = 0 and coherent per-hart
+    // state before interrupts are enabled: SIE is 0 (SBI HSM entry), tp
+    // was set by step 1, and sp is this hart's boot stack from `_ap_start`.
+    unsafe {
+        cambios_core::arch::riscv64::trap::install();
+    }
+
+    // Step 3: SBI timer — reads BootInfo for timebase, enables
+    // sie.STIE, arms first tick.
+    // SAFETY: `timer::init` requires `boot::install` to have run (the BSP
+    // ran it before starting any hart), SIE = 0, and one call per hart
+    // after its trap vector is installed (step 2).
+    let _reload = unsafe { cambios_core::arch::riscv64::timer::init(100) };
 
     // Step 4: per-hart scheduler + Timer. `local_scheduler()` /
     // `local_timer()` index PER_CPU_SCHEDULER / PER_CPU_TIMER by
@@ -2317,44 +2358,70 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     let cpu_index = cpu.extra.load(core::sync::atomic::Ordering::Acquire) as usize;
     let mpidr_aff = cpu.mpidr;
 
-    // SAFETY: All steps below are called exactly once per AP during the AP
-    // startup sequence. BSP has already initialized shared hardware (GIC
+    // Every step below runs exactly once per AP, on that AP, in this
+    // order. The BSP has already initialized shared hardware (GIC
     // distributor, timer frequency). Each unsafe call initialises per-CPU
-    // state (TPIDR_EL1, VBAR_EL1, GIC CPU interface, GICR, timer).
+    // state (TPIDR_EL1, VBAR_EL1, GIC CPU interface, GICR, timer). IRQs
+    // stay masked (DAIF.I) until step 9.
+
+    // Step 1: Per-CPU EL1 config (no-op on AArch64)
+    // SAFETY: `init_for_cpu` requires one call per AP during early init;
+    // this is the AP's entry point.
     unsafe {
-        // Step 1: Per-CPU EL1 config (no-op on AArch64)
         cambios_core::arch::gdt::init_for_cpu(cpu_index);
-
-        // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
-        cambios_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
-
-        // Step 2b: Enable FP/NEON for EL0 and EL1 on this CPU. CPACR_EL1
-        // is per-CPU; the BSP's setting does not reach the APs. Without
-        // it the first user task placed here that runs a NEON `memset`
-        // traps with EC=0x07 and is reaped — the policy service, homed on
-        // CPU 1 by spawn-time placement, from 2026-10-27 until 2026-11-04.
-        cambios_core::arch::aarch64::enable_fpsimd();
-
-        // Step 3: Install exception vector table (per-CPU VBAR_EL1)
-        cambios_core::arch::syscall::init();
-
-        // Step 4: Initialize GIC CPU interface for this AP
-        cambios_core::arch::aarch64::gic::init();
-
-        // Step 5: Initialize GIC Redistributor for this AP
-        /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`;
-        /// matches the BSP constant of the same name above. Every
-        /// AP walks its own redistributor at `base + cpu_index*stride`
-        /// inside `init_redistributor`.
-        const GICR_PHYS: u64 = 0x080A_0000;
-        let hhdm = cambios_core::hhdm_offset();
-        cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
-
-        // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
-        // ADR-021: AP discovers if BSP forgot to init the timer.
-        cambios_core::arch::aarch64::timer::init_ap()
-            .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
     }
+
+    // Step 2: Initialize per-CPU data (writes TPIDR_EL1)
+    // SAFETY: `init_ap` requires one call per AP, on that AP, with a
+    // unique `cpu_index` in 1..MAX_CPUS. `start_application_processors`
+    // stores a distinct index counting up from 1 in each `cpu.extra`.
+    unsafe {
+        cambios_core::arch::aarch64::percpu::init_ap(cpu_index, mpidr_aff);
+    }
+
+    // Step 2b: Enable FP/NEON for EL0 and EL1 on this CPU. CPACR_EL1
+    // is per-CPU; the BSP's setting does not reach the APs. Without
+    // it the first user task placed here that runs a NEON `memset`
+    // traps with EC=0x07 and is reaped — the policy service, homed on
+    // CPU 1 by spawn-time placement, from 2026-10-27 until 2026-11-04.
+    cambios_core::arch::aarch64::enable_fpsimd();
+
+    // Step 3: Install exception vector table (per-CPU VBAR_EL1)
+    // SAFETY: `syscall::init` requires DAIF.I set and an aligned, valid
+    // `exception_vector_table`; IRQs are masked until step 9, and the
+    // table is the same `global_asm!` symbol the BSP installed.
+    unsafe {
+        cambios_core::arch::syscall::init();
+    }
+
+    // Step 4: Initialize GIC CPU interface for this AP
+    // SAFETY: `gic::init` requires one call per CPU during boot with
+    // interrupts masked: this is this AP's call, and DAIF.I is set.
+    unsafe {
+        cambios_core::arch::aarch64::gic::init();
+    }
+
+    // Step 5: Initialize GIC Redistributor for this AP
+    /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`;
+    /// matches the BSP constant of the same name above. Every
+    /// AP walks its own redistributor at `base + cpu_index*stride`
+    /// inside `init_redistributor`.
+    const GICR_PHYS: u64 = 0x080A_0000;
+    let hhdm = cambios_core::hhdm_offset();
+    // SAFETY: `init_redistributor` requires one call per CPU with that
+    // CPU's GICR frame mapped. `kmain`'s early MMIO setup maps the frames
+    // of CPUs 0-3 (128 pages from GICR_PHYS), so this holds for
+    // `cpu_index` < 4; every QEMU target runs `-smp 2`.
+    unsafe {
+        cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
+    }
+
+    // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
+    // ADR-021: AP discovers if BSP forgot to init the timer.
+    // SAFETY: `timer::init_ap` requires one call per AP during startup
+    // with interrupts masked; DAIF.I is set until step 9.
+    let timer = unsafe { cambios_core::arch::aarch64::timer::init_ap() };
+    timer.unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
 
     // Step 7: Initialize per-CPU scheduler and timer
     {
@@ -2378,9 +2445,11 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     cambios_core::ONLINE_CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Step 9: Set SP_EL1 and enable IRQs
-    // SAFETY: All AP-local hardware is initialized.
+    // Set SP_EL1 = current AP stack for exception entry
+    // SAFETY: the SPSel toggle is valid at EL1, the current SP is this
+    // AP's Limine-provided stack (valid kernel memory), and IRQs are
+    // still masked, so no exception can enter on a half-set SP_EL1.
     unsafe {
-        // Set SP_EL1 = current AP stack for exception entry
         core::arch::asm!(
             "mov {tmp}, sp",
             "msr spsel, #1",
@@ -2389,7 +2458,12 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
             tmp = out(reg) _,
             options(nostack),
         );
-        // Unmask IRQ — timer was started by init_ap(), GIC is configured
+    }
+    // Unmask IRQ — timer was started by init_ap(), GIC is configured
+    // SAFETY: all AP-local interrupt state is initialized (VBAR_EL1 in
+    // step 3, GIC in steps 4-5, timer in step 6, SP_EL1 just above), so
+    // the first IRQ lands on a valid vector with a valid stack.
+    unsafe {
         core::arch::asm!("msr daifclr, #2", options(nostack, nomem));
     }
 
@@ -2574,7 +2648,6 @@ unsafe fn start_application_processors() {
             }
             println!("  ✓ {} AP(s) online (total harts: {})", dispatched, hart_count);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "riscv64"))]
@@ -2679,14 +2752,17 @@ fn microkernel_loop() -> ! {
     {
         // Drain any pending GIC interrupts from boot that were never acknowledged.
         // Without this, the GIC won't deliver new interrupts.
-        // SAFETY: GIC is initialized. acknowledge_irq/write_eoi are ICC sysreg
-        // operations valid at EL1. Loop terminates when INTID >= 1020 (spurious).
-        unsafe {
-            loop {
-                let intid = cambios_core::arch::aarch64::gic::acknowledge_irq();
-                if intid >= 1020 { break; }
-                cambios_core::arch::aarch64::gic::write_eoi();
-            }
+        // Loop terminates when INTID >= 1020 (spurious).
+        loop {
+            // SAFETY: the GIC CPU interface is initialized and IRQs are
+            // still masked (unmasked below), so no handler runs on this
+            // CPU and this ack/EOI pair is the only one in flight; ICC
+            // sysreg access is valid at EL1 outside a handler too.
+            let intid = unsafe { cambios_core::arch::aarch64::gic::acknowledge_irq() };
+            if intid >= 1020 { break; }
+            // SAFETY: follows the `acknowledge_irq` above that returned a
+            // real INTID, which is the pairing `write_eoi` requires.
+            unsafe { cambios_core::arch::aarch64::gic::write_eoi(); }
         }
         // Rearm the timer so the first tick fires cleanly.
         // SAFETY: Timer is initialized; writing CNTP_TVAL_EL0 is valid at EL1.
@@ -2745,10 +2821,15 @@ fn microkernel_loop() -> ! {
             smp_diag_printed = true;
             let online = cambios_core::online_cpu_count();
             let mut buf_tail: [u64; 8] = [0; 8];
-            let report_n = core::cmp::min(online, 8);
-            for i in 0..report_n {
-                buf_tail[i] = cambios_core::PER_CPU_TIMER_TICKS[i]
-                    .load(core::sync::atomic::Ordering::Relaxed);
+            let report_n = core::cmp::min(online, buf_tail.len());
+            // Zip bounds the loop by the shorter array; no index, no
+            // out-of-bounds panic edge.
+            for (slot, ticks) in buf_tail
+                .iter_mut()
+                .zip(cambios_core::PER_CPU_TIMER_TICKS.iter())
+                .take(report_n)
+            {
+                *slot = ticks.load(core::sync::atomic::Ordering::Relaxed);
             }
             println!(
                 "[SMP] per-CPU timer ticks after ~1s ({} online): {:?}",

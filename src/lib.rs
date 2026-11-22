@@ -5,12 +5,8 @@
 #![cfg_attr(not(test), no_main)]
 #![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
-// Per-op unsafe discipline (Dev Convention 1): every `unsafe {}` holds at most
-// one unsafe op and carries its own `// SAFETY:`. Hard-denied now that all three
-// arch backends are clean; a genuinely-irreducible block takes a local
-// `#[allow(clippy::multiple_unsafe_ops_per_block)]` with a written rationale.
-#![deny(clippy::undocumented_unsafe_blocks)]
-#![deny(clippy::multiple_unsafe_ops_per_block)]
+// Per-op unsafe discipline (Dev Convention 1) is denied in Cargo.toml
+// `[lints.clippy]`, which binds this library and the kernel binary alike.
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 //! CambiOS Microkernel - Verification-Ready Core
 //!
@@ -724,9 +720,12 @@ pub fn try_wake_policy_waiter(
 #[cfg(not(test))]
 pub fn wake_message_waiters_all_cpus(endpoint: u32) -> usize {
     let mut woken = 0;
-    for cpu in 0..online_cpu_count().min(MAX_CPUS) {
+    // Iterating the array bounds the loop by its length (MAX_CPUS), so
+    // there is no index to check and no out-of-bounds panic edge;
+    // `take` stops at the CPUs that are online.
+    for (cpu, sched_lock) in PER_CPU_SCHEDULER.iter().enumerate().take(online_cpu_count()) {
         let woken_here = {
-            let mut guard = PER_CPU_SCHEDULER[cpu].lock();
+            let mut guard = sched_lock.lock();
             if let Some(sched) = guard.as_mut() {
                 sched.wake_message_waiters(endpoint)
             } else {

@@ -111,7 +111,7 @@ Open mechanism decisions awaiting Revisit-when triggers — see [docs/dev-notes/
 
 ## Development Conventions
 
-1. **Every `unsafe` block MUST have a `// SAFETY:` comment, and every `pub unsafe fn` MUST have a `# Safety` rustdoc section** explaining why the operation is safe / what contract the caller must uphold. Citing alignment, bounds, aliasing, or lifetime invariants is the point — "trust me" is not a SAFETY comment. The `unsafe { ... }` rule is enforced by `make check-unsafe-coverage`; the `pub unsafe fn` rule is enforced by `clippy::missing_safety_doc = "deny"` in `[lints.clippy]`. One unsafe op per block, each with its own `// SAFETY:`, is hard-enforced by `#![deny(clippy::multiple_unsafe_ops_per_block)]` + `#![deny(clippy::undocumented_unsafe_blocks)]` in `src/lib.rs`, gated tri-arch by `make check-clippy` (a genuinely-irreducible block takes a local `#[allow(...)]` with rationale).
+1. **Every `unsafe` block MUST have a `// SAFETY:` comment, and every `pub unsafe fn` MUST have a `# Safety` rustdoc section** explaining why the operation is safe / what contract the caller must uphold. Citing alignment, bounds, aliasing, or lifetime invariants is the point — "trust me" is not a SAFETY comment. The `unsafe { ... }` rule is enforced by `make check-unsafe-coverage`; the `pub unsafe fn` rule is enforced by `clippy::missing_safety_doc = "deny"` in `[lints.clippy]`. One unsafe op per block, each with its own `// SAFETY:`, is hard-enforced by `multiple_unsafe_ops_per_block = "deny"` + `undocumented_unsafe_blocks = "deny"` in the same `[lints.clippy]` table (Cargo.toml, so they bind the library and the kernel binary alike), gated tri-arch by `make check-clippy` (a genuinely-irreducible block takes a local `#[allow(...)]` with rationale).
 
 2. **Lock ordering** (see [.claude/rules/locks.md](.claude/rules/locks.md)) must always be followed. Never acquire a lower-numbered lock while holding a higher-numbered one.
 
@@ -250,7 +250,7 @@ make check-index-isolation   # no STATUS.md diff >20 lines with .rs staged (hook
 make check-lockfile          # lists Cargo.lock crate changes (hook, advisory)
 make check-unsafe-coverage   # Convention 1: every unsafe block has SAFETY (CI, hook)
 make check-status-freshness  # STATUS.md sync date within 7 days (hook, advisory); CI runs --strict for Kani-total drift
-make check-clippy            # Convention 1 clippy denies, all three arches (CI)
+make check-clippy            # Convention 1 clippy denies and -D warnings, library + kernel binary, all three arches (CI)
 # check-doc-refs is line-keyed: any edit that moves a const in a cited file trips it. Run it with the other
 # line-keyed gates after the last edit; `python3 tools/check-doc-refs.py --fix` re-anchors drifted refs.
 

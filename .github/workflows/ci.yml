@@ -8,7 +8,7 @@
 #
 #   * tri-arch release build        — `make check-all` (x86_64 + aarch64 + riscv64)
 #   * host unit tests               — `make test`
-#   * missing_safety_doc = "deny"   — `cargo clippy --lib` (Dev Convention 1)
+#   * unsafe discipline + warnings  — `make check-clippy`, library + kernel binary (Dev Convention 1)
 #   * don't-grow-the-baseline lints — the pure-Python check-* gates
 #   * user crates                   — `make check-user` + `make test-user`
 #   * fuzz targets                  — `make fuzz-build` (they build; runs are manual)
@@ -99,12 +99,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # clippy — enforces the unsafe-discipline deny lints on ALL THREE backends
-  # (`make check-clippy`): missing_safety_doc (Cargo.toml [lints.clippy]) +
-  # multiple_unsafe_ops_per_block + undocumented_unsafe_blocks (src/lib.rs
-  # #![deny], Dev Convention 1). Tri-arch because x86_64 clippy never compiles
-  # the cfg-gated aarch64/riscv64 paths, so a per-op violation in an arch
-  # backend only surfaces when clippy runs on that target. No `-D warnings`, so
-  # the gate is exactly the deny lints, not a flood of unrelated style lints.
+  # (`make check-clippy`): missing_safety_doc + multiple_unsafe_ops_per_block +
+  # undocumented_unsafe_blocks (all three in Cargo.toml [lints.clippy], Dev
+  # Convention 1), on the library and the kernel binary. Tri-arch because
+  # x86_64 clippy never compiles the cfg-gated aarch64/riscv64 paths, so a
+  # per-op violation in an arch backend only surfaces when clippy runs on that
+  # target. `-D warnings` since 2026-11-21: the backlog of ~125 style lints
+  # that kept it off is gone, so any warning is new and fails here.
   # ---------------------------------------------------------------------------
   clippy:
     name: clippy (unsafe discipline, tri-arch)
