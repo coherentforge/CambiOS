@@ -125,8 +125,15 @@ pub fn map_page(
     // the contract at the API boundary in debug builds.
     debug_assert_eq!(virt_addr & 0xFFF, 0, "map_page virt_addr not page-aligned");
     debug_assert_eq!(phys_addr & 0xFFF, 0, "map_page phys_addr not page-aligned");
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_addr));
-    let frame = X86PhysFrame::containing_address(PhysAddr::new(phys_addr));
+    // `try_new`, not `new`: `VirtAddr::new` panics on a non-canonical
+    // address and `PhysAddr::new` on any of bits 52-63 set. Some callers
+    // pass user-supplied addresses (SYS_MAP_MMIO took `1 << 52` straight
+    // to a kernel panic, sandbox review 2026-11-21, R1); the kernel answers
+    // a typed error instead.
+    let virt = VirtAddr::try_new(virt_addr).map_err(|_| PagingError::InvalidAddress)?;
+    let phys = PhysAddr::try_new(phys_addr).map_err(|_| PagingError::InvalidAddress)?;
+    let page = Page::<Size4KiB>::containing_address(virt);
+    let frame = X86PhysFrame::containing_address(phys);
 
     let mut adapter = FrameAllocatorAdapter::new(frame_alloc);
 

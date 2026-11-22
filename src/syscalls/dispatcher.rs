@@ -1748,18 +1748,35 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Security: reject mapping RAM regions as MMIO. The check
-        // walks the recorded USABLE extents (populated from the Limine
-        // memmap by add_region) and rejects any overlap. This permits
-        // MMIO BARs that land *inside* the RAM address range — a real
-        // shape on QEMU x86_64 with -m 4G, where the 32-bit PCI MMIO
-        // hole at 0xFE000000-0xFEC00000 sits below the high RAM extent
-        // starting at 0x100000000. The previous linear-ceiling check
-        // (`phys_addr < total_count*4096`) rejected those legitimate
-        // MMIO ranges.
+        // Security: an allow-list. The range must lie wholly inside a
+        // memory BAR of a discovered device (riscv64: a DTB virtio-mmio
+        // region, recorded as BAR 0). Device registers are the only
+        // physical memory a driver may map. The previous check refused
+        // only USABLE RAM, a deny-list of one memory-map kind, so the
+        // kernel image, boot modules, ACPI tables and firmware ranges
+        // were "not RAM" and mapped user-writable (sandbox review
+        // 2026-11-21, R1: a ring 3 probe rewrote kernel rodata). No lock:
+        // the device table is written once at boot and read-only after.
+        //
+        // Deferred: any map-mmio row may map any device's BAR, not only its own.
+        // Why: no device-to-row assignment yet; without an IOMMU, DMA reaches all memory anyway.
+        // Revisit when: the manifest gains device assignment, or IOMMU support (VT-d / SMMU) lands.
+        let map_len = (num_pages as u64).saturating_mul(4096);
+        if !crate::pci::is_range_in_pci_mem_bar(phys_addr, map_len) {
+            crate::audit::emit(crate::audit::RawAuditEvent::syscall_denied(
+                ctx.process_id,
+                SyscallNumber::MapMmio as u64,
+                crate::audit::now(),
+                0,
+            ));
+            return Err(SyscallError::PermissionDenied);
+        }
+        // Second layer: a BAR address is whatever the device's config
+        // space reports, so also refuse any overlap with USABLE RAM (the
+        // extents `add_region` recorded from the memory map). A BAR inside
+        // RAM is a broken or hostile device, not a mapping to grant.
         {
             let fa_guard = crate::FRAME_ALLOCATOR.lock();
-            let map_len = (num_pages as u64).saturating_mul(4096);
             if fa_guard.is_ram_overlap(phys_addr, map_len) {
                 return Err(SyscallError::PermissionDenied);
             }

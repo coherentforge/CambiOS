@@ -1127,6 +1127,56 @@ pub fn is_port_in_pci_bar(port: u16) -> bool {
     false
 }
 
+/// Whether the physical range `[phys, phys + len)` lies wholly inside the
+/// memory BAR `[bar_base, bar_base + bar_size)`, with the BAR rounded out to
+/// 4 KiB page boundaries (a mapping is whole pages, so a BAR smaller than a
+/// page, or one ending mid-page, is mappable by the page that holds it).
+///
+/// Pure and overflow-safe: any wrapping sum, an empty range, or an unused
+/// BAR (base or size 0) answers `false`. This is the allow-list behind
+/// `SYS_MAP_MMIO`.
+pub fn range_within_bar(phys: u64, len: u64, bar_base: u64, bar_size: u64) -> bool {
+    if len == 0 || bar_base == 0 || bar_size == 0 {
+        return false;
+    }
+    let Some(end) = phys.checked_add(len) else {
+        return false;
+    };
+    let Some(bar_end) = bar_base.checked_add(bar_size) else {
+        return false;
+    };
+    let Some(bar_end_page) = bar_end.checked_add(0xFFF).map(|e| e & !0xFFF) else {
+        return false;
+    };
+    let bar_start_page = bar_base & !0xFFF;
+    phys >= bar_start_page && end <= bar_end_page
+}
+
+/// Whether `[phys, phys + len)` lies wholly inside one memory BAR of a
+/// discovered device. On riscv64 the table also holds the DTB's virtio-mmio
+/// regions, recorded as BAR 0 (`register_virtio_mmio`), so the same check
+/// covers all three architectures.
+///
+/// Used by `SYS_MAP_MMIO` as its allow-list: device registers are the only
+/// physical memory a driver may map. Kernel image, boot modules, ACPI
+/// tables, firmware-reserved ranges and RAM are in no BAR, so they are
+/// refused without being named.
+pub fn is_range_in_pci_mem_bar(phys: u64, len: u64) -> bool {
+    let count = device_count();
+    // SAFETY: count <= MAX_PCI_DEVICES, elements 0..count are initialized
+    // by scan_bus. Shared reference only — no mutation.
+    let devices = unsafe { &DEVICES[..count] };
+    devices.iter().any(|dev| {
+        dev.bars
+            .iter()
+            .zip(dev.bar_sizes.iter())
+            .zip(dev.bar_is_io.iter())
+            .any(|((&base, &size), &is_io)| {
+                !is_io && range_within_bar(phys, len, base, size as u64)
+            })
+    })
+}
+
 /// Find a device by vendor and device ID.
 ///
 /// Returns the first match, or `None` if no matching device was found.
@@ -1555,5 +1605,48 @@ mod tests {
         assert_eq!(caps.present, 1);
         assert_eq!(caps.common_cfg.bar, 3);
         assert_eq!(caps.isr_cfg.bar, 3);
+    }
+
+    // ---- range_within_bar (SYS_MAP_MMIO allow-list) ----------------------
+
+    const BAR: u64 = 0xFE00_0000;
+
+    #[test]
+    fn range_inside_bar_is_allowed() {
+        assert!(range_within_bar(BAR, 0x4000, BAR, 0x4000));
+        assert!(range_within_bar(BAR + 0x1000, 0x1000, BAR, 0x4000));
+    }
+
+    #[test]
+    fn range_past_bar_end_is_refused() {
+        assert!(!range_within_bar(BAR, 0x5000, BAR, 0x4000));
+        assert!(!range_within_bar(BAR + 0x4000, 0x1000, BAR, 0x4000));
+    }
+
+    #[test]
+    fn range_before_bar_is_refused() {
+        assert!(!range_within_bar(BAR - 0x1000, 0x2000, BAR, 0x4000));
+    }
+
+    #[test]
+    fn sub_page_bar_admits_its_one_page() {
+        // A 256-byte BAR at a page offset is mappable by its page only.
+        assert!(range_within_bar(BAR, 0x1000, BAR + 0x100, 0x100));
+        assert!(!range_within_bar(BAR, 0x2000, BAR + 0x100, 0x100));
+    }
+
+    #[test]
+    fn unused_bar_or_empty_range_is_refused() {
+        assert!(!range_within_bar(0, 0x1000, 0, 0x1000));
+        assert!(!range_within_bar(BAR, 0x1000, BAR, 0));
+        assert!(!range_within_bar(BAR, 0, BAR, 0x4000));
+    }
+
+    #[test]
+    fn wrapping_sums_are_refused() {
+        // The R1 panic address (bit 52) and a range that wraps u64.
+        assert!(!range_within_bar(1 << 52, 0x1000, BAR, 0x4000));
+        assert!(!range_within_bar(u64::MAX & !0xFFF, 0x2000, BAR, 0x4000));
+        assert!(!range_within_bar(BAR, 0x1000, u64::MAX & !0xFFF, 0x2000));
     }
 }

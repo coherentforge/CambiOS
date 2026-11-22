@@ -148,7 +148,9 @@ pub enum SyscallNumber {
     /// map_mmio(phys_addr: u64, num_pages: u32) -> u64
     /// Map device MMIO into the calling process's address space with uncacheable
     /// attributes. Returns user-space virtual address, or negative error.
-    /// Kernel validates the physical address is not in RAM regions.
+    /// The kernel accepts the range only if it lies wholly inside a memory
+    /// BAR of a discovered device (riscv64: a DTB virtio-mmio region) and
+    /// overlaps no usable RAM; anything else is `PermissionDenied`.
     MapMmio = 20,
 
     /// alloc_dma(num_pages: u32, flags: u32) -> (vaddr: u64, paddr: u64)
