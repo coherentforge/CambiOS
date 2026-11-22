@@ -410,6 +410,28 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
+        // Kernel-origin endpoints accept no user send. The kernel is the
+        // only legitimate sender on the policy-query endpoint (22) and the
+        // block driver's command endpoint (26); its sends go straight to
+        // `SHARDED_IPC`, never through here. Their receivers act on what
+        // arrives as kernel instructions (the block driver writes the
+        // shared page to the LBA a command names), and the receive paths
+        // serve the `IPC_MANAGER` queue ahead of the kernel's shard, so a
+        // user message here would be taken for the kernel's. The ordinary
+        // capability check cannot stop it: every process holds
+        // `AllEndpoints { send }` (cambios-manifest, replies go to
+        // client-chosen endpoints). Refused before the user buffer is read
+        // or any lock taken. ADR-002 Layer 2 (authority), ADR-005 § 1.
+        if kernel_origin_endpoint(endpoint_id) {
+            crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+                ctx.process_id,
+                crate::ipc::EndpointId(endpoint_id),
+                crate::audit::now(),
+                0,
+            ));
+            return Err(SyscallError::PermissionDenied);
+        }
+
         // Read user buffer into kernel. ADR-020 Phase B: typed
         // UserReadSlice replaces the raw (addr, len) pair.
         let slice = UserReadSlice::validate(ctx, user_buf, len)?;
@@ -4713,6 +4735,23 @@ mod tests {
             SyscallDispatcher::handle_write(args(16, 0x1000, 257), &ctx),
             Err(SyscallError::InvalidArg),
         );
+    }
+
+    #[test]
+    fn handle_write_to_kernel_origin_endpoint_is_denied() {
+        // The refusal comes before the user buffer is read, so an
+        // unmapped buffer address still yields PermissionDenied.
+        let ctx = fake_ctx();
+        for ep in [
+            cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT,
+            crate::policy::POLICY_QUERY_ENDPOINT,
+        ] {
+            assert_eq!(
+                SyscallDispatcher::handle_write(args(ep as u64, 0x1000, 16), &ctx),
+                Err(SyscallError::PermissionDenied),
+                "user send to kernel-origin endpoint {ep} must be refused",
+            );
+        }
     }
 
     // ---- handle_print validation -------------------------------------------
