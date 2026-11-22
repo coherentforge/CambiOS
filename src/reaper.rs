@@ -137,6 +137,106 @@ impl Default for ReclaimQueue {
     }
 }
 
+/// Per-CPU reaper instrumentation: how often this CPU's idle-loop reaper
+/// runs, and how many reclaim items it has taken in and freed.
+///
+/// The reaper runs only when its CPU runs the idle task (ADR-034 §
+/// Divergence: the vehicle is the idle loop). A CPU that always has a Ready
+/// task (a yield-spinning poller is enough) never idles, so its reaper
+/// never runs and every exit on it holds a page-table root, a kernel stack
+/// and a global task slot until it does. ADR-034 § Open Problems names the
+/// measurement that decides whether that bound matters: the per-CPU queue
+/// high-watermark. The BSP's one-shot `[sched]` diagnostic reports it.
+///
+/// Lock-free and outside the lock hierarchy: each CPU writes only its own
+/// entry (the pusher is a task on that CPU, the drainer is that CPU's idle
+/// loop), any CPU may read. Counters are `u64` so no realistic uptime
+/// wraps them.
+pub struct ReaperStats {
+    passes: core::sync::atomic::AtomicU64,
+    pushed: core::sync::atomic::AtomicU64,
+    drained: core::sync::atomic::AtomicU64,
+    high_water: core::sync::atomic::AtomicU64,
+    last_pass_tick: core::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of one CPU's [`ReaperStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReaperSnapshot {
+    /// `drain_local` calls: one per idle-loop iteration on this CPU.
+    pub passes: u64,
+    /// Items the death path pushed onto this CPU's queue.
+    pub pushed: u64,
+    /// Items this CPU's reaper popped and freed.
+    pub drained: u64,
+    /// Pushed but not yet drained (saturating: the two counters are read
+    /// one after the other, not atomically together).
+    pub pending: u64,
+    /// The deepest the queue has been, measured right after a push.
+    pub high_water: u64,
+    /// `Timer::get_ticks()` at the most recent pass (0 = never ran). Read
+    /// against the current tick, it says how long the reaper has been
+    /// starved: a CPU that never idles stops advancing it.
+    pub last_pass_tick: u64,
+}
+
+impl ReaperStats {
+    /// All counters zero. `const` for the per-CPU static array.
+    pub const fn new() -> Self {
+        use core::sync::atomic::AtomicU64;
+        Self {
+            passes: AtomicU64::new(0),
+            pushed: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
+            high_water: AtomicU64::new(0),
+            last_pass_tick: AtomicU64::new(0),
+        }
+    }
+
+    /// One reaper pass (a `drain_local` call), whether or not it found
+    /// work; `now_tick` is `Timer::get_ticks()` at the pass.
+    pub fn note_pass(&self, now_tick: u64) {
+        use core::sync::atomic::Ordering;
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        self.last_pass_tick.store(now_tick, Ordering::Relaxed);
+    }
+
+    /// One item pushed; `queue_len` is the queue's length right after the push.
+    pub fn note_push(&self, queue_len: usize) {
+        use core::sync::atomic::Ordering;
+        self.pushed.fetch_add(1, Ordering::Relaxed);
+        self.high_water.fetch_max(queue_len as u64, Ordering::Relaxed);
+    }
+
+    /// One item popped and freed by the reaper.
+    pub fn note_drained(&self) {
+        self.drained.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read every counter. Relaxed loads: this is a diagnostic, and
+    /// `pending` saturates rather than underflowing if a drain lands
+    /// between the two reads.
+    pub fn snapshot(&self) -> ReaperSnapshot {
+        use core::sync::atomic::Ordering;
+        let pushed = self.pushed.load(Ordering::Relaxed);
+        let drained = self.drained.load(Ordering::Relaxed);
+        ReaperSnapshot {
+            passes: self.passes.load(Ordering::Relaxed),
+            pushed,
+            drained,
+            pending: pushed.saturating_sub(drained),
+            high_water: self.high_water.load(Ordering::Relaxed),
+            last_pass_tick: self.last_pass_tick.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for ReaperStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Drain this CPU's reclaim queue, freeing each item's page-table root +
 /// intermediates and kernel stack. Called from the per-CPU idle loop
 /// (`microkernel_loop` and the AP idle loops) in normal context — interrupts
@@ -158,6 +258,8 @@ impl Default for ReclaimQueue {
 /// idle loop).
 #[cfg(not(test))]
 pub fn drain_local() {
+    let stats = crate::local_reaper_stats();
+    stats.note_pass(crate::scheduler::Timer::get_ticks());
     loop {
         // Pop under the queue lock alone; the guard is dropped at the end of
         // this block, before FRAME_ALLOCATOR is acquired below.
@@ -168,6 +270,7 @@ pub fn drain_local() {
                 None => break,
             }
         };
+        stats.note_drained();
 
         // Free the page-table root + intermediate frames. The owning task has
         // yielded off this root (it is no CPU's active CR3/satp/TTBR0), so the
@@ -239,5 +342,56 @@ fn free_kernel_stack(kstack_top: u64) {
         // remains. Freed exactly once: the item is enqueued only by the winner
         // of the `Running -> Terminated` transition (ADR-034 §3 enqueue-once).
         unsafe { alloc::alloc::dealloc(base, layout) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reaper_stats_start_at_zero() {
+        assert_eq!(ReaperStats::new().snapshot(), ReaperSnapshot::default());
+    }
+
+    #[test]
+    fn reaper_stats_pending_is_pushed_minus_drained() {
+        let s = ReaperStats::new();
+        s.note_push(1);
+        s.note_push(2);
+        s.note_push(3);
+        s.note_drained();
+        let snap = s.snapshot();
+        assert_eq!((snap.pushed, snap.drained, snap.pending), (3, 1, 2));
+    }
+
+    #[test]
+    fn reaper_stats_high_water_keeps_the_maximum() {
+        let s = ReaperStats::new();
+        s.note_push(1);
+        s.note_push(4);
+        s.note_drained();
+        s.note_drained();
+        s.note_push(3);
+        assert_eq!(s.snapshot().high_water, 4);
+    }
+
+    #[test]
+    fn reaper_stats_pending_saturates_instead_of_underflowing() {
+        // A drain counted before its push is read (the two loads are not
+        // one atomic read) must not wrap to u64::MAX.
+        let s = ReaperStats::new();
+        s.note_drained();
+        assert_eq!(s.snapshot().pending, 0);
+    }
+
+    #[test]
+    fn reaper_stats_passes_count_every_call_and_keep_the_last_tick() {
+        let s = ReaperStats::new();
+        for tick in [10, 20, 30, 40, 50] {
+            s.note_pass(tick);
+        }
+        let snap = s.snapshot();
+        assert_eq!((snap.passes, snap.last_pass_tick), (5, 50));
     }
 }

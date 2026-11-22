@@ -110,14 +110,31 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
                         }
                     }
                 }
+                // ADR-034 reaper health per CPU: (idle-loop reaper passes,
+                // tick of the last pass, reclaim items pending, queue
+                // high-water). The reaper runs only when its CPU idles, so
+                // a last-pass tick far behind the current one means exits
+                // on that CPU since then have not been reclaimed. Lock-free
+                // reads.
+                let mut reaper = [(0u64, 0u64, 0u64, 0u64); 16];
+                for (slot, stats) in reaper
+                    .iter_mut()
+                    .zip(crate::PER_CPU_REAPER_STATS.iter())
+                    .take(online)
+                {
+                    let s = stats.snapshot();
+                    *slot = (s.passes, s.last_pass_tick, s.pending, s.high_water);
+                }
                 let accepted = crate::io::try_print(format_args!(
-                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; current {:?}; runnable {:?}; policy queries submitted {} answered {} expired {} retried {}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
+                    "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; current {:?}; runnable {:?}; tick {}; reaper (passes, last pass tick, pending, high-water)/cpu {:?}; policy queries submitted {} answered {} expired {} retried {}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
                     crate::RESCHED_KICKS_SENT.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_HANDLED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_SWITCHED.load(core::sync::atomic::Ordering::Relaxed),
                     &per_cpu[..online],
                     &current[..online],
                     &ready[..online],
+                    Timer::get_ticks(),
+                    &reaper[..online],
                     crate::policy::POLICY_QUERIES_SUBMITTED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::policy::POLICY_QUERIES_ANSWERED.load(core::sync::atomic::Ordering::Relaxed),
                     crate::policy::POLICY_QUERIES_EXPIRED.load(core::sync::atomic::Ordering::Relaxed),

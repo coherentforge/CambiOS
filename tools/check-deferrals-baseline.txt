@@ -106,8 +106,8 @@ src/reaper.rs:4:deferred
 src/reaper.rs:9:deferred
 src/reaper.rs:43:deferred
 src/reaper.rs:65:deferred
-src/scheduler/mod.rs:395:placeholder
-src/scheduler/mod.rs:396:placeholder
+src/scheduler/mod.rs:412:placeholder
+src/scheduler/mod.rs:413:placeholder
 src/syscalls/dispatcher.rs:4421:for-now
 src/syscalls/userspace.rs:31:for-now
 src/syscalls/userspace.rs:53:TODO

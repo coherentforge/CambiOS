@@ -453,16 +453,26 @@ pub fn reap_process(
             kstack_top: kstack_to_reclaim,
             task_id,
         };
-        if crate::local_reclaim_queue().lock().push(item).is_err() {
-            // Structurally impossible (queue sized to MAX_TASKS, ADR-034
-            // §5). If it ever happens, degrade to a bounded leak — the
-            // resources stay allocated (as before ADR-034) but the kernel
-            // stays live. Never panic or block in the death path.
-            crate::println!(
-                "  [Exit] WARN: reclaim queue full; leaking root={:#x} kstack={:#x}",
-                item.root_phys,
-                item.kstack_top
-            );
+        // The queue's length right after the push feeds the high-watermark
+        // ADR-034 § Open Problems asks for; recorded after the queue lock
+        // is released (the stats are lock-free).
+        let pushed_len = {
+            let mut queue = crate::local_reclaim_queue().lock();
+            queue.push(item).map(|()| queue.len())
+        };
+        match pushed_len {
+            Ok(len) => crate::local_reaper_stats().note_push(len),
+            Err(_) => {
+                // Structurally impossible (queue sized to MAX_TASKS, ADR-034
+                // §5). If it ever happens, degrade to a bounded leak — the
+                // resources stay allocated (as before ADR-034) but the kernel
+                // stays live. Never panic or block in the death path.
+                crate::println!(
+                    "  [Exit] WARN: reclaim queue full; leaking root={:#x} kstack={:#x}",
+                    item.root_phys,
+                    item.kstack_top
+                );
+            }
         }
     }
 }

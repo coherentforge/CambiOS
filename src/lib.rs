@@ -1341,6 +1341,37 @@ pub fn local_reclaim_queue() -> &'static IrqSpinlock<reaper::ReclaimQueue> {
     &PER_CPU_RECLAIM_QUEUE[cpu_id]
 }
 
+/// Per-CPU reaper instrumentation (ADR-034 § Open Problems, the
+/// high-watermark trigger): passes, pushes, drains and queue high-water for
+/// each CPU's idle-loop reaper. Lock-free atomics, no lock domain: each CPU
+/// writes its own entry, the BSP's `[sched]` diagnostic reads them all.
+pub static PER_CPU_REAPER_STATS: [reaper::ReaperStats; MAX_CPUS] =
+    [const { reaper::ReaperStats::new() }; MAX_CPUS];
+
+/// Get the current CPU's reaper statistics.
+#[cfg(target_arch = "x86_64")]
+pub fn local_reaper_stats() -> &'static reaper::ReaperStats {
+    // SAFETY: GS base initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::x86_64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_REAPER_STATS[cpu_id]
+}
+
+/// Get the current CPU's reaper statistics (AArch64).
+#[cfg(target_arch = "aarch64")]
+pub fn local_reaper_stats() -> &'static reaper::ReaperStats {
+    // SAFETY: TPIDR_EL1 initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::aarch64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_REAPER_STATS[cpu_id]
+}
+
+/// Get the current hart's reaper statistics (RISC-V).
+#[cfg(target_arch = "riscv64")]
+pub fn local_reaper_stats() -> &'static reaper::ReaperStats {
+    // SAFETY: `tp` initialized at boot; cpu_id is a pure read.
+    let cpu_id = unsafe { arch::riscv64::percpu::current_percpu().cpu_id() } as usize;
+    &PER_CPU_REAPER_STATS[cpu_id]
+}
+
 /// Allocate a physical frame, preferring the local CPU's cache.
 ///
 /// Fast path (no global lock): pop from per-CPU cache.
