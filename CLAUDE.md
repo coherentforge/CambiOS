@@ -1,5 +1,9 @@
 # CambiOS Microkernel — Claude Code Context
 
+## Scope
+
+CambiOS is Jason Ricca's own kernel, licensed AGPL-3.0-or-later (GNU Affero General Public License). Work here is defensive review of this kernel and its services, and that review is the priority. Deliverables are fixes, tests, and proofs. A probe that reproduces a finding against this kernel under QEMU is a test, and it exists so the fix can be shown to close it.
+
 ## Formal Verification (Non-Negotiable Constraint)
 
 Every design decision in kernel code must keep future formal verification achievable:

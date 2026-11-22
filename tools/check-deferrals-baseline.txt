@@ -4,7 +4,7 @@
 
 .claude/rules/kernel.md:48:eventually
 .claude/rules/platform-gotchas.md:31:deferred
-CLAUDE.md:11:eventually
+CLAUDE.md:15:eventually
 docs/CambiOS.md:224:deferred
 docs/CambiOS.md:363:deferred
 docs/CambiOS.md:444:deferred
