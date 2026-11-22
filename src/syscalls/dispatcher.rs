@@ -160,9 +160,70 @@ impl core::fmt::Display for Latin1<'_> {
     }
 }
 
-fn kernel_origin_endpoint(endpoint_id: u32) -> bool {
-    endpoint_id == cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT
-        || endpoint_id == crate::policy::POLICY_QUERY_ENDPOINT
+/// The endpoints with the kernel at one end, and what `handle_write` does
+/// with a user write to each. ADR-002 § Mandatory Enforcement: this is the
+/// whole list. A new endpoint with the kernel at one end is a new variant
+/// here, and the exhaustive match in `handle_write` will not compile until
+/// it is given a gate or a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelEndpoint {
+    /// User to user: the ordinary capability pipeline.
+    Ordinary,
+    /// Policy queries (ADR-006). Kernel-origin: the kernel is the only
+    /// legitimate sender, so a user write is refused.
+    PolicyQuery,
+    /// Block-driver commands (`cambios-blk-proto`). Kernel-origin.
+    BlockCommand,
+    /// Policy decisions. Kernel-consumed: admitted only from the process
+    /// spawn identified as the policy service.
+    PolicyReply,
+    /// Block-driver replies. Kernel-consumed: admitted only from a process
+    /// bound to the endpoint's manifest reservation owner (ADR-018).
+    BlockReply,
+}
+
+impl KernelEndpoint {
+    fn of(endpoint_id: u32) -> Self {
+        match endpoint_id {
+            crate::policy::POLICY_QUERY_ENDPOINT => Self::PolicyQuery,
+            cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT => Self::BlockCommand,
+            crate::policy::POLICY_RESP_ENDPOINT => Self::PolicyReply,
+            cambios_blk_proto::BLK_KERNEL_RESP_ENDPOINT => Self::BlockReply,
+            _ => Self::Ordinary,
+        }
+    }
+
+    /// The kernel sends here and a user process receives. The kernel's
+    /// sends go to `SHARDED_IPC`, so the receive paths consult it too.
+    fn is_kernel_origin(self) -> bool {
+        matches!(self, Self::PolicyQuery | Self::BlockCommand)
+    }
+}
+
+/// Refuse a user write to an endpoint with the kernel at one end: a
+/// `cap.denied` audit event and `PermissionDenied`.
+fn deny_kernel_endpoint(ctx: &SyscallContext, endpoint_id: u32) -> SyscallResult {
+    crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
+        ctx.process_id,
+        crate::ipc::EndpointId(endpoint_id),
+        crate::audit::now(),
+        0,
+    ));
+    Err(SyscallError::PermissionDenied)
+}
+
+/// Copy a `len`-byte user message (1..=256, checked by the caller) into a
+/// kernel buffer. ADR-020: typed `UserReadSlice`.
+fn read_user_message(
+    ctx: &SyscallContext,
+    user_buf: u64,
+    len: usize,
+) -> Result<[u8; 256], SyscallError> {
+    let slice = UserReadSlice::validate(ctx, user_buf, len)?;
+    let mut kbuf = [0u8; 256];
+    let dst = kbuf.get_mut(..len).ok_or(SyscallError::InvalidArg)?;
+    slice.read_into(dst)?;
+    Ok(kbuf)
 }
 
 impl SyscallDispatcher {
@@ -410,126 +471,141 @@ impl SyscallDispatcher {
             return Err(SyscallError::InvalidArg);
         }
 
-        // Kernel-origin endpoints accept no user send. The kernel is the
-        // only legitimate sender on the policy-query endpoint (22) and the
-        // block driver's command endpoint (26); its sends go straight to
-        // `SHARDED_IPC`, never through here. Their receivers act on what
-        // arrives as kernel instructions (the block driver writes the
-        // shared page to the LBA a command names), and the receive paths
-        // serve the `IPC_MANAGER` queue ahead of the kernel's shard, so a
-        // user message here would be taken for the kernel's. The ordinary
-        // capability check cannot stop it: every process holds
-        // `AllEndpoints { send }` (cambios-manifest, replies go to
-        // client-chosen endpoints). Refused before the user buffer is read
-        // or any lock taken. ADR-002 Layer 2 (authority), ADR-005 § 1.
-        if kernel_origin_endpoint(endpoint_id) {
-            crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
-                ctx.process_id,
-                crate::ipc::EndpointId(endpoint_id),
-                crate::audit::now(),
-                0,
-            ));
-            return Err(SyscallError::PermissionDenied);
+        // Endpoints with the kernel at one end are handled before the
+        // capability pipeline, and every gate runs before the user buffer
+        // is read. The ordinary capability check cannot guard them: every
+        // process holds `AllEndpoints { send }` (cambios-manifest; replies
+        // go to client-chosen endpoints), so Layer 2 passes any sender.
+        // ADR-002 § Mandatory Enforcement, ADR-005 § 1.
+        match KernelEndpoint::of(endpoint_id) {
+            // Kernel-origin: the kernel is the only legitimate sender, and
+            // its sends go straight to `SHARDED_IPC`, never through here.
+            // The receivers act on what arrives as the kernel's instruction
+            // (the block driver writes the shared page to the LBA a command
+            // names), and the receive paths serve the `IPC_MANAGER` queue
+            // ahead of the kernel's shard, so a user message here would be
+            // taken for the kernel's. Refused before any lock is taken.
+            KernelEndpoint::PolicyQuery | KernelEndpoint::BlockCommand => {
+                deny_kernel_endpoint(ctx, endpoint_id)
+            }
+            KernelEndpoint::BlockReply => Self::write_block_reply(ctx, endpoint_id, user_buf, len),
+            KernelEndpoint::PolicyReply => Self::write_policy_reply(ctx, endpoint_id, user_buf, len),
+            KernelEndpoint::Ordinary => Self::write_ordinary(ctx, endpoint_id, user_buf, len),
         }
+    }
 
-        // Read user buffer into kernel. ADR-020 Phase B: typed
-        // UserReadSlice replaces the raw (addr, len) pair.
-        let slice = UserReadSlice::validate(ctx, user_buf, len)?;
-        let mut kbuf = [0u8; 256];
-        slice.read_into(&mut kbuf[..len])?;
+    /// A user write to the block driver's kernel-reply endpoint. The
+    /// kernel is the only consumer (`BlockDriverClient` polls it), so the
+    /// write never reaches a user receiver; an identity gate stands in for
+    /// the pipeline. The manifest reserves the endpoint to the block-driver
+    /// row (ADR-018), and only a process bound to that row's Principal may
+    /// write here: the kernel acts on these replies (it copies disk blocks
+    /// through the page the handshake reply names), so a reply from anyone
+    /// else is a forged instruction to the kernel. No reservation ⇒ nobody
+    /// may write here (fail closed). The gate runs before the user buffer
+    /// is read. The accepted message is stamped with the sender's Principal
+    /// like every other control message (ADR-005 § 1); `from` carries the
+    /// sender's process slot so the client can resolve the sender for the
+    /// handshake's DMA-ownership check.
+    ///
+    /// Lock ordering: CAPABILITY_MANAGER(4) alone, released before the user
+    /// copy and the shard enqueue. Note: NO scheduler wake —
+    /// `BlockDriverClient::call` polls for the reply on the same endpoint
+    /// after its wake-driver send, so an extra wake here is redundant and
+    /// (empirically) provokes a subtle interaction that stalls the driver's
+    /// own virtqueue self-test (ADR-010 § Divergence 2).
+    fn write_block_reply(
+        ctx: &SyscallContext,
+        endpoint_id: u32,
+        user_buf: u64,
+        len: usize,
+    ) -> SyscallResult {
+        let Some(owner_aid) =
+            crate::ipc::endpoint_reservation::ENDPOINT_RESERVATIONS.owner(endpoint_id)
+        else {
+            return deny_kernel_endpoint(ctx, endpoint_id);
+        };
+        let sender = {
+            let cap_guard = crate::CAPABILITY_MANAGER.lock();
+            cap_guard
+                .as_ref()
+                .and_then(|cap_mgr| cap_mgr.get_principal(ctx.process_id).ok())
+        };
+        let sender = match sender {
+            Some(p) if p.aid() == &owner_aid => p,
+            _ => return deny_kernel_endpoint(ctx, endpoint_id),
+        };
 
-        // Block-driver kernel reply endpoint. The kernel is the only
-        // consumer (`BlockDriverClient` polls it), so this write never
-        // reaches a user receiver and bypasses the send-side capability
-        // pipeline; what replaces the pipeline is an identity gate. The
-        // manifest reserves this endpoint to the block-driver row
-        // (ADR-018), and only a process bound to that row's Principal may
-        // write here: the kernel acts on these replies (it copies disk
-        // blocks through the page the handshake reply names), so a reply
-        // from anyone else is a forged instruction to the kernel. Every
-        // process holds `AllEndpoints { send }`, which is why the ordinary
-        // capability check would not have stopped one. No reservation ⇒
-        // nobody may write here (fail closed). The accepted message is
-        // stamped with the sender's Principal like every other control
-        // message (ADR-005 § 1); `from` carries the sender's process slot
-        // so the client can resolve the sender for the handshake's
-        // DMA-ownership check.
-        //
-        // Lock ordering: CAPABILITY_MANAGER(4) alone, released before the
-        // shard enqueue. Note: NO scheduler wake — `BlockDriverClient::
-        // call` polls for the reply on the same endpoint after its
-        // wake-driver send, so an extra wake here is redundant and
-        // (empirically) provokes a subtle interaction that stalls the
-        // driver's own virtqueue self-test (ADR-010 § Divergence 2).
-        if endpoint_id == cambios_blk_proto::BLK_KERNEL_RESP_ENDPOINT {
-            let ep = crate::ipc::EndpointId(endpoint_id);
-            let Some(owner_aid) =
-                crate::ipc::endpoint_reservation::ENDPOINT_RESERVATIONS.owner(endpoint_id)
-            else {
-                crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
-                    ctx.process_id, ep, crate::audit::now(), 0,
-                ));
-                return Err(SyscallError::PermissionDenied);
-            };
-            let sender = {
-                let cap_guard = crate::CAPABILITY_MANAGER.lock();
-                cap_guard
-                    .as_ref()
-                    .and_then(|cap_mgr| cap_mgr.get_principal(ctx.process_id).ok())
-            };
-            let sender = match sender {
-                Some(p) if p.aid() == &owner_aid => p,
-                _ => {
-                    crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
-                        ctx.process_id, ep, crate::audit::now(), 0,
-                    ));
-                    return Err(SyscallError::PermissionDenied);
-                }
-            };
-            let mut msg = crate::ipc::Message::new(
-                crate::ipc::EndpointId(ctx.process_id.slot()),
-                ep,
-            );
-            if msg.set_payload(&kbuf[..len]).is_err() {
-                return Err(SyscallError::InvalidArg);
-            }
-            msg.sender_principal = Some(sender);
-            if crate::SHARDED_IPC.send_message(ep, msg).is_err() {
-                return Err(SyscallError::OutOfMemory);
-            }
-            return Ok(len as u64);
-        }
-
-        // Policy response interception — before any lock acquisition.
-        // Writes to POLICY_RESP_ENDPOINT are consumed by the kernel (never
-        // enter the IPC queue). Only the policy service may write here.
-        if endpoint_id == crate::policy::POLICY_RESP_ENDPOINT {
-            let expected_pid = crate::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire);
-            if ctx.process_id.as_raw() != expected_pid {
-                return Err(SyscallError::PermissionDenied);
-            }
-            if let Some((query_id, allowed)) = crate::policy::parse_response(&kbuf[..len]) {
-                let task_id = {
-                    let mut router = crate::POLICY_ROUTER.lock();
-                    router.complete_query(query_id)
-                };
-                // POLICY_ROUTER lock dropped before scheduler wake
-                if let Some(tid) = task_id {
-                    let val = if allowed {
-                        crate::policy::DECISION_ALLOW
-                    } else {
-                        crate::policy::DECISION_DENY
-                    };
-                    crate::policy::POLICY_DECISIONS[tid.slot() as usize]
-                        .store(val, core::sync::atomic::Ordering::Release);
-                    crate::policy::POLICY_QUERIES_ANSWERED
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    crate::wake_task_on_cpu(tid);
-                }
-                return Ok(len as u64);
-            }
+        let kbuf = read_user_message(ctx, user_buf, len)?;
+        let ep = crate::ipc::EndpointId(endpoint_id);
+        let mut msg = crate::ipc::Message::new(
+            crate::ipc::EndpointId(ctx.process_id.slot()),
+            ep,
+        );
+        if msg.set_payload(&kbuf[..len]).is_err() {
             return Err(SyscallError::InvalidArg);
         }
+        msg.sender_principal = Some(sender);
+        if crate::SHARDED_IPC.send_message(ep, msg).is_err() {
+            return Err(SyscallError::OutOfMemory);
+        }
+        Ok(len as u64)
+    }
+
+    /// A user write to the policy-reply endpoint. Consumed by the kernel
+    /// (never enters an IPC queue). Only the process `handle_spawn`
+    /// identified as the policy service may write here; until one is
+    /// identified `POLICY_SERVICE_PID` is `u64::MAX`, which no process id
+    /// equals, so nothing is accepted. The gate runs before the user buffer
+    /// is read. A reply whose `query_id` names no pending query (it
+    /// expired, or was never issued) completes nothing: query ids are
+    /// monotonic and never reused, so a late reply cannot answer a later
+    /// query.
+    fn write_policy_reply(
+        ctx: &SyscallContext,
+        endpoint_id: u32,
+        user_buf: u64,
+        len: usize,
+    ) -> SyscallResult {
+        let expected_pid = crate::POLICY_SERVICE_PID.load(core::sync::atomic::Ordering::Acquire);
+        if ctx.process_id.as_raw() != expected_pid {
+            return deny_kernel_endpoint(ctx, endpoint_id);
+        }
+
+        let kbuf = read_user_message(ctx, user_buf, len)?;
+        let Some((query_id, allowed)) = crate::policy::parse_response(&kbuf[..len]) else {
+            return Err(SyscallError::InvalidArg);
+        };
+        let task_id = {
+            let mut router = crate::POLICY_ROUTER.lock();
+            router.complete_query(query_id)
+        };
+        // POLICY_ROUTER lock dropped before scheduler wake
+        if let Some(tid) = task_id {
+            let val = if allowed {
+                crate::policy::DECISION_ALLOW
+            } else {
+                crate::policy::DECISION_DENY
+            };
+            crate::policy::POLICY_DECISIONS[tid.slot() as usize]
+                .store(val, core::sync::atomic::Ordering::Release);
+            crate::policy::POLICY_QUERIES_ANSWERED
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::wake_task_on_cpu(tid);
+        }
+        Ok(len as u64)
+    }
+
+    /// A user-to-user write: the ADR-002 pipeline (capability check, then
+    /// the interceptor's structural checks) via
+    /// `send_message_with_capability`.
+    fn write_ordinary(
+        ctx: &SyscallContext,
+        endpoint_id: u32,
+        user_buf: u64,
+        len: usize,
+    ) -> SyscallResult {
+        let kbuf = read_user_message(ctx, user_buf, len)?;
 
         // Build IPC message. `from` is the sender's reply endpoint (the
         // first endpoint they registered), so receivers can route replies
@@ -1179,15 +1255,12 @@ impl SyscallDispatcher {
                 // Drop IPC/capability locks here
             };
 
-            // Virtio-blk kernel-command endpoint: kernel-origin
-            // commands land in `SHARDED_IPC` (not `IPC_MANAGER`). Scoped
-            // narrowly to endpoint 26 so other recv paths — which have no
-            // reason to consult SHARDED_IPC today — are unaffected.
-            /// ARCHITECTURAL: endpoint 26 is the virtio-blk kernel-command
-            /// slot in the CambiOS IPC number-space; see
-            /// `BLK_KERNEL_RESP_ENDPOINT` above for the ABI-break caveat.
-            const BLK_KERNEL_CMD_ENDPOINT: u32 = 26;
-            let msg = if kernel_origin_endpoint(endpoint_id) {
+            // Kernel-origin endpoints (policy queries, block commands):
+            // the kernel's sends land in `SHARDED_IPC`, not `IPC_MANAGER`.
+            // Scoped to `KernelEndpoint::is_kernel_origin` so the other
+            // recv paths, which have no reason to consult SHARDED_IPC,
+            // are unaffected.
+            let msg = if KernelEndpoint::of(endpoint_id).is_kernel_origin() {
                 msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
             } else {
                 msg
@@ -1280,7 +1353,7 @@ impl SyscallDispatcher {
                 // → shard; no path holds a shard while taking a scheduler
                 // lock (the wake helpers drop it first), so this nests
                 // without inversion.
-                let shard_guard = if kernel_origin_endpoint(endpoint_id) {
+                let shard_guard = if KernelEndpoint::of(endpoint_id).is_kernel_origin() {
                     Some(crate::SHARDED_IPC.shards[endpoint_id as usize].lock())
                 } else {
                     None
@@ -1365,7 +1438,7 @@ impl SyscallDispatcher {
         };
 
         // Kernel-origin endpoints (same special case as handle_recv_msg).
-        let msg = if kernel_origin_endpoint(endpoint_id) {
+        let msg = if KernelEndpoint::of(endpoint_id).is_kernel_origin() {
             msg.or_else(|| crate::SHARDED_IPC.recv_message(endpoint))
         } else {
             msg
@@ -4755,20 +4828,64 @@ mod tests {
     }
 
     #[test]
-    fn handle_write_to_kernel_origin_endpoint_is_denied() {
-        // The refusal comes before the user buffer is read, so an
-        // unmapped buffer address still yields PermissionDenied.
+    fn kernel_endpoint_table_is_exactly_the_four() {
+        // ADR-002 § Mandatory Enforcement names four endpoints with the
+        // kernel at one end. Every other endpoint id is ordinary.
+        use KernelEndpoint::*;
+        let mut origin = [0u32; 2];
+        let mut consumed = [0u32; 2];
+        let (mut no, mut nc) = (0usize, 0usize);
+        for ep in 0..crate::ipc::MAX_ENDPOINTS as u32 {
+            match KernelEndpoint::of(ep) {
+                Ordinary => {}
+                PolicyQuery | BlockCommand => {
+                    assert!(no < origin.len(), "more than two kernel-origin endpoints");
+                    origin[no] = ep;
+                    no += 1;
+                }
+                PolicyReply | BlockReply => {
+                    assert!(nc < consumed.len(), "more than two kernel-consumed endpoints");
+                    consumed[nc] = ep;
+                    nc += 1;
+                }
+            }
+        }
+        assert_eq!((no, nc), (2, 2));
+        assert_eq!(origin, [crate::policy::POLICY_QUERY_ENDPOINT, cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT]);
+        assert_eq!(consumed, [crate::policy::POLICY_RESP_ENDPOINT, cambios_blk_proto::BLK_KERNEL_RESP_ENDPOINT]);
+        assert!(KernelEndpoint::of(crate::policy::POLICY_QUERY_ENDPOINT).is_kernel_origin());
+        assert!(KernelEndpoint::of(cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT).is_kernel_origin());
+        assert!(!KernelEndpoint::of(crate::policy::POLICY_RESP_ENDPOINT).is_kernel_origin());
+        assert!(!KernelEndpoint::of(cambios_blk_proto::BLK_KERNEL_RESP_ENDPOINT).is_kernel_origin());
+    }
+
+    #[test]
+    fn handle_write_to_kernel_endpoints_is_denied_before_the_buffer_is_read() {
+        // fake_ctx() has cr3 = 0, so any user-buffer read fails. A
+        // PermissionDenied for each of the four therefore comes from the
+        // refusal or the identity gate, which must run before the read.
+        // Host tests run with no manifest (no reservation on the block
+        // reply endpoint) and no identified policy service
+        // (POLICY_SERVICE_PID = u64::MAX): both gates admit nobody.
         let ctx = fake_ctx();
         for ep in [
-            cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT,
             crate::policy::POLICY_QUERY_ENDPOINT,
+            crate::policy::POLICY_RESP_ENDPOINT,
+            cambios_blk_proto::BLK_KERNEL_RESP_ENDPOINT,
+            cambios_blk_proto::BLK_KERNEL_CMD_ENDPOINT,
         ] {
             assert_eq!(
                 SyscallDispatcher::handle_write(args(ep as u64, 0x1000, 16), &ctx),
                 Err(SyscallError::PermissionDenied),
-                "user send to kernel-origin endpoint {ep} must be refused",
+                "user write to kernel endpoint {ep} must be refused or gated",
             );
         }
+        // Control: an ordinary endpoint reaches the buffer read, which
+        // fails some other way. Without this, the loop above could pass
+        // because every write from fake_ctx is PermissionDenied.
+        let ordinary = SyscallDispatcher::handle_write(args(16, 0x1000, 16), &ctx);
+        assert!(ordinary.is_err());
+        assert_ne!(ordinary, Err(SyscallError::PermissionDenied));
     }
 
     // ---- handle_print validation -------------------------------------------
