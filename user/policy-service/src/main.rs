@@ -277,7 +277,10 @@ fn service_loop() -> ! {
     line.push_dec(table.len as u32);
     line.push(b" syscall profiles from the manifest\n");
     line.print();
-    ipc::ServiceLoop::new(POLICY_QUERY_ENDPOINT, PolicyHandler { table }).run()
+    // Queries come from the kernel: KernelLoop acts only on messages whose
+    // kernel-written sender field is the kernel origin (identity.md
+    // § Kernel transcribes). A message from any process is dropped.
+    ipc::KernelLoop::new(POLICY_QUERY_ENDPOINT, PolicyHandler { table }).run()
 }
 
 /// Per-query dispatch: parse the fixed query, decide, reply.
@@ -285,8 +288,8 @@ struct PolicyHandler {
     table: PolicyTable,
 }
 
-impl ipc::Handler for PolicyHandler {
-    fn handle(&mut self, msg: &ipc::VerifiedMessage<'_>) -> ipc::Result<()> {
+impl ipc::KernelHandler for PolicyHandler {
+    fn handle(&mut self, msg: &ipc::KernelMessage<'_>) -> ipc::Result<()> {
         // Query payload: [query_id:8][caller_pid:4][syscall_num:4][caller_principal:32]
         let mut r = msg.reader();
         let query_id = r.u64()?;

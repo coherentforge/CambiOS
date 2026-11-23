@@ -192,13 +192,44 @@ impl fmt::Display for Principal {
     }
 }
 
+/// Who sent a message. Every message has exactly one sender from the moment
+/// it is constructed; there is no anonymous or unstamped message
+/// (identity.md § Kernel transcribes; never interprets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sender {
+    /// The kernel itself (a policy query, a block-driver command). The
+    /// kernel is not a Principal; on the wire this is
+    /// `cambios_abi::KERNEL_ORIGIN_SENDER`.
+    Kernel,
+    /// A process, identified by its bound Principal. The Principal comes
+    /// from the capability table, whose `bind_principal` refuses the two
+    /// values the wire field reserves, so it never encodes as anything but
+    /// itself. Message construction does not re-check it: that would be a
+    /// hot-path branch on a Principal value (ADR-026 § 1).
+    Process(Principal),
+}
+
+impl Sender {
+    /// The 32-byte sender field a receiver sees (`[sender:32]` of the
+    /// receive header).
+    pub fn wire(&self) -> [u8; 32] {
+        match self {
+            Self::Kernel => cambios_abi::KERNEL_ORIGIN_SENDER,
+            Self::Process(p) => *p.aid(),
+        }
+    }
+}
+
 /// A single IPC message with verification-friendly structure.
 ///
 /// # Invariants (for formal verification)
 ///
 /// - `payload_len <= 256` (enforced by `set_payload()`).
-/// - `sender_principal` is `None` on construction and set only by the kernel
-///   in `send_message_with_capability()`. User code cannot forge this field.
+/// - `sender` is fixed at construction and has no setter. A `Sender::Kernel`
+///   message can be constructed only inside `crate::ipc` (the private
+///   `from_kernel`), and the one caller is
+///   [`ShardedIpcManager::send_from_kernel`]; the public constructor takes
+///   a Principal. User code never supplies the sender.
 /// - `from` and `to` are valid `EndpointId` values (< `MAX_ENDPOINTS`).
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -209,24 +240,39 @@ pub struct Message {
     /// (channels — see docs/adr/005-ipc-primitives-control-and-bulk.md).
     pub payload: [u8; 256],
     pub payload_len: usize,
-    /// Sender's cryptographic identity, stamped by the kernel.
-    ///
-    /// This field is NEVER set by user code. The kernel writes it in
-    /// `send_message_with_capability()` after the capability check passes.
-    /// Recipients can trust this field unconditionally — it is unforgeable.
-    pub sender_principal: Option<Principal>,
+    /// Stamped by the kernel at construction; private so nothing outside
+    /// this module can make a message claim kernel origin.
+    sender: Sender,
 }
 
 impl Message {
-    /// Create a new message
-    pub fn new(from: EndpointId, to: EndpointId) -> Self {
+    /// A message from a process, stamped with its bound Principal.
+    pub fn new(from: EndpointId, to: EndpointId, sender: Principal) -> Self {
         Message {
             from,
             to,
             payload: [0u8; 256],
             payload_len: 0,
-            sender_principal: None,
+            sender: Sender::Process(sender),
         }
+    }
+
+    /// A message from the kernel. Private, so callable only from
+    /// `crate::ipc` and its submodules; the one caller is
+    /// [`ShardedIpcManager::send_from_kernel`] (plus this module's tests).
+    fn from_kernel(from: EndpointId, to: EndpointId) -> Self {
+        Message {
+            from,
+            to,
+            payload: [0u8; 256],
+            payload_len: 0,
+            sender: Sender::Kernel,
+        }
+    }
+
+    /// Who sent this message.
+    pub fn sender(&self) -> Sender {
+        self.sender
     }
 
     /// Set message payload
@@ -655,31 +701,51 @@ impl IpcManager {
         }
     }
 
-    /// Create a new IPC manager directly on the heap.
-    /// Avoids stack overflow from the ~163KB struct.
+    /// Create a new IPC manager directly on the heap, field by field.
+    /// Avoids stack overflow from the ~163KB struct (Convention 4).
+    ///
+    /// Every field is written explicitly; zeroed memory is not assumed to
+    /// be `None` (Convention 7). This matters for `Option<Message>`: the
+    /// compiler may encode its `None` in a spare value of `Sender`'s tag, so
+    /// a zeroed slot could read as `Some` of a message with a zeroed sender,
+    /// which is `Sender::Kernel` if that variant takes tag 0. Same shape as
+    /// `ChannelManager::new_boxed`.
     ///
     /// Returns `None` if heap allocation fails.
     pub fn new_boxed() -> Option<Box<Self>> {
-        use alloc::alloc::{alloc_zeroed, Layout};
+        use alloc::alloc::{alloc, Layout};
+        const EMPTY_QUEUE: EndpointQueue = EndpointQueue::new();
+        const EMPTY_CHANNEL: SyncChannel = SyncChannel::new();
         let layout = Layout::new::<Self>();
         // SAFETY: layout is non-zero-sized (IpcManager contains arrays).
-        let ptr = unsafe { alloc_zeroed(layout) as *mut Self };
+        let ptr = unsafe { alloc(layout) as *mut Self };
         if ptr.is_null() {
             return None;
         }
-        // SAFETY: All array fields are valid when zero-initialized:
-        // - Option<Message>::None = discriminant 0 = zeroed (Message.sender_principal
-        //   is only relevant inside Some(Message), which is constructed via enqueue)
-        // - usize head/tail/count = 0 = zeroed
-        // - SyncChannelState::Empty = first variant = discriminant 0
-        // - Option<u32>::None = zeroed
-        // Write the interceptor field explicitly (fat pointer — don't rely on zeroed).
-        // SAFETY: ptr is valid, non-null, and allocated above. Accessing the interceptor field.
+        // SAFETY: ptr is a fresh, exclusively owned allocation with Self's
+        // layout; addr_of_mut! projects without creating a reference to the
+        // uninitialized struct.
+        let queues = unsafe { core::ptr::addr_of_mut!((*ptr).queues) } as *mut EndpointQueue;
+        for i in 0..MAX_ENDPOINTS {
+            // SAFETY: i < MAX_ENDPOINTS, so the projected element is in bounds.
+            let q = unsafe { queues.add(i) };
+            // SAFETY: q is a valid, aligned, exclusively owned element.
+            unsafe { q.write(EMPTY_QUEUE) };
+        }
+        // SAFETY: same projection argument as `queues` above.
+        let channels = unsafe { core::ptr::addr_of_mut!((*ptr).sync_channels) } as *mut SyncChannel;
+        for i in 0..MAX_ENDPOINTS {
+            // SAFETY: i < MAX_ENDPOINTS, so the projected element is in bounds.
+            let c = unsafe { channels.add(i) };
+            // SAFETY: c is a valid, aligned, exclusively owned element.
+            unsafe { c.write(EMPTY_CHANNEL) };
+        }
+        // SAFETY: same projection argument as `queues` above.
         let interceptor_ptr = unsafe { core::ptr::addr_of_mut!((*ptr).interceptor) };
-        // SAFETY: interceptor_ptr is valid — writing None (the only non-trivially-zeroed field).
+        // SAFETY: interceptor_ptr is valid and exclusively owned.
         unsafe { interceptor_ptr.write(None) };
-        // SAFETY: ptr was allocated via alloc_zeroed with the correct layout. All
-        // fields are now initialized (zeroed arrays + explicit interceptor write).
+        // SAFETY: every field of Self has now been written exactly once and
+        // ptr came from `alloc` with Self's layout.
         Some(unsafe { Box::from_raw(ptr) })
     }
 
@@ -749,16 +815,21 @@ impl IpcManager {
 
     /// Send a message with capability enforcement and interceptor check.
     ///
-    /// Pipeline: capability check → stamp sender_principal → interceptor check → enqueue.
+    /// Pipeline: capability check → build the message stamped with the
+    /// sender's bound Principal → interceptor check → enqueue.
     ///
-    /// The kernel stamps `msg.sender_principal` from the sender's bound Principal
-    /// in the CapabilityManager. This is the sole code path that sets
-    /// sender_principal — user code cannot forge it.
+    /// The message is constructed here, after the Principal lookup, so there
+    /// is no window in which it exists unstamped, and the stamp comes from
+    /// the CapabilityManager, never from the caller. A sender with no bound
+    /// Principal is refused (`PermissionDenied`): there is no anonymous
+    /// message to send. The syscall identity gate already refuses such a
+    /// caller before it gets here; this is the same rule, held by the type.
     pub fn send_message_with_capability(
         &mut self,
         from_process: ProcessId,
         endpoint: EndpointId,
-        mut msg: Message,
+        from: EndpointId,
+        payload: &[u8],
         cap_mgr: &capability::CapabilityManager,
     ) -> Result<(), IpcError> {
         // Layer 1: Capability check
@@ -767,7 +838,11 @@ impl IpcManager {
             .map_err(|_| IpcError::PermissionDenied)?;
 
         // Stamp sender identity (unforgeable — kernel sets this, never user code)
-        msg.sender_principal = cap_mgr.get_principal(from_process).ok();
+        let sender = cap_mgr
+            .get_principal(from_process)
+            .map_err(|_| IpcError::PermissionDenied)?;
+        let mut msg = Message::new(from, endpoint, sender);
+        msg.set_payload(payload)?;
 
         // Layer 2: Interceptor check (defense-in-depth)
         if let Some(ref interceptor) = self.interceptor {
@@ -1032,6 +1107,22 @@ impl ShardedIpcManager {
         self.shards[endpoint.0 as usize].lock().queue.enqueue(msg)
     }
 
+    /// Send a message from the kernel itself: the only way a message
+    /// stamped `Sender::Kernel` is created. Callers are the kernel's own
+    /// upcalls (`policy::policy_check` to the policy-query endpoint, the
+    /// block client to the block driver's command endpoint); no syscall
+    /// path reaches it. identity.md § Kernel transcribes.
+    pub fn send_from_kernel(
+        &self,
+        endpoint: EndpointId,
+        from: EndpointId,
+        payload: &[u8],
+    ) -> Result<(), IpcError> {
+        let mut msg = Message::from_kernel(from, endpoint);
+        msg.set_payload(payload)?;
+        self.send_message(endpoint, msg)
+    }
+
     /// Receive a message from an endpoint (async).
     pub fn recv_message(&self, endpoint: EndpointId) -> Option<Message> {
         if endpoint.0 as usize >= MAX_ENDPOINTS {
@@ -1141,8 +1232,8 @@ mod tests {
     fn clear_endpoint_discards_queued_messages() {
         let mut mgr = IpcManager::new();
         let ep = EndpointId(5);
-        mgr.send_message(ep, Message::new(EndpointId(1), ep)).unwrap();
-        mgr.send_message(ep, Message::new(EndpointId(1), ep)).unwrap();
+        mgr.send_message(ep, test_msg(EndpointId(1), ep)).unwrap();
+        mgr.send_message(ep, test_msg(EndpointId(1), ep)).unwrap();
         assert!(mgr.has_message(ep));
         mgr.clear_endpoint(ep);
         assert!(!mgr.has_message(ep));
@@ -1155,13 +1246,19 @@ mod tests {
     fn sharded_clear_endpoint_discards_queued_messages() {
         let mgr = ShardedIpcManager::new();
         let ep = EndpointId(7);
-        mgr.send_message(ep, Message::new(EndpointId(1), ep)).unwrap();
+        mgr.send_message(ep, test_msg(EndpointId(1), ep)).unwrap();
         assert!(mgr.has_message(ep));
         mgr.clear_endpoint(ep);
         assert!(!mgr.has_message(ep));
     }
 
     use super::*;
+
+    /// A message from an arbitrary process, for tests where the sender is
+    /// not what is under test.
+    fn test_msg(from: EndpointId, to: EndpointId) -> Message {
+        Message::new(from, to, Principal::from_aid([0x11; 32]))
+    }
 
     // ========================================================================
     // Async IPC tests
@@ -1172,7 +1269,7 @@ mod tests {
         let mut queue = EndpointQueue::new();
         assert!(queue.is_empty());
 
-        let msg = Message::new(EndpointId(0), EndpointId(1));
+        let msg = test_msg(EndpointId(0), EndpointId(1));
         queue.enqueue(msg).unwrap();
         assert!(!queue.is_empty());
 
@@ -1187,12 +1284,12 @@ mod tests {
     fn test_endpoint_queue_full() {
         let mut queue = EndpointQueue::new();
         for i in 0..16 {
-            let msg = Message::new(EndpointId(i), EndpointId(0));
+            let msg = test_msg(EndpointId(i), EndpointId(0));
             queue.enqueue(msg).unwrap();
         }
         assert!(queue.is_full());
 
-        let msg = Message::new(EndpointId(99), EndpointId(0));
+        let msg = test_msg(EndpointId(99), EndpointId(0));
         assert_eq!(queue.enqueue(msg).unwrap_err(), IpcError::QueueFull);
     }
 
@@ -1201,7 +1298,7 @@ mod tests {
         let mut mgr = IpcManager::new();
         let endpoint = EndpointId(5);
 
-        let msg = Message::new(EndpointId(0), endpoint);
+        let msg = test_msg(EndpointId(0), endpoint);
         mgr.send_message(endpoint, msg).unwrap();
 
         assert!(mgr.has_message(endpoint));
@@ -1220,7 +1317,7 @@ mod tests {
         let mut channel = SyncChannel::new();
         assert_eq!(channel.state(), SyncChannelState::Empty);
 
-        let msg = Message::new(EndpointId(0), EndpointId(1));
+        let msg = test_msg(EndpointId(0), EndpointId(1));
         let result = channel.deposit_send(msg, 10).unwrap();
         assert!(result.is_none()); // No receiver waiting
         assert_eq!(channel.state(), SyncChannelState::SenderWaiting);
@@ -1244,7 +1341,7 @@ mod tests {
         assert_eq!(channel.state(), SyncChannelState::ReceiverWaiting);
 
         // Sender deposits while receiver is waiting
-        let msg = Message::new(EndpointId(0), EndpointId(1));
+        let msg = test_msg(EndpointId(0), EndpointId(1));
         let result = channel.deposit_send(msg, 10).unwrap();
         assert_eq!(result, Some(20)); // Receiver task 20 should be woken
         assert_eq!(channel.state(), SyncChannelState::Empty);
@@ -1256,7 +1353,7 @@ mod tests {
         let mut channel = SyncChannel::new();
 
         // Step 1: Caller sends request
-        let request = Message::new(EndpointId(0), EndpointId(1));
+        let request = test_msg(EndpointId(0), EndpointId(1));
         let result = channel.deposit_call(request, 10).unwrap();
         assert!(result.is_none()); // No receiver, caller must block
         assert_eq!(channel.state(), SyncChannelState::CallerWaiting);
@@ -1269,7 +1366,7 @@ mod tests {
         assert_eq!(channel.state(), SyncChannelState::ReplyPending);
 
         // Step 3: Receiver sends reply
-        let reply = Message::new(EndpointId(1), EndpointId(0));
+        let reply = test_msg(EndpointId(1), EndpointId(0));
         let caller_task = channel.deposit_reply(reply).unwrap();
         assert_eq!(caller_task, 10); // Caller should be woken
         assert_eq!(channel.state(), SyncChannelState::Empty);
@@ -1290,13 +1387,13 @@ mod tests {
         assert_eq!(channel.state(), SyncChannelState::ReceiverWaiting);
 
         // Caller does call() — receiver gets woken
-        let request = Message::new(EndpointId(0), EndpointId(1));
+        let request = test_msg(EndpointId(0), EndpointId(1));
         let result = channel.deposit_call(request, 10).unwrap();
         assert_eq!(result, Some(20)); // Wake receiver
         assert_eq!(channel.state(), SyncChannelState::ReplyPending);
 
         // Receiver sends reply
-        let reply = Message::new(EndpointId(1), EndpointId(0));
+        let reply = test_msg(EndpointId(1), EndpointId(0));
         let caller_task = channel.deposit_reply(reply).unwrap();
         assert_eq!(caller_task, 10);
     }
@@ -1307,7 +1404,7 @@ mod tests {
         let endpoint = EndpointId(5);
 
         // Send (no receiver waiting)
-        let msg = Message::new(EndpointId(0), endpoint);
+        let msg = test_msg(EndpointId(0), endpoint);
         let result = mgr.sync_send(endpoint, msg, 10).unwrap();
         assert!(matches!(result, SyncSendResult::SenderMustBlock));
 
@@ -1328,7 +1425,7 @@ mod tests {
         let endpoint = EndpointId(5);
 
         // Call (no receiver)
-        let request = Message::new(EndpointId(0), endpoint);
+        let request = test_msg(EndpointId(0), endpoint);
         let result = mgr.sync_call(endpoint, request, 10).unwrap();
         assert!(matches!(result, SyncCallResult::CallerMustBlock));
 
@@ -1337,7 +1434,7 @@ mod tests {
         assert!(matches!(result, SyncRecvResult::Message(_, None))); // Don't wake caller
 
         // Service replies — wake caller
-        let reply = Message::new(endpoint, EndpointId(0));
+        let reply = test_msg(endpoint, EndpointId(0));
         let caller_task = mgr.sync_reply(endpoint, reply).unwrap();
         assert_eq!(caller_task, 10);
 
@@ -1351,11 +1448,11 @@ mod tests {
         let mut channel = SyncChannel::new();
 
         // First send
-        let msg = Message::new(EndpointId(0), EndpointId(1));
+        let msg = test_msg(EndpointId(0), EndpointId(1));
         channel.deposit_send(msg, 10).unwrap();
 
         // Second send on busy channel — rejected
-        let msg2 = Message::new(EndpointId(0), EndpointId(1));
+        let msg2 = test_msg(EndpointId(0), EndpointId(1));
         assert!(channel.deposit_send(msg2, 11).is_err());
     }
 
@@ -1364,9 +1461,14 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_message_sender_principal_defaults_to_none() {
-        let msg = Message::new(EndpointId(0), EndpointId(1));
-        assert!(msg.sender_principal.is_none());
+    fn test_message_carries_its_constructor_sender() {
+        let p = Principal::from_aid([0xAA; 32]);
+        let msg = Message::new(EndpointId(0), EndpointId(1), p);
+        assert_eq!(msg.sender(), Sender::Process(p));
+        assert_eq!(msg.sender().wire(), [0xAA; 32]);
+        let k = Message::from_kernel(EndpointId(0), EndpointId(1));
+        assert_eq!(k.sender(), Sender::Kernel);
+        assert_eq!(k.sender().wire(), cambios_abi::KERNEL_ORIGIN_SENDER);
     }
 
     #[test]
@@ -1386,16 +1488,43 @@ mod tests {
         cap_mgr.bind_principal(proc_id, principal).unwrap();
 
         // Send a message through the capability-checked path
-        let msg = Message::new(EndpointId(0), endpoint);
-        mgr.send_message_with_capability(proc_id, endpoint, msg, &cap_mgr).unwrap();
+        mgr.send_message_with_capability(proc_id, endpoint, EndpointId(0), b"x", &cap_mgr)
+            .unwrap();
 
-        // Verify: the received message has sender_principal stamped by kernel
+        // Verify: the received message is stamped with the bound Principal
         let received = mgr.recv_message(endpoint).unwrap();
-        assert_eq!(received.sender_principal, Some(principal));
+        assert_eq!(received.sender(), Sender::Process(principal));
+        assert_eq!(received.payload(), b"x");
     }
 
     #[test]
-    fn test_send_with_capability_no_principal_stamps_none() {
+    fn test_send_with_capability_stamps_every_endpoint_as_the_process() {
+        // The user-write path never produces a kernel-origin message, on
+        // any endpoint id: closure 2 of identity.md's forgery argument at
+        // the IPC layer (the dispatcher adds the KernelEndpoint refusals).
+        use crate::ipc::capability::CapabilityManager;
+
+        let mut mgr = IpcManager::new();
+        let mut cap_mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(0, 0);
+        let principal = Principal::from_aid([0x5A; 32]);
+        cap_mgr.register_process(proc_id).unwrap();
+        cap_mgr.bind_principal(proc_id, principal).unwrap();
+        for ep in 0..MAX_ENDPOINTS as u32 {
+            let endpoint = EndpointId(ep);
+            cap_mgr.grant_capability(proc_id, endpoint, CapabilityRights::FULL).unwrap();
+            // The interceptor's no-self-send rule does not apply: no
+            // interceptor is installed on a test manager.
+            mgr.send_message_with_capability(proc_id, endpoint, EndpointId(0), b"x", &cap_mgr)
+                .unwrap();
+            let received = mgr.recv_message(endpoint).unwrap();
+            assert_eq!(received.sender(), Sender::Process(principal), "endpoint {ep}");
+            assert_ne!(received.sender().wire(), cambios_abi::KERNEL_ORIGIN_SENDER);
+        }
+    }
+
+    #[test]
+    fn test_send_with_capability_refuses_unbound_sender() {
         use crate::ipc::capability::CapabilityManager;
 
         let mut mgr = IpcManager::new();
@@ -1408,26 +1537,34 @@ mod tests {
         cap_mgr.register_process(proc_id).unwrap();
         cap_mgr.grant_capability(proc_id, endpoint, CapabilityRights::FULL).unwrap();
 
-        let msg = Message::new(EndpointId(0), endpoint);
-        mgr.send_message_with_capability(proc_id, endpoint, msg, &cap_mgr).unwrap();
-
-        // No Principal bound → Err from get_principal → None stamped
-        let received = mgr.recv_message(endpoint).unwrap();
-        assert!(received.sender_principal.is_none());
+        // No Principal bound: there is no anonymous message to send.
+        assert_eq!(
+            mgr.send_message_with_capability(proc_id, endpoint, EndpointId(0), b"x", &cap_mgr),
+            Err(IpcError::PermissionDenied),
+        );
+        assert!(!mgr.has_message(endpoint));
     }
 
     #[test]
-    fn test_direct_send_does_not_stamp_principal() {
-        // send_message() (non-capability path) does NOT stamp sender_principal.
-        // Only send_message_with_capability() does. This is by design:
-        // the kernel stamps identity only through the authorized path.
-        let mut mgr = IpcManager::new();
-        let endpoint = EndpointId(5);
+    fn test_send_from_kernel_is_stamped_kernel() {
+        let mgr = ShardedIpcManager::new();
+        let ep = EndpointId(26);
+        mgr.send_from_kernel(ep, EndpointId(25), b"cmd").unwrap();
+        let received = mgr.recv_message(ep).unwrap();
+        assert_eq!(received.sender(), Sender::Kernel);
+        assert_eq!(received.sender().wire(), cambios_abi::KERNEL_ORIGIN_SENDER);
+        assert_eq!(received.from, EndpointId(25));
+        assert_eq!(received.payload(), b"cmd");
+    }
 
-        let msg = Message::new(EndpointId(0), endpoint);
-        mgr.send_message(endpoint, msg).unwrap();
-
-        let received = mgr.recv_message(endpoint).unwrap();
-        assert!(received.sender_principal.is_none());
+    #[test]
+    fn test_new_boxed_queues_start_empty() {
+        // new_boxed writes every slot explicitly (Convention 7); a zeroed
+        // slot must never surface as a message, least of all a kernel one.
+        let mut mgr = IpcManager::new_boxed().unwrap();
+        for ep in 0..MAX_ENDPOINTS as u32 {
+            assert!(!mgr.has_message(EndpointId(ep)), "endpoint {ep}");
+            assert!(mgr.recv_message(EndpointId(ep)).is_none(), "endpoint {ep}");
+        }
     }
 }

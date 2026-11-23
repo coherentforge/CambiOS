@@ -111,6 +111,10 @@ pub enum CapabilityError {
     AccessDenied,
     CapabilityFull,
     InvalidOperation,
+    /// `bind_principal` was given one of the two values the message sender
+    /// field reserves (zero, or the kernel origin); see
+    /// `cambios_abi::WireSender::is_bindable_aid`.
+    ReservedPrincipal,
 }
 
 impl fmt::Display for CapabilityError {
@@ -121,6 +125,7 @@ impl fmt::Display for CapabilityError {
             Self::AccessDenied => write!(f, "Access denied"),
             Self::CapabilityFull => write!(f, "Process capability table full"),
             Self::InvalidOperation => write!(f, "Invalid capability operation"),
+            Self::ReservedPrincipal => write!(f, "Principal value is reserved"),
         }
     }
 }
@@ -594,11 +599,21 @@ impl CapabilityManager {
     ///
     /// Once bound, the Principal cannot be rebound without explicit unbind.
     /// This prevents identity theft — a process cannot assume another's identity.
+    ///
+    /// Refuses the zero value and the kernel-origin value
+    /// (`ReservedPrincipal`): a process bound to either would have its
+    /// messages decode as unstamped or as the kernel's (identity.md § Kernel
+    /// transcribes). This is the boundary check that lets message
+    /// construction trust the table without branching on the Principal in
+    /// the hot path (ADR-026 § 1).
     pub fn bind_principal(
         &mut self,
         process_id: ProcessId,
         principal: Principal,
     ) -> Result<(), CapabilityError> {
+        if !cambios_abi::WireSender::is_bindable_aid(principal.aid()) {
+            return Err(CapabilityError::ReservedPrincipal);
+        }
         let caps = self.lookup_mut(process_id)?;
         if caps.principal.is_some() {
             return Err(CapabilityError::InvalidOperation); // Already bound
@@ -1101,6 +1116,25 @@ mod tests {
 
         let retrieved = mgr.get_principal(proc_id).unwrap();
         assert_eq!(retrieved, principal);
+    }
+
+    #[test]
+    fn test_bind_principal_refuses_reserved_values() {
+        // identity.md § Kernel transcribes: no process may be bound to the
+        // zero value or the kernel-origin value, so no process's messages
+        // can decode as unstamped or as the kernel's.
+        let mut mgr = CapabilityManager::new_for_test();
+        let proc_id = ProcessId::new(1, 0);
+        mgr.register_process(proc_id).unwrap();
+        for reserved in [[0u8; 32], cambios_abi::KERNEL_ORIGIN_SENDER] {
+            assert_eq!(
+                mgr.bind_principal(proc_id, Principal::from_aid(reserved)),
+                Err(CapabilityError::ReservedPrincipal),
+            );
+            assert!(mgr.get_principal(proc_id).is_err(), "nothing was bound");
+        }
+        // A real AID still binds afterwards.
+        mgr.bind_principal(proc_id, Principal::from_aid([0x42; 32])).unwrap();
     }
 
     #[test]

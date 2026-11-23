@@ -684,10 +684,11 @@ fn run() -> ! {
             sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
         });
 
-        // Kernel-facing endpoint: the kernel is the anonymous sender —
-        // trust is by endpoint choice; nobody else registers ep26. See
-        // the RawMessage docs for why poll_raw is legitimate here.
-        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+        // Kernel-facing endpoint: commands from the kernel itself.
+        // poll_kernel acts only on a message whose kernel-written sender
+        // field is the kernel origin (identity.md § Kernel transcribes);
+        // the kernel also refuses every user write to 26.
+        did_work |= ipc::poll_kernel(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
             let resp_len = handle_kernel_cmd(&mut driver, msg.payload(), &mut resp_buf);
             if resp_len > 0 {
                 sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf[..resp_len]);
@@ -715,16 +716,17 @@ fn no_device_loop() -> ! {
     loop {
         let mut did_work = false;
 
-        // NO_DEVICE responder: deliberately raw — any well-formed request
-        // (verified or not) gets the one-byte error so callers fail fast
-        // instead of timing out. No data path exists in this loop.
-        did_work |= ipc::poll_raw(BLK_ENDPOINT, &mut recv_buf, |msg| {
+        // NO_DEVICE responder: every request gets the one-byte error so
+        // callers fail fast instead of timing out. No data path exists in
+        // this loop. Verified receive admits every real sender (the kernel
+        // stamps every process's messages), so nothing is lost by it.
+        did_work |= ipc::poll_verified(BLK_ENDPOINT, &mut recv_buf, |msg| {
             sys::write(msg.from_endpoint(), &resp_buf);
         });
 
         // The kernel accepts only a reply that echoes its tag, so the
         // fast failure has to carry it.
-        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+        did_work |= ipc::poll_kernel(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
             if let Some(req) = decode_kernel_request(msg.payload()) {
                 let n = encode_kstatus_reply(STATUS_NO_DEVICE, req.tag, &mut kern_resp_buf);
                 sys::write(BLK_KERNEL_RESP_ENDPOINT, &kern_resp_buf[..n]);

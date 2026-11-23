@@ -22,5 +22,10 @@ build = "build.rs"
 [lib]
 path = "src/lib.rs"
 
+# capability.rs's bind_principal refuses the sender-field reserved values via
+# cambios_abi::WireSender (identity.md § Kernel transcribes). no_std, no deps.
+[dependencies]
+cambios-abi = { path = "../../cambios-abi" }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }

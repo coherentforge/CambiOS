@@ -78,9 +78,16 @@ pub mod ipc {
         pub const fn from_public_key(key: [u8; 32]) -> Self {
             Principal { public_key: key }
         }
+        pub const fn from_aid(aid: [u8; 32]) -> Self {
+            Principal { public_key: aid }
+        }
         pub const ZERO: Self = Principal { public_key: [0u8; 32] };
         pub fn is_zero(&self) -> bool {
             self.public_key == [0u8; 32]
+        }
+        /// Mirrors `Principal::aid` (the AID and the key coincide in v1).
+        pub fn aid(&self) -> &[u8; 32] {
+            &self.public_key
         }
     }
 
@@ -356,6 +363,41 @@ mod proofs {
         let boxed: Box<[Option<ProcessCapabilities>]> = v.into_boxed_slice();
         let slice: &'static mut [Option<ProcessCapabilities>] = Box::leak(boxed);
         CapabilityManager::from_object_slice(slice).unwrap()
+    }
+
+    /// C-19 — `bind_principal` binds no process to a value the message
+    /// sender field reserves (identity.md § Kernel transcribes). For every
+    /// 32-byte AID: if it decodes as anything but a Principal (all zero, or
+    /// the kernel origin), the bind is `Err(ReservedPrincipal)` and the
+    /// process stays unbound; otherwise the bind succeeds and the bound
+    /// Principal is exactly that AID. So a process's messages, stamped from
+    /// this table, never carry the kernel-origin value.
+    ///
+    /// Unwind covers: the 32-byte AID comparisons (`memcmp`, 32 iterations,
+    /// in `WireSender::decode` and the asserts) and the `make_manager` init
+    /// loop (3 iterations).
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn proof_bind_principal_refuses_reserved_sender_values() {
+        let mut mgr = make_manager(3);
+        let pid = ProcessId::new(1, 0);
+        mgr.register_process(pid).unwrap();
+
+        let aid: [u8; 32] = kani::any();
+        let result = mgr.bind_principal(pid, super::ipc::Principal::from_aid(aid));
+
+        match cambios_abi::WireSender::decode(&aid) {
+            cambios_abi::WireSender::Principal(_) => {
+                assert!(result.is_ok());
+                let bound = mgr.get_principal(pid).unwrap();
+                assert!(*bound.aid() == aid);
+                assert!(*bound.aid() != cambios_abi::KERNEL_ORIGIN_SENDER);
+            }
+            cambios_abi::WireSender::Unstamped | cambios_abi::WireSender::Kernel => {
+                assert!(matches!(result, Err(CapabilityError::ReservedPrincipal)));
+                assert!(mgr.get_principal(pid).is_err());
+            }
+        }
     }
 
     /// P3.9 — `lookup` (via `verify_access`) rejects any `ProcessId` whose

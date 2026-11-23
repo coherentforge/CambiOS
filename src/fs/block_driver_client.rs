@@ -256,24 +256,24 @@ impl BlockDriverClient {
         //    kernel is the only consumer and nothing is in flight.
         crate::SHARDED_IPC.clear_endpoint(EndpointId(BLK_KERNEL_RESP_ENDPOINT));
 
-        // 3. Build and send the request.
-        let mut msg = Message::new(
-            EndpointId(BLK_KERNEL_RESP_ENDPOINT),
-            EndpointId(BLK_KERNEL_CMD_ENDPOINT),
-        );
-        if msg.set_payload(request).is_err() {
-            return Err(BlockError::DeviceError);
-        }
+        // 3. Send the request. `send_from_kernel` stamps it with the kernel
+        //    origin, which the driver's kernel-origin receive requires
+        //    (identity.md § Kernel transcribes).
         if crate::SHARDED_IPC
-            .send_message(EndpointId(BLK_KERNEL_CMD_ENDPOINT), msg)
+            .send_from_kernel(
+                EndpointId(BLK_KERNEL_CMD_ENDPOINT),
+                EndpointId(BLK_KERNEL_RESP_ENDPOINT),
+                request,
+            )
             .is_err()
         {
             return Err(BlockError::DeviceError);
         }
 
         // 4. Wake any task blocked on the driver's command endpoint (the
-        //    driver's service loop uses `recv_verified(24)` / `recv_msg(26)`
-        //    which blocks on `MessageWait` when both queues are empty).
+        //    driver polls 24 with the verified receive and 26 with the
+        //    kernel-origin receive; a blocking receive parks on
+        //    `MessageWait` when the queue is empty).
         //    Plain-lock all-CPU wake — the prior try_lock loop could
         //    silently skip a contended scheduler, losing the wake (see
         //    wake_message_waiters_all_cpus). Syscall context, no lock held.
@@ -312,10 +312,10 @@ impl BlockDriverClient {
 
     /// The reply if it carries the driver's stamp and answers `tag`.
     fn accept(&self, reply: &Message, tag: u32) -> Option<Reply> {
-        let stamped = reply
-            .sender_principal
-            .as_ref()
-            .is_some_and(|p| p.aid() == self.driver.aid());
+        let stamped = matches!(
+            reply.sender(),
+            crate::ipc::Sender::Process(p) if p.aid() == self.driver.aid()
+        );
         if !stamped {
             return None;
         }

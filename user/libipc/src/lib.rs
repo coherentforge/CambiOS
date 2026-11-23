@@ -20,6 +20,9 @@
 //!   no `Box<dyn>` — the no-trait-objects rule holds in userspace
 //!   framework code too). Receives via `recv_verified` only: the
 //!   identity-gate invariant is structural, not per-service diligence.
+//!   [`KernelLoop`] / [`poll_kernel`] are the same shape for the two
+//!   endpoints that carry kernel instructions: they receive via
+//!   `recv_kernel`, which accepts only the kernel origin.
 //!
 //! The `Encode`/`Decode` derive the ADR discusses is deliberately absent.
 //! Revisit when: a second real request/response struct needs it (the
@@ -29,7 +32,7 @@
 #![forbid(unsafe_code)]
 
 use cambios_libsys as sys;
-pub use cambios_libsys::VerifiedMessage;
+pub use cambios_libsys::{KernelMessage, VerifiedMessage};
 
 // ============================================================================
 // ServiceError — the shared status vocabulary
@@ -294,55 +297,57 @@ impl<H: Handler> ServiceLoop<H> {
 }
 
 // ============================================================================
-// Multi-endpoint polling (the driver shape: ADR-037 Phase 1)
+// Kernel-origin messages: the policy service and the block drivers
 // ============================================================================
 
-/// A message whose trust anchor is **endpoint choice, not sender
-/// identity** — the kernel-command pattern. Kernel-origin messages carry
-/// no Principal (`recv_verified` structurally rejects them); a service
-/// accepts them only on an endpoint nothing else speaks on (virtio-blk's
-/// ep 26 is the precedent).
-///
-/// **Never use this for a user-facing endpoint.** User requests go
-/// through [`ServiceLoop`] / [`poll_verified`] and the identity gate.
-/// Reaching for [`poll_raw`] on an endpoint users can send to is the
-/// exact bypass the project's identity rules exist to prevent.
-pub struct RawMessage<'a> {
-    from_endpoint: u32,
-    payload: &'a [u8],
+/// Per-message dispatch for a service whose endpoint carries instructions
+/// from the kernel (the policy service on its query endpoint). The same
+/// contract as [`Handler`], over a [`KernelMessage`].
+pub trait KernelHandler {
+    /// Handle one kernel-origin message.
+    fn handle(&mut self, msg: &KernelMessage<'_>) -> Result<()>;
 }
 
-impl<'a> RawMessage<'a> {
-    /// Parse a received wire message (`wire` = the first `n` bytes the
-    /// kernel wrote: 36-byte header + payload). Returns `None` below the
-    /// 37-byte minimum (header + 1 payload byte). No identity check —
-    /// see the type docs for when that is legitimate.
-    pub fn parse(wire: &'a [u8]) -> Option<Self> {
-        if wire.len() < 37 {
-            return None;
+/// [`ServiceLoop`] for a kernel-origin endpoint: `recv_kernel` →
+/// [`KernelHandler::handle`] → yield when idle. Receives **only** via
+/// `recv_kernel`, so a service built on it acts only on messages whose
+/// kernel-written sender field is the kernel origin (identity.md § Kernel
+/// transcribes); a message from any process is dropped.
+pub struct KernelLoop<H: KernelHandler> {
+    endpoint: u32,
+    handler: H,
+}
+
+impl<H: KernelHandler> KernelLoop<H> {
+    /// A loop serving `endpoint` with `handler`.
+    pub const fn new(endpoint: u32, handler: H) -> Self {
+        Self { endpoint, handler }
+    }
+
+    /// Run forever. Empty queue, short message, or any sender but the
+    /// kernel yields the CPU; handler errors drop the message.
+    pub fn run(mut self) -> ! {
+        let mut buf = [0u8; RECV_BUF_SIZE];
+        loop {
+            match sys::recv_kernel(self.endpoint, &mut buf) {
+                Some(msg) => {
+                    let _ = self.handler.handle(&msg);
+                }
+                None => sys::yield_now(),
+            }
         }
-        let from_endpoint = u32::from_le_bytes([wire[32], wire[33], wire[34], wire[35]]);
-        Some(Self {
-            from_endpoint,
-            payload: &wire[36..],
-        })
-    }
-
-    /// The endpoint the sender named for replies.
-    pub const fn from_endpoint(&self) -> u32 {
-        self.from_endpoint
-    }
-
-    /// The payload bytes (after the 36-byte header).
-    pub const fn payload(&self) -> &'a [u8] {
-        self.payload
-    }
-
-    /// A [`Reader`] positioned at the start of the payload.
-    pub fn reader(&self) -> Reader<'a> {
-        Reader::new(self.payload)
     }
 }
+
+impl MessageExt for KernelMessage<'_> {
+    fn reader(&self) -> Reader<'_> {
+        Reader::new(self.payload())
+    }
+}
+
+// ============================================================================
+// Multi-endpoint polling (the driver shape: ADR-037 Phase 1)
+// ============================================================================
 
 /// Poll a **verified** endpoint without blocking; run `f` if an
 /// identity-verified message is queued. Returns `true` if a message was
@@ -361,20 +366,13 @@ pub fn poll_verified(endpoint: u32, buf: &mut [u8], f: impl FnOnce(&VerifiedMess
     }
 }
 
-/// Poll a **kernel-trusted raw** endpoint without blocking; run `f` if a
-/// message is queued. Trust is by endpoint choice — read the
-/// [`RawMessage`] docs before using this anywhere new. Returns `true`
-/// if a message was consumed.
-pub fn poll_raw(endpoint: u32, buf: &mut [u8], f: impl FnOnce(&RawMessage<'_>)) -> bool {
-    let n = sys::try_recv_msg(endpoint, buf);
-    if n <= 0 {
-        return false;
-    }
-    let total = n as usize;
-    if total > buf.len() {
-        return false;
-    }
-    match RawMessage::parse(&buf[..total]) {
+/// Poll a **kernel-origin** endpoint without blocking; run `f` if a
+/// message the kernel itself sent is queued. Returns `true` if a message
+/// was consumed. A queued message from any process is dropped and returns
+/// `false`, as [`poll_verified`] does for unverified senders. Replaces the
+/// old `poll_raw`, which trusted the endpoint number alone.
+pub fn poll_kernel(endpoint: u32, buf: &mut [u8], f: impl FnOnce(&KernelMessage<'_>)) -> bool {
+    match sys::try_recv_kernel(endpoint, buf) {
         Some(msg) => {
             f(&msg);
             true
@@ -462,30 +460,6 @@ mod tests {
         let mut w8 = Writer::new(&mut buf8);
         w8.put_u64(u64::MAX).unwrap();
         assert_eq!(w8.put_bytes(&[]), Ok(())); // zero-length always fits
-    }
-
-    #[test]
-    fn raw_message_parses_header_and_payload() {
-        let mut wire = [0u8; 40];
-        // 32 zero principal bytes (anonymous — RawMessage doesn't care),
-        // then from_endpoint = 25 LE, then 4 payload bytes.
-        wire[32..36].copy_from_slice(&25u32.to_le_bytes());
-        wire[36..40].copy_from_slice(&[9, 8, 7, 6]);
-        let msg = RawMessage::parse(&wire).unwrap();
-        assert_eq!(msg.from_endpoint(), 25);
-        assert_eq!(msg.payload(), &[9, 8, 7, 6]);
-        let mut r = msg.reader();
-        assert_eq!(r.u8().unwrap(), 9);
-    }
-
-    #[test]
-    fn raw_message_rejects_below_minimum() {
-        // 36 bytes = header with zero payload bytes -> below the 37 minimum.
-        assert!(RawMessage::parse(&[0u8; 36]).is_none());
-        assert!(RawMessage::parse(&[]).is_none());
-        // Exactly 37 = header + 1 payload byte -> parses.
-        let msg = RawMessage::parse(&[0u8; 37]).unwrap();
-        assert_eq!(msg.payload().len(), 1);
     }
 
     #[test]

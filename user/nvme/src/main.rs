@@ -314,7 +314,8 @@ fn run() -> ! {
             let resp_len = handle_user_cmd(&mut driver, msg.payload()[0], &mut resp_buf);
             sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
         });
-        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+        // Kernel commands: poll_kernel acts only on the kernel origin.
+        did_work |= ipc::poll_kernel(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
             let resp_len = handle_kernel_cmd(&mut driver, msg.payload(), &mut resp_buf);
             if resp_len > 0 {
                 sys::write(BLK_KERNEL_RESP_ENDPOINT, &resp_buf[..resp_len]);
@@ -338,12 +339,12 @@ fn no_device_loop() -> ! {
     let mut kern_resp = [0u8; 16];
     loop {
         let mut did_work = false;
-        did_work |= ipc::poll_raw(BLK_ENDPOINT, &mut recv_buf, |msg| {
+        did_work |= ipc::poll_verified(BLK_ENDPOINT, &mut recv_buf, |msg| {
             sys::write(msg.from_endpoint(), &resp);
         });
         // The kernel accepts only a reply that echoes its tag, so the
         // fast failure has to carry it.
-        did_work |= ipc::poll_raw(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
+        did_work |= ipc::poll_kernel(BLK_KERNEL_CMD_ENDPOINT, &mut kern_recv_buf, |msg| {
             if let Some(req) = decode_kernel_request(msg.payload()) {
                 let n = encode_kstatus_reply(STATUS_NO_DEVICE, req.tag, &mut kern_resp);
                 sys::write(BLK_KERNEL_RESP_ENDPOINT, &kern_resp[..n]);

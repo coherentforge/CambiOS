@@ -212,6 +212,19 @@ fn deny_kernel_endpoint(ctx: &SyscallContext, endpoint_id: u32) -> SyscallResult
     Err(SyscallError::PermissionDenied)
 }
 
+/// The 36-byte header a receiver sees ahead of the payload:
+/// `[sender:32][from_endpoint:4 LE]`. The sender field is the kernel's
+/// stamp (`Sender::wire`: the kernel-origin value or the sending process's
+/// bound Principal), never bytes the sender supplied; its meaning is
+/// `cambios_abi::WireSender`.
+fn receive_header(msg: &crate::ipc::Message) -> [u8; 36] {
+    let mut header = [0u8; 36];
+    let (sender, from) = header.split_at_mut(32);
+    sender.copy_from_slice(&msg.sender().wire());
+    from.copy_from_slice(&msg.from.0.to_le_bytes());
+    header
+}
+
 /// Copy a `len`-byte user message (1..=256, checked by the caller) into a
 /// kernel buffer. ADR-020: typed `UserReadSlice`.
 fn read_user_message(
@@ -541,11 +554,11 @@ impl SyscallDispatcher {
         let mut msg = crate::ipc::Message::new(
             crate::ipc::EndpointId(ctx.process_id.slot()),
             ep,
+            sender,
         );
         if msg.set_payload(&kbuf[..len]).is_err() {
             return Err(SyscallError::InvalidArg);
         }
-        msg.sender_principal = Some(sender);
         if crate::SHARDED_IPC.send_message(ep, msg).is_err() {
             return Err(SyscallError::OutOfMemory);
         }
@@ -619,13 +632,9 @@ impl SyscallDispatcher {
             0
         };
         let from_ep = if reply_ep != 0 { reply_ep } else { ctx.process_id.slot() };
-        let mut msg = crate::ipc::Message::new(
-            crate::ipc::EndpointId(from_ep),
-            endpoint,
-        );
-        if msg.set_payload(&kbuf[..len]).is_err() {
-            return Err(SyscallError::InvalidArg);
-        }
+        // The message itself is built inside send_message_with_capability,
+        // stamped with the sender's bound Principal from the capability
+        // table.
 
         // Lock ordering: IPC_MANAGER(3) → CAPABILITY_MANAGER(4)
         let mut ipc_guard = crate::IPC_MANAGER.lock();
@@ -643,7 +652,13 @@ impl SyscallDispatcher {
         // overflow showed up as a fake cap-denied event in audit-tail and
         // saturated serial. Operational errors return an EAGAIN-shaped
         // status so the caller can react, but no audit emit.
-        match ipc_mgr.send_message_with_capability(ctx.process_id, endpoint, msg, cap_mgr) {
+        match ipc_mgr.send_message_with_capability(
+            ctx.process_id,
+            endpoint,
+            crate::ipc::EndpointId(from_ep),
+            &kbuf[..len],
+            cap_mgr,
+        ) {
             Ok(()) => {}
             Err(crate::ipc::IpcError::PermissionDenied) => {
                 crate::audit::emit(crate::audit::RawAuditEvent::capability_denied(
@@ -1270,13 +1285,8 @@ impl SyscallDispatcher {
                 let payload = msg.payload();
                 let payload_len = core::cmp::min(payload.len(), buf_len - 36);
 
-                // Build response: [principal:32][from:4][payload:N]
-                let mut header = [0u8; 36];
-
-                if let Some(principal) = msg.sender_principal {
-                    header[0..32].copy_from_slice(principal.aid());
-                }
-                header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
+                // Build response: [sender:32][from:4][payload:N]
+                let header = receive_header(&msg);
 
                 // ADR-020 Phase B: header and payload are two separate
                 // typed slices at adjacent addresses. Each validates its
@@ -1448,11 +1458,7 @@ impl SyscallDispatcher {
             let payload = msg.payload();
             let payload_len = core::cmp::min(payload.len(), buf_len - 36);
 
-            let mut header = [0u8; 36];
-            if let Some(principal) = msg.sender_principal {
-                header[0..32].copy_from_slice(principal.aid());
-            }
-            header[32..36].copy_from_slice(&msg.from.0.to_le_bytes());
+            let header = receive_header(&msg);
 
             // ADR-020 Phase B: mirror handle_recv_msg — typed slices
             // per segment (header + payload). `checked_add` mirrors the

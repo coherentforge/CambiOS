@@ -269,7 +269,11 @@ mod tests {
     use super::*;
 
     fn make_msg(from: u32, to: u32, payload_len: usize) -> Message {
-        let mut msg = Message::new(EndpointId(from), EndpointId(to));
+        let mut msg = Message::new(
+            EndpointId(from),
+            EndpointId(to),
+            crate::ipc::Principal::from_aid([0x11; 32]),
+        );
         msg.payload_len = payload_len;
         msg
     }

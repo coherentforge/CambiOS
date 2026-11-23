@@ -40,7 +40,7 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Value | Meaning |
 | --- | --- |
 | **1 (behavior)** | Observable: "RecvMsg blocks on an empty queue and wakes on send." Tests are a natural fit; proofs sometimes apply. |
-| **2 (guarantee)** | Invariant: "Every IPC message's `sender_principal` equals the sender's bound Principal at send time." Proofs are the right tool; tests can corroborate. |
+| **2 (guarantee)** | Invariant: "Every IPC message a process sends carries that process's bound Principal as its sender." Proofs are the right tool; tests can corroborate. |
 | **3 (meaning)** | Intent: "Zero-trust: no operation is implicitly trusted." Always `Aspirational` — meaning-claims are not proof-shaped. Adjudicated by ADR review and red-team, never by a verifier. Layer-3 rows exist so the doc explicitly maps the territory verifiers cannot reach. |
 
 ## How to add rows
@@ -147,13 +147,13 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Gap          | Cross-module property (ProcessTable + CapabilityManager) — Kani's per-function model can't state the claim because the postcondition mentions invariants from two different modules. Targeted for the planned Kani→Verus pivot once contracts compose. The deliberate-fail-in-Kani artifact is row C-11's planned scaffold. |
 | Cited where  | [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md), `src/syscalls/dispatcher.rs::handle_exit` |
 
-## C-11: Identity transcription invariant — every IPC message's `sender_principal` equals the sender process's bound Principal at send time
+## C-11: Identity transcription invariant — every IPC message a process sends carries `Sender::Process` of that process's bound Principal at send time
 
 | Layer        | 2 |
 | Status       | Aspirational |
 | Backing      | prose only — [ADR-026](../docs/adr/026-identity-transcription-at-the-kernel-ring.md) |
 | Bound        | N/A |
-| Gap          | The entire claim. The property spans `IpcManager::send_message_with_capability` (stamps sender_principal) + `CapabilityManager::verify_access` (cap check) + `ProcessTable::lookup` (resolves caller's Principal) + `IpcInterceptor` (potential tampering). Four modules, three lock domains, no Kani vocabulary for stating it. The deliberate-Kani-failure step in the planned pivot turns this row's `Backing:` into "Kani harness X (deliberately fails to discharge); Verus harness Y (proven)" once the artifact lands. |
+| Gap          | The entire claim. The property spans `IpcManager::send_message_with_capability` (builds the message with the bound Principal as its sender) + `CapabilityManager::verify_access` (cap check) + `ProcessTable::lookup` (resolves caller's Principal) + `IpcInterceptor` (potential tampering). Four modules, three lock domains, no Kani vocabulary for stating it. The deliberate-Kani-failure step in the planned pivot turns this row's `Backing:` into "Kani harness X (deliberately fails to discharge); Verus harness Y (proven)" once the artifact lands. |
 | Cited where  | [ADR-026](../docs/adr/026-identity-transcription-at-the-kernel-ring.md), [identity.md](../docs/identity.md), [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md) |
 | Revisit when | Verus proof crate `verification/identity-proofs-verus/` lands with this claim as row 1; per the Kani→Verus pivot plan in `~/.claude/projects/.../memory/project_verification_claims_and_verus_pivot.md`. The ipc-proofs-failed/ Kani harness is the load-bearing artifact justifying the pivot. |
 
@@ -226,19 +226,28 @@ If a row would conflate two values (e.g. "Tested at the unit level but Proven at
 | Gap          | Authority paths 1 and 3 of ADR-007 § "Who can revoke" (original grantor, policy service) are not implemented, so nothing is proven about them. The proof is per-function on the capability table: it does not cover `handle_revoke_capability`'s argument handling, the audit emit (compiled out of the proof crate), or channel-role unmap (stubbed in the kernel). History worth keeping: these three harnesses replace one for the retired bootstrap-only rule, which stopped compiling on 2026-09-15 (`e40096e`). From that commit until this row landed the capability crate did not build, and its required CI check reported success without running, because the workflow skips Kani when no proof input changes. Rows C-5 and C-10 were not backed during that window. |
 | Cited where  | [ADR-007](../docs/adr/007-capability-revocation-and-telemetry.md) § "Who can revoke", `src/ipc/capability.rs::CapabilityManager::revoke` |
 
+## C-19: No process is bound to a value the message sender field reserves, so no process's messages carry the kernel origin
+
+| Layer        | 2 |
+| Status       | Proven |
+| Backing      | `verification/capability-proofs::proof_bind_principal_refuses_reserved_sender_values`; host tests `src/ipc/capability.rs::tests::test_bind_principal_refuses_reserved_values`, `src/ipc/mod.rs::tests::test_send_with_capability_stamps_every_endpoint_as_the_process` |
+| Bound        | 3-slot `CapabilityManager`, one registered process, the AID fully symbolic (every 32-byte value). Kani checks: a value that `cambios_abi::WireSender::decode` reads as unstamped or kernel is refused with `ReservedPrincipal` and leaves the process unbound; any other value binds and is returned unchanged by `get_principal`. The harness fails when the refusal is removed (checked 2026-11-22). |
+| Gap          | This is the table half of identity.md's forgery argument (closure 1). The other half, that a process's messages are stamped from this table and a `Sender::Kernel` message is built only by `ShardedIpcManager::send_from_kernel`, rests on the type (the private `Message::from_kernel` constructor) and on host tests, not on a proof; stating it needs the IPC send path in a proof crate. Overlaps C-11's gap. |
+| Cited where  | [identity.md](../docs/identity.md) § Kernel transcribes; never interprets, `src/ipc/capability.rs::CapabilityManager::bind_principal`, `cambios-abi::WireSender` |
+
 ---
 
 # Status summary
 
-As of 2026-11-04:
+As of 2026-11-22:
 
 | Status | Layer 1 | Layer 2 | Layer 3 | Total |
 | --- | --- | --- | --- | --- |
-| Proven | 0 | 8 | 0 | 8 |
+| Proven | 0 | 9 | 0 | 9 |
 | Tested | 1 | 2 | 0 | 3 |
 | Asserted | 1 | 0 | 0 | 1 |
 | Aspirational | 0 | 4 | 2 | 6 |
-| **Total** | **2** | **14** | **2** | **18** |
+| **Total** | **2** | **15** | **2** | **19** |
 
 The shape is what it should be at this stage: most of the load-bearing safety properties (parsers, allocator, capability manager, user-slice validators) have proof backing; the cross-module identity / authorization properties are honestly Aspirational with a concrete pivot plan; the meaning-claims are Aspirational by their nature and the doc explicitly says so. The two weak-memory TLB-shootdown ordering invariants (C-16, C-17) are a third honest-Aspirational kind: the barrier/fence is provably emitted (disassembly) but the only witness QEMU can give is no-regression, so real weakly-ordered SMP hardware or a litmus/Kani model is the path to a stronger status.
 

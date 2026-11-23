@@ -1173,6 +1173,56 @@ impl SyscallError {
 pub type SyscallResult = Result<u64, SyscallError>;
 
 // ============================================================================
+// Message sender field (identity.md § Kernel transcribes; never interprets)
+// ============================================================================
+//
+// A received message starts `[sender:32][from_endpoint:4]`, written by the
+// kernel on every receive; user code never supplies the sender bytes. These
+// definitions are the one place the kernel and libsys agree on what those 32
+// bytes mean.
+
+/// ARCHITECTURAL: the sender field of a message the kernel itself sent (a
+/// policy query, a block-driver command). The kernel is not a Principal, so
+/// its messages carry this origin value instead of an AID; the kernel refuses
+/// to bind any process to it, so no process's messages can carry it. Non-zero
+/// because zero already means "not stamped"; all 0xFF so it reads as reserved
+/// in a hex dump.
+pub const KERNEL_ORIGIN_SENDER: [u8; 32] = [0xFF; 32];
+
+/// The 32-byte sender field of a received message, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireSender {
+    /// All zero: the kernel did not stamp a sender. A stamping kernel never
+    /// writes it. Verified receive and kernel-origin receive both refuse it,
+    /// so a service running on a kernel that does not stamp stays inert.
+    Unstamped,
+    /// The kernel itself sent the message.
+    Kernel,
+    /// A process sent it; the bytes are that process's bound Principal AID.
+    Principal([u8; 32]),
+}
+
+impl WireSender {
+    /// Decode a sender field. Total: every 32-byte value is exactly one case.
+    pub fn decode(field: &[u8; 32]) -> Self {
+        if *field == [0u8; 32] {
+            Self::Unstamped
+        } else if *field == KERNEL_ORIGIN_SENDER {
+            Self::Kernel
+        } else {
+            Self::Principal(*field)
+        }
+    }
+
+    /// Whether `aid` may be bound to a process: neither of the two values
+    /// the sender field reserves. A process bound to either would have its
+    /// messages decode as something other than its own Principal.
+    pub fn is_bindable_aid(aid: &[u8; 32]) -> bool {
+        matches!(Self::decode(aid), Self::Principal(_))
+    }
+}
+
+// ============================================================================
 // Storage-stack handle types (ADR-028 § Decision 1)
 // ============================================================================
 //
@@ -1827,5 +1877,29 @@ mod tests {
             assert!(num.is_some(), "from_u64({}) returned None", i);
             let _ = num.unwrap().requires_identity();
         }
+    }
+
+    #[test]
+    fn wire_sender_decodes_each_reserved_value_and_nothing_else() {
+        use super::{WireSender, KERNEL_ORIGIN_SENDER};
+        assert_eq!(WireSender::decode(&[0u8; 32]), WireSender::Unstamped);
+        assert_eq!(WireSender::decode(&KERNEL_ORIGIN_SENDER), WireSender::Kernel);
+        assert_ne!(KERNEL_ORIGIN_SENDER, [0u8; 32]);
+        // Values one byte away from each reserved value are Principals.
+        let mut near_zero = [0u8; 32];
+        near_zero[31] = 1;
+        let mut near_kernel = KERNEL_ORIGIN_SENDER;
+        near_kernel[0] = 0xFE;
+        for aid in [near_zero, near_kernel, [0x42u8; 32]] {
+            assert_eq!(WireSender::decode(&aid), WireSender::Principal(aid));
+        }
+    }
+
+    #[test]
+    fn reserved_sender_values_are_not_bindable() {
+        use super::{WireSender, KERNEL_ORIGIN_SENDER};
+        assert!(!WireSender::is_bindable_aid(&[0u8; 32]));
+        assert!(!WireSender::is_bindable_aid(&KERNEL_ORIGIN_SENDER));
+        assert!(WireSender::is_bindable_aid(&[0x42u8; 32]));
     }
 }

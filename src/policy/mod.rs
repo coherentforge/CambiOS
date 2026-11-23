@@ -27,7 +27,7 @@
 //! boot wave): there is no one to ask.
 
 use crate::ipc::interceptor::InterceptDecision;
-use crate::ipc::{EndpointId, Message, ProcessId};
+use crate::ipc::ProcessId;
 use crate::scheduler::TaskId;
 use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU8;
@@ -124,7 +124,15 @@ pub const DECISION_EXPIRED: u8 = 3;
 // Wire format
 // ============================================================================
 
-/// Build a policy query message for the policy service.
+/// ARCHITECTURAL: the policy query wire size; the layout below fixes it.
+pub const POLICY_QUERY_LEN: usize = 48;
+
+/// Build a policy query payload for the policy service. The kernel sends
+/// it with `SHARDED_IPC.send_from_kernel`, so it carries the kernel origin
+/// (identity.md § Kernel transcribes) and the policy service's
+/// kernel-origin receive accepts it. Until 2026-11-22 queries were stamped
+/// with the bootstrap Principal as a stand-in, so that the service's
+/// verified receive would accept them.
 ///
 /// Query payload layout (48 bytes):
 /// ```text
@@ -133,37 +141,21 @@ pub const DECISION_EXPIRED: u8 = 3;
 /// [12..16] syscall_num: u32
 /// [16..48] caller_principal: [u8; 32]
 /// ```
-pub fn build_query_message(
+pub fn build_query_payload(
     query_id: u64,
     caller_pid: ProcessId,
     syscall_num: u32,
     caller_principal: &[u8; 32],
-) -> Message {
-    let mut msg = Message::new(
-        EndpointId(POLICY_RESP_ENDPOINT),   // from: response endpoint
-        EndpointId(POLICY_QUERY_ENDPOINT),  // to: query endpoint
-    );
-    // The kernel is the sender. Stamp the bootstrap Principal so the
-    // policy service's verified receive (libipc `ServiceLoop`, which
-    // drops anonymous messages by design) accepts the query. Without
-    // this no query was ever answered: every gated syscall sat out the
-    // full `POLICY_TIMEOUT_TICKS` and failed open — one second per
-    // gated syscall, on QEMU and on the Dell 3630 alike (found
-    // 2026-10-27 via the per-service boot times).
-    #[cfg(not(test))]
-    {
-        msg.sender_principal = Some(crate::BOOTSTRAP_PRINCIPAL.load());
-    }
-
-    let mut payload = [0u8; 48];
-    payload[0..8].copy_from_slice(&query_id.to_le_bytes());
-    payload[8..12].copy_from_slice(&caller_pid.slot().to_le_bytes());
-    payload[12..16].copy_from_slice(&syscall_num.to_le_bytes());
-    payload[16..48].copy_from_slice(caller_principal);
-
-    // SAFETY of unwrap: 48 < 256, set_payload cannot fail.
-    let _ = msg.set_payload(&payload);
-    msg
+) -> [u8; POLICY_QUERY_LEN] {
+    let mut payload = [0u8; POLICY_QUERY_LEN];
+    let (id, rest) = payload.split_at_mut(8);
+    let (pid, rest) = rest.split_at_mut(4);
+    let (sys, principal) = rest.split_at_mut(4);
+    id.copy_from_slice(&query_id.to_le_bytes());
+    pid.copy_from_slice(&caller_pid.slot().to_le_bytes());
+    sys.copy_from_slice(&syscall_num.to_le_bytes());
+    principal.copy_from_slice(caller_principal);
+    payload
 }
 
 /// Parse a policy response from the user-space policy service.
@@ -600,9 +592,13 @@ pub fn policy_check(
         // POLICY_ROUTER lock dropped
 
         // Build and send query message
-        let msg = build_query_message(query_id, process_id, syscall_num, &principal_bytes);
+        let payload = build_query_payload(query_id, process_id, syscall_num, &principal_bytes);
         if crate::SHARDED_IPC
-            .send_message(EndpointId(POLICY_QUERY_ENDPOINT), msg)
+            .send_from_kernel(
+                crate::ipc::EndpointId(POLICY_QUERY_ENDPOINT),
+                crate::ipc::EndpointId(POLICY_RESP_ENDPOINT), // from: the reply endpoint
+                &payload,
+            )
             .is_err()
         {
             // Queue full — withdraw the pending query; no decision, no permission.
@@ -985,17 +981,14 @@ mod tests {
     // --- Wire format tests ---
 
     #[test]
-    fn test_build_query_message() {
+    fn test_build_query_payload() {
         let principal = [0xABu8; 32];
-        let msg = build_query_message(42, ProcessId::new(5, 0), 7, &principal);
-        let p = msg.payload();
+        let p = build_query_payload(42, ProcessId::new(5, 0), 7, &principal);
         assert_eq!(p.len(), 48);
         assert_eq!(u64::from_le_bytes(p[0..8].try_into().unwrap()), 42);
         assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 5);
         assert_eq!(u32::from_le_bytes(p[12..16].try_into().unwrap()), 7);
         assert_eq!(&p[16..48], &[0xAB; 32]);
-        assert_eq!(msg.from, EndpointId(POLICY_RESP_ENDPOINT));
-        assert_eq!(msg.to, EndpointId(POLICY_QUERY_ENDPOINT));
     }
 
     #[test]

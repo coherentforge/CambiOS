@@ -934,10 +934,12 @@ impl<'a> VerifiedMessage<'a> {
 /// (36-byte header + 256 payload). Smaller buffers work but truncate.
 ///
 /// Returns `Some(VerifiedMessage)` only if a message is available AND the
-/// sender has a non-anonymous (non-zero) Principal. Returns `None` if:
+/// kernel stamped it with the sending process's Principal. Returns `None` if:
 /// - No message available (queue empty)
 /// - Message too short (< 37 bytes: 32 principal + 4 endpoint + 1 payload)
-/// - Sender principal is anonymous (all zeros)
+/// - Sender field unstamped (all zeros: a kernel that does not stamp)
+/// - Sender field is the kernel origin (kernel instructions go to
+///   [`recv_kernel`], never to a user-facing handler)
 ///
 /// This is the **only** way to obtain a `VerifiedMessage`. Services that
 /// use this function structurally cannot operate on a kernel that does not
@@ -956,41 +958,150 @@ pub fn recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMes
 /// stall that motivated `SYS_TRY_RECV_MSG`).
 ///
 /// Returns `None` for all of: queue empty, message too short, sender
-/// anonymous.
+/// unstamped, sender the kernel.
 pub fn try_recv_verified<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<VerifiedMessage<'a>> {
     let n = try_recv_msg(endpoint, buf);
     parse_verified(buf, n)
 }
 
 /// The one verification parser behind [`recv_verified`] and
-/// [`try_recv_verified`]: length check, Principal extraction, the
-/// structural anonymous-sender rejection, header split.
-fn parse_verified(buf: &mut [u8], n: i64) -> Option<VerifiedMessage<'_>> {
-    if n <= 0 {
+/// [`try_recv_verified`]: header split, then THE STRUCTURAL CHECK. Only a
+/// message stamped with a process's Principal passes: an unstamped sender
+/// field (a kernel that does not stamp) and the kernel-origin value are
+/// both refused, so a kernel instruction never reaches a handler written
+/// for user requests (identity.md § Kernel transcribes).
+fn parse_verified(buf: &[u8], n: i64) -> Option<VerifiedMessage<'_>> {
+    let (sender, from_endpoint, payload) = split_received(buf, n)?;
+    match sender {
+        cambios_abi::WireSender::Principal(aid) => Some(VerifiedMessage {
+            sender: Principal(aid),
+            from_endpoint,
+            payload,
+        }),
+        cambios_abi::WireSender::Unstamped | cambios_abi::WireSender::Kernel => None,
+    }
+}
+
+/// A message the kernel itself sent: a policy query, a block-driver
+/// command. Obtainable only from [`recv_kernel`] / [`try_recv_kernel`],
+/// which accept a message only if its kernel-written sender field is the
+/// kernel-origin value (`cambios_abi::KERNEL_ORIGIN_SENDER`). No process
+/// can produce that value: the kernel stamps every process's messages with
+/// its bound Principal and refuses to bind the reserved value.
+///
+/// For the two services that act on kernel instructions. A user-facing
+/// endpoint uses [`recv_verified`], which refuses kernel-origin messages.
+pub struct KernelMessage<'a> {
+    from_endpoint: u32,
+    payload: &'a [u8],
+}
+
+impl<'a> KernelMessage<'a> {
+    /// The endpoint the kernel named for replies.
+    pub fn from_endpoint(&self) -> u32 {
+        self.from_endpoint
+    }
+
+    /// The payload bytes (after the 36-byte header).
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+/// Receive a kernel-origin message on `endpoint` (blocking). `None` if the
+/// message is short or its sender is anything but the kernel.
+pub fn recv_kernel<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<KernelMessage<'a>> {
+    let n = recv_msg(endpoint, buf);
+    parse_kernel(buf, n)
+}
+
+/// Non-blocking [`recv_kernel`], for multi-endpoint poll loops (the same
+/// reason [`try_recv_verified`] exists).
+pub fn try_recv_kernel<'a>(endpoint: u32, buf: &'a mut [u8]) -> Option<KernelMessage<'a>> {
+    let n = try_recv_msg(endpoint, buf);
+    parse_kernel(buf, n)
+}
+
+/// The parser behind [`recv_kernel`] and [`try_recv_kernel`]: the same
+/// header split as [`parse_verified`]; only the kernel-origin sender passes.
+fn parse_kernel(buf: &[u8], n: i64) -> Option<KernelMessage<'_>> {
+    let (sender, from_endpoint, payload) = split_received(buf, n)?;
+    match sender {
+        cambios_abi::WireSender::Kernel => Some(KernelMessage { from_endpoint, payload }),
+        cambios_abi::WireSender::Unstamped | cambios_abi::WireSender::Principal(_) => None,
+    }
+}
+
+/// Split a received message (`n` = the receive syscall's return) into its
+/// decoded sender field, from-endpoint and payload. `None` for no message,
+/// a negative error, or fewer than 37 bytes (32 sender + 4 endpoint +
+/// 1 payload byte).
+fn split_received(buf: &[u8], n: i64) -> Option<(cambios_abi::WireSender, u32, &[u8])> {
+    let total = usize::try_from(n).ok()?;
+    let wire = buf.get(..total)?;
+    if total < 37 {
         return None;
     }
-    let total = n as usize;
-    // 32 principal + 4 endpoint + 1 minimum payload byte
-    if total < 37 || total > buf.len() {
-        return None;
+    let (sender, rest) = wire.split_at(32);
+    let (from, payload) = rest.split_at(4);
+    let sender: &[u8; 32] = sender.try_into().ok()?;
+    let from = u32::from_le_bytes(from.try_into().ok()?);
+    Some((cambios_abi::WireSender::decode(sender), from, payload))
+}
+
+#[cfg(test)]
+mod receive_parse_tests {
+    use super::*;
+
+    /// A received message as the kernel writes it: `[sender:32][from:4][payload]`.
+    fn wire(sender: [u8; 32], from: u32, payload: &[u8]) -> ([u8; 292], i64) {
+        let mut buf = [0u8; 292];
+        buf[..32].copy_from_slice(&sender);
+        buf[32..36].copy_from_slice(&from.to_le_bytes());
+        buf[36..36 + payload.len()].copy_from_slice(payload);
+        (buf, (36 + payload.len()) as i64)
     }
 
-    let mut principal_bytes = [0u8; 32];
-    principal_bytes.copy_from_slice(&buf[0..32]);
-    let principal = Principal(principal_bytes);
+    #[test]
+    fn verified_receive_accepts_only_a_process_principal() {
+        let (buf, n) = wire([0x42; 32], 9, b"hi");
+        let msg = parse_verified(&buf, n).expect("a process message passes");
+        assert_eq!(msg.sender().as_bytes(), &[0x42; 32]);
+        assert_eq!(msg.from_endpoint(), 9);
+        assert_eq!(msg.payload(), b"hi");
 
-    // THE STRUCTURAL CHECK: no principal, no message, no service.
-    if principal.is_anonymous() {
-        return None;
+        let (buf, n) = wire([0u8; 32], 9, b"hi");
+        assert!(parse_verified(&buf, n).is_none(), "unstamped is refused");
+        let (buf, n) = wire(cambios_abi::KERNEL_ORIGIN_SENDER, 9, b"hi");
+        assert!(parse_verified(&buf, n).is_none(), "kernel origin is refused");
     }
 
-    let from_endpoint = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+    #[test]
+    fn kernel_receive_accepts_only_the_kernel_origin() {
+        let (buf, n) = wire(cambios_abi::KERNEL_ORIGIN_SENDER, 25, b"cmd");
+        let msg = parse_kernel(&buf, n).expect("a kernel message passes");
+        assert_eq!(msg.from_endpoint(), 25);
+        assert_eq!(msg.payload(), b"cmd");
 
-    Some(VerifiedMessage {
-        sender: principal,
-        from_endpoint,
-        payload: &buf[36..total],
-    })
+        let (buf, n) = wire([0u8; 32], 25, b"cmd");
+        assert!(parse_kernel(&buf, n).is_none(), "unstamped is refused");
+        let (buf, n) = wire([0x42; 32], 25, b"cmd");
+        assert!(parse_kernel(&buf, n).is_none(), "a process is refused");
+        // A process cannot get the kernel value into the sender field by
+        // putting it in the payload: the sender is the first 32 bytes only.
+        let (buf, n) = wire([0x42; 32], 25, &cambios_abi::KERNEL_ORIGIN_SENDER);
+        assert!(parse_kernel(&buf, n).is_none());
+    }
+
+    #[test]
+    fn short_or_failed_receives_parse_to_nothing() {
+        let (buf, _) = wire(cambios_abi::KERNEL_ORIGIN_SENDER, 0, b"x");
+        for n in [-1i64, 0, 36] {
+            assert!(parse_kernel(&buf, n).is_none(), "n = {n}");
+            assert!(parse_verified(&buf, n).is_none(), "n = {n}");
+        }
+        assert!(parse_kernel(&buf, 293).is_none(), "longer than the buffer");
+    }
 }
 
 // ============================================================================
