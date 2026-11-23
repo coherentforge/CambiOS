@@ -223,6 +223,7 @@ make check-stable     # x86_64 + aarch64 only (escape hatch for temporary backen
 # reserves). On a macOS host `make test` also links the test binary as ELF, the format CI links, without running it.
 make test             # kernel library
 make test-user        # every package in the Makefile's HOST_TEST_CRATES (`make host-test-user-libsys` for one)
+make test-tools       # the Python tool tests, tools/test_*.py (stdlib unittest)
 make check-user       # every user crate builds for every architecture that lists it
 
 # What this machine has and lacks: toolchain, targets, emulator, firmware, hooks

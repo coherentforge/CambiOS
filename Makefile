@@ -356,6 +356,12 @@ $(foreach c,$(HOST_TEST_CRATES),$(eval $(call HOST_TEST_RULE,$(c))))
 test-user: $(foreach c,$(HOST_TEST_CRATES),host-test-$(subst /,-,$(c)))
 	@echo "=== host tests pass in $(words $(HOST_TEST_CRATES)) packages ==="
 
+# Host tests for the Python tools under tools/ (stdlib unittest, files
+# named tools/test_*.py). First: the pre-push gate's derived-lockfile rule.
+.PHONY: test-tools
+test-tools:
+	python3 -m unittest discover -s tools -p 'test_*.py'
+
 sign-tool:
 	@echo "=== Building ELF signing tool ==="
 	cd $(SIGN_ELF_DIR) && cargo build --release --target $(HOST_TARGET)

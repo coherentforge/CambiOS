@@ -39,6 +39,11 @@ What the hooks require of a commit is stated in the root [CLAUDE.md](../../CLAUD
 #    in .claude/settings.local.json (calls tools/log-claude-edit.py) plus
 #    `CLAUDE_PREFLIGHT_SESSION`. Warn-but-pass without an edit log.
 #    Checks only commits no remote-tracking ref already has.
+#    One derived-file case is accepted (2026-11-22): a Cargo.lock that
+#    cargo regenerated, when its sibling Cargo.toml changed in the same
+#    commit and is in the edit log, and only path-package lines changed.
+#    A `source =` / `checksum =` line (registry or git dependency) is
+#    still refused. Each acceptance prints a NOTICE. Tests: make test-tools.
 #    Scripts: tools/log-claude-edit.py + tools/check-edit-window.py.
 # All run automatically when installed via `make install-hooks`.
 ```
