@@ -2957,9 +2957,10 @@ impl SyscallDispatcher {
     /// Args: arg1 = channel_id (u64)
     ///
     /// Returns: user-space virtual address of the shared region, or negative error.
+    /// On any error the caller has no new mapping and no new region.
     ///
-    /// Lock ordering: CAPABILITY_MANAGER(4) → CHANNEL_MANAGER(5) →
-    /// PROCESS_TABLE(6) → FRAME_ALLOCATOR(7)
+    /// Lock ordering: CHANNEL_MANAGER(6) → PROCESS_TABLE(7) →
+    /// FRAME_ALLOCATOR(8), nested, held from the state check to the commit.
     fn handle_channel_attach(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
         use crate::ipc::channel::ChannelId;
 
@@ -2972,31 +2973,43 @@ impl SyscallDispatcher {
         // caller_principal already resolved by dispatch()
         let caller_principal = *ctx.caller_principal.as_ref().ok_or(SyscallError::PermissionDenied)?;
 
-        // --- Read channel record to get physical_base, num_pages, role ---
-        let (physical_base, num_pages, peer_writable) = {
-            let chan_guard = crate::CHANNEL_MANAGER.lock();
-            let chan_mgr = chan_guard.as_ref().ok_or(SyscallError::InvalidArg)?;
-            let record = chan_mgr.get(channel_id).map_err(|_| SyscallError::InvalidArg)?;
-
-            // Verify state and principal before allocating anything.
-            if record.state != crate::ipc::channel::ChannelState::AwaitingAttach {
-                return Err(SyscallError::InvalidArg);
-            }
-            if record.peer_principal != caller_principal {
-                return Err(SyscallError::PermissionDenied);
-            }
-
-            (record.physical_base, record.num_pages, record.role.peer_writable())
-        }; // drop CHANNEL_MANAGER(5) — will re-acquire below for the attach mutation
-
-        // --- Allocate VMA region + map into peer's page table ---
+        // Check, map and commit are one critical section under
+        // CHANNEL_MANAGER(6), nesting PROCESS_TABLE(7) → FRAME_ALLOCATOR(8)
+        // (downward, the cluster-revoke order). With the channel lock held
+        // from the state check to the commit, no close, revoke or second
+        // attacher can run in between. Taking them as three sections, with
+        // the mapping between two channel-lock holds, let the creator close
+        // an `AwaitingAttach` channel mid-map: the close freed the frames
+        // (the peer side was skipped, nothing recorded it), the commit then
+        // failed, and the caller kept a writable mapping of freed frames
+        // (sandbox review run 003, R2). Every failure after
+        // `allocate_region` unmaps what was mapped and releases the region,
+        // so a failed attach leaves the caller as it was (ADR-005: after
+        // ATTACH returns, the peer has the mapping; otherwise it has none).
+        // FRAME_ALLOCATOR and PROCESS_TABLE were already held across the
+        // whole map, so holding CHANNEL_MANAGER too adds no new hold time.
         let peer_vaddr = {
+            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
+            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
+
+            // --- Verify state and principal before allocating anything ---
+            let (physical_base, num_pages, peer_writable) = {
+                let record = chan_mgr.get(channel_id).map_err(|_| SyscallError::InvalidArg)?;
+                if record.state != crate::ipc::channel::ChannelState::AwaitingAttach {
+                    return Err(SyscallError::InvalidArg);
+                }
+                if record.peer_principal != caller_principal {
+                    return Err(SyscallError::PermissionDenied);
+                }
+                (record.physical_base, record.num_pages, record.role.peer_writable())
+            };
+
+            // --- Allocate VMA region + map into the caller's page table ---
             let mut pt_guard = crate::PROCESS_TABLE.lock();
             let vma = pt_guard
                 .as_mut()
                 .and_then(|pt| pt.vma_mut(ctx.process_id))
                 .ok_or(SyscallError::InvalidArg)?;
-
             let vaddr = vma
                 .allocate_region(num_pages)
                 .ok_or(SyscallError::OutOfMemory)?;
@@ -3007,33 +3020,62 @@ impl SyscallDispatcher {
                 crate::memory::paging::flags::user_ro()
             };
 
-            let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
-            // SAFETY: ctx.cr3 is a valid PML4/L0 for the peer process.
-            unsafe {
-                let mut pt = crate::memory::paging::page_table_from_cr3(ctx.cr3);
-                crate::memory::paging::map_range(
-                    &mut pt,
-                    vaddr,
-                    physical_base,
-                    num_pages as usize,
-                    flags,
-                    &mut fa_guard,
-                )
-                .map_err(|_| SyscallError::OutOfMemory)?;
-            }
-            drop(fa_guard);
-            drop(pt_guard);
-            vaddr
-        };
+            let committed = {
+                let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
+                // SAFETY: ctx.cr3 is the caller's own page-table root
+                // (checked non-zero above), live for the whole syscall;
+                // FRAME_ALLOCATOR is held across the walk (ADR-034 §1,
+                // occupancy class 2).
+                let mut pt = unsafe { crate::memory::paging::page_table_from_cr3(ctx.cr3) };
 
-        // --- Finalize attach in ChannelManager ---
-        {
-            let mut chan_guard = crate::CHANNEL_MANAGER.lock();
-            let chan_mgr = chan_guard.as_mut().ok_or(SyscallError::InvalidArg)?;
-            chan_mgr
-                .attach(channel_id, caller_principal, ctx.process_id, peer_vaddr)
-                .map_err(|_| SyscallError::InvalidArg)?;
-        }
+                // Map page by page, counting, so a failure part-way can
+                // unmap exactly what this call mapped. Bounded by
+                // `num_pages` <= MAX_CHANNEL_PAGES.
+                let mut mapped: usize = 0;
+                let mut map_ok = true;
+                while mapped < num_pages as usize {
+                    let off = mapped as u64 * 4096;
+                    if crate::memory::paging::map_page(
+                        &mut pt, vaddr + off, physical_base + off, flags, &mut fa_guard,
+                    )
+                    .is_err()
+                    {
+                        map_ok = false;
+                        break;
+                    }
+                    mapped += 1;
+                }
+
+                // Commit while every lock is still held. The checks above
+                // ran under this same channel-lock hold, so `attach` failing
+                // here is an invariant break; it is unwound all the same.
+                let committed = if map_ok {
+                    chan_mgr
+                        .attach(channel_id, caller_principal, ctx.process_id, vaddr)
+                        .map(|_| ())
+                        .map_err(|_| SyscallError::InvalidArg)
+                } else {
+                    Err(SyscallError::OutOfMemory)
+                };
+
+                if committed.is_err() {
+                    // The channel's frames are not the caller's: unmap them
+                    // and leave them to the channel record.
+                    for i in 0..mapped {
+                        let _ = crate::memory::paging::unmap_page(&mut pt, vaddr + i as u64 * 4096);
+                    }
+                }
+                committed
+            }; // drop FRAME_ALLOCATOR(8)
+
+            if let Err(e) = committed {
+                // The region holds no mapping now; dropping its entry is all
+                // that is left to undo.
+                let _ = vma.free_region(vaddr);
+                return Err(e);
+            }
+            vaddr
+        }; // drop PROCESS_TABLE(7), then CHANNEL_MANAGER(6)
 
         crate::audit::emit(crate::audit::RawAuditEvent::channel_attached(
             ctx.process_id, channel_id.as_raw(), crate::audit::now(), 0,
