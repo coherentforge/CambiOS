@@ -284,6 +284,14 @@ pub mod flags {
         PageFlags(DESC_UXN | DESC_PXN)
     }
 
+    /// Kernel MMIO: EL1 RW, no EL0 access, device memory
+    /// (Device-nGnRnE, AttrIndx 0), UXN + PXN. The leaf `early_map_mmio`
+    /// writes, for device pages mapped once the frame allocator is up.
+    /// Same name and contract as the x86_64 `flags::kernel_mmio`.
+    pub fn kernel_mmio() -> PageFlags {
+        PageFlags(DESC_UXN | DESC_PXN | DEVICE_MEMORY_FLAG)
+    }
+
     /// User read-only, executable from EL0.
     /// PXN set: kernel can't execute user pages.
     pub fn user_ro() -> PageFlags {

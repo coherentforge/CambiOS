@@ -8,8 +8,8 @@ src/acpi/mod.rs:143:MADT_TYPE_IO_APIC
 src/acpi/mod.rs:144:MADT_TYPE_INTERRUPT_SOURCE_OVERRIDE
 src/acpi/mod.rs:181:MAX_IO_APICS
 src/acpi/mod.rs:184:MAX_OVERRIDES
-src/arch/aarch64/gic.rs:33:MAX_CPUS
-src/arch/aarch64/gic.rs:202:DEVICE_VECTOR_BASE
+src/arch/aarch64/gic.rs:34:MAX_CPUS
+src/arch/aarch64/gic.rs:203:DEVICE_VECTOR_BASE
 src/arch/aarch64/mod.rs:160:USER_CS
 src/arch/aarch64/mod.rs:162:USER_SS
 src/arch/aarch64/mod.rs:164:KERNEL_CS

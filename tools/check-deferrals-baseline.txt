@@ -69,7 +69,7 @@ docs/identity.md:121:eventually
 docs/manuals/03-signature-chain.md:67:placeholder
 docs/review-protocol.md:76:deferred
 docs/storage-planning.md:42:deferred
-src/arch/aarch64/gic.rs:130:deferred
+src/arch/aarch64/gic.rs:131:deferred
 src/arch/aarch64/mod.rs:159:placeholder
 src/arch/aarch64/mod.rs:161:placeholder
 src/arch/aarch64/mod.rs:163:placeholder
@@ -95,11 +95,11 @@ src/lib.rs:1328:deferred
 src/lib.rs:1336:deferred
 src/memory/mod.rs:697:placeholder
 src/memory/mod.rs:706:placeholder
-src/microkernel/main.rs:1050:for-now
-src/microkernel/main.rs:1156:for-now
-src/microkernel/main.rs:2193:deferred
-src/microkernel/main.rs:2222:deferred
-src/microkernel/main.rs:2569:for-now
+src/microkernel/main.rs:1053:for-now
+src/microkernel/main.rs:1159:for-now
+src/microkernel/main.rs:2196:deferred
+src/microkernel/main.rs:2225:deferred
+src/microkernel/main.rs:2571:for-now
 src/platform/mod.rs:353:for-now
 src/process.rs:1327:deferred
 src/process.rs:1328:deferred

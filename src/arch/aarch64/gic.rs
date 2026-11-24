@@ -26,6 +26,7 @@
 //! | ICC_SGI1R_EL1   | Software Generated Interrupt     |
 
 use crate::arch::mmio::{ReadOnly, ReadWrite, RegVal};
+use crate::boot::BootError;
 use bitflags::bitflags;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -220,8 +221,43 @@ pub const DEVICE_VECTOR_BASE: u8 = 32;
 /// GICD base address (set during `init_distributor`).
 static GICD_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// GICR base address of CPU 0 (set during `init_redistributor`).
+/// HARDWARE: GICv3 Redistributor region base on QEMU `virt`
+/// (`base_memmap[VIRT_GIC_REDIST]`; the second `reg` entry of the GIC node
+/// in the DTB QEMU generates). Real hardware reads it from the device tree
+/// or the ACPI MADT GICR structure.
+pub const GICR_PHYS: u64 = 0x080A_0000;
+
+/// HARDWARE: size of QEMU `virt`'s low redistributor region
+/// (`base_memmap[VIRT_GIC_REDIST]`; DTB `reg` = 0x80a0000 + 0xf60000 on
+/// QEMU 11.1). The region ends where PL011 UART0 begins (0x0900_0000) and
+/// holds `GICR_REGION_CPUS` per-CPU frames. QEMU puts the redistributors of
+/// CPUs 123 and up in a second region (`VIRT_HIGH_GIC_REDIST2`,
+/// 0x40_0000_0000) that this kernel does not map; those CPUs are not woken.
+const GICR_REGION_BYTES: u64 = 0x00F6_0000;
+
+/// HARDWARE: 4 KiB pages in one CPU's redistributor frame (RD_base +
+/// SGI_base, two 64 KiB frames; Arm GIC Architecture Specification
+/// IHI 0069, redistributor memory map).
+const GICR_FRAME_PAGES: u64 = (core::mem::size_of::<GicrFrame>() as u64) / 0x1000;
+
+/// HARDWARE: CPUs whose redistributor frame lies in QEMU `virt`'s low
+/// region: `GICR_REGION_BYTES / size_of::<GicrFrame>()` = 123.
+pub const GICR_REGION_CPUS: u32 =
+    (GICR_REGION_BYTES / core::mem::size_of::<GicrFrame>() as u64) as u32;
+
+// Every CPU with a mapped redistributor also has a slot in the per-CPU
+// arrays sized by MAX_CPUS (`LAST_IAR`, the schedulers, percpu).
+const _: () = assert!(GICR_REGION_CPUS as usize <= MAX_CPUS);
+
+/// Kernel virtual address of CPU 0's redistributor frame (stored by
+/// `map_redistributors`).
 static GICR_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// CPUs, counting up from CPU 0, whose redistributor frame
+/// `map_redistributors` mapped. Zero until it runs. Written once by the BSP
+/// before any AP is woken (Release, after `GICR_BASE`); read by every CPU's
+/// `init_redistributor` and by AP bring-up (Acquire).
+static GICR_MAPPED_CPUS: AtomicU32 = AtomicU32::new(0);
 
 bitflags! {
     /// GICD_CTLR control bits (GICv3, Affinity Routing enabled, Non-Secure view).
@@ -381,9 +417,10 @@ unsafe fn gicd() -> &'static GicdRegs {
 /// Construct CPU `cpu_id`'s GICR per-CPU frame from the stored base.
 ///
 /// # Safety
-/// `GICR_BASE` must have been initialized (in `init_redistributor` for CPU 0)
-/// to a valid, mapped GICR region covering CPUs 0..=`cpu_id`, each a per-CPU
-/// frame of `size_of::<GicrFrame>()` (0x20000) with device memory attributes.
+/// `cpu_id` must be below `GICR_MAPPED_CPUS` (loaded with Acquire): then
+/// `map_redistributors` has mapped CPUs 0..=`cpu_id`'s frames, each
+/// `size_of::<GicrFrame>()` (0x20000) with device memory attributes, and
+/// stored their base in `GICR_BASE`.
 #[inline]
 unsafe fn gicr(cpu_id: u32) -> &'static GicrFrame {
     let base = GICR_BASE.load(Ordering::Relaxed) as usize;
@@ -437,19 +474,98 @@ pub unsafe fn init_distributor(gicd_base: u64) {
     regs.ctlr.write(GicdCtlr::ARE | GicdCtlr::ENABLE_GRP1NS);
 }
 
-/// Initialize the GIC Redistributor for a specific CPU.
+/// How many CPUs' redistributor frames to map when the boot protocol
+/// reports `reported` CPUs: every one whose frame QEMU `virt`'s low region
+/// holds, and at least the BSP's (no CPU list still means one CPU). Pure;
+/// the effectful half is `map_redistributors`.
+pub const fn redistributor_cpus_to_map(reported: usize) -> u32 {
+    let wanted = if reported == 0 { 1 } else { reported };
+    if wanted > GICR_REGION_CPUS as usize {
+        GICR_REGION_CPUS
+    } else {
+        wanted as u32
+    }
+}
+
+/// CPUs, counting up from CPU 0, whose redistributor frame is mapped. AP
+/// bring-up wakes only CPUs whose logical index is below this count.
+pub fn mapped_redistributors() -> u32 {
+    GICR_MAPPED_CPUS.load(Ordering::Acquire)
+}
+
+/// Map the redistributor frames of the first
+/// `redistributor_cpus_to_map(reported)` CPUs into the kernel half
+/// (HHDM + phys, Device-nGnRnE) through the frame allocator, and publish the
+/// count for `init_redistributor` and AP bring-up. Returns the count.
 ///
-/// Wakes the redistributor and enables PPI 30 (ARM Generic Timer).
+/// Limine's aarch64 HHDM does not cover device MMIO. These frames are not
+/// mapped by `early_map_mmio`: its three bootstrap tables reach only the
+/// 2 MiB block that also holds the GICD, which ends at CPU 11's frame
+/// (0x0820_0000), and nothing touches the GICR before the BSP's
+/// `init_redistributor`.
 ///
 /// # Safety
-/// Must be called once per CPU during boot. GICR MMIO must be mapped.
-pub unsafe fn init_redistributor(gicr_base: u64, cpu_id: u32) {
-    if cpu_id == 0 {
-        GICR_BASE.store(gicr_base, Ordering::Release);
+/// Call once, on the BSP, during single-threaded boot, after the frame
+/// allocator and the HHDM offset are initialized and before any AP is woken.
+pub unsafe fn map_redistributors(reported: usize) -> Result<u32, BootError> {
+    let cpus = redistributor_cpus_to_map(reported);
+    let hhdm = crate::hhdm_offset();
+    // SAFETY: reading TTBR1_EL1 at EL1 is always valid; it holds the kernel
+    // page-table root.
+    let root_phys = unsafe { crate::arch::aarch64::paging::kernel_root_phys() };
+    // SAFETY: `root_phys` is the kernel page-table root read just above;
+    // single-threaded boot (caller contract), so no other reference to it
+    // is live.
+    let mut pt = unsafe { crate::memory::paging::page_table_from_cr3(root_phys) };
+    {
+        let mut fa = crate::FRAME_ALLOCATOR.lock();
+        // Bounded: cpus <= GICR_REGION_CPUS (123), so at most 3,936 pages.
+        let pages = u64::from(cpus) * GICR_FRAME_PAGES;
+        for page in 0..pages {
+            let phys = GICR_PHYS + page * 0x1000;
+            // A frame already mapped means this ran twice or something else
+            // claimed the region with unknown attributes: refuse either way.
+            crate::memory::paging::map_page(
+                &mut pt,
+                phys + hhdm,
+                phys,
+                crate::memory::paging::flags::kernel_mmio(),
+                &mut fa,
+            )
+            .map_err(|_| BootError::GicRedistributorMapFailed)?;
+        }
     }
-    // SAFETY: `GICR_BASE` was set on CPU 0 before any AP runs (ADR-036 § 3);
-    // the caller mapped this CPU's redistributor frame. One construction; all
-    // field accesses below are safe.
+    GICR_BASE.store(GICR_PHYS + hhdm, Ordering::Release);
+    GICR_MAPPED_CPUS.store(cpus, Ordering::Release);
+    Ok(cpus)
+}
+
+/// Initialize the GIC Redistributor for a specific CPU.
+///
+/// Wakes the redistributor and enables PPI 30 (ARM Generic Timer). A
+/// `cpu_id` whose frame `map_redistributors` did not map is refused with
+/// `GicRedistributorUnmapped` instead of faulting on the access.
+///
+/// Frames are found by index (`GICR_BASE + cpu_id * 0x20000`), which
+/// assumes the logical CPU index AP bring-up assigns (Limine's CPU order,
+/// BSP first) is the redistributor order.
+/// Deferred: match frames by `GICR_TYPER.Affinity_Value` against MPIDR.
+/// Why: the order matches on QEMU `virt`, the only aarch64 target that
+/// boots; matching needs `GICR_TYPER` in the typed frame.
+/// Revisit when: a non-QEMU aarch64 target boots (same trigger as
+/// `ECAM_PHYS_AARCH64`; its redistributor base comes from the DTB or MADT).
+///
+/// # Safety
+/// Call once per CPU, on that CPU, during boot with interrupts masked, after
+/// `map_redistributors` ran on the BSP. `cpu_id` is the CPU's logical index.
+pub unsafe fn init_redistributor(cpu_id: u32) -> Result<(), BootError> {
+    if cpu_id >= GICR_MAPPED_CPUS.load(Ordering::Acquire) {
+        return Err(BootError::GicRedistributorUnmapped);
+    }
+    // SAFETY: `cpu_id` is below the mapped count just loaded with Acquire,
+    // so `map_redistributors` mapped its frame (Device-nGnRnE) and stored
+    // `GICR_BASE` before publishing that count (ADR-036 § 3). One
+    // construction; all field accesses below are safe.
     let frame = unsafe { gicr(cpu_id) };
 
     // Wake the redistributor: clear ProcessorSleep, then wait for ChildrenAsleep.
@@ -481,6 +597,7 @@ pub unsafe fn init_redistributor(gicr_base: u64, cpu_id: u32) {
     frame.sgi.isenabler0.write(1 << 30);
 
     crate::println!("  GIC Redistributor: CPU {} woken, PPI 30 enabled", cpu_id);
+    Ok(())
 }
 
 /// Enable a Shared Peripheral Interrupt (SPI) in the distributor.
@@ -596,11 +713,41 @@ mod tests {
         // Each CPU's GICR frame is 0x20000 (two 64 KiB frames). The typed
         // GicrFrame block's size IS that stride, used directly in `gicr()`.
         assert_eq!(core::mem::size_of::<GicrFrame>(), 0x20000);
-        let base = 0x080A_0000u64;
+        let base = GICR_PHYS;
         let stride = core::mem::size_of::<GicrFrame>() as u64;
         assert_eq!(base + 0 * stride, 0x080A_0000);
         assert_eq!(base + 1 * stride, 0x080C_0000);
         assert_eq!(base + 3 * stride, 0x0810_0000);
+        // CPUs 4 and 5: the frames the 4-CPU early mapping left unmapped
+        // (`-smp 6` faulted reading GICR_WAKER at +0x14 of each).
+        assert_eq!(base + 4 * stride, 0x0812_0000);
+        assert_eq!(base + 5 * stride, 0x0814_0000);
+    }
+
+    #[test]
+    fn test_gicr_region_matches_qemu_virt_memmap() {
+        // The low region ends exactly at PL011 UART0 and holds 123 frames
+        // (QEMU 11.1 DTB: reg = 0x80a0000 + 0xf60000).
+        assert_eq!(GICR_PHYS + GICR_REGION_BYTES, 0x0900_0000);
+        assert_eq!(GICR_REGION_CPUS, 123);
+        assert_eq!(GICR_FRAME_PAGES, 32);
+        // The last mapped frame stays below the UART.
+        let last_end = GICR_PHYS
+            + u64::from(GICR_REGION_CPUS) * core::mem::size_of::<GicrFrame>() as u64;
+        assert!(last_end <= 0x0900_0000);
+    }
+
+    #[test]
+    fn test_redistributor_cpus_to_map() {
+        assert_eq!(redistributor_cpus_to_map(0), 1); // no CPU list: the BSP
+        assert_eq!(redistributor_cpus_to_map(1), 1);
+        assert_eq!(redistributor_cpus_to_map(2), 2);
+        assert_eq!(redistributor_cpus_to_map(4), 4);
+        assert_eq!(redistributor_cpus_to_map(6), 6);
+        assert_eq!(redistributor_cpus_to_map(123), 123);
+        assert_eq!(redistributor_cpus_to_map(124), 123); // high region not mapped
+        assert_eq!(redistributor_cpus_to_map(MAX_CPUS), 123);
+        assert_eq!(redistributor_cpus_to_map(usize::MAX), 123);
     }
 
     #[test]

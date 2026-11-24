@@ -67,6 +67,18 @@ pub enum BootError {
     /// Site: `src/microkernel/main.rs` `plic::init(...)` expect on riscv64.
     PlicInitFailed,
 
+    /// Mapping the GICv3 redistributor frames into the kernel half
+    /// failed (frame allocator exhausted, or a frame already mapped).
+    /// Site: `src/arch/aarch64/gic.rs` `map_redistributors`.
+    GicRedistributorMapFailed,
+
+    /// A CPU tried to initialize a redistributor whose frame was never
+    /// mapped: `map_redistributors` did not run first, or the CPU's
+    /// index lies past the mapped count. A boot-sequencing bug; AP
+    /// bring-up wakes only CPUs with a mapped frame.
+    /// Site: `src/arch/aarch64/gic.rs` `init_redistributor`.
+    GicRedistributorUnmapped,
+
     // ── Early-heap allocations during interrupt setup ──
 
     /// `Layout::from_size_align` failed for the double-fault IST stack.
@@ -181,6 +193,10 @@ pub fn boot_failed(err: BootError) -> ! {
             "APIC timer calibration failed (bus frequency zero)",
         BootError::PlicInitFailed =>
             "PLIC init failed (DTB PLIC address range implausible)",
+        BootError::GicRedistributorMapFailed =>
+            "GIC redistributor frames could not be mapped",
+        BootError::GicRedistributorUnmapped =>
+            "CPU initialized a GIC redistributor whose frame is not mapped",
         BootError::IstStackLayoutInvalid =>
             "IST stack layout computation failed",
         BootError::IstStackAllocFailed =>
@@ -234,6 +250,8 @@ mod tests {
             BootError::ApicInitFailed,
             BootError::ApicCalibrationFailed,
             BootError::PlicInitFailed,
+            BootError::GicRedistributorMapFailed,
+            BootError::GicRedistributorUnmapped,
             BootError::IstStackLayoutInvalid,
             BootError::IstStackAllocFailed,
             BootError::TimerFrequencyMissing,
@@ -273,6 +291,8 @@ mod tests {
             BootError::ApicInitFailed,
             BootError::ApicCalibrationFailed,
             BootError::PlicInitFailed,
+            BootError::GicRedistributorMapFailed,
+            BootError::GicRedistributorUnmapped,
             BootError::IstStackLayoutInvalid,
             BootError::IstStackAllocFailed,
             BootError::TimerFrequencyMissing,
@@ -282,6 +302,7 @@ mod tests {
             BootError::ManifestMalformed,
             BootError::ManifestInconsistent,
             BootError::ManifestTranscriptionFailed,
+            BootError::ManifestRetainFailed,
             BootError::ManifestModuleMissing,
             BootError::InitModuleMissing,
             BootError::InitCreationFailed,

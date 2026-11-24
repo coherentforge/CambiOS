@@ -214,16 +214,9 @@ unsafe extern "C" fn kmain() -> ! {
             }
         }
 
-        // GIC Redistributor at 0x080A_0000 (QEMU virt). Each CPU's GICR
-        // frame is 128 KiB (0x20000 stride, two 64 KiB frames).
-        // Map enough for 4 CPUs: 4 × 32 pages = 128 pages = 512 KiB.
-        for page in 0..128u64 {
-            // SAFETY: same invariants as PL011 mapping above.
-            if unsafe { early_map_mmio(0x080A_0000 + page * 0x1000) }.is_err() {
-                // SAFETY: wfe is unconditionally legal at EL1.
-                loop { unsafe { core::arch::asm!("wfe", options(nostack, nomem)); } }
-            }
-        }
+        // The GIC Redistributor frames are not mapped here: one per CPU
+        // Limine reports, they are mapped through the frame allocator just
+        // before the BSP's `init_redistributor` (`gic::map_redistributors`).
     }
 
     // Early diagnostic on AArch64: write to PL011 via HHDM to confirm entry.
@@ -527,9 +520,6 @@ unsafe extern "C" fn kmain() -> ! {
         /// Platform-fixed by QEMU's `virt` machine; real hardware
         /// discovers this from the device tree or ACPI MADT.
         const GICD_PHYS: u64 = 0x0800_0000;
-        /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`.
-        /// Platform-fixed by QEMU; see `GICD_PHYS` above.
-        const GICR_PHYS: u64 = 0x080A_0000;
         let hhdm = cambios_core::hhdm_offset();
         // SAFETY: `init_distributor` requires one call during
         // single-threaded boot with the GICD region mapped. `kmain`'s
@@ -540,13 +530,26 @@ unsafe extern "C" fn kmain() -> ! {
         }
         println!("  ✓ GIC Distributor initialized");
 
-        // Initialize GIC Redistributor for BSP (PPI 30 = timer)
-        // SAFETY: `init_redistributor` requires one call per CPU with
-        // that CPU's GICR frame mapped. CPU 0's frame is the first of the
-        // 128 pages from GICR_PHYS that `kmain`'s early MMIO setup mapped.
-        unsafe {
-            cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, 0);
-        }
+        // Map one GIC Redistributor frame per CPU Limine reports (bounded
+        // by the redistributor region; AP bring-up wakes only CPUs with a
+        // mapped frame), then initialize the BSP's (PPI 30 = timer).
+        // ADR-021: typed BootError propagation.
+        let reported_cpus = MP_REQUEST.get_response().map_or(1, |r| r.cpus().len());
+        // SAFETY: `map_redistributors` requires one call on the BSP during
+        // single-threaded boot, after the frame allocator and HHDM offset
+        // are initialized and before any AP is woken: both inits ran above,
+        // and `start_application_processors` runs below.
+        let mapped = unsafe { cambios_core::arch::aarch64::gic::map_redistributors(reported_cpus) };
+        let mapped = mapped.unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
+        println!(
+            "  ✓ GIC Redistributor frames mapped for {} of {} CPU(s)",
+            mapped, reported_cpus,
+        );
+        // SAFETY: `init_redistributor` requires one call per CPU, on that
+        // CPU, with interrupts masked and after `map_redistributors`: this
+        // is the BSP's (CPU 0) call, DAIF.I is set, and the map ran above.
+        let gicr = unsafe { cambios_core::arch::aarch64::gic::init_redistributor(0) };
+        gicr.unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
         println!("  ✓ GIC Redistributor initialized (CPU 0)");
 
         // Start ARM Generic Timer at 100 Hz
@@ -2402,19 +2405,18 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     }
 
     // Step 5: Initialize GIC Redistributor for this AP
-    /// HARDWARE: ARM GICv3 Redistributor base on QEMU `virt`;
-    /// matches the BSP constant of the same name above. Every
-    /// AP walks its own redistributor at `base + cpu_index*stride`
-    /// inside `init_redistributor`.
-    const GICR_PHYS: u64 = 0x080A_0000;
-    let hhdm = cambios_core::hhdm_offset();
-    // SAFETY: `init_redistributor` requires one call per CPU with that
-    // CPU's GICR frame mapped. `kmain`'s early MMIO setup maps the frames
-    // of CPUs 0-3 (128 pages from GICR_PHYS), so this holds for
-    // `cpu_index` < 4; every QEMU target runs `-smp 2`.
-    unsafe {
-        cambios_core::arch::aarch64::gic::init_redistributor(GICR_PHYS + hhdm, cpu_index as u32);
-    }
+    // ADR-021: an AP whose frame is not mapped gets a typed failure, not
+    // a data abort. `start_application_processors` wakes only CPUs whose
+    // index is below `gic::mapped_redistributors()`, so it does not fire.
+    // SAFETY: `init_redistributor` requires one call per CPU, on that CPU,
+    // with interrupts masked and after the BSP's `map_redistributors`:
+    // this is this AP's call, DAIF.I is set until step 9, and the BSP
+    // mapped the frames before waking any AP. It checks `cpu_index`
+    // against the mapped count itself.
+    let gicr = unsafe {
+        cambios_core::arch::aarch64::gic::init_redistributor(cpu_index as u32)
+    };
+    gicr.unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
 
     // Step 6: Start ARM Generic Timer (reuses BSP's frequency/reload values)
     // ADR-021: AP discovers if BSP forgot to init the timer.
@@ -2681,8 +2683,16 @@ unsafe fn start_application_processors() {
 
     println!("  Waking {} AP(s) (total CPUs: {})...", ap_count, total_cpus);
 
+    // An AArch64 AP needs a mapped GIC Redistributor frame for its timer
+    // interrupt. The BSP mapped one per reported CPU, bounded by the
+    // redistributor region (`gic::map_redistributors`); a CPU past that
+    // count is not woken rather than left to fault in `ap_entry`.
+    #[cfg(target_arch = "aarch64")]
+    let wakeable = cambios_core::arch::aarch64::gic::mapped_redistributors() as usize;
+
     // Assign logical CPU indices and wake each AP
     let mut cpu_index: usize = 1; // BSP = 0, APs start at 1
+    let mut dispatched: u32 = 0;
     for cpu in cpus.iter() {
         #[cfg(target_arch = "x86_64")]
         let is_bsp = cpu.lapic_id as u64 == bsp_id;
@@ -2692,6 +2702,15 @@ unsafe fn start_application_processors() {
             continue; // Skip BSP
         }
 
+        #[cfg(target_arch = "aarch64")]
+        if cpu_index >= wakeable {
+            println!(
+                "  ⚠ {} AP(s) not woken: GIC Redistributor frames mapped for {} CPU(s)",
+                ap_count - dispatched as usize, wakeable,
+            );
+            break;
+        }
+
         // Store the logical CPU index in the `extra` field for the AP to read
         cpu.extra.store(cpu_index as u64, core::sync::atomic::Ordering::Release);
 
@@ -2699,10 +2718,11 @@ unsafe fn start_application_processors() {
         cpu.goto_address.write(ap_entry);
 
         cpu_index += 1;
+        dispatched += 1;
     }
 
-    // Wait for all APs to signal ready (with timeout)
-    let expected = ap_count as u32;
+    // Wait for every woken AP to signal ready (with timeout)
+    let expected = dispatched;
     let mut spin_count: u64 = 0;
     /// TUNING: spin-loop ceiling while waiting for all APs to reach
     /// their ready signal. 100M ≈ a few seconds on modern hardware,
