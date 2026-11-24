@@ -65,7 +65,11 @@ const DESC_ATTR_DEVICE: u64 = 0 << 2;
 const DESC_PXN: u64 = 1 << 53;
 /// UXN: User eXecute Never.
 const DESC_UXN: u64 = 1 << 54;
-/// Mask for output address bits [47:12].
+/// HARDWARE: APTable[0], table descriptors only: no EL0 access below (VMSAv8-64 table descriptor).
+const DESC_APTABLE_NO_EL0: u64 = 1 << 61;
+/// HARDWARE: APTable[1], table descriptors only: no write access below (VMSAv8-64 table descriptor).
+const DESC_APTABLE_RO: u64 = 1 << 62;
+/// HARDWARE: mask for output address bits [47:12] (VMSAv8-64 descriptor, 48-bit OA).
 pub const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 // ============================================================================
@@ -93,6 +97,39 @@ pub fn pte_is_table(pte: u64) -> bool {
 #[inline]
 pub fn pte_addr(pte: u64) -> u64 {
     pte & ADDR_MASK
+}
+
+/// True if an L0-L2 entry is a table descriptor that leaves EL0 able to
+/// make `access` at the levels below it: APTable (bits 62:61) neither
+/// removes EL0 access nor, for a write, makes them read-only. A block
+/// descriptor is refused: user mappings are 4 KiB pages, so a block in
+/// a user walk is not a user mapping. Pure; used by
+/// `memory::paging::translate_user`.
+#[inline]
+pub fn pte_table_permits_user(pte: u64, access: crate::memory::UserAccess) -> bool {
+    if !pte_is_table(pte) || pte & DESC_APTABLE_NO_EL0 != 0 {
+        return false;
+    }
+    match access {
+        crate::memory::UserAccess::Read => true,
+        crate::memory::UserAccess::Write => pte & DESC_APTABLE_RO == 0,
+    }
+}
+
+/// True if an L3 entry is a valid page descriptor that EL0 can `access`:
+/// AP[1] (bit 6) grants EL0 access, and a write also needs AP[2]
+/// (bit 7, read-only) clear. Pure; used by
+/// `memory::paging::translate_user`.
+#[inline]
+pub fn pte_leaf_permits_user(pte: u64, access: crate::memory::UserAccess) -> bool {
+    let page = DESC_VALID | DESC_TABLE;
+    if pte & page != page || pte & DESC_AP_EL0 == 0 {
+        return false;
+    }
+    match access {
+        crate::memory::UserAccess::Read => true,
+        crate::memory::UserAccess::Write => pte & DESC_AP_RO == 0,
+    }
 }
 
 /// Build a table descriptor pointing at `child_phys` (an L1/L2/L3 table
@@ -322,5 +359,70 @@ pub mod flags {
     /// mapping in `main.rs`.
     pub fn user_framebuffer() -> PageFlags {
         user_mmio()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::UserAccess::{Read, Write};
+
+    const FRAME: u64 = 0x4000_1000;
+
+    #[test]
+    fn leaf_user_rw_permits_read_and_write() {
+        let pte = make_leaf_pte(FRAME, flags::user_rw());
+        assert!(pte_leaf_permits_user(pte, Read));
+        assert!(pte_leaf_permits_user(pte, Write));
+    }
+
+    #[test]
+    fn leaf_user_ro_permits_read_only() {
+        let pte = make_leaf_pte(FRAME, flags::user_ro());
+        assert!(pte_leaf_permits_user(pte, Read));
+        assert!(!pte_leaf_permits_user(pte, Write));
+    }
+
+    #[test]
+    fn leaf_kernel_pages_permit_nothing() {
+        for f in [flags::KERNEL_RO, flags::kernel_rw(), flags::kernel_mmio()] {
+            let pte = make_leaf_pte(FRAME, f);
+            assert!(!pte_leaf_permits_user(pte, Read));
+            assert!(!pte_leaf_permits_user(pte, Write));
+        }
+    }
+
+    #[test]
+    fn leaf_invalid_or_reserved_encoding_permits_nothing() {
+        let rw = make_leaf_pte(FRAME, flags::user_rw());
+        // Valid bit clear.
+        assert!(!pte_leaf_permits_user(rw & !DESC_VALID, Read));
+        // Bit 1 clear at L3 is a reserved encoding, not a page.
+        assert!(!pte_leaf_permits_user(rw & !DESC_TABLE, Read));
+        assert!(!pte_leaf_permits_user(0, Read));
+    }
+
+    #[test]
+    fn table_descriptor_permits_both() {
+        let pte = make_table_pte(FRAME);
+        assert!(pte_table_permits_user(pte, Read));
+        assert!(pte_table_permits_user(pte, Write));
+    }
+
+    #[test]
+    fn table_aptable_narrows_the_levels_below() {
+        let pte = make_table_pte(FRAME);
+        assert!(!pte_table_permits_user(pte | DESC_APTABLE_NO_EL0, Read));
+        assert!(!pte_table_permits_user(pte | DESC_APTABLE_NO_EL0, Write));
+        assert!(pte_table_permits_user(pte | DESC_APTABLE_RO, Read));
+        assert!(!pte_table_permits_user(pte | DESC_APTABLE_RO, Write));
+    }
+
+    #[test]
+    fn block_or_invalid_entry_is_not_a_user_table() {
+        // A block descriptor: valid, bit 1 clear, with user RW permissions.
+        let block = make_leaf_pte(FRAME, flags::user_rw()) & !DESC_TABLE;
+        assert!(!pte_table_permits_user(block, Read));
+        assert!(!pte_table_permits_user(0, Read));
     }
 }

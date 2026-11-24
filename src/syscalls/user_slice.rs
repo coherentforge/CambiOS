@@ -18,10 +18,14 @@
 //! - **At construction (`::validate`)**: cheap checks — non-zero
 //!   `cr3` for non-empty buffers, length within `MAX_USER_BUFFER`,
 //!   address within the canonical user-space range, no overflow.
-//! - **At use (`read_into` / `write_from`)**: per-page page-table
-//!   walk via the module-private `read_user_buffer` /
-//!   `write_user_buffer` helpers below. Can still fail if a page
-//!   is unmapped at the moment of copy.
+//! - **At use (`read_into` / `write_from`)**: per-page check via the
+//!   module-private `read_user_buffer` / `write_user_buffer` helpers
+//!   below, that the caller could make the copy's access to the page
+//!   itself (present and user-accessible at every level, and writable
+//!   for a write) and that the frame behind it is RAM inside the
+//!   kernel's direct map. A page that fails either check fails the
+//!   copy with `InvalidArg`. Before the check existed, the kernel
+//!   wrote into read-only user pages (sandbox review run 003, R4).
 //!
 //! # Module-private helpers
 //!
@@ -38,6 +42,8 @@
 
 use super::SyscallError;
 use super::dispatcher::SyscallContext;
+use crate::boot::{MemoryRegion, MemoryRegionKind};
+use crate::memory::UserAccess;
 
 // ============================================================================
 // Bounds — shared with sibling modules via pub(super).
@@ -71,21 +77,85 @@ pub(super) const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
 //
 // The page-traversal logic (bounds, page-boundary chunking, partial-failure
 // handling) is in `copy_from_user_pages` / `copy_to_user_pages` — generic
-// over a `translate` closure (vaddr → phys) and a `read_phys` / `write_phys`
-// closure (phys, slice → copy). This shape lets host tests exercise the
-// traversal without touching `crate::memory::paging` or HHDM.
+// over a `translate` closure ((vaddr, access) → phys) and a `read_phys` /
+// `write_phys` closure (phys, slice → copy). Each helper names its own
+// direction to `translate` (`Read` / `Write`), so a caller cannot ask for
+// the wrong one. This shape lets host tests exercise the traversal and
+// the direction without touching `crate::memory::paging` or HHDM.
 //
-// `read_user_buffer` / `write_user_buffer` wire the closures to the live
-// page-table walk + HHDM deref. Both are module-private: the typed
-// slices above are the only reachable path.
+// `read_user_buffer` / `write_user_buffer` wire the closures to
+// `user_page_phys` (the live walk plus the RAM check) and the HHDM deref.
+// Both are module-private: the typed slices above are the only reachable
+// path.
+
+/// True for the memory-map kinds that are RAM the kernel's direct map
+/// covers. Limine's HHDM maps exactly these, plus the framebuffer, on
+/// x86_64 and AArch64; on riscv64 the boot trampoline direct-maps the
+/// first 512 GiB of physical memory.
+/// Device memory, firmware tables and the framebuffer are not RAM: a user
+/// buffer there is refused, not copied through an address the direct map
+/// lacks (a kernel fault) or one that reaches a device.
+fn region_kind_is_ram(kind: MemoryRegionKind) -> bool {
+    match kind {
+        MemoryRegionKind::Usable
+        | MemoryRegionKind::BootloaderReclaimable
+        | MemoryRegionKind::ExecutableAndModules => true,
+        MemoryRegionKind::Reserved
+        | MemoryRegionKind::AcpiReclaimable
+        | MemoryRegionKind::AcpiNvs
+        | MemoryRegionKind::BadMemory
+        | MemoryRegionKind::Framebuffer
+        | MemoryRegionKind::Unknown(_) => false,
+    }
+}
+
+/// True iff the 4 KiB frame holding `phys` lies wholly inside one RAM
+/// region of `regions` ([`region_kind_is_ram`]). Pure; one pass over
+/// `regions` (at most `boot::MAX_MEMORY_REGIONS`). Regions may overlap
+/// (riscv64 reports RAM as one Usable region with reservations laid over
+/// it); the only question here is whether the frame is RAM.
+fn frame_is_ram(regions: &[MemoryRegion], phys: u64) -> bool {
+    let frame = phys & !0xFFF;
+    let Some(frame_end) = frame.checked_add(4096) else {
+        return false;
+    };
+    regions.iter().any(|r| {
+        region_kind_is_ram(r.kind)
+            && r.base <= frame
+            && r.base.checked_add(r.length).is_some_and(|end| frame_end <= end)
+    })
+}
+
+/// The physical address a copy on the caller's behalf may touch at
+/// `vaddr`, or `None`. This is the check the copy's `unsafe` relies on:
+/// - the caller can make `access` there itself: present and
+///   user-accessible at every level, and writable for a write
+///   (`paging::translate_user`);
+/// - the frame is RAM inside the direct map ([`frame_is_ram`]), so
+///   `hhdm + phys` is a kernel address that maps it.
+///
+/// `cr3 == 0` (a kernel task) and boot info not yet published both
+/// answer `None`, so the copy fails.
+fn user_page_phys(cr3: u64, vaddr: u64, access: UserAccess) -> Option<u64> {
+    if cr3 == 0 {
+        return None;
+    }
+    // SAFETY: cr3 is the calling process's page-table root, from the
+    // SyscallContext the slice borrows. page_table_from_cr3 builds a
+    // temporary handle through the HHDM; translate_user only reads it.
+    let mut pt = unsafe { crate::memory::paging::page_table_from_cr3(cr3) };
+    let phys = crate::memory::paging::translate_user(&mut pt, vaddr, access)?;
+    let info = crate::boot::try_info()?;
+    frame_is_ram(info.memory_regions(), phys).then_some(phys)
+}
 
 /// Generic copy from a user-space virtual range into a kernel buffer.
 ///
-/// `translate(vaddr) -> Option<phys>` returns the full physical address
-/// (page-base + offset) for `vaddr`, or `None` if unmapped.
-/// `read_phys(phys, dst)` copies `dst.len()` bytes starting at `phys`
-/// into `dst`. The caller guarantees `dst.len()` does not cross a page
-/// boundary.
+/// `translate(vaddr, UserAccess::Read) -> Option<phys>` returns the full
+/// physical address (page-base + offset) for `vaddr`, or `None` if the
+/// caller cannot read it. `read_phys(phys, dst)` copies `dst.len()`
+/// bytes starting at `phys` into `dst`. The caller guarantees
+/// `dst.len()` does not cross a page boundary.
 fn copy_from_user_pages<T, R>(
     translate: T,
     read_phys: R,
@@ -94,7 +164,7 @@ fn copy_from_user_pages<T, R>(
     dst: &mut [u8],
 ) -> Result<usize, SyscallError>
 where
-    T: Fn(u64) -> Option<u64>,
+    T: Fn(u64, UserAccess) -> Option<u64>,
     R: Fn(u64, &mut [u8]),
 {
     if len == 0 {
@@ -116,7 +186,7 @@ where
         let page_offset = (vaddr & 0xFFF) as usize;
         let chunk = core::cmp::min(len - copied, 4096 - page_offset);
 
-        match translate(vaddr) {
+        match translate(vaddr, UserAccess::Read) {
             Some(phys) => {
                 read_phys(phys, &mut dst[copied..copied + chunk]);
                 copied += chunk;
@@ -129,8 +199,9 @@ where
 }
 
 /// Generic copy from a kernel buffer into a user-space virtual range.
-/// Mirror of `copy_from_user_pages`; `write_phys(phys, src)` writes `src`
-/// at `phys`. Caller guarantees no-cross-page-boundary on `src.len()`.
+/// Mirror of `copy_from_user_pages`, asking `translate` for
+/// `UserAccess::Write`; `write_phys(phys, src)` writes `src` at `phys`.
+/// Caller guarantees no-cross-page-boundary on `src.len()`.
 fn copy_to_user_pages<T, W>(
     translate: T,
     write_phys: W,
@@ -138,7 +209,7 @@ fn copy_to_user_pages<T, W>(
     src: &[u8],
 ) -> Result<usize, SyscallError>
 where
-    T: Fn(u64) -> Option<u64>,
+    T: Fn(u64, UserAccess) -> Option<u64>,
     W: Fn(u64, &[u8]),
 {
     let len = src.len();
@@ -161,7 +232,7 @@ where
         let page_offset = (vaddr & 0xFFF) as usize;
         let chunk = core::cmp::min(len - written, 4096 - page_offset);
 
-        match translate(vaddr) {
+        match translate(vaddr, UserAccess::Write) {
             Some(phys) => {
                 write_phys(phys, &src[written..written + chunk]);
                 written += chunk;
@@ -175,10 +246,10 @@ where
 
 /// Read bytes from a user-space virtual address into a kernel buffer.
 ///
-/// Module-private production wrapper: walks the process page table (CR3)
-/// to translate each page the buffer spans, then reads via HHDM.
-/// Returns the number of bytes copied. `cr3 == 0` yields a translator
-/// that always returns `None`, so the first byte fails with `InvalidArg`.
+/// Module-private production wrapper: [`user_page_phys`] checks each
+/// page the buffer spans (the caller can read it, and it is RAM), then
+/// the bytes are read via HHDM. Returns the number of bytes copied.
+/// `cr3 == 0` fails the first page, so the copy fails with `InvalidArg`.
 ///
 /// # Safety contract
 /// `cr3` must be a valid page-table root physical address for the calling
@@ -192,23 +263,12 @@ fn read_user_buffer(
 ) -> Result<usize, SyscallError> {
     let hhdm = crate::hhdm_offset();
     copy_from_user_pages(
-        |vaddr| {
-            if cr3 == 0 {
-                return None;
-            }
-            // SAFETY: cr3 is the process's page-table root.
-            // page_table_from_cr3 builds a temporary OffsetPageTable via HHDM;
-            // translate performs a read-only walk.
-            unsafe {
-                let pt = crate::memory::paging::page_table_from_cr3(cr3);
-                crate::memory::paging::translate(&pt, vaddr)
-            }
-        },
+        |vaddr, access| user_page_phys(cr3, vaddr, access),
         |phys, dst_chunk| {
-            // SAFETY: phys is from a successful page-table walk (page is mapped).
-            // hhdm + phys is a valid kernel virtual address. dst_chunk.len() is
-            // bounded by the chunk math in copy_from_user_pages — never crosses
-            // a page boundary.
+            // SAFETY: phys came from user_page_phys: a page the caller can
+            // read, backed by RAM the direct map covers, so hhdm + phys is a
+            // mapped kernel address. dst_chunk.len() is bounded by the chunk
+            // math in copy_from_user_pages and never crosses a page boundary.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (phys + hhdm) as *const u8,
@@ -225,26 +285,20 @@ fn read_user_buffer(
 
 /// Write bytes from a kernel buffer into a user-space virtual address.
 ///
-/// Module-private production wrapper. Mirror of `read_user_buffer`.
-/// Target pages must be mapped writable in the process address space
-/// (caller's responsibility via VMA tracker / page-table flags).
+/// Module-private production wrapper. Mirror of `read_user_buffer`: a
+/// page the caller cannot write itself (read-only, supervisor-only,
+/// unmapped) or one not backed by RAM fails the copy with `InvalidArg`.
+/// Pages before it in the range have already been written.
 fn write_user_buffer(cr3: u64, user_addr: u64, src: &[u8]) -> Result<usize, SyscallError> {
     let hhdm = crate::hhdm_offset();
     copy_to_user_pages(
-        |vaddr| {
-            if cr3 == 0 {
-                return None;
-            }
-            // SAFETY: same as read_user_buffer — cr3 is valid; walk is read-only.
-            unsafe {
-                let pt = crate::memory::paging::page_table_from_cr3(cr3);
-                crate::memory::paging::translate(&pt, vaddr)
-            }
-        },
+        |vaddr, access| user_page_phys(cr3, vaddr, access),
         |phys, src_chunk| {
-            // SAFETY: phys is mapped; hhdm + phys is kernel-writable; the page
-            // must be RW (caller guarantees via VMA tracker / page-table flags).
-            // src_chunk.len() does not cross a page boundary.
+            // SAFETY: phys came from user_page_phys with UserAccess::Write: a
+            // page the caller can write itself, backed by RAM the direct map
+            // covers, so hhdm + phys is a mapped kernel address and the write
+            // lands only where the caller could have stored. src_chunk.len()
+            // does not cross a page boundary.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src_chunk.as_ptr(),
@@ -296,7 +350,8 @@ impl<'ctx> UserReadSlice<'ctx> {
     /// - Address + length overflows, or crosses the user-space end.
     ///
     /// Does not page-walk. A read may still fail later if a page in
-    /// the range is unmapped at copy time.
+    /// the range is not one the caller can read, or not RAM, at copy
+    /// time.
     ///
     /// Zero-length slices validate unconditionally and read as no-ops.
     pub fn validate(
@@ -338,8 +393,9 @@ impl<'ctx> UserReadSlice<'ctx> {
     /// [`Self::len`] exactly.
     ///
     /// Returns `Ok(())` on success. Returns `Err(SyscallError::InvalidArg)`
-    /// on length mismatch or if any page in the user range is unmapped
-    /// at copy time.
+    /// on length mismatch, or if any page in the user range is not one
+    /// the caller can read (unmapped, supervisor-only) or not backed by
+    /// RAM at copy time.
     ///
     /// # Not a point-in-time snapshot across pages
     ///
@@ -416,6 +472,11 @@ impl<'ctx> UserWriteSlice<'ctx> {
 
     /// Copy `src` into the user buffer. `src.len()` must equal
     /// [`Self::len`] exactly.
+    ///
+    /// Returns `Err(SyscallError::InvalidArg)` on length mismatch, or if
+    /// any page in the user range is not one the caller can write itself
+    /// (unmapped, read-only, supervisor-only) or not backed by RAM at copy
+    /// time. Pages before the failing one have been written.
     pub fn write_from(&self, src: &[u8]) -> Result<(), SyscallError> {
         if src.len() != self.len {
             return Err(SyscallError::InvalidArg);
@@ -758,13 +819,34 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    /// What the fake page table lets the user do with a page: the
+    /// outcome `paging::translate_user` computes from the real PTEs.
+    #[derive(Clone, Copy)]
+    enum FakePerm {
+        UserRw,
+        UserRo,
+        Supervisor,
+    }
+
+    impl FakePerm {
+        fn permits(self, access: UserAccess) -> bool {
+            match (self, access) {
+                (FakePerm::UserRw, _) => true,
+                (FakePerm::UserRo, UserAccess::Read) => true,
+                (FakePerm::UserRo, UserAccess::Write) => false,
+                (FakePerm::Supervisor, _) => false,
+            }
+        }
+    }
+
     /// Test fixture: a page table where mapped pages live in a HashMap and
-    /// translate uses identity (returns the same vaddr as phys). RefCell
-    /// is required because write_phys needs interior mutability while the
-    /// closure is borrowed for the call.
+    /// translate uses identity (returns the same vaddr as phys) when the
+    /// page's permission allows the access asked for. RefCell is required
+    /// because write_phys needs interior mutability while the closure is
+    /// borrowed for the call.
     struct FakeSpace {
-        pages: RefCell<HashMap<u64, [u8; 4096]>>,
-        translate_calls: RefCell<Vec<u64>>,
+        pages: RefCell<HashMap<u64, ([u8; 4096], FakePerm)>>,
+        translate_calls: RefCell<Vec<(u64, UserAccess)>>,
     }
 
     impl FakeSpace {
@@ -775,31 +857,39 @@ mod tests {
             }
         }
 
+        /// Map a user read-write page.
         fn map(&self, page_base: u64, fill: impl Fn(usize) -> u8) {
+            self.map_as(page_base, FakePerm::UserRw, fill);
+        }
+
+        fn map_as(&self, page_base: u64, perm: FakePerm, fill: impl Fn(usize) -> u8) {
             assert_eq!(page_base & 0xFFF, 0, "page_base must be 4 KiB aligned");
             let mut p = [0u8; 4096];
             for (i, slot) in p.iter_mut().enumerate() {
                 *slot = fill(i);
             }
-            self.pages.borrow_mut().insert(page_base, p);
+            self.pages.borrow_mut().insert(page_base, (p, perm));
         }
 
         fn page(&self, page_base: u64) -> [u8; 4096] {
-            *self.pages.borrow().get(&page_base).expect("page not mapped")
+            self.pages.borrow().get(&page_base).expect("page not mapped").0
         }
 
         fn translate_count(&self) -> usize {
             self.translate_calls.borrow().len()
         }
 
-        fn translator(&self) -> impl Fn(u64) -> Option<u64> + '_ {
-            |v: u64| {
-                self.translate_calls.borrow_mut().push(v);
+        fn accesses(&self) -> Vec<UserAccess> {
+            self.translate_calls.borrow().iter().map(|&(_, a)| a).collect()
+        }
+
+        fn translator(&self) -> impl Fn(u64, UserAccess) -> Option<u64> + '_ {
+            |v: u64, access: UserAccess| {
+                self.translate_calls.borrow_mut().push((v, access));
                 let base = v & !0xFFF;
-                if self.pages.borrow().contains_key(&base) {
-                    Some(v)
-                } else {
-                    None
+                match self.pages.borrow().get(&base) {
+                    Some(&(_, perm)) if perm.permits(access) => Some(v),
+                    _ => None,
                 }
             }
         }
@@ -809,7 +899,7 @@ mod tests {
                 let base = phys & !0xFFF;
                 let off = (phys & 0xFFF) as usize;
                 let pages = self.pages.borrow();
-                let page = pages.get(&base).expect("read_phys: page not mapped");
+                let page = &pages.get(&base).expect("read_phys: page not mapped").0;
                 dst.copy_from_slice(&page[off..off + dst.len()]);
             }
         }
@@ -819,7 +909,7 @@ mod tests {
                 let base = phys & !0xFFF;
                 let off = (phys & 0xFFF) as usize;
                 let mut pages = self.pages.borrow_mut();
-                let page = pages.get_mut(&base).expect("write_phys: page not mapped");
+                let page = &mut pages.get_mut(&base).expect("write_phys: page not mapped").0;
                 page[off..off + src.len()].copy_from_slice(src);
             }
         }
@@ -1109,5 +1199,177 @@ mod tests {
         assert_eq!(result, Ok(2));
         assert_eq!(space.page(0x1000)[0xFFF], 0xAA);
         assert_eq!(space.page(0x2000)[0], 0xBB);
+    }
+
+    // ---- Direction: each helper asks for its own access (review R4) --------
+
+    #[test]
+    fn copy_from_pages_asks_for_read_on_every_page() {
+        let space = FakeSpace::new();
+        space.map(0x1000, |_| 0);
+        space.map(0x2000, |_| 0);
+
+        let mut dst = [0u8; 512];
+        let result = copy_from_user_pages(
+            space.translator(), space.reader(),
+            0x1F00, 512, &mut dst,
+        );
+        assert_eq!(result, Ok(512));
+        assert_eq!(space.accesses(), vec![UserAccess::Read, UserAccess::Read]);
+    }
+
+    #[test]
+    fn copy_to_pages_asks_for_write_on_every_page() {
+        let space = FakeSpace::new();
+        space.map(0x1000, |_| 0);
+        space.map(0x2000, |_| 0);
+
+        let result = copy_to_user_pages(
+            space.translator(), space.writer(),
+            0x1F00, &[0x5A; 512],
+        );
+        assert_eq!(result, Ok(512));
+        assert_eq!(space.accesses(), vec![UserAccess::Write, UserAccess::Write]);
+    }
+
+    // ---- Permissions: a page the caller cannot touch fails the copy --------
+
+    #[test]
+    fn copy_to_pages_read_only_page_refused_and_untouched() {
+        let space = FakeSpace::new();
+        space.map_as(0x1000, FakePerm::UserRo, |_| 0xAA);
+
+        let result = copy_to_user_pages(
+            space.translator(), space.writer(),
+            0x1000, &[0x12; 32],
+        );
+        assert_eq!(result, Err(SyscallError::InvalidArg));
+        assert!(space.page(0x1000).iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn copy_from_pages_read_only_page_is_readable() {
+        let space = FakeSpace::new();
+        space.map_as(0x1000, FakePerm::UserRo, |_| 0xAA);
+
+        let mut dst = [0u8; 32];
+        let result = copy_from_user_pages(
+            space.translator(), space.reader(),
+            0x1000, 32, &mut dst,
+        );
+        assert_eq!(result, Ok(32));
+        assert_eq!(dst, [0xAA; 32]);
+    }
+
+    #[test]
+    fn copy_to_pages_second_page_read_only_partial_write_visible() {
+        let space = FakeSpace::new();
+        space.map(0x1000, |_| 0);
+        space.map_as(0x2000, FakePerm::UserRo, |_| 0xAA);
+
+        let result = copy_to_user_pages(
+            space.translator(), space.writer(),
+            0x1F00, &[0xDD; 512],
+        );
+        assert_eq!(result, Err(SyscallError::InvalidArg));
+        // The writable first page took its 256 bytes before the second
+        // page was refused; the read-only page is untouched.
+        let p1 = space.page(0x1000);
+        assert!(p1[0xF00..].iter().all(|&b| b == 0xDD));
+        assert!(space.page(0x2000).iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn supervisor_page_refused_in_both_directions() {
+        let space = FakeSpace::new();
+        space.map_as(0x1000, FakePerm::Supervisor, |_| 0x77);
+
+        let mut dst = [0u8; 16];
+        let read = copy_from_user_pages(
+            space.translator(), space.reader(),
+            0x1000, 16, &mut dst,
+        );
+        assert_eq!(read, Err(SyscallError::InvalidArg));
+        assert_eq!(dst, [0u8; 16]);
+
+        let write = copy_to_user_pages(
+            space.translator(), space.writer(),
+            0x1000, &[0x11; 16],
+        );
+        assert_eq!(write, Err(SyscallError::InvalidArg));
+        assert!(space.page(0x1000).iter().all(|&b| b == 0x77));
+    }
+
+    // ---- RAM backing: frame_is_ram / region_kind_is_ram ---------------------
+
+    fn region(base: u64, length: u64, kind: MemoryRegionKind) -> MemoryRegion {
+        MemoryRegion { base, length, kind }
+    }
+
+    #[test]
+    fn region_kind_is_ram_only_for_direct_mapped_ram() {
+        assert!(region_kind_is_ram(MemoryRegionKind::Usable));
+        assert!(region_kind_is_ram(MemoryRegionKind::BootloaderReclaimable));
+        assert!(region_kind_is_ram(MemoryRegionKind::ExecutableAndModules));
+        for kind in [
+            MemoryRegionKind::Reserved,
+            MemoryRegionKind::AcpiReclaimable,
+            MemoryRegionKind::AcpiNvs,
+            MemoryRegionKind::BadMemory,
+            MemoryRegionKind::Framebuffer,
+            MemoryRegionKind::Unknown(0x1234),
+        ] {
+            assert!(!region_kind_is_ram(kind), "{:?} is not RAM", kind);
+        }
+    }
+
+    #[test]
+    fn frame_is_ram_inside_usable_region() {
+        let map = [region(0x10_0000, 0x10_0000, MemoryRegionKind::Usable)];
+        assert!(frame_is_ram(&map, 0x10_0000));
+        assert!(frame_is_ram(&map, 0x10_0ABC)); // offset within the frame
+        assert!(frame_is_ram(&map, 0x1F_F000)); // last frame of the region
+    }
+
+    #[test]
+    fn frame_is_ram_refuses_frames_outside_ram() {
+        let map = [
+            region(0x10_0000, 0x10_0000, MemoryRegionKind::Usable),
+            region(0xFD00_0000, 0x40_0000, MemoryRegionKind::Framebuffer),
+            region(0xFEE0_0000, 0x1000, MemoryRegionKind::Reserved),
+        ];
+        assert!(!frame_is_ram(&map, 0x20_0000)); // one past the Usable end
+        assert!(!frame_is_ram(&map, 0xFEBD_0000)); // a PCI BAR in the hole
+        assert!(!frame_is_ram(&map, 0xFD00_0000)); // framebuffer
+        assert!(!frame_is_ram(&map, 0xFEE0_0000)); // reserved (LAPIC page)
+        assert!(!frame_is_ram(&[], 0x10_0000));
+    }
+
+    #[test]
+    fn frame_is_ram_needs_the_whole_frame_inside_one_region() {
+        // A region that ends mid-frame does not cover that frame.
+        let map = [region(0x10_0000, 0x800, MemoryRegionKind::Usable)];
+        assert!(!frame_is_ram(&map, 0x10_0000));
+    }
+
+    #[test]
+    fn frame_is_ram_overlaid_reservation_is_still_ram() {
+        // riscv64 shape: all of RAM as one Usable region, the DTB laid
+        // over it as Reserved. The frame is RAM either way.
+        let map = [
+            region(0x8000_0000, 0x2000_0000, MemoryRegionKind::Usable),
+            region(0x8F00_0000, 0x1_0000, MemoryRegionKind::Reserved),
+        ];
+        assert!(frame_is_ram(&map, 0x8F00_0000));
+    }
+
+    #[test]
+    fn frame_is_ram_survives_overflowing_inputs() {
+        // The frame's own end overflows.
+        let top = [region(u64::MAX - 0xFFF, 0x1000, MemoryRegionKind::Usable)];
+        assert!(!frame_is_ram(&top, u64::MAX));
+        // The region's end overflows: treated as covering nothing.
+        let wide = [region(0x1000, u64::MAX, MemoryRegionKind::Usable)];
+        assert!(!frame_is_ram(&wide, 0x1000));
     }
 }

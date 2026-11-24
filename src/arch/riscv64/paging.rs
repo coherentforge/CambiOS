@@ -84,6 +84,29 @@ pub fn pte_addr(pte: u64) -> u64 {
     (pte & ADDR_MASK) << 2
 }
 
+/// True if an L0-L2 entry is a pointer to a next-level table. Sv48
+/// non-leaf PTEs carry no permission bits, so nothing at this level can
+/// narrow `access`; the check is that the walk may descend. A superpage
+/// leaf is refused: user mappings are 4 KiB pages, and the kernel half
+/// every root carries maps gigapages. Pure; used by
+/// `memory::paging::translate_user`.
+#[inline]
+pub fn pte_table_permits_user(pte: u64, _access: crate::memory::UserAccess) -> bool {
+    pte_is_table(pte)
+}
+
+/// True if an L3 entry is a valid U-mode page that allows `access`:
+/// V, U and R for a read; V, U, R and W for a write (W without R is a
+/// reserved encoding). Pure; used by `memory::paging::translate_user`.
+#[inline]
+pub fn pte_leaf_permits_user(pte: u64, access: crate::memory::UserAccess) -> bool {
+    let needed = match access {
+        crate::memory::UserAccess::Read => PTE_V | PTE_U | PTE_R,
+        crate::memory::UserAccess::Write => PTE_V | PTE_U | PTE_R | PTE_W,
+    };
+    pte & needed == needed
+}
+
 /// Build a table descriptor pointing at `child_phys` (an L1/L2/L3 table
 /// frame). Valid only; no R/W/X, so the walker descends.
 #[inline]

@@ -20,6 +20,7 @@ use x86_64::structures::paging::{
     OffsetPageTable, PageTable, PageTableFlags, Mapper, Page, Size4KiB,
     FrameAllocator as X86FrameAllocator, PhysFrame as X86PhysFrame,
 };
+use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::{PhysAddr, VirtAddr};
 use super::frame_allocator::{FrameAllocator, PhysFrame, PAGE_SIZE};
 use core::fmt;
@@ -257,6 +258,67 @@ pub fn translate(page_table: &OffsetPageTable, virt_addr: u64) -> Option<u64> {
     use x86_64::structures::paging::mapper::Translate;
     let virt = VirtAddr::new(virt_addr);
     page_table.translate_addr(virt).map(|pa| pa.as_u64())
+}
+
+/// True if a page-table entry at any level lets ring 3 make `access`
+/// through it: PRESENT and USER_ACCESSIBLE, plus WRITABLE for a write.
+/// The hardware ANDs U/S and R/W across all four levels, so
+/// [`translate_user`] applies this to every entry on the walk. Pure.
+fn entry_permits_user(flags: PageTableFlags, access: super::UserAccess) -> bool {
+    let needed = match access {
+        super::UserAccess::Read => PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
+        super::UserAccess::Write => {
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE
+        }
+    };
+    flags.contains(needed)
+}
+
+/// [`entry_permits_user`] for a PML4, PDPT or PD entry, which must also
+/// point to a table: a 1 GiB or 2 MiB page (HUGE_PAGE) is refused, since
+/// user mappings are 4 KiB pages. Pure.
+fn table_entry_permits_user(flags: PageTableFlags, access: super::UserAccess) -> bool {
+    entry_permits_user(flags, access) && !flags.contains(PageTableFlags::HUGE_PAGE)
+}
+
+/// The physical address behind `virt_addr`, only if ring 3 can make
+/// `access` there itself. The address a kernel copy on the user's behalf
+/// may touch (sandbox review run 003, R4). `None` for a non-canonical
+/// address, a missing level, a huge page, or an entry that withholds
+/// the access at any level.
+///
+/// Walks the four levels itself rather than calling `Translate::translate`,
+/// which reports the leaf's flags only. Each entry is a volatile copy, as
+/// in the AArch64/RISC-V walk: no reference to a table the MMU may be
+/// updating (Accessed/Dirty) is ever formed. Takes `&mut` because x86_64
+/// 0.14's `level_4_table` does; nothing is written.
+pub fn translate_user(
+    page_table: &mut OffsetPageTable,
+    virt_addr: u64,
+    access: super::UserAccess,
+) -> Option<u64> {
+    let virt = VirtAddr::try_new(virt_addr).ok()?;
+    let hhdm = page_table.phys_offset().as_u64();
+    let mut table = page_table.level_4_table() as *const PageTable as *const PageTableEntry;
+    for idx in [virt.p4_index(), virt.p3_index(), virt.p2_index()] {
+        // SAFETY: `table` is the HHDM address of a valid page table: the
+        // root by the OffsetPageTable's contract, each deeper one because
+        // the entry naming it passed table_entry_permits_user (present,
+        // not huge) and page-table frames are RAM the HHDM maps. idx < 512
+        // by PageTableIndex, so the offset stays inside the 4 KiB table.
+        let entry = unsafe { core::ptr::read_volatile(table.wrapping_add(usize::from(idx))) };
+        if !table_entry_permits_user(entry.flags(), access) {
+            return None;
+        }
+        table = (entry.addr().as_u64() + hhdm) as *const PageTableEntry;
+    }
+    // SAFETY: `table` is the leaf table the loop reached through present,
+    // non-huge table entries only; p1_index < 512.
+    let leaf = unsafe { core::ptr::read_volatile(table.wrapping_add(usize::from(virt.p1_index()))) };
+    if !entry_permits_user(leaf.flags(), access) {
+        return None;
+    }
+    Some(leaf.addr().as_u64() + (virt_addr & 0xFFF))
 }
 
 /// Create a new PML4 for a user process.
@@ -501,5 +563,52 @@ pub mod flags {
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::WRITE_THROUGH
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::UserAccess::{Read, Write};
+
+    #[test]
+    fn user_rw_permits_read_and_write() {
+        assert!(entry_permits_user(flags::user_rw(), Read));
+        assert!(entry_permits_user(flags::user_rw(), Write));
+    }
+
+    #[test]
+    fn user_ro_permits_read_only() {
+        assert!(entry_permits_user(flags::user_ro(), Read));
+        assert!(!entry_permits_user(flags::user_ro(), Write));
+    }
+
+    #[test]
+    fn kernel_entries_permit_nothing() {
+        for f in [flags::KERNEL_RO, flags::kernel_rw(), flags::kernel_mmio()] {
+            assert!(!entry_permits_user(f, Read));
+            assert!(!entry_permits_user(f, Write));
+        }
+    }
+
+    #[test]
+    fn not_present_permits_nothing() {
+        let rw_not_present = flags::user_rw() - PageTableFlags::PRESENT;
+        assert!(!entry_permits_user(rw_not_present, Read));
+        assert!(!entry_permits_user(PageTableFlags::empty(), Read));
+    }
+
+    #[test]
+    fn table_entry_refuses_huge_page() {
+        let huge = flags::user_rw() | PageTableFlags::HUGE_PAGE;
+        assert!(table_entry_permits_user(flags::user_rw(), Write));
+        assert!(!table_entry_permits_user(huge, Read));
+        assert!(!table_entry_permits_user(huge, Write));
+    }
+
+    #[test]
+    fn read_only_table_entry_withholds_write_below_it() {
+        assert!(table_entry_permits_user(flags::user_ro(), Read));
+        assert!(!table_entry_permits_user(flags::user_ro(), Write));
     }
 }

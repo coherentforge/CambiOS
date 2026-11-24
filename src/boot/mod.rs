@@ -628,11 +628,10 @@ impl OnceBootInfo {
         cell_ptr.write(info);
     }
 
-    fn get(&self) -> &BootInfo {
-        assert!(
-            self.initialized.load(Ordering::Acquire),
-            "boot::info() called before boot::install"
-        );
+    fn try_get(&self) -> Option<&BootInfo> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return None;
+        }
         // SAFETY: The cell pointer comes from &self so is valid for
         // the lifetime of the static. No writer is active:
         // `initialized == true` was observed via Acquire,
@@ -641,7 +640,17 @@ impl OnceBootInfo {
         let cell_ref = unsafe { &*self.cell.get() };
         // SAFETY: `install` wrote a fully-initialized BootInfo before
         // setting `initialized`, so `assume_init_ref` is sound.
-        unsafe { cell_ref.assume_init_ref() }
+        Some(unsafe { cell_ref.assume_init_ref() })
+    }
+
+    fn get(&self) -> &BootInfo {
+        match self.try_get() {
+            Some(info) => info,
+            // BOOT_PANIC_OK: the assert `info()` always had, written out. A
+            // read before `finish` is a kernel bug; paths a user request can
+            // reach call `try_info()` and refuse instead.
+            None => panic!("boot::info() called before boot::install"),
+        }
     }
 }
 
@@ -708,6 +717,13 @@ pub fn install(info: BootInfo) {
 /// kernel.
 pub fn info() -> &'static BootInfo {
     BOOT_INFO.get()
+}
+
+/// Access the BootInfo, or `None` before the boot adapter publishes it.
+/// For paths reachable from user requests, which answer with a typed
+/// refusal instead of [`info`]'s panic.
+pub fn try_info() -> Option<&'static BootInfo> {
+    BOOT_INFO.try_get()
 }
 
 #[cfg(test)]

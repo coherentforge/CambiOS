@@ -20,6 +20,18 @@ pub mod object_table;
 #[cfg(target_arch = "x86_64")]
 pub mod paging;
 
+/// The access a kernel copy makes to a user page on the user's behalf,
+/// for `paging::translate_user`. The kernel may make it only where the
+/// user could make it itself. An enum, not a bool, so every call site
+/// names its direction (ADR-020 § Problem 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAccess {
+    /// The kernel reads the page: the user must be able to read it.
+    Read,
+    /// The kernel writes the page: the user must be able to write it.
+    Write,
+}
+
 /// Shared 4-level / 4 KiB / 48-bit paging for AArch64 + RISC-V (Sv48).
 ///
 /// The walk logic, bootstrap frame pool, map/unmap/translate/reclaim
@@ -353,6 +365,47 @@ pub mod paging {
             return None;
         }
         Some(ap::pte_addr(entry) + page_offset)
+    }
+
+    /// The physical address behind `virt_addr`, only if the user can make
+    /// `access` there itself. The address a kernel copy on the user's
+    /// behalf may touch (sandbox review run 003, R4).
+    ///
+    /// Every level is checked, because the hardware's effective permission
+    /// is the intersection of all levels. L0-L2 must be table descriptors
+    /// that do not narrow the access (`ap::pte_table_permits_user`); a block
+    /// or superpage there is refused, since user mappings are 4 KiB pages.
+    /// The L3 leaf must be a valid user page that allows the access
+    /// (`ap::pte_leaf_permits_user`). `None` for anything else, and for an
+    /// address in the kernel half of the walk (riscv64 copies those L0
+    /// entries into every root; none of them is a user mapping).
+    ///
+    /// Takes `&mut` for the x86_64 signature, whose crate needs it, so
+    /// one call site serves every arch; nothing is written.
+    pub fn translate_user(
+        pt: &mut PageTableRef,
+        virt_addr: u64,
+        access: super::UserAccess,
+    ) -> Option<u64> {
+        let va = virt_addr & !0xFFF;
+        let mut table_phys = pt.root_phys;
+        for idx in [l0_index(va), l1_index(va), l2_index(va)] {
+            // SAFETY: table_phys is a valid page table: the root by the
+            // PageTableRef contract, each deeper one because the entry that
+            // named it passed pte_table_permits_user, a table-descriptor check.
+            let entry = unsafe { read_entry(table_phys, idx) };
+            if !ap::pte_table_permits_user(entry, access) {
+                return None;
+            }
+            table_phys = ap::pte_addr(entry);
+        }
+        // SAFETY: table_phys is the L3 table the loop reached through table
+        // descriptors only.
+        let leaf = unsafe { read_entry(table_phys, l3_index(va)) };
+        if !ap::pte_leaf_permits_user(leaf, access) {
+            return None;
+        }
+        Some(ap::pte_addr(leaf) + (virt_addr & 0xFFF))
     }
 
     /// Create a new L0 page table for a user process.

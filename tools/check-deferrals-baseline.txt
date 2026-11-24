@@ -93,8 +93,8 @@ src/lib.rs:106:TBD
 src/lib.rs:1320:deferred
 src/lib.rs:1328:deferred
 src/lib.rs:1336:deferred
-src/memory/mod.rs:697:placeholder
-src/memory/mod.rs:706:placeholder
+src/memory/mod.rs:750:placeholder
+src/memory/mod.rs:759:placeholder
 src/microkernel/main.rs:1053:for-now
 src/microkernel/main.rs:1159:for-now
 src/microkernel/main.rs:2196:deferred

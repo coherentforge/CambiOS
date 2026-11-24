@@ -29,8 +29,7 @@ src/arch/aarch64/paging.rs:61:DESC_ATTR_NORMAL
 src/arch/aarch64/paging.rs:63:DESC_ATTR_DEVICE
 src/arch/aarch64/paging.rs:65:DESC_PXN
 src/arch/aarch64/paging.rs:67:DESC_UXN
-src/arch/aarch64/paging.rs:69:ADDR_MASK
-src/arch/aarch64/paging.rs:277:DEVICE_MEMORY_FLAG
+src/arch/aarch64/paging.rs:314:DEVICE_MEMORY_FLAG
 src/arch/aarch64/percpu.rs:24:MAX_CPUS
 src/arch/aarch64/timer.rs:29:TIMER_PPI_INTID
 src/arch/aarch64/tlb.rs:21:PAGE_SHIFT
@@ -59,7 +58,7 @@ src/arch/riscv64/paging.rs:49:PTE_A
 src/arch/riscv64/paging.rs:51:PTE_D
 src/arch/riscv64/paging.rs:57:ADDR_MASK
 src/arch/riscv64/paging.rs:60:SATP_PPN_MASK
-src/arch/riscv64/paging.rs:180:HHDM_GIGAPAGE_COVERAGE
+src/arch/riscv64/paging.rs:203:HHDM_GIGAPAGE_COVERAGE
 src/arch/riscv64/percpu.rs:34:MAX_CPUS
 src/arch/riscv64/plic.rs:65:REG_ENABLE_BASE
 src/arch/riscv64/plic.rs:67:REG_ENABLE_STRIDE
@@ -287,10 +286,10 @@ src/memory/frame_allocator.rs:42:MAX_FRAMES
 src/memory/frame_allocator.rs:67:BITMAP_WORDS
 src/memory/heap.rs:17:MIN_BLOCK_SIZE
 src/memory/heap.rs:20:HEAP_ALIGN
-src/memory/mod.rs:77:ENTRIES_PER_TABLE
-src/memory/mod.rs:675:BOOTLOADER_BASE
-src/memory/mod.rs:678:KERNEL_LOAD_ADDR
-src/memory/mod.rs:681:EXTENDED_MEMORY_BASE
+src/memory/mod.rs:89:ENTRIES_PER_TABLE
+src/memory/mod.rs:728:BOOTLOADER_BASE
+src/memory/mod.rs:731:KERNEL_LOAD_ADDR
+src/memory/mod.rs:734:EXTENDED_MEMORY_BASE
 src/policy/mod.rs:116:DECISION_NONE
 src/policy/mod.rs:117:DECISION_ALLOW
 src/policy/mod.rs:118:DECISION_DENY
