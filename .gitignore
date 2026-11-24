@@ -18,12 +18,6 @@ iso_root/
 *.log
 .symbols
 
-# External repo cloned locally for convenience — canonical source is
-# github.com/riccajason/mcp-rust-analyzer, wired in via .mcp.json.
-# The local .venv / __pycache__ / server.py belong to that project,
-# not this one.
-tools/mcp-rust-analyzer/
-
 # Python bytecode cache from tools/*.py runs.
 __pycache__/
 

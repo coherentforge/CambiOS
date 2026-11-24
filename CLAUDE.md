@@ -287,6 +287,8 @@ make symbols
 
 `.mcp.json` configures an MCP (Model Context Protocol) server that exposes rust-analyzer. When it is connected, prefer its symbol, definition, reference, implementation and hover tools over Grep for navigating Rust; Grep stays right for string literals, comments and non-Rust files.
 
+`.mcp.json` runs `mcp-rust-analyzer` from PATH, so each machine installs it once, outside this repository: clone [riccajason/mcp-rust-analyzer](https://github.com/riccajason/mcp-rust-analyzer), run `python3 -m venv .venv && .venv/bin/pip install -e .` in the clone, and link `.venv/bin/mcp-rust-analyzer` into a directory on PATH such as `~/.local/bin`. rust-analyzer itself must be on PATH too. A session that started before the link existed connects through `/mcp`.
+
 ## Required Reading by Subsystem
 
 When working on a subsystem, read its design documents and ADRs *before* writing code; the "Unread subsystem" Stop-and-Ask bullet is checked against this map. Source files are not listed: open the subsystem's directory. A subsystem with no row is small enough that the code is the documentation. Pure intent lives in the design documents and ADRs, current status in [STATUS.md](STATUS.md). The full ADR set is [docs/adr/](docs/adr/) (run `ls docs/adr/`; do not cite a range here, it drifts).
