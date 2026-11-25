@@ -70,7 +70,7 @@ The validated facts the slice carries by construction:
 - Caller's `cr3` is non-zero (kernel tasks can't meaningfully pass user pointers).
 
 The facts it does *not* yet carry (and may never, per the validation-timing discussion below):
-- Every page in the range is currently mapped in the caller's page table. That check happens at read/write time, per-page, in `copy_from_user_pages` / `copy_to_user_pages`.
+- Every page in the range is currently mapped in the caller's page table with the access the slice's direction needs (user-accessible at every level of the walk, and writable for a write), and backed by RAM the kernel's direct map covers. That check happens at read/write time, per-page, in `copy_from_user_pages` / `copy_to_user_pages`.
 
 ## Decision
 
@@ -287,3 +287,9 @@ Phases A–C leave the type system as the sole enforcement mechanism: `UserReadS
 ### `from_user_struct<T>(slice)` / `to_user_struct<T>(slice)` generic helpers
 
 Many handlers read or write a fixed-size struct (e.g., `ExitInfo`, `ChannelInfo`, `FramebufferDescriptor`). Today these are all byte buffers of known length. A generic helper `UserWriteSlice::write_struct::<T>(&T)` that asserts `slice.len() == size_of::<T>()` and `transmute_copy`s the bytes would be type-safer than manual `write_from(as_bytes(&t))`. **Revisit when:** the third identical copy of "byte-encode this struct then write_from" appears — the rule-of-three says the abstraction is earning its keep. Two copies today: `ExitInfo` (once ADR-019 lands), `ChannelInfo`, `FramebufferDescriptor`. Close to the trigger.
+
+## Divergence
+
+The body above reflects the implemented design. The original wordings, with the date and commit where they changed, are preserved here.
+
+- **The use-time page check covers permissions and backing, not only presence** (2026-11-23, bb32b7b). The per-page walk in the copy helpers accepted any present mapping, so a process could have the kernel write into its own read-only pages, and a page backed by device memory was copied through as if it were RAM (sandbox review run 003, finding R4). `paging::translate_user` now returns a frame only if every level of the walk grants the user the access the copy's direction needs, and the copy refuses a frame that is not RAM in the boot memory map. The check stays where § Validation timing puts it: at use time, per page. *Prior wording (§ The Reframe, the facts the slice does not carry): "Every page in the range is currently mapped in the caller's page table. That check happens at read/write time, per-page, in `copy_from_user_pages` / `copy_to_user_pages`."*
