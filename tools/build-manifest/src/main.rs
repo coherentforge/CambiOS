@@ -217,19 +217,20 @@ fn usage(prog: &str) -> ! {
     eprintln!("  (all arches) or contains <name>. A kept service depending on");
     eprintln!("  a filtered-out one is an error — the emitted dependency graph");
     eprintln!("  must be closed. Omitted = no filtering (every entry emits).");
-    eprintln!("--profile <name>: emit only services whose `profile` list is");
-    eprintln!("  empty (every profile) or contains <name>. Same closure rule.");
-    eprintln!("  Omitted = `default`, so profile-tagged entries never emit by");
-    eprintln!("  accident.");
+    eprintln!("--profile <name>[,<name>...]: emit only services whose `profile`");
+    eprintln!("  list is empty (every profile) or contains one of the names.");
+    eprintln!("  Same closure rule. Several names combine an image profile with");
+    eprintln!("  an add-on one (`default,regress`). Omitted = `default`, so");
+    eprintln!("  profile-tagged entries never emit by accident.");
     exit(2);
 }
 
-/// Keep the services whose `tags(s)` list is empty or names `target`;
-/// then require the kept set's `depends_on` graph to be closed.
+/// Keep the services whose `tags(s)` list is empty or names one of
+/// `targets`; then require the kept set's `depends_on` graph to be closed.
 fn filter_registry(
     registry: &mut Registry,
     dimension: &str,
-    target: &str,
+    targets: &[&str],
     tags: impl Fn(&ServiceDef) -> &Vec<String>,
 ) {
     // Filter each entry on its OWN tags, then derive the kept-name set
@@ -239,7 +240,8 @@ fn filter_registry(
     // posture per profile (the headless shell owns the input endpoint).
     registry
         .services
-        .retain(|s| tags(s).is_empty() || tags(s).iter().any(|t| t == target));
+        .retain(|s| tags(s).is_empty() || tags(s).iter().any(|t| targets.contains(&t.as_str())));
+    let shown = targets.join(",");
     let kept: Vec<String> = registry.services.iter().map(|s| s.name.clone()).collect();
     for svc in &registry.services {
         for dep in &svc.depends_on {
@@ -247,13 +249,13 @@ fn filter_registry(
                 eprintln!(
                     "service '{}' depends on '{}', which is filtered out \
                      for {} '{}' — fix the {} tags in the registry",
-                    svc.name, dep, dimension, target, dimension
+                    svc.name, dep, dimension, shown, dimension
                 );
                 exit(1);
             }
         }
     }
-    eprintln!("{} filter '{}': {} service(s) kept", dimension, target, registry.services.len());
+    eprintln!("{} filter '{}': {} service(s) kept", dimension, shown, registry.services.len());
 }
 
 /// After every filter has run, each name must survive exactly once.
@@ -330,9 +332,14 @@ fn main() {
     // service depending on a filtered-out one means the registry's
     // tags are wrong, not that the dependency should silently vanish.
     if let Some(target) = &arch {
-        filter_registry(&mut registry, "arch", target, |s| &s.arch);
+        filter_registry(&mut registry, "arch", &[target.as_str()], |s| &s.arch);
     }
-    filter_registry(&mut registry, "profile", &profile, |s| &s.profile);
+    let profiles: Vec<&str> = profile.split(',').collect();
+    if profiles.iter().any(|p| p.is_empty()) {
+        eprintln!("--profile '{}': empty profile name in the list", profile);
+        exit(2);
+    }
+    filter_registry(&mut registry, "profile", &profiles, |s| &s.profile);
     reject_duplicate_names(&registry, arch.as_deref(), &profile);
 
     // Resolve endpoint dependencies against the KEPT set: exactly one
@@ -612,16 +619,59 @@ endpoints = [40]
     #[test]
     fn same_name_disjoint_profiles_keeps_exactly_the_matching_entry() {
         let mut r = registry(TWO_SHELLS);
-        filter_registry(&mut r, "profile", "headless", |s| &s.profile);
+        filter_registry(&mut r, "profile", &["headless"], |s| &s.profile);
         let shells: Vec<&ServiceDef> = r.services.iter().filter(|s| s.name == "shell").collect();
         assert_eq!(shells.len(), 1);
         assert_eq!(shells[0].endpoints, vec![18, 30]);
         assert!(r.services.iter().any(|s| s.name == "everywhere"));
 
         let mut r = registry(TWO_SHELLS);
-        filter_registry(&mut r, "profile", "default", |s| &s.profile);
+        filter_registry(&mut r, "profile", &["default"], |s| &s.profile);
         let shells: Vec<&ServiceDef> = r.services.iter().filter(|s| s.name == "shell").collect();
         assert_eq!(shells.len(), 1);
         assert_eq!(shells[0].endpoints, vec![18]);
+    }
+
+    const WITH_ADD_ON: &str = r#"
+[init]
+endpoint = 1
+syscalls = ["spawn"]
+
+[[service]]
+name = "everywhere"
+syscalls = ["print"]
+
+[[service]]
+name = "gui"
+syscalls = ["print"]
+profile = ["default"]
+
+[[service]]
+name = "serial-only"
+syscalls = ["print"]
+profile = ["headless"]
+
+[[service]]
+name = "probe"
+syscalls = ["print"]
+profile = ["regress"]
+"#;
+
+    fn kept_names(r: &Registry) -> Vec<&str> {
+        r.services.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn several_profiles_keep_the_union_of_their_entries() {
+        let mut r = registry(WITH_ADD_ON);
+        filter_registry(&mut r, "profile", &["default", "regress"], |s| &s.profile);
+        assert_eq!(kept_names(&r), vec!["everywhere", "gui", "probe"]);
+    }
+
+    #[test]
+    fn an_add_on_profile_entry_stays_out_of_the_plain_image() {
+        let mut r = registry(WITH_ADD_ON);
+        filter_registry(&mut r, "profile", &["default"], |s| &s.profile);
+        assert_eq!(kept_names(&r), vec!["everywhere", "gui"]);
     }
 }

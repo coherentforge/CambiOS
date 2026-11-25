@@ -268,6 +268,7 @@ CAMBIOS_TIER=tier1 cargo build --target x86_64-unknown-none --release
 # QEMU
 make run                         # x86_64 (ISO, rebuilds kernel + modules)
 make run-quiet                   # x86_64 via tools/qemu-run-quiet.py. Exit 0 = shell banner reached and every required line seen, 1 = panic or exception, 2 = hang or a required line missing. Required lines: RUN_QUIET_REQUIRES in the Makefile, plus EXTRA_REQUIRES="--require '…'"; `SUCCESS="virtio-net ready" TIMEOUT=90` for pre-shell testing.
+make run-regress                 # run-quiet with the `regress` manifest profile added: user/regression-probe reruns the reproductions of fixed kernel findings from ring 3 and must print `[REGRESS] done: N pass, 0 fail`, and the `[sched]` line must show reaper pending and high-water ≤ 1. Other arches: build their image with MANIFEST_PROFILES=default,regress.
 make run-aarch64                 # AArch64 (FAT image); serial-only, no GPU: the compositor runs headless (run-aarch64-gui attaches one)
 make run-riscv64                 # RISC-V (OpenSBI)
 make iso                         # x86_64 ISO only

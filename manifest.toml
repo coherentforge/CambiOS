@@ -67,6 +67,11 @@
 #                        before the shell. GUI entries are tagged with
 #                        the profiles that carry a display; untagged
 #                        entries ship everywhere.
+#   regress              an add-on, never an image by itself: entries
+#                        that exist only for `make run-regress`, which
+#                        emits `--profile default,regress` (an entry is
+#                        kept if untagged or tagged with any listed
+#                        profile).
 
 [init]
 endpoint = 1
@@ -250,6 +255,19 @@ profile = ["default", "framebuffer-fallback"]
 name = "faultme"
 syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 lifetime = "on-demand"
+
+# Kernel regression probe (user/regression-probe): reruns, from ring 3,
+# the reproductions of fixed kernel findings and prints PASS or FAIL per
+# finding (`make run-regress`). Tagged with the add-on `regress` profile
+# only, so no shipping image spawns it. map-mmio: the R1 stage asks for
+# non-device physical memory and must be refused. spawn + wait-task +
+# create-process: the reaper stage spawns faultme after the boot wave.
+[[service]]
+name = "regression-probe"
+syscalls = ["exit", "get-principal", "get-time", "map-mmio", "print", "spawn", "wait-task", "write", "yield"]
+system = ["create-process"]
+lifetime = "one-shot"
+profile = ["regress"]
 
 # --- USB / PIV chain -------------------------------------------------------------
 

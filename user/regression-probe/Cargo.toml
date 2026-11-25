@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors
+
+[package]
+name = "cambios-regression-probe"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "CambiOS regression probe — reruns the reproductions of fixed kernel findings from ring 3 under QEMU (`make run-regress`) and prints PASS or FAIL per finding."
+
+[dependencies]
+cambios-libsys = { path = "../libsys" }
+cambios-libsys-rt = { path = "../libsys-rt" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

@@ -75,13 +75,14 @@ $(foreach a,$(ARCHES),$(if $(TRIPLE_$(a)),,$(error src/arch/$(a)/ exists but thi
 STAGE_x86_64 := policy-service key-store-service fs-service virtio-blk nvme \
 	usb-host ccid virtio-net udp-stack shell compositor scanout-virtio-gpu \
 	scanout-limine virtio-input terminal-window ping sprouty tree worm \
-	hello-window faultme audit-tail fde-mount
+	hello-window faultme regression-probe audit-tail fde-mount
 STAGE_aarch64 := policy-service key-store-service fs-service virtio-blk \
 	fde-mount usb-host ccid virtio-net udp-stack scanout-virtio-gpu \
 	virtio-input compositor terminal-window tree hello-window faultme worm \
-	ping sprouty shell audit-tail
+	ping sprouty shell audit-tail regression-probe
 STAGE_riscv64 := policy-service key-store-service fs-service virtio-blk \
-	fde-mount usb-host ccid virtio-net udp-stack audit-tail shell faultme
+	fde-mount usb-host ccid virtio-net udp-stack audit-tail shell faultme \
+	regression-probe
 
 # User crates that build for the architecture but are not in its image.
 #
@@ -106,8 +107,14 @@ $(foreach a,$(ARCHES),$(eval CRATES_$(a) := init $$(STAGE_$(a)) $$(UNSTAGED_$(a)
 
 # Image profiles: the values a manifest.toml `profile` tag may take.
 # `default` is the QEMU image (`make iso`); `PROFILE=` picks one of the
-# bare-metal ones for img-usb.
-PROFILES := default headless framebuffer-fallback
+# bare-metal ones for img-usb. `regress` is an add-on, never an image of
+# its own: `make run-regress` builds `default,regress` (MANIFEST_PROFILES).
+PROFILES := default headless framebuffer-fallback regress
+
+# The profiles the QEMU manifests (manifest, manifest-aarch64,
+# manifest-riscv64) are emitted for, comma-separated; build-manifest keeps
+# an entry that is untagged or tagged with any of them.
+MANIFEST_PROFILES ?= default
 
 # The proof crates are the *-proofs directories under verification/.
 PROOF_CRATES := $(sort $(patsubst verification/%/Cargo.toml,%,$(wildcard verification/*-proofs/Cargo.toml)))
@@ -248,7 +255,7 @@ else
   SIGN_FLAGS :=
 endif
 
-.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists check-env check-elf-link check-dco install-hooks audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv
+.PHONY: manifest-profile all kernel iso run run-gui run-uefi test clean symbols img-x86 run-img-x86 img-usb run-img-usb usb verify-usb disk-img kernel-aarch64 img-aarch64 run-aarch64 run-aarch64-gui kernel-riscv64 img-riscv64 run-riscv64 check-all check-stable check-x86 check-clippy check-clippy-x86 check-adrs new-adr check-doc-refs update-doc-refs-baseline check-lists check-env check-elf-link check-dco install-hooks audit-taxonomy check-audit-taxonomy check-index-isolation check-deferrals update-deferrals-baseline check-fail-open update-fail-open-baseline claude-preflight sync-site sync-site-check user-elf user-elf-aarch64 sign-tool manifest manifest-headless manifest-aarch64 manifest-riscv64 mkinitrd gen-dev-piv-keys format-volume bake-font export-pubkey kernel-dev-piv key-store-service-dev-piv iso-dev-piv run-quiet-dev-piv run-regress
 
 all: iso
 
@@ -376,7 +383,7 @@ manifest: sign-tool
 	@echo "=== Building build-manifest tool ==="
 	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Emitting + signing manifest.bin (x86_64) ==="
-	$(BUILD_MANIFEST) manifest.toml -o manifest.bin --arch x86_64
+	$(BUILD_MANIFEST) manifest.toml -o manifest.bin --arch x86_64 --profile $(MANIFEST_PROFILES)
 	$(SIGN_ELF) $(SIGN_FLAGS) manifest.bin
 	@echo "=== manifest.bin ready (signed) ==="
 
@@ -403,7 +410,7 @@ manifest-aarch64: sign-tool
 	@echo "=== Building build-manifest tool ==="
 	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Emitting + signing manifest-aarch64.bin ==="
-	$(BUILD_MANIFEST) manifest.toml -o manifest-aarch64.bin --arch aarch64
+	$(BUILD_MANIFEST) manifest.toml -o manifest-aarch64.bin --arch aarch64 --profile $(MANIFEST_PROFILES)
 	$(SIGN_ELF) $(SIGN_FLAGS) manifest-aarch64.bin
 	@echo "=== manifest-aarch64.bin ready (signed) ==="
 
@@ -411,7 +418,7 @@ manifest-riscv64: sign-tool
 	@echo "=== Building build-manifest tool ==="
 	cd $(BUILD_MANIFEST_DIR) && cargo build --release --target $(HOST_TARGET)
 	@echo "=== Emitting + signing manifest-riscv64.bin ==="
-	$(BUILD_MANIFEST) manifest.toml -o manifest-riscv64.bin --arch riscv64
+	$(BUILD_MANIFEST) manifest.toml -o manifest-riscv64.bin --arch riscv64 --profile $(MANIFEST_PROFILES)
 	$(SIGN_ELF) $(SIGN_FLAGS) manifest-riscv64.bin
 	@echo "=== manifest-riscv64.bin ready (signed) ==="
 
@@ -637,6 +644,24 @@ run-quiet: iso disk-img
 			-vga virtio \
 			$(QEMU_DISPLAY) \
 			-no-reboot
+
+# Regression probe run (user/regression-probe): the x86_64 QEMU image with
+# the `regress` profile's manifest row added, so init spawns the probe in
+# the boot wave. It reruns the reproductions of fixed kernel findings from
+# ring 3. Passes when the probe reports no failed stage and the kernel's
+# `[sched]` line (x86_64 only, tick 2000) shows the reaper kept up with the
+# probe's post-wave deaths: pending and high-water at most 1 on both CPUs
+# (run-quiet boots -smp 2, hence two tuples; ADR-034 § Open Problems names
+# a high-water above 1 as a reaper vehicle that stopped running).
+# aarch64 / riscv64: build their images with MANIFEST_PROFILES=default,regress
+# and run their QEMU arguments under tools/qemu-run-quiet.py with the first
+# require below.
+REGRESS_REQUIRES := --require '\[REGRESS\] done: [0-9]+ pass, 0 fail' \
+	--require 'reaper \(passes, last pass tick, pending, high-water\)/cpu \[\([0-9]+, [0-9]+, [01], [01]\), \([0-9]+, [0-9]+, [01], [01]\)\]'
+
+run-regress:
+	$(MAKE) run-quiet MANIFEST_PROFILES=default,regress TIMEOUT=$(or $(TIMEOUT),120) \
+		EXTRA_REQUIRES="$(REGRESS_REQUIRES) $(EXTRA_REQUIRES)"
 
 # Quiet run under `--features dev-piv` — the stream A FDE end-to-end
 # smoke test. Formats the disk image with a fresh signed volume
