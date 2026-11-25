@@ -525,9 +525,16 @@ pub mod flags {
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE
     }
 
-    /// User data: present, writable, user-accessible
+    /// User data: present, writable, user-accessible, never executable
+    /// (W^X). Every writable user page is data: ELF segments (the loader's
+    /// verifier refuses a writable + executable segment), the stack,
+    /// `SYS_ALLOCATE`, DMA grants and channel mappings. aarch64 sets UXN
+    /// and riscv64 leaves X clear for the same constructor.
     pub fn user_rw() -> PageTableFlags {
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
     }
 
     /// Kernel MMIO: present, writable, uncacheable (NO_CACHE +
@@ -541,13 +548,15 @@ pub mod flags {
             | PageTableFlags::NO_EXECUTE
     }
 
-    /// User MMIO: present, writable, user-accessible, uncacheable (NO_CACHE).
-    /// For mapping device MMIO regions into user-space processes.
+    /// User MMIO: present, writable, user-accessible, uncacheable
+    /// (NO_CACHE), never executable. For mapping device MMIO regions into
+    /// user-space processes.
     pub fn user_mmio() -> PageTableFlags {
         PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::NO_CACHE
+            | PageTableFlags::NO_EXECUTE
     }
 
     /// User framebuffer: present, writable, user-accessible,
@@ -557,12 +566,13 @@ pub mod flags {
     /// (uncacheable) every 4-byte store was its own bus transaction and
     /// a 4 MB frame took on the order of a second on the Dell 3630
     /// (2026-10-24). Device *registers* must never use this: WC
-    /// reorders and merges stores.
+    /// reorders and merges stores. Never executable.
     pub fn user_framebuffer() -> PageTableFlags {
         PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::WRITE_THROUGH
+            | PageTableFlags::NO_EXECUTE
     }
 }
 
@@ -581,6 +591,15 @@ mod tests {
     fn user_ro_permits_read_only() {
         assert!(entry_permits_user(flags::user_ro(), Read));
         assert!(!entry_permits_user(flags::user_ro(), Write));
+    }
+
+    #[test]
+    fn writable_user_entries_are_never_executable() {
+        // W^X: every user constructor that grants write sets NO_EXECUTE.
+        for f in [flags::user_rw(), flags::user_mmio(), flags::user_framebuffer()] {
+            assert!(f.contains(PageTableFlags::WRITABLE));
+            assert!(f.contains(PageTableFlags::NO_EXECUTE));
+        }
     }
 
     #[test]

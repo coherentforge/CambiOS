@@ -63,12 +63,15 @@ pub(super) const MAX_USER_BUFFER: usize = 16384;
 /// HARDWARE: canonical user-space address ceiling.
 /// x86_64: lower-half canonical addresses end at bit 47
 /// (Intel SDM Vol 3 §3.3.7.1).
-/// AArch64 / RISC-V: TTBR0 / Sv48 cover 0..2^48 with T0SZ=16;
-/// the 0x0001_0000_0000_0000 value uses the full 48-bit range.
-#[cfg(target_arch = "x86_64")]
+/// RISC-V Sv48: one root serves both halves and bits 63..48 must equal
+/// bit 47, so the user half is 0..2^47; a VA with bit 47 set indexes the
+/// kernel half of the same root (RISC-V Privileged Spec, Sv48).
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 pub(super) const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
-/// HARDWARE: see `USER_SPACE_END` above — 48-bit VA variant.
-#[cfg(not(target_arch = "x86_64"))]
+/// HARDWARE: AArch64 TTBR0 with T0SZ=16 is a separate root covering
+/// 0..2^48 (Arm ARM, D8.2 VMSAv8-64 translation table regimes); the kernel
+/// half is TTBR1.
+#[cfg(target_arch = "aarch64")]
 pub(super) const USER_SPACE_END: u64 = 0x0001_0000_0000_0000;
 
 // ============================================================================

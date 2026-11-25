@@ -384,6 +384,16 @@ mod tests {
     }
 
     #[test]
+    fn writable_user_leaves_are_never_executable() {
+        // W^X: every user constructor that grants write sets UXN.
+        for f in [flags::user_rw(), flags::user_mmio(), flags::user_framebuffer()] {
+            let pte = make_leaf_pte(FRAME, f);
+            assert!(pte_leaf_permits_user(pte, Write));
+            assert!(pte & DESC_UXN != 0);
+        }
+    }
+
+    #[test]
     fn leaf_kernel_pages_permit_nothing() {
         for f in [flags::KERNEL_RO, flags::kernel_rw(), flags::kernel_mmio()] {
             let pte = make_leaf_pte(FRAME, f);

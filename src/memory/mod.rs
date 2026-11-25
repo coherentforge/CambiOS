@@ -201,17 +201,17 @@ pub mod paging {
         Ok(table_phys)
     }
 
-    /// Walk L0→L1→L2 read-only. Returns None if any level is unmapped.
+    /// Walk L0→L1→L2 read-only. None if a level is unmapped or a leaf (block / superpage).
     unsafe fn walk_to_l3_readonly(root_phys: u64, va: u64) -> Option<u64> {
         let indices = [l0_index(va), l1_index(va), l2_index(va)];
         let mut table_phys = root_phys;
 
-        // SAFETY: Caller guarantees root_phys is a valid page table.
-        // Each level descends through valid table descriptors.
+        // SAFETY: Caller guarantees root_phys is a valid page table; each
+        // level descends only through `pte_is_table` entries (tables).
         unsafe {
             for &idx in &indices {
                 let entry = read_entry(table_phys, idx);
-                if !ap::pte_is_valid(entry) {
+                if !ap::pte_is_table(entry) {
                     return None;
                 }
                 table_phys = ap::pte_addr(entry);
