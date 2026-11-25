@@ -62,7 +62,7 @@ docs/adr/031-unified-storage-substrate.md:24:deferred
 docs/adr/033-multi-principal-vault.md:149:deferred
 docs/adr/034-deferred-task-resource-reclamation.md:11:deferred
 docs/adr/034-deferred-task-resource-reclamation.md:16:deferred
-docs/adr/034-deferred-task-resource-reclamation.md:153:deferred
+docs/adr/034-deferred-task-resource-reclamation.md:154:deferred
 docs/adr/035-translation-layer-compatibility.md:54:deferred
 docs/identity-synthesis.md:124:deferred
 docs/identity.md:121:eventually
@@ -90,9 +90,9 @@ src/fs/block.rs:174:eventually
 src/ipc/capability.rs:759:deferred
 src/ipc/capability.rs:818:TODO
 src/lib.rs:106:TBD
-src/lib.rs:1320:deferred
-src/lib.rs:1328:deferred
-src/lib.rs:1336:deferred
+src/lib.rs:1321:deferred
+src/lib.rs:1329:deferred
+src/lib.rs:1337:deferred
 src/memory/mod.rs:750:placeholder
 src/memory/mod.rs:759:placeholder
 src/microkernel/main.rs:1053:for-now
@@ -105,8 +105,8 @@ src/process.rs:1327:deferred
 src/process.rs:1328:deferred
 src/reaper.rs:4:deferred
 src/reaper.rs:9:deferred
-src/reaper.rs:43:deferred
-src/reaper.rs:65:deferred
+src/reaper.rs:45:deferred
+src/reaper.rs:67:deferred
 src/scheduler/mod.rs:412:placeholder
 src/scheduler/mod.rs:413:placeholder
 src/syscalls/dispatcher.rs:4559:for-now

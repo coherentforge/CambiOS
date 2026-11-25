@@ -432,21 +432,25 @@ pub fn reap_process(
     // this CPU still runs through (CR3/satp/TTBR0) and the kernel stack it
     // still stands on — to this CPU's reaper. Both are in use *right now*;
     // freeing the root inline is the confirmed triple-fault, and the stack
-    // can't free itself. `reaper::drain_local()` frees them from the idle
-    // loop after the terminal yield below switches the CPU off them.
+    // can't free itself. A later `reaper::drain_local()` on this CPU (the
+    // next death here, or the idle loop) frees them, after the terminal
+    // yield below has switched the CPU off them.
     //
-    // Pushed under the per-CPU queue lock alone — every hierarchy lock was
-    // released above, so this is not a lower-while-holding-higher
-    // inversion. Safe to enqueue here because `purge_task` cleared
-    // `current_task`, so the timer ISR takes its no-switch path
-    // (`time_slice_expired()` is false with no current task): the dying
-    // task is never involuntarily switched away between this push and the
-    // terminal yield, so the item is durable before any context switch.
-    // Enqueue-once: gated on winning the Running->Terminated transition.
-    // Enqueue whenever we won the transition and this is a real task: even
-    // a kernel task with no per-process root and no heap stack still owns a
-    // scheduler slot the reaper must reclaim (ADR-034 Phase B). The idle
-    // task never exits, so it never reaches here, but guard anyway.
+    // First this death drains the earlier deaths on this CPU, so at most
+    // one item (this one) is pending after it, whether or not the CPU ever
+    // idles. Every hierarchy lock was released above, so the drain and the
+    // push (queue lock alone) are not lower-while-holding-higher
+    // inversions. Preemption is off from the drain through the push:
+    // `purge_task` left `current_task == None`, which `isr_kick` treats as
+    // switchable, and a switch before the push would abandon this task's
+    // item (a leak of its root, stack and slot). After the push a switch is
+    // harmless: the item is queued and the switch moves the CPU off the
+    // dead root and stack. Enqueue-once: gated on winning the
+    // Running->Terminated transition. Enqueue whenever we won the
+    // transition and this is a real task: even a kernel task with no
+    // per-process root and no heap stack still owns a scheduler slot the
+    // reaper must reclaim (ADR-034 Phase B). The idle task never exits, so
+    // it never reaches here, but guard anyway.
     if won_transition && !task_id.is_idle() {
         let item = crate::reaper::ReclaimItem {
             root_phys: deferred_root.unwrap_or(0),
@@ -456,10 +460,13 @@ pub fn reap_process(
         // The queue's length right after the push feeds the high-watermark
         // ADR-034 § Open Problems asks for; recorded after the queue lock
         // is released (the stats are lock-free).
+        crate::preempt_disable();
+        crate::reaper::drain_local();
         let pushed_len = {
             let mut queue = crate::local_reclaim_queue().lock();
             queue.push(item).map(|()| queue.len())
         };
+        crate::preempt_enable();
         match pushed_len {
             Ok(len) => crate::local_reaper_stats().note_push(len),
             Err(_) => {

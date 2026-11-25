@@ -1306,8 +1306,9 @@ pub fn local_frame_cache() -> &'static Spinlock<FrameCache> {
 /// Per-CPU deferred-reclaim queues (ADR-034 §3). Each CPU owns
 /// `PER_CPU_RECLAIM_QUEUE[cpu_id]`. A dying task's death path pushes its
 /// `{ page-table root, kernel stack }` here (under this lock alone — never
-/// nested with a hierarchy lock); the per-CPU idle-loop reaper
-/// (`reaper::drain_local`) pops and frees them from a clean context.
+/// nested with a hierarchy lock); the per-CPU reaper (`reaper::drain_local`,
+/// run from the idle loop and from each death just before its push) pops
+/// and frees them from a clean context.
 ///
 /// `IrqSpinlock`, not a plain `Spinlock`, because the pusher is a task in the
 /// `Terminated`-but-still-running state: disabling interrupts across the brief
@@ -1343,7 +1344,7 @@ pub fn local_reclaim_queue() -> &'static IrqSpinlock<reaper::ReclaimQueue> {
 
 /// Per-CPU reaper instrumentation (ADR-034 § Open Problems, the
 /// high-watermark trigger): passes, pushes, drains and queue high-water for
-/// each CPU's idle-loop reaper. Lock-free atomics, no lock domain: each CPU
+/// each CPU's reaper. Lock-free atomics, no lock domain: each CPU
 /// writes its own entry, the BSP's `[sched]` diagnostic reads them all.
 pub static PER_CPU_REAPER_STATS: [reaper::ReaperStats; MAX_CPUS] =
     [const { reaper::ReaperStats::new() }; MAX_CPUS];

@@ -16,23 +16,25 @@
 //!
 //! See [ADR-034](../docs/adr/034-deferred-task-resource-reclamation.md).
 //!
-//! ## Mechanism (Phase A)
+//! ## Mechanism
 //!
-//! The death path captures `{ page-table root, kernel-stack top }` by value,
-//! marks the task `Terminated`, and pushes the pair onto
+//! The death path captures `{ page-table root, kernel-stack top, task slot }`
+//! by value, marks the task `Terminated`, and pushes the item onto
 //! [`crate::PER_CPU_RECLAIM_QUEUE`] for its own CPU — under the queue lock
 //! alone, with no hierarchy lock held (ADR-034 §3 lock discipline). It then
-//! yields. Because `purge_task` has already cleared `current_task`, the timer
-//! ISR takes its no-switch path (`time_slice_expired()` is `false` with no
-//! current task), so the dying task is never involuntarily switched away
-//! between the enqueue and its terminal yield — the queued item is durable
-//! before any context switch, and any switch (the terminal yield) moves the
-//! CPU off the dead root and stack *as part of the switch* (CR3/satp reload +
-//! stack swap) before the reaper can run.
+//! yields. Once the item is queued, any switch away from the dying task (the
+//! terminal yield, or a reschedule kick, which `isr_kick` takes because a
+//! purged task is not Running) moves the CPU off the dead root and stack *as
+//! part of the switch* (CR3/satp reload + stack swap) before the reaper can
+//! run, so the item is safe to free from then on.
 //!
-//! [`drain_local`] runs later, from this CPU's idle loop, in normal context
-//! (interrupts enabled, `SCHEDULER` not held). It frees the page-table root +
-//! intermediates and the kernel stack — by then no CPU is on either.
+//! [`drain_local`] frees items in normal context (interrupts enabled, no
+//! hierarchy lock held). It runs from two places on each CPU: the idle loop,
+//! and the death path itself, just before the dying task pushes its own item,
+//! so every death first reaps the earlier deaths on its CPU (ADR-034 §3). The
+//! second caller is what keeps a CPU that never idles (a yield-spinning
+//! poller is enough) from holding every later exit's root, stack and global
+//! task slot: after each death at most one item, the newest, is pending.
 
 extern crate alloc;
 
@@ -137,21 +139,20 @@ impl Default for ReclaimQueue {
     }
 }
 
-/// Per-CPU reaper instrumentation: how often this CPU's idle-loop reaper
-/// runs, and how many reclaim items it has taken in and freed.
+/// Per-CPU reaper instrumentation: how often this CPU's reaper runs, and how
+/// many reclaim items it has taken in and freed.
 ///
-/// The reaper runs only when its CPU runs the idle task (ADR-034 §
-/// Divergence: the vehicle is the idle loop). A CPU that always has a Ready
-/// task (a yield-spinning poller is enough) never idles, so its reaper
-/// never runs and every exit on it holds a page-table root, a kernel stack
-/// and a global task slot until it does. ADR-034 § Open Problems names the
-/// measurement that decides whether that bound matters: the per-CPU queue
-/// high-watermark. The BSP's one-shot `[sched]` diagnostic reports it.
+/// The reaper runs from the idle loop and from every death on its CPU
+/// (ADR-034 §3), so after each death at most one item is pending. A
+/// `pending` above 1, or a high-water above 1, means a vehicle stopped
+/// running: the ADR-034 § Open Problems trigger. A last-pass tick far behind
+/// the current one alone means only that the CPU neither idled nor saw a
+/// death since. The BSP's one-shot `[sched]` diagnostic reports all of it.
 ///
 /// Lock-free and outside the lock hierarchy: each CPU writes only its own
-/// entry (the pusher is a task on that CPU, the drainer is that CPU's idle
-/// loop), any CPU may read. Counters are `u64` so no realistic uptime
-/// wraps them.
+/// entry (pusher and drainer both run on that CPU with preemption off, so
+/// neither can migrate mid-update), any CPU may read. Counters are `u64` so
+/// no realistic uptime wraps them.
 pub struct ReaperStats {
     passes: core::sync::atomic::AtomicU64,
     pushed: core::sync::atomic::AtomicU64,
@@ -163,7 +164,8 @@ pub struct ReaperStats {
 /// A point-in-time copy of one CPU's [`ReaperStats`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReaperSnapshot {
-    /// `drain_local` calls: one per idle-loop iteration on this CPU.
+    /// `drain_local` calls on this CPU: one per idle-loop iteration and one
+    /// per death.
     pub passes: u64,
     /// Items the death path pushed onto this CPU's queue.
     pub pushed: u64,
@@ -238,9 +240,11 @@ impl Default for ReaperStats {
 }
 
 /// Drain this CPU's reclaim queue, freeing each item's page-table root +
-/// intermediates and kernel stack. Called from the per-CPU idle loop
-/// (`microkernel_loop` and the AP idle loops) in normal context — interrupts
-/// enabled, no hierarchy lock held.
+/// intermediates, kernel stack and scheduler slot. Two callers, both in
+/// normal context (interrupts enabled, no hierarchy lock held): the per-CPU
+/// idle loop (`microkernel_loop` and the AP idle loops), and the death path
+/// (`reap::reap_process`), just before the dying task pushes its own item
+/// (ADR-034 §3).
 ///
 /// Lock discipline (ADR-034 §3): pop under the queue lock **alone**, release
 /// it, then take `FRAME_ALLOCATOR(8)` for the frame frees — never nested. The
@@ -252,73 +256,99 @@ impl Default for ReaperStats {
 /// own CPU's queue, and a Terminated+purged task cannot migrate, so the slot
 /// is local to the reaper. No foreign-`SCHEDULER` acquisition (ADR-034 §3).
 ///
-/// Bounded: the loop runs at most `RECLAIM_QUEUE_CAPACITY` times per call
-/// (the queue cannot grow while we drain it on this CPU — the only pusher is a
-/// dying task running on this same CPU, which cannot run concurrently with the
-/// idle loop).
+/// Each item runs with preemption disabled on this CPU ([`drain_one`]), so
+/// the drain is correct whatever its caller: a caller that is an ordinary
+/// task can be neither switched away nor migrated between popping an item
+/// from this CPU's queue and freeing its slot in this CPU's scheduler. A
+/// migration there would make `reap_slot` run against another CPU's
+/// scheduler, miss, and leave the slot's `TASK_SLOT_BITMAP` bit set for good.
+///
+/// Bounded: at most `RECLAIM_QUEUE_CAPACITY` items per call, a counted loop.
+/// The queue can grow during a call only between items, while preemption is
+/// back on and another task on this CPU can run and die (the idle-loop
+/// caller); the bound holds regardless, and that task's own death drains
+/// what this call left.
 #[cfg(not(test))]
 pub fn drain_local() {
-    let stats = crate::local_reaper_stats();
-    stats.note_pass(crate::scheduler::Timer::get_ticks());
-    loop {
-        // Pop under the queue lock alone; the guard is dropped at the end of
-        // this block, before FRAME_ALLOCATOR is acquired below.
-        let item = {
-            let mut queue = crate::local_reclaim_queue().lock();
-            match queue.pop() {
-                Some(item) => item,
-                None => break,
-            }
-        };
-        stats.note_drained();
-
-        // Free the page-table root + intermediate frames. The owning task has
-        // yielded off this root (it is no CPU's active CR3/satp/TTBR0), so the
-        // active-root guard inside `reclaim_process_page_tables` is pure
-        // defense-in-depth here.
-        if item.root_phys != 0 {
-            let mut frame_alloc = crate::FRAME_ALLOCATOR.lock();
-            crate::memory::paging::reclaim_process_page_tables(item.root_phys, &mut frame_alloc);
+    crate::local_reaper_stats().note_pass(crate::scheduler::Timer::get_ticks());
+    for _ in 0..RECLAIM_QUEUE_CAPACITY {
+        crate::preempt_disable();
+        let drained = drain_one();
+        crate::preempt_enable();
+        if !drained {
+            break;
         }
+    }
+}
 
-        // Free the kernel stack the task stood on (FRAME_ALLOCATOR released).
-        if item.kstack_top != 0 {
-            free_kernel_stack(item.kstack_top);
+/// Host-test stub: there are no per-CPU queues or frame allocator on the
+/// host, and the death path that calls this is exercised under QEMU.
+#[cfg(test)]
+pub fn drain_local() {}
+
+/// Pop one item from this CPU's queue and free it; `false` if the queue was
+/// empty. The caller ([`drain_local`]) holds preemption off across the call,
+/// so every per-CPU lookup below resolves to the same CPU.
+#[cfg(not(test))]
+fn drain_one() -> bool {
+    // Pop under the queue lock alone; the guard is dropped at the end of
+    // this block, before FRAME_ALLOCATOR is acquired below.
+    let item = {
+        let mut queue = crate::local_reclaim_queue().lock();
+        match queue.pop() {
+            Some(item) => item,
+            None => return false,
         }
+    };
+    crate::local_reaper_stats().note_drained();
 
-        // Reclaim the scheduler slot (ADR-034 Phase B) and bump the slot's
-        // generation so the next occupant gets a distinct TaskId. Both happen
-        // under the local SCHEDULER lock so no create on this CPU can grab the
-        // freed slot with the stale generation in between. `reap_slot`
-        // validates the slot still holds that exact Terminated task, so a
-        // double-drain or a racing reuse is a no-op rather than a corruption.
-        if !item.task_id.is_idle() {
-            let reaped = {
-                let mut sched_guard = crate::local_scheduler().lock();
-                if let Some(sched) = sched_guard.as_mut() {
-                    if sched.reap_slot(item.task_id) {
-                        crate::bump_task_generation(item.task_id.slot());
-                        true
-                    } else {
-                        false
-                    }
+    // Free the page-table root + intermediate frames. The owning task has
+    // yielded off this root (it is no CPU's active CR3/satp/TTBR0), so the
+    // active-root guard inside `reclaim_process_page_tables` is pure
+    // defense-in-depth here.
+    if item.root_phys != 0 {
+        let mut frame_alloc = crate::FRAME_ALLOCATOR.lock();
+        crate::memory::paging::reclaim_process_page_tables(item.root_phys, &mut frame_alloc);
+    }
+
+    // Free the kernel stack the task stood on (FRAME_ALLOCATOR released).
+    if item.kstack_top != 0 {
+        free_kernel_stack(item.kstack_top);
+    }
+
+    // Reclaim the scheduler slot (ADR-034 Phase B) and bump the slot's
+    // generation so the next occupant gets a distinct TaskId. Both happen
+    // under the local SCHEDULER lock so no create on this CPU can grab the
+    // freed slot with the stale generation in between. `reap_slot`
+    // validates the slot still holds that exact Terminated task, so a
+    // double-drain or a racing reuse is a no-op rather than a corruption.
+    if !item.task_id.is_idle() {
+        let reaped = {
+            let mut sched_guard = crate::local_scheduler().lock();
+            if let Some(sched) = sched_guard.as_mut() {
+                if sched.reap_slot(item.task_id) {
+                    crate::bump_task_generation(item.task_id.slot());
+                    true
                 } else {
                     false
                 }
-            };
-            // Release the GLOBAL slot bit only after a successful reap+bump, and
-            // only then — a false `reaped` means the slot already holds a
-            // different live task (racing reuse / double-drain) and its bit must
-            // NOT be cleared. Releasing after the bump is what lets the next
-            // claimer of this slot observe the new generation (this release is
-            // the synchronizes-with edge for the claimer's acquire load). Done
-            // with the SCHEDULER lock dropped: the bitmap is an independent
-            // lock-free domain (ADR-034 Residual Risk closure).
-            if reaped {
-                crate::release_task_slot(item.task_id.slot() as usize);
+            } else {
+                false
             }
+        };
+        // Release the GLOBAL slot bit only after a successful reap+bump, and
+        // only then — a false `reaped` means the slot already holds a
+        // different live task (racing reuse / double-drain) and its bit must
+        // NOT be cleared. Releasing after the bump is what lets the next
+        // claimer of this slot observe the new generation (this release is
+        // the synchronizes-with edge for the claimer's acquire load). Done
+        // with the SCHEDULER lock dropped: the bitmap is an independent
+        // lock-free domain (ADR-034 Residual Risk closure).
+        if reaped {
+            crate::release_task_slot(item.task_id.slot() as usize);
         }
     }
+    true
 }
 
 /// Free a heap-allocated kernel stack given its top address.

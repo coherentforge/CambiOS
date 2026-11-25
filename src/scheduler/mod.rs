@@ -110,12 +110,12 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
                         }
                     }
                 }
-                // ADR-034 reaper health per CPU: (idle-loop reaper passes,
-                // tick of the last pass, reclaim items pending, queue
-                // high-water). The reaper runs only when its CPU idles, so
-                // a last-pass tick far behind the current one means exits
-                // on that CPU since then have not been reclaimed. Lock-free
-                // reads.
+                // ADR-034 reaper health per CPU: (reaper passes, tick of
+                // the last pass, reclaim items pending, queue high-water).
+                // The reaper runs when its CPU idles and on every death on
+                // it, so pending or high-water above 1 means a vehicle
+                // stopped running; an old last-pass tick alone means only
+                // no idle and no death since. Lock-free reads.
                 let mut reaper = [(0u64, 0u64, 0u64, 0u64); 16];
                 for (slot, stats) in reaper
                     .iter_mut()
