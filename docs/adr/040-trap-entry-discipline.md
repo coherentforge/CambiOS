@@ -198,8 +198,14 @@ Self-modifying code in the entry path is harder to audit and to verify than a br
 Each step is its own commit, and each step's regression-probe stage fails on the commit before it:
 
 1. Emergency stacks on every CPU (§ 7).
-2. The common trap entry and full exception coverage, GS handling unchanged (§ 3, § 4), with the `clac` flag still off. Probe stages: `ud2`, a push through a non-canonical stack pointer, `int1`.
+2. The common trap entry and full exception coverage, GS handling unchanged (§ 3, § 4), with the `clac` flag still off. Probe stages: `ud2` and `int1`. A third, a push through a non-canonical stack pointer, is #SS on Intel hardware and a gate there; QEMU's TCG raises #GP for it, which had a handler before this step, so under QEMU it passes on the earlier kernel too.
 3. Syscall entry flags, no ring-0 return path, the return-address backstop (§ 5). Probe stage: trap flag set across `syscall`.
 4. `swapgs`, the paranoid entries and the fences (§ 2). Probe stages: GS reloaded from ring 3, then a syscall; then a timer interrupt.
 5. CR0 and CR4 ownership, the SMAP flag on, the QEMU `-cpu` flags (§ 6). Probe stage: an unmasked SIMD exception arrives as #XM.
 6. The user address floor and ceiling (§ 8).
+
+## Divergence
+
+The body above reflects the implemented design. The original wordings, with the date and commit where they changed, are preserved here.
+
+- **Step 2's non-canonical stack push is a gate on Intel hardware only** (2026-11-25, eb0bf98). Under QEMU the push raised #GP, not #SS, and the earlier kernel had a #GP handler, so the stage passed on it too; `ud2` and `int1` are the stages that tell the two kernels apart there. The stage stays, as `trap-badstack`. *Prior wording (§ Sequencing, step 2): "Probe stages: `ud2`, a push through a non-canonical stack pointer, `int1`."*
