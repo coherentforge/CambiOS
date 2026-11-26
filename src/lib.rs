@@ -7,7 +7,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 // Per-op unsafe discipline (Dev Convention 1) is denied in Cargo.toml
 // `[lints.clippy]`, which binds this library and the kernel binary alike.
-#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 //! CambiOS Microkernel - Verification-Ready Core
 //!
 //! A minimal microkernel for x86-64 supporting:
@@ -550,6 +549,13 @@ static PREEMPT_DEPTH_LIVE: core::sync::atomic::AtomicBool =
 /// every CPU that takes a lock can name itself.
 pub fn preempt_depth_go_live() {
     PREEMPT_DEPTH_LIVE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether per-CPU data can be read on any CPU running kernel code: the
+/// same moment as [`preempt_depth_go_live`]. A fault report reads the CPU
+/// id only after this.
+pub fn per_cpu_live() -> bool {
+    PREEMPT_DEPTH_LIVE.load(core::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(not(test))]

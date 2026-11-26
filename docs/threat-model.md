@@ -87,7 +87,7 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 **Why it matters for CambiOS.** These `unsafe` blocks are irreducible (the hardware semantics require raw asm). They are also the blocks where a bug is invisible in SAFETY comments — the invariant lives in the *agreement* between two separate asm paths (syscall vs. ISR vs. voluntary yield) that must produce bit-identical frames. x86_64 `syscall_entry` / AArch64 SPSel toggle / RISC-V S-mode trap are the three hot sites.
 
-**Current mitigation.** SAFETY comments + host-side layout tests on `SavedContext`. Tri-arch build gate (`make check-all`) catches compile-time frame mismatches. `PerCpu.kernel_rsp0` updated on every context switch.
+**Current mitigation.** SAFETY comments + host-side layout tests on `SavedContext`. Tri-arch build gate (`make check-all`) catches compile-time frame mismatches. `PerCpu.kernel_rsp0` updated on every context switch. On x86_64 every interrupt and exception enters through one common trap entry and every saved context is resumed through one common exit ([ADR-040](adr/040-trap-entry-discipline.md) § 3), so two paths build a `SavedContext` (the trap entry and `yield_save_and_switch`'s synthetic frame) where there were three stubs and about thirty compiler-generated prologues; the slot offsets both depend on and the 16-byte frame size are compile-time assertions in `arch/x86_64/mod.rs`. `syscall_entry` keeps its own frame.
 
 **Gap.** No formal proof that the three save paths produce identical frames. No Kani harness on context switch. The "three sites must agree" invariant is enforced by human discipline, not the type system.
 

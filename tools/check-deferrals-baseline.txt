@@ -89,10 +89,10 @@ src/boot/riscv.rs:750:deferred
 src/fs/block.rs:174:eventually
 src/ipc/capability.rs:759:deferred
 src/ipc/capability.rs:818:TODO
-src/lib.rs:106:TBD
-src/lib.rs:1321:deferred
-src/lib.rs:1329:deferred
-src/lib.rs:1337:deferred
+src/lib.rs:105:TBD
+src/lib.rs:1327:deferred
+src/lib.rs:1335:deferred
+src/lib.rs:1343:deferred
 src/memory/mod.rs:750:placeholder
 src/memory/mod.rs:759:placeholder
 src/microkernel/main.rs:1053:for-now

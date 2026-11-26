@@ -726,6 +726,8 @@ pub fn load_elf_process(
                 r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0,
                 r9: 0, r8: 0, rbp: 0, rdi: 0, rsi: 0, rdx: 0,
                 rcx: 0, rbx: 0, rax: 0,
+                vector: crate::arch::SavedContext::NO_VECTOR,
+                error_code: 0,
                 rip: metadata.entry_point,
                 cs: crate::arch::gdt::USER_CS as u64,
                 rflags: 0x202, // IF set (interrupts enabled)

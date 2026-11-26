@@ -286,6 +286,21 @@ impl IstSlot {
             IstSlot::MachineCheck => 2,
         }
     }
+
+    /// The value an IDT gate's IST field holds for this slot (IST1 is 1;
+    /// 0 there means "no switch").
+    pub const fn gate_index(self) -> u8 {
+        self.tss_index() as u8 + 1
+    }
+
+    /// The vector whose gate names this slot (ADR-040 § 7).
+    pub const fn vector(self) -> u8 {
+        match self {
+            IstSlot::DoubleFault => 8,
+            IstSlot::Nmi => 2,
+            IstSlot::MachineCheck => 18,
+        }
+    }
 }
 
 /// TUNING: 4 KiB pages per emergency stack. Trades the handler's stack

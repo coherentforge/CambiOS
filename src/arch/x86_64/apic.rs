@@ -60,8 +60,9 @@ const LVT_TIMER_MASKED: u32 = 1 << 16;
 /// SIVR: APIC Software Enable bit
 const SIVR_APIC_ENABLE: u32 = 1 << 8;
 
-/// Spurious interrupt vector (must be in range 0x10..=0xFF)
-const SPURIOUS_VECTOR: u8 = 0xFF;
+/// Spurious interrupt vector (must be in range 0x10..=0xFF). The trap
+/// dispatch sends no EOI for it (Intel SDM Vol. 3A § 11.9).
+pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
 /// Timer interrupt vector (same as the PIT used — vector 32)
 pub const TIMER_VECTOR: u8 = 32;

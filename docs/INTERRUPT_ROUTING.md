@@ -22,11 +22,17 @@ CambiOS uses the **Local APIC** and **I/O APIC** exclusively. The legacy 8259 PI
 
 | Vector | Source | Handler |
 |---|---|---|
-| 0-31 | CPU exceptions | Exception handlers in IDT |
-| 32 | Local APIC timer (100Hz periodic) | Naked asm stub → `timer_isr_inner` |
-| 33-56 | Device IRQs via I/O APIC (GSI + 33) | Per-GSI `x86-interrupt` handlers |
+Every vector enters through its stub in `arch/x86_64/trap.rs` and the common trap entry, which calls `interrupts::x86_trap(ctx, vector, error)` ([ADR-040](adr/040-trap-entry-discipline.md) § 3). The table below is `x86_trap`'s dispatch:
+
+| Vector | Source | Handler |
+|---|---|---|
+| 0-31 | CPU exceptions | `exceptions::handle`: ring 3 reaps the task, ring 0 halts with a report, NMI logs and returns ([ADR-040](adr/040-trap-entry-discipline.md) § 4) |
+| 32 | Local APIC timer (100Hz periodic) | `timer_isr_inner` |
+| 33-56 | Device IRQs via I/O APIC (GSI + 33) | `device_irqs::device_irq_handler(gsi)`, once the I/O APIC is up |
+| 0xFD | Reschedule IPI | `resched_isr_inner` |
 | 0xFE | TLB shootdown IPI | `tlb_shootdown_isr` |
-| 0xFF | APIC spurious interrupt | `spurious_interrupt` |
+| 0xFF | APIC spurious interrupt | nothing (no EOI) |
+| any other | unassigned | logged once per vector, EOI |
 
 ### Device IRQ Routing (I/O APIC)
 
@@ -34,12 +40,12 @@ Configured at boot by `ioapic::configure_device_irqs()`:
 
 | Device | ISA IRQ | GSI | Vector | Handler |
 |---|---|---|---|---|
-| Keyboard | 1 | 1 | 34 | `device_irqs::gsi_1` |
-| COM2/Serial | 3 | 3 | 36 | `device_irqs::gsi_3` |
-| COM1/Serial | 4 | 4 | 37 | `device_irqs::gsi_4` |
-| PS/2 Mouse | 12 | 12 | 45 | `device_irqs::gsi_12` |
-| Primary IDE | 14 | 14 | 47 | `device_irqs::gsi_14` |
-| Secondary IDE | 15 | 15 | 48 | `device_irqs::gsi_15` |
+| Keyboard | 1 | 1 | 34 | `device_irq_handler(1)` |
+| COM2/Serial | 3 | 3 | 36 | `device_irq_handler(3)` |
+| COM1/Serial | 4 | 4 | 37 | `device_irq_handler(4)` |
+| PS/2 Mouse | 12 | 12 | 45 | `device_irq_handler(12)` |
+| Primary IDE | 14 | 14 | 47 | `device_irq_handler(14)` |
+| Secondary IDE | 15 | 15 | 48 | `device_irq_handler(15)` |
 
 ACPI MADT interrupt source overrides are respected — the I/O APIC driver reads them during init and adjusts polarity and trigger mode per GSI.
 
@@ -56,9 +62,9 @@ Local APIC timer counts down to zero
 CPU takes vector 32 interrupt
     |
     v
-timer_isr_stub (naked asm in arch/x86_64/mod.rs)
-    - Pushes all GPRs onto stack to form SavedContext
-    - Passes current RSP to Rust function
+vector 32's stub + x86_trap_common (arch/x86_64/trap.rs)
+    - Pushes 0 (no error code) and the vector, then all GPRs: a SavedContext
+    - Calls x86_trap(ctx, 32, 0) (interrupts/mod.rs)
     |
     v
 timer_isr_inner(current_rsp) (arch/x86_64/mod.rs)
@@ -74,7 +80,8 @@ scheduler::on_timer_isr(current_rsp) (scheduler/mod.rs)
 Back in timer_isr_inner:
     - If context switch: update TSS.RSP0, load new CR3
     - APIC EOI (apic::write_eoi())
-    - iretq with new RSP (switches to new task)
+    - x86_trap_restore pops the context at the returned RSP; iretq
+      (switches to new task)
 ```
 
 Key details:
@@ -97,9 +104,8 @@ I/O APIC routes to Local APIC on target CPU
 CPU takes vector 33+GSI interrupt
     |
     v
-device_irqs::gsi_N(InterruptStackFrame) (interrupts/mod.rs)
-    - x86-interrupt calling convention
-    - Calls device_irq_handler(gsi)
+vector's stub + x86_trap_common → x86_trap(ctx, 33 + gsi, 0)
+    - Dispatches to device_irq_handler(gsi) once the I/O APIC is up
     |
     v
 device_irq_handler(gsi) (interrupts/mod.rs)
@@ -309,10 +315,11 @@ Each CPU's Local APIC timer fires on that CPU only. The timer ISR only touches `
 | File | Contents |
 |---|---|
 | `src/interrupts/routing.rs` | InterruptRoutingTable, InterruptRoute, IrqNumber, InterruptContext |
-| `src/interrupts/mod.rs` | IDT setup, exception handlers, device ISR handlers (gsi_0-23), `device_irq_handler()` |
+| `src/arch/x86_64/trap.rs` | IDT, per-vector stubs, common trap entry and exit |
+| `src/interrupts/mod.rs` | `x86_trap` dispatch, exception decisions, `device_irq_handler()` |
 | `src/arch/x86_64/apic.rs` | Local APIC driver (timer, EOI, PIC disable, IPI) |
 | `src/arch/x86_64/ioapic.rs` | I/O APIC driver (device IRQ routing, redirection table) |
-| `src/arch/x86_64/mod.rs` | `timer_isr_stub` (asm), `timer_isr_inner` (Rust) |
+| `src/arch/x86_64/mod.rs` | `SavedContext`, `timer_isr_inner`, `resched_isr_inner` |
 | `src/scheduler/mod.rs` | `on_timer_isr()`, `wake_irq_waiters()` |
 | `src/syscalls/dispatcher.rs` | `handle_wait_irq()` (SYS_WAIT_IRQ implementation) |
 | `src/acpi/mod.rs` | MADT parsing for I/O APIC addresses and interrupt source overrides |

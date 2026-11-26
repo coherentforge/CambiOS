@@ -3,22 +3,27 @@
 
 //! Interrupt handling subsystem
 //!
-//! Manages interrupt descriptor tables, exception handlers, and interrupt routing.
+//! On x86_64 every vector enters through one trap path ([ADR-040] § 3,
+//! `arch::x86_64::trap`) and lands in [`x86_trap`], which decides what the
+//! vector means:
 //!
-//! ## Interrupt Vectors
-//! - 0-31: CPU exceptions (divide error, page fault, etc.)
+//! - 0-31: CPU exceptions. Every one has a decision ([ADR-040] § 4): from
+//!   ring 3 the task is reaped ([ADR-019]); from ring 0 the CPU halts with a
+//!   report; an NMI is logged and returns.
 //! - 32: APIC timer (periodic, drives preemptive scheduling)
-//! - 33-56: Device IRQs via I/O APIC (keyboard, serial, IDE, etc.)
-//! - 0xFE: TLB shootdown IPI
-//! - 0xFF: APIC spurious interrupt
+//! - 33-56: Device IRQs via I/O APIC, once the I/O APIC is routed
+//! - 0xFD: reschedule IPI; 0xFE: TLB shootdown IPI
+//! - 0xFF: APIC spurious interrupt (no EOI)
+//! - anything else: unassigned, logged once per vector, acknowledged
 //!
 //! The 8259 PIC is remapped to 0xF0-0xFF and fully masked at boot.
 //! All hardware interrupts are delivered through the Local APIC.
+//!
+//! [ADR-040]: ../../docs/adr/040-trap-entry-discipline.md
+//! [ADR-019]: ../../docs/adr/019-process-fault-reaping-and-peer-generation.md
 
 extern crate alloc;
 
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::idt::InterruptDescriptorTable;
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,70 +35,170 @@ pub mod pit;
 
 pub use routing::{InterruptRoutingTable, InterruptRoute, IrqNumber, InterruptContext, InterruptRoutingError};
 
-/// Interrupt descriptor table.
-///
-/// # Safety
-/// IDT storage wrapper — replaces `static mut` with `UnsafeCell` to comply
-/// with Rust 2024 edition deprecation of `static mut` references.
-///
-/// All writes happen during single-threaded init (`init()` and
-/// `init_hardware_interrupts()`) before interrupts are enabled. After
-/// `load()`, only the CPU reads it (not software).
-#[cfg(target_arch = "x86_64")]
-struct IdtStorage(core::cell::UnsafeCell<InterruptDescriptorTable>);
-
-#[cfg(target_arch = "x86_64")]
-// SAFETY: IDT is written during single-threaded boot init, then read-only
-// by CPU hardware. No concurrent software access occurs after init.
-unsafe impl Sync for IdtStorage {}
-
-#[cfg(target_arch = "x86_64")]
-static IDT: IdtStorage = IdtStorage(core::cell::UnsafeCell::new(InterruptDescriptorTable::new()));
-
-/// Obtain a mutable reference to the IDT. Init-time only.
-///
-/// # Safety
-///
-/// Must only be called during single-threaded init with interrupts
-/// disabled. No other reference to the IDT may exist.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn idt_mut() -> &'static mut InterruptDescriptorTable {
-    // SAFETY: Caller guarantees single-threaded init context.
-    unsafe { &mut *IDT.0.get() }
-}
-
-/// Obtain a shared reference to the IDT. Used for `load()`.
-///
-/// # Safety
-///
-/// The IDT must be fully initialized before calling.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn idt_ref() -> &'static InterruptDescriptorTable {
-    // SAFETY: Caller guarantees IDT is initialized.
-    unsafe { &*IDT.0.get() }
-}
-
 /// Tracks whether the IDT has been loaded (set once during `init()`).
 #[cfg(target_arch = "x86_64")]
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 
-/// Exception types and their handlers
+/// Set once the I/O APIC is initialized and the device vectors (33-56)
+/// mean device interrupts. Until then those vectors are unassigned.
+#[cfg(target_arch = "x86_64")]
+static DEVICE_IRQS_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// The x86_64 trap dispatch ([ADR-040] § 3, § 4), called by the common trap
+/// entry with interrupts disabled (every gate is an interrupt gate) on the
+/// stack the CPU chose: the task's kernel stack from ring 3, the current
+/// stack from ring 0, or an IST stack for NMI, #DF and #MC.
+///
+/// `ctx` is the `SavedContext` the entry built; `vector` and `error` are
+/// copies of its two trap slots. Returns the stack pointer of the context
+/// the common exit resumes: `ctx` itself, or another task's saved context
+/// after the timer or reschedule handler switched.
+///
+/// [ADR-040]: ../../docs/adr/040-trap-entry-discipline.md
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+extern "C" fn x86_trap(ctx: *mut crate::arch::x86_64::SavedContext, vector: u64, error: u64) -> u64 {
+    use crate::arch::x86_64::{apic, ioapic, tlb, RESCHED_VECTOR};
+
+    let rsp = ctx as u64;
+    let Ok(vector) = u8::try_from(vector) else {
+        // The stubs push 0-255 only: the entry read the wrong slot.
+        exceptions::halt_bad_vector(vector)
+    };
+    let device_base = ioapic::DEVICE_VECTOR_BASE;
+    let device_end = device_base as usize + ioapic::MAX_GSI_PINS;
+    match vector {
+        0..=31 => {
+            // SAFETY: ctx is the SavedContext the common entry just built on
+            // this stack; it stays in place for this call, and nothing else
+            // refers to it while the handler reads it.
+            let frame = unsafe { &*ctx };
+            exceptions::handle(frame, vector, error);
+            rsp
+        }
+        apic::TIMER_VECTOR => crate::arch::x86_64::timer_isr_inner(rsp),
+        RESCHED_VECTOR => crate::arch::x86_64::resched_isr_inner(rsp),
+        tlb::TLB_SHOOTDOWN_VECTOR => {
+            tlb::tlb_shootdown_isr();
+            rsp
+        }
+        // Intel SDM Vol. 3A § 11.9: no EOI for the spurious vector.
+        apic::SPURIOUS_VECTOR => rsp,
+        v if v >= device_base
+            && (v as usize) < device_end
+            && DEVICE_IRQS_LIVE.load(Ordering::Acquire) =>
+        {
+            device_irqs::device_irq_handler(u32::from(v - device_base));
+            rsp
+        }
+        v => {
+            unassigned_vector(v);
+            rsp
+        }
+    }
+}
+
+/// ARCHITECTURAL: words of the once-per-vector log bitmap: 256 vectors at
+/// 64 bits a word.
+#[cfg(target_arch = "x86_64")]
+const UNASSIGNED_SEEN_WORDS: usize = 4;
+
+/// Vectors already reported as unassigned (one bit each), so a stray
+/// source is logged once, not at its interrupt rate.
+#[cfg(target_arch = "x86_64")]
+static UNASSIGNED_SEEN: [core::sync::atomic::AtomicU64; UNASSIGNED_SEEN_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; UNASSIGNED_SEEN_WORDS];
+
+/// A vector nothing claims ([ADR-040] § 3, stub obligation 7): log it the
+/// first time, acknowledge it, return. It must not be mistaken for a fault
+/// of whichever task was running.
+///
+/// [ADR-040]: ../../docs/adr/040-trap-entry-discipline.md
+#[cfg(target_arch = "x86_64")]
+fn unassigned_vector(vector: u8) {
+    let bit = 1u64 << (vector % 64);
+    if let Some(word) = UNASSIGNED_SEEN.get(usize::from(vector / 64)) {
+        if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            let _ = crate::io::try_print(format_args!(
+                "  [trap] vector {:#x} has no handler; acknowledged and ignored\n",
+                vector
+            ));
+        }
+    }
+    // SAFETY: an external or IPI vector reaches here only with interrupts
+    // enabled, which init_hardware_interrupts does after the Local APIC is
+    // initialized; an EOI with nothing in service is ignored by the APIC.
+    unsafe { crate::arch::x86_64::apic::write_eoi() };
+}
+
+/// The decisions for exception vectors 0-31 ([ADR-040] § 4).
+///
+/// [ADR-040]: ../../docs/adr/040-trap-entry-discipline.md
 #[cfg(target_arch = "x86_64")]
 pub mod exceptions {
-    use x86_64::structures::idt::InterruptStackFrame;
+    use crate::arch::x86_64::SavedContext;
+    use crate::reap::FaultKind;
+
+    /// The architectural name of exception `vector` (Intel SDM Vol. 3A
+    /// Table 6-1; AMD APM Vol. 2 § 8.2 for 28-30).
+    pub const fn name(vector: u8) -> &'static str {
+        match vector {
+            0 => "DIVIDE ERROR",
+            1 => "DEBUG",
+            2 => "NMI",
+            3 => "BREAKPOINT",
+            4 => "OVERFLOW",
+            5 => "BOUND RANGE EXCEEDED",
+            6 => "INVALID OPCODE",
+            7 => "DEVICE NOT AVAILABLE",
+            8 => "DOUBLE FAULT",
+            9 => "COPROCESSOR SEGMENT OVERRUN",
+            10 => "INVALID TSS",
+            11 => "SEGMENT NOT PRESENT",
+            12 => "STACK-SEGMENT FAULT",
+            13 => "GENERAL PROTECTION",
+            14 => "PAGE FAULT",
+            16 => "x87 FLOATING-POINT",
+            17 => "ALIGNMENT CHECK",
+            18 => "MACHINE CHECK",
+            19 => "SIMD FLOATING-POINT",
+            20 => "VIRTUALIZATION",
+            21 => "CONTROL PROTECTION",
+            28 => "HYPERVISOR INJECTION",
+            29 => "VMM COMMUNICATION",
+            30 => "SECURITY",
+            _ => "RESERVED",
+        }
+    }
+
+    /// TUNING: `try_print` attempts a halting CPU makes before it gives up
+    /// on its report. A report waits out another CPU's print this way, and
+    /// does not hang when the lock's holder is the code this CPU
+    /// interrupted (which a spinning `println!` would). About a millisecond
+    /// of spinning on current hardware.
+    const REPORT_ATTEMPTS: u32 = 1 << 20;
+
+    /// Print a halting report without spinning on a lock forever.
+    fn report(args: core::fmt::Arguments) {
+        for _ in 0..REPORT_ATTEMPTS {
+            if crate::io::try_print(args) {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
 
     /// Reap the current user task for a fault and never return
     /// (ADR-019 § Decision 6). Runs on the faulting task's own kernel
-    /// stack (the CPL3→0 transition loaded TSS RSP0), so re-enabling
+    /// stack (the CPL3→0 transition loaded TSS RSP0; ADR-040 § 4 keeps every
+    /// trap that reaches here off the IST stacks), so re-enabling
     /// interrupts here is exactly the syscall path's posture — and it is
     /// required: the reap spins on cross-CPU TLB-shootdown acks, which a
     /// masked CPU can neither send nor answer. The task is about to be
     /// marked Terminated, so nothing re-enters it; the terminal yield
     /// loop never returns. Callers must have read CR2 (page faults)
     /// before this, since a nested #PF would clobber it.
-    fn reap_user_fault(kind: crate::reap::FaultKind, fault_addr: u64, pc: u64) -> ! {
+    fn reap_user_fault(kind: FaultKind, fault_addr: u64, pc: u64) -> ! {
         x86_64::instructions::interrupts::enable();
         if !crate::reap::reap_faulting_current(kind, fault_addr, pc) {
             // A user-mode fault with no current process is a broken
@@ -111,155 +216,144 @@ pub mod exceptions {
         }
     }
 
-    /// Division by zero exception handler.
-    ///
-    /// User-mode: reap the faulting task (ADR-019).
-    /// Kernel-mode: unrecoverable — halt.
-    pub extern "x86-interrupt" fn divide_by_zero(stack_frame: InterruptStackFrame) {
-        let cs = stack_frame.code_segment;
-        let is_user = (cs & 0x3) == 3;
+    /// The decision for exception `vector` with error code `error` and the
+    /// interrupted context `frame`. Returns only for an NMI.
+    pub fn handle(frame: &SavedContext, vector: u8, error: u64) {
+        match vector {
+            2 => {
+                nmi(frame);
+                return;
+            }
+            // A double fault or machine check may have been caused by the
+            // very state a report would read (the stack, per-CPU data), and
+            // neither is the interrupted task's fault.
+            8 | 18 => halt_with_report(frame, vector, error, 0, false),
+            _ => {}
+        }
+        // CR2 before anything else: the code below could take a nested
+        // page fault, which would overwrite it.
+        let cr2 = if vector == 14 { x86_64::registers::control::Cr2::read_raw() } else { 0 };
+        if frame.cs & 0x3 == 3 {
+            let (kind, fault_addr) = match vector {
+                0 => (FaultKind::DivideByZero, 0),
+                6 => (FaultKind::InvalidOpcode, 0),
+                // A #GP has no faulting address; its error code rides in
+                // the fault_addr slot.
+                13 => (FaultKind::GeneralProtection, error),
+                14 => {
+                    crate::println!(
+                        "  [PageFault] user {} at {:#x} (RIP={:#x})",
+                        page_fault_kind(error), cr2, frame.rip
+                    );
+                    (FaultKind::PageFault, cr2)
+                }
+                v => (FaultKind::ArchSpecific(v), error),
+            };
+            reap_user_fault(kind, fault_addr, frame.rip);
+        }
+        halt_with_report(frame, vector, error, cr2, true)
+    }
 
-        if is_user {
-            reap_user_fault(
-                crate::reap::FaultKind::DivideByZero,
-                0,
-                stack_frame.instruction_pointer.as_u64(),
-            );
-        } else {
-            crate::println!(
-                "\n!!! KERNEL DIVIDE BY ZERO !!!\n{:#?}",
-                stack_frame
-            );
-            crate::halt();
+    /// "protection write", "not-present read", ... from a #PF error code
+    /// (bit 0 present, bit 1 write, bit 4 instruction fetch).
+    fn page_fault_kind(error: u64) -> &'static str {
+        let present = error & 0x1 != 0;
+        let write = error & 0x2 != 0;
+        let fetch = error & 0x10 != 0;
+        match (present, fetch, write) {
+            (true, true, _) => "protection execute",
+            (true, false, true) => "protection write",
+            (true, false, false) => "protection read",
+            (false, true, _) => "not-present execute",
+            (false, false, true) => "not-present write",
+            (false, false, false) => "not-present read",
         }
     }
 
-    /// General protection fault handler.
-    ///
-    /// User-mode GPF: reap the faulting task (ADR-019); the error code
-    /// rides in the `fault_addr` slot (a GPF has no faulting address).
-    /// Kernel-mode GPF: unrecoverable — halt with diagnostics.
-    pub extern "x86-interrupt" fn general_protection_fault(
-        stack_frame: InterruptStackFrame,
-        error_code: u64,
-    ) {
-        // CS RPL bits [1:0] indicate the privilege level of the interrupted code.
-        // CPL=3 (user mode) if bits [1:0] of CS == 3.
-        let cs = stack_frame.code_segment;
-        let is_user = (cs & 0x3) == 3;
-
-        if is_user {
-            reap_user_fault(
-                crate::reap::FaultKind::GeneralProtection,
-                error_code,
-                stack_frame.instruction_pointer.as_u64(),
-            );
-        } else {
-            crate::println!(
-                "\n!!! KERNEL GPF !!!\n  Error code: {:#x}\n{:#?}",
-                error_code, stack_frame
-            );
-            crate::halt();
-        }
+    /// An NMI is not the interrupted task's doing: log it and resume. Runs
+    /// on the NMI IST stack, so it must not take an exception (the `iretq`
+    /// of a nested one would re-enable NMIs, and a second NMI would reuse
+    /// this stack) and must not switch tasks (ADR-040 § 4): one
+    /// best-effort print, nothing else.
+    fn nmi(frame: &SavedContext) {
+        let _ = crate::io::try_print(format_args!(
+            "[NMI] at RIP={:#x} CS={:#x}; resumed\n",
+            frame.rip, frame.cs
+        ));
     }
 
-    /// Page fault handler (vector 14).
-    ///
-    /// Distinguishes user-mode faults (reap the offending task, ADR-019)
-    /// from kernel-mode faults (unrecoverable — halt with diagnostics).
-    ///
-    /// ## Error code bits (x86_64)
-    /// - Bit 0 (PRESENT): 0 = page not present, 1 = protection violation
-    /// - Bit 1 (WRITE): 0 = read access, 1 = write access
-    /// - Bit 2 (USER): 0 = kernel mode, 1 = user mode
-    /// - Bit 4 (INSTRUCTION_FETCH): 1 = caused by instruction fetch
-    pub extern "x86-interrupt" fn page_fault(
-        stack_frame: InterruptStackFrame,
-        error_code: x86_64::structures::idt::PageFaultErrorCode,
-    ) {
-        use x86_64::registers::control::Cr2;
-        use x86_64::structures::idt::PageFaultErrorCode;
-
-        let faulting_addr = Cr2::read_raw();
-        let is_user = error_code.contains(PageFaultErrorCode::USER_MODE);
-        let is_write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
-        let is_present = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
-        let is_fetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
-
-        if is_user {
-            // User-mode page fault: reap the faulting task. CR2 was read
-            // above, before interrupts are re-enabled inside the reap.
-            let fault_type = if is_present { "protection" } else { "not-present" };
-            let access = if is_fetch { "execute" } else if is_write { "write" } else { "read" };
-            crate::println!(
-                "  [PageFault] user {} {} at {:#x} (RIP={:#x})",
-                fault_type, access, faulting_addr, stack_frame.instruction_pointer.as_u64()
-            );
-            reap_user_fault(
-                crate::reap::FaultKind::PageFault,
-                faulting_addr,
-                stack_frame.instruction_pointer.as_u64(),
-            );
-        } else {
-            // Kernel-mode page fault: unrecoverable — halt with diagnostics
-            let fault_type = if is_present { "protection" } else { "not-present" };
-            let access = if is_fetch { "execute" } else if is_write { "write" } else { "read" };
-
-            // Identify which task/CPU triggered the fault
-            // SAFETY: GS base is initialized during boot (BSP and AP).
-            let cpu_id = unsafe { crate::arch::percpu::current_cpu_id() };
-            let task_id = crate::local_scheduler().try_lock().and_then(|guard| {
+    /// Report an exception the kernel cannot recover from and halt this CPU.
+    /// `with_per_cpu` adds the CPU and task (read through GS), which a
+    /// double fault or machine check skips.
+    fn halt_with_report(frame: &SavedContext, vector: u8, error: u64, cr2: u64, with_per_cpu: bool) -> ! {
+        report(format_args!(
+            "\nEXCEPTION: {} in ring {} (vector {}, error code {:#x})\n  RIP={:#x} CS={:#x} RFLAGS={:#x} RSP={:#x} SS={:#x}\n",
+            name(vector), frame.cs & 0x3, vector, error,
+            frame.rip, frame.cs, frame.rflags, frame.rsp, frame.ss
+        ));
+        if vector == 14 {
+            report(format_args!("  page fault: {} at CR2={:#x}\n", page_fault_kind(error), cr2));
+        }
+        if with_per_cpu && crate::per_cpu_live() {
+            // SAFETY: per_cpu_live() says this CPU's GS base was set (the
+            // boot CPU in init_bsp; every AP initializes its own first).
+            let cpu = unsafe { crate::arch::percpu::current_cpu_id() };
+            let task = crate::local_scheduler().try_lock().and_then(|guard| {
                 guard.as_ref().and_then(|s| s.current_task().map(|t| t.slot()))
             });
-
-            crate::println!(
-                "\n!!! KERNEL PAGE FAULT !!!\n  Address: {:#x}\n  Type: {} {}\n  Error code: {:?}\n  CPU={}, task={}\n{:#?}",
-                faulting_addr, fault_type, access, error_code,
-                cpu_id, task_id.unwrap_or(0xFFFF), stack_frame
-            );
-            crate::halt();
+            report(format_args!("  CPU {} task {:?}\n", cpu, task));
         }
+        crate::halt()
     }
 
-    /// Double fault handler (non-recoverable)
-    pub extern "x86-interrupt" fn double_fault(
-        stack_frame: InterruptStackFrame,
-        error_code: u64,
-    ) -> ! {
-        crate::println!(
-            "EXCEPTION: DOUBLE FAULT (code: {:#x})\n{:#?}",
-            error_code, stack_frame
-        );
-        loop { x86_64::instructions::hlt(); }
+    /// A trap whose vector slot held something no stub pushes.
+    pub fn halt_bad_vector(vector: u64) -> ! {
+        report(format_args!("\nEXCEPTION: trap entry read vector {:#x}, which no stub pushes\n", vector));
+        crate::halt()
     }
 
-    /// APIC spurious interrupt handler.
-    ///
-    /// Per Intel SDM: do NOT send EOI for spurious interrupts.
-    pub extern "x86-interrupt" fn spurious_interrupt(_stack_frame: InterruptStackFrame) {
-        // Intentionally empty — no EOI
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn every_architectural_exception_has_a_name() {
+            for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 28, 29, 30] {
+                assert_ne!(name(v), "RESERVED", "vector {}", v);
+            }
+            for v in [15u8, 22, 23, 24, 25, 26, 27, 31] {
+                assert_eq!(name(v), "RESERVED", "vector {}", v);
+            }
+        }
+
+        #[test]
+        fn page_fault_kind_decodes_the_error_bits() {
+            assert_eq!(page_fault_kind(0x0), "not-present read");
+            assert_eq!(page_fault_kind(0x2), "not-present write");
+            assert_eq!(page_fault_kind(0x7), "protection write");
+            assert_eq!(page_fault_kind(0x15), "protection execute");
+            assert_eq!(page_fault_kind(0x10), "not-present execute");
+        }
     }
 }
 
-/// Device IRQ handlers for I/O APIC-routed interrupts.
+/// Device IRQ handling for I/O APIC-routed interrupts.
 ///
-/// Each handler corresponds to a specific GSI (Global System Interrupt).
-/// The vector number is DEVICE_VECTOR_BASE (33) + GSI.
-/// Handlers wake tasks blocked via SYS_WAIT_IRQ and send APIC EOI.
+/// The vector number is DEVICE_VECTOR_BASE (33) + GSI. The handler wakes
+/// tasks blocked via SYS_WAIT_IRQ and sends APIC EOI.
 #[cfg(target_arch = "x86_64")]
 pub mod device_irqs {
-    use x86_64::structures::idt::InterruptStackFrame;
 
     /// Common device IRQ handler — wakes blocked tasks and sends EOI.
     ///
-    /// Called from each per-GSI ISR stub. If the IRQ has a registered handler
+    /// Called from `x86_trap` for vectors 33-56. If the IRQ has a registered handler
     /// (via SYS_WAIT_IRQ + interrupt routing table), uses TASK_CPU_MAP for a
     /// targeted single-CPU wake. Otherwise falls back to scanning all CPUs.
     ///
     /// IRQ affinity (set by SYS_WAIT_IRQ) routes the interrupt to the same
     /// CPU as the pinned driver task, so the targeted path is the common case
     /// for registered device IRQs.
-    fn device_irq_handler(gsi: u32) {
+    pub(crate) fn device_irq_handler(gsi: u32) {
         let mut woken = false;
         // Did the routing table name a driver for this GSI? `None` also
         // when the router lock was contended — in which case we must not
@@ -340,73 +434,11 @@ pub mod device_irqs {
     /// (`MAX_GSI_PINS`).
     static STRAY_IRQ_MASKED: [core::sync::atomic::AtomicU32; 24] =
         [const { core::sync::atomic::AtomicU32::new(0) }; 24];
-
-    // Generate per-GSI ISR handlers via macro.
-    // Each handler is a thin trampoline that calls device_irq_handler(N).
-    macro_rules! device_isr {
-        ($name:ident, $gsi:expr) => {
-            pub extern "x86-interrupt" fn $name(_sf: InterruptStackFrame) {
-                device_irq_handler($gsi);
-            }
-        };
-    }
-
-    // GSI 0 is the PIT timer (already handled by APIC timer), but we generate
-    // a handler anyway for completeness (e.g., if I/O APIC IRQ 0 override exists).
-    device_isr!(gsi_0,  0);
-    device_isr!(gsi_1,  1);
-    device_isr!(gsi_2,  2);
-    device_isr!(gsi_3,  3);
-    device_isr!(gsi_4,  4);
-    device_isr!(gsi_5,  5);
-    device_isr!(gsi_6,  6);
-    device_isr!(gsi_7,  7);
-    device_isr!(gsi_8,  8);
-    device_isr!(gsi_9,  9);
-    device_isr!(gsi_10, 10);
-    device_isr!(gsi_11, 11);
-    device_isr!(gsi_12, 12);
-    device_isr!(gsi_13, 13);
-    device_isr!(gsi_14, 14);
-    device_isr!(gsi_15, 15);
-    device_isr!(gsi_16, 16);
-    device_isr!(gsi_17, 17);
-    device_isr!(gsi_18, 18);
-    device_isr!(gsi_19, 19);
-    device_isr!(gsi_20, 20);
-    device_isr!(gsi_21, 21);
-    device_isr!(gsi_22, 22);
-    device_isr!(gsi_23, 23);
-
-    /// Array of device ISR function pointers, indexed by GSI.
-    /// Used to register handlers in the IDT during init.
-    pub const HANDLERS: [extern "x86-interrupt" fn(InterruptStackFrame); 24] = [
-        gsi_0,  gsi_1,  gsi_2,  gsi_3,  gsi_4,  gsi_5,  gsi_6,  gsi_7,
-        gsi_8,  gsi_9,  gsi_10, gsi_11, gsi_12, gsi_13, gsi_14, gsi_15,
-        gsi_16, gsi_17, gsi_18, gsi_19, gsi_20, gsi_21, gsi_22, gsi_23,
-    ];
 }
 
-/// Register device ISR handlers in the IDT for I/O APIC vectors.
-///
-/// Installs handlers for vectors DEVICE_VECTOR_BASE..DEVICE_VECTOR_BASE+24
-/// (vectors 33-56), one per GSI.
-///
-/// # Safety
-/// Must be called during single-threaded init before IDT reload.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn register_device_isrs() {
-    use crate::arch::x86_64::ioapic::DEVICE_VECTOR_BASE;
-
-    // SAFETY: Single-threaded init before IDT reload, interrupts disabled.
-    let idt = unsafe { idt_mut() };
-    for (gsi, handler) in device_irqs::HANDLERS.iter().enumerate() {
-        let vector = DEVICE_VECTOR_BASE as usize + gsi;
-        idt[vector].set_handler_fn(*handler);
-    }
-}
-
-/// Initialize interrupt handling (exceptions only, no hardware interrupts yet).
+/// Initialize interrupt handling: every IDT gate points at its trap stub
+/// (ADR-040 § 3), so every exception has its decision from here on; the
+/// hardware interrupt sources come up in `init_hardware_interrupts()`.
 ///
 /// Call `init_hardware_interrupts()` separately after kernel subsystems are ready.
 ///
@@ -416,10 +448,9 @@ pub unsafe fn register_device_isrs() {
 /// The IDT static is mutated and loaded into the CPU.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn init() {
-    // SAFETY: configure_idt() writes to IDT via idt_mut(). Single-threaded init.
-    unsafe { configure_idt() };
-    // SAFETY: IDT is fully configured by configure_idt(). Single-threaded init.
-    unsafe { idt_ref().load() };
+    // SAFETY: single-threaded boot, interrupts disabled (caller); no other
+    // CPU has loaded the IDT.
+    unsafe { crate::arch::x86_64::trap::init_idt() };
     IDT_LOADED.store(true, Ordering::Release);
 }
 
@@ -429,9 +460,11 @@ pub unsafe fn init() {
 /// 1. Disable PIC (remap to 0xF0-0xFF, mask all)
 /// 2. Enable Local APIC + per-CPU data
 /// 3. Parse ACPI MADT + initialize I/O APIC (if RSDP available)
-/// 4. Register timer ISR, device ISRs, and spurious handler in IDT
-/// 5. Allocate IST stack for double-fault handler
-/// 6. Reload IDT, configure I/O APIC device IRQ routing
+/// 4. Mark the device vectors live (the IDT already routes every vector
+///    to `x86_trap`, set up by `init()`)
+/// 5. Allocate the boot CPU's emergency stacks; point the NMI, #DF and #MC
+///    gates at them
+/// 6. Configure I/O APIC device IRQ routing
 /// 7. Calibrate and start APIC timer
 /// 8. Enable interrupts
 ///
@@ -504,89 +537,35 @@ pub unsafe fn init_hardware_interrupts(
         None
     };
 
-    // Step 4a: Register timer ISR stub at vector 32
-    extern "C" {
-        fn timer_isr_stub();
-    }
-    // SAFETY: Single-threaded init, interrupts disabled, IDT not yet reloaded.
-    let idt_table = unsafe { idt_mut() };
-    // SAFETY: set_handler_addr is unsafe because the handler must follow the
-    // x86-interrupt ABI. timer_isr_stub is our global_asm naked entry point that does.
-    unsafe {
-        idt_table[apic::TIMER_VECTOR as usize]
-            .set_handler_addr(x86_64::VirtAddr::new(timer_isr_stub as *const () as u64));
-    }
-
-    // Step 4b: Register spurious interrupt handler at vector 0xFF
-    // SAFETY: Single-threaded init, interrupts disabled.
-    let idt = unsafe { idt_mut() };
-    idt[0xFF_usize].set_handler_fn(exceptions::spurious_interrupt);
-
-    // Step 4c: Register device ISR handlers at vectors 33-56 (if I/O APIC available)
+    // Step 4: The IDT already sends every vector to x86_trap (init()).
+    // What changes now is what the device vectors mean: with an I/O APIC
+    // they are device interrupts; without one they stay unassigned.
     if acpi_info.is_some() {
-        // SAFETY: Single-threaded init, IDT not yet reloaded.
-        unsafe { register_device_isrs(); }
-        crate::println!("  Device ISR handlers registered (vectors 33-56)");
+        DEVICE_IRQS_LIVE.store(true, Ordering::Release);
+        crate::println!("  Device vectors 33-56 dispatch to the device IRQ handler");
     }
 
-    // Step 4d: Register TLB shootdown IPI handler at vector 0xFE
-    {
-        use crate::arch::x86_64::tlb;
-        // SAFETY: Single-threaded init, interrupts disabled.
-        idt[tlb::TLB_SHOOTDOWN_VECTOR as usize]
-            .set_handler_fn(tlb::tlb_shootdown_isr);
-        crate::println!("  TLB shootdown handler registered (vector {:#x})", tlb::TLB_SHOOTDOWN_VECTOR);
-    }
-
-    // Step 4e: Register the reschedule-kick IPI at vector 0xFD. Same
-    // naked-stub shape as the timer ISR because the handler may switch
-    // tasks.
-    {
-        extern "C" {
-            fn resched_isr_stub();
-        }
-        // SAFETY: Single-threaded init, interrupts disabled; the stub
-        // follows the x86-interrupt frame contract like timer_isr_stub.
-        unsafe {
-            idt[crate::arch::x86_64::RESCHED_VECTOR as usize]
-                .set_handler_addr(x86_64::VirtAddr::new(resched_isr_stub as *const () as u64));
-        }
-        crate::println!("  Reschedule IPI handler registered (vector {:#x})", crate::arch::x86_64::RESCHED_VECTOR);
-    }
-
-    // Step 5: The boot CPU's emergency stacks (ADR-040 § 7). Each AP
-    // allocates its own in `ap_entry`; the shared IDT names the slots.
+    // Step 5: The boot CPU's emergency stacks (ADR-040 § 7), then the three
+    // gates that switch to them. Each AP allocates its own stacks in
+    // `ap_entry` before it loads this IDT.
     {
         // SAFETY: on the boot CPU (index 0), interrupts disabled, after
         // gdt::init_for_cpu(0) and percpu::init_bsp (step 2b).
         unsafe { gdt::allocate_ist_stacks(0) }?;
-
-        // SAFETY: Single-threaded init, IDT not yet reloaded.
-        let idt_table = unsafe { idt_mut() };
-        // SAFETY: set_stack_index is unsafe because an IST slot with no
-        // stack behind it would corrupt the stack switch on exception.
-        // Every CPU allocates all three slots before it loads the IDT
-        // (allocate_ist_stacks above; ap_entry for the APs).
-        unsafe {
-            idt_table
-                .double_fault
-                .set_handler_fn(exceptions::double_fault)
-                .set_stack_index(gdt::IstSlot::DoubleFault.tss_index());
+        for slot in gdt::IstSlot::ALL {
+            // SAFETY: single-threaded init, interrupts disabled; the boot
+            // CPU's stack for this slot exists (above), and every AP
+            // allocates its own before it loads the IDT (ap_entry).
+            unsafe { crate::arch::x86_64::trap::set_gate_ist(slot.vector(), slot) };
         }
-
         crate::println!(
-            "  Emergency stacks: {} x {} KiB (double fault on IST{})",
+            "  Emergency stacks: {} x {} KiB (NMI, double fault, machine check)",
             gdt::IstSlot::ALL.len(),
             gdt::IST_STACK_PAGES * 4,
-            gdt::IstSlot::DoubleFault.tss_index() + 1
         );
     }
 
-    // Step 6a: Reload IDT with all handlers (timer, device ISRs, exceptions)
-    // SAFETY: IDT is fully configured by all steps above.
-    unsafe { idt_ref().load() };
-
-    // Step 6b: Configure I/O APIC device IRQ routing (after IDT loaded)
+    // Step 6: Configure I/O APIC device IRQ routing
     if let Some(ref info) = acpi_info {
         // SAFETY: IDT loaded, I/O APIC initialized. Single-threaded boot.
         unsafe { ioapic::configure_device_irqs(info, bsp_apic_id as u8); }
@@ -603,24 +582,6 @@ pub unsafe fn init_hardware_interrupts(
     crate::println!("  ✓ Interrupts enabled (APIC timer + device IRQs)");
 
     Ok(())
-}
-
-/// Configure the interrupt descriptor table
-///
-/// # Safety
-/// Must be called before `IDT.load()` and before interrupts are enabled.
-/// All writes to the mutable static IDT happen here during single-threaded init.
-#[cfg(target_arch = "x86_64")]
-unsafe fn configure_idt() {
-    // SAFETY: Single-threaded init — interrupts disabled, no concurrent IDT access.
-    // Each set_handler_fn registers a valid extern "x86-interrupt" handler.
-    // SAFETY: Single-threaded init, interrupts disabled.
-    let idt = unsafe { idt_mut() };
-    idt.divide_error.set_handler_fn(exceptions::divide_by_zero);
-    idt.general_protection_fault
-        .set_handler_fn(exceptions::general_protection_fault);
-    idt.page_fault.set_handler_fn(exceptions::page_fault);
-    idt.double_fault.set_handler_fn(exceptions::double_fault);
 }
 
 /// Request interrupt with verification contract
@@ -648,15 +609,16 @@ pub fn idt_loaded() -> bool {
 
 /// Load the shared IDT on an Application Processor.
 ///
-/// The IDT is configured once by the BSP during `init()` / `init_hardware_interrupts()`.
-/// APs just need to execute `lidt` to point their IDTR at the same table.
+/// The IDT is built once by the BSP in `init()` (its IST gates in
+/// `init_hardware_interrupts()`). APs execute `lidt` on the same table.
 ///
 /// # Safety
 /// BSP must have fully configured and loaded the IDT before calling this.
 /// Must be called with interrupts disabled.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn load_idt_ap() {
-    // SAFETY: IDT is fully configured by BSP (IDT_LOADED is true).
-    // Same virtual address on all CPUs via the global static.
-    unsafe { idt_ref().load() };
+    // SAFETY: the BSP built the IDT in init() (IDT_LOADED is true) and set
+    // its IST gates; this AP allocated its emergency stacks first
+    // (ap_entry); interrupts are disabled (caller).
+    unsafe { crate::arch::x86_64::trap::load_idt() };
 }

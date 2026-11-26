@@ -126,10 +126,9 @@ pub unsafe fn flush_all_local() {
 /// Reads the global shootdown request, invalidates the requested pages
 /// (or flushes all), decrements the pending counter, and sends EOI.
 ///
-/// This is registered in the IDT at vector TLB_SHOOTDOWN_VECTOR (0xFE).
-pub extern "x86-interrupt" fn tlb_shootdown_isr(
-    _stack_frame: x86_64::structures::idt::InterruptStackFrame,
-) {
+/// Called from `interrupts::x86_trap` for vector TLB_SHOOTDOWN_VECTOR
+/// (0xFE), with interrupts disabled (an interrupt gate).
+pub fn tlb_shootdown_isr() {
     let page_count = SHOOTDOWN.page_count.load(Ordering::Acquire);
 
     if page_count == 0 {

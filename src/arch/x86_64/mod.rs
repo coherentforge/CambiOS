@@ -13,10 +13,12 @@
 //! 1. **Explicit switch** (`context_switch`): Used for voluntary yields and blocking.
 //!    Saves all registers, jumps to target task. Never returns.
 //!
-//! 2. **Interrupt-driven switch** (`timer_isr_stub`): Used for preemption.
-//!    Assembly ISR stub saves full register state to the current task's `SavedContext`,
-//!    calls a Rust handler that may swap the context pointer, then restores from
-//!    the (potentially different) context and does `iretq`.
+//! 2. **Interrupt-driven switch** (the trap entry in [`trap`], ADR-040 § 3):
+//!    every vector's stub and the common entry save the full register state
+//!    as a `SavedContext` on the current stack, `interrupts::x86_trap` may
+//!    return another task's context (the timer and reschedule vectors), and
+//!    the common exit restores whichever context it returned and does `iretq`.
+//!    `yield_save_and_switch` builds the same shape and leaves the same way.
 
 pub mod apic;
 pub mod gdt;
@@ -26,6 +28,7 @@ pub mod percpu;
 pub mod portio;
 pub mod syscall;
 pub mod tlb;
+pub mod trap;
 
 use crate::scheduler::CpuContext;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -274,13 +277,16 @@ core::arch::global_asm!(
 // Interrupt-driven context switching
 // ============================================================================
 
-/// Saved register state for interrupt context switches.
+/// Saved register state for interrupt context switches (ADR-040 § 3).
 ///
-/// When the timer ISR fires, the CPU pushes SS, RSP, RFLAGS, CS, RIP.
-/// The ISR stub then pushes rax, rbx, ... r15 (each `push` decrements RSP).
+/// On a trap the CPU pushes SS, RSP, RFLAGS, CS, RIP and, for some vectors,
+/// an error code; the vector's stub pushes a 0 where it did not, then the
+/// vector number; the common entry pushes rax, rbx, ... r15 (each `push`
+/// decrements RSP). `yield_save_and_switch` and the loader build the same
+/// shape, so the common exit can resume any saved context.
 ///
-/// Fields are ordered by ascending memory address.  The last register pushed
-/// (r15) ends up at the lowest address, so it's the first field.  The CPU-
+/// Fields are ordered by ascending memory address. The last register pushed
+/// (r15) ends up at the lowest address, so it's the first field. The CPU-
 /// pushed frame (rip, cs, rflags, rsp, ss) is at the highest addresses.
 #[repr(C)]
 pub struct SavedContext {
@@ -300,6 +306,11 @@ pub struct SavedContext {
     pub rcx: u64,
     pub rbx: u64,
     pub rax: u64,
+    /// The vector the trap stub pushed, or [`SavedContext::NO_VECTOR`] for
+    /// a context no trap produced (a yield, a new task's first entry).
+    pub vector: u64,
+    /// The CPU's error code for the vector, or 0 where it pushes none.
+    pub error_code: u64,
     // Pushed by CPU on interrupt entry
     pub rip: u64,
     pub cs: u64,
@@ -307,6 +318,25 @@ pub struct SavedContext {
     pub rsp: u64,
     pub ss: u64,
 }
+
+impl SavedContext {
+    /// ARCHITECTURAL: the `vector` of a saved context that no trap produced
+    /// (`yield_save_and_switch`'s synthetic frame, a new task's first
+    /// frame). Not a vector number: those are 0-255. The yield assembly
+    /// pushes it as `push -1`.
+    pub const NO_VECTOR: u64 = u64::MAX;
+}
+
+// The trap entry, the common exit and `yield_save_and_switch` address these
+// slots by offset; the stub's 16-byte alignment at the call into Rust needs
+// the size to be a multiple of 16 (ADR-040 § 3).
+const _: () = assert!(core::mem::offset_of!(SavedContext, rax) == 112);
+const _: () = assert!(core::mem::offset_of!(SavedContext, vector) == 120);
+const _: () = assert!(core::mem::offset_of!(SavedContext, error_code) == 128);
+const _: () = assert!(core::mem::offset_of!(SavedContext, rip) == 136);
+const _: () = assert!(core::mem::offset_of!(SavedContext, ss) == 168);
+const _: () = assert!(core::mem::size_of::<SavedContext>() == 176);
+const _: () = assert!(core::mem::size_of::<SavedContext>().is_multiple_of(16));
 
 /// Pointer to the current task's SavedContext on its kernel stack.
 /// The timer ISR handler sets this to point to a different task's context
@@ -380,113 +410,16 @@ pub fn cpu_to_saved_context(cpu: &CpuContext, saved: &mut SavedContext) {
     saved.ss = gdt::KERNEL_SS as u64;
 }
 
-// ============================================================================
-// Timer ISR stub — naked assembly for preemptive context switching
-// ============================================================================
-//
-// When the PIT timer fires (vector 32), the CPU pushes SS, RSP, RFLAGS, CS, RIP.
-// This stub pushes all 15 GPRs to create a full SavedContext on the current stack,
-// calls the Rust handler which may decide to switch tasks, then restores registers
-// from the (potentially different) SavedContext and returns via iretq.
-
-#[cfg(not(any(fuzzing, test)))]
-core::arch::global_asm!(
-    ".global timer_isr_stub",
-    "timer_isr_stub:",
-    // Save all GPRs to form SavedContext (struct fields: r15..rax at offsets 0..112)
-    "push rax",
-    "push rbx",
-    "push rcx",
-    "push rdx",
-    "push rsi",
-    "push rdi",
-    "push rbp",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    // RSP now points to SavedContext. Pass as first arg to Rust handler.
-    "mov rdi, rsp",
-    "cld",                      // Clear DF per ABI before calling C function
-    "call timer_isr_inner",
-    // RAX = new RSP (same task or different task's SavedContext)
-    "mov rsp, rax",
-    // Restore GPRs from (potentially new) SavedContext
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rbp",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rbx",
-    "pop rax",
-    // Return to (potentially new) task — pops RIP, CS, RFLAGS, RSP, SS
-    "iretq",
-);
-
-#[cfg(not(any(fuzzing, test)))]
-core::arch::global_asm!(
-    ".global resched_isr_stub",
-    "resched_isr_stub:",
-    // Identical frame to timer_isr_stub: the handler may switch tasks.
-    "push rax",
-    "push rbx",
-    "push rcx",
-    "push rdx",
-    "push rsi",
-    "push rdi",
-    "push rbp",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov rdi, rsp",
-    "cld",
-    "call resched_isr_inner",
-    "mov rsp, rax",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rbp",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rbx",
-    "pop rax",
-    "iretq",
-);
-
 /// ARCHITECTURAL: IPI vector for the cross-CPU reschedule kick. Sits
 /// just below the TLB-shootdown IPI (0xFE) and the spurious vector
 /// (0xFF), above every device vector the I/O APIC hands out (33..56).
 pub const RESCHED_VECTOR: u8 = 0xFD;
 
-/// Rust handler called from `resched_isr_stub` on the CPU that was
-/// kicked. Reschedules if this CPU was idle (or its current task is no
-/// longer Running), applies the switch hint, and acknowledges the IPI.
-#[unsafe(no_mangle)]
-extern "C" fn resched_isr_inner(current_rsp: u64) -> u64 {
+/// Reschedule-IPI handler, called from `interrupts::x86_trap` on the CPU
+/// that was kicked. Reschedules if this CPU was idle (or its current task
+/// is no longer Running), applies the switch hint, and acknowledges the IPI.
+/// Takes and returns the stack pointer of a `SavedContext`, like the timer.
+pub(crate) fn resched_isr_inner(current_rsp: u64) -> u64 {
     let (new_rsp, hint) = crate::scheduler::on_resched_ipi(current_rsp);
     crate::RESCHED_KICKS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if new_rsp != current_rsp {
@@ -547,16 +480,15 @@ pub fn kick_cpu(cpu: usize) {
     });
 }
 
-/// Rust handler called from the timer ISR stub.
+/// Timer handler (vector 32), called from `interrupts::x86_trap`.
 ///
 /// Receives the current task's saved RSP (pointing to SavedContext on its stack).
 /// Returns the RSP to restore from — same value if no switch, or a different
 /// task's SavedContext RSP if a context switch is needed.
 ///
 /// Delegates portable tick/schedule logic to `scheduler::on_timer_isr()`,
-/// then performs x86-specific post-switch work (TSS, CR3, PIC EOI).
-#[unsafe(no_mangle)]
-extern "C" fn timer_isr_inner(current_rsp: u64) -> u64 {
+/// then performs x86-specific post-switch work (TSS, CR3, APIC EOI).
+pub(crate) fn timer_isr_inner(current_rsp: u64) -> u64 {
     let (new_rsp, hint) = crate::scheduler::on_timer_isr(current_rsp);
 
     // x86-specific post-switch: update TSS and CR3
@@ -656,33 +588,41 @@ pub fn halt_until_preempted(kernel_stack_top: u64) -> ! {
 //
 // Assembly trampoline for voluntary context switching from syscall handlers.
 //
-// Builds a synthetic SavedContext (identical layout to the timer ISR's) on the
-// current kernel stack, calls yield_inner (Rust) to save it and schedule the
-// next task, then restores from the (potentially different) SavedContext and
-// does iretq.
+// Builds a synthetic SavedContext (the trap entry's layout, ADR-040 § 3) on
+// the current kernel stack, calls yield_inner (Rust) to save it and schedule
+// the next task, then leaves through the common trap exit, which restores
+// from the (potentially different) SavedContext and does iretq.
 //
-// When the yielding task is later re-scheduled (by the timer ISR or another
+// When the yielding task is later re-scheduled (by the timer or another
 // yield_save_and_switch), iretq goes to .Lyield_resume, which re-enables
 // interrupts and returns to the syscall handler that called us.
+//
+// The frame is placed as the CPU places one: RSP is first aligned down to
+// 16 bytes, and the frame's saved RSP is the unaligned entry value, so the
+// resumed `ret` finds the return address. 22 words then leave RSP aligned
+// at `call yield_inner`, as the SysV ABI requires (the previous frame, 20
+// words from an entry RSP 8 bytes off alignment, called it misaligned).
 //
 // Stack layout after the push sequence (SavedContext, low → high):
 //   [rsp+0]   r15          ← RSP points here (arg to yield_inner)
 //   [rsp+8]   r14
 //   ...
 //   [rsp+112] rax
-//   [rsp+120] rip          = .Lyield_resume
-//   [rsp+128] cs           = current CS (KERNEL_CS)
-//   [rsp+136] rflags       (IF=0, saved under cli)
-//   [rsp+144] rsp          = entry RSP (caller's stack with return address)
-//   [rsp+152] ss           = current SS (KERNEL_SS)
+//   [rsp+120] vector       = SavedContext::NO_VECTOR (no trap produced it)
+//   [rsp+128] error_code   = 0
+//   [rsp+136] rip          = .Lyield_resume
+//   [rsp+144] cs           = current CS (KERNEL_CS)
+//   [rsp+152] rflags       (IF=0, saved under cli)
+//   [rsp+160] rsp          = entry RSP (caller's stack with return address)
+//   [rsp+168] ss           = current SS (KERNEL_SS)
 
 extern "C" {
     /// Voluntary context switch.
     ///
     /// Saves all registers as a SavedContext on the kernel stack, calls the
     /// scheduler to pick the next task, and restores from the next task's
-    /// SavedContext via iretq. When the calling task is later re-scheduled,
-    /// this function returns normally to its caller.
+    /// SavedContext via the common trap exit. When the calling task is
+    /// later re-scheduled, this function returns normally to its caller.
     ///
     /// # Safety
     /// Must be called on the kernel stack (not user stack). The caller must
@@ -700,25 +640,28 @@ core::arch::global_asm!(
     // ---- Disable interrupts for atomic save ----
     "cli",
 
-    // ---- Build synthetic iretq frame (same layout as CPU interrupt entry) ----
-    // Order: SS, RSP, RFLAGS, CS, RIP (high address → low address on stack)
+    // ---- Place the frame as the CPU would ----
+    // r11 and rax are scratch: caller-saved, so their values need not
+    // survive, though their slots are still filled below.
+    "mov r11, rsp",             // entry RSP (points at our return address)
+    "and rsp, -16",
+
+    // ---- Synthetic iretq frame: SS, RSP, RFLAGS, CS, RIP ----
     "mov rax, ss",
     "push rax",                 // SS
-
-    "lea rax, [rsp + 8]",      // Entry RSP (before SS push; points to return addr)
-    "push rax",                 // RSP
-
+    "push r11",                 // RSP = entry RSP
     "pushfq",                   // RFLAGS (IF=0 since cli)
-
     "mov rax, cs",
     "push rax",                 // CS (KERNEL_CS)
-
     "lea rax, [rip + .Lyield_resume]",
     "push rax",                 // RIP = .Lyield_resume
 
-    // ---- Push all GPRs (same order as timer_isr_stub) ----
-    // RAX was clobbered above — its value is irrelevant (caller-saved).
-    "push rax",                 // RAX (clobbered, but SavedContext needs the slot)
+    // ---- The trap entry's error-code and vector slots ----
+    "push 0",                   // error_code
+    "push -1",                  // vector = SavedContext::NO_VECTOR
+
+    // ---- Push all GPRs (same order as the trap entry) ----
+    "push rax",
     "push rbx",
     "push rcx",
     "push rdx",
@@ -735,7 +678,6 @@ core::arch::global_asm!(
     "push r15",
 
     // ---- Call Rust scheduler ----
-    // RSP → SavedContext (identical layout to timer ISR's)
     "mov rdi, rsp",
     "cld",
     "call yield_inner",
@@ -743,22 +685,7 @@ core::arch::global_asm!(
 
     // ---- Restore from (potentially new) SavedContext ----
     "mov rsp, rax",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rbp",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rbx",
-    "pop rax",
-    "iretq",
+    "jmp x86_trap_restore",
 
     // ---- Resume point for yielded tasks ----
     // iretq restores: RIP=here, CS=KERNEL_CS, RFLAGS(IF=0), RSP, SS.
@@ -802,11 +729,10 @@ mod fuzz_asm_stubs {
         unreachable!("context_switch called outside kernel target")
     }
 
+    /// The trap stub table (`trap::X86_TRAP_STUB_TABLE`): host builds read
+    /// nothing from it, the linker only needs the symbol.
     #[unsafe(no_mangle)]
-    pub extern "C" fn timer_isr_stub() {}
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn resched_isr_stub() {}
+    pub static X86_TRAP_STUB_TABLE: [u64; super::trap::IDT_ENTRIES] = [0; super::trap::IDT_ENTRIES];
 
     #[unsafe(no_mangle)]
     pub extern "C" fn yield_save_and_switch() {}
