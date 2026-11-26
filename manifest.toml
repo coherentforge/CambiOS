@@ -278,10 +278,11 @@ profile = ["regress"]
 # The probe's hostile child (user/regress-victim): receives one mode byte
 # on endpoint 60 and executes the instruction it names, which a correct
 # kernel answers by reaping it (ADR-040 § Sequencing). x86_64 only for now;
-# same add-on profile.
+# same add-on profile. get-time: the syscall the trap-flag mode makes;
+# yield: the nested-task mode's yielding syscall.
 [[service]]
 name = "regress-victim"
-syscalls = ["exit", "print", "recv-msg", "register-endpoint", "write"]
+syscalls = ["exit", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 endpoints = [60]
 lifetime = "on-demand"
 profile = ["regress"]

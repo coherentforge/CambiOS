@@ -40,9 +40,10 @@
 //!   is listening on its endpoint, send it one mode byte, and wait for it.
 //!   It executes the instruction the byte names (`ud2`; a push through a
 //!   non-canonical stack pointer, #SS on Intel hardware and #GP under
-//!   QEMU; `int1`, #DB). The stage passes when
-//!   the child comes back reaped for a fault and the probe itself is still
-//!   running. `SYS_WAIT_TASK` does not yet say which fault (ADR-019's
+//!   QEMU; `int1`, #DB; the trap flag set across `syscall`; the
+//!   nested-task flag set across a yielding syscall, ADR-040 § 5). The
+//!   stage passes when the child comes back reaped for a fault (exits 0
+//!   for the nested-task stage) and the probe itself is still running. `SYS_WAIT_TASK` does not yet say which fault (ADR-019's
 //!   `ExitInfo`); the kernel's `[Fault]` line in the log does.
 
 #![no_std]
@@ -103,11 +104,18 @@ const FAULTED: i64 = i32::MIN as i64;
 /// no handler before ADR-040; QEMU's TCG raises #GP for it instead, which
 /// did, so under QEMU that stage also passes on a kernel without the fix
 /// and only `trap-UD` and `trap-ICEBP` tell the two apart.
+///
+/// The last value is the `SYS_WAIT_TASK` result a correct kernel gives:
+/// [`FAULTED`] for the stages whose instruction must fault in ring 3, 0
+/// for trap-NT, where the program must simply finish (the danger was the
+/// kernel's own `iretq` faulting on the flag the program set).
 #[cfg(target_arch = "x86_64")]
-const TRAP_STAGES: [(u8, &[u8], &[u8]); 3] = [
-    (1, b"trap-UD", b"a ring-3 ud2 (invalid opcode) reaps the program and the kernel runs on"),
-    (2, b"trap-badstack", b"a ring-3 push through a non-canonical stack pointer reaps the program and the kernel runs on"),
-    (3, b"trap-ICEBP", b"a ring-3 int1 (#DB) reaps the program and the kernel runs on"),
+const TRAP_STAGES: [(u8, &[u8], &[u8], i64); 5] = [
+    (1, b"trap-UD", b"a ring-3 ud2 (invalid opcode) reaps the program and the kernel runs on", FAULTED),
+    (2, b"trap-badstack", b"a ring-3 push through a non-canonical stack pointer reaps the program and the kernel runs on", FAULTED),
+    (3, b"trap-ICEBP", b"a ring-3 int1 (#DB) reaps the program and the kernel runs on", FAULTED),
+    (4, b"trap-TF", b"a trap flag set across syscall single-steps nothing in the kernel; the program is reaped for #DB back in ring 3", FAULTED),
+    (5, b"trap-NT", b"a nested-task flag set across a yielding syscall does not reach the kernel's iretq; the program exits normally", 0),
 ];
 
 /// Physical addresses `SYS_MAP_MMIO` must refuse on this architecture: none
@@ -401,9 +409,10 @@ fn stage_reaper(t: &mut Tally) {
 }
 
 /// One x86_64 trap stage: spawn regress-victim, wait (bounded) for it to
-/// say it is listening, send it `mode`, and wait for it to end.
+/// say it is listening, send it `mode`, wait for it to end, and pass if
+/// `SYS_WAIT_TASK` returns `expect`.
 #[cfg(target_arch = "x86_64")]
-fn stage_trap(t: &mut Tally, mode: u8, id: &[u8], what: &[u8]) {
+fn stage_trap(t: &mut Tally, mode: u8, id: &[u8], what: &[u8], expect: i64) {
     let handle = sys::spawn(b"regress-victim");
     if handle < 0 {
         Line::new().text(b"[REGRESS] ").text(id).text(b": spawn regress-victim failed rc=")
@@ -435,7 +444,7 @@ fn stage_trap(t: &mut Tally, mode: u8, id: &[u8], what: &[u8]) {
     let code = sys::wait_task(handle as u64);
     Line::new().text(b"[REGRESS] ").text(id).text(b": regress-victim ended, wait rc=")
         .hex(code as u64).emit();
-    t.record(code == FAULTED, id, what);
+    t.record(code == expect, id, what);
 }
 
 fn run() -> ! {
@@ -455,8 +464,8 @@ fn run() -> ! {
     stage_r1(&mut t);
     stage_reaper(&mut t);
     #[cfg(target_arch = "x86_64")]
-    for (mode, id, what) in TRAP_STAGES {
-        stage_trap(&mut t, mode, id, what);
+    for (mode, id, what, expect) in TRAP_STAGES {
+        stage_trap(&mut t, mode, id, what, expect);
     }
 
     Line::new()
