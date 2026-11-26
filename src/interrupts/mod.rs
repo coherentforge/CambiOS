@@ -441,7 +441,7 @@ pub unsafe fn init() {
 ///
 /// # Safety
 /// Must be called exactly once, after `init()` and subsystem initialization.
-/// Kernel heap must be initialized (for IST stack allocation).
+/// The frame allocator must be initialized (for the emergency stacks).
 ///
 /// Returns `Err(BootError)` if any subsystem init step fails. `kmain`
 /// dispatches to `boot::boot_failed` on error.
@@ -554,39 +554,32 @@ pub unsafe fn init_hardware_interrupts(
         crate::println!("  Reschedule IPI handler registered (vector {:#x})", crate::arch::x86_64::RESCHED_VECTOR);
     }
 
-    // Step 5: Allocate IST stack for double-fault (4 KB)
+    // Step 5: The boot CPU's emergency stacks (ADR-040 § 7). Each AP
+    // allocates its own in `ap_entry`; the shared IDT names the slots.
     {
-        use alloc::alloc::{alloc, Layout};
-        /// ARCHITECTURAL: IST stack size for the double-fault handler.
-        /// 4 KiB is the minimum workable size — the handler itself is
-        /// minimal (prints and halts), and a larger stack is waste on
-        /// a per-CPU allocation that's never re-entered.
-        const IST_STACK_SIZE: usize = 4096;
-        let layout = Layout::from_size_align(IST_STACK_SIZE, 16)
-            .map_err(|_| BootError::IstStackLayoutInvalid)?;
-        // SAFETY: Kernel heap is initialized. Layout is valid.
-        let ist_base = unsafe { alloc(layout) };
-        if ist_base.is_null() {
-            return Err(BootError::IstStackAllocFailed);
-        }
-        let ist_top = ist_base as u64 + IST_STACK_SIZE as u64;
+        // SAFETY: on the boot CPU (index 0), interrupts disabled, after
+        // gdt::init_for_cpu(0) and percpu::init_bsp (step 2b).
+        unsafe { gdt::allocate_ist_stacks(0) }?;
 
-        // SAFETY: Interrupts disabled, single-threaded.
-        unsafe { gdt::set_ist(0, ist_top); }
-
-        // Wire double-fault IDT entry to use IST1 (hardware IST index 1 = TSS.ist[0])
         // SAFETY: Single-threaded init, IDT not yet reloaded.
         let idt_table = unsafe { idt_mut() };
-        // SAFETY: set_stack_index is unsafe because an invalid IST index would corrupt
-        // the stack switch on exception. Index 0 maps to IST1 (allocated above).
+        // SAFETY: set_stack_index is unsafe because an IST slot with no
+        // stack behind it would corrupt the stack switch on exception.
+        // Every CPU allocates all three slots before it loads the IDT
+        // (allocate_ist_stacks above; ap_entry for the APs).
         unsafe {
             idt_table
                 .double_fault
                 .set_handler_fn(exceptions::double_fault)
-                .set_stack_index(0); // x86_64 crate: 0 maps to IST1
+                .set_stack_index(gdt::IstSlot::DoubleFault.tss_index());
         }
 
-        crate::println!("  IST1 (double-fault): {:#x}", ist_top);
+        crate::println!(
+            "  Emergency stacks: {} x {} KiB (double fault on IST{})",
+            gdt::IstSlot::ALL.len(),
+            gdt::IST_STACK_PAGES * 4,
+            gdt::IstSlot::DoubleFault.tss_index() + 1
+        );
     }
 
     // Step 6a: Reload IDT with all handlers (timer, device ISRs, exceptions)

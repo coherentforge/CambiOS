@@ -79,15 +79,15 @@ pub enum BootError {
     /// Site: `src/arch/aarch64/gic.rs` `init_redistributor`.
     GicRedistributorUnmapped,
 
-    // ── Early-heap allocations during interrupt setup ──
+    // ── Per-CPU emergency (IST) stacks, ADR-040 § 7 ──
 
-    /// `Layout::from_size_align` failed for the double-fault IST stack.
-    /// Site: `src/interrupts/mod.rs` IST stack layout expect.
-    IstStackLayoutInvalid,
-
-    /// Allocator returned null for the double-fault IST stack.
-    /// Site: `src/interrupts/mod.rs` IST stack null-check panic.
+    /// The frame allocator could not supply a CPU's emergency stack.
+    /// Site: `arch::x86_64::gdt::allocate_ist_stacks`.
     IstStackAllocFailed,
+
+    /// A CPU index at or past `MAX_CPUS` asked for emergency stacks.
+    /// Site: `arch::x86_64::gdt::allocate_ist_stacks`.
+    IstStackCpuOutOfRange,
 
     // ── Platform timer ──
 
@@ -197,10 +197,10 @@ pub fn boot_failed(err: BootError) -> ! {
             "GIC redistributor frames could not be mapped",
         BootError::GicRedistributorUnmapped =>
             "CPU initialized a GIC redistributor whose frame is not mapped",
-        BootError::IstStackLayoutInvalid =>
-            "IST stack layout computation failed",
         BootError::IstStackAllocFailed =>
-            "IST stack allocator returned null",
+            "no frames for a CPU's emergency (IST) stack",
+        BootError::IstStackCpuOutOfRange =>
+            "CPU index out of range for emergency (IST) stacks",
         BootError::TimerFrequencyMissing =>
             "platform timer frequency unavailable",
         BootError::TimerFrequencyTooLow =>
@@ -252,8 +252,8 @@ mod tests {
             BootError::PlicInitFailed,
             BootError::GicRedistributorMapFailed,
             BootError::GicRedistributorUnmapped,
-            BootError::IstStackLayoutInvalid,
             BootError::IstStackAllocFailed,
+            BootError::IstStackCpuOutOfRange,
             BootError::TimerFrequencyMissing,
             BootError::TimerFrequencyTooLow,
             BootError::TimerInvariantViolation,
@@ -293,8 +293,8 @@ mod tests {
             BootError::PlicInitFailed,
             BootError::GicRedistributorMapFailed,
             BootError::GicRedistributorUnmapped,
-            BootError::IstStackLayoutInvalid,
             BootError::IstStackAllocFailed,
+            BootError::IstStackCpuOutOfRange,
             BootError::TimerFrequencyMissing,
             BootError::TimerFrequencyTooLow,
             BootError::TimerInvariantViolation,

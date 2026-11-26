@@ -2296,6 +2296,20 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // SAFETY: GDT loaded (GS base will be overwritten by percpu init). One-time per AP.
     unsafe { cambios_core::arch::x86_64::percpu::init_ap(cpu_index, apic_id) };
 
+    // Step 2b: This CPU's emergency stacks (ADR-040 § 7), before it loads
+    // the IDT whose double-fault gate names one. Without them this CPU
+    // must not run: a double fault would push to address 0 and reset the
+    // machine. It stays halted and never signals ready; the BSP's bounded
+    // wait reports it missing and boots without it.
+    // SAFETY: on CPU cpu_index itself, interrupts disabled, after
+    // gdt::init_for_cpu and percpu::init_ap above.
+    if let Err(e) = unsafe { cambios_core::arch::gdt::allocate_ist_stacks(cpu_index) } {
+        println!("  ✗ CPU {}: emergency stacks: {:?}; CPU left halted", cpu_index, e);
+        loop {
+            hlt();
+        }
+    }
+
     // Step 3: Load the shared IDT (configured by BSP)
     // SAFETY: BSP has fully configured and loaded the IDT.
     unsafe { cambios_core::interrupts::load_idt_ap() };

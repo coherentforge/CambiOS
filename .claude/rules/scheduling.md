@@ -26,7 +26,7 @@ paths:
 - PIT used only for one-shot APIC timer calibration at boot
 - Timer ISR: naked asm stub (`global_asm!` in `arch/mod.rs`) → Rust `timer_isr_inner`
 - APIC EOI (`apic::write_eoi()`) replaces PIC EOI
-- IST1 allocated for double-fault handler (4KB dedicated stack)
+- Emergency (IST) stacks: every CPU allocates three in its own init, for double fault (IST1, wired), NMI and machine check (IST2, IST3, wired with their handlers), 8 KiB each from the frame allocator (ADR-040 § 7). A trap entered on one never calls the scheduler
 - Uses `try_lock()` to avoid deadlock when interrupted code holds a lock
 - Portable `on_timer_isr()` + `ContextSwitchHint` pattern in `scheduler/mod.rs`
 - **Voluntary context switch** via `yield_save_and_switch`: builds synthetic SavedContext (identical layout to timer ISR) on the kernel stack, calls `yield_inner` → `on_voluntary_yield` → `scheduler.voluntary_yield()`. No EOI (not a hardware interrupt). x86_64 (`arch/x86_64/mod.rs`): synthetic iretq frame, TSS/CR3 updates. AArch64 (`arch/aarch64/mod.rs`): synthetic eret frame, SP_EL0 via SPSel toggle, TTBR0_EL1/TLB updates. Used by handle_exit, handle_yield, handle_recv_msg (restart loop), handle_wait_irq.

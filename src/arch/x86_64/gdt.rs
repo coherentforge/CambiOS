@@ -257,25 +257,77 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
     }
 }
 
-/// Set an Interrupt Stack Table entry in the current CPU's TSS.
+/// One of a CPU's emergency stacks (ADR-040 § 7): an Interrupt Stack Table
+/// entry the CPU switches to unconditionally for the vector whose IDT gate
+/// names it. These are the events that must work when the current stack
+/// cannot be trusted. A trap entered on one never calls the scheduler
+/// (ADR-040 § 4): the stack restarts at its top on every entry, so a second
+/// entry would overwrite a first that had been switched away from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IstSlot {
+    /// IST1: double fault (#DF, vector 8).
+    DoubleFault,
+    /// IST2: non-maskable interrupt (vector 2).
+    Nmi,
+    /// IST3: machine check (#MC, vector 18).
+    MachineCheck,
+}
+
+impl IstSlot {
+    /// Every slot, in hardware order.
+    pub const ALL: [IstSlot; 3] = [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck];
+
+    /// Index into `Tss::ist` (IST1 is index 0). The `x86_64` crate's
+    /// `EntryOptions::set_stack_index` takes the same value.
+    pub const fn tss_index(self) -> u16 {
+        match self {
+            IstSlot::DoubleFault => 0,
+            IstSlot::Nmi => 1,
+            IstSlot::MachineCheck => 2,
+        }
+    }
+}
+
+/// TUNING: 4 KiB pages per emergency stack. Trades the handler's stack
+/// depth (the trap entry's saved context, the handler, and one formatted
+/// `try_print` line) against 3 × this × 4 KiB of RAM per CPU; ADR-040 § 7
+/// and the ASSUMPTIONS.md row carry the sizing.
+pub const IST_STACK_PAGES: usize = 2;
+
+/// Give CPU `cpu_index` its three emergency stacks (ADR-040 § 7).
 ///
-/// IST entries provide dedicated stacks for critical interrupt handlers
-/// (e.g., double-fault) that must not depend on the current task's kernel stack.
-///
-/// `index` is 0-based (IST1 = index 0, IST7 = index 6).
-/// `stack_top` is the top (highest address) of the allocated stack.
+/// Each stack is `IST_STACK_PAGES` contiguous frames from the frame
+/// allocator, reached through the direct map, outside the kernel heap.
+/// The frames are never freed: a CPU keeps its emergency stacks for the
+/// kernel's lifetime. On an error part-way, the stacks already allocated
+/// stay allocated; the caller does not bring this CPU into service.
 ///
 /// # Safety
-/// Must be called with interrupts disabled. Per-CPU data must be initialized.
-/// The stack must remain valid for the lifetime of the kernel.
-pub unsafe fn set_ist(index: usize, stack_top: u64) {
-    assert!(index < 7, "IST index must be 0..6");
-    // SAFETY: Called with interrupts disabled. Per-CPU data is initialized.
-    let cpu_idx = unsafe { super::percpu::current_percpu() }.cpu_id() as usize;
-    // SAFETY: cpu_idx is in 0..MAX_CPUS. Accessing our CPU's TSS.
-    let tss_ptr = unsafe { &raw mut CPU_TSS[cpu_idx] };
-    // SAFETY: Writing the IST entry (index is checked above to be < 7).
-    unsafe { (*tss_ptr).ist[index] = stack_top };
+/// Called on CPU `cpu_index` itself, during its initialization, with
+/// interrupts disabled, so no trap can select an IST entry of this TSS
+/// while it is written; after [`init_for_cpu`] (which loads this TSS) and
+/// after the per-CPU data init (the frame-allocator lock raises this CPU's
+/// preempt count through GS).
+pub unsafe fn allocate_ist_stacks(cpu_index: usize) -> Result<(), crate::boot::BootError> {
+    if cpu_index >= MAX_CPUS {
+        return Err(crate::boot::BootError::IstStackCpuOutOfRange);
+    }
+    let bytes = (IST_STACK_PAGES * 4096) as u64;
+    for slot in IstSlot::ALL {
+        let base = crate::FRAME_ALLOCATOR
+            .lock()
+            .allocate_contiguous(IST_STACK_PAGES)
+            .map_err(|_| crate::boot::BootError::IstStackAllocFailed)?;
+        let top = base.addr + crate::hhdm_offset() + bytes;
+        // SAFETY: cpu_index < MAX_CPUS (checked above). The caller is CPU
+        // cpu_index, with interrupts disabled, so nothing else reads or
+        // writes this TSS entry now.
+        let tss_ptr = unsafe { &raw mut CPU_TSS[cpu_index] };
+        // SAFETY: tss_ptr is this CPU's TSS (above); tss_index() < 7 by
+        // construction, so the index is in bounds of `ist`.
+        unsafe { (*tss_ptr).ist[slot.tss_index() as usize] = top };
+    }
+    Ok(())
 }
 
 extern "C" {
@@ -305,3 +357,25 @@ core::arch::global_asm!(
     "mov ss, ax",
     "ret",                              // return to Rust caller
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each emergency stack has its own TSS slot, inside the seven the
+    /// hardware has, and `ALL` lists every slot once.
+    #[test]
+    fn ist_slots_are_distinct_hardware_entries() {
+        // The TSS has seven IST entries (IST1..IST7, `Tss::ist`).
+        let mut seen = [false; 7];
+        for slot in IstSlot::ALL {
+            let i = slot.tss_index() as usize;
+            assert!(i < seen.len());
+            assert!(!seen[i], "{:?} shares a TSS slot", slot);
+            seen[i] = true;
+        }
+        for slot in [IstSlot::DoubleFault, IstSlot::Nmi, IstSlot::MachineCheck] {
+            assert!(IstSlot::ALL.contains(&slot));
+        }
+    }
+}
