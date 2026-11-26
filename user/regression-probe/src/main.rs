@@ -34,6 +34,16 @@
 //!   `[sched]` line at tick 2000 (x86_64) shows whether the reaper kept up
 //!   (pending and high-water at most 1 per CPU), and `make run-regress`
 //!   requires that line.
+//! - **Trap stages** (x86_64; most exceptions had no handler, so any of
+//!   them from ring 3 became a double fault that halted the kernel;
+//!   ADR-040 § 4): spawn `regress-victim`, wait for it to report that it
+//!   is listening on its endpoint, send it one mode byte, and wait for it.
+//!   It executes the instruction the byte names (`ud2`; a push through a
+//!   non-canonical stack pointer, #SS on Intel hardware and #GP under
+//!   QEMU; `int1`, #DB). The stage passes when
+//!   the child comes back reaped for a fault and the probe itself is still
+//!   running. `SYS_WAIT_TASK` does not yet say which fault (ADR-019's
+//!   `ExitInfo`); the kernel's `[Fault]` line in the log does.
 
 #![no_std]
 #![no_main]
@@ -61,6 +71,44 @@ const REAPER_STAGE_TICK: u64 = 1000;
 /// on a two-CPU QEMU are what make an unreaped backlog visible as
 /// `pending > 1`; four covers both CPUs under least-populated placement.
 const REAPER_CHILDREN: usize = 4;
+
+/// ARCHITECTURAL: this probe's endpoint (its manifest row): regress-victim
+/// reports there that it is listening.
+#[cfg(target_arch = "x86_64")]
+const PROBE_ENDPOINT: u32 = 59;
+
+/// ARCHITECTURAL: regress-victim's endpoint (its manifest row): the probe
+/// sends the mode byte there.
+#[cfg(target_arch = "x86_64")]
+const VICTIM_ENDPOINT: u32 = 60;
+
+/// What regress-victim sends once it is listening.
+#[cfg(target_arch = "x86_64")]
+const VICTIM_READY: &[u8] = b"victim-ready";
+
+/// TUNING: ticks (5 s at 100 Hz) the probe waits for regress-victim to
+/// report that it is listening before the stage fails. A spawn and the
+/// child's first syscalls take a few ticks under QEMU.
+#[cfg(target_arch = "x86_64")]
+const VICTIM_READY_TICKS: u64 = 500;
+
+/// What `SYS_WAIT_TASK` returns for a child the kernel reaped for a fault:
+/// the kernel's `reap::FAULTED_EXIT_CODE` (`i32::MIN`), sign-extended.
+#[cfg(target_arch = "x86_64")]
+const FAULTED: i64 = i32::MIN as i64;
+
+/// The x86_64 trap stages: regress-victim's mode byte (shared with
+/// `user/regress-victim`; keep the two in step), the stage id, and what a
+/// correct kernel does. `trap-badstack` is #SS on Intel hardware, which had
+/// no handler before ADR-040; QEMU's TCG raises #GP for it instead, which
+/// did, so under QEMU that stage also passes on a kernel without the fix
+/// and only `trap-UD` and `trap-ICEBP` tell the two apart.
+#[cfg(target_arch = "x86_64")]
+const TRAP_STAGES: [(u8, &[u8], &[u8]); 3] = [
+    (1, b"trap-UD", b"a ring-3 ud2 (invalid opcode) reaps the program and the kernel runs on"),
+    (2, b"trap-badstack", b"a ring-3 push through a non-canonical stack pointer reaps the program and the kernel runs on"),
+    (3, b"trap-ICEBP", b"a ring-3 int1 (#DB) reaps the program and the kernel runs on"),
+];
 
 /// Physical addresses `SYS_MAP_MMIO` must refuse on this architecture: none
 /// lies inside a device BAR. The first ones are pages the old deny-list
@@ -352,7 +400,51 @@ fn stage_reaper(t: &mut Tally) {
     t.record(all, b"reaper", what);
 }
 
+/// One x86_64 trap stage: spawn regress-victim, wait (bounded) for it to
+/// say it is listening, send it `mode`, and wait for it to end.
+#[cfg(target_arch = "x86_64")]
+fn stage_trap(t: &mut Tally, mode: u8, id: &[u8], what: &[u8]) {
+    let handle = sys::spawn(b"regress-victim");
+    if handle < 0 {
+        Line::new().text(b"[REGRESS] ").text(id).text(b": spawn regress-victim failed rc=")
+            .dec(handle.unsigned_abs()).emit();
+        t.record(false, id, b"regress-victim could not be spawned");
+        return;
+    }
+    let deadline = sys::get_time() + VICTIM_READY_TICKS;
+    let mut buf = [0u8; 96];
+    let listening = loop {
+        if let Some(msg) = sys::try_recv_verified(PROBE_ENDPOINT, &mut buf) {
+            if msg.payload() == VICTIM_READY {
+                break true;
+            }
+        }
+        if sys::get_time() > deadline {
+            break false;
+        }
+        sys::yield_now();
+    };
+    if !listening {
+        t.record(false, id, b"regress-victim never reported that it was listening");
+        return;
+    }
+    if sys::write(VICTIM_ENDPOINT, &[mode]) < 0 {
+        t.record(false, id, b"the mode byte could not be sent to regress-victim");
+        return;
+    }
+    let code = sys::wait_task(handle as u64);
+    Line::new().text(b"[REGRESS] ").text(id).text(b": regress-victim ended, wait rc=")
+        .hex(code as u64).emit();
+    t.record(code == FAULTED, id, what);
+}
+
 fn run() -> ! {
+    // The trap stages' handshake endpoint; registered before the readiness
+    // ping, as the entry macro would.
+    #[cfg(target_arch = "x86_64")]
+    if sys::register_endpoint(PROBE_ENDPOINT) < 0 {
+        sys::print(b"[REGRESS] could not register endpoint 59; the trap stages will fail\r\n");
+    }
     // A boot-wave row: report ready first so init settles the wave while the
     // stages run.
     cambios_libsys_rt::ready();
@@ -362,6 +454,10 @@ fn run() -> ! {
     stage_r4(&mut t);
     stage_r1(&mut t);
     stage_reaper(&mut t);
+    #[cfg(target_arch = "x86_64")]
+    for (mode, id, what) in TRAP_STAGES {
+        stage_trap(&mut t, mode, id, what);
+    }
 
     Line::new()
         .text(b"[REGRESS] done: ")

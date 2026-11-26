@@ -75,7 +75,7 @@ $(foreach a,$(ARCHES),$(if $(TRIPLE_$(a)),,$(error src/arch/$(a)/ exists but thi
 STAGE_x86_64 := policy-service key-store-service fs-service virtio-blk nvme \
 	usb-host ccid virtio-net udp-stack shell compositor scanout-virtio-gpu \
 	scanout-limine virtio-input terminal-window ping sprouty tree worm \
-	hello-window faultme regression-probe audit-tail fde-mount
+	hello-window faultme regression-probe regress-victim audit-tail fde-mount
 STAGE_aarch64 := policy-service key-store-service fs-service virtio-blk \
 	fde-mount usb-host ccid virtio-net udp-stack scanout-virtio-gpu \
 	virtio-input compositor terminal-window tree hello-window faultme worm \

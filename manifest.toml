@@ -21,6 +21,8 @@
 #   22/23 policy query/response        32 fde-mount
 #                                      33 ccid
 #   19 ping                            61 tree   62 worm   63 sprouty
+#                                      59 regression-probe
+#                                      60 regress-victim (regress only)
 #   29 hello-window
 # Apps (games, hello-window) are manifest entries with
 # `lifetime = "on-demand"` (ADR-018 step 9): init does NOT spawn them;
@@ -261,13 +263,29 @@ lifetime = "on-demand"
 # finding (`make run-regress`). Tagged with the add-on `regress` profile
 # only, so no shipping image spawns it. map-mmio: the R1 stage asks for
 # non-device physical memory and must be refused. spawn + wait-task +
-# create-process: the reaper stage spawns faultme after the boot wave.
+# create-process: the reaper stage spawns faultme after the boot wave,
+# and the x86_64 trap stages spawn regress-victim. Endpoint 59 +
+# register-endpoint + try-recv-msg: regress-victim reports there that it
+# is listening.
 [[service]]
 name = "regression-probe"
-syscalls = ["exit", "get-principal", "get-time", "map-mmio", "print", "spawn", "wait-task", "write", "yield"]
+syscalls = ["exit", "get-principal", "get-time", "map-mmio", "print", "register-endpoint", "spawn", "try-recv-msg", "wait-task", "write", "yield"]
+endpoints = [59]
 system = ["create-process"]
 lifetime = "one-shot"
 profile = ["regress"]
+
+# The probe's hostile child (user/regress-victim): receives one mode byte
+# on endpoint 60 and executes the instruction it names, which a correct
+# kernel answers by reaping it (ADR-040 § Sequencing). x86_64 only for now;
+# same add-on profile.
+[[service]]
+name = "regress-victim"
+syscalls = ["exit", "print", "recv-msg", "register-endpoint", "write"]
+endpoints = [60]
+lifetime = "on-demand"
+profile = ["regress"]
+arch = ["x86_64"]
 
 # --- USB / PIV chain -------------------------------------------------------------
 
