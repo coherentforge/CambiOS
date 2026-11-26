@@ -108,11 +108,11 @@ src/arch/x86_64/percpu.rs:24:MAX_CPUS
 src/arch/x86_64/percpu.rs:27:IA32_GS_BASE
 src/arch/x86_64/percpu.rs:65:PERCPU_KERNEL_RSP0
 src/arch/x86_64/percpu.rs:67:PERCPU_USER_RSP_SCRATCH
-src/arch/x86_64/syscall.rs:35:MSR_EFER
-src/arch/x86_64/syscall.rs:36:MSR_STAR
-src/arch/x86_64/syscall.rs:37:MSR_LSTAR
-src/arch/x86_64/syscall.rs:38:MSR_SFMASK
-src/arch/x86_64/syscall.rs:41:EFER_SCE
+src/arch/x86_64/syscall.rs:43:MSR_EFER
+src/arch/x86_64/syscall.rs:44:MSR_STAR
+src/arch/x86_64/syscall.rs:45:MSR_LSTAR
+src/arch/x86_64/syscall.rs:46:MSR_SFMASK
+src/arch/x86_64/syscall.rs:49:EFER_SCE
 src/arch/x86_64/tlb.rs:27:TLB_SHOOTDOWN_VECTOR
 src/arch/x86_64/tlb.rs:32:MAX_INDIVIDUAL_PAGES
 src/audit/buffer.rs:36:STAGING_BUFFER_CAPACITY

@@ -197,8 +197,9 @@ pub mod exceptions {
     /// masked CPU can neither send nor answer. The task is about to be
     /// marked Terminated, so nothing re-enters it; the terminal yield
     /// loop never returns. Callers must have read CR2 (page faults)
-    /// before this, since a nested #PF would clobber it.
-    fn reap_user_fault(kind: FaultKind, fault_addr: u64, pc: u64) -> ! {
+    /// before this, since a nested #PF would clobber it. The syscall exit
+    /// calls it too, for a return address outside user space (ADR-040 § 5).
+    pub(crate) fn reap_user_fault(kind: FaultKind, fault_addr: u64, pc: u64) -> ! {
         x86_64::instructions::interrupts::enable();
         if !crate::reap::reap_faulting_current(kind, fault_addr, pc) {
             // A user-mode fault with no current process is a broken

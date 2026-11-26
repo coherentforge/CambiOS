@@ -7,10 +7,18 @@
 //!   1. CPU saves RIP → RCX, RFLAGS → R11
 //!   2. CS/SS loaded from STAR MSR (kernel selectors)
 //!   3. RIP loaded from LSTAR MSR (→ `syscall_entry`)
-//!   4. RFLAGS masked by SFMASK (clears IF — interrupts disabled on entry)
+//!   4. RFLAGS masked by SFMASK: TF, IF, DF, IOPL, NT and AC cleared
+//!      ([ADR-040] § 5), so none of the caller's values for them reaches
+//!      ring 0 (interrupts are disabled on entry)
 //!
 //! The stub saves caller state, builds a SyscallFrame, calls `syscall_handler_inner`,
-//! and returns via `sysretq` (ring 3 caller) or `jmp rcx` (ring 0 caller).
+//! and returns via `sysretq`. Only ring 3 executes `syscall`; there is no
+//! ring-0 return path. A saved return address that is not canonical in the
+//! lower half is never returned to: the caller is reaped instead
+//! (`syscall_bad_return`), because Intel CPUs raise the resulting #GP in
+//! ring 0 on the caller's stack (CVE-2012-0217).
+//!
+//! [ADR-040]: ../../../docs/adr/040-trap-entry-discipline.md
 //!
 //! ## Register convention
 //!
@@ -39,6 +47,17 @@ const MSR_SFMASK: u32 = 0xC000_0084;
 
 /// EFER: System Call Extensions enable
 const EFER_SCE: u64 = 1 << 0;
+
+/// HARDWARE: the RFLAGS bits SFMASK clears on `syscall` entry (Intel SDM
+/// Vol. 1 § 3.4.3): TF (bit 8), IF (9), DF (10), IOPL (12-13), NT (14), AC
+/// (18). ADR-040 § 5: a set TF would single-step the first kernel
+/// instruction on the caller's stack; NT would make the kernel's next
+/// `iretq` fault; AC would switch SMAP off in the kernel; DF must be clear
+/// for Rust code (the stub also runs `cld`); IF stays clear until the stub
+/// is on the kernel stack. `sysretq` restores the caller's flags from R11.
+const SFMASK_FLAGS: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (3 << 12) | (1 << 14) | (1 << 18);
+
+const _: () = assert!(SFMASK_FLAGS == 0x47700);
 
 // ============================================================================
 // Syscall frame passed to the Rust handler
@@ -91,10 +110,9 @@ pub unsafe fn init() {
     // SAFETY: MSR_LSTAR is a valid MSR. syscall_entry is our global_asm entry point.
     unsafe { super::msr::write(MSR_LSTAR, syscall_entry as *const () as u64) };
 
-    // SFMASK: RFLAGS bits to CLEAR on SYSCALL entry
-    // 0x200 = IF — disable interrupts until the handler explicitly re-enables them
+    // SFMASK: RFLAGS bits to CLEAR on SYSCALL entry (SFMASK_FLAGS).
     // SAFETY: MSR_SFMASK is a valid MSR.
-    unsafe { super::msr::write(MSR_SFMASK, 0x200) };
+    unsafe { super::msr::write(MSR_SFMASK, SFMASK_FLAGS) };
 
     // Enable System Call Extensions in EFER
     // SAFETY: MSR_EFER is a valid MSR.
@@ -122,8 +140,14 @@ pub unsafe fn init() {
 // return path to prevent an ISR between the kernel→user RSP switch and sysretq.
 //
 // Exit: RAX = return value.
-//       For ring 3 callers → sysretq (CS=USER_CS, SS=USER_SS, RIP=RCX, RFLAGS=R11)
-//       For ring 0 callers → restore RFLAGS from R11, jmp to RCX
+//       sysretq (CS=USER_CS, SS=USER_SS, RIP=RCX, RFLAGS=R11). Only ring 3
+//       executes `syscall`, so there is no other way back.
+//       Before that, the saved RCX must be canonical in the lower half
+//       (bits 63:47 clear). A `syscall` in the last user page saves
+//       RCX = 0x8000_0000_0000, and `sysretq` with it raises #GP in ring 0
+//       on the user's RSP on Intel CPUs (CVE-2012-0217). Such a caller is
+//       reaped instead (`syscall_bad_return`, ADR-040 § 5): its return
+//       address is outside user space, so no correct program gets here.
 //
 // Kernel stack layout after entry (high address first):
 //   user_rsp          ← pushed from gs:[PERCPU_USER_RSP_SCRATCH]
@@ -180,6 +204,14 @@ core::arch::global_asm!(
     "call syscall_handler_inner",
     // RAX now holds the return value
 
+    // ---- The return address must be canonical in the lower half ----
+    // [rsp + 112] is the saved RCX (user RIP): the 7-word SyscallFrame,
+    // then r15, r14, r13, r12, rbp, rbx, r11. Interrupts are still on, as
+    // the reap needs.
+    "mov rcx, [rsp + 112]",
+    "shr rcx, 47",
+    "jnz .Lsyscall_bad_return",
+
     // ---- Disable interrupts for return path ----
     // Prevents timer ISR from firing between RSP switch and sysretq,
     // which would push an ISR frame onto the user stack.
@@ -205,22 +237,36 @@ core::arch::global_asm!(
     // (cli above) so no ISR frame can be pushed onto the user stack.
     "pop rsp",              // user RSP (safe: sysretq doesn't touch stack)
 
-    // ---- Return path ----
-    // Bit 47 of return RIP distinguishes kernel (high-half) from user (low-half).
-    // Ring 3: sysretq sets CS/SS to user selectors with RPL=3.
-    // Ring 0: manual RFLAGS restore + jmp (sysretq would force ring 3).
-    "bt rcx, 47",
-    "jc .Lsyscall_kernel_ret",
-
-    // User return path
+    // ---- Return to ring 3 ----
     "sysretq",
 
-    // Kernel return path (for ring 0 testing)
-    ".Lsyscall_kernel_ret:",
-    "push r11",
-    "popfq",                // restore RFLAGS (re-enables IF if it was set)
-    "jmp rcx",              // jump to saved RIP
+    // ---- A return address outside user space: reap, never return ----
+    // Still on the kernel stack with every register pushed; RSP is as it
+    // was at the call above, so the call below is aligned.
+    ".Lsyscall_bad_return:",
+    "mov rdi, [rsp + 112]",
+    "call syscall_bad_return",
+    "ud2",                  // syscall_bad_return does not return
 );
+
+/// The caller of a syscall whose saved return address (RCX) is not
+/// canonical in the lower half: reap it instead of returning (ADR-040 § 5).
+///
+/// Called from `syscall_entry` on the caller's kernel stack with interrupts
+/// enabled, after its syscall ran. Recorded as a general-protection fault at
+/// that address, the fault `sysretq` would have raised on the way back.
+#[unsafe(no_mangle)]
+extern "C" fn syscall_bad_return(return_rip: u64) -> ! {
+    crate::println!(
+        "  [syscall] return address {:#x} is outside user space; reaping the caller",
+        return_rip
+    );
+    crate::interrupts::exceptions::reap_user_fault(
+        crate::reap::FaultKind::GeneralProtection,
+        return_rip,
+        return_rip,
+    )
+}
 
 // ============================================================================
 // Rust syscall handler (called from assembly stub)
