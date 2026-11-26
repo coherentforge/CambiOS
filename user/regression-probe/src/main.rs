@@ -107,15 +107,19 @@ const FAULTED: i64 = i32::MIN as i64;
 ///
 /// The last value is the `SYS_WAIT_TASK` result a correct kernel gives:
 /// [`FAULTED`] for the stages whose instruction must fault in ring 3, 0
-/// for trap-NT, where the program must simply finish (the danger was the
-/// kernel's own `iretq` faulting on the flag the program set).
+/// for trap-NT and the two GS stages, where the program must simply
+/// finish (the danger was the kernel faulting on state the program set:
+/// its own `iretq` on NT, its per-CPU reads through a GS base the program
+/// loaded).
 #[cfg(target_arch = "x86_64")]
-const TRAP_STAGES: [(u8, &[u8], &[u8], i64); 5] = [
+const TRAP_STAGES: [(u8, &[u8], &[u8], i64); 7] = [
     (1, b"trap-UD", b"a ring-3 ud2 (invalid opcode) reaps the program and the kernel runs on", FAULTED),
     (2, b"trap-badstack", b"a ring-3 push through a non-canonical stack pointer reaps the program and the kernel runs on", FAULTED),
     (3, b"trap-ICEBP", b"a ring-3 int1 (#DB) reaps the program and the kernel runs on", FAULTED),
     (4, b"trap-TF", b"a trap flag set across syscall single-steps nothing in the kernel; the program is reaped for #DB back in ring 3", FAULTED),
     (5, b"trap-NT", b"a nested-task flag set across a yielding syscall does not reach the kernel's iretq; the program exits normally", 0),
+    (6, b"trap-GS-syscall", b"a ring-3 mov gs followed by a syscall does not move the kernel's per-CPU base; the program exits normally", 0),
+    (7, b"trap-GS-tick", b"a ring-3 mov gs followed by timer ticks in ring 3 does not move the kernel's per-CPU base; the program exits normally", 0),
 ];
 
 /// Physical addresses `SYS_MAP_MMIO` must refuse on this architecture: none

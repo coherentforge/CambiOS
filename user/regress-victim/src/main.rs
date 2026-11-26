@@ -8,9 +8,9 @@
 //! and sends it one byte naming a hostile instruction sequence: one a
 //! program can execute in ring 3 and that once halted the whole kernel.
 //! This program executes it. For most modes a correct kernel reaps it for
-//! the fault; for the nested-task mode a correct kernel lets it finish
-//! and exit 0. The probe checks which happened and that the kernel kept
-//! running.
+//! the fault; for the nested-task and GS modes a correct kernel lets it
+//! finish and exit 0. The probe checks which happened and that the kernel
+//! kept running.
 //!
 //! The mode arrives over IPC because `SYS_SPAWN` carries only a name: one
 //! program can then serve every hostile stage instead of one crate per
@@ -43,6 +43,30 @@ const MODE_SS: u8 = 2;
 const MODE_ICEBP: u8 = 3;
 const MODE_TF: u8 = 4;
 const MODE_NT: u8 = 5;
+const MODE_GS_SYSCALL: u8 = 6;
+const MODE_GS_TICK: u8 = 7;
+
+/// ARCHITECTURAL: the kernel GDT's user data selector (index 3, RPL 3; see
+/// `.claude/rules/x86_64.md`). Ring 3 may load it into GS, which in 64-bit
+/// mode sets GS's base to the descriptor's base, 0.
+const USER_DATA_SELECTOR: u16 = 0x1B;
+
+/// TUNING: countdown iterations per spin chunk in the GS tick mode. Long
+/// enough that the first chunk usually spans a timer tick (tens of ms
+/// under QEMU's TCG emulation, about 15 ms at 5 GHz), short enough that
+/// the tick check between chunks ends the mode soon after the ticks land.
+const GS_TICK_SPIN: u64 = 1 << 26;
+
+/// TUNING: ticks (10 ms each) that must pass while the GS tick mode spins
+/// in ring 3. A periodic local timer that advanced the clock this far has
+/// interrupted this CPU in ring 3 at least once.
+const GS_TICK_MIN_TICKS: u64 = 3;
+
+/// SCAFFOLDING: bound on spin chunks in the GS tick mode, so the mode
+/// ends even if the clock stops.
+/// Why: Convention 8 bounded iteration; 64 chunks is seconds under TCG.
+/// Replace when: a ring-3 tick counter makes the clock check unnecessary.
+const GS_TICK_MAX_CHUNKS: u32 = 64;
 
 cambios_libsys_rt::service_main! {
     name: "REGRESS-VICTIM",
@@ -137,6 +161,29 @@ fn run() -> ! {
             sys::print(b"[REGRESS-VICTIM] yielded with NT set; exiting normally\r\n");
             sys::exit(0);
         }
+        MODE_GS_SYSCALL => {
+            sys::print(b"[REGRESS-VICTIM] mov gs, then a syscall\r\n");
+            load_user_gs();
+            let _ = sys::get_time();
+            sys::print(b"[REGRESS-VICTIM] the syscall returned; exiting normally\r\n");
+            sys::exit(0);
+        }
+        MODE_GS_TICK => {
+            sys::print(b"[REGRESS-VICTIM] mov gs, then timer ticks in ring 3\r\n");
+            let start = sys::get_time();
+            load_user_gs();
+            // No syscall until the first chunk ends: the ticks that land
+            // during it interrupt ring 3 with the GS base this program set.
+            for _ in 0..GS_TICK_MAX_CHUNKS {
+                spin(GS_TICK_SPIN);
+                if sys::get_time().wrapping_sub(start) >= GS_TICK_MIN_TICKS {
+                    sys::print(b"[REGRESS-VICTIM] ticks taken in ring 3; exiting normally\r\n");
+                    sys::exit(0);
+                }
+            }
+            sys::print(b"[REGRESS-VICTIM] the clock did not advance while spinning\r\n");
+            sys::exit(6);
+        }
         _ => {
             sys::print(b"[REGRESS-VICTIM] unknown mode\r\n");
             sys::exit(5);
@@ -144,4 +191,33 @@ fn run() -> ! {
     }
     sys::print(b"[REGRESS-VICTIM] BUG: the instruction did not fault\r\n");
     sys::exit(2)
+}
+
+/// Load [`USER_DATA_SELECTOR`] into GS from ring 3. A kernel that trusts
+/// whatever GS base is live when it enters ring 0 then addresses its
+/// per-CPU block at 0.
+fn load_user_gs() {
+    // SAFETY: loads a selector ring 3 may load (a DPL-3 data descriptor);
+    // it sets GS's base to 0, and this program never addresses through GS.
+    unsafe {
+        core::arch::asm!(
+            "mov gs, {sel:x}",
+            sel = in(reg) USER_DATA_SELECTOR,
+            options(nomem, nostack, preserves_flags),
+        )
+    };
+}
+
+/// Count `n` down to zero in a register: ring-3 time with no syscall.
+fn spin(n: u64) {
+    // SAFETY: a register-only loop; it touches no memory and no stack.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "dec {n}",
+            "jnz 2b",
+            n = inout(reg) n => _,
+            options(nomem, nostack),
+        )
+    };
 }
