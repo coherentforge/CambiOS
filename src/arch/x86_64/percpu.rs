@@ -13,9 +13,9 @@
 //! - Any code can call `current_percpu()` to get the current CPU's data
 //!
 //! ## GS base and swapgs
-//! Currently the kernel owns GS base at all times. When user-mode GS base
-//! support is added, `swapgs` must be inserted at syscall/interrupt entry
-//! and exit points to swap between kernel and user GS base.
+//! ADR-040 § 2: PerCpu is in IA32_GS_BASE in ring 0 and parked in
+//! IA32_KERNEL_GS_BASE while a program runs; `swapgs` at every ring-3
+//! boundary and nowhere else (see [`IA32_KERNEL_GS_BASE`]).
 
 /// Maximum number of CPUs supported.
 ///
@@ -65,6 +65,21 @@ pub fn bsp_pat() -> u64 {
 pub const PERCPU_KERNEL_RSP0: usize = 24;
 /// GS-relative offset of `PerCpu.user_rsp_scratch`
 pub const PERCPU_USER_RSP_SCRATCH: usize = 32;
+
+/// ADR-040 § 2: in ring 0 `IA32_GS_BASE` holds this CPU's `PerCpu` and
+/// this MSR the GS base ring 3 gets back on the next exit; in ring 3 the
+/// two are exchanged. `swapgs` runs always at `syscall` entry and before
+/// `sysretq`, at the common trap entry and exit when the frame's CS is
+/// ring 3, and in the NMI / #DF / #MC entries by reading `IA32_GS_BASE`
+/// itself (`arch::x86_64::trap`). Both init paths set this MSR to 0, the
+/// base a program starts with; a program can set its own only to 0 (`mov
+/// gs` with a flat descriptor; CR4.FSGSBASE is not set), so a value one
+/// task leaves behind cannot leak to another. Nothing after boot may load
+/// a GS selector in ring 0: that would reset the kernel's base.
+///
+/// HARDWARE: IA32_KERNEL_GS_BASE (Intel SDM Vol. 4, MSR 0xC000_0102), the
+/// value `swapgs` exchanges with `IA32_GS_BASE`.
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 // ============================================================================
 // PerCpu struct
@@ -238,6 +253,10 @@ pub unsafe fn init_bsp(apic_id: u32) {
 
     // SAFETY: IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
     unsafe { super::msr::write(IA32_GS_BASE, percpu as u64) };
+    // SAFETY: IA32_KERNEL_GS_BASE is a valid MSR on every x86_64 CPU. 0 is
+    // the GS base ring 3 starts with: the first exit to ring 3 swaps it in
+    // and parks PerCpu here (ADR-040 § 2).
+    unsafe { super::msr::write(IA32_KERNEL_GS_BASE, 0) };
 
     // SAFETY: IA32_PAT is a valid architectural MSR on every x86_64
     // CPU; reading it has no side effects. Single-threaded boot.
@@ -280,6 +299,10 @@ pub unsafe fn init_ap(cpu_index: usize, apic_id: u32) {
 
     // SAFETY: IA32_GS_BASE is a valid MSR; percpu has 'static lifetime.
     unsafe { super::msr::write(IA32_GS_BASE, percpu as u64) };
+    // SAFETY: IA32_KERNEL_GS_BASE is a valid MSR on every x86_64 CPU. 0 is
+    // the GS base ring 3 starts with: the first exit to ring 3 swaps it in
+    // and parks PerCpu here (ADR-040 § 2).
+    unsafe { super::msr::write(IA32_KERNEL_GS_BASE, 0) };
 
     // Replicate the BSP's PAT (see `BSP_PAT`). Runs before this AP
     // touches any WC-mapped memory and before its caches hold lines

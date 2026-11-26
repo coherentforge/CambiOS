@@ -129,8 +129,10 @@ pub unsafe fn init() {
 //        Args in RDI, RSI, RDX, R10, R8, R9   (R10 replaces RCX for arg4)
 //        Interrupts disabled (SFMASK cleared IF)
 //        RSP = user stack (SYSCALL does not switch stacks)
+//        GS base = the program's (ADR-040 § 2)
 //
-// The stub immediately switches RSP from the user stack to the per-CPU kernel
+// The stub first executes `swapgs` (GS base becomes this CPU's PerCpu),
+// then switches RSP from the user stack to the per-CPU kernel
 // stack (read from gs:[PERCPU_KERNEL_RSP0]). The user RSP is saved via the
 // per-CPU scratch slot (gs:[PERCPU_USER_RSP_SCRATCH]) and pushed onto the
 // kernel stack for restoration on return.
@@ -161,9 +163,14 @@ core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
 
+    // ---- Kernel GS (ADR-040 § 2) ----
+    // Only ring 3 executes `syscall`, so GS base is the program's here and
+    // IA32_KERNEL_GS_BASE holds this CPU's PerCpu: swap them, always. A
+    // program can change its own GS base (`mov gs` with a user selector
+    // loads base 0), so nothing before this instruction may read GS.
+    "swapgs",
+
     // ---- Switch to kernel stack ----
-    // GS base points to this CPU's PerCpu (kernel owns GS at all times).
-    // No swapgs needed — user code cannot modify GS base (FSGSBASE not enabled).
     "mov gs:[32], rsp",     // Save user RSP to PerCpu.user_rsp_scratch
     "mov rsp, gs:[24]",     // Load kernel RSP from PerCpu.kernel_rsp0
 
@@ -237,7 +244,10 @@ core::arch::global_asm!(
     // (cli above) so no ISR frame can be pushed onto the user stack.
     "pop rsp",              // user RSP (safe: sysretq doesn't touch stack)
 
-    // ---- Return to ring 3 ----
+    // ---- Return to ring 3: the program's GS back, then sysretq ----
+    // Adjacent, interrupts off: nothing between them can fault (an NMI or
+    // #MC here takes the paranoid entry, which reads GS base itself).
+    "swapgs",
     "sysretq",
 
     // ---- A return address outside user space: reap, never return ----

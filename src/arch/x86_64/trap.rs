@@ -30,8 +30,11 @@
 //! and a clear direction flag (`cld`), which interrupt delivery does not
 //! clear and the SysV ABI requires.
 //!
-//! GS is not touched here yet: the kernel's per-CPU GS base is still live in
-//! ring 3 (ADR-040 § 2's `swapgs` lands separately).
+//! GS (ADR-040 § 2): the common entry swaps GS when the saved CS is ring 3
+//! and fences on both paths; the common exit swaps it back when the CS
+//! being returned to is ring 3, immediately before `iretq`. NMI, #DF and
+//! #MC take `x86_trap_paranoid` instead, which decides by reading
+//! `IA32_GS_BASE`, because they can arrive where CS and GS disagree.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
@@ -214,7 +217,11 @@ core::arch::global_asm!(
     "pushq $0",
     ".endif",
     "pushq $x86_trap_vec",
+    ".if (x86_trap_vec == 2) || (x86_trap_vec == 8) || (x86_trap_vec == 18)",
+    "jmp x86_trap_paranoid",
+    ".else",
     "jmp x86_trap_common",
+    ".endif",
     ".pushsection .rodata.X86_TRAP_STUB_TABLE, \"a\"",
     ".quad 1b",
     ".popsection",
@@ -225,7 +232,8 @@ core::arch::global_asm!(
 );
 
 // ----------------------------------------------------------------------------
-// Common entry and exit. Stack at entry, low to high: vector, error code,
+// Common entry and exit, and the paranoid entry. Stack at entry, low to
+// high: vector, error code,
 // RIP, CS, RFLAGS, RSP, SS. After the pushes RSP points at a complete
 // SavedContext (r15 first), which is the argument to x86_trap.
 // ----------------------------------------------------------------------------
@@ -248,6 +256,16 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    // GS (ADR-040 § 2): from ring 3 the program's GS base is live and
+    // PerCpu is parked in IA32_KERNEL_GS_BASE; swap. [rsp + 144] is the
+    // saved CS (15 registers, vector, error code, RIP below it).
+    "test byte ptr [rsp + 144], 3",
+    "jz .Lx86_trap_from_ring0",
+    "swapgs",
+    ".Lx86_trap_from_ring0:",
+    // Both paths reach this fence before any GS-relative access: the CPU
+    // can speculate past the branch either way (CVE-2019-1125).
+    "lfence",
     // AC from the interrupted context would disable SMAP in the handler
     // (ADR-040 § 2). `clac` is #UD without SMAP, hence the flag.
     "cmp byte ptr [rip + X86_SMAP_ACTIVE], 0",
@@ -278,6 +296,84 @@ core::arch::global_asm!(
     "pop rbx",
     "pop rax",
     "add rsp, 16",                  // vector and error code
+    // To ring 3: the program's GS base back. [rsp + 8] is the CS being
+    // returned to. Interrupts are off here (every gate is an interrupt
+    // gate; the yield path runs under cli), and nothing between the
+    // swapgs and the iretq can fault; an NMI or #MC there takes the
+    // paranoid entry, which reads GS base itself.
+    "test byte ptr [rsp + 8], 3",
+    "jz .Lx86_trap_to_ring0",
+    "swapgs",
+    ".Lx86_trap_to_ring0:",
+    "iretq",
+
+    // ------------------------------------------------------------------
+    // Paranoid entry: NMI, #DF, #MC (ADR-040 § 2). These arrive on IST
+    // stacks and can land between `syscall` and its swapgs, or between an
+    // exit's swapgs and its sysretq / iretq, where CS says ring 0 but the
+    // GS base is the program's. So the GS decision comes from the GS base
+    // itself: a kernel-half value is PerCpu (sound while a program can
+    // only load 0; ADR-040 Open Problems). R12, callee-saved and already
+    // pushed, remembers whether to swap back. Only the NMI returns, and an
+    // IST-entered trap never switches tasks (ADR-040 § 4), so the context
+    // resumed is the one built here.
+    // ------------------------------------------------------------------
+    ".global x86_trap_paranoid",
+    "x86_trap_paranoid:",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov ecx, 0xC0000101",          // IA32_GS_BASE
+    "rdmsr",                        // edx:eax; edx bit 31 = bit 63
+    "xor r12d, r12d",
+    "test edx, edx",
+    "js .Lx86_paranoid_kernel_gs",
+    "swapgs",
+    "mov r12d, 1",
+    ".Lx86_paranoid_kernel_gs:",
+    "lfence",
+    "cmp byte ptr [rip + X86_SMAP_ACTIVE], 0",
+    "je .Lx86_paranoid_no_clac",
+    "clac",
+    ".Lx86_paranoid_no_clac:",
+    "mov rdi, rsp",
+    "mov rsi, [rsp + 120]",
+    "mov rdx, [rsp + 128]",
+    "cld",
+    "call x86_trap",
+    "mov rsp, rax",
+    "test r12d, r12d",
+    "jz .Lx86_paranoid_restore",
+    "swapgs",
+    ".Lx86_paranoid_restore:",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "add rsp, 16",
     "iretq",
 );
 
