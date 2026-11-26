@@ -125,7 +125,7 @@ pub fn on_timer_isr(current_rsp: u64) -> (u64, Option<ContextSwitchHint>) {
                     let s = stats.snapshot();
                     *slot = (s.passes, s.last_pass_tick, s.pending, s.high_water);
                 }
-                let accepted = crate::io::try_print(format_args!(
+                let accepted = crate::io::try_print_serial_first(format_args!(
                     "[sched] reschedule kicks: sent {}, handled {}, switched {}; tasks/cpu {:?}; current {:?}; runnable {:?}; tick {}; reaper (passes, last pass tick, pending, high-water)/cpu {:?}; policy queries submitted {} answered {} expired {} retried {}; boot stamps fbcon +{} loop +{} aps +{} Mcycles\n",
                     crate::RESCHED_KICKS_SENT.load(core::sync::atomic::Ordering::Relaxed),
                     crate::RESCHED_KICKS_HANDLED.load(core::sync::atomic::Ordering::Relaxed),

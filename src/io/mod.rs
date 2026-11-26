@@ -44,6 +44,11 @@ use crate::Spinlock;
 #[cfg(target_arch = "x86_64")]
 static SERIAL1: Spinlock<Option<Com1>> = Spinlock::new(None);
 
+/// Set once `init` has a COM1 to drive. [`read_byte`] checks it instead of
+/// taking `SERIAL1`, so the console reader never holds the console lock.
+#[cfg(target_arch = "x86_64")]
+static COM1_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// HARDWARE: polls of the line-status register before a byte that will
 /// not leave COM1 is declared stuck. At 38400 baud a byte occupies the
 /// line for ~260 µs and a port-I/O read costs ~1-2 µs, so a healthy UART
@@ -294,6 +299,7 @@ pub unsafe fn init() {
             let mut port = unsafe { SerialPort::new(COM1_BASE) };
             port.init();
             *guard = Some(Com1 { port, state: TxState::Live });
+            COM1_READY.store(true, core::sync::atomic::Ordering::Release);
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -340,15 +346,52 @@ pub fn print(args: fmt::Arguments) {
 /// one sink accepted the text, so a one-shot diagnostic can retry on a
 /// later tick instead of being lost.
 pub fn try_print(args: fmt::Arguments) -> bool {
+    let serial = try_print_serial(args) == SerialOffer::Taken;
+    serial | fbcon::try_print(args)
+}
+
+/// What became of text offered to the serial console without waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerialOffer {
+    /// The serial console wrote it.
+    Taken,
+    /// The serial console lock was held; nothing was written.
+    Busy,
+    /// No serial console was found at boot.
+    Absent,
+}
+
+/// Interrupt-context print to the serial console alone; never spins.
+pub fn try_print_serial(args: fmt::Arguments) -> SerialOffer {
     use core::fmt::Write;
-    let mut accepted = false;
-    if let Some(mut guard) = SERIAL1.try_lock() {
-        if let Some(serial) = guard.as_mut() {
+    let Some(mut guard) = SERIAL1.try_lock() else { return SerialOffer::Busy };
+    match guard.as_mut() {
+        Some(serial) => {
             let _ = write!(serial, "{}", args);
-            accepted = true;
+            SerialOffer::Taken
         }
+        None => SerialOffer::Absent,
     }
-    accepted | fbcon::try_print(args)
+}
+
+/// A one-shot diagnostic from interrupt context, for a line a test harness
+/// reads off the serial log. Returns `true` once the text is out: the
+/// serial console took it (and the framebuffer console got one best-effort
+/// copy), or there is no serial console and the framebuffer console took
+/// it. While the serial lock is held nothing is written anywhere, so the
+/// caller retries on a later tick without duplicating the line on the
+/// framebuffer. [`try_print`] returns `true` when any one sink took the
+/// text, and a framebuffer-only success there lost the `[sched]` line from
+/// the serial log about one boot in three (2026-11-25).
+pub fn try_print_serial_first(args: fmt::Arguments) -> bool {
+    match try_print_serial(args) {
+        SerialOffer::Busy => false,
+        SerialOffer::Taken => {
+            let _ = fbcon::try_print(args);
+            true
+        }
+        SerialOffer::Absent => fbcon::try_print(args),
+    }
 }
 
 #[macro_export]
@@ -402,13 +445,22 @@ pub unsafe fn enable_console_rx_irq() {
 pub fn read_byte() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        // Hold SERIAL1 lock to ensure init has completed, but we read
-        // COM1 registers directly (uart_16550 doesn't expose a try-receive).
-        let mut guard = SERIAL1.lock();
-        let _serial = guard.as_mut()?;
+        // Not under SERIAL1. The shell polls here in a loop, and a reader
+        // holding the console lock across these two port reads is the
+        // holder an interrupt on this CPU finds, so the interrupt's
+        // try_print loses its serial output (QEMU delivers interrupts
+        // right after a port read, which made that systematic). COM1's
+        // receive side is independent of a transmit on another CPU: THR
+        // is a different register, and reading LSR clears only receive
+        // error bits. One reader: SYS_CONSOLE_READ's caller, the image's
+        // one `shell` row; two concurrent readers could each see or lose
+        // a byte, which the device would do anyway.
+        if !COM1_READY.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
 
         use x86_64::instructions::port::Port;
-        let base = 0x3F8u16;
+        let base = COM1_BASE;
         // SAFETY: Reading Line Status Register (base+5) is a side-effect-free read
         // on a valid x86 I/O port. The serial port was initialized at boot.
         let lsr: u8 = unsafe { Port::new(base + 5).read() };
