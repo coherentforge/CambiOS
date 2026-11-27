@@ -119,15 +119,19 @@ Every bit gets a defined value, written at boot-CPU and secondary-CPU init:
 | CR4.FSGSBASE | 0 | a program must not write GS base directly (§ 2) |
 | CR4.SMEP, CR4.SMAP | 1 when CPUID leaf 7 reports them | the kernel never executes user pages, and never reads or writes a user address directly ([ADR-020](020-typed-user-buffer-slices-at-syscall-boundary.md)'s copies go through the direct map) |
 | CR4.UMIP | 1 when reported | `sgdt`, `sidt`, `sldt`, `smsw` and `str` fault in ring 3 |
-| CR4.OSFXSR, CR4.OSXMMEXCPT | 1 | without OSXMMEXCPT an unmasked SIMD exception is #UD rather than #XM |
+| CR4.OSFXSR, CR4.OSXMMEXCPT | 1 | the values FP/SIMD state saving needs: SSE enabled, and an unmasked SIMD exception is #XM rather than #UD. Until that saving exists, CR0.EM keeps every x87, MMX and SSE instruction from running |
 | CR4.MCE | 1 | without it a machine check shuts the CPU down instead of reaching the #MC handler |
 | CR4.OSXSAVE | 0 while FP/SIMD register state is not saved across a context switch | an AVX instruction is #UD and its program is reaped: a defined outcome |
-| CR4.TSD, CR0.AM | decided in the change that writes this table | whether ring 3 may read the time-stamp counter; whether a program can turn on alignment-check faults |
+| CR4.TSD | 1 | `rdtsc` and `rdtscp` fault in ring 3. A program gets time from a syscall, so time is the kernel's to give (it can be coarsened, or the instruction emulated) rather than a free high-resolution timer for cache side channels |
+| CR4.PCE | 0 | `rdpmc` faults in ring 3: performance counters are a side channel |
+| CR0.EM | 1 while FP/SIMD register state is not saved across a context switch | an x87 instruction is #NM and an MMX or SSE instruction is #UD, and the program is reaped. Without it the x87 and MMX registers, and the SSE registers once OSFXSR is set, carry one task's values into the next task on that CPU. No x86_64 code in the tree uses them: both targets are soft-float |
+| CR0.AM | 0 | a program cannot turn on alignment-check faults. RFLAGS.AC then matters only to SMAP in ring 0, where every entry clears it |
 | CR0.WP | 1 | the kernel honours read-only pages |
-| CR0.NE, CR0.MP = 1; CR0.EM, CR0.TS = 0 | | x87 and SSE behave as the compiler assumes |
+| CR0.NE, CR0.MP = 1; CR0.TS = 0; CR0.CD, CR0.NW = 0 | | x87 errors are #MF rather than the legacy FERR# interrupt once EM is 0; caching on |
 | CR4.PAE, LA57, PGE, PCIDE | checked, not rewritten | paging-mode bits must match the page tables already in use; the kernel asserts the values it depends on |
+| every other bit | 0, except CR0.PE, PG and ET, which stay 1 | long mode requires PE and PG; ET reads as 1 on every x86_64 CPU |
 
-QEMU's default `qemu64` CPU model has neither SMEP nor SMAP, so every x86_64 QEMU target passes `-cpu qemu64,+smep,+smap` (spelled out rather than `max`, whose feature set changes between QEMU versions), and CI keeps one regression boot on bare `qemu64` so the feature-absent branches stay tested.
+QEMU's default `qemu64` CPU model has none of SMEP, SMAP and UMIP, so every x86_64 QEMU target passes `-cpu qemu64,+smep,+smap,+umip` (the Makefile's `QEMU_CPU_X86`; spelled out rather than `max`, whose feature set changes between QEMU versions), and CI keeps one regression boot on bare `qemu64` so the feature-absent branches stay tested.
 
 ### 7. x86_64: emergency stacks on every CPU
 
@@ -191,7 +195,9 @@ Self-modifying code in the entry path is harder to audit and to verify than a br
 
 > **Deferred decision.** Guard pages below the IST stacks. Why: the stacks live in the direct map, which has no 4 KiB holes to leave unmapped; guard pages need a kernel-stack virtual region, which task kernel stacks need too. **Revisit when:** a kernel-stack virtual region with guard pages exists for task stacks; the IST stacks move into it in the same change.
 
-> **Deferred decision.** The values of CR4.TSD and CR0.AM. **Revisit when:** the change that writes § 6's table lands; it records both values here.
+> **Deferred decision.** FP/SIMD register state saved across a context switch, so ring 3 can use x87, SSE and AVX. Why: no x86_64 program uses them today (both x86_64 targets are soft-float), and saving needs a per-task save area with its own design: eager rather than lazy, an area outside `SavedContext`, FXSAVE or XSAVE, and the initial state of a new task. **Revisit when:** a program needs floating point or vector instructions on x86_64, or the aarch64 FP/SIMD save lands, whichever is first. CR0.EM goes to 0 and CR4.OSXSAVE is decided in that change, and the probe's x87 stage becomes one that checks state survives a switch.
+
+> **Deferred decision.** CR0.AM = 1, so a program can ask for alignment-check faults on its own accesses. Why: nothing asks for it, and with AM = 0 one fewer exception is reachable from ring 3. **Revisit when:** a program, or the [ADR-016](016-win-compat-api-ai-boundary.md) compatibility layer, needs #AC delivered.
 
 ## Sequencing
 
@@ -201,7 +207,7 @@ Each step is its own commit, and each step's regression-probe stage fails on the
 2. The common trap entry and full exception coverage, GS handling unchanged (§ 3, § 4), with the `clac` flag still off. Probe stages: `ud2` and `int1`. A third, a push through a non-canonical stack pointer, is #SS on Intel hardware and a gate there; QEMU's TCG raises #GP for it, which had a handler before this step, so under QEMU it passes on the earlier kernel too.
 3. Syscall entry flags, no ring-0 return path, the return-address backstop (§ 5). Probe stage: trap flag set across `syscall`.
 4. `swapgs`, the paranoid entries and the fences (§ 2). Probe stages: GS reloaded from ring 3, then a syscall; then a timer interrupt.
-5. CR0 and CR4 ownership, the SMAP flag on, the QEMU `-cpu` flags (§ 6). Probe stage: an unmasked SIMD exception arrives as #XM.
+5. CR0 and CR4 ownership, the SMAP flag on, the QEMU `-cpu` flags (§ 6). Probe stages: an x87 instruction, `rdtsc`, and (on a CPU that reports UMIP) `sidt` in ring 3 each reap the program.
 6. The user address floor and ceiling (§ 8).
 
 ## Divergence
@@ -209,3 +215,4 @@ Each step is its own commit, and each step's regression-probe stage fails on the
 The body above reflects the implemented design. The original wordings, with the date and commit where they changed, are preserved here.
 
 - **Step 2's non-canonical stack push is a gate on Intel hardware only** (2026-11-25, eb0bf98). Under QEMU the push raised #GP, not #SS, and the earlier kernel had a #GP handler, so the stage passed on it too; `ud2` and `int1` are the stages that tell the two kernels apart there. The stage stays, as `trap-badstack`. *Prior wording (§ Sequencing, step 2): "Probe stages: `ud2`, a push through a non-canonical stack pointer, `int1`."*
+- **The x87, MMX and SSE registers stay unavailable to ring 3 until their state is saved; TSD and AM decided** (2026-11-27, measured on 1185ae0). Step 5 read CR0 = PE ET WP PG and CR4 = PAE on both CPUs under QEMU: x87 and MMX already ran in ring 3 with no state saved across a switch, and setting OSFXSR alone would have added SSE to that channel. A scan of the built kernel and every x86_64 user program found no x87, MMX or SSE instruction and no `rdtsc` or `sidt` in user code, so EM = 1, TSD = 1 and UMIP cost nothing in the tree. QEMU's TCG emulates UMIP, so it joined the `-cpu` flags. *Prior wording (§ 6 table): "| CR4.OSFXSR, CR4.OSXMMEXCPT | 1 | without OSXMMEXCPT an unmasked SIMD exception is #UD rather than #XM |", "| CR4.TSD, CR0.AM | decided in the change that writes this table | whether ring 3 may read the time-stamp counter; whether a program can turn on alignment-check faults |", "| CR0.NE, CR0.MP = 1; CR0.EM, CR0.TS = 0 | | x87 and SSE behave as the compiler assumes |"; (§ 6 QEMU paragraph) "QEMU's default `qemu64` CPU model has neither SMEP nor SMAP, so every x86_64 QEMU target passes `-cpu qemu64,+smep,+smap`"; (§ Sequencing, step 5) "Probe stage: an unmasked SIMD exception arrives as #XM."; (Open Problems) "> **Deferred decision.** The values of CR4.TSD and CR0.AM. **Revisit when:** the change that writes § 6's table lands; it records both values here."*
