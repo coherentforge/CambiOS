@@ -6,7 +6,8 @@
 //!
 //! The probe spawns this program, waits for it to say it is listening,
 //! and sends it one byte naming a hostile instruction sequence: one a
-//! program can execute in ring 3 and that once halted the whole kernel.
+//! program can execute in ring 3 and that once halted the whole kernel, or
+//! once ran when it must not (x87 with no FP state saved, `rdtsc`, `sidt`).
 //! This program executes it. For most modes a correct kernel reaps it for
 //! the fault; for the nested-task and GS modes a correct kernel lets it
 //! finish and exit 0. The probe checks which happened and that the kernel
@@ -45,6 +46,9 @@ const MODE_TF: u8 = 4;
 const MODE_NT: u8 = 5;
 const MODE_GS_SYSCALL: u8 = 6;
 const MODE_GS_TICK: u8 = 7;
+const MODE_X87: u8 = 8;
+const MODE_RDTSC: u8 = 9;
+const MODE_SIDT: u8 = 10;
 
 /// ARCHITECTURAL: the kernel GDT's user data selector (index 3, RPL 3; see
 /// `.claude/rules/x86_64.md`). Ring 3 may load it into GS, which in 64-bit
@@ -183,6 +187,44 @@ fn run() -> ! {
             }
             sys::print(b"[REGRESS-VICTIM] the clock did not advance while spinning\r\n");
             sys::exit(6);
+        }
+        MODE_X87 => {
+            sys::print(b"[REGRESS-VICTIM] fld1 (x87)\r\n");
+            // SAFETY: deliberately faults: with CR0.EM set an x87
+            // instruction raises #NM. On a kernel that leaves EM clear,
+            // `fld1` pushes 1.0 onto the x87 stack and `fstp st(0)` pops
+            // it, so the x87 stack is as it was; no memory is touched.
+            unsafe {
+                core::arch::asm!("fld1", "fstp st(0)", out("st(0)") _, options(nomem, nostack))
+            };
+        }
+        MODE_RDTSC => {
+            sys::print(b"[REGRESS-VICTIM] rdtsc\r\n");
+            // SAFETY: deliberately faults: with CR4.TSD set `rdtsc` is #GP
+            // outside ring 0. Otherwise it writes EDX:EAX, both declared.
+            unsafe {
+                core::arch::asm!(
+                    "rdtsc",
+                    out("eax") _,
+                    out("edx") _,
+                    options(nomem, nostack, preserves_flags),
+                )
+            };
+        }
+        MODE_SIDT => {
+            sys::print(b"[REGRESS-VICTIM] sidt\r\n");
+            let mut idtr = [0u8; 10];
+            // SAFETY: deliberately faults: with CR4.UMIP set `sidt` is #GP
+            // outside ring 0. Otherwise it stores the 10-byte IDTR image
+            // (limit, base) into `idtr`, a local buffer of exactly that size.
+            unsafe {
+                core::arch::asm!(
+                    "sidt [{}]",
+                    in(reg) idtr.as_mut_ptr(),
+                    options(nostack, preserves_flags),
+                )
+            };
+            core::hint::black_box(&idtr);
         }
         _ => {
             sys::print(b"[REGRESS-VICTIM] unknown mode\r\n");

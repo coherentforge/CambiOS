@@ -105,22 +105,52 @@ const FAULTED: i64 = i32::MIN as i64;
 /// did, so under QEMU that stage also passes on a kernel without the fix
 /// and only `trap-UD` and `trap-ICEBP` tell the two apart.
 ///
-/// The last value is the `SYS_WAIT_TASK` result a correct kernel gives:
+/// The fourth value is the `SYS_WAIT_TASK` result a correct kernel gives:
 /// [`FAULTED`] for the stages whose instruction must fault in ring 3, 0
 /// for trap-NT and the two GS stages, where the program must simply
 /// finish (the danger was the kernel faulting on state the program set:
 /// its own `iretq` on NT, its per-CPU reads through a GS base the program
-/// loaded).
+/// loaded). The last is the CPU feature the stage needs: the kernel turns
+/// UMIP on only where the CPU reports it (ADR-040 § 6), so trap-UMIP is
+/// skipped, not counted, on a CPU without it.
 #[cfg(target_arch = "x86_64")]
-const TRAP_STAGES: [(u8, &[u8], &[u8], i64); 7] = [
-    (1, b"trap-UD", b"a ring-3 ud2 (invalid opcode) reaps the program and the kernel runs on", FAULTED),
-    (2, b"trap-badstack", b"a ring-3 push through a non-canonical stack pointer reaps the program and the kernel runs on", FAULTED),
-    (3, b"trap-ICEBP", b"a ring-3 int1 (#DB) reaps the program and the kernel runs on", FAULTED),
-    (4, b"trap-TF", b"a trap flag set across syscall single-steps nothing in the kernel; the program is reaped for #DB back in ring 3", FAULTED),
-    (5, b"trap-NT", b"a nested-task flag set across a yielding syscall does not reach the kernel's iretq; the program exits normally", 0),
-    (6, b"trap-GS-syscall", b"a ring-3 mov gs followed by a syscall does not move the kernel's per-CPU base; the program exits normally", 0),
-    (7, b"trap-GS-tick", b"a ring-3 mov gs followed by timer ticks in ring 3 does not move the kernel's per-CPU base; the program exits normally", 0),
+const TRAP_STAGES: [(u8, &[u8], &[u8], i64, Requires); 10] = [
+    (1, b"trap-UD", b"a ring-3 ud2 (invalid opcode) reaps the program and the kernel runs on", FAULTED, Requires::Nothing),
+    (2, b"trap-badstack", b"a ring-3 push through a non-canonical stack pointer reaps the program and the kernel runs on", FAULTED, Requires::Nothing),
+    (3, b"trap-ICEBP", b"a ring-3 int1 (#DB) reaps the program and the kernel runs on", FAULTED, Requires::Nothing),
+    (4, b"trap-TF", b"a trap flag set across syscall single-steps nothing in the kernel; the program is reaped for #DB back in ring 3", FAULTED, Requires::Nothing),
+    (5, b"trap-NT", b"a nested-task flag set across a yielding syscall does not reach the kernel's iretq; the program exits normally", 0, Requires::Nothing),
+    (6, b"trap-GS-syscall", b"a ring-3 mov gs followed by a syscall does not move the kernel's per-CPU base; the program exits normally", 0, Requires::Nothing),
+    (7, b"trap-GS-tick", b"a ring-3 mov gs followed by timer ticks in ring 3 does not move the kernel's per-CPU base; the program exits normally", 0, Requires::Nothing),
+    (8, b"trap-x87", b"an x87 instruction in ring 3 reaps the program: no FP register state exists while none is saved across a switch", FAULTED, Requires::Nothing),
+    (9, b"trap-rdtsc", b"rdtsc in ring 3 reaps the program: a program's time comes from the kernel", FAULTED, Requires::Nothing),
+    (10, b"trap-UMIP", b"sidt in ring 3 reaps the program: the IDT's kernel address stays in ring 0", FAULTED, Requires::Umip),
 ];
+
+/// A CPU feature a trap stage needs before its expectation holds.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum Requires {
+    Nothing,
+    /// CPUID leaf 7, subleaf 0, ECX bit 2.
+    Umip,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Requires {
+    /// Whether this CPU has the feature. CPUID is unprivileged: ring 3
+    /// reads the same leaf the kernel decided from. Leaf 0 first, because
+    /// leaf 7 means nothing on a CPU whose highest basic leaf is below it.
+    fn met(self) -> bool {
+        match self {
+            Requires::Nothing => true,
+            Requires::Umip => {
+                core::arch::x86_64::__cpuid(0).eax >= 7
+                    && core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 2) != 0
+            }
+        }
+    }
+}
 
 /// Physical addresses `SYS_MAP_MMIO` must refuse on this architecture: none
 /// lies inside a device BAR. The first ones are pages the old deny-list
@@ -468,7 +498,12 @@ fn run() -> ! {
     stage_r1(&mut t);
     stage_reaper(&mut t);
     #[cfg(target_arch = "x86_64")]
-    for (mode, id, what, expect) in TRAP_STAGES {
+    for (mode, id, what, expect, requires) in TRAP_STAGES {
+        if !requires.met() {
+            Line::new().text(b"[REGRESS] SKIP ").text(id)
+                .text(b": the CPU does not report the feature this stage needs").emit();
+            continue;
+        }
         stage_trap(&mut t, mode, id, what, expect);
     }
 
