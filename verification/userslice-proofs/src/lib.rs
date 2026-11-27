@@ -27,11 +27,15 @@
 //! `super::`-style imports.
 //!
 //! The page-walk helpers further down `user_slice.rs`
-//! (`read_user_buffer` / `write_user_buffer`) reference
-//! `crate::hhdm_offset` and `crate::memory::paging::*`. Those are
+//! (`read_user_buffer` / `write_user_buffer` and the `user_page_phys`
+//! check they share) reference `crate::hhdm_offset`,
+//! `crate::memory::{UserAccess, paging::*}` and
+//! `crate::boot::{MemoryRegion, MemoryRegionKind, try_info}`. Those are
 //! stubbed with type-compatible no-op implementations: the proofs
 //! only exercise `validate()` and never call the helpers, so the
-//! stubs never run.
+//! stubs never run. `MemoryRegionKind` keeps the kernel's exact
+//! variant list, because `user_slice.rs` matches on it exhaustively:
+//! a variant added on one side only fails this crate's build.
 //!
 //! Run with `cargo kani` from this directory.
 
@@ -72,19 +76,27 @@ pub fn hhdm_offset() -> u64 {
 }
 
 pub mod memory {
+    /// Mirror of `crate::memory::UserAccess`: the direction a kernel copy
+    /// asks `paging::translate_user` for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UserAccess {
+        Read,
+        Write,
+    }
+
     /// Stub mirroring the kernel's `crate::memory::paging` module.
     /// The kernel ships two implementations (one per cfg-arch); both
-    /// expose `page_table_from_cr3` and `translate`, but with different
-    /// return types (`OffsetPageTable<'static>` on x86_64,
-    /// `PageTableRef` on others). For the proof crate the return type
-    /// is irrelevant — `validate()` never calls these functions, and
-    /// the only call sites (in `read_user_buffer` / `write_user_buffer`)
-    /// only do `let pt = ...; translate(&pt, vaddr)`. A unit-struct
-    /// `OffsetPageTable<'a>` satisfies both call sites on any arch.
+    /// expose `page_table_from_cr3` and `translate_user`, but with
+    /// different page-table types (`OffsetPageTable<'static>` on x86_64,
+    /// `PageTableRef` on others). For the proof crate the type is
+    /// irrelevant: `validate()` never calls these functions, and the
+    /// only call site (`user_page_phys`) only does
+    /// `let mut pt = ...; translate_user(&mut pt, vaddr, access)`. A
+    /// unit-struct `OffsetPageTable<'a>` satisfies it on any arch.
     pub mod paging {
         /// Arch-agnostic stub. Named to match the x86_64 kernel-side
         /// type for symmetry; the only requirement is that
-        /// `translate(&Self, _) -> Option<u64>` type-checks.
+        /// `translate_user(&mut Self, _, _) -> Option<u64>` type-checks.
         pub struct OffsetPageTable<'a> {
             _phantom: core::marker::PhantomData<&'a ()>,
         }
@@ -98,9 +110,56 @@ pub mod memory {
         }
 
         /// Stub. Always returns `None`; the proven path never calls this.
-        pub fn translate(_pt: &OffsetPageTable, _virt_addr: u64) -> Option<u64> {
+        pub fn translate_user(
+            _pt: &mut OffsetPageTable,
+            _virt_addr: u64,
+            _access: super::UserAccess,
+        ) -> Option<u64> {
             None
         }
+    }
+}
+
+pub mod boot {
+    //! Stand-ins for the `crate::boot` names `user_page_phys` uses to
+    //! check that a frame is RAM. Never reached from a proof.
+
+    /// Mirror of `crate::boot::MemoryRegion`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MemoryRegion {
+        pub base: u64,
+        pub length: u64,
+        pub kind: MemoryRegionKind,
+    }
+
+    /// Mirror of `crate::boot::MemoryRegionKind`, every variant, in the
+    /// kernel's order: `region_kind_is_ram` matches on all of them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MemoryRegionKind {
+        Usable,
+        Reserved,
+        AcpiReclaimable,
+        AcpiNvs,
+        BadMemory,
+        BootloaderReclaimable,
+        ExecutableAndModules,
+        Framebuffer,
+        Unknown(u64),
+    }
+
+    /// Stand-in for `crate::boot::BootInfo`; only `memory_regions` is used.
+    pub struct BootInfo;
+
+    impl BootInfo {
+        pub fn memory_regions(&self) -> &[MemoryRegion] {
+            &[]
+        }
+    }
+
+    /// Stub for `crate::boot::try_info`. Always `None`, as in the kernel
+    /// before boot info is published.
+    pub fn try_info() -> Option<&'static BootInfo> {
+        None
     }
 }
 
