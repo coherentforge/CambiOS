@@ -131,10 +131,12 @@ unsafe impl Sync for IdtStorage {}
 
 static IDT: IdtStorage = IdtStorage(UnsafeCell::new(Idt([IdtGate::MISSING; IDT_ENTRIES])));
 
-/// Set once the boot CPU has turned SMAP on (ADR-040 § 6). The common entry
-/// reads it to decide whether to execute `clac`, which is an invalid opcode
-/// on a CPU without SMAP: a branch on a flag written once at boot, not code
-/// patching. Nothing sets it yet.
+/// Set by `cr::init_bsp` once the boot CPU has turned SMAP on (ADR-040
+/// § 6). The common and paranoid entries read it to decide whether to
+/// execute `clac`, which is an invalid opcode on a CPU without SMAP: a
+/// branch on a flag written once at boot, not code patching. True of every
+/// CPU that traps through this IDT: an AP runs the boot CPU's feature set
+/// or stays halted before loading the IDT (`cr::init_ap`).
 #[unsafe(no_mangle)]
 pub static X86_SMAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 

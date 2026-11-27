@@ -89,6 +89,22 @@ pub enum BootError {
     /// Site: `arch::x86_64::gdt::allocate_ist_stacks`.
     IstStackCpuOutOfRange,
 
+    // ── Control registers, ADR-040 § 6 ──
+
+    /// The boot CPU's CR4 as found has PAE clear.
+    /// Site: `arch::x86_64::cr::init_bsp`.
+    Cr4PaeClear,
+
+    /// The boot CPU's CR4 as found has 5-level paging on; the kernel
+    /// builds 4-level tables.
+    /// Site: `arch::x86_64::cr::init_bsp`.
+    Cr4La57Set,
+
+    /// The boot CPU's CR4 as found has PCIDs on; the kernel's CR3 writes
+    /// assume bits 11:0 are not a PCID.
+    /// Site: `arch::x86_64::cr::init_bsp`.
+    Cr4PcideSet,
+
     // ── Platform timer ──
 
     /// Platform timer frequency unavailable.
@@ -201,6 +217,12 @@ pub fn boot_failed(err: BootError) -> ! {
             "no frames for a CPU's emergency (IST) stack",
         BootError::IstStackCpuOutOfRange =>
             "CPU index out of range for emergency (IST) stacks",
+        BootError::Cr4PaeClear =>
+            "CR4 as found has PAE clear",
+        BootError::Cr4La57Set =>
+            "CR4 as found has 5-level paging on; the kernel builds 4-level tables",
+        BootError::Cr4PcideSet =>
+            "CR4 as found has PCIDs on; the kernel's CR3 writes do not carry one",
         BootError::TimerFrequencyMissing =>
             "platform timer frequency unavailable",
         BootError::TimerFrequencyTooLow =>
@@ -254,6 +276,9 @@ mod tests {
             BootError::GicRedistributorUnmapped,
             BootError::IstStackAllocFailed,
             BootError::IstStackCpuOutOfRange,
+            BootError::Cr4PaeClear,
+            BootError::Cr4La57Set,
+            BootError::Cr4PcideSet,
             BootError::TimerFrequencyMissing,
             BootError::TimerFrequencyTooLow,
             BootError::TimerInvariantViolation,
@@ -295,6 +320,9 @@ mod tests {
             BootError::GicRedistributorUnmapped,
             BootError::IstStackAllocFailed,
             BootError::IstStackCpuOutOfRange,
+            BootError::Cr4PaeClear,
+            BootError::Cr4La57Set,
+            BootError::Cr4PcideSet,
             BootError::TimerFrequencyMissing,
             BootError::TimerFrequencyTooLow,
             BootError::TimerInvariantViolation,

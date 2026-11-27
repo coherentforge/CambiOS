@@ -117,7 +117,7 @@ Each entry carries a `Revisit when:` line naming an **observable trigger** (per 
 
 **Threat family.** A syscall handler reads user memory once to validate/parse, then reads the same (or derived) user memory again to act. A concurrent thread in the same process swaps the page between reads. Kernel validates one value and acts on a different one.
 
-**Why it matters for CambiOS.** No SMAP. User pointers are page-walked via HHDM, not copied to kernel memory via a hardware-atomic path. The kernel's guarantees about what it "read" are only as strong as its discipline about re-reading.
+**Why it matters for CambiOS.** User pointers are page-walked and copied through the HHDM, not through a hardware-atomic path. SMAP is on where the CPU reports it ([ADR-040](adr/040-trap-entry-discipline.md) § 6), but it does not apply here: the HHDM is a kernel mapping. The kernel's guarantees about what it "read" are only as strong as its discipline about re-reading.
 
 **Current mitigation.** ADR-020 typed slices (`UserReadSlice` / `UserWriteSlice`) force a validate-once / read-into-kernel-buffer-once shape. Audited 2026-04-23: every handler in `src/syscalls/dispatcher.rs` that touches user memory reads into a kernel `kbuf` and makes all downstream decisions from `kbuf`. `dispatch()` resolves `caller_principal` once from `CAPABILITY_MANAGER`, not user memory. `SyscallArgs` is a by-value register snapshot — no back-channel through arg accessors.
 

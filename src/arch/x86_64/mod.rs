@@ -21,6 +21,7 @@
 //!    `yield_save_and_switch` builds the same shape and leaves the same way.
 
 pub mod apic;
+pub mod cr;
 pub mod gdt;
 pub mod ioapic;
 pub mod msr;

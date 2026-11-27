@@ -188,6 +188,11 @@ USER_LD  := user/user.ld
 # QEMU_DISPLAY: empty by default (interactive `run-quiet` keeps its
 # window); headless CI sets `QEMU_DISPLAY=-display none`.
 # QEMU_GUI_DISPLAY: the window backend of the *-gui run targets.
+# QEMU_CPU_X86: the CPU model every x86_64 run target passes. QEMU's
+# default `qemu64` has no SMEP, SMAP or UMIP, so the kernel's CR4 would
+# leave them off (ADR-040 § 6); they are spelled out rather than `max`,
+# whose feature set changes between QEMU versions. CI's second boot sets
+# `QEMU_CPU_X86=qemu64` so the feature-absent branches stay tested.
 ifeq ($(origin HOST_TARGET),undefined)
 HOST_TARGET = $(eval HOST_TARGET := $(or $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p'),unknown-host))$(HOST_TARGET)
 endif
@@ -195,6 +200,7 @@ HOST_OS = $(subst $(firstword $(subst -, ,$(HOST_TARGET)))-,,$(HOST_TARGET))
 TEST_TARGET ?= $(HOST_TARGET)
 QEMU_DISPLAY ?=
 QEMU_GUI_DISPLAY ?= $(if $(findstring apple-darwin,$(HOST_TARGET)),cocoa,gtk)
+QEMU_CPU_X86 ?= qemu64,+smep,+smap,+umip
 
 # RISC-V initrd artifacts
 INITRD_RISCV64 := initrd-riscv64.img
@@ -590,6 +596,7 @@ disk-img:
 # displays.
 run: iso disk-img
 	qemu-system-x86_64 \
+		-cpu $(QEMU_CPU_X86) \
 		-cdrom $(ISO) \
 		-serial mon:stdio \
 		-smp 2 \
@@ -632,6 +639,7 @@ run-quiet: iso disk-img
 		$(if $(SUCCESS),--success "$(SUCCESS)",) \
 		$(RUN_QUIET_REQUIRES) $(EXTRA_REQUIRES) \
 		-- qemu-system-x86_64 \
+			-cpu $(QEMU_CPU_X86) \
 			-cdrom $(ISO) \
 			-serial mon:stdio \
 			-smp 2 \
@@ -690,6 +698,7 @@ run-quiet-dev-piv: iso-dev-piv disk-img
 		$(if $(TIMEOUT),--timeout $(TIMEOUT),) \
 		$(if $(SUCCESS),--success "$(SUCCESS)",) \
 		-- qemu-system-x86_64 \
+			-cpu $(QEMU_CPU_X86) \
 			-cdrom $(ISO) \
 			-serial mon:stdio \
 			-smp 2 \
@@ -710,6 +719,7 @@ run-quiet-dev-piv: iso-dev-piv disk-img
 # `QEMU_GUI_DISPLAY="vnc=:0"` and connect with a VNC viewer.
 run-gui: iso disk-img
 	qemu-system-x86_64 \
+		-cpu $(QEMU_CPU_X86) \
 		-cdrom $(ISO) \
 		-serial mon:stdio \
 		-smp 2 \
@@ -729,6 +739,7 @@ run-gui: iso disk-img
 run-uefi: iso
 	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
+		-cpu $(QEMU_CPU_X86) \
 		-cdrom $(ISO) \
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
 		-drive if=pflash,format=raw,file=/tmp/cambios-efivars.fd \
@@ -790,6 +801,7 @@ EFI_VARS_X86 ?= $(call efi_fw,edk2-i386-vars.fd)
 run-img-x86: img-x86
 	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
+		-cpu $(QEMU_CPU_X86) \
 		-drive file=$(IMG_X86),format=raw \
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
 		-drive if=pflash,format=raw,file=/tmp/cambios-efivars.fd \
@@ -853,6 +865,7 @@ img-usb: img-x86
 run-img-usb: img-usb disk-img
 	@cp $(EFI_VARS_X86) /tmp/cambios-efivars.fd
 	qemu-system-x86_64 \
+		-cpu $(QEMU_CPU_X86) \
 		-drive file=$(IMG_USB),format=raw \
 		-drive if=pflash,format=raw,readonly=on,file=$(EFI_FW_X86) \
 		-drive if=pflash,format=raw,file=/tmp/cambios-efivars.fd \

@@ -382,6 +382,18 @@ unsafe extern "C" fn kmain() -> ! {
     // Initialize exception/interrupt vector table
     #[cfg(target_arch = "x86_64")]
     {
+        // ADR-040 § 6: the kernel's CR0 and CR4, before the IDT whose
+        // entry reads the SMAP flag, before any AP starts (they copy this
+        // CPU's feature set) and before any program runs.
+        // SAFETY: once, on the boot CPU, single-threaded boot, interrupts
+        // disabled, no AP started, no program run yet.
+        match unsafe { cambios_core::arch::x86_64::cr::init_bsp() } {
+            Ok(f) => println!(
+                "✓ CR0/CR4 owned (SMEP {}, SMAP {}, UMIP {}; x87/SSE off, rdtsc ring 0 only)",
+                f.smep, f.smap, f.umip
+            ),
+            Err(e) => cambios_core::boot::boot_failed(e.into()),
+        }
         // SAFETY: Single-threaded boot, GDT already loaded. Sets up exception handlers.
         unsafe { cambios_core::interrupts::init(); }
         println!("✓ IDT loaded");
@@ -2305,6 +2317,19 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // gdt::init_for_cpu and percpu::init_ap above.
     if let Err(e) = unsafe { cambios_core::arch::gdt::allocate_ist_stacks(cpu_index) } {
         println!("  ✗ CPU {}: emergency stacks: {:?}; CPU left halted", cpu_index, e);
+        loop {
+            hlt();
+        }
+    }
+
+    // Step 2c: the boot CPU's CR0 and CR4 values (ADR-040 § 6), before
+    // this CPU loads the IDT: its entry executes `clac` when the boot CPU
+    // turned SMAP on, which is #UD on a CPU without it. A CPU that lacks a
+    // feature the boot CPU uses stays halted, like one without stacks.
+    // SAFETY: on this AP, interrupts disabled, after the BSP's
+    // cr::init_bsp (it ran before AP bring-up) and before load_idt_ap.
+    if let Err(e) = unsafe { cambios_core::arch::x86_64::cr::init_ap() } {
+        println!("  ✗ CPU {}: control registers: {:?}; CPU left halted", cpu_index, e);
         loop {
             hlt();
         }

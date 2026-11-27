@@ -75,7 +75,17 @@ jobs:
         # actually answering: the `[sched]` diagnostic the BSP prints ~20 s
         # in must report queries answered (> 0) and none expired. A boot
         # whose enforcer never answers no longer passes (ADR-006
-        # § Divergence 2026-10-28).
+        # § Divergence 2026-10-28). The CR line proves the Makefile's
+        # `-cpu` flags reached QEMU and the kernel turned SMEP, SMAP and
+        # UMIP on (ADR-040 § 6).
         run: >
           make run-quiet TIMEOUT=180
-          EXTRA_REQUIRES="--require 'policy queries submitted [1-9][0-9]* answered [1-9][0-9]* expired 0'"
+          EXTRA_REQUIRES="--require 'policy queries submitted [1-9][0-9]* answered [1-9][0-9]* expired 0'
+          --require 'CR0/CR4 owned \(SMEP true, SMAP true, UMIP true'"
+      - name: Boot to shell on bare qemu64 (no SMEP, SMAP or UMIP)
+        # ADR-040 § 6: one boot on QEMU's default CPU model, which reports
+        # none of the three, so the branches that leave them off (and the
+        # trap entry's skipped `clac`) keep running somewhere.
+        run: >
+          make run-quiet TIMEOUT=180 QEMU_CPU_X86=qemu64
+          EXTRA_REQUIRES="--require 'CR0/CR4 owned \(SMEP false, SMAP false, UMIP false'"
