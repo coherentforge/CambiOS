@@ -128,19 +128,15 @@ HOST_TEST_CRATES := cambios-abi cambios-blk-proto cambios-ccid-proto \
 	user/cambios-style user/init user/key-store-service user/libflag \
 	user/libfs user/libgui user/libgui-proto user/libinput-proto \
 	user/libipc user/libscanout user/libsys user/libterm user/ping \
-	user/sprouty user/terminal-window user/worm
+	user/sprouty user/terminal-window user/usb-host user/virtio-input \
+	user/worm
 
-# Binary-only crates: `#![no_std] #![no_main]` with their own panic
-# handler, so the test harness cannot link them (duplicate lang item
-# `panic_impl`). Their tests (usb-host: descriptor and HID keyboard
-# parsing; virtio-input: evdev mapping) run nowhere.
-# Deferred: moving each crate's pure modules into a lib target, the
-# split ping, sprouty and worm already use.
-# Why: a source restructure of two drivers, separate from the build
-# lists this section holds.
-# Revisit when: either crate is next edited, or a third binary-only
-# crate with tests appears here.
-HOST_TEST_EXEMPT := user/usb-host user/virtio-input
+# Binary-only crates whose tests cannot run: `#![no_std] #![no_main]`
+# with their own panic handler, so the test harness cannot link them
+# (duplicate lang item `panic_impl`). Empty, and meant to stay so: a
+# crate whose tests would land here moves its pure modules into a lib
+# target instead (ping, sprouty, worm, usb-host, virtio-input).
+HOST_TEST_EXEMPT :=
 
 # Extra cargo arguments for every user-crate build and host test. CI
 # passes `CARGO_LOCKED=--locked`, so a Cargo.lock that no longer matches

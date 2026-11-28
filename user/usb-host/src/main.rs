@@ -38,8 +38,8 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-mod descriptors;
-mod hid_kbd;
+use cambios_usb_host::{descriptors, hid_kbd};
+
 mod pci;
 #[allow(unsafe_code)]
 mod ring;

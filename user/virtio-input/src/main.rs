@@ -37,8 +37,6 @@
 #![deny(unsafe_code)]
 
 #[allow(unsafe_code)]
-mod evdev;
-#[allow(unsafe_code)]
 mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
@@ -49,7 +47,7 @@ use cambios_libinput_proto::{
 };
 use cambios_libsys as sys;
 
-use evdev::{
+use cambios_virtio_input::evdev::{
     evdev_to_hid, hid_to_ascii_us, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY,
     EV_REL, EV_SYN, KEY_A, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT,
     KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_SPACE, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y,
