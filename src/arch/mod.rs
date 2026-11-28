@@ -37,6 +37,14 @@ pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::*;
 
+/// The riscv64 trap vector's entry-branch check (ADR-040 § 9): pure
+/// logic with no backend dependency, so the host test build compiles it
+/// on every architecture and `make test` runs its tests, which no
+/// riscv64 host does. The riscv64 backend reaches it through this path.
+#[cfg(any(target_arch = "riscv64", test))]
+#[path = "riscv64/entry_branch.rs"]
+pub mod riscv64_entry_branch;
+
 // ============================================================================
 // Portable TLB shootdown wrapper
 // ============================================================================

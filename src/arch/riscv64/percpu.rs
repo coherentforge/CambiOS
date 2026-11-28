@@ -16,8 +16,12 @@
 //! ```text
 //! trap_entry:
 //!     csrrw tp, sscratch, tp     # atomic swap: tp = sscratch, sscratch = tp
-//!     ...                         # tp now holds kernel PerCpu*
-//!     csrrw tp, sscratch, tp     # swap back before sret
+//!     sd sp, 40(tp)              # the one store before the sentinel is back
+//!     csrrw sp, sscratch, zero   # sp = user tp, sscratch = 0 (the sentinel)
+//!     sd sp, 48(tp)              # park the user tp; then load the kernel sp
+//!     ...                        # kernel runs with tp = PerCpu*, sscratch = 0
+//!     csrw sscratch, tp          # before an sret to U-mode: sscratch = PerCpu*
+//!     ld tp, 32(sp)              # tp = the user's tp, then sret
 //! ```
 //!
 //! This is RISC-V's equivalent of x86_64's `swapgs`. AArch64 does not
@@ -27,7 +31,10 @@
 //!
 //! `sscratch` holds the kernel PerCpu* when running in U-mode, and zero
 //! when running in S-mode (zero signals "trap came from S-mode" so the
-//! trap handler knows not to swap).
+//! trap handler knows not to swap). An sret to S-mode leaves `tp` alone:
+//! it is this hart's PerCpu*, and a frame's copy is the saving hart's.
+//! The invariant, its transitions and the check that enforces it are
+//! ADR-040 § 9.
 
 /// Maximum number of harts supported. Matches x86_64 / AArch64 for
 /// consistency across architectures.
@@ -50,6 +57,10 @@ pub const MAX_CPUS: usize = 256;
 /// |  32    | current_task_id   |  4   |
 /// |  36    | interrupt_depth   |  4   |
 /// |  40    | user_sp_scratch   |  8   |
+/// |  48    | user_tp_scratch   |  8   |
+///
+/// The offsets the trap vector uses (24, 40, 48) are compile-time
+/// assertions below the struct.
 #[repr(C)]
 pub struct PerCpu {
     /// Pointer to self — allows `ld x0, 0(tp)` to fetch the struct.
@@ -73,7 +84,19 @@ pub struct PerCpu {
     /// it back into the SavedContext's gpr[2] slot once the trap
     /// frame is allocated. Never accessed outside the trap vector.
     user_sp_scratch: u64,
+    /// Trap-entry scratch for the user's `tp`: the vector moves it out of
+    /// `sscratch` (writing the sentinel 0 back) one store after entry and
+    /// parks it here until the frame exists (ADR-040 § 9). Never accessed
+    /// outside the trap vector.
+    user_tp_scratch: u64,
 }
+
+/// ARCHITECTURAL: the trap vector addresses these fields by fixed offset
+/// (`ld sp, 24(tp)`, `sd sp, 40(tp)`, `sd sp, 48(tp)`); a layout change
+/// that moves one fails the build instead of the first trap.
+const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_stack_top) == 24);
+const _: () = assert!(core::mem::offset_of!(PerCpu, user_sp_scratch) == 40);
+const _: () = assert!(core::mem::offset_of!(PerCpu, user_tp_scratch) == 48);
 
 // SAFETY: Each PerCpu is only touched by its owning hart (`tp` is set
 // once per hart and not shared). Cross-hart reads of `cpu_id` /
@@ -96,6 +119,7 @@ impl PerCpu {
             current_task_id: 0,
             interrupt_depth: 0,
             user_sp_scratch: 0,
+            user_tp_scratch: 0,
         }
     }
 
@@ -187,6 +211,7 @@ pub unsafe fn init_bsp(hart_id: u64) {
     slot.current_task_id = 0;
     slot.interrupt_depth = 0;
     slot.user_sp_scratch = 0;
+    slot.user_tp_scratch = 0;
 
     // Set tp = kernel PerCpu pointer; clear sscratch = 0. The
     // trap vector's entry `csrrw tp, sscratch, tp` expects this
@@ -230,12 +255,20 @@ pub unsafe fn init_ap(cpu_index: usize, hart_id: u64) {
     slot.hart_id = hart_id;
     slot.current_task_id = 0;
     slot.interrupt_depth = 0;
+    slot.user_sp_scratch = 0;
+    slot.user_tp_scratch = 0;
 
-    // SAFETY: writing the tp CSR from S-mode on this hart is safe.
+    // Set tp = this hart's PerCpu and sscratch = 0, as init_bsp does: the
+    // trap vector reads a non-zero sscratch as "came from U-mode" (ADR-040
+    // § 9), and SBI HSM's hart_start leaves every register but satp,
+    // sstatus.SIE, a0 and a1 undefined, so the AP must not inherit
+    // whatever the firmware left.
+    // SAFETY: writing the tp / sscratch CSRs from S-mode is always permitted.
     unsafe {
         core::arch::asm!(
-            "mv tp, {0}",
-            in(reg) percpu as u64,
+            "mv tp, {ptr}",
+            "csrw sscratch, zero",
+            ptr = in(reg) percpu as u64,
             options(nostack, nomem, preserves_flags),
         );
     }

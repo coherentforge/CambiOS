@@ -25,10 +25,19 @@
 //!
 //! On U→S entry the vector additionally:
 //!   1. Stashes the user `sp` into `PerCpu.user_sp_scratch` (offset 40).
-//!   2. Loads the kernel stack from `PerCpu.kernel_stack_top` (off 24).
-//!   3. Saves the user's original `tp` (now in `sscratch`) into the
-//!      SavedContext's gpr[4] slot.
-//!   4. Saves the user's `sp` (from the PerCpu scratch slot) into gpr[2].
+//!   2. Moves the user's `tp` out of `sscratch` and writes the sentinel 0
+//!      back, in one instruction (`csrrw sp, sscratch, zero`), then parks
+//!      it in `PerCpu.user_tp_scratch` (offset 48). Before the swap only
+//!      step 1's store runs; a trap there would re-enter with the
+//!      program's `tp` as its anchor (ADR-040 § 9).
+//!   3. Loads the kernel stack from `PerCpu.kernel_stack_top` (off 24).
+//!   4. Copies the user's `sp` and `tp` from the PerCpu scratch slots into
+//!      the SavedContext's gpr[2] and gpr[4].
+//!
+//! Both branches tell the Rust handler which one ran; the handler checks
+//! it against the frame's captured `sstatus.SPP`, which the hardware
+//! wrote at the trap, and halts with a typed report if the two disagree
+//! (`entry_branch::check`).
 //!
 //! On S→U return the vector additionally:
 //!   1. Sets `sscratch` back to the kernel PerCpu pointer so the next
@@ -38,7 +47,10 @@
 //! S→S (kernel preempted by kernel-mode timer) behaves identically to
 //! R-3's original kernel-only vector: no PerCpu reads, no sscratch
 //! writes beyond the initial swap/swap-back pair, the full frame is
-//! allocated on the *current* sp.
+//! allocated on the *current* sp. The frame's gpr[4] is saved but never
+//! restored: the S-mode exit keeps `tp` as it is, this hart's `PerCpu`,
+//! so a kernel context resumed on another hart (a migrated task) does
+//! not bring the saving hart's pointer with it (ADR-040 § 9).
 //!
 //! ## Trap frame layout
 //!
@@ -63,6 +75,7 @@
 //! populated [`super::SavedContext`] on the kernel stack.
 
 use super::SavedContext;
+use crate::arch::riscv64_entry_branch::{self as entry_branch, EntryBranch};
 
 // ============================================================================
 // Trap vector assembly — single kernel-mode entry
@@ -130,19 +143,26 @@ _riscv_trap_vector:
     sd x31, 248(sp)
     addi t0, sp, 288                // pre-trap kernel sp
     sd t0, 16(sp)                   // gpr[2] = pre-trap sp
+    li a3, 0                        // entry branch: supervisor (x13 saved above)
     j 20f
 
 10:
-    // From U-mode: post-swap tp = kernel PerCpu, sscratch = user_tp.
-    // Stash user sp, load kernel stack, allocate frame.
+    // From U-mode: post-swap tp = this hart's PerCpu, sscratch = the
+    // program's tp. Until the csrrw below, a trap would re-enter here with
+    // the program's tp as its anchor, so one store through tp is all that
+    // runs first (ADR-040 § 9).
     sd sp, 40(tp)                   // PerCpu.user_sp_scratch = user_sp
+    csrrw sp, sscratch, zero        // sp = user_tp, sscratch = 0 (sentinel)
+    // A trap from here on takes the S-mode branch. sp holds the program's
+    // tp until the load below, so both instructions address only through tp.
+    sd sp, 48(tp)                   // PerCpu.user_tp_scratch = user_tp
     ld sp, 24(tp)                   // sp = PerCpu.kernel_stack_top
     addi sp, sp, -288
     sd x1,   8(sp)
     sd x3,  24(sp)
-    // x4 (tp) is currently kernel_tp; the user's tp is in sscratch.
-    // Skip `sd x4` here — gpr[4] is written from sscratch below so
-    // the frame carries user_tp for the sret-to-U restore path.
+    // x4 (tp) is currently kernel_tp; the user's tp is in
+    // PerCpu.user_tp_scratch. Skip `sd x4` here: gpr[4] is written from
+    // that slot below so the frame carries user_tp for the sret-to-U path.
     sd x5,  40(sp)
     sd x6,  48(sp)
     sd x7,  56(sp)
@@ -172,8 +192,9 @@ _riscv_trap_vector:
     sd x31, 248(sp)
     ld t0, 40(tp)                   // t0 = user_sp (from PerCpu scratch)
     sd t0, 16(sp)                   // gpr[2] = user_sp
-    csrr t0, sscratch               // t0 = user_tp
+    ld t0, 48(tp)                   // t0 = user_tp (from PerCpu scratch)
     sd t0, 32(sp)                   // gpr[4] = user_tp
+    li a3, 1                        // entry branch: user (x13 saved above)
 
 20:
     // === Shared: save sepc + sstatus, dispatch ===
@@ -185,6 +206,7 @@ _riscv_trap_vector:
     mv   a0, sp
     csrr a1, scause
     csrr a2, stval
+    // a3 = the entry branch, set by each branch above
     call _riscv_rust_trap_handler
     mv   sp, a0                     // handler may have swapped frames
 
@@ -199,9 +221,11 @@ _riscv_trap_vector:
     beqz t1, 30f                    // SPP == 0 → return to U-mode
 
     // === Restore for sret to S-mode ===
+    // tp is not loaded from the frame: it already holds this hart's
+    // PerCpu, and the frame's copy is the hart the context was saved on
+    // (ADR-040 § 9).
     ld x1,   8(sp)
     ld x3,  24(sp)
-    ld x4,  32(sp)
     ld x5,  40(sp)
     ld x6,  48(sp)
     ld x7,  56(sp)
@@ -276,19 +300,21 @@ _riscv_trap_vector:
 // Rust trap handler
 // ============================================================================
 
-/// Scause bit 63 — set for interrupts, clear for synchronous exceptions.
+/// HARDWARE: `scause` bit 63, set for interrupts, clear for synchronous
+/// exceptions (riscv-privileged, "Supervisor Cause Register").
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 
-/// Mask for the cause code (low 63 bits of scause).
+/// HARDWARE: the cause code, the low 63 bits of `scause` (same register).
 const SCAUSE_CODE_MASK: u64 = (1 << 63) - 1;
 
-/// Interrupt cause code — supervisor timer.
+/// HARDWARE: interrupt cause code 5, supervisor timer (riscv-privileged,
+/// `scause` interrupt codes).
 const IRQ_TIMER: u64 = 5;
 
-/// Interrupt cause code — supervisor external (PLIC).
+/// HARDWARE: interrupt cause code 9, supervisor external (the PLIC).
 const IRQ_EXTERNAL: u64 = 9;
 
-/// Interrupt cause code — supervisor software (IPI).
+/// HARDWARE: interrupt cause code 1, supervisor software (the IPI).
 const IRQ_SOFTWARE: u64 = 1;
 
 // ============================================================================
@@ -334,6 +360,17 @@ pub enum TrapError {
     /// IRQ_EXTERNAL / IRQ_SOFTWARE arms above didn't claim it). Code is
     /// the low 63 bits of `scause`.
     UnexpectedInterrupt { code: u64 },
+    /// The trap vector's `sscratch` test and `sstatus.SPP` disagree about
+    /// which mode the trap came from (ADR-040 § 9), so the frame was
+    /// built from the wrong per-CPU anchor and nothing in it is trusted.
+    /// `branch` is what the vector reported (`None`: a value it never
+    /// passes), `origin` what SPP says.
+    EntryBranchMismatch {
+        branch: Option<EntryBranch>,
+        origin: EntryBranch,
+        sstatus: u64,
+        sepc: u64,
+    },
 }
 
 /// Map a U-mode `scause` code onto the portable fault vocabulary
@@ -481,6 +518,15 @@ fn report_and_halt(err: TrapError) -> ! {
         TrapError::UnexpectedInterrupt { code } => {
             crate::println!("  cause: unexpected S-mode interrupt code {}", code);
         }
+        TrapError::EntryBranchMismatch { branch, origin, sstatus, sepc } => {
+            crate::println!(
+                "  cause: trap vector took the {:?} branch for a trap from {:?} \
+                 (sscratch invariant broken, ADR-040 § 9)",
+                branch, origin
+            );
+            crate::println!("  sstatus: {:#x}", sstatus);
+            crate::println!("  sepc:  {:#x}", sepc);
+        }
     }
     crate::halt();
 }
@@ -504,7 +550,8 @@ fn report_and_halt(err: TrapError) -> ! {
 /// # Safety
 /// - Only the trap vector may call this. The assembly guarantees
 ///   `saved` points to a live SavedContext, `scause` and `stval` are
-///   the CSR values read at trap entry.
+///   the CSR values read at trap entry, and `entry_branch` is 0 from its
+///   S-mode branch or 1 from its U-mode branch.
 /// - Interrupts are masked on S-mode trap entry (sstatus.SIE is
 ///   cleared by hardware on entry; restored from SPIE on sret).
 #[no_mangle]
@@ -512,7 +559,22 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
     saved: *mut SavedContext,
     scause: u64,
     stval: u64,
+    entry_branch: u64,
 ) -> u64 {
+    // SAFETY: `saved` was populated by the trap vector before this
+    // function was called; the pointer is valid for the duration of the
+    // handler and the memory is not aliased.
+    let sepc = unsafe { (*saved).sepc };
+    // SAFETY: same object as the read above; sstatus is a plain u64 in
+    // the saved frame.
+    let sstatus = unsafe { (*saved).sstatus };
+    // Before any dispatch: an interrupt is exactly the trap that arrived
+    // through the wrong branch when the invariant broke. The check reads
+    // the frame's captured sstatus, not the live CSR.
+    if let Err(entry_branch::Mismatch { branch, origin }) = entry_branch::check(entry_branch, sstatus) {
+        report_and_halt(TrapError::EntryBranchMismatch { branch, origin, sstatus, sepc });
+    }
+
     let is_interrupt = scause & SCAUSE_INTERRUPT != 0;
     let code = scause & SCAUSE_CODE_MASK;
 
@@ -562,16 +624,7 @@ pub unsafe extern "C" fn _riscv_rust_trap_handler(
         // recoverable: ECALL-from-U (the syscall path) and any other
         // fault taken in U-mode (the process is reaped, ADR-019). A
         // fault taken in S-mode is a kernel bug and halts.
-        //
-        // SAFETY: `saved` was populated by the trap vector before this
-        // function was called; the pointer is valid for the duration
-        // of the handler and the memory is not aliased.
-        let sepc = unsafe { (*saved).sepc };
-        // SAFETY: same object as the read above; sstatus is a plain u64
-        // in the saved frame.
-        let sstatus = unsafe { (*saved).sstatus };
-        // sstatus.SPP (bit 8): privilege before the trap. 0 = U-mode.
-        let from_user = sstatus & (1 << 8) == 0;
+        let from_user = EntryBranch::from_sstatus(sstatus) == EntryBranch::User;
         // ECALL from U-mode is the only recoverable arm — handle it
         // before classify_sync_fault, which would otherwise have to
         // model the syscall path.

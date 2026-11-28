@@ -59,7 +59,7 @@ src/arch/riscv64/paging.rs:51:PTE_D
 src/arch/riscv64/paging.rs:57:ADDR_MASK
 src/arch/riscv64/paging.rs:60:SATP_PPN_MASK
 src/arch/riscv64/paging.rs:203:HHDM_GIGAPAGE_COVERAGE
-src/arch/riscv64/percpu.rs:34:MAX_CPUS
+src/arch/riscv64/percpu.rs:41:MAX_CPUS
 src/arch/riscv64/plic.rs:65:REG_ENABLE_BASE
 src/arch/riscv64/plic.rs:67:REG_ENABLE_STRIDE
 src/arch/riscv64/plic.rs:70:REG_CONTEXT_BASE
@@ -74,11 +74,6 @@ src/arch/riscv64/sbi.rs:200:SBI_IPI_SEND_IPI
 src/arch/riscv64/sbi.rs:234:IPI_EXTENSION_ID
 src/arch/riscv64/tlb.rs:85:PAGE_SIZE
 src/arch/riscv64/tlb.rs:130:PAGES_SENTINEL_ALL
-src/arch/riscv64/trap.rs:280:SCAUSE_INTERRUPT
-src/arch/riscv64/trap.rs:283:SCAUSE_CODE_MASK
-src/arch/riscv64/trap.rs:286:IRQ_TIMER
-src/arch/riscv64/trap.rs:289:IRQ_EXTERNAL
-src/arch/riscv64/trap.rs:292:IRQ_SOFTWARE
 src/arch/x86_64/apic.rs:25:IA32_APIC_BASE_MSR
 src/arch/x86_64/apic.rs:28:APIC_BASE_ENABLE
 src/arch/x86_64/apic.rs:56:LVT_TIMER_PERIODIC
