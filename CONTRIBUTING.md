@@ -84,6 +84,10 @@ CLAUDE.md is the full statement. The ones a lint enforces on every crate:
 
 Kernel code has more (typed errors and no panics, tagged numeric bounds, the lock hierarchy, no architecture-specific code in portable modules). Read CLAUDE.md before touching `src/`.
 
+## Security problems
+
+[SECURITY.md](SECURITY.md) says how to report one, privately or in the open, and what happens next. The known-finding backlog is public: issues labelled `review-finding`, and the maintainers' review documents under `docs/dev-notes/`.
+
 ## Architectural decisions
 
 A new architectural decision gets a new ADR: `make new-adr TITLE="..."`. Do not bury a decision in a code comment. Changing the body of an existing ADR needs the maintainer's agreement to the diff first; the superseded wording moves to a Divergence appendix in the same file.

@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors
+name: Bug
+description: Something builds, boots or behaves differently from what the code or a design record says it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the kernel lets a process do something it should refuse, use the **Security finding** template instead.
+        Search the open issues first; a comment on an existing issue beats a duplicate.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The `main` commit you built (`git rev-parse --short HEAD`).
+      placeholder: 0e8d86d
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      multiple: true
+      options:
+        - x86_64
+        - aarch64
+        - riscv64
+        - host (tests, tools, lints)
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: Operating system and the output of `make check-env` if the build or a tool is involved.
+      placeholder: macOS 15 on Apple Silicon; Ubuntu 24.04 x86_64
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen
+      description: Name the design record if one says so (an ADR, CLAUDE.md, STATUS.md, a rules file).
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happens
+      description: Serial log, panic text, `make` output. Paste text, not a screenshot, where you can.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The commands, from a clean checkout. `make run-quiet` and its exit code are the common shape.
+      placeholder: |
+        make check-all
+        make run-quiet   # exit 2, hangs after "[FS] seeded demo objects"
+    validations:
+      required: true

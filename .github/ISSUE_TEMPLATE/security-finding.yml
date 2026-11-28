@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors
+name: Security finding
+description: The kernel or a service lets a process do something the design says it must refuse.
+labels: ["review-finding"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        CambiOS is pre-release and its finding backlog is public, so a public issue is the normal path.
+        If you would rather the maintainers see it first, [open a private report](https://github.com/coherentforge/CambiOS/security/advisories/new) instead. SECURITY.md explains both.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      placeholder: 0e8d86d
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      multiple: true
+      options:
+        - x86_64
+        - aarch64
+        - riscv64
+        - all three
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What goes wrong, in plain terms
+      description: One or two sentences a reader outside the subsystem can follow. The maintainers' own findings read like "a process can make the kernel write into its own read-only pages".
+    validations:
+      required: true
+  - type: dropdown
+    id: confidence
+    attributes:
+      label: Confidence
+      options:
+        - Demonstrated under QEMU (probe attached or described)
+        - Confirmed by tracing the code
+        - Plausible; here is what would settle it
+    validations:
+      required: true
+  - type: textarea
+    id: path
+    attributes:
+      label: Path
+      description: File and line of the check that is missing or wrong, and the steps from a ring-3 action to the effect.
+    validations:
+      required: true
+  - type: textarea
+    id: probe
+    attributes:
+      label: Reproduction
+      description: Probe source or the QEMU command and serial output. A ring-3 reproduction becomes a stage in `user/regression-probe` once fixed.
+      render: text
+  - type: textarea
+    id: fix
+    attributes:
+      label: Fix shape, if you have one
+      description: Prose is fine. A kernel change starts with agreement on the shape (CONTRIBUTING.md, CLAUDE.md § Stop-and-Ask Gate).

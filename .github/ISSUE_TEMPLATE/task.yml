@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors
+name: Task or proposal
+description: Work to be done, or a change to propose, that is not a bug.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A new architectural decision is an ADR (`make new-adr TITLE="..."`), proposed in a pull request; use this template to open the conversation first if you want one.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Kernel work (`src/`) is reviewed by the maintainer and starts with agreement on the shape. User crates, tools and docs merge on green checks.
+      options:
+        - kernel (src/)
+        - userspace (user/)
+        - verification (verification/, fuzz/)
+        - docs and tools (docs/, tools/, hooks, lints)
+        - build and CI
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What and why
+      description: What would be true afterwards that is not true now, and which design record (ADR, STATUS.md row, Known issue) it serves.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Proposed shape
+      description: Files, crates, syscalls or documents touched; what is deliberately left out.
+  - type: checkboxes
+    id: taking
+    attributes:
+      label: Taking it
+      options:
+        - label: I intend to do this work myself.

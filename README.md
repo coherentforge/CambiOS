@@ -36,18 +36,20 @@ CambiOS boots to preemptive SMP multitasking on all three target architectures u
 
 ## Building
 
-Host: macOS (Apple Silicon). Kernel binaries run only under QEMU or on bare-metal target hardware — never on the host.
+Hosts: macOS on Apple Silicon, or x86_64 Linux (what CI runs on). Kernel binaries run only under QEMU or on bare-metal target hardware — never on the host.
 
 Prerequisites:
-- Rust nightly (pinned in `rust-toolchain.toml`)
-- Targets: `x86_64-unknown-none`, `aarch64-unknown-none`, `riscv64gc-unknown-none-elf`
-- QEMU (Homebrew)
+- Rust nightly (pinned in `rust-toolchain.toml`; the targets and clippy install themselves on first use)
+- QEMU
 - `mtools` (AArch64 FAT disk images)
-- Limine is auto-cloned; OpenSBI ships with QEMU as `-bios default` for RISC-V
+- Limine is auto-cloned at a pinned commit; OpenSBI ships with QEMU as `-bios default` for RISC-V
+
+`make check-env` reports what this machine has and lacks, and how to get it.
 
 ```bash
-# Unit tests (host macOS)
-RUST_MIN_STACK=8388608 cargo test --lib --target x86_64-apple-darwin
+# Unit tests (host)
+make test                   # kernel library
+make test-user              # user, protocol and tool crates
 
 # Tri-architecture regression gate — REQUIRED before any commit
 make check-all              # x86_64 + aarch64 + riscv64
@@ -87,7 +89,7 @@ ELF binary arrives
     → ObjectStore: ownership enforced on get / put / delete
 ```
 
-The three interceptor hooks collapse into one trait that an out-of-kernel policy service can drive — see [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md).
+The three interceptor hooks collapse into one interceptor (an enum, not a trait object: the kernel has no dynamic dispatch on its hot paths) that an out-of-kernel policy service drives — see [ADR-002](docs/adr/002-three-layer-enforcement-pipeline.md) and its § Divergence.
 
 ### Identity
 
@@ -122,9 +124,9 @@ All three architectures share the same high-level sequence:
 4. IPC manager, capability manager, zero-trust interceptor.
 5. Bootstrap Principal built from the compiled-in YubiKey public key.
 6. Kernel object tables sized from detected memory and the active tier policy ([ADR-008](docs/adr/008-boot-time-sized-object-tables.md)).
-7. Signed ELF boot modules verified and loaded, one per entry in `BOOT_MODULE_ORDER`.
+7. The signed boot manifest is verified and transcribed; `init` (PID 1) is created from it.
 8. AP cores come online with per-CPU scheduler state.
-9. Preemptive SMP scheduling begins.
+9. Preemptive SMP scheduling begins; `init` verifies, loads and supervises every service the manifest names ([ADR-018](docs/adr/018-init-process-and-boot-manifest.md)).
 
 Where the architectures differ:
 
@@ -161,7 +163,7 @@ user/                        # User-space services — each one is an isolated b
 ├── fs-service/              # Content-addressed object store front-end
 ├── key-store-service/       # Ed25519 signing service (bootstrap-key holder)
 ├── policy-service/          # Out-of-kernel policy decisions via interceptor hook
-├── virtio-{net,blk}/ i219-net/ udp-stack/ dhcp-client/   # Network + storage drivers / stack
+├── virtio-{net,blk}/ nvme/ i219-net/ udp-stack/   # Network + storage drivers / stack
 ├── compositor/ scanout-{limine,virtio-gpu}/              # Graphics stack (ADR-011/014)
 └── shell/                   # Interactive serial shell
 
@@ -170,7 +172,7 @@ fuzz/                        # cargo-fuzz targets with shadow-model oracles
 docs/                        # Design docs, ADRs, manuals
 ```
 
-The authoritative list of *what actually builds into the boot image* is the `BOOT_MODULE_ORDER` constant in `src/boot_modules.rs` and the Makefile's per-target module rules. If the tree above and the Makefile disagree, the Makefile wins.
+The authoritative list of *what actually boots* is `manifest.toml` (one row per service, with its architectures, grants and dependencies) and the Makefile's build lists; `make check-lists` fails when any copy of a list disagrees with the Makefile. If the tree above and the Makefile disagree, the Makefile wins.
 
 ---
 
@@ -195,7 +197,7 @@ Points `core.hooksPath` at the tracked `.githooks/` directory so the pre-commit 
 **Working rules:**
 
 - **Tri-architecture regression gate is mandatory.** `make check-all` must pass before any commit — no commit may regress x86_64, aarch64, or riscv64. See [ADR-013](docs/adr/013-riscv64-architecture-support.md) § Tri-Architecture Regression Discipline.
-- **Commits are PGP-signed.** The repo enforces signing at the Git level; unsigned commits will not land.
+- **Every commit is signed off** (`git commit -s`, the Developer Certificate of Origin); the commit-msg hook rejects one without it. Cryptographic signing (GPG or SSH) is asked for, not yet enforced on pull requests. The process contract is [CONTRIBUTING.md](CONTRIBUTING.md); the way to report a security problem is [SECURITY.md](SECURITY.md).
 - **Every `unsafe` block needs a `// SAFETY:` comment** explaining the invariants that make the operation sound.
 - **No panics, unwraps, or expects in kernel code.** Every failure is a typed `Result`.
 - **No dynamic dispatch in kernel hot paths.** Monomorphized generics only — verifiers cannot reason about trait objects.

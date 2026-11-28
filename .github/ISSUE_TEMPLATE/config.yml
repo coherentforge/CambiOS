@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca and CambiOS contributors
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security problem privately
+    url: https://github.com/coherentforge/CambiOS/security/advisories/new
+    about: Only the maintainers can read a private vulnerability report. SECURITY.md says when to use it.
+  - name: Ask a question or float a design idea
+    url: https://github.com/coherentforge/CambiOS/discussions
+    about: Architecture questions, proposals that are not yet an ADR, and anything that is not a bug or a task.
