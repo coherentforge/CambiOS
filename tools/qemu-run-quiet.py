@@ -11,7 +11,7 @@ reflecting what actually happened.
 Exit codes:
   0 — success sentinel seen (default: ``CambiOS Shell v0.1`` — banner)
       AND every ``--require REGEX`` matched some line
-  1 — kernel panic, CPU exception, or Limine bailout
+  1 — kernel panic, CPU exception, kernel fault banner, or Limine bailout
   2 — no sentinel, or a required line still missing, within --timeout
       (or QEMU exited before then)
 
@@ -38,6 +38,12 @@ from collections import deque
 FAILURE_PATTERNS = [
     re.compile(r"MICROKERNEL PANIC:"),
     re.compile(r"EXCEPTION:"),
+    # A line framed in `!!` is a kernel fault banner on every architecture
+    # (aarch64 `!!! KERNEL FAULT !!!`, riscv64 `!! RISC-V S-MODE TRAP —
+    # KERNEL FAULT !!`, the no-current-process and zero-RSP reports). Without
+    # it a halted aarch64 or riscv64 kernel ran out the timeout as a hang.
+    # tools/test_qemu_run_quiet.py checks every such banner in src/.
+    re.compile(r"^\s*!!+ .*!!+\s*$"),
     re.compile(r"Limine base revision not supported"),
 ]
 
@@ -56,6 +62,10 @@ NOISE_PATTERNS = [
 CONTEXT_BEFORE = 5
 RING_SIZE = 50
 MAX_POST_FAILURE_LINES = 100
+# Seconds of output kept after the first failure line. The report that
+# follows a fault banner arrives at once and a halted kernel prints nothing
+# more, so waiting for MAX_POST_FAILURE_LINES ran out --timeout instead.
+POST_FAILURE_GRACE_S = 5
 
 
 def classify(line: str, success_re: re.Pattern) -> str:
@@ -127,10 +137,13 @@ def main() -> int:
 
     # Daemon watchdog kills QEMU if the main loop hasn't already. Killing
     # closes the stdout pipe, which ends the `for raw in proc.stdout` loop.
-    def watchdog() -> None:
-        time.sleep(args.timeout)
+    def kill_if_running() -> None:
         if proc.poll() is None:
             proc.kill()
+
+    def watchdog() -> None:
+        time.sleep(args.timeout)
+        kill_if_running()
 
     threading.Thread(target=watchdog, daemon=True).start()
 
@@ -178,6 +191,9 @@ def main() -> int:
 
             if kind == "failure" and not saw_failure:
                 saw_failure = True
+                grace = threading.Timer(POST_FAILURE_GRACE_S, kill_if_running)
+                grace.daemon = True
+                grace.start()
                 for c in list(ring)[-CONTEXT_BEFORE - 1:-1]:
                     print(c)
                 print(line)
