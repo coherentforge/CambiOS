@@ -63,6 +63,8 @@ docs/adr/034-deferred-task-resource-reclamation.md:11:deferred
 docs/adr/034-deferred-task-resource-reclamation.md:16:deferred
 docs/adr/034-deferred-task-resource-reclamation.md:154:deferred
 docs/adr/035-translation-layer-compatibility.md:54:deferred
+docs/dev-notes/review-blk-reply-seam-2026-11-18.md:210:deferred
+docs/dev-notes/review-blk-reply-seam-2026-11-18.md:249:deferred
 docs/identity-synthesis.md:124:deferred
 docs/identity.md:121:eventually
 docs/manuals/03-signature-chain.md:67:placeholder
@@ -79,7 +81,7 @@ src/arch/riscv64/mod.rs:119:placeholder
 src/arch/riscv64/mod.rs:121:placeholder
 src/arch/riscv64/mod.rs:123:placeholder
 src/arch/riscv64/mod.rs:125:placeholder
-src/arch/riscv64/mod.rs:647:for-now
+src/arch/riscv64/mod.rs:652:for-now
 src/audit/drain.rs:359:for-now
 src/boot/limine.rs:15:deferred
 src/boot/limine.rs:16:for-now
