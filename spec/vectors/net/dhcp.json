@@ -1,0 +1,89 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-120",
+      "input": {
+        "interface": 1,
+        "transaction": "A1B2C3D4",
+        "reply_interface": 2,
+        "reply_transaction": "A1B2C3D4",
+        "reply_type": "DHCPACK"
+      },
+      "expect": {
+        "lease_changed": false,
+        "reason": "wrong_interface"
+      },
+      "covers": [
+        "AT-net-014",
+        "INV-net-016"
+      ],
+      "source": "RFC 2131 §4.3"
+    },
+    {
+      "id": "NET-V-121",
+      "input": {
+        "interface": 1,
+        "transaction": "A1B2C3D4",
+        "reply_interface": 1,
+        "reply_transaction": "A1B2C3D4",
+        "reply_type": "DHCPACK",
+        "address": "192.0.2.10",
+        "operator_pinned_address": "192.0.2.20"
+      },
+      "expect": {
+        "lease_changed": false,
+        "active_address": "192.0.2.20",
+        "reason": "operator_pin"
+      },
+      "covers": [
+        "AT-net-014",
+        "INV-net-016"
+      ],
+      "source": "CambiOS operator-pinned address rule"
+    },
+    {
+      "id": "NET-V-122",
+      "input": {
+        "interface": 1,
+        "family": "ipv6",
+        "transaction": "010203",
+        "reply_interface": 1,
+        "reply_transaction": "010203",
+        "reply_type": "REPLY",
+        "address": "2001:db8::10"
+      },
+      "expect": {
+        "lease_changed": true,
+        "family": "ipv6"
+      },
+      "covers": [
+        "AT-net-014",
+        "INV-net-016"
+      ],
+      "source": "RFC 8415"
+    },
+    {
+      "id": "NET-V-123",
+      "input": {
+        "interface": 1,
+        "family": "ipv4",
+        "transaction": "A1B2C3D4",
+        "reply_interface": 1,
+        "reply_transaction": "01020304",
+        "reply_type": "DHCPACK",
+        "address": "192.0.2.10"
+      },
+      "expect": {
+        "lease_changed": false,
+        "reason": "wrong_transaction"
+      },
+      "covers": [
+        "AT-net-014",
+        "INV-net-016"
+      ],
+      "source": "RFC 2131 §4.3; active transaction match"
+    }
+  ]
+}

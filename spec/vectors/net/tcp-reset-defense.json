@@ -1,0 +1,64 @@
+{
+  "license": "AGPL-3.0-or-later",
+  "copyright": "Copyright (C) 2026 CambiOS contributors",
+  "cases": [
+    {
+      "id": "NET-V-060",
+      "input": {
+        "state": "Established",
+        "rcv_nxt": 1000,
+        "rcv_wnd": 4096,
+        "segment": {
+          "flags": [
+            "RST"
+          ],
+          "seq": 1200
+        }
+      },
+      "expect": {
+        "state": "Established",
+        "response": {
+          "flags": [
+            "ACK"
+          ],
+          "seq": 0,
+          "ack": 1000
+        }
+      },
+      "covers": [
+        "AT-net-008",
+        "INV-net-009"
+      ],
+      "source": "RFC 5961 §3.2"
+    },
+    {
+      "id": "NET-V-061",
+      "input": {
+        "state": "Established",
+        "rcv_nxt": 1000,
+        "rcv_wnd": 4096,
+        "segment": {
+          "flags": [
+            "SYN"
+          ],
+          "seq": 1200
+        }
+      },
+      "expect": {
+        "state": "Established",
+        "response": {
+          "flags": [
+            "ACK"
+          ],
+          "seq": 0,
+          "ack": 1000
+        }
+      },
+      "covers": [
+        "AT-net-008",
+        "INV-net-009"
+      ],
+      "source": "RFC 5961 §4.2"
+    }
+  ]
+}

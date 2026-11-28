@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cambios-net-conformance-v1",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 CambiOS contributors",
+  "type": "object",
+  "required": [
+    "license",
+    "copyright",
+    "cases"
+  ],
+  "properties": {
+    "license": {
+      "const": "AGPL-3.0-or-later"
+    },
+    "copyright": {
+      "const": "Copyright (C) 2026 CambiOS contributors"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "input",
+          "expect",
+          "covers",
+          "source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^NET-V-[0-9]{3}$"
+          },
+          "input": {
+            "type": "object"
+          },
+          "expect": {
+            "type": "object"
+          },
+          "covers": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^(INV|AT)-net-[0-9]{3}$"
+            }
+          },
+          "source": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
