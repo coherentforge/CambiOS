@@ -123,6 +123,8 @@ This is structurally identical to x86_64's `swapgs` mechanism: a CSR holds the k
 
 `PerCpu` shape matches the existing AArch64 layout — `self_ptr`, `cpu_id`, `hardware_id` (here `hart_id`), `kernel_stack_top`, `current_task_id`, `interrupt_depth`. Every arch's `PerCpu` should keep this shape so portable code reads it uniformly.
 
+The invariant the swap depends on, and the check that enforces it, are [ADR-040](040-trap-entry-discipline.md) § 9.
+
 ## Strategic Posture: Generic-First, Never Board-Specific
 
 The plan file commits to "generic first, board-specific never" for RISC-V. This ADR makes the same commitment formal: CambiOS RISC-V code targets *RISC-V standards*, not any specific board's quirks.

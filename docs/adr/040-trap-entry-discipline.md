@@ -14,7 +14,8 @@ This ADR decides how the kernel takes control when the CPU enters it from a less
 |---|---|
 | How the kernel finds its per-CPU data on entry from a less-privileged mode, every architecture (the principle) | **This ADR § 1** |
 | x86_64: `swapgs`, the one trap entry, exception coverage, syscall entry flags, emergency (IST) stacks, CR0 / CR4 ownership | **This ADR § 2-7** |
-| riscv64 and aarch64 trap-entry mechanisms | The § 1 principle binds them; each architecture's mechanism is recorded here, as its own section, when its entry is brought under the rule |
+| riscv64: the `sscratch` invariant and the entry-branch check | **This ADR § 9** |
+| aarch64 trap-entry mechanism | The § 1 principle binds it; its mechanism is recorded here, as its own section, when its entry is brought under the rule |
 | What the scheduler does with a saved context | [ADR-001](001-smp-scheduling-and-lock-hierarchy.md), [SCHEDULER.md](../../src/scheduler/SCHEDULER.md), unchanged |
 | What happens to a task that faults | [ADR-019](019-process-fault-reaping-and-peer-generation.md), [ADR-034](034-deferred-task-resource-reclamation.md), unchanged |
 | Copying to and from user memory | [ADR-020](020-typed-user-buffer-slices-at-syscall-boundary.md), unchanged |
@@ -32,6 +33,7 @@ Before this ADR, the x86_64 kernel reached its per-CPU data (`PerCpu`, which hol
 3. **The syscall entry masked only the interrupt flag.** The trap flag, direction flag, alignment-check flag and nested-task flag reached ring 0 with the program's values.
 4. **Only the boot CPU had an emergency stack.** Every other CPU's TSS held 0 there, so a double fault on it pushed to address 0, faulted again, and reset the machine with no message.
 5. **The kernel ran on inherited control-register state.** SMEP and SMAP (Supervisor Mode Execution / Access Prevention) were off; FSGSBASE, OSXMMEXCPT, MCE and CR0.WP were unknown.
+6. **riscv64: the kernel ran with `sscratch` holding the program's `tp`.** The user-entry path read the program's `tp` out of `sscratch` and left it there, so a trap the kernel then took in S-mode with interrupts on (a timer tick during a fault reap, or after a switch into a context saved in S-mode) took the user-entry branch, stored through `tp + 40` and loaded its stack pointer from `tp + 24`, with `tp` the program's value. An unmapped value halted the kernel; a kernel address the program could influence was a stack pivot. Separately, every return to S-mode (the vector's exit and `yield_save_and_switch`) loaded `tp` from the frame, so a kernel context saved on one hart and resumed on another brought the saving hart's `PerCpu` with it.
 
 ## Decision
 
@@ -41,7 +43,7 @@ Before this ADR, the x86_64 kernel reached its per-CPU data (`PerCpu`, which hol
 
 - **x86_64:** `IA32_KERNEL_GS_BASE`, reached by `swapgs` (§ 2).
 - **aarch64:** `TPIDR_EL1`, which EL0 cannot write ([src/arch/aarch64/percpu.rs](../../src/arch/aarch64/percpu.rs)).
-- **riscv64:** `sscratch` must hold the kernel's value whenever U-mode runs; its mechanism is recorded here when the riscv64 trap entry is brought under this rule.
+- **riscv64:** `sscratch`, which U-mode cannot read or write (§ 9).
 
 ### 2. x86_64: the GS invariant
 
@@ -143,6 +145,20 @@ Each CPU gets three IST stacks, for NMI, #MC and #DF, allocated during that CPU'
 
 The VMA tracker (each process's record of its mapped regions) refuses a region that covers page 0 or the last user page, whether the caller chose the address (the loader) or the tracker did (the allocator syscalls use). With page 0 refused, a future mistake in the per-CPU anchor is a fault rather than ring-0 control, even on a CPU without SMAP; with the last page refused, the § 5 non-canonical return cannot arise.
 
+### 9. riscv64: the `sscratch` invariant
+
+**While U-mode runs, `sscratch` holds this hart's `PerCpu` and `tp` holds the program's value. While the kernel runs, `tp` holds `PerCpu` and `sscratch` is 0.** The trap vector's first instruction, `csrrw tp, sscratch, tp`, exchanges the two, and a non-zero `tp` after it means the trap came from U-mode. The vector decides from this sentinel because at its first instruction no register is free to read `sstatus.SPP` with (x86_64 decides from the saved CS, which the CPU pushes); Linux's riscv entry uses the same sentinel.
+
+| Transition | Where | Rule |
+|---|---|---|
+| trap from U-mode | `_riscv_trap_vector`, user branch | one store after entry (the program's `sp` into `PerCpu.user_sp_scratch`, addressed through `tp` = `PerCpu`), `csrrw sp, sscratch, zero` reads the program's `tp` and writes the sentinel back in one instruction; the `tp` is parked in `PerCpu.user_tp_scratch` until the frame exists. No stack is touched before the swap |
+| trap from S-mode | the vector's S-mode branch | the swap finds 0 and a second swap restores it; `sscratch` stays 0 |
+| `sret` to U-mode | the vector's exit when the frame's SPP is 0; `yield_save_and_switch` for a target whose SPP is 0 | `csrw sscratch, tp` (this hart's `PerCpu`) just before the program's registers are restored. Every saved frame's `sstatus` has SIE = 0, so no interrupt lands between it and `sret` |
+| `sret` to S-mode | the vector's exit when SPP is 1; `yield_save_and_switch` for a target whose SPP is 1 | `sscratch` is already 0; the yield path writes 0 again. `tp` is not loaded from the frame: it holds this hart's `PerCpu`, and the frame's copy is the hart the context was saved on |
+| hart start | `percpu::init_bsp`, `percpu::init_ap` | `csrw sscratch, zero` before the trap vector is installed: the privileged spec leaves its value at hart start unspecified |
+
+**The entry-branch check.** The vector passes the branch it took to the Rust handler, which compares it with `sstatus.SPP` before any dispatch and halts with `TrapError::EntryBranchMismatch` if they disagree. Under the rule above the kernel runs with `sscratch` non-zero only in the entry stub before its `csrrw` and in the exit path after `csrw sscratch, tp`, and there the value is this hart's own `PerCpu`, so a trap in either window is a kernel bug. The check turns it into a typed report instead of a dispatch on a frame built from the wrong anchor. It is pure logic over two integers in `src/arch/riscv64/entry_branch.rs`, which `src/arch/mod.rs` declares for the host test build on every architecture, so `make test` exercises it; no riscv64 host exists. A non-host backend's other decisions get host tests the same way.
+
 ## Architecture
 
 | Piece | Lives in |
@@ -153,10 +169,11 @@ The VMA tracker (each process's record of its mapped regions) refuses a region t
 | CR0 / CR4 ownership, SMAP flag | `src/arch/x86_64/`, called from boot-CPU and secondary-CPU init |
 | IST stacks | `src/arch/x86_64/gdt.rs` (TSS), allocated from per-CPU init |
 | Floor and ceiling | `src/process.rs` (`VmaTracker`) |
+| riscv64 trap vector, `sscratch` at hart start; the entry-branch check | `src/arch/riscv64/trap.rs`, `yield_save_and_switch` in `src/arch/riscv64/mod.rs`, `src/arch/riscv64/percpu.rs`; `src/arch/riscv64/entry_branch.rs` (pure, host-tested) |
 
 ## Threat Model Impact
 
-[threat-model.md](../threat-model.md) T-4 (`unsafe` in syscall entry and exit and context switch) names the agreement between separate save paths as the invariant held by discipline alone. This ADR reduces the x86_64 save paths from three (timer stub, reschedule stub, `yield_save_and_switch`) plus about thirty compiler-generated frames to two (the common entry and `yield_save_and_switch`), both producing the same `SavedContext`, plus `syscall_entry`'s own frame. It adds one invariant to T-4's surface, the § 2 GS state, and makes it explicit. T-4 is updated when the common entry lands.
+[threat-model.md](../threat-model.md) T-4 (`unsafe` in syscall entry and exit and context switch) names the agreement between separate save paths as the invariant held by discipline alone. This ADR reduces the x86_64 save paths from three (timer stub, reschedule stub, `yield_save_and_switch`) plus about thirty compiler-generated frames to two (the common entry and `yield_save_and_switch`), both producing the same `SavedContext`, plus `syscall_entry`'s own frame. It adds one invariant to T-4's surface, the § 2 GS state, and makes it explicit. T-4 is updated when the common entry lands. On riscv64 it makes the § 9 `sscratch` state explicit in T-4's surface; T-4 is updated in the change that fixes the user-entry path.
 
 ## Verification Target
 
@@ -164,6 +181,7 @@ The VMA tracker (each process's record of its mapped regions) refuses a region t
 - **Frame agreement.** `SavedContext` layout, the stub's push order and `yield_save_and_switch`'s synthetic frame agree, by compile-time assertion and host layout tests.
 - **Exception totality.** `x86_trap`'s dispatch is an exhaustive match over the vector number; no vector reaches the double fault for lack of a handler.
 - **The IST rule.** No IST-entered arm reaches the scheduler: checkable as a call-graph property of the NMI, #MC and #DF arms.
+- **The `sscratch` state machine (riscv64).** Per hart, two states (kernel running: `sscratch` = 0; U-mode running: `sscratch` = `PerCpu`), with transitions only at the § 9 sites. Target: no path from the vector's entry reaches the Rust handler with `sscratch` non-zero, and every path to an `sret` into U-mode writes `PerCpu` to it with interrupts off and nothing after it but loads from the frame and the `sret`; every path to an `sret` into S-mode leaves `tp` as this hart's `PerCpu`.
 
 ## Alternatives Considered
 
@@ -208,7 +226,8 @@ Each step is its own commit, and each step's regression-probe stage fails on the
 3. Syscall entry flags, no ring-0 return path, the return-address backstop (§ 5). Probe stage: trap flag set across `syscall`.
 4. `swapgs`, the paranoid entries and the fences (§ 2). Probe stages: GS reloaded from ring 3, then a syscall; then a timer interrupt.
 5. CR0 and CR4 ownership, the SMAP flag on, the QEMU `-cpu` flags (§ 6). Probe stages: an x87 instruction, `rdtsc`, and (on a CPU that reports UMIP) `sidt` in ring 3 each reap the program.
-6. The user address floor and ceiling (§ 8).
+6. riscv64: the `sscratch` invariant and the entry-branch check (§ 9). Probe stage: `trap-tp-reap`, a program that sets `tp` and faults with 16 MiB mapped, so that its reap, with interrupts on, spans timer ticks.
+7. The user address floor and ceiling (§ 8).
 
 ## Divergence
 
@@ -216,3 +235,4 @@ The body above reflects the implemented design. The original wordings, with the 
 
 - **Step 2's non-canonical stack push is a gate on Intel hardware only** (2026-11-25, eb0bf98). Under QEMU the push raised #GP, not #SS, and the earlier kernel had a #GP handler, so the stage passed on it too; `ud2` and `int1` are the stages that tell the two kernels apart there. The stage stays, as `trap-badstack`. *Prior wording (§ Sequencing, step 2): "Probe stages: `ud2`, a push through a non-canonical stack pointer, `int1`."*
 - **The x87, MMX and SSE registers stay unavailable to ring 3 until their state is saved; TSD and AM decided** (2026-11-27, measured on 1185ae0). Step 5 read CR0 = PE ET WP PG and CR4 = PAE on both CPUs under QEMU: x87 and MMX already ran in ring 3 with no state saved across a switch, and setting OSFXSR alone would have added SSE to that channel. A scan of the built kernel and every x86_64 user program found no x87, MMX or SSE instruction and no `rdtsc` or `sidt` in user code, so EM = 1, TSD = 1 and UMIP cost nothing in the tree. QEMU's TCG emulates UMIP, so it joined the `-cpu` flags. *Prior wording (§ 6 table): "| CR4.OSFXSR, CR4.OSXMMEXCPT | 1 | without OSXMMEXCPT an unmasked SIMD exception is #UD rather than #XM |", "| CR4.TSD, CR0.AM | decided in the change that writes this table | whether ring 3 may read the time-stamp counter; whether a program can turn on alignment-check faults |", "| CR0.NE, CR0.MP = 1; CR0.EM, CR0.TS = 0 | | x87 and SSE behave as the compiler assumes |"; (§ 6 QEMU paragraph) "QEMU's default `qemu64` CPU model has neither SMEP nor SMAP, so every x86_64 QEMU target passes `-cpu qemu64,+smep,+smap`"; (§ Sequencing, step 5) "Probe stage: an unmasked SIMD exception arrives as #XM."; (Open Problems) "> **Deferred decision.** The values of CR4.TSD and CR0.AM. **Revisit when:** the change that writes § 6's table lands; it records both values here."*
+- **riscv64's mechanism recorded as § 9; § Sequencing gains it as step 6** (2026-11-28; the fix is the kernel commit that follows this one, "riscv64: the trap vector keeps sscratch at 0 while the kernel runs"). The user-entry path read the program's `tp` out of `sscratch` and left it there (sandbox review of the memory core, 2026-11-24); the fix brings riscv64's entry under § 1, as the Scope Boundary anticipated. *Prior wording (Scope Boundary): "| riscv64 and aarch64 trap-entry mechanisms | The § 1 principle binds them; each architecture's mechanism is recorded here, as its own section, when its entry is brought under the rule |"; (§ 1) "- **riscv64:** `sscratch` must hold the kernel's value whenever U-mode runs; its mechanism is recorded here when the riscv64 trap entry is brought under this rule."; (§ Sequencing) "6. The user address floor and ceiling (§ 8)."*
