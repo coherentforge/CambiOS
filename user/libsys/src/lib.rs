@@ -114,17 +114,18 @@ fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
 #[inline(always)]
 fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let ret: i64;
-    // SAFETY: Invokes the kernel SVC handler via `svc #0`.
-    // The kernel validates all arguments.
+    // SAFETY: Invokes the kernel SVC handler via `svc #0`; the kernel
+    // validates every argument.
     //
     // AArch64 convention: x8 = syscall number, x0-x5 = args, x0 = return.
-    // The SVC exception saves/restores all registers via the exception
-    // vector stub (sync_el0_stub), so only x0 is modified on return
-    // (the stub writes the return value into the saved x0 slot).
-    //
-    // Clobbers: x0 (return value). x1-x7 and x8 are restored by the kernel's
-    // exception return path, but we mark them clobbered defensively since
-    // the kernel could change its ABI without breaking us.
+    // The kernel's exception stub saves and restores x0-x30 and writes the
+    // result into the saved x0 slot. It does not save or restore the
+    // FP/SIMD registers (STATUS.md Known issues), so a syscall can return
+    // with any of v0-v31 changed. `clobber_abi("C")` declares x0-x18, x30
+    // and all of v0-v31 clobbered (the Rust reference's aarch64 "C" list),
+    // so the compiler keeps no value in any of them across the `svc`: a
+    // zero vector hoisted for struct zeroing is rebuilt after the call.
+    // The operands name the registers that carry arguments.
     unsafe {
         core::arch::asm!(
             "svc #0",
@@ -132,25 +133,7 @@ fn syscall_raw3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
             inlateout("x1") arg2 => _,
             inlateout("x2") arg3 => _,
             inlateout("x8") num => _,
-            // x3-x7 not used but may be clobbered by future kernel changes
-            lateout("x3") _,
-            lateout("x4") _,
-            lateout("x5") _,
-            lateout("x6") _,
-            lateout("x7") _,
-            // x9-x15 are caller-saved (corruptible) in AAPCS64
-            lateout("x9") _,
-            lateout("x10") _,
-            lateout("x11") _,
-            lateout("x12") _,
-            lateout("x13") _,
-            lateout("x14") _,
-            lateout("x15") _,
-            // x16-x17 are intra-procedure-call scratch
-            lateout("x16") _,
-            lateout("x17") _,
-            // x18 is platform register (caller-saved)
-            lateout("x18") _,
+            clobber_abi("C"),
             options(nostack),
         );
     }
@@ -170,20 +153,7 @@ fn syscall_raw4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
             inlateout("x2") arg3 => _,
             inlateout("x3") arg4 => _,
             inlateout("x8") num => _,
-            lateout("x4") _,
-            lateout("x5") _,
-            lateout("x6") _,
-            lateout("x7") _,
-            lateout("x9") _,
-            lateout("x10") _,
-            lateout("x11") _,
-            lateout("x12") _,
-            lateout("x13") _,
-            lateout("x14") _,
-            lateout("x15") _,
-            lateout("x16") _,
-            lateout("x17") _,
-            lateout("x18") _,
+            clobber_abi("C"),
             options(nostack),
         );
     }

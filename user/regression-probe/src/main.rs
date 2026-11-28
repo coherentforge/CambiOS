@@ -290,8 +290,9 @@ fn raw_syscall3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let ret: i64;
     // SAFETY: the same `svc #0` sequence as libsys's `syscall_raw3`
     // (aarch64): x8 = number, x0-x2 = arguments, x0 = result; the kernel
-    // validates every argument. Caller-saved registers are declared
-    // clobbered, as libsys does.
+    // validates every argument. `clobber_abi("C")` declares x0-x18, x30
+    // and all of v0-v31 clobbered, as libsys does: the kernel does not
+    // preserve the FP/SIMD registers across a syscall.
     unsafe {
         core::arch::asm!(
             "svc #0",
@@ -299,21 +300,7 @@ fn raw_syscall3(num: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
             inlateout("x1") arg2 => _,
             inlateout("x2") arg3 => _,
             inlateout("x8") num => _,
-            lateout("x3") _,
-            lateout("x4") _,
-            lateout("x5") _,
-            lateout("x6") _,
-            lateout("x7") _,
-            lateout("x9") _,
-            lateout("x10") _,
-            lateout("x11") _,
-            lateout("x12") _,
-            lateout("x13") _,
-            lateout("x14") _,
-            lateout("x15") _,
-            lateout("x16") _,
-            lateout("x17") _,
-            lateout("x18") _,
+            clobber_abi("C"),
             options(nostack),
         );
     }
