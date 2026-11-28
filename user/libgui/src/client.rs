@@ -388,6 +388,8 @@ impl Client {
     /// calling `submit_*` (the borrow checker will enforce this
     /// because `submit_*` takes `&mut self`).
     pub fn surface_mut(&mut self) -> Surface<'_> {
+        let pitch_pixels = (self.pitch / 4) as usize;
+        let base = self.surface_vaddr as *mut u32;
         // SAFETY:
         // - `surface_vaddr` is the caller's own mapping of the
         //   surface channel, returned by `channel_attach`, and is
@@ -404,8 +406,6 @@ impl Client {
         // pre-blending inside the surface — required for layered
         // windows where the eventual composition happens in the
         // compositor.
-        let pitch_pixels = (self.pitch / 4) as usize;
-        let base = self.surface_vaddr as *mut u32;
         unsafe {
             if self.alpha_blend {
                 Surface::from_raw_argb(base, pitch_pixels, self.width, self.height)

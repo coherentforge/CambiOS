@@ -933,11 +933,11 @@ fn composite_blank_and_present(backend: &mut Backend) {
         Backend::Limine(b) => b.scanout,
         Backend::Headless(_) => return,
     };
+    let total_bytes =
+        (scanout.geometry.height as usize) * (scanout.geometry.pitch as usize);
     // SAFETY: scanout.vaddr was obtained from channel_attach on the
     // scanout channel (compositor peer, RW). Valid for
     // height × pitch bytes. Bounded write.
-    let total_bytes =
-        (scanout.geometry.height as usize) * (scanout.geometry.pitch as usize);
     #[allow(unsafe_code)]
     unsafe {
         core::ptr::write_bytes(scanout.vaddr as *mut u8, 0, total_bytes);

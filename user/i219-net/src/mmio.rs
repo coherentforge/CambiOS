@@ -62,12 +62,6 @@ impl Mmio {
         let v = self.read32(offset);
         self.write32(offset, v | mask);
     }
-
-    /// Atomic read-modify-write for clearing bits in a 32-bit register.
-    pub fn clear_bits32(&self, offset: u32, mask: u32) {
-        let v = self.read32(offset);
-        self.write32(offset, v & !mask);
-    }
 }
 
 /// Spin for a short delay (used during reset / link bringup).

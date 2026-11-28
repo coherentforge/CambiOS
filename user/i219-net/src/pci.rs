@@ -46,9 +46,6 @@ pub struct PciDeviceInfo {
     pub device_id: u16,
     pub class: u8,
     pub subclass: u8,
-    pub bus: u8,
-    pub device: u8,
-    pub function: u8,
     pub bars: [BarInfo; 6],
 }
 
@@ -92,9 +89,8 @@ impl PciDeviceInfo {
             device_id,
             class: buf[4],
             subclass: buf[5],
-            bus: buf[6],
-            device: buf[7],
-            function: buf[8],
+            // buf[6..9] is the PCI bus / device / function; the driver
+            // addresses the device by BAR only.
             bars,
         })
     }

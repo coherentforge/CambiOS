@@ -46,7 +46,7 @@ mod ring;
 use cambios_libsys as sys;
 use mmio::{spin_delay, Mmio};
 use regs::*;
-use ring::{DmaBuf, Ring, BUF_SIZE, RING_SIZE};
+use ring::{Ring, BUF_SIZE, RING_SIZE};
 
 // ============================================================================
 // Panic handler
@@ -67,7 +67,8 @@ const CMD_GET_STATUS: u8 = 4;
 const STATUS_OK: u8 = 0;
 const STATUS_ERROR: u8 = 1;
 const STATUS_NO_DATA: u8 = 2;
-const STATUS_NO_DEVICE: u8 = 3;
+// 3 is virtio-net's NO_DEVICE reply. This driver never sends it: without a
+// device it leaves endpoint 20 unregistered for virtio-net (`no_device_loop`).
 
 // ============================================================================
 // Driver state

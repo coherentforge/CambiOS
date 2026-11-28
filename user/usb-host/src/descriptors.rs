@@ -64,8 +64,6 @@ pub enum EndpointType {
 /// Parsed Configuration Descriptor (USB 2.0 § 9.6.3).
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigurationDescriptor {
-    pub total_length: u16,
-    pub num_interfaces: u8,
     pub configuration_value: u8,
 }
 
@@ -74,7 +72,6 @@ pub struct ConfigurationDescriptor {
 pub struct InterfaceDescriptor {
     pub interface_number: u8,
     pub alternate_setting: u8,
-    pub num_endpoints: u8,
     pub interface_class: u8,
     pub interface_subclass: u8,
     pub interface_protocol: u8,
@@ -148,7 +145,7 @@ pub enum DescriptorError {
     NotConfiguration,
     /// `wTotalLength` doesn't match the blob length the caller passed
     /// in — partial read or corrupt response.
-    TotalLengthMismatch { declared: u16, actual: usize },
+    TotalLengthMismatch,
     /// A descriptor's `bLength` field is zero (would cause infinite
     /// loop in a length-driven walk) or runs off the end of the blob.
     BadLength,
@@ -180,15 +177,12 @@ pub fn parse_configuration(
     }
     let total_length = u16::from_le_bytes([blob[2], blob[3]]);
     if total_length as usize != blob.len() {
-        return Err(DescriptorError::TotalLengthMismatch {
-            declared: total_length,
-            actual: blob.len(),
-        });
+        return Err(DescriptorError::TotalLengthMismatch);
     }
+    // blob[4] is bNumInterfaces; the walk is length-driven and finds
+    // interfaces by their own descriptors.
     Ok((
         ConfigurationDescriptor {
-            total_length,
-            num_interfaces: blob[4],
             configuration_value: blob[5],
         },
         &blob[b_length..],
@@ -203,7 +197,8 @@ fn parse_interface(blob: &[u8]) -> Result<InterfaceDescriptor, DescriptorError> 
     Ok(InterfaceDescriptor {
         interface_number: blob[2],
         alternate_setting: blob[3],
-        num_endpoints: blob[4],
+        // blob[4] is bNumEndpoints; endpoints are found by walking to the
+        // next interface descriptor.
         interface_class: blob[5],
         interface_subclass: blob[6],
         interface_protocol: blob[7],

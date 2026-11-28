@@ -1263,11 +1263,11 @@ impl XhciController {
         self.control_transfer_in(dev, setup_packet, buf_paddr, 18)?;
 
         // Copy the 18-byte device descriptor out of the DMA buffer.
+        let mut desc = [0u8; 18];
         // SAFETY: buf_vaddr is the page we allocated above (still
         // mapped, owned exclusively); the device descriptor fits in
         // 18 bytes well inside the page. Volatile reads make the
         // controller's writes visible.
-        let mut desc = [0u8; 18];
         unsafe {
             let src = buf_vaddr as *const u8;
             for (i, slot) in desc.iter_mut().enumerate() {

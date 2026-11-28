@@ -344,14 +344,18 @@ impl VirtQueue {
         let desc_ptr = self.base_vaddr as *mut VirtqDesc;
         let mut cur = head_idx;
         for step in 0..pending.length {
-            // SAFETY: cur < queue_size at every step — either the head (just
+            // cur < queue_size at every step: either the head (just
             // validated) or a `next` field of a previous descriptor that we
-            // set in push_chain. validate on each step defensively.
+            // set in push_chain. Checked on each step defensively.
             if cur >= self.queue_size {
                 self.dead = true;
                 sys::print(b"[BLK] DEVICE KILLED: chain walk out of bounds\n");
                 return None;
             }
+            // SAFETY: cur < queue_size (checked just above), so the
+            // descriptor lies in this queue's table; the device has handed
+            // the chain back, and `&mut self` means no other reference to it
+            // exists here.
             let desc = unsafe { &mut *desc_ptr.add(cur as usize) };
             let next_in_chain = desc.next;
             let has_next = (desc.flags & VIRTQ_DESC_F_NEXT) != 0;

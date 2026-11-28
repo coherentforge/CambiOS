@@ -33,7 +33,6 @@ pub const STATUS_FAILED: u8 = 128;
 
 /// Virtio-net feature bits.
 pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
-pub const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 /// Modern virtio requires bit 32 in the driver's accepted feature set.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 

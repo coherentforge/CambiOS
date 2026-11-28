@@ -270,7 +270,10 @@ impl NetDriver {
         self.tx_buf.zero();
         // Copy packet data after the header
         let dst = (self.tx_buf.vaddr + self.hdr_size as u64) as *mut u8;
-        // This write goes to the bounce buffer (driver memory), not device memory
+        // SAFETY: dst is inside the TX bounce buffer (one DMA page owned by
+        // this driver), and hdr_size + packet.len() <= its size (checked
+        // above), so the copy stays in it; the packet is a caller slice in
+        // this program's memory, so the two do not overlap.
         #[allow(unsafe_code)]
         unsafe {
             core::ptr::copy_nonoverlapping(packet.as_ptr(), dst, packet.len());
@@ -333,6 +336,11 @@ impl NetDriver {
 
             // Read payload from bounce buffer (skip virtio-net header)
             let src = (pending.vaddr + self.hdr_size as u64) as *const u8;
+            // SAFETY: pending.vaddr is an RX bounce buffer this driver
+            // posted, and pop_used clamped validated_len to the length
+            // posted, so hdr_size + copy_len <= that buffer's size; copy_len
+            // <= out.len(), and `out` is the caller's slice, distinct from
+            // the DMA page.
             #[allow(unsafe_code)]
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), copy_len);

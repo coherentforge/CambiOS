@@ -18,11 +18,6 @@ pub const VIRTIO_NET_DEVICE_ID_MODERN: u16 = 0x1041;
 pub struct PciDeviceInfo {
     pub vendor_id: u16,
     pub device_id: u16,
-    pub class: u8,
-    pub subclass: u8,
-    pub bus: u8,
-    pub device: u8,
-    pub function: u8,
     pub bars: [BarInfo; 6],
     /// Index used in `sys::device_info(index, ...)` — needed to look up the
     /// modern-pci capability layout via `sys::virtio_modern_caps(index)`.
@@ -67,11 +62,9 @@ impl PciDeviceInfo {
         Some(PciDeviceInfo {
             vendor_id,
             device_id,
-            class: buf[4],
-            subclass: buf[5],
-            bus: buf[6],
-            device: buf[7],
-            function: buf[8],
+            // buf[4..9] is class, subclass and the PCI bus / device /
+            // function; the driver matches on vendor and device ID and
+            // addresses the device by BAR.
             bars,
             index,
         })

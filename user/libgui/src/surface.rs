@@ -198,6 +198,11 @@ impl<'a> Surface<'a> {
         if ux >= self.width || uy >= self.height {
             return;
         }
+        // SAFETY: ux < width <= pitch_pixels and uy < height (checked
+        // above), so off < pitch_pixels × height, and `from_raw` /
+        // `from_raw_argb`'s contract makes `base` valid for reads and writes
+        // of that many u32s with no aliasing Rust reference. Volatile: the
+        // compositor reads the same memory from its own process.
         unsafe {
             let off = (uy as usize) * self.pitch_pixels + (ux as usize);
             let p = self.base.add(off);

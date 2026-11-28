@@ -68,12 +68,6 @@ impl DmaBuf {
         unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), n); }
         n
     }
-
-    /// Zero the buffer.
-    pub fn zero(&self) {
-        // SAFETY: vaddr is from alloc_dma, valid for BUF_SIZE bytes.
-        unsafe { core::ptr::write_bytes(self.vaddr as *mut u8, 0, BUF_SIZE as usize); }
-    }
 }
 
 /// A descriptor ring (TX or RX) with its bounce buffers.

@@ -343,9 +343,23 @@ $(foreach a,$(ARCHES),$(foreach c,$(CRATES_$(a)),$(eval $(call USER_CRATE_RULE,$
 # Every user crate, for every architecture that has a rule for it:
 # the staged crates the images build anyway, and the UNSTAGED ones no
 # image builds.
-.PHONY: check-user
-check-user: $(foreach a,$(ARCHES),$(addsuffix $(SUFFIX_$(a)),$(CRATES_$(a))))
-	@echo "=== every user crate builds for every architecture that lists it ==="
+.PHONY: check-user check-user-build
+# A warning fails it: the build output is kept and searched, and cargo
+# replays a fresh crate's cached warnings, so a warning cannot hide in a
+# crate that did not rebuild. (Denying warnings through RUSTFLAGS instead
+# would change every user crate's fingerprint, so the next image build
+# would rebuild them all.)
+CHECK_USER_LOG := target/check-user.log
+check-user-build: $(foreach a,$(ARCHES),$(addsuffix $(SUFFIX_$(a)),$(CRATES_$(a))))
+
+check-user:
+	@mkdir -p target
+	@{ $(MAKE) --no-print-directory check-user-build 2>&1; echo $$? > $(CHECK_USER_LOG).rc; } | tee $(CHECK_USER_LOG)
+	@rc=$$(cat $(CHECK_USER_LOG).rc); [ "$$rc" = 0 ] || exit $$rc
+	@if grep -q '^warning' $(CHECK_USER_LOG); then \
+		echo "check-user: user crates built with warnings (fix them; see $(CHECK_USER_LOG)):"; \
+		grep '^warning' $(CHECK_USER_LOG) | sort | uniq -c; exit 1; fi
+	@echo "=== every user crate builds for every architecture that lists it, with no warning ==="
 
 # Host tests of the packages in HOST_TEST_CRATES, one goal each
 # (`make host-test-user-libsys`). They build for USER_TEST_TARGET, the
@@ -1243,8 +1257,8 @@ update-boot-panics-baseline:
 # block, in every Rust file in the repository except verification/.
 # Comment-block-aware scanner; cluster + assignment-continuation
 # + attribute-line aware. Baseline at
-# tools/check-unsafe-coverage-baseline.txt: empty for the kernel, 19
-# sites in five user crates. Exits nonzero on any new site.
+# tools/check-unsafe-coverage-baseline.txt: empty since 2026-11-27, every
+# site in the tree covered. Exits nonzero on any new site.
 check-unsafe-coverage:
 	python3 tools/check-unsafe-coverage.py
 

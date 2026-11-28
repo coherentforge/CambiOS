@@ -55,7 +55,6 @@ pub struct PendingBuffer {
     pub paddr: u64,
     pub vaddr: u64,
     pub len: u32,
-    pub device_writable: bool,
 }
 
 /// Compute total pages needed for a legacy virtqueue.
@@ -132,6 +131,12 @@ impl VirtQueue {
         // Initialize free descriptor chain
         let desc_ptr = base_vaddr as *mut VirtqDesc;
         for i in 0..queue_size {
+            // SAFETY: base_vaddr is the page-aligned mapping of the
+            // `total_pages` DMA pages alloc_dma just returned, owned by this
+            // queue alone; the descriptor table is its first queue_size × 16
+            // bytes, so descriptor i < queue_size is in bounds and 16-byte
+            // aligned. The device has not been given the queue yet, so
+            // nothing else touches it.
             let d = unsafe { &mut *desc_ptr.add(i as usize) };
             d.addr = 0;
             d.len = 0;
@@ -141,6 +146,10 @@ impl VirtQueue {
 
         // Zero available ring header (flags=0, idx=0)
         let avail_base = base_vaddr + avail_offset as u64;
+        // SAFETY: the available ring's 4-byte header (flags, idx) starts at
+        // avail_offset = queue_size × 16, inside the allocation
+        // (legacy_queue_pages counts queue_size × 16 + 6 + queue_size × 2
+        // bytes before the used ring) and 2-byte aligned.
         unsafe {
             core::ptr::write_volatile(avail_base as *mut u16, 0); // flags
             core::ptr::write_volatile((avail_base + 2) as *mut u16, 0); // idx
@@ -148,6 +157,10 @@ impl VirtQueue {
 
         // Zero used ring header (flags=0, idx=0)
         let used_base = base_vaddr + used_offset as u64;
+        // SAFETY: the used ring's 4-byte header starts at used_offset, the
+        // page boundary after the available ring, inside the allocation
+        // (legacy_queue_pages adds 6 + queue_size × 8 bytes from there,
+        // rounded up to a page) and page-aligned.
         unsafe {
             core::ptr::write_volatile(used_base as *mut u16, 0); // flags
             core::ptr::write_volatile((used_base + 2) as *mut u16, 0); // idx
@@ -166,11 +179,6 @@ impl VirtQueue {
             pending: [None; MAX_QUEUE_SIZE as usize],
             dead: false,
         })
-    }
-
-    /// Physical page frame number (for legacy transport REG_QUEUE_PFN).
-    pub fn pfn(&self) -> u32 {
-        (self.base_paddr / 4096) as u32
     }
 
     /// Physical addresses of the three ring sub-regions within the
@@ -213,6 +221,10 @@ impl VirtQueue {
         }
 
         let desc_ptr = self.base_vaddr as *mut VirtqDesc;
+        // SAFETY: desc_idx < queue_size (checked above), so the descriptor
+        // lies in this queue's table (see `new`). It is on the free list,
+        // so the device is not reading it, and `&mut self` means no other
+        // reference to it exists in this program.
         let desc = unsafe { &mut *desc_ptr.add(desc_idx as usize) };
 
         self.next_free_desc = desc.next;
@@ -227,12 +239,15 @@ impl VirtQueue {
             paddr,
             vaddr,
             len,
-            device_writable,
         });
 
         // Write to available ring: ring entries start at offset 4 (after flags + idx)
         let avail_base = self.base_vaddr + self.avail_offset as u64;
         let ring_slot = self.avail_idx % self.queue_size;
+        // SAFETY: ring_slot < queue_size, so the entry at avail_base + 4 +
+        // 2 × ring_slot lies inside the available ring (header plus
+        // queue_size u16 entries, all within the allocation) and is 2-byte
+        // aligned. Volatile: the device reads it.
         unsafe {
             let ring_ptr = (avail_base + 4) as *mut u16;
             core::ptr::write_volatile(ring_ptr.add(ring_slot as usize), desc_idx);
@@ -240,6 +255,8 @@ impl VirtQueue {
         self.avail_idx = self.avail_idx.wrapping_add(1);
 
         // Update available ring index (device reads this)
+        // SAFETY: the available ring's idx field, at avail_base + 2, as in
+        // `new`. Volatile: the device reads it.
         unsafe {
             core::ptr::write_volatile((avail_base + 2) as *mut u16, self.avail_idx);
         }
@@ -259,6 +276,9 @@ impl VirtQueue {
         let used_base = self.base_vaddr + self.used_offset as u64;
 
         // Read device's used ring index
+        // SAFETY: the used ring's idx field, at used_base + 2 (see `new`):
+        // in bounds and aligned. Volatile: the device writes it; its value
+        // is treated as untrusted below.
         let device_idx = DeviceValue::new(unsafe {
             core::ptr::read_volatile((used_base + 2) as *const u16)
         });
@@ -270,6 +290,10 @@ impl VirtQueue {
         // Read the used element
         let ring_idx = self.last_used_idx % self.queue_size;
         let elem_ptr = (used_base + 4) as *const VirtqUsedElem;
+        // SAFETY: ring_idx < queue_size, so element ring_idx (8 bytes at
+        // used_base + 4 + 8 × ring_idx) lies inside the used ring and is
+        // 4-byte aligned. VirtqUsedElem is two u32s, so any bit pattern the
+        // device wrote is a valid value; its fields are validated below.
         let elem = unsafe { core::ptr::read_volatile(elem_ptr.add(ring_idx as usize)) };
 
         // VALIDATE: descriptor index within queue bounds
@@ -297,6 +321,9 @@ impl VirtQueue {
 
         // Return descriptor to free list
         let desc_ptr = self.base_vaddr as *mut VirtqDesc;
+        // SAFETY: validated_idx < queue_size (validate_index above), so the
+        // descriptor lies in this queue's table. The device has handed it
+        // back, and `&mut self` means no other reference to it exists here.
         let desc = unsafe { &mut *desc_ptr.add(validated_idx as usize) };
         desc.next = self.next_free_desc;
         self.next_free_desc = validated_idx;
@@ -305,11 +332,6 @@ impl VirtQueue {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         Some((pending, validated_len))
-    }
-
-    /// Number of free descriptors.
-    pub fn free_descriptors(&self) -> u16 {
-        self.free_count
     }
 }
 
@@ -335,28 +357,10 @@ impl BounceBuffer {
         })
     }
 
-    /// Write data into the bounce buffer. Returns bytes written (clamped to size).
-    pub fn write(&self, data: &[u8]) -> usize {
-        let len = core::cmp::min(data.len(), self.size as usize);
-        let dst = self.vaddr as *mut u8;
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, len);
-        }
-        len
-    }
-
-    /// Read data from the bounce buffer into `dst`. Returns bytes read (clamped).
-    pub fn read(&self, dst: &mut [u8], len: usize) -> usize {
-        let actual = core::cmp::min(core::cmp::min(len, dst.len()), self.size as usize);
-        let src = self.vaddr as *const u8;
-        unsafe {
-            core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), actual);
-        }
-        actual
-    }
-
     /// Zero the buffer.
     pub fn zero(&self) {
+        // SAFETY: vaddr is the mapping of the one DMA page alloc_dma
+        // returned in `new`, writable and owned by this buffer; size is 4096.
         unsafe {
             core::ptr::write_bytes(self.vaddr as *mut u8, 0, self.size as usize);
         }
