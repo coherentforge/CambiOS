@@ -45,6 +45,14 @@
 #                              list (architectures, user crates, proof
 #                              crates) agrees with the Makefile's "Build
 #                              lists" section. No baseline.
+#   check-proof-codegen:       Every Kani proof crate whose inputs are
+#                              staged (its own files, the kernel file it
+#                              #[path]-includes, its path dependencies)
+#                              compiles under `cargo kani --only-codegen`.
+#                              Warn-but-pass when Kani is not installed;
+#                              CI's kani-codegen job still gates. Catches
+#                              a kernel file outgrowing its proof crate's
+#                              stand-ins (CI red 2026-11-24, 2026-09-15).
 #   check-status-freshness:    STATUS.md `last_synced_to_code:` must be
 #                              within 7 days of today. Advisory only
 #                              (exit 0; warn-but-pass first iteration).
@@ -66,4 +74,5 @@ python3 tools/check-unsafe-coverage.py
 python3 tools/check-fail-open.py
 python3 tools/check-doc-refs.py
 python3 tools/check-lists.py
+python3 tools/check-proof-codegen.py
 python3 tools/check-status-freshness.py

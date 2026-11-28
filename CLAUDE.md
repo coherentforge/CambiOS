@@ -242,6 +242,7 @@ make stats
 # Lints. A failing lint prints its own remedy. Most are don't-grow-the-baseline gates (tools/check-*-baseline.txt).
 # CI = run on every push; hook = run by pre-commit.
 make check-lists             # every copy of a build list matches the Makefile's (CI, hook)
+make check-proof-codegen     # every Kani proof crate compiles (CI's kani-codegen; hook: the crates whose inputs are staged)
 make check-adrs              # ADR cross-refs; regenerates docs/adr/INDEX.md (CI)
 make audit-taxonomy          # regenerates docs/generated/audit-taxonomy.md from cambios-abi
 make check-audit-taxonomy    # that generated doc is in sync (CI)

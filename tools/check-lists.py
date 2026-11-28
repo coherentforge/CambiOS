@@ -224,6 +224,20 @@ def check_proof_crates(proofs, excluded):
     filtered = set(re.findall(r"^\s*- '(src/[^']+)'", wf, flags=re.M))
     same(".github/workflows/proofs.yml", "path filter vs the kernel files the proof crates #[path]-include", included, filtered)
 
+    # A path dependency is a proof input too (capability-proofs uses
+    # cambios-abi): its directory must be in the filter as 'dir/**', or a
+    # change there is solved only by the weekly run.
+    deps = set()
+    for crate in proofs:
+        manifest = tomllib.loads(read(f"verification/{crate}/Cargo.toml"))
+        for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for spec in manifest.get(table, {}).values():
+                if isinstance(spec, dict) and "path" in spec:
+                    dep = (ROOT / "verification" / crate / spec["path"]).resolve()
+                    deps.add(dep.relative_to(ROOT.resolve()).as_posix())
+    dep_globs = set(re.findall(r"^\s*- '([^'*]+)/\*\*'", wf, flags=re.M)) - {"verification"}
+    same(".github/workflows/proofs.yml", "path filter vs the proof crates' path dependencies", deps, dep_globs)
+
     m = re.search(r"across (\d+) proof crates", read("STATUS.md"))
     if m and int(m.group(1)) != len(proofs):
         problem("STATUS.md", f'says "across {m.group(1)} proof crates"; there are {len(proofs)}')

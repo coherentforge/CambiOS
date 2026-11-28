@@ -34,11 +34,14 @@
 #   buddy-proofs       src/memory/buddy_allocator.rs
 #   frame-proofs       src/memory/frame_allocator.rs
 #   elf-proofs         src/loader/elf.rs
-#   capability-proofs  src/ipc/capability.rs
+#   capability-proofs  src/ipc/capability.rs, cambios-abi/ (path dependency)
 #   userslice-proofs   src/syscalls/user_slice.rs
 #   dtb-proofs         src/boot/riscv.rs
 # A change to any of these (or to verification/ or this file) re-runs all six;
-# adding a proof crate means adding its #[path] file to the filter below.
+# adding a proof crate means adding its #[path] file, and any path dependency
+# as 'dir/**', to the filter below (`make check-lists` checks both). Locally
+# the pre-commit hook compiles the crates whose inputs are staged
+# (tools/check-proof-codegen.py).
 #
 # Kani ships its own bundled toolchain + CBMC, independent of
 # rust-toolchain.toml. The pinned version below MUST match the version the
@@ -97,6 +100,7 @@ jobs:
               - 'src/ipc/capability.rs'
               - 'src/syscalls/user_slice.rs'
               - 'src/boot/riscv.rs'
+              - 'cambios-abi/**'
               - '.github/workflows/proofs.yml'
       # A scheduled or manually dispatched run solves everything; only push
       # and pull_request runs consult the path filter.

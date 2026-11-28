@@ -1519,6 +1519,13 @@ $(VERIFY_TARGETS): verify-%:
 verify-all: $(VERIFY_TARGETS)
 	@echo "=== All proof crates verified ==="
 
+# Every proof crate compiles under Kani (harnesses included, no solver):
+# CI's kani-codegen job, locally. The pre-commit hook runs the same script
+# on only the crates whose inputs are staged.
+.PHONY: check-proof-codegen
+check-proof-codegen:
+	python3 tools/check-proof-codegen.py --all
+
 clean:
 	cargo clean
 	rm -f $(ISO) $(IMG_X86) $(IMG_AARCH64) $(INITRD_RISCV64)
