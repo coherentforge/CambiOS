@@ -264,7 +264,7 @@ lifetime = "on-demand"
 # only, so no shipping image spawns it. map-mmio: the R1 stage asks for
 # non-device physical memory and must be refused. spawn + wait-task +
 # create-process: the reaper stage spawns faultme after the boot wave,
-# and the x86_64 trap stages spawn regress-victim. Endpoint 59 +
+# and the x86_64 and riscv64 trap stages spawn regress-victim. Endpoint 59 +
 # register-endpoint + try-recv-msg: regress-victim reports there that it
 # is listening.
 [[service]]
@@ -277,16 +277,17 @@ profile = ["regress"]
 
 # The probe's hostile child (user/regress-victim): receives one mode byte
 # on endpoint 60 and executes the instruction it names, which a correct
-# kernel answers by reaping it (ADR-040 § Sequencing). x86_64 only for now;
+# kernel answers by reaping it (ADR-040 § Sequencing). x86_64 and riscv64;
 # same add-on profile. get-time: the syscall the trap-flag and GS modes
-# make; yield: the nested-task mode's yielding syscall.
+# make; yield: the nested-task mode's yielding syscall; allocate: the
+# riscv64 tp mode maps memory so its reap spans timer ticks.
 [[service]]
 name = "regress-victim"
-syscalls = ["exit", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
+syscalls = ["allocate", "exit", "get-time", "print", "recv-msg", "register-endpoint", "write", "yield"]
 endpoints = [60]
 lifetime = "on-demand"
 profile = ["regress"]
-arch = ["x86_64"]
+arch = ["x86_64", "riscv64"]
 
 # --- USB / PIV chain -------------------------------------------------------------
 

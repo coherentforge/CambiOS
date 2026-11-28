@@ -34,16 +34,19 @@
 //!   `[sched]` line at tick 2000 (x86_64) shows whether the reaper kept up
 //!   (pending and high-water at most 1 per CPU), and `make run-regress`
 //!   requires that line.
-//! - **Trap stages** (x86_64; most exceptions had no handler, so any of
-//!   them from ring 3 became a double fault that halted the kernel;
-//!   ADR-040 § 4): spawn `regress-victim`, wait for it to report that it
-//!   is listening on its endpoint, send it one mode byte, and wait for it.
-//!   It executes the instruction the byte names (`ud2`; a push through a
-//!   non-canonical stack pointer, #SS on Intel hardware and #GP under
-//!   QEMU; `int1`, #DB; the trap flag set across `syscall`; the
-//!   nested-task flag set across a yielding syscall, ADR-040 § 5). The
-//!   stage passes when the child comes back reaped for a fault (exits 0
-//!   for the nested-task stage) and the probe itself is still running. `SYS_WAIT_TASK` does not yet say which fault (ADR-019's
+//! - **Trap stages** (x86_64 and riscv64; they run before the reaper
+//!   stage): spawn `regress-victim`, wait for it to report that it is
+//!   listening on its endpoint, send it one mode byte, and wait for it. It
+//!   executes the sequence the byte names; `TRAP_STAGES` lists each stage
+//!   with the result a correct kernel gives. On x86_64 these are the ADR-040
+//!   entry fixes: exceptions that had no handler and halted the kernel
+//!   (§ 4), flags carried across `syscall` (§ 5), a GS base set from ring 3
+//!   (§ 2), control-register state (§ 6). On riscv64 the child sets `tp`
+//!   and faults with 16 MiB mapped, so its reap spans timer ticks; the trap
+//!   vector used to leave the program's `tp` in `sscratch`, and a tick
+//!   during the reap took it as the per-CPU pointer (§ 9). A stage passes
+//!   when the child ends with the expected result and the probe itself is
+//!   still running. `SYS_WAIT_TASK` does not yet say which fault (ADR-019's
 //!   `ExitInfo`); the kernel's `[Fault]` line in the log does.
 
 #![no_std]
@@ -75,27 +78,27 @@ const REAPER_CHILDREN: usize = 4;
 
 /// ARCHITECTURAL: this probe's endpoint (its manifest row): regress-victim
 /// reports there that it is listening.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const PROBE_ENDPOINT: u32 = 59;
 
 /// ARCHITECTURAL: regress-victim's endpoint (its manifest row): the probe
 /// sends the mode byte there.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const VICTIM_ENDPOINT: u32 = 60;
 
 /// What regress-victim sends once it is listening.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const VICTIM_READY: &[u8] = b"victim-ready";
 
 /// TUNING: ticks (5 s at 100 Hz) the probe waits for regress-victim to
 /// report that it is listening before the stage fails. A spawn and the
 /// child's first syscalls take a few ticks under QEMU.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const VICTIM_READY_TICKS: u64 = 500;
 
 /// What `SYS_WAIT_TASK` returns for a child the kernel reaped for a fault:
 /// the kernel's `reap::FAULTED_EXIT_CODE` (`i32::MIN`), sign-extended.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 const FAULTED: i64 = i32::MIN as i64;
 
 /// The x86_64 trap stages: regress-victim's mode byte (shared with
@@ -127,16 +130,28 @@ const TRAP_STAGES: [(u8, &[u8], &[u8], i64, Requires); 10] = [
     (10, b"trap-UMIP", b"sidt in ring 3 reaps the program: the IDT's kernel address stays in ring 0", FAULTED, Requires::Umip),
 ];
 
+/// The riscv64 trap stage: regress-victim's mode byte, the stage id, what
+/// a correct kernel does, and the expected `SYS_WAIT_TASK` result, as in
+/// the x86_64 table. The program sets `tp`, the register riscv64 user code
+/// owns and the kernel's trap vector swaps with `sscratch`, then faults
+/// after mapping enough memory that its reap spans timer ticks with
+/// interrupts on (ADR-040 § 9).
+#[cfg(target_arch = "riscv64")]
+const TRAP_STAGES: [(u8, &[u8], &[u8], i64, Requires); 1] = [
+    (11, b"trap-tp-reap", b"a fault with tp set reaps the program; the ticks during the reap do not take the program's tp as the per-CPU pointer", FAULTED, Requires::Nothing),
+];
+
 /// A CPU feature a trap stage needs before its expectation holds.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 #[derive(Clone, Copy)]
 enum Requires {
     Nothing,
     /// CPUID leaf 7, subleaf 0, ECX bit 2.
+    #[cfg(target_arch = "x86_64")]
     Umip,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 impl Requires {
     /// Whether this CPU has the feature. CPUID is unprivileged: ring 3
     /// reads the same leaf the kernel decided from. Leaf 0 first, because
@@ -144,6 +159,7 @@ impl Requires {
     fn met(self) -> bool {
         match self {
             Requires::Nothing => true,
+            #[cfg(target_arch = "x86_64")]
             Requires::Umip => {
                 core::arch::x86_64::__cpuid(0).eax >= 7
                     && core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 2) != 0
@@ -429,10 +445,10 @@ fn stage_reaper(t: &mut Tally) {
     t.record(all, b"reaper", what);
 }
 
-/// One x86_64 trap stage: spawn regress-victim, wait (bounded) for it to
-/// say it is listening, send it `mode`, wait for it to end, and pass if
+/// One trap stage: spawn regress-victim, wait (bounded) for it to say it
+/// is listening, send it `mode`, wait for it to end, and pass if
 /// `SYS_WAIT_TASK` returns `expect`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 fn stage_trap(t: &mut Tally, mode: u8, id: &[u8], what: &[u8], expect: i64) {
     let handle = sys::spawn(b"regress-victim");
     if handle < 0 {
@@ -471,7 +487,7 @@ fn stage_trap(t: &mut Tally, mode: u8, id: &[u8], what: &[u8], expect: i64) {
 fn run() -> ! {
     // The trap stages' handshake endpoint; registered before the readiness
     // ping, as the entry macro would.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     if sys::register_endpoint(PROBE_ENDPOINT) < 0 {
         sys::print(b"[REGRESS] could not register endpoint 59; the trap stages will fail\r\n");
     }
@@ -483,8 +499,11 @@ fn run() -> ! {
     let mut t = Tally { pass: 0, fail: 0 };
     stage_r4(&mut t);
     stage_r1(&mut t);
-    stage_reaper(&mut t);
-    #[cfg(target_arch = "x86_64")]
+    // The trap stages run before the reaper stage, which waits for a tick
+    // well past the boot wave and then spawns children back to back: they
+    // do not depend on it, and a stage that runs first still reports if a
+    // later one stops the run.
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     for (mode, id, what, expect, requires) in TRAP_STAGES {
         if !requires.met() {
             Line::new().text(b"[REGRESS] SKIP ").text(id)
@@ -493,6 +512,7 @@ fn run() -> ! {
         }
         stage_trap(&mut t, mode, id, what, expect);
     }
+    stage_reaper(&mut t);
 
     Line::new()
         .text(b"[REGRESS] done: ")

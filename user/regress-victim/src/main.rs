@@ -8,10 +8,12 @@
 //! and sends it one byte naming a hostile instruction sequence: one a
 //! program can execute in ring 3 and that once halted the whole kernel, or
 //! once ran when it must not (x87 with no FP state saved, `rdtsc`, `sidt`).
-//! This program executes it. For most modes a correct kernel reaps it for
-//! the fault; for the nested-task and GS modes a correct kernel lets it
-//! finish and exit 0. The probe checks which happened and that the kernel
-//! kept running.
+//! On riscv64 the one mode sets `tp`, which the trap vector once left in
+//! `sscratch` for the kernel to trust, then faults. This program executes
+//! the sequence; the modes are per architecture (`execute`). For most
+//! modes a correct kernel reaps it for the fault; for the nested-task and
+//! GS modes a correct kernel lets it finish and exit 0. The probe checks
+//! which happened and that the kernel kept running.
 //!
 //! The mode arrives over IPC because `SYS_SPAWN` carries only a name: one
 //! program can then serve every hostile stage instead of one crate per
@@ -39,38 +41,72 @@ const PROBE_ENDPOINT: u32 = 59;
 const READY: &[u8] = b"victim-ready";
 
 /// Mode bytes, shared with `user/regression-probe` (keep the two in step).
+/// 1-10 are x86_64 instruction sequences, 11 is riscv64's.
+#[cfg(target_arch = "x86_64")]
 const MODE_UD: u8 = 1;
+#[cfg(target_arch = "x86_64")]
 const MODE_SS: u8 = 2;
+#[cfg(target_arch = "x86_64")]
 const MODE_ICEBP: u8 = 3;
+#[cfg(target_arch = "x86_64")]
 const MODE_TF: u8 = 4;
+#[cfg(target_arch = "x86_64")]
 const MODE_NT: u8 = 5;
+#[cfg(target_arch = "x86_64")]
 const MODE_GS_SYSCALL: u8 = 6;
+#[cfg(target_arch = "x86_64")]
 const MODE_GS_TICK: u8 = 7;
+#[cfg(target_arch = "x86_64")]
 const MODE_X87: u8 = 8;
+#[cfg(target_arch = "x86_64")]
 const MODE_RDTSC: u8 = 9;
+#[cfg(target_arch = "x86_64")]
 const MODE_SIDT: u8 = 10;
+#[cfg(target_arch = "riscv64")]
+const MODE_TP_REAP: u8 = 11;
 
 /// ARCHITECTURAL: the kernel GDT's user data selector (index 3, RPL 3; see
 /// `.claude/rules/x86_64.md`). Ring 3 may load it into GS, which in 64-bit
 /// mode sets GS's base to the descriptor's base, 0.
+#[cfg(target_arch = "x86_64")]
 const USER_DATA_SELECTOR: u16 = 0x1B;
 
 /// TUNING: countdown iterations per spin chunk in the GS tick mode. Long
 /// enough that the first chunk usually spans a timer tick (tens of ms
 /// under QEMU's TCG emulation, about 15 ms at 5 GHz), short enough that
 /// the tick check between chunks ends the mode soon after the ticks land.
+#[cfg(target_arch = "x86_64")]
 const GS_TICK_SPIN: u64 = 1 << 26;
 
 /// TUNING: ticks (10 ms each) that must pass while the GS tick mode spins
 /// in ring 3. A periodic local timer that advanced the clock this far has
 /// interrupted this CPU in ring 3 at least once.
+#[cfg(target_arch = "x86_64")]
 const GS_TICK_MIN_TICKS: u64 = 3;
 
 /// SCAFFOLDING: bound on spin chunks in the GS tick mode, so the mode
 /// ends even if the clock stops.
 /// Why: Convention 8 bounded iteration; 64 chunks is seconds under TCG.
 /// Replace when: a ring-3 tick counter makes the clock check unnecessary.
+#[cfg(target_arch = "x86_64")]
 const GS_TICK_MAX_CHUNKS: u32 = 64;
+
+/// TUNING: pages (16 MiB) the riscv64 `tp` mode maps before it faults. The
+/// reap unmaps them one by one, each with a TLB shootdown, with
+/// interrupts on, so it spans timer ticks under QEMU; a kernel that kept
+/// the program's `tp` in `sscratch` takes one of those ticks through the
+/// user-entry branch (the sandbox review's reproduction, 2026-11-24).
+#[cfg(target_arch = "riscv64")]
+const TP_REAP_PAGES: u32 = 4096;
+
+/// TUNING: ticks (10 ms each) the 16 MiB mapping must take for the `tp`
+/// mode to count. The reap unmaps the same pages one by one, each with a
+/// TLB shootdown, so a mapping that spanned a tick says the reap will
+/// too; one that did not says the stage would pass on any kernel, the
+/// tick that once took the program's `tp` as the per-CPU pointer never
+/// having come, and the mode exits 8 instead of faulting.
+#[cfg(target_arch = "riscv64")]
+const TP_REAP_MIN_MAP_TICKS: u64 = 1;
 
 cambios_libsys_rt::service_main! {
     name: "REGRESS-VICTIM",
@@ -91,6 +127,15 @@ fn run() -> ! {
             sys::exit(4);
         }
     };
+    execute(mode);
+    sys::print(b"[REGRESS-VICTIM] BUG: the instruction did not fault\r\n");
+    sys::exit(2)
+}
+
+/// Run the x86_64 sequence `mode` names. Returns only when a sequence that
+/// must fault did not.
+#[cfg(target_arch = "x86_64")]
+fn execute(mode: u8) {
     match mode {
         MODE_UD => {
             sys::print(b"[REGRESS-VICTIM] ud2\r\n");
@@ -226,18 +271,71 @@ fn run() -> ! {
             };
             core::hint::black_box(&idtr);
         }
-        _ => {
-            sys::print(b"[REGRESS-VICTIM] unknown mode\r\n");
-            sys::exit(5);
+        _ => unknown_mode(),
+    }
+}
+
+/// Run the riscv64 sequence `mode` names. Returns only when a sequence that
+/// must fault did not.
+#[cfg(target_arch = "riscv64")]
+fn execute(mode: u8) {
+    match mode {
+        MODE_TP_REAP => {
+            sys::print(b"[REGRESS-VICTIM] map 16 MiB, set tp, then fault\r\n");
+            let start = sys::get_time();
+            if sys::allocate(TP_REAP_PAGES) <= 0 {
+                sys::print(b"[REGRESS-VICTIM] allocate failed\r\n");
+                sys::exit(7);
+            }
+            let map_ticks = sys::get_time().wrapping_sub(start);
+            print_ticks(b"[REGRESS-VICTIM] mapping took ", map_ticks);
+            if map_ticks < TP_REAP_MIN_MAP_TICKS {
+                sys::print(b"[REGRESS-VICTIM] the mapping did not span a tick; the reap would not either\r\n");
+                sys::exit(8);
+            }
+            // SAFETY: deliberately faults. `tp` is an ordinary user
+            // register (the thread pointer; this program has no
+            // thread-local storage) and nothing runs after this block, so
+            // the value written to it is never used here. The store to
+            // address 16 faults (page 0 is never mapped), and the kernel
+            // must reap the program with `tp` still holding 0xdead0000.
+            unsafe {
+                core::arch::asm!("li tp, 0xdead0000", "sd zero, 16(zero)", options(noreturn, nostack))
+            };
+        }
+        _ => unknown_mode(),
+    }
+}
+
+/// Print `prefix`, a tick count in decimal, and " tick(s)".
+#[cfg(target_arch = "riscv64")]
+fn print_ticks(prefix: &[u8], ticks: u64) {
+    // 20 digits hold any u64; filled from the right.
+    let mut digits = [b'0'; 20];
+    let mut i = digits.len();
+    let mut n = ticks;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
         }
     }
-    sys::print(b"[REGRESS-VICTIM] BUG: the instruction did not fault\r\n");
-    sys::exit(2)
+    sys::print(prefix);
+    sys::print(&digits[i..]);
+    sys::print(b" tick(s)\r\n");
+}
+
+fn unknown_mode() -> ! {
+    sys::print(b"[REGRESS-VICTIM] unknown mode\r\n");
+    sys::exit(5)
 }
 
 /// Load [`USER_DATA_SELECTOR`] into GS from ring 3. A kernel that trusts
 /// whatever GS base is live when it enters ring 0 then addresses its
 /// per-CPU block at 0.
+#[cfg(target_arch = "x86_64")]
 fn load_user_gs() {
     // SAFETY: loads a selector ring 3 may load (a DPL-3 data descriptor);
     // it sets GS's base to 0, and this program never addresses through GS.
@@ -251,6 +349,7 @@ fn load_user_gs() {
 }
 
 /// Count `n` down to zero in a register: ring-3 time with no syscall.
+#[cfg(target_arch = "x86_64")]
 fn spin(n: u64) {
     // SAFETY: a register-only loop; it touches no memory and no stack.
     unsafe {

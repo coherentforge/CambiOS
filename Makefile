@@ -82,7 +82,7 @@ STAGE_aarch64 := policy-service key-store-service fs-service virtio-blk \
 	ping sprouty shell audit-tail regression-probe
 STAGE_riscv64 := policy-service key-store-service fs-service virtio-blk \
 	fde-mount usb-host ccid virtio-net udp-stack audit-tail shell faultme \
-	regression-probe
+	regression-probe regress-victim
 
 # User crates that build for the architecture but are not in its image.
 #
